@@ -2639,6 +2639,13 @@ pub struct App {
     pub session_channel: Option<crate::session_host::InnerChannel>,
     /// Roster last read from the session host's presence sidecar.
     pub session_participants: Vec<crate::session_host::Participant>,
+    /// Multiplayer: the participant whose keystrokes are currently flowing
+    /// into this croft (from the host's typing attribution frames).
+    session_typist: Option<u64>,
+    /// Multiplayer: every participant's last-known caret, stashed when the
+    /// typist changes and restored when they type again, so interleaved
+    /// input drives per-participant carets in the shared buffer.
+    session_carets: std::collections::HashMap<u64, SessionCaret>,
     /// Sidecar mtime at the last roster read, so the poll is a cheap stat.
     session_presence_mtime: Option<std::time::SystemTime>,
     /// Cadence gate for the presence poll (stat every 500ms, not every tick).
@@ -3470,6 +3477,8 @@ impl App {
             list_picker: None,
             session_channel: crate::session_host::InnerChannel::from_env(),
             session_participants: Vec::new(),
+            session_typist: None,
+            session_carets: std::collections::HashMap::new(),
             session_presence_mtime: None,
             last_session_presence_poll: std::time::Instant::now(),
             git_output_log: Vec::new(),
@@ -10452,6 +10461,23 @@ impl App {
             // Sticky scroll: recompute the pinned scope headers from the top
             // visible line each frame so they track scrolling.
             self.editor.sticky_lines = self.build_sticky_lines();
+            // Multiplayer ghost carets: other participants' parked carets in
+            // the active file, in their colors. The current typist's caret is
+            // the live cursor, so it never ghosts; departed participants drop
+            // out with the roster.
+            self.editor.ghost_carets = match self.editor.path.clone() {
+                Some(path) if !self.session_carets.is_empty() => self
+                    .session_carets
+                    .iter()
+                    .filter(|(id, parked)| {
+                        Some(**id) != self.session_typist
+                            && parked.path == path
+                            && self.session_participants.iter().any(|p| p.id == **id)
+                    })
+                    .map(|(id, parked)| (parked.row, parked.col, participant_color(*id)))
+                    .collect(),
+                _ => Vec::new(),
+            };
             // Render the editor group layout tree. The active group is hoisted
             // into `self.editor`; every other group lives in `editor_layout`.
             // Lay the leaves out and paint each at its rect (depth-first order),
@@ -15451,6 +15477,51 @@ impl App {
             self.open_participants_picker();
         }
         true
+    }
+
+    /// Drain typing attribution from the session host: when the typing
+    /// participant changes, hand the shared cursor over (stash the previous
+    /// typist's caret, restore the new one's).
+    fn poll_session_typing(&mut self) -> bool {
+        let Some(channel) = self.session_channel.as_mut() else {
+            return false;
+        };
+        let Some(id) = channel.drain_typing() else {
+            return false;
+        };
+        if self.session_typist == Some(id) {
+            return false;
+        }
+        self.apply_typist_change(id);
+        true
+    }
+
+    /// Participant `id` is typing now: park the previous typist's caret and
+    /// move the shared cursor back to where `id` last was (same file only;
+    /// a caret parked in another file just renders there as a ghost once
+    /// that file is active again).
+    fn apply_typist_change(&mut self, id: u64) {
+        let path = self.editor.path.clone();
+        if let (Some(prev), Some(path)) = (self.session_typist, path.as_ref()) {
+            self.session_carets.insert(
+                prev,
+                SessionCaret {
+                    path: path.clone(),
+                    row: self.editor.cursor_row,
+                    col: self.editor.cursor_col,
+                },
+            );
+        }
+        self.session_typist = Some(id);
+        if let (Some(parked), Some(path)) = (self.session_carets.get(&id), path.as_ref())
+            && parked.path == *path
+            && !self.editor.lines.is_empty()
+        {
+            let row = parked.row.min(self.editor.lines.len() - 1);
+            let col = parked.col.min(self.editor.lines[row].chars().count());
+            self.editor.cursor_row = row;
+            self.editor.cursor_col = col;
+        }
     }
 
     /// Act on the row chosen in the list picker.
@@ -30113,6 +30184,30 @@ enum ParticipantVerb {
     Kick,
 }
 
+/// One participant's parked caret in a multiplayer session: where they were
+/// when someone else took over typing (docs/MULTIPLAYER.md).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionCaret {
+    path: PathBuf,
+    row: usize,
+    col: usize,
+}
+
+/// The stable color a participant's ghost caret wears, from a small palette
+/// keyed by their id (also the join order, so the first guest is always
+/// green, the second magenta, and so on).
+fn participant_color(id: u64) -> Color {
+    const PALETTE: [Color; 6] = [
+        Color::Rgb(0x8c, 0xc2, 0x65), // green
+        Color::Rgb(0xd6, 0x6b, 0xd0), // magenta
+        Color::Rgb(0x56, 0xb6, 0xc2), // cyan
+        Color::Rgb(0xe0, 0x9a, 0x4e), // amber
+        Color::Rgb(0x9a, 0x86, 0xfd), // purple
+        Color::Rgb(0xe0, 0x6c, 0x75), // red
+    ];
+    PALETTE[(id % PALETTE.len() as u64) as usize]
+}
+
 /// Parse a participants action-picker row id back into (verb, participant).
 fn parse_participant_action(id: &str) -> Option<(ParticipantVerb, u64)> {
     let (verb, id) = id.split_once(':')?;
@@ -30659,6 +30754,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let pulls_changed = app.drain_remote_pulls();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
+        let session_typing_changed = app.poll_session_typing();
         let bells_changed = app.drain_terminal_bells();
         let labels_changed = app.refresh_terminal_labels();
         let auto_save_changed = app.tick_auto_save();
@@ -30736,6 +30832,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || pulls_changed
             || ports_changed
             || session_presence_changed
+            || session_typing_changed
             || bells_changed
             || labels_changed
             || auto_save_changed

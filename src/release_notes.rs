@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Multiplayer participants UI: in a shared session the status bar now shows an \"N attached\" badge, joins and leaves are announced, and \"Session: Participants\" (Cmd+K A) lists everyone attached so you can grant or revoke write control or disconnect a participant — powered by a token-authenticated control channel between croft and its session host.",
+    summary: "Attributed carets for multiplayer sessions: the session host tells croft whose keystrokes are flowing, so when participants take turns typing each one keeps their own caret — the editor parks the previous typist's cursor, restores the new typist's, and paints everyone else's position as a colored ghost caret in the file.",
 }];

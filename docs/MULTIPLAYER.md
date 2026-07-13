@@ -8,10 +8,16 @@ a dtach fallback. PR 3b (participants UI) SHIPPED in 0.1.628: the host
 exports a token-authenticated privileged control channel to the inner croft
 (Inner/Kick verbs), which polls the presence sidecar, shows an "N attached"
 status badge, announces joins and leaves, and drives grant/revoke/disconnect
-from Session: Participants (Cmd+K A). PR 3c (attributed carets) is next;
-the rest of this document is the design it follows. It exists so the
-multiplayer pillar starts from croft's real architecture instead of from a
-Live Share mental model that does not fit a single-process TUI.
+from Session: Participants (Cmd+K A). PR 3c (attributed carets) SHIPPED in
+0.1.629: the host sends Typing frames to the privileged channel whenever
+the writing client changes (ordered before that client's bytes reach the
+PTY), and croft hands the shared cursor over on each switch, parking the
+previous typist's caret, restoring the new typist's, and painting everyone
+else's position as a colored ghost caret. Phase D (independent viewports)
+remains explicitly deferred; the rest of this document is the design the
+shipped phases followed. It exists so the multiplayer pillar starts from
+croft's real architecture instead of from a Live Share mental model that
+does not fit a single-process TUI.
 
 ## Goal
 

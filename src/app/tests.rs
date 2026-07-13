@@ -18887,3 +18887,50 @@ fn participant_rows_show_role_and_size() {
     assert!(row.label.contains("read-only"));
     assert!(!row.label.contains("0\u{d7}0"));
 }
+
+#[test]
+fn typist_change_stashes_and_restores_per_participant_carets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello world\nsecond line\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_at(&file, 0, 0).unwrap();
+
+    // Participant 1 starts typing with the cursor at (1, 3): no stash to
+    // restore, cursor untouched.
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 3;
+    app.apply_typist_change(1);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 3));
+
+    // Participant 1 moves to (0, 2); then participant 2 takes over: 1's
+    // caret is parked where they left it.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 2;
+    app.apply_typist_change(2);
+    let parked = app.session_carets.get(&1).expect("caret parked for 1");
+    assert_eq!((parked.row, parked.col), (0, 2));
+
+    // Participant 2 works at (1, 4); participant 1 returns: 2 is parked and
+    // 1's caret is restored.
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 4;
+    app.apply_typist_change(1);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 2));
+    let parked = app.session_carets.get(&2).expect("caret parked for 2");
+    assert_eq!((parked.row, parked.col), (1, 4));
+
+    // A parked caret past the end of a shrunken buffer restores clamped.
+    app.session_carets.insert(
+        3,
+        SessionCaret {
+            path: app.editor.path.clone().unwrap(),
+            row: 99,
+            col: 99,
+        },
+    );
+    app.apply_typist_change(3);
+    assert!(app.editor.cursor_row < app.editor.lines.len());
+    let line_len = app.editor.lines[app.editor.cursor_row].chars().count();
+    assert!(app.editor.cursor_col <= line_len);
+}

@@ -1376,6 +1376,11 @@ pub struct Editor {
     /// Each entry is a full selection (anchor and head); head is that caret's
     /// cursor. Edits apply to the primary and all of these as one undo step.
     pub carets: Vec<EditorSelection>,
+    /// Collaborators' caret positions in this file (multiplayer sessions,
+    /// docs/MULTIPLAYER.md): (row, char col, participant color). Painted as
+    /// colored block cells like secondary carets; the App rebuilds this
+    /// before each render from the session roster.
+    pub ghost_carets: Vec<(usize, usize, Color)>,
     /// Enclosing scope header lines to pin at the top of the viewport (VS Code
     /// "Sticky Scroll"), outermost first, set by `App` from the outline scope
     /// chain of the top visible line. Empty disables the feature (e.g. wrap
@@ -1585,6 +1590,7 @@ impl Editor {
             last_gutter_width: 0,
             selection: None,
             carets: Vec::new(),
+            ghost_carets: Vec::new(),
             sticky_lines: Vec::new(),
             sticky_click_rows: Vec::new(),
             box_anchor: None,
@@ -6661,6 +6667,19 @@ impl Widget for &mut Editor {
                 }
             }
 
+            // Collaborators' ghost carets (multiplayer): the same block shape
+            // as secondary carets, in each participant's color. The local
+            // hardware caret is painted by the terminal after drawing, so it
+            // always sits above these.
+            for &(gr, gc, color) in &self.ghost_carets {
+                let on_row = gr == line_idx
+                    && gc >= row_start
+                    && (gc < row_end || (gc == row_end && row_end == line_len));
+                if on_row {
+                    paint_ghost_caret(buf, text_x, y, row_width, gc + ex(gc), row_start, color);
+                }
+            }
+
             // GitLens-style inline blame: a dim italic annotation trailing the
             // cursor's line, on its last visual segment, in the focused editor
             // only. Painted last so no overlay covers it, and clipped to the
@@ -7118,6 +7137,34 @@ fn paint_block_cursor(
         Style::default()
             .fg(Color::Black)
             .bg(Color::Rgb(0xae, 0xc6, 0xff))
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+/// Paint one collaborator's caret cell in their color (multiplayer ghost
+/// caret): same shape and clipping as `paint_block_cursor`, but tinted per
+/// participant so everyone can see where the others are.
+fn paint_ghost_caret(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    col_char: usize,
+    scroll_col: usize,
+    color: Color,
+) {
+    if col_char < scroll_col {
+        return;
+    }
+    let col = col_char - scroll_col;
+    if col as u16 >= text_width {
+        return;
+    }
+    let cell = &mut buf[(text_x + col as u16, y)];
+    cell.set_style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(color)
             .add_modifier(Modifier::BOLD),
     );
 }
@@ -14468,5 +14515,34 @@ mod tests {
             "the text area is not the chevron"
         );
         assert!(!e.is_line_hidden(1));
+    }
+
+    #[test]
+    fn ghost_carets_paint_participant_colored_cells() {
+        let f = NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "hello world\nsecond line\n").unwrap();
+        let mut ed = Editor::new();
+        ed.open(f.path()).unwrap();
+        let color = Color::Rgb(1, 2, 3);
+        // One caret at (0, 6); one on a row far past the buffer, which must
+        // simply never paint.
+        ed.ghost_carets = vec![(0, 6, color), (99, 0, color)];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+        let hits: Vec<(u16, u16)> = (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].style().bg == Some(color))
+            .collect();
+        assert_eq!(hits.len(), 1, "exactly one ghost caret cell: {hits:?}");
+        let (x, y) = hits[0];
+        assert_eq!(y, ed.last_inner.y, "ghost sits on the first content row");
+        let text_x = ed.last_inner.x + ed.last_gutter_width + 1;
+        assert_eq!(x, text_x + 6, "ghost sits at char column 6");
     }
 }

@@ -63,6 +63,12 @@ pub enum Control {
     /// pump exits as on a detach). Honored from a control-holding client or
     /// the inner channel.
     Kick { id: u64 },
+    /// Host to privileged channels only: participant `id` is now the one
+    /// typing (sent when the writing client changes, not per keystroke).
+    /// Ordered before that client's bytes reach the PTY, so the inner croft
+    /// can attribute the keystrokes it is about to receive and switch to
+    /// that participant's caret (docs/MULTIPLAYER.md, attributed carets).
+    Typing { id: u64 },
 }
 
 /// One attached client as reported in [`Control::Presence`].
@@ -184,6 +190,12 @@ struct Host {
     /// Shared secret for the inner croft's privileged control channel,
     /// exported to the inner command as CROFT_SESSION_TOKEN.
     token: String,
+    /// Authenticated privileged channels (the inner croft); they receive
+    /// typing attribution, never PTY bytes or presence frames.
+    privileged: Mutex<Vec<Arc<Mutex<UnixStream>>>>,
+    /// Which client's input last reached the PTY, to send [`Control::Typing`]
+    /// only on writer changes.
+    last_writer: Mutex<Option<u64>>,
 }
 
 /// Run the session server: spawn `inner` on a fresh PTY, listen on `socket`,
@@ -271,6 +283,8 @@ pub(crate) fn serve_with_token(
         last_size: Mutex::new((80, 24)),
         socket: socket.to_path_buf(),
         token: token.to_string(),
+        privileged: Mutex::new(Vec::new()),
+        last_writer: Mutex::new(None),
     });
 
     // PTY output -> every client, verbatim (byte-transparent broadcast).
@@ -398,6 +412,17 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                     if my_id.is_none() && token == host.token =>
                 {
                     privileged = true;
+                    host.privileged.lock().unwrap().push(Arc::clone(&tx));
+                    // Catch the channel up on who is currently typing: a
+                    // writer change announced before this registration would
+                    // otherwise never be repeated for the same writer.
+                    let current = *host.last_writer.lock().unwrap();
+                    if let Some(id) = current {
+                        let _ = tx
+                            .lock()
+                            .unwrap()
+                            .write_all(&encode_control_frame(&Control::Typing { id }));
+                    }
                 }
                 Frame::Control(Control::Hello { name, cols, rows })
                     if my_id.is_none() && !privileged =>
@@ -432,6 +457,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                     // Server-side enforcement: a read-only client's input
                     // never reaches the PTY (unlike abduco's advisory -r).
                     if has_control {
+                        announce_typing(host, id);
                         let mut pty = host.pty_input.lock().unwrap();
                         if pty.write_all(&bytes).and_then(|_| pty.flush()).is_err() {
                             break 'conn;
@@ -472,6 +498,22 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
         apply_winsize(host, false);
         update_presence(host);
     }
+}
+
+/// Tell the privileged channels whose input is about to reach the PTY,
+/// only when the writer changed (never per keystroke). Ordered before the
+/// PTY write so the attribution precedes the keystrokes it covers.
+fn announce_typing(host: &Host, id: u64) {
+    {
+        let mut last = host.last_writer.lock().unwrap();
+        if *last == Some(id) {
+            return;
+        }
+        *last = Some(id);
+    }
+    let frame = encode_control_frame(&Control::Typing { id });
+    let mut channels = host.privileged.lock().unwrap();
+    channels.retain(|tx| tx.lock().unwrap().write_all(&frame).is_ok());
 }
 
 /// Grant or revoke write control on `target`, but only when the requester
@@ -684,6 +726,8 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<i32> {
 /// which the app already polls.
 pub struct InnerChannel {
     stream: UnixStream,
+    /// Decoder for host frames (typing attribution) on this channel.
+    reader: FrameReader,
     /// The presence sidecar this session's host maintains.
     pub presence: PathBuf,
 }
@@ -705,10 +749,36 @@ impl InnerChannel {
                 token: token.to_string(),
             }))
             .ok()?;
+        // Non-blocking so the app's per-tick drain_typing never stalls the
+        // render loop. Outbound frames are a few dozen bytes into an
+        // otherwise idle socket, so writes don't meaningfully block either.
+        stream.set_nonblocking(true).ok()?;
         Some(Self {
             stream,
+            reader: FrameReader::new(),
             presence: presence_path(socket),
         })
+    }
+
+    /// Drain any host frames waiting on the channel and return the latest
+    /// "who is typing" attribution, if it changed. Non-blocking.
+    pub fn drain_typing(&mut self) -> Option<u64> {
+        let mut latest = None;
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    for frame in self.reader.push(&buf[..n]) {
+                        if let Frame::Control(Control::Typing { id }) = frame {
+                            latest = Some(id);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        latest
     }
 
     pub fn set_control(&mut self, id: u64, grant: bool) -> bool {
@@ -1157,11 +1227,23 @@ mod tests {
         a.read_until(
             |f| matches!(f, Frame::Bytes(bytes) if bytes.windows(5).any(|w| w == b"noise")),
         );
-        let mut probe = [0u8; 64];
-        assert!(
-            inner.read(&mut probe).is_err(),
-            "privileged channel must stay silent (got broadcast bytes)"
-        );
+        // Typing attribution is the only traffic a privileged channel may
+        // see: never PTY broadcast bytes, never presence frames.
+        let mut probe = [0u8; 4096];
+        let mut fr = FrameReader::new();
+        loop {
+            match inner.read(&mut probe) {
+                Ok(0) | Err(_) => break, // read timeout: channel drained
+                Ok(n) => {
+                    for f in fr.push(&probe[..n]) {
+                        assert!(
+                            matches!(f, Frame::Control(Control::Typing { .. })),
+                            "privileged channel must only see typing attribution, got {f:?}"
+                        );
+                    }
+                }
+            }
+        }
 
         // Kick disconnects the guest; the roster shrinks to the owner.
         inner
@@ -1206,6 +1288,63 @@ mod tests {
         a.read_until(|f| {
             matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
         });
+    }
+
+    #[test]
+    fn typing_markers_reach_privileged_channel_on_writer_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut a = TestClient::connect(&socket, "owner", 80, 24);
+        a.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut b = TestClient::connect(&socket, "guest", 80, 24);
+        let frames = b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        let ps = roster(&frames).unwrap();
+        let owner_id = ps.iter().find(|p| p.name == "owner").unwrap().id;
+        let guest_id = ps.iter().find(|p| p.name == "guest").unwrap().id;
+        let mut channel = InnerChannel::connect(&socket, TEST_TOKEN).expect("channel");
+
+        let drain_marker = |channel: &mut InnerChannel| -> Option<u64> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(id) = channel.drain_typing() {
+                    return Some(id);
+                }
+                if Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        // Owner types: one marker for the writer change.
+        a.send(&encode_bytes_frame(b"aa\r"));
+        assert_eq!(drain_marker(&mut channel), Some(owner_id));
+
+        // Same writer keeps typing: no marker for a different writer (wait
+        // for the echo so the server has definitely processed the input; a
+        // duplicate owner marker from the registration catch-up is allowed).
+        a.send(&encode_bytes_frame(b"bb\r"));
+        a.read_until(|f| matches!(f, Frame::Bytes(bytes) if bytes.windows(2).any(|w| w == b"bb")));
+        let leftover = channel.drain_typing();
+        assert!(
+            leftover.is_none() || leftover == Some(owner_id),
+            "{leftover:?}"
+        );
+
+        // Control moves to the guest and the guest types: a marker for the
+        // new writer.
+        assert!(channel.set_control(guest_id, true));
+        b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.name == "guest" && p.control))
+        });
+        b.send(&encode_bytes_frame(b"cc\r"));
+        assert_eq!(drain_marker(&mut channel), Some(guest_id));
     }
 
     #[test]
