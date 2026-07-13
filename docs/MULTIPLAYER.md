@@ -246,12 +246,16 @@ buffers, and only here does a CRDT enter (per-buffer sequence CRDT; OT is
 rejected outright since croft has no central server authority to transform
 against and CRDTs are the settled answer in 2026). The CRDT foundation is
 built ([`src/collab.rs`], the `cola` crate wrapped as [`CollabDoc`], convergence
-and serde round-trip tested). Remaining slices: (1) map the editor's
-`Vec<String>`/row-col edits to `CollabDoc`'s byte offsets and handle UTF-8
-boundaries; (2) carry [`Op`]s over the session-host control channel with an
-initial-state bootstrap for a joining peer; (3) run one inner croft per
-participant and render each its own viewport; (4) reconcile with the
-single-author assumptions catalogued below. It collides with every
+and serde round-trip tested). Slices, with status:
+
+1. **Done.** `CollabDoc` over `cola`: concurrent inserts/deletes converge, ops
+   serialize for the wire.
+2. **Done.** Editor coordinate bridge: `byte_offset`/`position` map the editor's
+   `(row, char-column)` to `CollabDoc`'s linear byte offsets, UTF-8 tested.
+3. **Next.** Op transport and the process model (designed below).
+4. **After.** Reconcile with the single-author assumptions catalogued below.
+
+The remaining work collides with every
 single-author assumption catalogued above: snapshot undo, no apply-edit
 chokepoint, disk-writing code paths that bypass buffers
 (`src/widgets/search.rs:1202`, `src/app/mod.rs:7851`), split views as copies, and
@@ -260,6 +264,56 @@ gate Phases A through C, which deliver most of the practical value
 (pairing, demos, rescue sessions, code review over SSH) for a fraction of
 the cost. Revisit only if shared-viewport multiplayer proves insufficient
 in real use.
+
+### Slice 3 design: op transport and the process model
+
+The single-broadcast mux cannot give two people different viewports: there is
+one PTY and one rendered screen. Independent viewports therefore mean one inner
+croft *process* per participant, each rendering its own screen, the processes
+sharing edits rather than sharing a terminal. The design:
+
+- **Two modes at attach.** The existing shared mode (everyone on one PTY) stays
+  the default. A guest opts into an independent viewport with a flag (e.g.
+  `croft <host> --solo` / a participants-menu action); that guest gets their own
+  inner croft instead of attaching to the host's PTY. Shared mode is untouched,
+  so nothing regresses.
+
+- **A collab socket, separate from the mux socket.** A per-workspace unix socket
+  (`<hash>.collab.sock`, sibling to `.mux.sock`) carries only [`Op`]s and
+  presence, never PTY bytes. A tiny relay (reuse the `session_host` framing:
+  `[type][len][payload]`, a new `FRAME_COLLAB`) fans each participant's ops out
+  to the others. No CRDT lives in the relay; it is a dumb multiplexer, exactly
+  like the PTY broadcast, because `cola` makes order-independence the client's
+  job.
+
+- **Per-file documents, keyed by workspace-relative path.** Each croft holds a
+  `CollabDoc` per shared open file. An edit produces an `Op` tagged with the
+  file key and the site id; peers integrate it via the slice-2 coordinate bridge
+  and repaint. Files not open on a peer are ignored until opened, then
+  bootstrapped.
+
+- **Bootstrap.** A joining peer, or a peer opening a file already open
+  elsewhere, requests the current document: the owner replies with the canonical
+  text plus the encoded replica state (`cola`'s `encode` feature) so subsequent
+  ops integrate. Until bootstrap completes the file opens read-only.
+
+- **Save races.** Exactly one participant is the file's *save owner* (the host by
+  default); only they write to disk, so the FS watcher and history snapshots see
+  one writer, as today. Guests' unsaved edits live in their `CollabDoc` and flow
+  to the owner over ops. This sidesteps the disk-writing bypass paths
+  (`src/widgets/search.rs`, multi-file replace) for shared files: those stay
+  owner-only.
+
+- **What still defers.** Undo remains per-process (each croft's own timeline)
+  until a shared-history design lands; LSP stays per-process against each croft's
+  own buffer, which is correct since each already syncs full text to its own
+  server. These are follow-ups, not blockers for first co-editing.
+
+RED-first as everywhere: the relay and per-file routing are testable headlessly
+(two in-process `CollabDoc`s plus a socket pair, asserting convergence through
+the relay) before any editor wiring. This is still the largest slice by far and
+is the point at which real editor-integration cost lands; it should ship as its
+own reviewed PR, not bundled with the foundation.
 
 ## Phased PR plan
 
