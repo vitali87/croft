@@ -12,18 +12,23 @@
 //! next to the canonical linear text (which croft owns, exactly as it owns the
 //! editor's `Vec<String>`). A local edit returns an [`Op`] to broadcast; a
 //! remote [`Op`] is integrated back into the text at the position cola resolves
-//! against concurrent edits. This module is deliberately self-contained and
-//! transport-agnostic: wiring it to the editor and the control channel is a
-//! later Phase D slice.
+//! against concurrent edits.
 //!
-//! Nothing outside this module constructs a [`CollabDoc`] yet (only its tests
-//! do); the editor/control-channel consumer is the next slice, so the whole
-//! module is allowed dead until then rather than sprinkling per-item allows.
+//! This module holds the transport-side foundation, all self-contained:
+//! - [`CollabDoc`]: the replicated buffer (slice 1).
+//! - [`byte_offset`]/[`position`]: bridge the editor's `(row, char-column)` to
+//!   `CollabDoc`'s linear byte offsets, UTF-8 aware (slice 2).
+//! - [`Envelope`] + [`relay_serve`]: the per-file wire message and the dumb
+//!   fan-out relay over a dedicated collab socket (slice 3).
+//!
+//! What is not here yet is the editor/mux wiring that produces and consumes
+//! these against live buffers (slice 4, docs/MULTIPLAYER.md), so nothing
+//! outside this module's tests constructs these types; the whole module is
+//! allowed dead until that consumer lands rather than sprinkling per-item
+//! allows.
 #![allow(dead_code)]
-//
-// ponytail: byte-offset model over the whole buffer, ASCII-proven here. The
-// row/col <-> byte-offset mapping against the editor's line vector, and the
-// UTF-8 boundary handling, land when the editor is wired in (next slice).
+
+use std::io::{Read, Write};
 
 use cola::{Deletion, Insertion, Replica};
 use serde::{Deserialize, Serialize};
@@ -152,6 +157,88 @@ pub fn position(lines: &[String], offset: usize) -> (usize, usize) {
     (row, col)
 }
 
+/// A per-file, per-site edit on the wire: which file (a workspace-relative
+/// key), which participant produced it, and the op. Peers route it to their
+/// `CollabDoc` for that file and integrate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Envelope {
+    pub file: String,
+    pub site: u64,
+    pub op: Op,
+}
+
+impl Envelope {
+    /// Serialize into one framed message for the collab socket, reusing the
+    /// session-host wire framing (`[type][len][payload]`).
+    pub fn encode(&self) -> Vec<u8> {
+        let json = serde_json::to_vec(self).unwrap_or_default();
+        crate::session_host::encode_bytes_frame(&json)
+    }
+}
+
+/// Fan each participant's [`Envelope`] frames out to the *other* participants.
+/// A dumb multiplexer, exactly like the PTY broadcast: `cola` makes ordering
+/// the client's job, so the relay never inspects an op. Runs until the socket
+/// closes; one thread per client. Distinct socket from the PTY mux
+/// (`<hash>.collab.sock`), so it never carries terminal bytes.
+pub fn relay_serve(socket: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::net::UnixListener;
+    if let Some(dir) = socket.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _ = std::fs::remove_file(socket);
+    // Bind 0600 with no TOCTOU window (same fix as the mux socket).
+    let prev_umask = unsafe { libc::umask(0o077) };
+    let listener = UnixListener::bind(socket);
+    unsafe { libc::umask(prev_umask) };
+    let listener = listener?;
+
+    let clients: std::sync::Arc<std::sync::Mutex<Vec<Peer>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    for stream in listener.incoming().flatten() {
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(stream.try_clone()?));
+        clients.lock().unwrap().push(std::sync::Arc::clone(&tx));
+        let clients = std::sync::Arc::clone(&clients);
+        std::thread::spawn(move || relay_client(stream, &tx, &clients));
+    }
+    Ok(())
+}
+
+type Peer = std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>;
+
+/// One connection: reassemble whole frames from this peer and forward each,
+/// atomically, to every other peer. Reframing (not raw byte forwarding) is
+/// what keeps two senders' frames from interleaving mid-message at a receiver.
+fn relay_client(
+    mut rx: std::os::unix::net::UnixStream,
+    me: &Peer,
+    clients: &std::sync::Arc<std::sync::Mutex<Vec<Peer>>>,
+) {
+    use crate::session_host::{Frame, FrameReader, encode_bytes_frame};
+    let mut reader = FrameReader::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        let n = match rx.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for frame in reader.push(&buf[..n]) {
+            let Frame::Bytes(payload) = frame else {
+                continue;
+            };
+            let out = encode_bytes_frame(&payload);
+            let mut peers = clients.lock().unwrap();
+            peers.retain(|c| {
+                std::sync::Arc::ptr_eq(c, me) || c.lock().unwrap().write_all(&out).is_ok()
+            });
+        }
+    }
+    clients
+        .lock()
+        .unwrap()
+        .retain(|c| !std::sync::Arc::ptr_eq(c, me));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +333,68 @@ mod tests {
 
         assert_eq!(a.text(), "foo\nXbar");
         assert_eq!(b.text(), a.text());
+    }
+
+    /// End-to-end transport: two participants connected through the relay
+    /// exchange an op and converge, with the relay never inspecting it.
+    #[test]
+    fn ops_converge_through_the_relay() {
+        use crate::session_host::{Frame, FrameReader};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("c.collab.sock");
+        {
+            let s = socket.clone();
+            std::thread::spawn(move || {
+                let _ = relay_serve(&s);
+            });
+        }
+        // Wait for the relay to bind.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut ca = loop {
+            if let Ok(s) = UnixStream::connect(&socket) {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "relay never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut cb = UnixStream::connect(&socket).expect("second client connects");
+        cb.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        let mut a = CollabDoc::new(1, "abc");
+        let mut b = a.fork(2);
+
+        // A edits and ships the envelope; B is unaware until the relay delivers.
+        let op = a.local_insert(3, "Z"); // a: "abcZ"
+        ca.write_all(
+            &Envelope {
+                file: "f.rs".into(),
+                site: 1,
+                op,
+            }
+            .encode(),
+        )
+        .unwrap();
+
+        // B reads the forwarded frame and integrates it.
+        let mut reader = FrameReader::new();
+        let mut buf = [0u8; 4096];
+        let got = 'outer: loop {
+            let n = cb.read(&mut buf).expect("relay delivers a frame");
+            for frame in reader.push(&buf[..n]) {
+                if let Frame::Bytes(payload) = frame {
+                    let env: Envelope = serde_json::from_slice(&payload).unwrap();
+                    b.apply_remote(&env.op);
+                    break 'outer env;
+                }
+            }
+        };
+
+        assert_eq!(got.file, "f.rs");
+        assert_eq!(b.text(), a.text());
+        assert_eq!(b.text(), "abcZ");
     }
 }

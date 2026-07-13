@@ -252,8 +252,13 @@ and serde round-trip tested). Slices, with status:
    serialize for the wire.
 2. **Done.** Editor coordinate bridge: `byte_offset`/`position` map the editor's
    `(row, char-column)` to `CollabDoc`'s linear byte offsets, UTF-8 tested.
-3. **Next.** Op transport and the process model (designed below).
-4. **After.** Reconcile with the single-author assumptions catalogued below.
+3. **Transport done.** `Envelope` (per-file, per-site op) and `relay_serve`
+   (dumb fan-out over `<hash>.collab.sock`); convergence through the relay is
+   tested headlessly. The process model it serves is designed below; wiring the
+   two inner-croft processes and their bootstrap is slice 4.
+4. **Next.** Run one inner croft per participant, wire the editor to produce and
+   consume ops, bootstrap a joining peer, and reconcile with the single-author
+   assumptions catalogued below.
 
 The remaining work collides with every
 single-author assumption catalogued above: snapshot undo, no apply-edit
