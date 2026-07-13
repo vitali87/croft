@@ -1,0 +1,976 @@
+//! Multiplayer session host: croft's own replacement for dtach on the
+//! persistent-session path (see docs/MULTIPLAYER.md).
+//!
+//! One `session-host` server owns the PTY the real croft TUI runs on and
+//! accepts any number of clients over a unix socket. Output bytes are
+//! broadcast to every client verbatim (byte-transparent, like dtach: Kitty
+//! graphics and every escape sequence pass through untouched). Input is
+//! attributed: each client is its own socket connection, so the server knows
+//! who typed what and can enforce write control server-side, which dtach and
+//! abduco cannot. Window size is the minimum across connected clients (the
+//! tmux rule), re-asserted with a jiggle on attach so the inner croft always
+//! repaints for a reattaching client.
+//!
+//! Wire format, both directions: `[type: u8][len: u32 be][payload]`.
+//! Type 0 carries raw PTY bytes; type 1 carries one NDJSON-style control
+//! message (see [`Control`]), the same compact-JSON convention as
+//! `crate::mcp::transport`.
+
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use serde::{Deserialize, Serialize};
+
+/// Frame type tag for raw PTY bytes (either direction).
+pub const FRAME_BYTES: u8 = 0;
+/// Frame type tag for a JSON [`Control`] message (either direction).
+pub const FRAME_CONTROL: u8 = 1;
+
+/// Control messages exchanged between host and clients. Serialized as
+/// compact JSON with a `"t"` tag so the protocol stays greppable on the wire
+/// and future fields stay backward-compatible (unknown fields are ignored).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum Control {
+    /// First message a client must send: identity and terminal size.
+    Hello { name: String, cols: u16, rows: u16 },
+    /// Client terminal was resized.
+    Resize { cols: u16, rows: u16 },
+    /// Host to clients: the current participant roster.
+    Presence { participants: Vec<Participant> },
+    /// A control-holding client grants write control to participant `id`.
+    Grant { id: u64 },
+    /// A control-holding client revokes write control from participant `id`.
+    Revoke { id: u64 },
+    /// Client detaches deliberately (the session keeps running).
+    Detach,
+    /// Host to clients: the inner croft exited with `code`; session over.
+    Exit { code: i32 },
+}
+
+/// One attached client as reported in [`Control::Presence`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Participant {
+    pub id: u64,
+    pub name: String,
+    pub cols: u16,
+    pub rows: u16,
+    /// Whether this client's keystrokes reach the PTY (write control).
+    pub control: bool,
+}
+
+/// A decoded frame.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Frame {
+    Bytes(Vec<u8>),
+    Control(Control),
+}
+
+/// Encode raw PTY bytes as a frame.
+pub fn encode_bytes_frame(data: &[u8]) -> Vec<u8> {
+    encode_frame(FRAME_BYTES, data)
+}
+
+/// Encode a control message as a frame.
+pub fn encode_control_frame(control: &Control) -> Vec<u8> {
+    let json = serde_json::to_vec(control).unwrap_or_default();
+    encode_frame(FRAME_CONTROL, &json)
+}
+
+fn encode_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + payload.len());
+    out.push(kind);
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Incremental frame decoder: feed it whatever chunk sizes the socket
+/// delivers; it yields every complete frame and buffers the remainder.
+#[derive(Default)]
+pub struct FrameReader {
+    buf: Vec<u8>,
+}
+
+impl FrameReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, data: &[u8]) -> Vec<Frame> {
+        self.buf.extend_from_slice(data);
+        let mut frames = Vec::new();
+        loop {
+            if self.buf.len() < 5 {
+                break;
+            }
+            let kind = self.buf[0];
+            let len =
+                u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
+            if self.buf.len() < 5 + len {
+                break;
+            }
+            let payload: Vec<u8> = self.buf.drain(..5 + len).skip(5).collect();
+            match kind {
+                FRAME_BYTES => frames.push(Frame::Bytes(payload)),
+                FRAME_CONTROL => {
+                    // A malformed control message is skipped rather than
+                    // poisoning the stream: framing already resynchronized us.
+                    if let Ok(control) = serde_json::from_slice::<Control>(&payload) {
+                        frames.push(Frame::Control(control));
+                    }
+                }
+                // Unknown frame type from a newer peer: ignore the payload.
+                _ => {}
+            }
+        }
+        frames
+    }
+}
+
+/// The PTY size every connected client can display: minimum cols and minimum
+/// rows across clients (the tmux rule). Clients reporting no size (0 in
+/// either dimension, seen under `script` and some CI PTYs) are pure
+/// observers here and never shrink the shared PTY. None when no client with
+/// a usable size is connected.
+pub fn min_winsize(sizes: impl Iterator<Item = (u16, u16)>) -> Option<(u16, u16)> {
+    sizes
+        .filter(|&(c, r)| c > 0 && r > 0)
+        .reduce(|(c1, r1), (c2, r2)| (c1.min(c2), r1.min(r2)))
+}
+
+/// Sidecar file the host keeps next to the socket with the current roster,
+/// so the inner croft (which only has a PTY, not the socket) can poll who is
+/// attached. Written atomically (tmp + rename).
+pub fn presence_path(socket: &Path) -> PathBuf {
+    let mut name = socket.file_name().unwrap_or_default().to_os_string();
+    name.push(".presence.json");
+    socket.with_file_name(name)
+}
+
+struct Client {
+    id: u64,
+    name: String,
+    cols: u16,
+    rows: u16,
+    control: bool,
+    tx: Arc<Mutex<UnixStream>>,
+}
+
+struct Host {
+    clients: Mutex<Vec<Client>>,
+    next_id: AtomicU64,
+    pty_input: Mutex<Box<dyn Write + Send>>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
+    last_size: Mutex<(u16, u16)>,
+    socket: PathBuf,
+}
+
+/// Run the session server: spawn `inner` on a fresh PTY, listen on `socket`,
+/// broadcast output, arbitrate input. Returns the inner command's exit code
+/// once it terminates (the caller propagates it, so codes like croft's
+/// drop-to-local 88 survive the mux, which dtach never propagated).
+pub fn serve(socket: &Path, workspace: Option<&Path>, inner: &[String]) -> Result<i32> {
+    anyhow::ensure!(
+        !inner.is_empty(),
+        "session-host needs an inner command after --"
+    );
+    if let Some(dir) = socket.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    if crate::session::is_alive(socket) {
+        anyhow::bail!("a session host is already running on {}", socket.display());
+    }
+    // A crashed server leaves a stale socket file behind (unix sockets are
+    // not auto-unlinked); the liveness probe above proved nobody owns it.
+    let _ = std::fs::remove_file(socket);
+    let listener =
+        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
+    {
+        // Possession of the account is the trust boundary (same as dtach);
+        // never let another user attach.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+            .context("restricting socket permissions")?;
+    }
+    if let Some(ws) = workspace {
+        crate::session::write_meta_preserving_created(socket, ws)?;
+    }
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("openpty")?;
+    let mut cmd = CommandBuilder::new(&inner[0]);
+    cmd.args(&inner[1..]);
+    // The inner croft re-asserts terminal modes on WINCH under this flag
+    // (the dead-mouse-on-reattach fix); the mux relies on that machinery.
+    cmd.env("CROFT_SESSION_PERSISTENT", "1");
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .context("spawning inner command")?;
+    drop(pair.slave);
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .context("cloning pty reader")?;
+    let writer = pair.master.take_writer().context("taking pty writer")?;
+    let host = Arc::new(Host {
+        clients: Mutex::new(Vec::new()),
+        next_id: AtomicU64::new(0),
+        pty_input: Mutex::new(writer),
+        master: Mutex::new(pair.master),
+        last_size: Mutex::new((80, 24)),
+        socket: socket.to_path_buf(),
+    });
+
+    // PTY output -> every client, verbatim (byte-transparent broadcast).
+    {
+        let host = Arc::clone(&host);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        broadcast(&host, &encode_bytes_frame(&buf[..n]));
+                    }
+                }
+            }
+        });
+    }
+
+    // Accept loop; one thread per client. The thread count equals the
+    // participant count, which is single digits by construction.
+    {
+        let host = Arc::clone(&host);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let host = Arc::clone(&host);
+                std::thread::spawn(move || client_thread(&host, stream));
+            }
+        });
+    }
+
+    let status = child.wait().context("waiting on inner command")?;
+    let code = status.exit_code() as i32;
+    broadcast(&host, &encode_control_frame(&Control::Exit { code }));
+    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(presence_path(socket));
+    Ok(code)
+}
+
+/// Write `frame` to every connected client, pruning the ones whose
+/// connection died. Returns whether any client was pruned.
+fn broadcast(host: &Host, frame: &[u8]) -> bool {
+    let mut clients = host.clients.lock().unwrap();
+    let before = clients.len();
+    clients.retain(|c| c.tx.lock().unwrap().write_all(frame).is_ok());
+    clients.len() != before
+}
+
+/// Resize the PTY to the minimum size across clients. `force_repaint`
+/// jiggles the size when it is already at the target, so a reattaching
+/// client always gets a real Resize event out of the inner croft (the role
+/// dtach's `-r winch` played; a same-size reattach would otherwise stare at
+/// a blank terminal).
+fn apply_winsize(host: &Host, force_repaint: bool) {
+    let target = {
+        let clients = host.clients.lock().unwrap();
+        match min_winsize(clients.iter().map(|c| (c.cols, c.rows))) {
+            Some(t) => t,
+            None => return,
+        }
+    };
+    let mut last = host.last_size.lock().unwrap();
+    let master = host.master.lock().unwrap();
+    let size = |cols: u16, rows: u16| PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    if *last != target {
+        let _ = master.resize(size(target.0, target.1));
+        *last = target;
+    } else if force_repaint {
+        let _ = master.resize(size(target.0, target.1.saturating_sub(1).max(1)));
+        let _ = master.resize(size(target.0, target.1));
+    }
+}
+
+/// Write the roster sidecar (atomic tmp + rename, so the inner croft never
+/// reads a torn file) and broadcast it as a Presence frame.
+fn update_presence(host: &Host) {
+    let participants: Vec<Participant> = {
+        let clients = host.clients.lock().unwrap();
+        clients
+            .iter()
+            .map(|c| Participant {
+                id: c.id,
+                name: c.name.clone(),
+                cols: c.cols,
+                rows: c.rows,
+                control: c.control,
+            })
+            .collect()
+    };
+    let path = presence_path(&host.socket);
+    if let Ok(json) = serde_json::to_string(&participants) {
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+    broadcast(
+        host,
+        &encode_control_frame(&Control::Presence { participants }),
+    );
+}
+
+/// Serve one client connection until it detaches or its socket dies.
+fn client_thread(host: &Host, mut stream: UnixStream) {
+    let tx = match stream.try_clone() {
+        Ok(s) => Arc::new(Mutex::new(s)),
+        Err(_) => return,
+    };
+    let mut reader = FrameReader::new();
+    let mut buf = [0u8; 16384];
+    let mut my_id: Option<u64> = None;
+    'conn: loop {
+        let n = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for frame in reader.push(&buf[..n]) {
+            match frame {
+                Frame::Control(Control::Hello { name, cols, rows }) if my_id.is_none() => {
+                    let id = host.next_id.fetch_add(1, Ordering::Relaxed);
+                    my_id = Some(id);
+                    {
+                        let mut clients = host.clients.lock().unwrap();
+                        // Write control auto-attaches only when nobody holds
+                        // it: the first client, or an owner reattaching after
+                        // every control holder left. Everyone else starts as
+                        // a read-only observer until granted.
+                        let control = !clients.iter().any(|c| c.control);
+                        clients.push(Client {
+                            id,
+                            name,
+                            cols,
+                            rows,
+                            control,
+                            tx: Arc::clone(&tx),
+                        });
+                    }
+                    apply_winsize(host, true);
+                    update_presence(host);
+                }
+                Frame::Bytes(bytes) => {
+                    let Some(id) = my_id else { continue };
+                    let has_control = {
+                        let clients = host.clients.lock().unwrap();
+                        clients.iter().any(|c| c.id == id && c.control)
+                    };
+                    // Server-side enforcement: a read-only client's input
+                    // never reaches the PTY (unlike abduco's advisory -r).
+                    if has_control {
+                        let mut pty = host.pty_input.lock().unwrap();
+                        if pty.write_all(&bytes).and_then(|_| pty.flush()).is_err() {
+                            break 'conn;
+                        }
+                    }
+                }
+                Frame::Control(Control::Resize { cols, rows }) => {
+                    let Some(id) = my_id else { continue };
+                    {
+                        let mut clients = host.clients.lock().unwrap();
+                        if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
+                            c.cols = cols;
+                            c.rows = rows;
+                        }
+                    }
+                    apply_winsize(host, false);
+                    update_presence(host);
+                }
+                Frame::Control(Control::Grant { id: target }) => {
+                    set_control(host, my_id, target, true);
+                }
+                Frame::Control(Control::Revoke { id: target }) => {
+                    set_control(host, my_id, target, false);
+                }
+                Frame::Control(Control::Detach) => break 'conn,
+                _ => {}
+            }
+        }
+    }
+    if let Some(id) = my_id {
+        {
+            let mut clients = host.clients.lock().unwrap();
+            clients.retain(|c| c.id != id);
+        }
+        apply_winsize(host, false);
+        update_presence(host);
+    }
+}
+
+/// Grant or revoke write control on `target`, but only when the requester
+/// itself holds control: read-only guests cannot promote themselves.
+fn set_control(host: &Host, requester: Option<u64>, target: u64, grant: bool) {
+    let Some(requester) = requester else { return };
+    let changed = {
+        let mut clients = host.clients.lock().unwrap();
+        let requester_has_control = clients.iter().any(|c| c.id == requester && c.control);
+        if !requester_has_control {
+            false
+        } else {
+            match clients.iter_mut().find(|c| c.id == target) {
+                Some(c) if c.control != grant => {
+                    c.control = grant;
+                    true
+                }
+                _ => false,
+            }
+        }
+    };
+    if changed {
+        update_presence(host);
+    }
+}
+
+/// dtach `-A` semantics: attach the session on `socket` if it is alive,
+/// otherwise spawn a detached server for `inner` first, then attach.
+pub fn attach_or_create(socket: &Path, workspace: Option<&Path>, inner: &[String]) -> Result<i32> {
+    if !crate::session::is_alive(socket) {
+        spawn_detached_server(socket, workspace, inner)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::session::is_alive(socket) {
+            if Instant::now() > deadline {
+                anyhow::bail!("session host did not start on {}", socket.display());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    attach_client(socket)
+}
+
+/// The argv (after the croft binary itself) that runs a detached server for
+/// `inner`. Pure so it can be unit-tested.
+fn detached_server_argv(socket: &Path, workspace: Option<&Path>, inner: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        String::from("session-host"),
+        String::from("--serve"),
+        String::from("--socket"),
+        socket.to_string_lossy().into_owned(),
+    ];
+    if let Some(ws) = workspace {
+        argv.push(String::from("--workspace"));
+        argv.push(ws.to_string_lossy().into_owned());
+    }
+    argv.push(String::from("--"));
+    argv.extend(inner.iter().cloned());
+    argv
+}
+
+fn spawn_detached_server(socket: &Path, workspace: Option<&Path>, inner: &[String]) -> Result<()> {
+    let exe = std::env::current_exe().context("resolving croft binary path")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(detached_server_argv(socket, workspace, inner));
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // New session so the server survives this client's terminal closing;
+    // exactly the role dtach's forked server plays.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn().context("spawning session host")?;
+    Ok(())
+}
+
+/// Attach this terminal as a client: raw mode, pump stdin to the socket and
+/// socket bytes to stdout, report resizes. Returns the session's exit code
+/// (0 on detach). Deliberately does nothing else to the terminal: every
+/// mode change (alt screen, mouse, Kitty flags) belongs to the inner croft
+/// and passes through as bytes, exactly as under dtach.
+pub fn attach_client(socket: &Path) -> Result<i32> {
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("connecting to {}", socket.display()))?;
+    crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
+    let result = attach_client_pump(&mut stream);
+    let _ = crossterm::terminal::disable_raw_mode();
+    result
+}
+
+fn attach_client_pump(stream: &mut UnixStream) -> Result<i32> {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let tx = Arc::new(Mutex::new(stream.try_clone().context("cloning socket")?));
+    tx.lock()
+        .unwrap()
+        .write_all(&encode_control_frame(&Control::Hello {
+            name: client_name(),
+            cols,
+            rows,
+        }))
+        .context("sending hello")?;
+
+    // stdin -> socket. The thread parks on a blocking read; it dies with the
+    // process when the session ends (the CLI exits right after we return).
+    {
+        let tx = Arc::clone(&tx);
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 16384];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        let _ = tx
+                            .lock()
+                            .unwrap()
+                            .write_all(&encode_control_frame(&Control::Detach));
+                        break;
+                    }
+                    Ok(n) => {
+                        if tx
+                            .lock()
+                            .unwrap()
+                            .write_all(&encode_bytes_frame(&buf[..n]))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Terminal size -> resize frames. A 200ms poll instead of a SIGWINCH
+    // handler keeps the client free of signal plumbing; the delay is
+    // imperceptible against the terminal's own resize animation.
+    // ponytail: poll, swap for signal_hook if 200ms ever reads as lag.
+    {
+        let tx = Arc::clone(&tx);
+        let mut last = (cols, rows);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(200));
+                let Ok(size) = crossterm::terminal::size() else {
+                    continue;
+                };
+                if size != last {
+                    last = size;
+                    let frame = encode_control_frame(&Control::Resize {
+                        cols: size.0,
+                        rows: size.1,
+                    });
+                    if tx.lock().unwrap().write_all(&frame).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // socket -> stdout, until the host reports the inner croft's exit or the
+    // connection drops (server killed; treated as a detach).
+    let mut out = std::io::stdout().lock();
+    let mut reader = FrameReader::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return Ok(0),
+            Ok(n) => n,
+        };
+        for frame in reader.push(&buf[..n]) {
+            match frame {
+                Frame::Bytes(bytes) => {
+                    out.write_all(&bytes).context("writing to terminal")?;
+                    out.flush().context("flushing terminal")?;
+                }
+                Frame::Control(Control::Exit { code }) => return Ok(code),
+                // Roster changes surface inside the inner croft (which polls
+                // the presence sidecar), not in this thin pump.
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `user@host`, the identity other participants see in the roster.
+fn client_name() -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| String::from("user"));
+    format!("{user}@{}", hostname())
+}
+
+#[cfg(unix)]
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
+    if ok {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    } else {
+        String::from("local")
+    }
+}
+
+#[cfg(not(unix))]
+fn hostname() -> String {
+    String::from("local")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_frame_round_trips_through_split_chunks() {
+        let frame = encode_bytes_frame(b"hello \x1b[31mworld");
+        let mut reader = FrameReader::new();
+        // Feed byte-by-byte to prove partial-chunk buffering works.
+        let mut out = Vec::new();
+        for b in &frame {
+            out.extend(reader.push(std::slice::from_ref(b)));
+        }
+        assert_eq!(out, vec![Frame::Bytes(b"hello \x1b[31mworld".to_vec())]);
+    }
+
+    #[test]
+    fn control_frame_round_trips_and_interleaves_with_bytes() {
+        let hello = Control::Hello {
+            name: String::from("vitali@mac"),
+            cols: 120,
+            rows: 40,
+        };
+        let mut wire = encode_control_frame(&hello);
+        wire.extend(encode_bytes_frame(b"ls\r"));
+        wire.extend(encode_control_frame(&Control::Detach));
+        let mut reader = FrameReader::new();
+        let frames = reader.push(&wire);
+        assert_eq!(
+            frames,
+            vec![
+                Frame::Control(hello),
+                Frame::Bytes(b"ls\r".to_vec()),
+                Frame::Control(Control::Detach),
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_reader_skips_malformed_control_json() {
+        let mut wire = encode_frame(FRAME_CONTROL, b"not json at all");
+        wire.extend(encode_bytes_frame(b"ok"));
+        let mut reader = FrameReader::new();
+        let frames = reader.push(&wire);
+        assert_eq!(frames, vec![Frame::Bytes(b"ok".to_vec())]);
+    }
+
+    #[test]
+    fn min_winsize_takes_minimum_dimensions_across_clients() {
+        assert_eq!(min_winsize(std::iter::empty()), None);
+        assert_eq!(min_winsize([(120, 40)].into_iter()), Some((120, 40)));
+        // Mins are taken per-dimension, not per-client: 100x30 here.
+        assert_eq!(
+            min_winsize([(120, 30), (100, 40)].into_iter()),
+            Some((100, 30))
+        );
+    }
+
+    #[test]
+    fn min_winsize_ignores_clients_with_unknown_size() {
+        // A client whose terminal reports no size (0 in either dimension,
+        // seen under `script` and some CI PTYs) must not shrink the shared
+        // PTY to nothing.
+        assert_eq!(
+            min_winsize([(0, 0), (100, 40)].into_iter()),
+            Some((100, 40))
+        );
+        assert_eq!(min_winsize([(120, 0), (0, 24)].into_iter()), None);
+        assert_eq!(min_winsize([(0, 0)].into_iter()), None);
+    }
+
+    #[test]
+    fn presence_path_sits_next_to_socket() {
+        let p = presence_path(Path::new("/x/sessions/ab.mux.sock"));
+        assert_eq!(p, Path::new("/x/sessions/ab.mux.sock.presence.json"));
+    }
+
+    #[test]
+    fn detached_server_argv_replays_socket_workspace_and_inner() {
+        let argv = detached_server_argv(
+            Path::new("/x/s.mux.sock"),
+            Some(Path::new("/work/repo")),
+            &[String::from("croft"), String::from("/work/repo")],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "session-host",
+                "--serve",
+                "--socket",
+                "/x/s.mux.sock",
+                "--workspace",
+                "/work/repo",
+                "--",
+                "croft",
+                "/work/repo",
+            ]
+        );
+        let argv = detached_server_argv(Path::new("/x/s.mux.sock"), None, &[String::from("cat")]);
+        assert_eq!(
+            argv,
+            vec![
+                "session-host",
+                "--serve",
+                "--socket",
+                "/x/s.mux.sock",
+                "--",
+                "cat"
+            ]
+        );
+    }
+
+    // ---- integration: a real server on a real socket around `cat` ----
+
+    struct TestClient {
+        stream: UnixStream,
+        reader: FrameReader,
+    }
+
+    impl TestClient {
+        fn connect(socket: &Path, name: &str, cols: u16, rows: u16) -> Self {
+            let stream = UnixStream::connect(socket).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut c = Self {
+                stream,
+                reader: FrameReader::new(),
+            };
+            c.send(&encode_control_frame(&Control::Hello {
+                name: String::from(name),
+                cols,
+                rows,
+            }));
+            c
+        }
+
+        fn send(&mut self, wire: &[u8]) {
+            self.stream.write_all(wire).expect("send");
+        }
+
+        /// Read frames until `pred` matches one, returning everything seen.
+        fn read_until(&mut self, pred: impl Fn(&Frame) -> bool) -> Vec<Frame> {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                assert!(Instant::now() < deadline, "timed out; saw {seen:?}");
+                let n = self.stream.read(&mut buf).expect("read");
+                assert!(n > 0, "server closed early; saw {seen:?}");
+                let frames = self.reader.push(&buf[..n]);
+                let done = frames.iter().any(&pred);
+                seen.extend(frames);
+                if done {
+                    return seen;
+                }
+            }
+        }
+    }
+
+    fn output_text(frames: &[Frame]) -> String {
+        let mut bytes = Vec::new();
+        for f in frames {
+            if let Frame::Bytes(b) = f {
+                bytes.extend_from_slice(b);
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn roster(frames: &[Frame]) -> Option<Vec<Participant>> {
+        frames.iter().rev().find_map(|f| match f {
+            Frame::Control(Control::Presence { participants }) => Some(participants.clone()),
+            _ => None,
+        })
+    }
+
+    fn spawn_test_server(socket: PathBuf) -> std::thread::JoinHandle<i32> {
+        std::thread::spawn(move || serve(&socket, None, &[String::from("cat")]).expect("serve"))
+    }
+
+    fn wait_alive(socket: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::session::is_alive(socket) {
+            assert!(Instant::now() < deadline, "server never bound the socket");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn serve_broadcasts_output_enforces_readonly_and_propagates_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        // Socket must not be readable by other users.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&socket).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "socket mode must be 0600");
+        }
+
+        let mut a = TestClient::connect(&socket, "owner", 120, 40);
+        // First client holds control and appears in presence.
+        let frames = a.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let ps = roster(&frames).unwrap();
+        assert_eq!(ps.len(), 1);
+        assert!(ps[0].control, "first client must hold write control");
+
+        let mut b = TestClient::connect(&socket, "guest", 100, 50);
+        let frames = b.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let ps = roster(&frames).unwrap();
+        assert_eq!(ps.len(), 2);
+        let guest = ps.iter().find(|p| p.name == "guest").unwrap();
+        assert!(!guest.control, "second client must attach read-only");
+
+        // Presence sidecar mirrors the roster.
+        let sidecar = std::fs::read_to_string(presence_path(&socket)).unwrap();
+        assert!(sidecar.contains("owner") && sidecar.contains("guest"));
+
+        // Read-only input is dropped server-side; owner input reaches the
+        // PTY (cat echoes it back to BOTH clients).
+        b.send(&encode_bytes_frame(b"INTRUDER"));
+        a.send(&encode_bytes_frame(b"hi\r"));
+        let a_frames =
+            a.read_until(|f| matches!(f, Frame::Bytes(b) if b.windows(2).any(|w| w == b"hi")));
+        let b_frames =
+            b.read_until(|f| matches!(f, Frame::Bytes(b) if b.windows(2).any(|w| w == b"hi")));
+        assert!(!output_text(&a_frames).contains("INTRUDER"));
+        assert!(!output_text(&b_frames).contains("INTRUDER"));
+
+        // EOT at line start ends cat; server broadcasts Exit and returns
+        // the inner exit code.
+        a.send(&encode_bytes_frame(&[0x04]));
+        let frames = a.read_until(|f| matches!(f, Frame::Control(Control::Exit { .. })));
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, Frame::Control(Control::Exit { code: 0 })))
+        );
+        assert_eq!(server.join().unwrap(), 0);
+        assert!(!socket.exists(), "server must unlink its socket on exit");
+    }
+
+    #[test]
+    fn control_moves_to_next_attacher_after_holder_detaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut a = TestClient::connect(&socket, "first", 80, 24);
+        a.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut b = TestClient::connect(&socket, "second", 80, 24);
+        b.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+
+        // Holder detaches; the remaining read-only guest stays read-only
+        // (control is never transferred implicitly)...
+        a.send(&encode_control_frame(&Control::Detach));
+        let frames = b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
+        });
+        let ps = roster(&frames).unwrap();
+        assert!(!ps[0].control, "guest must not inherit control implicitly");
+
+        // ...but the next fresh attach (e.g. the owner coming back) gains
+        // control because nobody holds it.
+        let mut c = TestClient::connect(&socket, "returning", 80, 24);
+        let frames = c.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        let ps = roster(&frames).unwrap();
+        let returning = ps.iter().find(|p| p.name == "returning").unwrap();
+        assert!(
+            returning.control,
+            "fresh attach with no holder gains control"
+        );
+    }
+
+    #[test]
+    fn grant_and_revoke_move_write_control_between_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut a = TestClient::connect(&socket, "owner", 80, 24);
+        a.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut b = TestClient::connect(&socket, "guest", 80, 24);
+        let frames = b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        let guest_id = roster(&frames)
+            .unwrap()
+            .iter()
+            .find(|p| p.name == "guest")
+            .unwrap()
+            .id;
+
+        // Guests cannot grant themselves control.
+        b.send(&encode_control_frame(&Control::Grant { id: guest_id }));
+        // Owner grants; everyone sees the guest holding control.
+        a.send(&encode_control_frame(&Control::Grant { id: guest_id }));
+        let frames = b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.name == "guest" && p.control))
+        });
+        // The self-grant must not have taken effect before the owner's grant:
+        // every roster before the owner-granted one shows the guest without
+        // control.
+        let grants: Vec<bool> = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Control(Control::Presence { participants }) => participants
+                    .iter()
+                    .find(|p| p.name == "guest")
+                    .map(|p| p.control),
+                _ => None,
+            })
+            .collect();
+        assert!(grants.last() == Some(&true));
+
+        // Guest types; input now reaches cat and echoes.
+        b.send(&encode_bytes_frame(b"granted\r"));
+        let echoed = b.read_until(
+            |f| matches!(f, Frame::Bytes(bytes) if bytes.windows(7).any(|w| w == b"granted")),
+        );
+        assert!(output_text(&echoed).contains("granted"));
+
+        // Owner revokes; guest input is dropped again.
+        a.send(&encode_control_frame(&Control::Revoke { id: guest_id }));
+        a.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.name == "guest" && !p.control))
+        });
+    }
+}

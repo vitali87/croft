@@ -1909,21 +1909,31 @@ fn remote_croft_command_for_terminal(
         Some(p) => format!("croft {}", shell_quote(p)),
         None => String::from("croft"),
     };
-    // Run croft under dtach so the session survives an SSH transport drop
-    // (laptop sleep, network change): `-A` reattaches the persisted session or
-    // creates a fresh one, `-E`/`-z` stop dtach from intercepting croft's Ctrl
-    // chords (croft keeps Ctrl+Z etc.), and `-r winch` fires SIGWINCH on
-    // reattach so croft repaints (crossterm turns every SIGWINCH into a Resize,
-    // which re-emits the inline images). dtach is transparent to the byte
-    // stream, so croft's OSC-1337 / Kitty graphics pass through untouched —
-    // tmux corrupts the Kitty protocol, which is why a transparent supervisor
-    // is used instead. Hosts without dtach exec croft directly, no persistence.
-    // `CROFT_SESSION_PERSISTENT=1` is exported only on the dtach branch so the
-    // remote croft can tell whether its session will survive a transport drop
-    // and surface that on its status line (the else branch leaves it unset).
+    // Run croft under a persistence supervisor so the session survives an SSH
+    // transport drop (laptop sleep, network change). Preferred: croft's own
+    // session host (`croft session-host`, the multiplayer mux; see
+    // docs/MULTIPLAYER.md) — attach-or-create semantics, byte-transparent
+    // broadcast to every attached client, server-side write control, and it
+    // propagates the inner exit code (dtach never did, so drop-to-local's 88
+    // only works on this branch). The `--probe` guard keeps a freshly shipped
+    // local croft from sending an unknown subcommand at a remote binary the
+    // background updater hasn't replaced yet. Fallback: dtach, exactly as
+    // before (`-A` attach-or-create, `-E`/`-z` keep its hands off croft's
+    // Ctrl chords, `-r winch` repaints on reattach). Both supervisors are
+    // byte-transparent so OSC-1337 / Kitty graphics pass through untouched —
+    // tmux corrupts the Kitty protocol, which is why neither branch uses it.
+    // Hosts with neither exec croft directly, no persistence.
+    // `CROFT_SESSION_PERSISTENT=1` is exported only on the persistent
+    // branches so the remote croft can tell whether its session survives a
+    // transport drop and surface that on its status line.
     let socket = dtach_socket_path(path);
+    let mux_socket = mux_socket_path(path);
+    let workspace_flag = match path.filter(|p| !p.is_empty()) {
+        Some(p) => format!(" --workspace {}", shell_quote(p)),
+        None => String::new(),
+    };
     format!(
-        "{prefix}if command -v dtach >/dev/null 2>&1; then mkdir -p \"$(dirname \"{socket}\")\"; export CROFT_SESSION_PERSISTENT=1; exec dtach -A \"{socket}\" -E -z -r winch {croft_invocation}; else exec {croft_invocation}; fi"
+        "{prefix}if croft session-host --probe >/dev/null 2>&1; then mkdir -p \"$(dirname \"{mux_socket}\")\"; export CROFT_SESSION_PERSISTENT=1; exec croft session-host --socket \"{mux_socket}\"{workspace_flag} -- {croft_invocation}; elif command -v dtach >/dev/null 2>&1; then mkdir -p \"$(dirname \"{socket}\")\"; export CROFT_SESSION_PERSISTENT=1; exec dtach -A \"{socket}\" -E -z -r winch {croft_invocation}; else exec {croft_invocation}; fi"
     )
 }
 
@@ -1936,6 +1946,21 @@ fn dtach_socket_path(path: Option<&str>) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hasher.write(path.unwrap_or("").as_bytes());
     format!("$HOME/.cache/croft/sessions/{:016x}.sock", hasher.finish())
+}
+
+/// Remote socket for a mux (session-host) session: same keying as the dtach
+/// socket (the raw launch arg, per the relay-key post-mortem above
+/// `relay_session_id`) but a distinct name, so a mux client never speaks
+/// croft's frame protocol at a live dtach server left over from an older
+/// binary.
+fn mux_socket_path(path: Option<&str>) -> String {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(path.unwrap_or("").as_bytes());
+    format!(
+        "$HOME/.cache/croft/sessions/{:016x}.mux.sock",
+        hasher.finish()
+    )
 }
 
 /// True for ssh's own connection-failure exit code (255), as opposed to any
@@ -2547,21 +2572,33 @@ Host !blocked *.internal
     }
 
     #[test]
-    fn remote_command_wraps_croft_in_dtach_for_session_persistence() {
+    fn remote_command_prefers_session_host_and_falls_back_to_dtach() {
         let command = remote_croft_command_for_terminal(Some("/srv/app"), None, None, false, &[]);
-        // The persisted session runs croft under dtach with the exact flags
-        // croft needs: attach-or-create, no detach/suspend key theft, WINCH
-        // redraw on reattach.
-        assert!(command.contains("command -v dtach"));
+        // Preferred: croft's own session host (multiplayer mux), gated on a
+        // probe so an old remote binary is never sent an unknown subcommand.
+        assert!(command.contains("if croft session-host --probe"));
+        assert!(command.contains("exec croft session-host --socket"));
+        assert!(command.contains(".mux.sock"));
+        assert!(command.contains("--workspace '/srv/app' -- croft '/srv/app'"));
+        // Fallback: dtach with the exact flags croft needs (attach-or-create,
+        // no detach/suspend key theft, WINCH redraw on reattach).
+        assert!(command.contains("elif command -v dtach"));
         assert!(command.contains("dtach -A"));
         assert!(command.contains("-E"));
         assert!(command.contains("-z"));
         assert!(command.contains("-r winch"));
-        // The dtach branch flags the session as persistent for the remote
-        // croft's status line.
+        // Both persistent branches flag the session for the status line.
         assert!(command.contains("export CROFT_SESSION_PERSISTENT=1;"));
-        // Hosts without dtach still launch croft directly (no persistence).
+        // Hosts with neither supervisor still launch croft directly.
         assert!(command.contains("else exec croft"));
+    }
+
+    #[test]
+    fn remote_command_omits_workspace_flag_without_a_path() {
+        let command = remote_croft_command_for_terminal(None, None, None, false, &[]);
+        assert!(command.contains("exec croft session-host --socket"));
+        assert!(!command.contains("--workspace"));
+        assert!(command.contains(" -- croft;"));
     }
 
     #[test]
@@ -2572,6 +2609,12 @@ Host !blocked *.internal
         assert_eq!(a1, a2, "same workspace must map to the same dtach session");
         assert_ne!(a1, b, "different workspaces must not share a session");
         assert!(a1.contains("/.cache/croft/sessions/"));
+        // The mux socket shares the keying but never the name, so a mux
+        // client can never connect to a live legacy dtach server.
+        let m = mux_socket_path(Some("/srv/app"));
+        assert_ne!(m, a1);
+        assert!(m.ends_with(".mux.sock"));
+        assert!(m.contains(&relay_session_id("/srv/app")));
     }
 
     #[test]

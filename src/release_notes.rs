@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Terminal search feeds the Search sidebar: the new Command Palette command \"Terminal: Search & Replace from Last grep/rg\" reads the last grep/rg/git grep you ran in a pane, seeds Search with its pattern and flags (-i/-w/-F/-E/-g), and runs it — turning a terminal search into an editable results list you can replace across every match at once with Search's replace-all.",
+    summary: "Multiplayer sessions: `croft attach` (and `croft <host>`) now run under croft's own session host instead of dtach — several people can attach the same workspace and share the session live, with the first attacher holding write control, later attachers joining read-only (enforced server-side), everyone sized to the smallest window, and no external dependency; existing dtach sessions keep working until they end.",
 }];

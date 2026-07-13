@@ -91,6 +91,28 @@ pub enum CliCommand {
     },
     /// List the running persistent croft sessions started with `croft attach`.
     Ls,
+    /// Internal: the multiplayer session host/client (croft's dtach
+    /// replacement; see docs/MULTIPLAYER.md). `croft attach` and the remote
+    /// launcher drive this; it is not intended for manual use.
+    #[command(hide = true)]
+    SessionHost {
+        /// Exit 0 immediately; lets the remote launch script probe whether
+        /// this binary supports mux sessions before preferring them.
+        #[arg(long, default_value_t = false)]
+        probe: bool,
+        /// Run the server (spawned detached by the attach-or-create client).
+        #[arg(long, default_value_t = false)]
+        serve: bool,
+        /// Session socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Workspace recorded in the session sidecar for `croft ls`.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The inner command after `--` (the real croft invocation).
+        #[arg(last = true)]
+        inner: Vec<String>,
+    },
     /// One-time setup for the cross-compile fast path used by `croft <host>`:
     /// installs cargo-zigbuild and adds the two rustup targets croft ships
     /// binaries for (x86_64 / aarch64 musl). After this finishes, the
@@ -150,6 +172,29 @@ impl Cli {
             }
             Some(CliCommand::Attach { path }) => crate::session::attach(path),
             Some(CliCommand::Ls) => crate::session::list(),
+            Some(CliCommand::SessionHost {
+                probe,
+                serve,
+                socket,
+                workspace,
+                inner,
+            }) => {
+                if probe {
+                    return Ok(());
+                }
+                let socket = socket.context("session-host requires --socket")?;
+                let code = if serve {
+                    crate::session_host::serve(&socket, workspace.as_deref(), &inner)?
+                } else {
+                    crate::session_host::attach_or_create(&socket, workspace.as_deref(), &inner)?
+                };
+                // Propagate the inner croft's exit code (e.g. the remote
+                // wrapper's drop-to-local 88) through the mux boundary.
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                Ok(())
+            }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
             Some(CliCommand::InstallLauncher { path, user, yes }) => {
@@ -742,6 +787,46 @@ mod tests {
     fn parses_ls_command() {
         let cli = Cli::parse_from(["croft", "ls"]);
         assert!(matches!(cli.command, Some(CliCommand::Ls)));
+    }
+
+    #[test]
+    fn parses_session_host_probe_serve_and_inner_command() {
+        let cli = Cli::parse_from(["croft", "session-host", "--probe"]);
+        match cli.command {
+            Some(CliCommand::SessionHost { probe, serve, .. }) => {
+                assert!(probe);
+                assert!(!serve);
+            }
+            _ => panic!("expected SessionHost"),
+        }
+        let cli = Cli::parse_from([
+            "croft",
+            "session-host",
+            "--serve",
+            "--socket",
+            "/x/s.mux.sock",
+            "--workspace",
+            "/work/repo",
+            "--",
+            "croft",
+            "/work/repo",
+        ]);
+        match cli.command {
+            Some(CliCommand::SessionHost {
+                probe,
+                serve,
+                socket,
+                workspace,
+                inner,
+            }) => {
+                assert!(!probe);
+                assert!(serve);
+                assert_eq!(socket, Some(PathBuf::from("/x/s.mux.sock")));
+                assert_eq!(workspace, Some(PathBuf::from("/work/repo")));
+                assert_eq!(inner, vec!["croft", "/work/repo"]);
+            }
+            _ => panic!("expected SessionHost"),
+        }
     }
 
     #[test]

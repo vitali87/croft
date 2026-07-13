@@ -1,16 +1,18 @@
-//! Local session persistence: run croft under dtach so a session launched on
+//! Local session persistence: run croft under the built-in session host
+//! ([`crate::session_host`], the multiplayer mux) so a session launched on
 //! this machine (its terminals, LSP, DAP, editor state) survives closing the
-//! terminal window and can be reattached later. This mirrors the remote
-//! persistence in [`crate::remote`] (same dtach flags and socket keying) but
-//! for the box croft already runs on.
+//! terminal window and can be reattached later, by one or several clients.
+//! This mirrors the remote persistence in [`crate::remote`] (same socket
+//! keying) but for the box croft already runs on.
 //!
 //! - `croft attach [path]` attaches to (or creates) the persistent session for
-//!   a workspace.
-//! - Detach by closing the window: the dtach client dies, the server keeps
-//!   croft alive. (`-E` disables dtach's own detach key so croft keeps every
-//!   Ctrl chord, exactly as on the remote path — an in-app detach chord would
-//!   need a separate control channel and is left for a follow-up.)
+//!   a workspace. Several attachers share the session (see
+//!   docs/MULTIPLAYER.md).
+//! - Detach by closing the window: the client dies, the host keeps croft
+//!   alive.
 //! - `croft ls` lists the live sessions and prunes dead sockets.
+//! - Sessions created by an older croft under dtach keep reattaching through
+//!   dtach until they end; new sessions never need dtach.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,6 +41,13 @@ fn socket_name(workspace: &Path) -> String {
 
 fn socket_path(workspace: &Path) -> PathBuf {
     sessions_dir().join(format!("{}.sock", socket_name(workspace)))
+}
+
+/// Socket for a mux (session-host) session. A distinct name from the legacy
+/// dtach socket, so a client never speaks croft's frame protocol at a live
+/// dtach server (which would feed the frames into the PTY as input).
+fn mux_socket_path(workspace: &Path) -> PathBuf {
+    sessions_dir().join(format!("{}.mux.sock", socket_name(workspace)))
 }
 
 fn meta_path(socket: &Path) -> PathBuf {
@@ -94,6 +103,22 @@ fn read_meta(socket: &Path) -> Option<SessionMeta> {
     serde_json::from_str(&json).ok()
 }
 
+/// Record the workspace sidecar for a session socket, keeping the original
+/// creation time across reattaches so `ls` uptime reflects the session's
+/// real start. Used by the session host when it takes ownership of a socket.
+pub(crate) fn write_meta_preserving_created(socket: &Path, workspace: &Path) -> Result<()> {
+    let created_unix = read_meta(socket)
+        .map(|m| m.created_unix)
+        .unwrap_or_else(now_unix);
+    write_meta(
+        socket,
+        &SessionMeta {
+            workspace: workspace.to_path_buf(),
+            created_unix,
+        },
+    )
+}
+
 /// A dtach server holds an open listening socket; a crashed server leaves a
 /// stale socket file behind (unix sockets aren't auto-unlinked), so existence
 /// isn't liveness — probe by connecting.
@@ -101,12 +126,12 @@ fn read_meta(socket: &Path) -> Option<SessionMeta> {
 // detached croft one WINCH repaint; fine for a handful of sessions, swap for an
 // lsof/peer check if the session count ever grows large.
 #[cfg(unix)]
-fn is_alive(socket: &Path) -> bool {
+pub(crate) fn is_alive(socket: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(socket).is_ok()
 }
 
 #[cfg(not(unix))]
-fn is_alive(_socket: &Path) -> bool {
+pub(crate) fn is_alive(_socket: &Path) -> bool {
     false
 }
 
@@ -143,8 +168,10 @@ fn exec_dtach(_socket: &Path, _inner: &[String]) -> Result<()> {
 }
 
 /// `croft attach [path]`: attach to (or create) the persistent session for a
-/// workspace. Falls back to a plain non-persistent launch when dtach is absent,
-/// same as the remote wrapper's `else exec` branch.
+/// workspace via the built-in session host (multiplayer mux; see
+/// docs/MULTIPLAYER.md), which needs no external binary. A workspace with a
+/// live legacy dtach session keeps reattaching through dtach so sessions
+/// started under an older croft are never orphaned.
 pub fn attach(path: Option<PathBuf>) -> Result<()> {
     let workspace = match path {
         Some(p) => p,
@@ -162,30 +189,23 @@ pub fn attach(path: Option<PathBuf>) -> Result<()> {
         workspace.to_string_lossy().into_owned(),
     ];
 
-    if !dtach_on_path() {
-        eprintln!(
-            "dtach not found; launching a non-persistent session. Install dtach \
-             (e.g. `brew install dtach`) for detach/reattach."
-        );
-        return crate::app::run(workspace, None, None, false);
-    }
-
     let dir = sessions_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let socket = socket_path(&workspace);
-    // Reattaching to an existing session keeps its original creation time, so
-    // `ls` uptime reflects when the session started, not this reattach.
-    let created_unix = read_meta(&socket)
-        .map(|m| m.created_unix)
-        .unwrap_or_else(now_unix);
-    write_meta(
-        &socket,
-        &SessionMeta {
-            workspace: workspace.clone(),
-            created_unix,
-        },
-    )?;
-    exec_dtach(&socket, &inner)
+
+    let legacy = socket_path(&workspace);
+    if is_alive(&legacy) && dtach_on_path() {
+        // Reattaching keeps the original creation time, so `ls` uptime
+        // reflects when the session started, not this reattach.
+        write_meta_preserving_created(&legacy, &workspace)?;
+        return exec_dtach(&legacy, &inner);
+    }
+
+    let mux = mux_socket_path(&workspace);
+    let code = crate::session_host::attach_or_create(&mux, Some(&workspace), &inner)?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 /// `croft ls`: print the live persistent sessions, pruning any dead sockets.
