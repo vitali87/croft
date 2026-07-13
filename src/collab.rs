@@ -107,6 +107,51 @@ impl CollabDoc {
     }
 }
 
+/// Byte offset of the char-indexed position `(row, col)` within the text
+/// formed by joining `lines` with `'\n'` — the linear coordinate CollabDoc and
+/// cola operate in. croft's editor addresses the buffer as `(row, char-column)`
+/// (`cursor_col` is a char index throughout src/widgets/editor.rs); cola
+/// addresses it as one byte offset, so every editor edit converts through here.
+pub fn byte_offset(lines: &[String], row: usize, col: usize) -> usize {
+    let mut offset = 0;
+    for line in lines.iter().take(row) {
+        offset += line.len() + 1; // +1 for the '\n' separator
+    }
+    if let Some(line) = lines.get(row) {
+        offset += line
+            .char_indices()
+            .nth(col)
+            .map(|(b, _)| b)
+            .unwrap_or(line.len());
+    }
+    offset
+}
+
+/// Inverse of [`byte_offset`]: the `(row, char-column)` of a byte `offset`.
+/// `offset` is assumed char-aligned (every offset cola or [`byte_offset`]
+/// produces is); a mid-char offset would clamp at the enclosing char boundary
+/// via `chars().count()`. Past-the-end clamps to the end of the last line.
+pub fn position(lines: &[String], offset: usize) -> (usize, usize) {
+    let mut remaining = offset;
+    for (row, line) in lines.iter().enumerate() {
+        let line_bytes = line.len();
+        if remaining <= line_bytes {
+            let end = line
+                .char_indices()
+                .map(|(b, _)| b)
+                .chain(std::iter::once(line_bytes))
+                .take_while(|&b| b <= remaining)
+                .count()
+                .saturating_sub(1);
+            return (row, end);
+        }
+        remaining -= line_bytes + 1; // consume the line and its '\n'
+    }
+    let row = lines.len().saturating_sub(1);
+    let col = lines.get(row).map(|l| l.chars().count()).unwrap_or(0);
+    (row, col)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +207,44 @@ mod tests {
         b.apply_remote(&decoded);
         assert_eq!(b.text(), a.text());
         assert_eq!(b.text(), "aZZbc");
+    }
+
+    #[test]
+    fn char_column_maps_to_byte_offset_across_lines_and_multibyte() {
+        // "héllo" is 5 chars / 6 bytes (é is 2 bytes); "wörld" likewise.
+        let lines = vec![String::from("héllo"), String::from("wörld")];
+
+        // Within the first line: char col 3 is the second 'l', at byte 4.
+        assert_eq!(byte_offset(&lines, 0, 3), 4);
+        // End of the first line: byte 6 (before the '\n').
+        assert_eq!(byte_offset(&lines, 0, 5), 6);
+        // Second line, char col 2 ('r'): 6 bytes + '\n' + "wö" (3 bytes) = 10.
+        assert_eq!(byte_offset(&lines, 1, 2), 10);
+
+        // Round-trips both directions for every valid position.
+        for (row, line) in lines.iter().enumerate() {
+            for col in 0..=line.chars().count() {
+                let off = byte_offset(&lines, row, col);
+                assert_eq!(position(&lines, off), (row, col), "row {row} col {col}");
+            }
+        }
+    }
+
+    /// The join text `byte_offset` addresses is exactly what `CollabDoc` holds,
+    /// so an editor edit expressed in (row, col) integrates at the right place.
+    #[test]
+    fn editor_position_edit_integrates_into_collabdoc() {
+        let lines = vec![String::from("foo"), String::from("bar")];
+        let joined = lines.join("\n");
+        let mut a = CollabDoc::new(1, &joined);
+        let mut b = a.fork(2);
+
+        // Insert "X" at editor position (row 1, col 0) = start of "bar".
+        let at = byte_offset(&lines, 1, 0);
+        let op = a.local_insert(at, "X");
+        b.apply_remote(&op);
+
+        assert_eq!(a.text(), "foo\nXbar");
+        assert_eq!(b.text(), a.text());
     }
 }
