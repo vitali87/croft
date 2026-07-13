@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Persistent local sessions: `croft attach` runs the workspace under dtach so its terminals, language servers, debugger, and open files survive closing the window. Close to detach, run `croft attach` again in the same folder to reattach where you left off, and `croft ls` to list what's still running. This is the persistence `croft remote` already gave over SSH, now local (install dtach; without it, attach opens a normal window).",
+    summary: "Terminal search feeds the Search sidebar: the new Command Palette command \"Terminal: Search & Replace from Last grep/rg\" reads the last grep/rg/git grep you ran in a pane, seeds Search with its pattern and flags (-i/-w/-F/-E/-g), and runs it — turning a terminal search into an editable results list you can replace across every match at once with Search's replace-all.",
 }];

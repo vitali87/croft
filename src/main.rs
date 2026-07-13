@@ -25,6 +25,7 @@ mod pdf;
 mod port_detect;
 mod prefs;
 mod quick_select;
+mod quickfix;
 mod release_notes;
 mod remote;
 mod remote_bulk;

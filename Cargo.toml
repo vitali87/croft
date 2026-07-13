@@ -1,6 +1,6 @@
 [package]
 name = "croft"
-version = "0.1.625"
+version = "0.1.626"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -106,6 +106,10 @@ resvg = { version = "0.47", default-features = false }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# POSIX shell tokenizer, already in the tree transitively. Used to split a
+# terminal command line (`rg -w "two words"`) into args when seeding Search
+# from the last grep/rg command (src/quickfix.rs).
+shlex = "1.3"
 csv = "1.4"
 calamine = "0.34"
 # Decompression for the `Provision::Binary` LSP backend (src/lsp/install.rs):

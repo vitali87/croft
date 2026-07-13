@@ -90,6 +90,8 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Debug: Attach to Python Process | `Ctrl`+`F5` | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
 | Preferences: Color Theme | `Cmd`+`K` `Cmd`+`T` | Pick the active color theme (also via the settings gear) |
 
+**Terminal: Search & Replace from Last grep/rg** (palette-only) reads the last `grep`/`rg`/`git grep` command run in the focused terminal, seeds the Search sidebar with its pattern and matching flags (`-i`, `-w`, `-F`/`-E`, `-g`), and runs it. The terminal search becomes the Search panel's results list, so you can replace across every match at once (`:cdo`-style) with the replace-all it already has.
+
 ## Settings, custom keybindings & snippets
 
 All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macOS and Linux) and are reachable from the Command Palette. Opening one that doesn't exist yet seeds it with a working example.

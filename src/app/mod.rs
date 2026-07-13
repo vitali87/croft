@@ -19485,6 +19485,39 @@ impl App {
     /// then the workspace root; `~` against $HOME. The click only lands
     /// when the resolved file exists, which also filters lookalikes such
     /// as `host.com:443`.
+    /// Seed the Search sidebar from the last `grep`/`rg` command run in the
+    /// focused terminal, then run it. The Search panel already has multi-file
+    /// replace-all, so this turns a terminal search into an editable,
+    /// replace-across-every-match buffer (the `:cdo` loop) with one command.
+    fn search_from_last_terminal_command(&mut self) {
+        let input = {
+            let term = self.terminal();
+            let decs = term.command_decorations();
+            match decs.last() {
+                Some(d) => term.command_input_text(d),
+                None => {
+                    self.status = String::from("No terminal command yet to search from");
+                    return;
+                }
+            }
+        };
+        let Some(sc) = crate::quickfix::parse_search_command(input.trim()) else {
+            self.status =
+                String::from("Last terminal command wasn't a grep/rg search — nothing to seed");
+            return;
+        };
+        self.search.query = sc.pattern.clone();
+        self.search.opts.case_sensitive = sc.case_sensitive;
+        self.search.opts.whole_word = sc.whole_word;
+        self.search.opts.use_regex = sc.use_regex;
+        if let Some(inc) = sc.include {
+            self.search.include = inc;
+        }
+        self.set_sidebar_view(SidebarView::Search);
+        self.submit_search_query();
+        self.status = format!("Search seeded from terminal: {}", sc.pattern);
+    }
+
     fn terminal_file_click(&mut self, col: u16, row: u16) -> bool {
         let Some((text, c)) = self.terminal().line_text_at(col, row) else {
             return false;
@@ -20716,6 +20749,7 @@ impl App {
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
+            Cmd::SearchFromTerminal => self.search_from_last_terminal_command(),
             Cmd::RestoreSnapshot => self.restore_history_snapshot(),
             Cmd::QuickFix => self.start_code_action(),
             Cmd::ReplaceInFile => self.open_editor_replace(),
