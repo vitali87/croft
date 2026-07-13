@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Attributed carets for multiplayer sessions: the session host tells croft whose keystrokes are flowing, so when participants take turns typing each one keeps their own caret — the editor parks the previous typist's cursor, restores the new typist's, and paints everyone else's position as a colored ghost caret in the file.",
+    kind: NoteKind::Fix,
+    summary: "Multiplayer session-host hardening from code review: the session socket is now created 0600 with no open window, the privileged-channel token never degrades to a predictable value if the RNG fails, grant/revoke/kick frames can no longer tear on a busy socket, rapid typist hand-offs keep every participant's caret, an open participants picker keeps your filter and selection when the roster changes, and a restarted session no longer inherits a dead one's uptime.",
 }];

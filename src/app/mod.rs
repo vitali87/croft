@@ -15471,10 +15471,22 @@ impl App {
         } else if after < before {
             self.status = format!("A participant detached ({after} attached)");
         }
-        if self.list_picker.as_ref().is_some_and(|p| {
-            p.purpose == crate::widgets::list_picker::ListPurpose::SessionParticipant
-        }) {
+        // Keep an open participants picker live without wiping the user's
+        // typed filter, highlight, or scroll (any client resizing churns the
+        // roster within the poll window; a naive rebuild would reset it).
+        if let Some(p) = self.list_picker.as_ref()
+            && p.purpose == crate::widgets::list_picker::ListPurpose::SessionParticipant
+        {
+            let (query, cursor, selected, scroll) =
+                (p.query.clone(), p.cursor, p.selected, p.scroll);
             self.open_participants_picker();
+            if let Some(p) = self.list_picker.as_mut() {
+                let last = p.rows.len().saturating_sub(1);
+                p.query = query;
+                p.cursor = cursor;
+                p.selected = selected.min(last);
+                p.scroll = scroll.min(last);
+            }
         }
         true
     }
@@ -15486,14 +15498,18 @@ impl App {
         let Some(channel) = self.session_channel.as_mut() else {
             return false;
         };
-        let Some(id) = channel.drain_typing() else {
-            return false;
-        };
-        if self.session_typist == Some(id) {
+        let typists = channel.drain_typing();
+        if typists.is_empty() {
             return false;
         }
-        self.apply_typist_change(id);
-        true
+        let mut changed = false;
+        for id in typists {
+            if self.session_typist != Some(id) {
+                self.apply_typist_change(id);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Participant `id` is typing now: park the previous typist's caret and

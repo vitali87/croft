@@ -103,6 +103,12 @@ fn read_meta(socket: &Path) -> Option<SessionMeta> {
     serde_json::from_str(&json).ok()
 }
 
+/// Remove a socket's meta sidecar (best effort). Called by the session host on
+/// clean exit so a later server for the same workspace starts a fresh uptime.
+pub(crate) fn remove_meta(socket: &Path) {
+    let _ = std::fs::remove_file(meta_path(socket));
+}
+
 /// Record the workspace sidecar for a session socket, keeping the original
 /// creation time across reattaches so `ls` uptime reflects the session's
 /// real start. Used by the session host when it takes ownership of a socket.

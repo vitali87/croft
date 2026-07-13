@@ -203,17 +203,20 @@ struct Host {
 /// once it terminates (the caller propagates it, so codes like croft's
 /// drop-to-local 88 survive the mux, which dtach never propagated).
 pub fn serve(socket: &Path, workspace: Option<&Path>, inner: &[String]) -> Result<i32> {
-    serve_with_token(socket, workspace, inner, &random_token())
+    serve_with_token(socket, workspace, inner, &random_token()?)
 }
 
 /// A random hex token for the privileged channel. The socket is already
 /// 0600, so this is a discriminator (inner croft vs regular participant),
-/// not the trust boundary; account possession remains that.
-fn random_token() -> String {
+/// not the trust boundary; account possession remains that. Propagate an RNG
+/// failure rather than emitting the all-zero buffer as a predictable token.
+fn random_token() -> Result<String> {
     use ring::rand::SecureRandom;
     let mut bytes = [0u8; 16];
-    let _ = ring::rand::SystemRandom::new().fill(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("session-host RNG failed: {e:?}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 pub(crate) fn serve_with_token(
@@ -235,11 +238,18 @@ pub(crate) fn serve_with_token(
     // A crashed server leaves a stale socket file behind (unix sockets are
     // not auto-unlinked); the liveness probe above proved nobody owns it.
     let _ = std::fs::remove_file(socket);
+    // Possession of the account is the trust boundary (same as dtach); never
+    // let another user attach. `bind` starts accepting connections the instant
+    // it returns, so a chmod on the next line leaves a TOCTOU window in which
+    // the socket carries umask-derived perms (0644 under umask 022). Bind under
+    // a 0077 umask so the socket is 0600 from creation; restore afterward.
+    let prev_umask = unsafe { libc::umask(0o077) };
     let listener =
-        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
+        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()));
+    unsafe { libc::umask(prev_umask) };
+    let listener = listener?;
     {
-        // Possession of the account is the trust boundary (same as dtach);
-        // never let another user attach.
+        // Belt-and-braces: assert 0600 even where umask was ignored.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
             .context("restricting socket permissions")?;
@@ -320,6 +330,9 @@ pub(crate) fn serve_with_token(
     broadcast(&host, &encode_control_frame(&Control::Exit { code }));
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(presence_path(socket));
+    // Drop the meta sidecar too, or a later server for this workspace inherits
+    // the dead session's created time and `croft ls` reports an inflated uptime.
+    crate::session::remove_meta(socket);
     Ok(code)
 }
 
@@ -760,25 +773,30 @@ impl InnerChannel {
         })
     }
 
-    /// Drain any host frames waiting on the channel and return the latest
-    /// "who is typing" attribution, if it changed. Non-blocking.
-    pub fn drain_typing(&mut self) -> Option<u64> {
-        let mut latest = None;
+    /// Drain any host frames waiting on the channel and return the "who is
+    /// typing" attributions in arrival order, collapsing only consecutive
+    /// repeats. Returning every distinct typist (not just the last) keeps a
+    /// rapid A->B->C writer burst within one tick from dropping B's caret
+    /// hand-over. Non-blocking.
+    pub fn drain_typing(&mut self) -> Vec<u64> {
+        let mut typists: Vec<u64> = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
             match self.stream.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     for frame in self.reader.push(&buf[..n]) {
-                        if let Frame::Control(Control::Typing { id }) = frame {
-                            latest = Some(id);
+                        if let Frame::Control(Control::Typing { id }) = frame
+                            && typists.last() != Some(&id)
+                        {
+                            typists.push(id);
                         }
                     }
                 }
                 Err(_) => break,
             }
         }
-        latest
+        typists
     }
 
     pub fn set_control(&mut self, id: u64, grant: bool) -> bool {
@@ -787,16 +805,35 @@ impl InnerChannel {
         } else {
             Control::Revoke { id }
         };
-        self.stream
-            .write_all(&encode_control_frame(&control))
-            .is_ok()
+        write_frame_blocking(&mut self.stream, &encode_control_frame(&control))
     }
 
     pub fn kick(&mut self, id: u64) -> bool {
-        self.stream
-            .write_all(&encode_control_frame(&Control::Kick { id }))
-            .is_ok()
+        write_frame_blocking(
+            &mut self.stream,
+            &encode_control_frame(&Control::Kick { id }),
+        )
     }
+}
+
+/// Write a whole frame to a socket that may be in non-blocking mode. `write_all`
+/// aborts on the first `WouldBlock` even after a partial write, which would leave
+/// a torn `[type][len][payload]` on the wire and desync the peer's FrameReader
+/// for every later control frame. Loop until the frame is fully committed.
+fn write_frame_blocking(stream: &mut UnixStream, frame: &[u8]) -> bool {
+    let mut written = 0;
+    while written < frame.len() {
+        match stream.write(&frame[written..]) {
+            Ok(0) => return false,
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// Parse a presence sidecar. None when the file is missing or torn (it is
@@ -1311,7 +1348,7 @@ mod tests {
         let drain_marker = |channel: &mut InnerChannel| -> Option<u64> {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                if let Some(id) = channel.drain_typing() {
+                if let Some(id) = channel.drain_typing().first().copied() {
                     return Some(id);
                 }
                 if Instant::now() > deadline {
@@ -1332,7 +1369,7 @@ mod tests {
         a.read_until(|f| matches!(f, Frame::Bytes(bytes) if bytes.windows(2).any(|w| w == b"bb")));
         let leftover = channel.drain_typing();
         assert!(
-            leftover.is_none() || leftover == Some(owner_id),
+            leftover.is_empty() || leftover == [owner_id],
             "{leftover:?}"
         );
 

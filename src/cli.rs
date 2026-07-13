@@ -83,8 +83,10 @@ pub enum CliCommand {
     },
     /// Attach to (or create) a persistent local session for a workspace, so its
     /// terminals, LSP, DAP, and editor state survive closing the window. Detach
-    /// by closing the window; reattach by running `croft attach` again. Requires
-    /// dtach on PATH (`brew install dtach`); without it, launches normally.
+    /// by closing the window; reattach by running `croft attach` again. Runs
+    /// under croft's built-in session host, which also lets others co-attach (no
+    /// external dependency); sessions started by an older croft under dtach keep
+    /// reattaching through dtach until they end.
     Attach {
         /// Workspace folder to open (defaults to the current directory).
         path: Option<PathBuf>,
