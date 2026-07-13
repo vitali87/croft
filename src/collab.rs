@@ -112,6 +112,52 @@ impl CollabDoc {
     }
 }
 
+/// Diff `doc`'s current text against `new` and apply the difference as local
+/// ops, returned for broadcast. This is the op-extraction path for the live
+/// editor (slice 4): croft's editor has no single apply-edit chokepoint (~46
+/// scattered mutation sites), so instead of threading positional deltas
+/// through every one, each shared file diffs its last-synced text against the
+/// current buffer whenever its edit seq advances. Multi-cursor edits, paste,
+/// undo, and wholesale reloads all reduce to a text-state transition here.
+pub fn text_delta_ops(doc: &mut CollabDoc, new: &str) -> Vec<Op> {
+    use similar::{ChangeTag, TextDiff};
+    let old = doc.text().to_string();
+    // A timed-out diff yields a coarser but still valid edit script, bounding
+    // the cost of reload-sized changes on the interactive tick.
+    let diff = TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(200))
+        .diff_chars(old.as_str(), new);
+    let mut ops = Vec::new();
+    let mut cursor = 0usize; // byte offset into doc's evolving text
+    let mut del = 0usize; // bytes of a pending delete run
+    let mut ins = String::new(); // text of a pending insert run
+    let mut flush = |doc: &mut CollabDoc, cursor: &mut usize, del: &mut usize, ins: &mut String| {
+        if *del > 0 {
+            ops.push(doc.local_delete(*cursor, *del));
+            *del = 0;
+        }
+        if !ins.is_empty() {
+            ops.push(doc.local_insert(*cursor, ins));
+            *cursor += ins.len();
+            ins.clear();
+        }
+    };
+    for change in diff.iter_all_changes() {
+        let bytes = change.value().len();
+        match change.tag() {
+            ChangeTag::Equal => {
+                flush(doc, &mut cursor, &mut del, &mut ins);
+                cursor += bytes;
+            }
+            ChangeTag::Delete => del += bytes,
+            ChangeTag::Insert => ins.push_str(change.value()),
+        }
+    }
+    flush(doc, &mut cursor, &mut del, &mut ins);
+    debug_assert_eq!(doc.text(), new);
+    ops
+}
+
 /// Byte offset of the char-indexed position `(row, col)` within the text
 /// formed by joining `lines` with `'\n'` — the linear coordinate CollabDoc and
 /// cola operate in. croft's editor addresses the buffer as `(row, char-column)`
@@ -294,6 +340,97 @@ mod tests {
         b.apply_remote(&decoded);
         assert_eq!(b.text(), a.text());
         assert_eq!(b.text(), "aZZbc");
+    }
+
+    /// The slice-4 extraction path: an arbitrary text-state transition on one
+    /// replica, expressed only as (old text, new text), produces ops that make
+    /// a fork converge to the new text.
+    #[test]
+    fn text_delta_ops_converge_a_fork_to_the_new_text() {
+        let mut a = CollabDoc::new(1, "hello world");
+        let mut b = a.fork(2);
+
+        let ops = text_delta_ops(&mut a, "hello brave new world");
+        assert!(!ops.is_empty(), "a real edit must emit ops");
+        assert_eq!(a.text(), "hello brave new world");
+        for op in &ops {
+            b.apply_remote(op);
+        }
+        assert_eq!(b.text(), a.text());
+    }
+
+    /// Multiple disjoint change runs (a delete at the front, a replace in the
+    /// middle, an insert at the end) all extract in one pass.
+    #[test]
+    fn text_delta_ops_handle_multiple_change_runs() {
+        let mut a = CollabDoc::new(1, "aaa bbb ccc ddd");
+        let mut b = a.fork(2);
+
+        let ops = text_delta_ops(&mut a, "bbb XYZ ddd eee");
+        assert_eq!(a.text(), "bbb XYZ ddd eee");
+        for op in &ops {
+            b.apply_remote(op);
+        }
+        assert_eq!(b.text(), a.text());
+    }
+
+    /// Multibyte chars keep the byte cursor honest: the diff walks chars but
+    /// ops address bytes.
+    #[test]
+    fn text_delta_ops_handle_multibyte_text() {
+        let mut a = CollabDoc::new(1, "héllo wörld");
+        let mut b = a.fork(2);
+
+        let ops = text_delta_ops(&mut a, "héllo, schöne Wörld");
+        assert_eq!(a.text(), "héllo, schöne Wörld");
+        for op in &ops {
+            b.apply_remote(op);
+        }
+        assert_eq!(b.text(), a.text());
+    }
+
+    /// No change, no ops: the tick-time extraction must be quiescent when the
+    /// buffer has not moved (an op here would echo forever between peers).
+    #[test]
+    fn text_delta_ops_emit_nothing_when_unchanged() {
+        let mut a = CollabDoc::new(1, "same text");
+        let ops = text_delta_ops(&mut a, "same text");
+        assert!(ops.is_empty());
+        assert_eq!(a.text(), "same text");
+    }
+
+    /// A wholesale buffer swap (the owner's disk-reload path in slice 4) is
+    /// just one big transition and still converges a fork.
+    #[test]
+    fn text_delta_ops_handle_wholesale_replacement() {
+        let mut a = CollabDoc::new(1, "the quick brown fox\njumps over\n");
+        let mut b = a.fork(2);
+
+        let ops = text_delta_ops(&mut a, "an entirely different\nbuffer\nnow\n");
+        assert_eq!(a.text(), "an entirely different\nbuffer\nnow\n");
+        for op in &ops {
+            b.apply_remote(op);
+        }
+        assert_eq!(b.text(), a.text());
+    }
+
+    /// Extraction composes with concurrency: both replicas diff-extract
+    /// concurrent local edits, exchange, and converge.
+    #[test]
+    fn concurrent_text_delta_ops_converge() {
+        let mut a = CollabDoc::new(1, "shared base line");
+        let mut b = a.fork(2);
+
+        let ops_a = text_delta_ops(&mut a, "shared MODIFIED base line");
+        let ops_b = text_delta_ops(&mut b, "shared base line plus tail");
+
+        for op in &ops_b {
+            a.apply_remote(op);
+        }
+        for op in &ops_a {
+            b.apply_remote(op);
+        }
+        assert_eq!(a.text(), b.text(), "replicas must converge");
     }
 
     #[test]
