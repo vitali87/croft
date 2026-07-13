@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Multiplayer groundwork for independent viewports (Phase D): a new replicated-document layer built on the cola text CRDT lets two participants edit the same buffer and always converge, with no central server. This is the foundation for future per-participant scroll and cursor; today's shared-viewport multiplayer was also field-tested end to end over a real SSH session on Linux.",
+    summary: "Live co-editing with independent viewports: run `croft attach --solo` (or `croft remote <host> <path> --solo`) to open your own croft on a shared workspace — scroll and navigate freely while edits to shared files replicate instantly between participants over a CRDT, with peers' carets ghosted in their colors and the session owner as the single writer to disk.",
 }];

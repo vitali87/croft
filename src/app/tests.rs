@@ -18934,3 +18934,100 @@ fn typist_change_stashes_and_restores_per_participant_carets() {
     let line_len = app.editor.lines[app.editor.cursor_row].chars().count();
     assert!(app.editor.cursor_col <= line_len);
 }
+
+/// Headless end-to-end of the Phase D live wiring: two Apps on the same
+/// workspace (an owner and a solo guest) connected through a real relay
+/// socket. The guest bootstraps the owner's buffer, edits flow both ways and
+/// converge, the guest never echoes an applied edit back, and the save-owner
+/// gates hold (guest Cmd+S is a no-op with a hint; the owner writes).
+#[test]
+fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello world").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+
+    let pump_until =
+        |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(owner, guest) {
+                assert!(Instant::now() < deadline, "never settled: {what}");
+                owner.poll_collab();
+                guest.poll_collab();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+    // Guest opens the shared file and bootstraps it from the owner's buffer.
+    pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+
+    // Guest types; the owner's buffer converges (through poll_collab's
+    // extract, the relay, and apply_collab_spans on the owner side).
+    guest.editor.insert_str("GUEST ");
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "guest edit reaches owner",
+        &|o, _| o.editor.lines[0].contains("GUEST"),
+    );
+
+    // Concurrent edits from both sides converge to identical buffers.
+    owner.editor.cursor_row = 0;
+    owner.editor.cursor_col = 0;
+    owner.editor.insert_str("OWNER ");
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "concurrent edits converge",
+        &|o, g| o.editor.lines == g.editor.lines && o.editor.lines[0].contains("OWNER"),
+    );
+
+    // No echo: with both sides converged and idle, the wire stays quiet.
+    let settled = owner.editor.lines.clone();
+    for _ in 0..20 {
+        assert!(!owner.poll_collab(), "owner must be quiescent");
+        assert!(!guest.poll_collab(), "guest must be quiescent");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(owner.editor.lines, settled);
+    assert_eq!(guest.editor.lines, settled);
+
+    // Save-owner gate: the guest's Cmd+S never writes shared files.
+    let disk_before = std::fs::read_to_string(&file).unwrap();
+    guest.save();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), disk_before);
+    assert!(
+        guest.status.contains("owner saves"),
+        "guest gets a hint, got: {}",
+        guest.status
+    );
+
+    // The owner writes the converged text.
+    owner.save();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        settled.join("\n"),
+        "owner save must persist the converged buffer"
+    );
+}

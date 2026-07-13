@@ -14,19 +14,19 @@
 //! remote [`Op`] is integrated back into the text at the position cola resolves
 //! against concurrent edits.
 //!
-//! This module holds the transport-side foundation, all self-contained:
-//! - [`CollabDoc`]: the replicated buffer (slice 1).
+//! This module is the whole collab layer below the app:
+//! - [`CollabDoc`]: the replicated buffer, with [`text_delta_ops`] extracting
+//!   ops from arbitrary text-state transitions (diff-based, so the editor
+//!   needs no apply-edit chokepoint).
 //! - [`byte_offset`]/[`position`]: bridge the editor's `(row, char-column)` to
-//!   `CollabDoc`'s linear byte offsets, UTF-8 aware (slice 2).
-//! - [`Envelope`] + [`relay_serve`]: the per-file wire message and the dumb
-//!   fan-out relay over a dedicated collab socket (slice 3).
+//!   `CollabDoc`'s linear byte offsets, UTF-8 aware.
+//! - [`Envelope`]/[`CollabMsg`] + [`relay_serve`]: the wire messages and the
+//!   dumb fan-out relay over a dedicated collab socket.
+//! - [`CollabChannel`] + [`CollabSession`]: a participant's connection and
+//!   per-file state machine (bootstrap handshake, site allocation, backlog).
 //!
-//! What is not here yet is the editor/mux wiring that produces and consumes
-//! these against live buffers (slice 4, docs/MULTIPLAYER.md), so nothing
-//! outside this module's tests constructs these types; the whole module is
-//! allowed dead until that consumer lands rather than sprinkling per-item
-//! allows.
-#![allow(dead_code)]
+//! The app side (`App::poll_collab`, src/app/mod.rs) feeds buffer text in
+//! and applies the returned [`CollabEvent`]s to open tabs.
 
 use std::io::{Read, Write};
 
@@ -88,6 +88,9 @@ impl CollabDoc {
 
     /// A second replica of this document for a new peer `id`, sharing the
     /// current contents and edit history so their future ops integrate.
+    /// In-process only: production peers join over [`Self::from_snapshot`];
+    /// the convergence tests bootstrap through this.
+    #[allow(dead_code)]
     pub fn fork(&self, id: u64) -> Self {
         Self {
             replica: self.replica.fork(id),
@@ -117,6 +120,11 @@ impl CollabDoc {
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// This replica's site id (unique per participant per document).
+    pub fn site_id(&self) -> u64 {
+        self.replica.id()
     }
 
     /// Apply a local insertion at byte offset `at` and return the op to
@@ -288,7 +296,10 @@ pub fn text_delta_ops(doc: &mut CollabDoc, new: &str) -> Vec<Op> {
 /// formed by joining `lines` with `'\n'` — the linear coordinate CollabDoc and
 /// cola operate in. croft's editor addresses the buffer as `(row, char-column)`
 /// (`cursor_col` is a char index throughout src/widgets/editor.rs); cola
-/// addresses it as one byte offset, so every editor edit converts through here.
+/// addresses it as one byte offset. The live wiring only converts the other
+/// way ([`position`]; extraction is diff-based), so this direction exists for
+/// the round-trip tests that pin the bridge.
+#[allow(dead_code)]
 pub fn byte_offset(lines: &[String], row: usize, col: usize) -> usize {
     let mut offset = 0;
     for line in lines.iter().take(row) {
@@ -341,7 +352,10 @@ pub struct Envelope {
 
 impl Envelope {
     /// Serialize into one framed message for the collab socket, reusing the
-    /// session-host wire framing (`[type][len][payload]`).
+    /// session-host wire framing (`[type][len][payload]`). Production sends
+    /// [`CollabMsg::Op`] (via [`CollabMsg::encode`]); the transport tests
+    /// drive the relay with bare envelopes.
+    #[allow(dead_code)]
     pub fn encode(&self) -> Vec<u8> {
         let json = serde_json::to_vec(self).unwrap_or_default();
         crate::session_host::encode_bytes_frame(&json)
@@ -372,6 +386,14 @@ pub enum CollabMsg {
         assigned_site: u64,
         text: String,
         replica: Vec<u8>,
+    },
+    /// A participant's caret moved: peers with the file open paint it as a
+    /// ghost caret in that participant's color.
+    Caret {
+        file: String,
+        site: u64,
+        row: usize,
+        col: usize,
     },
 }
 
@@ -498,14 +520,6 @@ impl CollabChannel {
         Some((socket, role))
     }
 
-    /// Connect using the CROFT_COLLAB_SOCKET / CROFT_COLLAB_ROLE pair the
-    /// launch tail put in the environment; None when this croft is not a
-    /// collab participant or the relay is not up yet.
-    pub fn from_env() -> Option<Self> {
-        let (socket, role) = Self::env_config()?;
-        Self::connect(&socket, role)
-    }
-
     pub fn connect(socket: &std::path::Path, role: CollabRole) -> Option<Self> {
         let stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
         // Non-blocking so the app's per-tick drain never stalls the render
@@ -545,6 +559,294 @@ impl CollabChannel {
             }
         }
         msgs
+    }
+}
+
+/// The owner's fixed site id; joiners are allocated ids from 2 up.
+const OWNER_SITE: u64 = 1;
+
+/// How long a guest waits for the owner's snapshot before giving up. A
+/// workspace with no live owner (nobody answers bootstrap) degrades to
+/// plain local editing instead of staying read-only forever.
+const BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Per-file replication state on one participant.
+enum DocState {
+    /// Guest waiting for the owner's [`CollabMsg::SnapshotReply`]. Ops for
+    /// the file arriving meanwhile are buffered and replayed after the
+    /// snapshot lands (duplicates with ops already folded into the snapshot
+    /// integrate as no-ops).
+    Bootstrapping {
+        nonce: u64,
+        deadline: std::time::Instant,
+        buffered: Vec<Envelope>,
+    },
+    // Boxed: CollabDoc is an order of magnitude larger than the bootstrap
+    // variant, and per-file states live in a map for the session's life.
+    Live(Box<CollabDoc>),
+}
+
+/// What [`CollabSession::poll`] resolved this tick, for the app to apply to
+/// its buffers. Everything is data: the session never touches an editor.
+#[derive(Debug)]
+pub enum CollabEvent {
+    /// Remote edits resolved against the local replica; replay the spans
+    /// sequentially onto the open buffer for `file`.
+    RemoteEdit {
+        file: String,
+        spans: Vec<ResolvedSpan>,
+    },
+    /// Bootstrap finished: swap the open buffer for `file` to `text` (the
+    /// owner's canonical text with any buffered ops already folded in) and
+    /// lift the input gate.
+    Bootstrapped { file: String, text: String },
+    /// No owner answered within the deadline: lift the input gate and treat
+    /// the file as local-only.
+    BootstrapTimedOut { file: String },
+    /// A peer's caret moved in `file`.
+    Caret {
+        file: String,
+        site: u64,
+        row: usize,
+        col: usize,
+    },
+}
+
+/// One participant's collab state machine: per-file replicated documents
+/// over a [`CollabChannel`], with the bootstrap handshake and site-id
+/// allocation (docs/MULTIPLAYER.md, Phase D). Editor-agnostic — the app
+/// feeds it buffer text and applies the events it returns — so the whole
+/// engine is testable headlessly through a relay socket pair.
+pub struct CollabSession {
+    pub role: CollabRole,
+    channel: CollabChannel,
+    docs: std::collections::HashMap<String, DocState>,
+    /// Owner: next site id to hand a joiner (the owner itself is site 1).
+    /// Only the owner allocates, so ids never collide (a collision would
+    /// permanently break convergence).
+    next_site: u64,
+    /// Guest: pairs a SnapshotReply to this session's own request. Seeded
+    /// from the process id so two guests' nonces never collide (replies are
+    /// broadcast, and adopting another guest's reply would clone its site).
+    next_nonce: u64,
+}
+
+impl CollabSession {
+    pub fn new(channel: CollabChannel) -> Self {
+        Self {
+            role: channel.role,
+            channel,
+            docs: std::collections::HashMap::new(),
+            next_site: OWNER_SITE + 1,
+            next_nonce: (std::process::id() as u64) << 32,
+        }
+    }
+
+    /// True when `file` is replicating (bootstrap finished).
+    pub fn is_live(&self, file: &str) -> bool {
+        matches!(self.docs.get(file), Some(DocState::Live(_)))
+    }
+
+    /// True while `file` waits for its snapshot (the app gates edit input).
+    pub fn is_bootstrapping(&self, file: &str) -> bool {
+        matches!(self.docs.get(file), Some(DocState::Bootstrapping { .. }))
+    }
+
+    /// The replicated text for `file`, when live. The tests assert
+    /// convergence through this; the app reads its own buffers.
+    #[allow(dead_code)]
+    pub fn doc_text(&self, file: &str) -> Option<&str> {
+        match self.docs.get(file) {
+            Some(DocState::Live(doc)) => Some(doc.text()),
+            _ => None,
+        }
+    }
+
+    /// Guest: start sharing `file` — ask the owner for its current state and
+    /// buffer inbound ops until the snapshot lands. No-op if already tracked.
+    pub fn request_file(&mut self, file: &str) {
+        if self.role != CollabRole::Guest || self.docs.contains_key(file) {
+            return;
+        }
+        let nonce = self.next_nonce;
+        self.next_nonce += 1;
+        self.channel.send(&CollabMsg::SnapshotRequest {
+            file: file.to_string(),
+            nonce,
+        });
+        self.docs.insert(
+            file.to_string(),
+            DocState::Bootstrapping {
+                nonce,
+                deadline: std::time::Instant::now() + BOOTSTRAP_TIMEOUT,
+                buffered: Vec::new(),
+            },
+        );
+    }
+
+    /// The local buffer for `file` now reads `current`: diff it against the
+    /// replica (invariant 1a, extract-before-apply) and broadcast the
+    /// resulting ops. Returns whether anything was sent. Quiescent when the
+    /// text is unchanged — an op emitted here for a remote edit the app just
+    /// applied would echo between peers forever.
+    pub fn local_change(&mut self, file: &str, current: &str) -> bool {
+        let Some(DocState::Live(doc)) = self.docs.get_mut(file) else {
+            return false;
+        };
+        if doc.text() == current {
+            return false;
+        }
+        let site = doc.site_id();
+        let ops = text_delta_ops(doc, current);
+        let sent = !ops.is_empty();
+        for op in ops {
+            self.channel.send(&CollabMsg::Op(Envelope {
+                file: file.to_string(),
+                site,
+                op,
+            }));
+        }
+        sent
+    }
+
+    /// Broadcast this participant's caret position in a live file.
+    pub fn send_caret(&mut self, file: &str, row: usize, col: usize) {
+        let Some(DocState::Live(doc)) = self.docs.get(file) else {
+            return;
+        };
+        let site = doc.site_id();
+        self.channel.send(&CollabMsg::Caret {
+            file: file.to_string(),
+            site,
+            row,
+            col,
+        });
+    }
+
+    /// Drain the channel and resolve everything into [`CollabEvent`]s
+    /// (invariant 1b: the app extracts local edits before calling this).
+    /// `owner_text` is the owner's buffer lookup for a file a guest wants
+    /// bootstrapped: return its current text (opening it if needed) or None
+    /// to decline (unreadable, binary). Guests ignore the callback.
+    pub fn poll(&mut self, mut owner_text: impl FnMut(&str) -> Option<String>) -> Vec<CollabEvent> {
+        let mut events = Vec::new();
+        for msg in self.channel.drain() {
+            match msg {
+                CollabMsg::Op(env) => match self.docs.get_mut(&env.file) {
+                    Some(DocState::Live(doc)) => {
+                        let spans = doc.apply_remote(&env.op);
+                        if !spans.is_empty() {
+                            events.push(CollabEvent::RemoteEdit {
+                                file: env.file,
+                                spans,
+                            });
+                        }
+                    }
+                    Some(DocState::Bootstrapping { buffered, .. }) => buffered.push(env),
+                    // Not open on this peer: ignored until opened, then the
+                    // bootstrap snapshot carries this edit anyway.
+                    None => {}
+                },
+                CollabMsg::SnapshotRequest { file, nonce } => {
+                    // Only the owner answers, so a request never draws
+                    // competing replies (and site allocation stays single-
+                    // writer).
+                    if self.role != CollabRole::Owner {
+                        continue;
+                    }
+                    if !self.docs.contains_key(&file) {
+                        let Some(text) = owner_text(&file) else {
+                            continue;
+                        };
+                        self.docs.insert(
+                            file.clone(),
+                            DocState::Live(Box::new(CollabDoc::new(OWNER_SITE, &text))),
+                        );
+                    }
+                    let Some(DocState::Live(doc)) = self.docs.get(&file) else {
+                        continue;
+                    };
+                    let assigned_site = self.next_site;
+                    self.next_site += 1;
+                    self.channel.send(&CollabMsg::SnapshotReply {
+                        file,
+                        nonce,
+                        assigned_site,
+                        text: doc.text().to_string(),
+                        replica: doc.encode(),
+                    });
+                }
+                CollabMsg::SnapshotReply {
+                    file,
+                    nonce,
+                    assigned_site,
+                    text,
+                    replica,
+                } => {
+                    let Some(DocState::Bootstrapping {
+                        nonce: want,
+                        buffered,
+                        ..
+                    }) = self.docs.get_mut(&file)
+                    else {
+                        continue;
+                    };
+                    // Replies are broadcast; adopt only the answer to this
+                    // session's own request (another guest's reply carries
+                    // another guest's site id).
+                    if *want != nonce {
+                        continue;
+                    }
+                    let buffered = std::mem::take(buffered);
+                    let Ok(mut doc) = CollabDoc::from_snapshot(assigned_site, &text, &replica)
+                    else {
+                        // Corrupt snapshot: give up as if nobody answered.
+                        self.docs.remove(&file);
+                        events.push(CollabEvent::BootstrapTimedOut { file });
+                        continue;
+                    };
+                    // Ops that raced the reply fold into the bootstrap text;
+                    // ones the snapshot already contained integrate as
+                    // duplicates (no-ops).
+                    for env in &buffered {
+                        let _ = doc.apply_remote(&env.op);
+                    }
+                    let final_text = doc.text().to_string();
+                    self.docs
+                        .insert(file.clone(), DocState::Live(Box::new(doc)));
+                    events.push(CollabEvent::Bootstrapped {
+                        file,
+                        text: final_text,
+                    });
+                }
+                CollabMsg::Caret {
+                    file,
+                    site,
+                    row,
+                    col,
+                } => events.push(CollabEvent::Caret {
+                    file,
+                    site,
+                    row,
+                    col,
+                }),
+            }
+        }
+        // Give up on bootstraps nobody answered (no owner running).
+        let now = std::time::Instant::now();
+        let timed_out: Vec<String> = self
+            .docs
+            .iter()
+            .filter_map(|(file, state)| match state {
+                DocState::Bootstrapping { deadline, .. } if now > *deadline => Some(file.clone()),
+                _ => None,
+            })
+            .collect();
+        for file in timed_out {
+            self.docs.remove(&file);
+            events.push(CollabEvent::BootstrapTimedOut { file });
+        }
+        events
     }
 }
 
@@ -928,6 +1230,169 @@ mod tests {
         // The original listener still owns the socket path.
         drop(listener);
         assert!(!crate::session::is_alive(&socket));
+    }
+
+    /// Start a relay on a temp socket and connect a session to it in `role`.
+    fn session_pair() -> (tempfile::TempDir, CollabSession, CollabSession) {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.collab.sock");
+        {
+            let s = socket.clone();
+            std::thread::spawn(move || {
+                let _ = relay_serve(&s);
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let owner = loop {
+            if let Some(ch) = CollabChannel::connect(&socket, CollabRole::Owner) {
+                break CollabSession::new(ch);
+            }
+            assert!(Instant::now() < deadline, "relay never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let guest = CollabSession::new(
+            CollabChannel::connect(&socket, CollabRole::Guest).expect("guest connects"),
+        );
+        (dir, owner, guest)
+    }
+
+    /// Pump both sessions until `done` says so or the deadline passes,
+    /// collecting every event per side. The owner serves one file.
+    fn pump(
+        owner: &mut CollabSession,
+        guest: &mut CollabSession,
+        owner_text: &str,
+        done: impl Fn(&[CollabEvent], &[CollabEvent]) -> bool,
+    ) -> (Vec<CollabEvent>, Vec<CollabEvent>) {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut oe, mut ge) = (Vec::new(), Vec::new());
+        while !done(&oe, &ge) {
+            assert!(Instant::now() < deadline, "sessions never settled");
+            oe.extend(owner.poll(|_| Some(owner_text.to_string())));
+            ge.extend(guest.poll(|_| None));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (oe, ge)
+    }
+
+    /// The full slice-4 handshake headlessly: a guest bootstraps a file from
+    /// the owner through the relay, edits it, and the owner's replica
+    /// converges; carets travel too.
+    #[test]
+    fn collab_sessions_bootstrap_and_converge_through_the_relay() {
+        let (_dir, mut owner, mut guest) = session_pair();
+
+        guest.request_file("src/f.rs");
+        assert!(guest.is_bootstrapping("src/f.rs"));
+        let (_, ge) = pump(&mut owner, &mut guest, "hello world", |_, ge| {
+            ge.iter()
+                .any(|e| matches!(e, CollabEvent::Bootstrapped { .. }))
+        });
+        let text = ge
+            .iter()
+            .find_map(|e| match e {
+                CollabEvent::Bootstrapped { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(text, "hello world");
+        assert!(guest.is_live("src/f.rs"));
+        assert!(owner.is_live("src/f.rs"), "answering seeds the owner doc");
+
+        // Guest edits; the owner's replica converges through the relay.
+        assert!(guest.local_change("src/f.rs", "hello brave world"));
+        guest.send_caret("src/f.rs", 0, 5);
+        let (oe, _) = pump(&mut owner, &mut guest, "hello world", |oe, _| {
+            oe.iter()
+                .any(|e| matches!(e, CollabEvent::RemoteEdit { .. }))
+                && oe.iter().any(|e| matches!(e, CollabEvent::Caret { .. }))
+        });
+        assert_eq!(owner.doc_text("src/f.rs"), Some("hello brave world"));
+        assert!(
+            oe.iter()
+                .any(|e| matches!(e, CollabEvent::Caret { row: 0, col: 5, .. }))
+        );
+    }
+
+    /// Concurrent edits on both sides converge to the identical text.
+    #[test]
+    fn collab_sessions_concurrent_edits_converge() {
+        let (_dir, mut owner, mut guest) = session_pair();
+        guest.request_file("src/f.rs");
+        pump(&mut owner, &mut guest, "shared base", |_, ge| {
+            ge.iter()
+                .any(|e| matches!(e, CollabEvent::Bootstrapped { .. }))
+        });
+
+        owner.local_change("src/f.rs", "MODIFIED shared base");
+        guest.local_change("src/f.rs", "shared base plus tail");
+        pump(&mut owner, &mut guest, "shared base", |oe, ge| {
+            oe.iter()
+                .any(|e| matches!(e, CollabEvent::RemoteEdit { .. }))
+                && ge
+                    .iter()
+                    .any(|e| matches!(e, CollabEvent::RemoteEdit { .. }))
+        });
+        assert_eq!(owner.doc_text("src/f.rs"), guest.doc_text("src/f.rs"));
+    }
+
+    /// No echo: once both sides converge and re-extract their (unchanged)
+    /// buffers, the wire goes quiet — an op re-emitted for a remote edit
+    /// would bounce between peers forever.
+    #[test]
+    fn collab_sessions_do_not_echo_applied_remote_edits() {
+        let (_dir, mut owner, mut guest) = session_pair();
+        guest.request_file("src/f.rs");
+        pump(&mut owner, &mut guest, "abc", |_, ge| {
+            ge.iter()
+                .any(|e| matches!(e, CollabEvent::Bootstrapped { .. }))
+        });
+
+        owner.local_change("src/f.rs", "abcX");
+        pump(&mut owner, &mut guest, "abc", |_, ge| {
+            ge.iter()
+                .any(|e| matches!(e, CollabEvent::RemoteEdit { .. }))
+        });
+        assert_eq!(guest.doc_text("src/f.rs"), Some("abcX"));
+
+        // The app's tick re-extracts each side's buffer, which now equals
+        // the replica text: nothing may be sent or received after that.
+        assert!(!owner.local_change("src/f.rs", "abcX"));
+        assert!(!guest.local_change("src/f.rs", "abcX"));
+        for _ in 0..20 {
+            assert!(owner.poll(|_| None).is_empty(), "owner must stay quiet");
+            assert!(guest.poll(|_| None).is_empty(), "guest must stay quiet");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// A guest with no owner on the relay stops waiting after the deadline
+    /// instead of gating input forever.
+    #[test]
+    fn bootstrap_times_out_without_an_owner() {
+        let (_dir, _owner, mut guest) = session_pair();
+        // The owner exists but never polls (never answers).
+        guest.request_file("src/f.rs");
+        let deadline =
+            std::time::Instant::now() + BOOTSTRAP_TIMEOUT + std::time::Duration::from_secs(3);
+        loop {
+            let events = guest.poll(|_| None);
+            if events
+                .iter()
+                .any(|e| matches!(e, CollabEvent::BootstrapTimedOut { .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bootstrap never timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!guest.is_bootstrapping("src/f.rs"));
+        assert!(!guest.is_live("src/f.rs"));
     }
 
     /// End-to-end transport: two participants connected through the relay

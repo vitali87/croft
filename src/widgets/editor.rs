@@ -1275,6 +1275,12 @@ pub struct Editor {
     /// did_change to the LSP server, so building lines.join("\n") only
     /// happens on actual changes, not every frame.
     pub edit_seq: u64,
+    /// The `edit_seq` the collab session last synced this buffer at (Phase D
+    /// independent viewports, docs/MULTIPLAYER.md). The tick diff extracts
+    /// ops only when `edit_seq` has moved past this, and it is re-pinned
+    /// after a remote edit is applied so the diff never rebroadcasts one
+    /// (same lazy-recompute pattern as `git_marks_seq`).
+    pub collab_synced_seq: u64,
     /// HEAD baseline for the git gutter: the committed version's lines. Set by
     /// the app (read off the workspace git root once per file / HEAD change).
     /// `None` when the file is untracked, outside a repo, or not yet fetched.
@@ -1558,6 +1564,7 @@ impl Editor {
             breakpoint_conditions: std::collections::HashMap::new(),
             breakpoint_logs: std::collections::HashMap::new(),
             edit_seq: 0,
+            collab_synced_seq: 0,
             git_head_lines: None,
             git_baseline_for: None,
             git_marks: std::collections::HashMap::new(),
@@ -7425,12 +7432,21 @@ impl EditorTabs {
     /// changes. Clean tabs are silently reloaded; dirty tabs are flagged as
     /// conflicts. This is the core of the FS-sync invariant: a file open in
     /// a background tab must reflect disk reality just like the focused one.
-    pub fn reload_externally_changed_tabs(&mut self) -> ExternalReloadReport {
+    /// `skip` exempts paths from the sweep: a collab guest never reloads
+    /// shared files from disk — its replica is authoritative, and the
+    /// owner's own reload reaches it as ops (docs/MULTIPLAYER.md, Phase D).
+    pub fn reload_externally_changed_tabs(
+        &mut self,
+        skip: &dyn Fn(&Path) -> bool,
+    ) -> ExternalReloadReport {
         let mut report = ExternalReloadReport::default();
         for ed in &mut self.editors {
             // Diff/image/sheet views don't carry an editable text buffer to
             // reload, and a path-less blank tab has nothing to sync.
             if ed.path.is_none() || ed.diff.is_some() {
+                continue;
+            }
+            if ed.path.as_deref().is_some_and(skip) {
                 continue;
             }
             let path = ed.path.clone();
@@ -11224,9 +11240,24 @@ mod tests {
             .unwrap()
             .set_modified(bumped)
             .unwrap();
-        let report = tabs.reload_externally_changed_tabs();
+        let report = tabs.reload_externally_changed_tabs(&|_| false);
         assert_eq!(report.reloaded, vec![a.clone()]);
         assert!(report.conflicts.is_empty());
+        // A skipped path (a collab guest's shared file) is left untouched.
+        std::fs::write(&b, "b NEW\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_modified(bumped)
+            .unwrap();
+        let report = tabs.reload_externally_changed_tabs(&|p| p == b.as_path());
+        assert!(report.reloaded.is_empty());
+        let b_tab = tabs
+            .iter_tabs()
+            .find(|e| e.path.as_deref() == Some(b.as_path()))
+            .unwrap();
+        assert_eq!(b_tab.lines[0], "b old");
         let a_tab = tabs
             .iter_tabs()
             .find(|e| e.path.as_deref() == Some(a.as_path()))

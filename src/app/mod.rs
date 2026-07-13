@@ -2650,6 +2650,22 @@ pub struct App {
     session_presence_mtime: Option<std::time::SystemTime>,
     /// Cadence gate for the presence poll (stat every 500ms, not every tick).
     last_session_presence_poll: std::time::Instant,
+    /// Phase D independent-viewport collab session (docs/MULTIPLAYER.md):
+    /// per-file replicated documents over the workspace's collab relay.
+    /// None until the lazy connect in `poll_collab` succeeds.
+    collab: Option<crate::collab::CollabSession>,
+    /// The collab socket and role the launch tail exported, read once at
+    /// startup. None when this croft is not a collab participant.
+    collab_config: Option<(PathBuf, crate::collab::CollabRole)>,
+    /// Throttle for the lazy relay connect (the owner starts before any
+    /// guest has spawned the relay, so the first attempts fail by design).
+    last_collab_connect: Option<std::time::Instant>,
+    /// Peers' last-known carets by site id: (file key, row, col). Painted
+    /// as ghost carets in the peer's color when their file is active.
+    collab_carets: std::collections::HashMap<u64, (String, usize, usize)>,
+    /// The last caret this croft broadcast, so an unmoved cursor sends
+    /// nothing on the tick.
+    collab_caret_sent: Option<(String, usize, usize)>,
     /// Rolling log of git commands croft has run and their summaries, shown
     /// read-only by the "Show Git Output" action (VS Code's Git channel).
     pub git_output_log: Vec<String>,
@@ -3481,6 +3497,11 @@ impl App {
             session_carets: std::collections::HashMap::new(),
             session_presence_mtime: None,
             last_session_presence_poll: std::time::Instant::now(),
+            collab: None,
+            collab_config: crate::collab::CollabChannel::env_config(),
+            last_collab_connect: None,
+            collab_carets: std::collections::HashMap::new(),
+            collab_caret_sent: None,
             git_output_log: Vec::new(),
             pending_discard_all: false,
             file_finder_index: None,
@@ -4632,7 +4653,11 @@ impl App {
     /// conflicts (the buffer and the disk are both preserved). Returns true
     /// if any tab reloaded or entered conflict, so the caller redraws.
     fn reload_open_file_after_external_change(&mut self) -> bool {
-        let report = self.editor.reload_externally_changed_tabs();
+        let guest = self.is_collab_guest();
+        let root = self.tree.root.clone();
+        let report = self
+            .editor
+            .reload_externally_changed_tabs(&|p| guest && collab_file_key(&root, p).is_some());
         if report.is_empty() {
             return false;
         }
@@ -7868,6 +7893,11 @@ impl App {
             }
             if let Some(n) = self.editor.apply_rename_to_open_tab(path, edits) {
                 occ_count += n;
+            } else if self.is_collab_guest() && collab_file_key(&self.tree.root, path).is_some() {
+                // Closed-file rename edits are raw disk writes; a collab
+                // guest never writes shared files (open tabs above are fine:
+                // those edits flow to the owner as ops).
+                continue;
             } else {
                 let content = std::fs::read_to_string(path)?;
                 let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
@@ -10478,6 +10508,22 @@ impl App {
                     .collect(),
                 _ => Vec::new(),
             };
+            // Collab peers' carets (Phase D independent viewports): same
+            // ghost rendering, keyed by workspace-relative file.
+            if !self.collab_carets.is_empty()
+                && let Some(active) = self
+                    .editor
+                    .path
+                    .as_ref()
+                    .and_then(|p| collab_file_key(&self.tree.root, p))
+            {
+                self.editor.ghost_carets.extend(
+                    self.collab_carets
+                        .iter()
+                        .filter(|(_, (file, _, _))| *file == active)
+                        .map(|(site, (_, row, col))| (*row, *col, participant_color(*site))),
+                );
+            }
             // Render the editor group layout tree. The active group is hoisted
             // into `self.editor`; every other group lives in `editor_layout`.
             // Lay the leaves out and paint each at its rect (depth-first order),
@@ -12898,6 +12944,21 @@ impl App {
                 SidebarView::Testing => self.handle_testing_key(key),
             },
             Pane::Editor => {
+                // A shared file is read-only until its bootstrap snapshot
+                // lands (a keystroke now would race the owner's canonical
+                // text). One gate at the dispatch covers every editor edit
+                // path; the window is the bootstrap round-trip.
+                if let Some(session) = self.collab.as_ref()
+                    && let Some(file) = self
+                        .editor
+                        .path
+                        .as_ref()
+                        .and_then(|p| collab_file_key(&self.tree.root, p))
+                    && session.is_bootstrapping(&file)
+                {
+                    self.status = format!("{file}: joining the shared session, one moment");
+                    return Ok(());
+                }
                 self.handle_editor_key(key);
                 self.poke_cursor();
             }
@@ -13016,6 +13077,14 @@ impl App {
     /// Replace every match in the current results with the Replace text, then
     /// re-run the query so the (now stale) hit list refreshes.
     fn run_search_replace_all(&mut self) {
+        if self.is_collab_guest() {
+            // Replace All writes hit files on disk directly; in a collab
+            // session only the owner writes (their croft offers the same
+            // action, and open shared files converge through the reload
+            // diff).
+            self.status = String::from("Replace All is owner-only in a shared session");
+            return;
+        }
         if self.search.query.trim().is_empty() {
             self.status = String::from("Replace All: enter a search term first");
             return;
@@ -15538,6 +15607,228 @@ impl App {
             self.editor.cursor_row = row;
             self.editor.cursor_col = col;
         }
+    }
+
+    /// Phase D per-tick collab pump (docs/MULTIPLAYER.md): connect lazily,
+    /// have guests bootstrap newly opened workspace files, extract local
+    /// edits into ops BEFORE applying inbound ones (the echo-storm
+    /// invariant), then resolve inbound events against the open buffers.
+    fn poll_collab(&mut self) -> bool {
+        use crate::collab::{CollabChannel, CollabEvent, CollabRole, CollabSession};
+        if self.collab.is_none() {
+            let Some((socket, role)) = self.collab_config.clone() else {
+                return false;
+            };
+            let due = self
+                .last_collab_connect
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2));
+            if !due {
+                return false;
+            }
+            self.last_collab_connect = Some(std::time::Instant::now());
+            match CollabChannel::connect(&socket, role) {
+                Some(ch) => self.collab = Some(CollabSession::new(ch)),
+                None => return false,
+            }
+        }
+        let mut session = self.collab.take().expect("connected above");
+        let root = self.tree.root.clone();
+        let mut changed = false;
+
+        // Guests share every text file they open under the workspace; files
+        // not open on a peer are ignored until opened, then bootstrapped.
+        if session.role == CollabRole::Guest {
+            let mut files: Vec<String> = Vec::new();
+            let mut collect = |editors: &[crate::widgets::editor::Editor]| {
+                for ed in editors {
+                    if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+                        continue;
+                    }
+                    if let Some(file) = ed.path.as_ref().and_then(|p| collab_file_key(&root, p)) {
+                        files.push(file);
+                    }
+                }
+            };
+            collect(&self.editor.editors);
+            for group in self.editor_layout.inactive_groups() {
+                collect(&group.editors);
+            }
+            for file in files {
+                if !session.is_live(&file) && !session.is_bootstrapping(&file) {
+                    session.request_file(&file);
+                    changed = true;
+                }
+            }
+        }
+
+        // Invariant 1a: extract-before-apply. Applying remote ops first
+        // would re-diff them below as local edits and rebroadcast (echo).
+        let mut extract = |editors: &mut [crate::widgets::editor::Editor]| {
+            for ed in editors.iter_mut() {
+                let Some(file) = ed.path.as_ref().and_then(|p| collab_file_key(&root, p)) else {
+                    continue;
+                };
+                if ed.edit_seq == ed.collab_synced_seq || !session.is_live(&file) {
+                    continue;
+                }
+                session.local_change(&file, &ed.lines.join("\n"));
+                ed.collab_synced_seq = ed.edit_seq;
+            }
+        };
+        extract(&mut self.editor.editors);
+        for group in self.editor_layout.inactive_groups_mut() {
+            extract(&mut group.editors);
+        }
+
+        // Invariant 1b: drain and resolve. The owner-side lookup opens the
+        // requested file as a background tab when needed, so guest edits
+        // land in a real buffer that saves, auto-saves, and reloads through
+        // the one code path.
+        let events = session.poll(|file| self.owner_buffer_text(&root, file));
+        for event in events {
+            changed = true;
+            match event {
+                CollabEvent::RemoteEdit { file, spans } => {
+                    self.apply_collab_spans(&root, &file, &spans);
+                }
+                CollabEvent::Bootstrapped { file, text } => {
+                    self.finish_collab_bootstrap(&root, &file, text);
+                }
+                CollabEvent::BootstrapTimedOut { file } => {
+                    self.status = format!("{file}: no session owner answered; editing locally");
+                }
+                CollabEvent::Caret {
+                    file,
+                    site,
+                    row,
+                    col,
+                } => {
+                    self.collab_carets.insert(site, (file, row, col));
+                }
+            }
+        }
+
+        // Broadcast this participant's caret when it moved in a live file.
+        if let Some(file) = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&root, p))
+            && session.is_live(&file)
+        {
+            let caret = (file, self.editor.cursor_row, self.editor.cursor_col);
+            if self.collab_caret_sent.as_ref() != Some(&caret) {
+                session.send_caret(&caret.0, caret.1, caret.2);
+                self.collab_caret_sent = Some(caret);
+            }
+        }
+
+        self.collab = Some(session);
+        changed
+    }
+
+    /// The owner's current text for a file a guest asked to share: the open
+    /// buffer if any, else open it as a background tab (keeping the owner's
+    /// focus where it was) and read that. None declines the request
+    /// (missing, unreadable, or not a text buffer).
+    fn owner_buffer_text(&mut self, root: &Path, file: &str) -> Option<String> {
+        let path = root.join(file);
+        let text_of = |ed: &crate::widgets::editor::Editor| {
+            (ed.diff.is_none() && ed.image.is_none() && ed.sheet.is_none())
+                .then(|| ed.lines.join("\n"))
+        };
+        if let Some(i) = self.editor.find_tab_with_path(&path) {
+            return text_of(&self.editor.editors[i]);
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            if let Some(i) = group.find_tab_with_path(&path) {
+                return text_of(&group.editors[i]);
+            }
+        }
+        if !path.is_file() {
+            return None;
+        }
+        let keep = self.editor.active_index();
+        self.editor.open_in_new_tab(&path).ok()?;
+        let opened = self.editor.active_index();
+        self.editor.select(keep);
+        text_of(&self.editor.editors[opened])
+    }
+
+    /// Replay resolved remote spans onto the open buffer for `file`,
+    /// converting each byte span to the editor's char coordinates. Spans are
+    /// sequential (each relative to the text with earlier ones applied), so
+    /// they go through `apply_span_edits` one at a time. When the same file
+    /// is open in several groups only the first found stays synced, matching
+    /// the existing split-view-as-independent-copies behavior.
+    fn apply_collab_spans(
+        &mut self,
+        root: &Path,
+        file: &str,
+        spans: &[crate::collab::ResolvedSpan],
+    ) {
+        let path = root.join(file);
+        let apply = |ed: &mut crate::widgets::editor::Editor| {
+            for s in spans {
+                let (sr, sc) = crate::collab::position(&ed.lines, s.at);
+                let (er, ec) = crate::collab::position(&ed.lines, s.at + s.deleted);
+                ed.apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
+                    start: (sr, sc),
+                    end: (er, ec),
+                    new_text: s.inserted.clone(),
+                }]);
+            }
+            // Echo suppression: apply_span_edits bumped edit_seq, which would
+            // re-arm the tick diff and rebroadcast what was just applied.
+            ed.collab_synced_seq = ed.edit_seq;
+        };
+        if let Some(i) = self.editor.find_tab_with_path(&path) {
+            apply(&mut self.editor.editors[i]);
+            return;
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            if let Some(i) = group.find_tab_with_path(&path) {
+                apply(&mut group.editors[i]);
+                return;
+            }
+        }
+    }
+
+    /// A guest's bootstrap snapshot landed: swap the buffer to the owner's
+    /// canonical text (usually identical to what was read from disk) and
+    /// mark the file synced, which also lifts the input gate.
+    fn finish_collab_bootstrap(&mut self, root: &Path, file: &str, text: String) {
+        let path = root.join(file);
+        let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+        let finish = |ed: &mut crate::widgets::editor::Editor| {
+            if ed.lines != lines {
+                ed.replace_all_lines(lines.clone());
+            }
+            ed.collab_synced_seq = ed.edit_seq;
+        };
+        if let Some(i) = self.editor.find_tab_with_path(&path) {
+            finish(&mut self.editor.editors[i]);
+        } else {
+            for group in self.editor_layout.inactive_groups_mut() {
+                if let Some(i) = group.find_tab_with_path(&path) {
+                    finish(&mut group.editors[i]);
+                    break;
+                }
+            }
+        }
+        self.status = format!("{file} is now live-shared");
+    }
+
+    /// True when this croft is a solo-viewport guest: the session owner is
+    /// the one writer of shared files to disk, so every save/reload/replace
+    /// path for workspace files is gated here. Config-based (not
+    /// connection-based) so the gates hold while the relay is still coming
+    /// up.
+    fn is_collab_guest(&self) -> bool {
+        matches!(
+            self.collab_config,
+            Some((_, crate::collab::CollabRole::Guest))
+        )
     }
 
     /// Act on the row chosen in the list picker.
@@ -25041,10 +25332,18 @@ impl App {
             return false;
         }
         let mut saved_paths: Vec<PathBuf> = Vec::new();
+        // Collab guests never write shared (workspace) files; the session
+        // owner is the single writer (docs/MULTIPLAYER.md, Phase D).
+        let guest = self.is_collab_guest();
+        let root = self.tree.root.clone();
         let due = |e: &crate::widgets::editor::Editor| {
             e.dirty
                 && e.path.is_some()
                 && !e.disk_conflict
+                && !(guest
+                    && e.path
+                        .as_ref()
+                        .is_some_and(|p| collab_file_key(&root, p).is_some()))
                 && e.last_edit_at
                     .is_some_and(|t| t.elapsed() >= Self::AUTO_SAVE_DELAY)
         };
@@ -25131,6 +25430,20 @@ impl App {
     }
 
     fn save(&mut self) {
+        // Guests in a collab session never write shared files: the owner is
+        // the single writer, so the FS watcher and history snapshots see one
+        // author. The guest's edits already flowed to the owner as ops.
+        if self.is_collab_guest()
+            && self
+                .editor
+                .path
+                .as_ref()
+                .is_some_and(|p| collab_file_key(&self.tree.root, p).is_some())
+        {
+            self.status =
+                String::from("Shared file: the session owner saves (your edits are already live)");
+            return;
+        }
         // A previously-refused save arms a one-shot override: the very next
         // Cmd+S overwrites the external change. Consume it here so it never
         // lingers past the press it was meant for.
@@ -30224,6 +30537,15 @@ fn participant_color(id: u64) -> Color {
     PALETTE[(id % PALETTE.len() as u64) as usize]
 }
 
+/// The workspace-relative key a file replicates under in a collab session
+/// (docs/MULTIPLAYER.md, Phase D). None outside the workspace: only
+/// workspace files are shared.
+fn collab_file_key(root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Parse a participants action-picker row id back into (verb, participant).
 fn parse_participant_action(id: &str) -> Option<(ParticipantVerb, u64)> {
     let (verb, id) = id.split_once(':')?;
@@ -30771,6 +31093,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
+        let collab_changed = app.poll_collab();
         let bells_changed = app.drain_terminal_bells();
         let labels_changed = app.refresh_terminal_labels();
         let auto_save_changed = app.tick_auto_save();
@@ -30849,6 +31172,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || ports_changed
             || session_presence_changed
             || session_typing_changed
+            || collab_changed
             || bells_changed
             || labels_changed
             || auto_save_changed

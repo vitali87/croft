@@ -84,6 +84,7 @@ croft ~/proj --open-file a.rs --zen  # ...focused on just the file (no sidebar/t
 croft remote <host>              # launch croft over SSH on a Linux server (host from ~/.ssh/config)
 croft attach                     # open the current folder as a persistent session (survives closing the window)
 croft attach ~/projects          # ...for a specific folder
+croft attach --solo ~/projects   # join a shared folder in your own viewport (live co-editing)
 croft ls                         # list running persistent sessions
 croft --help
 ```
@@ -91,6 +92,8 @@ croft --help
 `croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works out of the box. See [LINUX.md](docs/LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
 
 `croft attach` runs the session under croft's built-in session host, so its terminals, language servers, debugger, and open files keep running after you close the window (or lose the SSH connection). Close the window to detach; run `croft attach` again in the same folder to reattach exactly where you left off, and `croft ls` to see what is still running. This is the same persistence `croft remote` already gives you over SSH, now available locally, with no external dependency. It is also multiplayer: several people (or several of your own windows) can `croft attach` the same folder and share the session live. The first attacher holds write control and later attachers join as read-only observers, enforced by the host, with everyone's window sized to the smallest participant (see [docs/MULTIPLAYER.md](docs/MULTIPLAYER.md)). Inside croft, the status bar shows an "N attached" badge whenever someone else is on, and **Session: Participants** (`Cmd+K A`) lists everyone so you can grant or revoke write control or disconnect a participant. When several people hold control and take turns typing, each keeps their own caret: croft parks the previous typist's cursor, restores the new typist's, and shows everyone else's position as a colored ghost caret in the editor. Sessions started by an older croft under dtach keep reattaching through dtach until they end.
+
+Prefer your own screen instead of the shared one? Add `--solo` (`croft attach --solo <folder>`, or `croft remote <host> <path> --solo` over SSH) to open an **independent viewport** on the same workspace: your own croft process, scrolling and navigating freely, while edits to shared files replicate live between participants and always converge (a CRDT under the hood, no central server). Peers' cursors appear as colored ghost carets, and the session owner is the single writer to disk, so saves, history, and the file watcher see one author (see [docs/MULTIPLAYER.md](docs/MULTIPLAYER.md)).
 
 ## Platform setup
 

@@ -21,14 +21,16 @@ zero-winsize guard, and inner exit-code propagation over SSH all verified end
 to end (see "Field test" below).
 
 Phase D (independent viewports) was deferred until shared-viewport multiplayer
-proved itself; it now has and Phase D is green-lit. Its foundation shipped in
-0.1.631: [`src/collab.rs`], a replicated text document over the `cola` CRDT
-(concurrent inserts and deletes converge without a central authority), with a
-serializable [`Op`] for the control channel. It is not yet wired to the editor
-or the mux; that is the next slice. The rest of this document is the design the
-shipped phases followed. It exists so the multiplayer pillar starts from
-croft's real architecture instead of from a Live Share mental model that
-does not fit a single-process TUI.
+proved itself; it now has and Phase D SHIPPED its first live co-editing cut in
+0.1.632: [`src/collab.rs`] (a replicated text document over the `cola` CRDT,
+diff-based op extraction, the bootstrap handshake, and the per-participant
+session state machine) wired into the running app (`App::poll_collab`), with
+`croft attach --solo` / `croft remote <host> <path> --solo` as the opt-in
+launch. See "Slice 4 as shipped" below for what landed and the deliberate
+deviations. The rest of this document is the design the shipped phases
+followed. It exists so the multiplayer pillar starts from croft's real
+architecture instead of from a Live Share mental model that does not fit a
+single-process TUI.
 
 ## Field test (0.1.630, real SSH, Linux musl)
 
@@ -252,23 +254,77 @@ and serde round-trip tested). Slices, with status:
    serialize for the wire.
 2. **Done.** Editor coordinate bridge: `byte_offset`/`position` map the editor's
    `(row, char-column)` to `CollabDoc`'s linear byte offsets, UTF-8 tested.
-3. **Transport done.** `Envelope` (per-file, per-site op) and `relay_serve`
+3. **Done.** `Envelope` (per-file, per-site op) and `relay_serve`
    (dumb fan-out over `<hash>.collab.sock`); convergence through the relay is
-   tested headlessly. The process model it serves is designed below; wiring the
-   two inner-croft processes and their bootstrap is slice 4.
-4. **Next.** Run one inner croft per participant, wire the editor to produce and
-   consume ops, bootstrap a joining peer, and reconcile with the single-author
-   assumptions catalogued below.
+   tested headlessly.
+4. **Done (0.1.632).** The live wiring: solo-viewport launch on both sides,
+   diff-based op extraction against real buffers, bootstrap, save ownership,
+   and peer carets. Details below.
 
-The remaining work collides with every
-single-author assumption catalogued above: snapshot undo, no apply-edit
-chokepoint, disk-writing code paths that bypass buffers
-(`src/widgets/search.rs:1202`, `src/app/mod.rs:7851`), split views as copies, and
-full-text LSP sync. It is weeks-to-months of foundation work and must not
-gate Phases A through C, which deliver most of the practical value
-(pairing, demos, rescue sessions, code review over SSH) for a fraction of
-the cost. Revisit only if shared-viewport multiplayer proves insufficient
-in real use.
+### Slice 4 as shipped (0.1.632)
+
+The design's per-edit chokepoint problem was solved by **diffing instead of
+refactoring**: each shared file pins the `edit_seq` it last synced at
+(`Editor::collab_synced_seq`); when the seq moves, `text_delta_ops` char-diffs
+the replica's text against the buffer and emits convergent ops
+(`similar::TextDiff`, bounded by a 200ms diff timeout — a timed-out diff is
+coarser but still a valid edit script). Multi-cursor, paste, undo, and
+wholesale reloads all reduce to text-state transitions, and any divergence
+self-heals at the next resync. Three invariants hold, each pinned by tests:
+
+1. **Extract-before-apply, per tick.** `App::poll_collab` diffs local edits
+   into ops before draining inbound ones; the reverse order would re-diff a
+   just-applied remote edit and rebroadcast it (echo storm).
+2. **Echo suppression.** Applying a remote span bumps `edit_seq` (via
+   `apply_span_edits` → `mark_buffer_changed`), so `collab_synced_seq` is
+   re-pinned immediately after; the headless two-App test asserts wire
+   quiescence after convergence.
+3. **One reloader.** Guests suppress disk reload of workspace files (the
+   replica is authoritative); the owner's reload flows through the tick diff,
+   so a git checkout is just a large local edit.
+
+The rest of the shipped shape:
+
+- **Bootstrap.** A guest opening a workspace file broadcasts
+  `SnapshotRequest{file, nonce}`; only the owner answers, with the canonical
+  text plus the cola-encoded replica and an owner-allocated site id (owner is
+  site 1 and the single allocator, so ids never collide; nonces are seeded
+  from the process id so two guests never adopt each other's reply). Ops
+  arriving mid-bootstrap are buffered and replayed (duplicates integrate as
+  no-ops). The file is input-gated (one gate, at the editor key dispatch)
+  until the snapshot lands; with **no owner on the relay the bootstrap times
+  out after 3s** and the file degrades to plain local editing — a deviation
+  from "read-only until ready", chosen so a lone solo guest is not read-only
+  forever.
+- **Backlog correctness.** `CollabDoc::apply_remote` drains cola's causal
+  backlog (out-of-order delivery), stashing insertion text by run identity;
+  silently dropping unmergeable ops (the slice-3 gap) permanently diverged
+  replicas and is RED-tested.
+- **Owner-side tabs.** Answering a request opens the file as a background tab
+  through the normal open machinery, so guest edits land in a real buffer and
+  saves, auto-save, history snapshots, and reload suppression all apply
+  through the one code path.
+- **Save ownership (v1: host owns all files).** Guest Cmd+S and auto-save are
+  no-ops with a status hint for workspace files; guest search Replace All is
+  blocked; guest LSP-rename skips closed-file disk writes (open tabs flow as
+  ops). The owner's search Replace All converges through its own reload-diff
+  rather than rerouting search internals through the buffer (invariant 3
+  makes both equivalent).
+- **Carets.** `CollabMsg::Caret` broadcasts each participant's cursor
+  (throttled to actual moves); peers paint them through the existing
+  `ghost_carets` machinery in the participant's color.
+- **Not shipped, deliberately.** The participants-menu "open solo viewport"
+  action: a viewport is a *process on the guest's machine*, which the host
+  croft cannot conjure over the mux — the affordance is the `--solo` flag on
+  the guest's own launch command. Split views of a shared file: only the
+  first-found tab stays synced, matching the existing
+  split-views-are-independent-copies behavior. Same-file collab docs are
+  keyed per workspace-relative path; files outside the workspace are never
+  shared.
+
+Still deferred (documented, not blockers): shared undo timeline (undo stays
+per-process; undoing a peer's edit is just an edit and converges), shared
+LSP (each croft syncs full text to its own servers), per-file save handoff.
 
 ### Slice 3 design: op transport and the process model
 
