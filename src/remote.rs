@@ -1963,6 +1963,20 @@ fn mux_socket_path(path: Option<&str>) -> String {
     )
 }
 
+/// Remote socket carrying Phase D collab ops between independent-viewport
+/// participants (never PTY bytes): same keying as the dtach and mux sockets,
+/// its own endpoint (see docs/MULTIPLAYER.md).
+#[allow(dead_code)] // consumer lands with the solo-viewport launch (slice 4d)
+fn collab_socket_path(path: Option<&str>) -> String {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(path.unwrap_or("").as_bytes());
+    format!(
+        "$HOME/.cache/croft/sessions/{:016x}.collab.sock",
+        hasher.finish()
+    )
+}
+
 /// True for ssh's own connection-failure exit code (255), as opposed to any
 /// status the remote croft itself returned. Only this warrants an auto-
 /// reconnect; a real remote crash (e.g. 101) must surface to the user.
@@ -2615,6 +2629,13 @@ Host !blocked *.internal
         assert_ne!(m, a1);
         assert!(m.ends_with(".mux.sock"));
         assert!(m.contains(&relay_session_id("/srv/app")));
+        // The collab socket (Phase D op relay) shares the keying too but is
+        // its own endpoint: it never carries PTY bytes.
+        let c = collab_socket_path(Some("/srv/app"));
+        assert_ne!(c, a1);
+        assert_ne!(c, m);
+        assert!(c.ends_with(".collab.sock"));
+        assert!(c.contains(&relay_session_id("/srv/app")));
     }
 
     #[test]

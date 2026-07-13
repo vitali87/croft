@@ -115,6 +115,16 @@ pub enum CliCommand {
         #[arg(last = true)]
         inner: Vec<String>,
     },
+    /// Internal: the Phase D collab-op relay, a dumb fan-out of CRDT edit ops
+    /// between independent-viewport participants over `<hash>.collab.sock`
+    /// (see docs/MULTIPLAYER.md). Spawned detached by the solo-viewport
+    /// launch; not intended for manual use.
+    #[command(hide = true)]
+    CollabRelay {
+        /// Collab socket path (`<hash>.collab.sock`).
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// One-time setup for the cross-compile fast path used by `croft <host>`:
     /// installs cargo-zigbuild and adds the two rustup targets croft ships
     /// binaries for (x86_64 / aarch64 musl). After this finishes, the
@@ -197,6 +207,7 @@ impl Cli {
                 }
                 Ok(())
             }
+            Some(CliCommand::CollabRelay { socket }) => crate::collab::relay_serve(&socket),
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
             Some(CliCommand::InstallLauncher { path, user, yes }) => {
@@ -828,6 +839,17 @@ mod tests {
                 assert_eq!(inner, vec!["croft", "/work/repo"]);
             }
             _ => panic!("expected SessionHost"),
+        }
+    }
+
+    #[test]
+    fn parses_collab_relay_subcommand() {
+        let cli = Cli::parse_from(["croft", "collab-relay", "--socket", "/x/s.collab.sock"]);
+        match cli.command {
+            Some(CliCommand::CollabRelay { socket }) => {
+                assert_eq!(socket, PathBuf::from("/x/s.collab.sock"));
+            }
+            _ => panic!("expected CollabRelay"),
         }
     }
 

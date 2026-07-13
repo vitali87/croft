@@ -50,6 +50,14 @@ fn mux_socket_path(workspace: &Path) -> PathBuf {
     sessions_dir().join(format!("{}.mux.sock", socket_name(workspace)))
 }
 
+/// Socket carrying Phase D collab ops between independent-viewport
+/// participants (never PTY bytes), sibling to the mux socket with the same
+/// keying (see docs/MULTIPLAYER.md).
+#[allow(dead_code)] // consumer lands with the solo-viewport launch (slice 4d)
+pub(crate) fn collab_socket_path(workspace: &Path) -> PathBuf {
+    sessions_dir().join(format!("{}.collab.sock", socket_name(workspace)))
+}
+
 fn meta_path(socket: &Path) -> PathBuf {
     socket.with_extension("json")
 }
@@ -293,6 +301,20 @@ mod tests {
         assert_ne!(a1, b);
         assert!(a1.to_string_lossy().contains(".cache/croft/sessions"));
         assert_eq!(a1.extension().and_then(|e| e.to_str()), Some("sock"));
+    }
+
+    #[test]
+    fn collab_socket_shares_keying_but_not_name_with_the_mux_socket() {
+        let ws = Path::new("/work/repo");
+        let collab = collab_socket_path(ws);
+        assert_eq!(collab, collab_socket_path(ws), "keying must be stable");
+        assert!(
+            collab
+                .to_string_lossy()
+                .ends_with(&format!("{}.collab.sock", socket_name(ws)))
+        );
+        assert_ne!(collab, mux_socket_path(ws));
+        assert_ne!(collab, socket_path(ws));
     }
 
     #[test]
