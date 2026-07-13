@@ -52,6 +52,17 @@ pub enum Control {
     Detach,
     /// Host to clients: the inner croft exited with `code`; session over.
     Exit { code: i32 },
+    /// First message of the inner croft's control channel instead of Hello:
+    /// authenticates with the token the host put in CROFT_SESSION_TOKEN. A
+    /// privileged channel is not a participant (no roster entry, no PTY
+    /// broadcast) and may grant/revoke/kick unconditionally, because every
+    /// keystroke reaching the inner croft's UI already came from a
+    /// control-holding client (read-only input is dropped at the host).
+    Inner { token: String },
+    /// Disconnect participant `id` (their session keeps running; the client
+    /// pump exits as on a detach). Honored from a control-holding client or
+    /// the inner channel.
+    Kick { id: u64 },
 }
 
 /// One attached client as reported in [`Control::Presence`].
@@ -170,6 +181,9 @@ struct Host {
     master: Mutex<Box<dyn MasterPty + Send>>,
     last_size: Mutex<(u16, u16)>,
     socket: PathBuf,
+    /// Shared secret for the inner croft's privileged control channel,
+    /// exported to the inner command as CROFT_SESSION_TOKEN.
+    token: String,
 }
 
 /// Run the session server: spawn `inner` on a fresh PTY, listen on `socket`,
@@ -177,6 +191,25 @@ struct Host {
 /// once it terminates (the caller propagates it, so codes like croft's
 /// drop-to-local 88 survive the mux, which dtach never propagated).
 pub fn serve(socket: &Path, workspace: Option<&Path>, inner: &[String]) -> Result<i32> {
+    serve_with_token(socket, workspace, inner, &random_token())
+}
+
+/// A random hex token for the privileged channel. The socket is already
+/// 0600, so this is a discriminator (inner croft vs regular participant),
+/// not the trust boundary; account possession remains that.
+fn random_token() -> String {
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 16];
+    let _ = ring::rand::SystemRandom::new().fill(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub(crate) fn serve_with_token(
+    socket: &Path,
+    workspace: Option<&Path>,
+    inner: &[String],
+    token: &str,
+) -> Result<i32> {
     anyhow::ensure!(
         !inner.is_empty(),
         "session-host needs an inner command after --"
@@ -216,6 +249,10 @@ pub fn serve(socket: &Path, workspace: Option<&Path>, inner: &[String]) -> Resul
     // The inner croft re-asserts terminal modes on WINCH under this flag
     // (the dead-mouse-on-reattach fix); the mux relies on that machinery.
     cmd.env("CROFT_SESSION_PERSISTENT", "1");
+    // Let the inner croft find its host and authenticate a privileged
+    // control channel (participants UI: grant/revoke/kick).
+    cmd.env("CROFT_SESSION_SOCKET", socket.as_os_str());
+    cmd.env("CROFT_SESSION_TOKEN", token);
     let mut child = pair
         .slave
         .spawn_command(cmd)
@@ -233,6 +270,7 @@ pub fn serve(socket: &Path, workspace: Option<&Path>, inner: &[String]) -> Resul
         master: Mutex::new(pair.master),
         last_size: Mutex::new((80, 24)),
         socket: socket.to_path_buf(),
+        token: token.to_string(),
     });
 
     // PTY output -> every client, verbatim (byte-transparent broadcast).
@@ -348,6 +386,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
     let mut reader = FrameReader::new();
     let mut buf = [0u8; 16384];
     let mut my_id: Option<u64> = None;
+    let mut privileged = false;
     'conn: loop {
         let n = match stream.read(&mut buf) {
             Ok(0) | Err(_) => break,
@@ -355,7 +394,14 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
         };
         for frame in reader.push(&buf[..n]) {
             match frame {
-                Frame::Control(Control::Hello { name, cols, rows }) if my_id.is_none() => {
+                Frame::Control(Control::Inner { token })
+                    if my_id.is_none() && token == host.token =>
+                {
+                    privileged = true;
+                }
+                Frame::Control(Control::Hello { name, cols, rows })
+                    if my_id.is_none() && !privileged =>
+                {
                     let id = host.next_id.fetch_add(1, Ordering::Relaxed);
                     my_id = Some(id);
                     {
@@ -405,10 +451,13 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                     update_presence(host);
                 }
                 Frame::Control(Control::Grant { id: target }) => {
-                    set_control(host, my_id, target, true);
+                    set_control(host, privileged, my_id, target, true);
                 }
                 Frame::Control(Control::Revoke { id: target }) => {
-                    set_control(host, my_id, target, false);
+                    set_control(host, privileged, my_id, target, false);
+                }
+                Frame::Control(Control::Kick { id: target }) => {
+                    kick(host, privileged, my_id, target);
                 }
                 Frame::Control(Control::Detach) => break 'conn,
                 _ => {}
@@ -426,13 +475,14 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
 }
 
 /// Grant or revoke write control on `target`, but only when the requester
-/// itself holds control: read-only guests cannot promote themselves.
-fn set_control(host: &Host, requester: Option<u64>, target: u64, grant: bool) {
-    let Some(requester) = requester else { return };
+/// is the privileged inner channel or itself holds control: read-only
+/// guests cannot promote themselves.
+fn set_control(host: &Host, privileged: bool, requester: Option<u64>, target: u64, grant: bool) {
     let changed = {
         let mut clients = host.clients.lock().unwrap();
-        let requester_has_control = clients.iter().any(|c| c.id == requester && c.control);
-        if !requester_has_control {
+        let allowed = privileged
+            || requester.is_some_and(|id| clients.iter().any(|c| c.id == id && c.control));
+        if !allowed {
             false
         } else {
             match clients.iter_mut().find(|c| c.id == target) {
@@ -446,6 +496,21 @@ fn set_control(host: &Host, requester: Option<u64>, target: u64, grant: bool) {
     };
     if changed {
         update_presence(host);
+    }
+}
+
+/// Disconnect participant `target` (privileged channel or a control holder
+/// only). Shutting the stream down unblocks the target's client thread,
+/// which then deregisters and updates presence itself.
+fn kick(host: &Host, privileged: bool, requester: Option<u64>, target: u64) {
+    let clients = host.clients.lock().unwrap();
+    let allowed =
+        privileged || requester.is_some_and(|id| clients.iter().any(|c| c.id == id && c.control));
+    if !allowed {
+        return;
+    }
+    if let Some(c) = clients.iter().find(|c| c.id == target) {
+        let _ = c.tx.lock().unwrap().shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -611,6 +676,64 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<i32> {
             }
         }
     }
+}
+
+/// The inner croft's privileged handle to its session host: lets the
+/// participants UI grant/revoke write control and disconnect clients.
+/// Fire-and-forget writes; the host answers through the presence sidecar,
+/// which the app already polls.
+pub struct InnerChannel {
+    stream: UnixStream,
+    /// The presence sidecar this session's host maintains.
+    pub presence: PathBuf,
+}
+
+impl InnerChannel {
+    /// Connect using the CROFT_SESSION_SOCKET / CROFT_SESSION_TOKEN pair the
+    /// host put in the inner croft's environment; None when not running
+    /// under a session host.
+    pub fn from_env() -> Option<Self> {
+        let socket = PathBuf::from(std::env::var_os("CROFT_SESSION_SOCKET")?);
+        let token = std::env::var("CROFT_SESSION_TOKEN").ok()?;
+        Self::connect(&socket, &token)
+    }
+
+    pub fn connect(socket: &Path, token: &str) -> Option<Self> {
+        let mut stream = UnixStream::connect(socket).ok()?;
+        stream
+            .write_all(&encode_control_frame(&Control::Inner {
+                token: token.to_string(),
+            }))
+            .ok()?;
+        Some(Self {
+            stream,
+            presence: presence_path(socket),
+        })
+    }
+
+    pub fn set_control(&mut self, id: u64, grant: bool) -> bool {
+        let control = if grant {
+            Control::Grant { id }
+        } else {
+            Control::Revoke { id }
+        };
+        self.stream
+            .write_all(&encode_control_frame(&control))
+            .is_ok()
+    }
+
+    pub fn kick(&mut self, id: u64) -> bool {
+        self.stream
+            .write_all(&encode_control_frame(&Control::Kick { id }))
+            .is_ok()
+    }
+}
+
+/// Parse a presence sidecar. None when the file is missing or torn (it is
+/// written atomically, so torn in practice means "host gone").
+pub fn read_presence(path: &Path) -> Option<Vec<Participant>> {
+    let json = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&json).ok()
 }
 
 /// `user@host`, the identity other participants see in the roster.
@@ -813,8 +936,12 @@ mod tests {
         })
     }
 
+    const TEST_TOKEN: &str = "test-token";
+
     fn spawn_test_server(socket: PathBuf) -> std::thread::JoinHandle<i32> {
-        std::thread::spawn(move || serve(&socket, None, &[String::from("cat")]).expect("serve"))
+        std::thread::spawn(move || {
+            serve_with_token(&socket, None, &[String::from("cat")], TEST_TOKEN).expect("serve")
+        })
     }
 
     fn wait_alive(socket: &Path) {
@@ -972,5 +1099,150 @@ mod tests {
             matches!(f, Frame::Control(Control::Presence { participants })
                 if participants.iter().any(|p| p.name == "guest" && !p.control))
         });
+    }
+
+    /// A raw connection that authenticates as the inner croft's privileged
+    /// control channel (no Hello, so it never becomes a participant).
+    fn connect_inner(socket: &Path, token: &str) -> UnixStream {
+        let mut stream = UnixStream::connect(socket).expect("connect inner");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(600)))
+            .unwrap();
+        stream
+            .write_all(&encode_control_frame(&Control::Inner {
+                token: String::from(token),
+            }))
+            .expect("send inner hello");
+        stream
+    }
+
+    #[test]
+    fn inner_channel_grants_revokes_and_kicks_without_joining_the_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut a = TestClient::connect(&socket, "owner", 80, 24);
+        a.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut inner = connect_inner(&socket, TEST_TOKEN);
+        let mut b = TestClient::connect(&socket, "guest", 80, 24);
+        let frames = b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        // The privileged channel is not a participant: the roster stays at 2.
+        let ps = roster(&frames).unwrap();
+        assert_eq!(ps.len(), 2);
+        let guest_id = ps.iter().find(|p| p.name == "guest").unwrap().id;
+
+        // Inner channel grants the guest control.
+        inner
+            .write_all(&encode_control_frame(&Control::Grant { id: guest_id }))
+            .unwrap();
+        b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.name == "guest" && p.control))
+        });
+        // ...and revokes it.
+        inner
+            .write_all(&encode_control_frame(&Control::Revoke { id: guest_id }))
+            .unwrap();
+        b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.name == "guest" && !p.control))
+        });
+
+        // The privileged channel never receives PTY broadcast bytes.
+        a.send(&encode_bytes_frame(b"noise\r"));
+        a.read_until(
+            |f| matches!(f, Frame::Bytes(bytes) if bytes.windows(5).any(|w| w == b"noise")),
+        );
+        let mut probe = [0u8; 64];
+        assert!(
+            inner.read(&mut probe).is_err(),
+            "privileged channel must stay silent (got broadcast bytes)"
+        );
+
+        // Kick disconnects the guest; the roster shrinks to the owner.
+        inner
+            .write_all(&encode_control_frame(&Control::Kick { id: guest_id }))
+            .unwrap();
+        let frames = a.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
+        });
+        assert_eq!(roster(&frames).unwrap()[0].name, "owner");
+    }
+
+    #[test]
+    fn inner_channel_api_drives_grant_and_presence_sidecar_reflects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut a = TestClient::connect(&socket, "owner", 80, 24);
+        a.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut b = TestClient::connect(&socket, "guest", 80, 24);
+        let frames = b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        let guest_id = roster(&frames)
+            .unwrap()
+            .iter()
+            .find(|p| p.name == "guest")
+            .unwrap()
+            .id;
+
+        let mut channel = InnerChannel::connect(&socket, TEST_TOKEN).expect("channel");
+        assert_eq!(channel.presence, presence_path(&socket));
+        assert!(channel.set_control(guest_id, true));
+        b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.name == "guest" && p.control))
+        });
+        let ps = read_presence(&channel.presence).expect("sidecar");
+        assert!(ps.iter().any(|p| p.name == "guest" && p.control));
+        assert!(channel.kick(guest_id));
+        a.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
+        });
+    }
+
+    #[test]
+    fn inner_channel_with_wrong_token_is_powerless() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut a = TestClient::connect(&socket, "owner", 80, 24);
+        a.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut impostor = connect_inner(&socket, "wrong-token");
+        let mut b = TestClient::connect(&socket, "guest", 80, 24);
+        let frames = b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        let guest_id = roster(&frames)
+            .unwrap()
+            .iter()
+            .find(|p| p.name == "guest")
+            .unwrap()
+            .id;
+
+        // A wrong-token channel cannot grant; the guest stays read-only
+        // through a subsequent legitimate roster update (owner's resize).
+        impostor
+            .write_all(&encode_control_frame(&Control::Grant { id: guest_id }))
+            .unwrap();
+        a.send(&encode_control_frame(&Control::Resize {
+            cols: 81,
+            rows: 24,
+        }));
+        let frames = b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.name == "owner" && p.cols == 81))
+        });
+        let ps = roster(&frames).unwrap();
+        assert!(!ps.iter().find(|p| p.name == "guest").unwrap().control);
     }
 }

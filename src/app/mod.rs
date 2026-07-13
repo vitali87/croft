@@ -2632,6 +2632,17 @@ pub struct App {
     /// Single-choice picker for SCM ops that act on one of a git-owned list
     /// (apply/pop/drop a stash, delete a tag, remove/push-to a remote).
     pub list_picker: Option<crate::widgets::list_picker::ListPicker>,
+    /// Privileged control channel to this session's host when running under
+    /// a persistent multiplayer session (docs/MULTIPLAYER.md); drives the
+    /// participants picker's grant/revoke/disconnect actions. None outside
+    /// a session host.
+    pub session_channel: Option<crate::session_host::InnerChannel>,
+    /// Roster last read from the session host's presence sidecar.
+    pub session_participants: Vec<crate::session_host::Participant>,
+    /// Sidecar mtime at the last roster read, so the poll is a cheap stat.
+    session_presence_mtime: Option<std::time::SystemTime>,
+    /// Cadence gate for the presence poll (stat every 500ms, not every tick).
+    last_session_presence_poll: std::time::Instant,
     /// Rolling log of git commands croft has run and their summaries, shown
     /// read-only by the "Show Git Output" action (VS Code's Git channel).
     pub git_output_log: Vec<String>,
@@ -3457,6 +3468,10 @@ impl App {
             scm_menu: crate::widgets::scm_menu::ScmMenuState::default(),
             input_prompt: None,
             list_picker: None,
+            session_channel: crate::session_host::InnerChannel::from_env(),
+            session_participants: Vec::new(),
+            session_presence_mtime: None,
+            last_session_presence_poll: std::time::Instant::now(),
             git_output_log: Vec::new(),
             pending_discard_all: false,
             file_finder_index: None,
@@ -10912,6 +10927,19 @@ impl App {
             ));
             spans.push(Span::raw("  "));
         }
+        // Multiplayer roster badge: how many clients are attached to this
+        // persistent session, painted only when someone else is here
+        // (manage them via Session: Participants, Cmd+K A).
+        if self.session_participants.len() > 1 {
+            spans.push(Span::styled(
+                format!(" \u{f0c0} {} attached ", self.session_participants.len()),
+                Style::default()
+                    .bg(Color::Rgb(0x2f, 0x6f, 0xd0))
+                    .fg(Color::Rgb(0xff, 0xff, 0xff))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("  "));
+        }
         // Diagnostics counts (click → PROBLEMS), VS Code-style, after git.
         // Always shown so the bar reads as a health indicator at a glance.
         let err_count = self.problems.error_count();
@@ -12167,6 +12195,12 @@ impl App {
             // Cmd+K Cmd+T / Cmd+K T: open the Color Theme picker.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'t') => {
                 self.open_theme_picker();
+                true
+            }
+            // Cmd+K A: who is attached to this multiplayer session
+            // (Session: Participants).
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'a') => {
+                self.open_participants_picker();
                 true
             }
             // Cmd+K Shift+Cmd+\: open a second view of the active file beside it
@@ -15298,6 +15332,127 @@ impl App {
         }
     }
 
+    /// "Session: Participants" (Cmd+K A): who is attached to this
+    /// multiplayer session, from the host's presence sidecar
+    /// (docs/MULTIPLAYER.md). Enter on a row opens the action picker.
+    fn open_participants_picker(&mut self) {
+        if self.session_channel.is_none() {
+            self.status = String::from("Not a persistent session (start one with `croft attach`)");
+            return;
+        }
+        let rows: Vec<crate::widgets::list_picker::ListRow> = self
+            .session_participants
+            .iter()
+            .map(participant_row)
+            .collect();
+        let picker = crate::widgets::list_picker::ListPicker::new(
+            crate::widgets::list_picker::ListPurpose::SessionParticipant,
+            "Session Participants",
+            rows,
+        );
+        self.open_list_picker(picker, "No participants yet");
+    }
+
+    /// Second-level picker for one participant: grant or revoke write
+    /// control, or disconnect them. Safe to expose to every attacher: a
+    /// read-only guest's keystrokes are dropped at the session host, so any
+    /// key that reaches this UI came from a control-holding client.
+    fn open_participant_actions(&mut self, id: u64) {
+        let Some(p) = self.session_participants.iter().find(|p| p.id == id) else {
+            return;
+        };
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let control_row = if p.control {
+            ListRow {
+                id: format!("revoke:{id}"),
+                label: String::from("Revoke write control"),
+            }
+        } else {
+            ListRow {
+                id: format!("grant:{id}"),
+                label: String::from("Grant write control"),
+            }
+        };
+        let rows = vec![
+            control_row,
+            ListRow {
+                id: format!("kick:{id}"),
+                label: String::from("Disconnect"),
+            },
+        ];
+        let picker = ListPicker::new(ListPurpose::SessionParticipantAction, p.name.clone(), rows);
+        self.open_list_picker(picker, "No actions");
+    }
+
+    /// Send a participant action to the session host and report it. The
+    /// roster update comes back through the presence poll.
+    fn run_participant_action(&mut self, verb: ParticipantVerb, id: u64) {
+        let name = self
+            .session_participants
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| format!("participant {id}"));
+        let Some(channel) = self.session_channel.as_mut() else {
+            return;
+        };
+        let ok = match verb {
+            ParticipantVerb::Grant => channel.set_control(id, true),
+            ParticipantVerb::Revoke => channel.set_control(id, false),
+            ParticipantVerb::Kick => channel.kick(id),
+        };
+        self.status = if ok {
+            match verb {
+                ParticipantVerb::Grant => format!("Granted write control to {name}"),
+                ParticipantVerb::Revoke => format!("Revoked write control from {name}"),
+                ParticipantVerb::Kick => format!("Disconnected {name}"),
+            }
+        } else {
+            String::from("Session host unreachable")
+        };
+    }
+
+    /// Poll the session host's presence sidecar (multiplayer roster): a stat
+    /// every 500ms, reparse only when the mtime moves. Surfaces joins and
+    /// leaves in the status line and keeps an open participants picker live.
+    fn poll_session_presence(&mut self) -> bool {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        let Some(channel) = self.session_channel.as_ref() else {
+            return false;
+        };
+        if self.last_session_presence_poll.elapsed() < INTERVAL {
+            return false;
+        }
+        self.last_session_presence_poll = std::time::Instant::now();
+        let path = channel.presence.clone();
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if mtime == self.session_presence_mtime {
+            return false;
+        }
+        self.session_presence_mtime = mtime;
+        let roster = crate::session_host::read_presence(&path).unwrap_or_default();
+        if roster == self.session_participants {
+            return false;
+        }
+        let before = self.session_participants.len();
+        let after = roster.len();
+        self.session_participants = roster;
+        // before == 0 is the initial self-only read; not worth announcing.
+        if after > before && before > 0 {
+            self.status = format!(
+                "A participant attached read-only ({after} attached). Manage via Session: Participants (Cmd+K A)"
+            );
+        } else if after < before {
+            self.status = format!("A participant detached ({after} attached)");
+        }
+        if self.list_picker.as_ref().is_some_and(|p| {
+            p.purpose == crate::widgets::list_picker::ListPurpose::SessionParticipant
+        }) {
+            self.open_participants_picker();
+        }
+        true
+    }
+
     /// Act on the row chosen in the list picker.
     fn confirm_list_picker(&mut self) {
         use crate::widgets::list_picker::ListPurpose;
@@ -15352,6 +15507,16 @@ impl App {
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
                     self.run_project_task(task);
+                }
+            }
+            ListPurpose::SessionParticipant => {
+                if let Ok(id) = row.id.parse::<u64>() {
+                    self.open_participant_actions(id);
+                }
+            }
+            ListPurpose::SessionParticipantAction => {
+                if let Some((verb, id)) = parse_participant_action(&row.id) {
+                    self.run_participant_action(verb, id);
                 }
             }
             ListPurpose::Settings => {
@@ -20836,6 +21001,7 @@ impl App {
             Cmd::ToggleRaisedExceptions => self.debug_toggle_raised_exceptions(),
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),
+            Cmd::SessionParticipants => self.open_participants_picker(),
             Cmd::RunTask => self.open_run_task_picker(),
             Cmd::RunBuildTask => self.run_build_task(),
             Cmd::RerunLastTask => self.rerun_last_task(),
@@ -29939,6 +30105,41 @@ mod tests;
 
 /// Stdout wrapper that tallies every byte ratatui flushes through the
 /// backend. The main loop reads + resets the counter once per frame to
+/// Action verb parsed from a participant-action row id (`grant:3` etc.).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParticipantVerb {
+    Grant,
+    Revoke,
+    Kick,
+}
+
+/// Parse a participants action-picker row id back into (verb, participant).
+fn parse_participant_action(id: &str) -> Option<(ParticipantVerb, u64)> {
+    let (verb, id) = id.split_once(':')?;
+    let id = id.parse().ok()?;
+    let verb = match verb {
+        "grant" => ParticipantVerb::Grant,
+        "revoke" => ParticipantVerb::Revoke,
+        "kick" => ParticipantVerb::Kick,
+        _ => return None,
+    };
+    Some((verb, id))
+}
+
+/// The roster row shown for one participant: name, window size, role.
+fn participant_row(p: &crate::session_host::Participant) -> crate::widgets::list_picker::ListRow {
+    let role = if p.control { "write" } else { "read-only" };
+    let size = if p.cols > 0 && p.rows > 0 {
+        format!("{}\u{d7}{}", p.cols, p.rows)
+    } else {
+        String::from("size unknown")
+    };
+    crate::widgets::list_picker::ListRow {
+        id: p.id.to_string(),
+        label: format!("{}  {}  ({})", p.name, size, role),
+    }
+}
+
 /// surface the per-frame payload size in the F8 perf HUD.
 struct CountingWriter {
     inner: Stdout,
@@ -30457,6 +30658,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let ports_changed = app.drain_ports_and_poll();
+        let session_presence_changed = app.poll_session_presence();
         let bells_changed = app.drain_terminal_bells();
         let labels_changed = app.refresh_terminal_labels();
         let auto_save_changed = app.tick_auto_save();
@@ -30533,6 +30735,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || remote_changed
             || pulls_changed
             || ports_changed
+            || session_presence_changed
             || bells_changed
             || labels_changed
             || auto_save_changed

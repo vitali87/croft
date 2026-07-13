@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Multiplayer sessions: `croft attach` (and `croft <host>`) now run under croft's own session host instead of dtach — several people can attach the same workspace and share the session live, with the first attacher holding write control, later attachers joining read-only (enforced server-side), everyone sized to the smallest window, and no external dependency; existing dtach sessions keep working until they end.",
+    summary: "Multiplayer participants UI: in a shared session the status bar now shows an \"N attached\" badge, joins and leaves are announced, and \"Session: Participants\" (Cmd+K A) lists everyone attached so you can grant or revoke write control or disconnect a participant — powered by a token-authenticated control channel between croft and its session host.",
 }];

@@ -41,6 +41,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | Keys | Action |
 |------|--------|
 | `Cmd+K` `Cmd+T` | Open the Color Theme picker |
+| `Cmd+K` `A` | Session: Participants (who is attached to this persistent session); `Enter` on a row grants/revokes write control or disconnects them |
 | `Cmd+K` `→` | Close the editor tabs to the right of the active one |
 | `Cmd+K` `S` | Select the active file as the compare anchor |
 | `Cmd+K` `C` | Diff the active file against the compare anchor |
@@ -89,6 +90,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Debug: Toggle Break on Raised Exceptions | `Alt`+`F9` | Break on raised (not just uncaught) exceptions |
 | Debug: Attach to Python Process | `Ctrl`+`F5` | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
 | Preferences: Color Theme | `Cmd`+`K` `Cmd`+`T` | Pick the active color theme (also via the settings gear) |
+| Session: Participants | `Cmd`+`K` `A` | List who is attached to this multiplayer session (docs/MULTIPLAYER.md); pick a participant to grant/revoke write control or disconnect them. The status bar shows an "N attached" badge whenever someone else is on |
 
 **Terminal: Search & Replace from Last grep/rg** (palette-only) reads the last `grep`/`rg`/`git grep` command run in the focused terminal, seeds the Search sidebar with its pattern and matching flags (`-i`, `-w`, `-F`/`-E`, `-g`), and runs it. The terminal search becomes the Search panel's results list, so you can replace across every match at once (`:cdo`-style) with the replace-all it already has.
 

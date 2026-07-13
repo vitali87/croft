@@ -18841,3 +18841,49 @@ fn alt_screen_upward_drag_through_the_real_mouse_pipeline_selects_upward() {
         "the extracted text names the rows the pointer actually crossed"
     );
 }
+
+#[test]
+fn participant_action_ids_round_trip() {
+    assert_eq!(
+        parse_participant_action("grant:3"),
+        Some((ParticipantVerb::Grant, 3))
+    );
+    assert_eq!(
+        parse_participant_action("revoke:0"),
+        Some((ParticipantVerb::Revoke, 0))
+    );
+    assert_eq!(
+        parse_participant_action("kick:12"),
+        Some((ParticipantVerb::Kick, 12))
+    );
+    assert_eq!(parse_participant_action("grant:"), None);
+    assert_eq!(parse_participant_action("promote:1"), None);
+    assert_eq!(parse_participant_action("grant"), None);
+}
+
+#[test]
+fn participant_rows_show_role_and_size() {
+    let p = crate::session_host::Participant {
+        id: 7,
+        name: String::from("vitali@mac"),
+        cols: 120,
+        rows: 40,
+        control: true,
+    };
+    let row = participant_row(&p);
+    assert_eq!(row.id, "7");
+    assert!(row.label.contains("vitali@mac"));
+    assert!(row.label.contains("120\u{d7}40"));
+    assert!(row.label.contains("write"));
+    // Read-only guest with an unknown size (0x0 under `script`).
+    let p = crate::session_host::Participant {
+        id: 8,
+        name: String::from("guest@box"),
+        cols: 0,
+        rows: 0,
+        control: false,
+    };
+    let row = participant_row(&p);
+    assert!(row.label.contains("read-only"));
+    assert!(!row.label.contains("0\u{d7}0"));
+}

@@ -113,6 +113,9 @@ pub enum Command {
     RunBuildTask,
     RerunLastTask,
     SearchFromTerminal,
+    /// Multiplayer: list who is attached to this persistent session and
+    /// grant/revoke write control or disconnect them (docs/MULTIPLAYER.md).
+    SessionParticipants,
 }
 
 /// Every command, in palette display order. Single source of truth for both
@@ -206,6 +209,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::OpenTriggersJson,
     Command::ToggleTerminalTimestamps,
     Command::SearchFromTerminal,
+    Command::SessionParticipants,
 ];
 
 impl Command {
@@ -301,6 +305,7 @@ impl Command {
             Command::OpenTriggersJson => "Preferences: Open Terminal Triggers (JSON)",
             Command::ToggleTerminalTimestamps => "Terminal: Toggle Timestamps",
             Command::SearchFromTerminal => "Terminal: Search & Replace from Last grep/rg",
+            Command::SessionParticipants => "Session: Participants",
         }
     }
 
@@ -400,6 +405,7 @@ impl Command {
             Command::OpenTriggersJson => "",
             Command::ToggleTerminalTimestamps => "",
             Command::SearchFromTerminal => "",
+            Command::SessionParticipants => "Cmd+K A",
         }
         // No catch-all: every Command must carry an accelerator (croft tenet),
         // so adding a variant fails to compile until its hint is supplied.
@@ -496,6 +502,7 @@ impl Command {
             Command::OpenTriggersJson => "open_triggers_json",
             Command::ToggleTerminalTimestamps => "toggle_terminal_timestamps",
             Command::SearchFromTerminal => "search_from_terminal",
+            Command::SessionParticipants => "session_participants",
             Command::RunTask => "run_task",
             Command::RunBuildTask => "run_build_task",
             Command::RerunLastTask => "rerun_last_task",

@@ -39,6 +39,13 @@ pub enum ListPurpose {
     /// boolean setting (`id` = `toggle:<field>`) or run a follow-up command
     /// (`id` = `cmd:<command_id>`, e.g. open a JSON file or the theme picker).
     Settings,
+    /// Multiplayer session roster (Session: Participants): the rows are the
+    /// clients attached to this session's host; `id` is the participant id.
+    /// Enter opens the per-participant action picker.
+    SessionParticipant,
+    /// Action on one participant: `id` is `grant:<id>` / `revoke:<id>` /
+    /// `kick:<id>`, applied through the session host's control channel.
+    SessionParticipantAction,
 }
 
 /// One selectable row: a stable `id` the App acts on (a stash index, a

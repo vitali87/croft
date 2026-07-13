@@ -4,11 +4,14 @@ Status: PR 3a (the `session-host` mux, src/session_host.rs) SHIPPED in
 0.1.627: server, client pump, frame protocol, min-of-clients winsize,
 server-side read-only with grant/revoke, presence sidecar plus frames, exit
 code propagation, wired into `croft attach` and the remote launch tail with
-a dtach fallback. PR 3b (participants UI in the inner croft) and PR 3c
-(attributed carets) are next; the rest of this document is the design they
-follow. It exists so the multiplayer pillar starts from croft's real
-architecture instead of from a Live Share mental model that does not fit a
-single-process TUI.
+a dtach fallback. PR 3b (participants UI) SHIPPED in 0.1.628: the host
+exports a token-authenticated privileged control channel to the inner croft
+(Inner/Kick verbs), which polls the presence sidecar, shows an "N attached"
+status badge, announces joins and leaves, and drives grant/revoke/disconnect
+from Session: Participants (Cmd+K A). PR 3c (attributed carets) is next;
+the rest of this document is the design it follows. It exists so the
+multiplayer pillar starts from croft's real architecture instead of from a
+Live Share mental model that does not fit a single-process TUI.
 
 ## Goal
 
