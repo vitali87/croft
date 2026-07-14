@@ -19126,6 +19126,17 @@ fn collab_stream_state_drives_the_badge_and_cancel_broadcasts() {
         owner.status
     );
 
+    // The relay is a dumb fan-out with no replay, so the owner must be
+    // connected BEFORE the pilot broadcasts or the message is simply lost
+    // (poll_collab's lazy connect is throttled and can lose that race
+    // under a contended parallel suite).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while owner.collab.is_none() {
+        assert!(Instant::now() < deadline, "owner never joined the relay");
+        owner.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
     // A pilot stand-in seat on the same relay.
     let mut pilot = {
         let deadline = Instant::now() + Duration::from_secs(5);
