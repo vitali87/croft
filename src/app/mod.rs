@@ -10543,6 +10543,15 @@ impl App {
                     }
                 }
             }
+            // Gutter stop button for an AI stream into the active file; the
+            // hoisted group is the only one that shows it (clear the rest so
+            // a group swap never leaves a stale button behind).
+            self.editor.stream_stop_line = self.stream_stop_row();
+            for group in self.editor_layout.inactive_groups_mut() {
+                for ed in &mut group.editors {
+                    ed.stream_stop_line = None;
+                }
+            }
             // Render the editor group layout tree. The active group is hoisted
             // into `self.editor`; every other group lives in `editor_layout`.
             // Lay the leaves out and paint each at its rect (depth-first order),
@@ -12308,6 +12317,13 @@ impl App {
             // (Session: Participants).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'a') => {
                 self.open_participants_picker();
+                true
+            }
+            // Cmd+K X: cancel the AI stream (croft pair) — the keyboard
+            // form of the gutter stop button; the pilot reverts the
+            // streamed text.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'x') => {
+                self.collab_cancel_stream();
                 true
             }
             // Cmd+K Shift+Cmd+\: open a second view of the active file beside it
@@ -15814,8 +15830,6 @@ impl App {
     /// streaming pilot over the relay to stop and revert. The badge clears
     /// when the pilot broadcasts StreamState(inactive), not optimistically —
     /// the revert is the pilot's to confirm.
-    // Callers land with the cancel affordances (follow-up slice).
-    #[allow(dead_code)]
     pub fn collab_cancel_stream(&mut self) {
         let Some(stream) = &self.collab_stream else {
             self.status = "No AI stream is active".into();
@@ -15827,6 +15841,29 @@ impl App {
         };
         session.send_stream_cancel();
         self.status = format!("Asked {} to stop streaming", stream.name);
+    }
+
+    /// The buffer row wearing the gutter stop button: the pilot's ghost
+    /// caret row when the streamed file is active here (the button rides
+    /// the stream), else the top visible row so the button is always in
+    /// view; None when no stream targets the active file.
+    fn stream_stop_row(&self) -> Option<usize> {
+        let stream = self.collab_stream.as_ref()?;
+        let active = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&self.tree.root, p))?;
+        if active != stream.file {
+            return None;
+        }
+        Some(
+            self.collab_carets
+                .get(&stream.site)
+                .filter(|c| c.file == stream.file)
+                .map(|c| c.row)
+                .unwrap_or(self.editor.scroll),
+        )
     }
 
     /// The owner's current text for a file a guest asked to share: the open
@@ -21482,6 +21519,7 @@ impl App {
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),
             Cmd::SessionParticipants => self.open_participants_picker(),
+            Cmd::CollabCancelStream => self.collab_cancel_stream(),
             Cmd::RunTask => self.open_run_task_picker(),
             Cmd::RunBuildTask => self.run_build_task(),
             Cmd::RerunLastTask => self.rerun_last_task(),
@@ -24842,6 +24880,14 @@ impl App {
                             self.editor_click.record(now, m.column, m.row);
                         }
                         self.poke_cursor();
+                        return;
+                    }
+                    // AI-stream stop button in the sign margin: cancel the
+                    // pilot's stream (it reverts the streamed text). Checked
+                    // before the play glyph, whose cell it borrows while a
+                    // stream is live.
+                    if self.editor.stream_stop_at(m.column, m.row) {
+                        self.collab_cancel_stream();
                         return;
                     }
                     // Gutter play glyph: run the test fn defined on the
@@ -30647,8 +30693,6 @@ struct CollabCaret {
 struct CollabStreamInfo {
     file: String,
     name: String,
-    // Consumed by the gutter stop button (follow-up slice).
-    #[allow(dead_code)]
     site: u64,
 }
 

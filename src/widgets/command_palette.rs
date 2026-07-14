@@ -116,6 +116,9 @@ pub enum Command {
     /// Multiplayer: list who is attached to this persistent session and
     /// grant/revoke write control or disconnect them (docs/MULTIPLAYER.md).
     SessionParticipants,
+    /// Cancel the AI pilot's token stream into a shared file; the pilot
+    /// reverts the streamed text (`croft pair`, docs/MULTIPLAYER.md).
+    CollabCancelStream,
 }
 
 /// Every command, in palette display order. Single source of truth for both
@@ -210,6 +213,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleTerminalTimestamps,
     Command::SearchFromTerminal,
     Command::SessionParticipants,
+    Command::CollabCancelStream,
 ];
 
 impl Command {
@@ -306,6 +310,7 @@ impl Command {
             Command::ToggleTerminalTimestamps => "Terminal: Toggle Timestamps",
             Command::SearchFromTerminal => "Terminal: Search & Replace from Last grep/rg",
             Command::SessionParticipants => "Session: Participants",
+            Command::CollabCancelStream => "Collab: Cancel AI Stream",
         }
     }
 
@@ -406,6 +411,7 @@ impl Command {
             Command::ToggleTerminalTimestamps => "",
             Command::SearchFromTerminal => "",
             Command::SessionParticipants => "Cmd+K A",
+            Command::CollabCancelStream => "Cmd+K X",
         }
         // No catch-all: every Command must carry an accelerator (croft tenet),
         // so adding a variant fails to compile until its hint is supplied.
@@ -503,6 +509,7 @@ impl Command {
             Command::ToggleTerminalTimestamps => "toggle_terminal_timestamps",
             Command::SearchFromTerminal => "search_from_terminal",
             Command::SessionParticipants => "session_participants",
+            Command::CollabCancelStream => "collab_cancel_stream",
             Command::RunTask => "run_task",
             Command::RunBuildTask => "run_build_task",
             Command::RerunLastTask => "rerun_last_task",

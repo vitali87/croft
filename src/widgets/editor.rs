@@ -1393,6 +1393,11 @@ pub struct Editor {
     /// below when the caret sits on the viewport's top row. The App
     /// rebuilds this before each render alongside `ghost_carets`.
     pub ghost_caret_labels: Vec<(usize, usize, String, Color)>,
+    /// The 0-based buffer line wearing the AI-stream stop button in the
+    /// sign margin (`croft pair`): clicking it — or Cmd+K X — cancels the
+    /// stream and reverts the streamed text. The App rebuilds this before
+    /// each render from the stream state and the pilot's ghost caret.
+    pub stream_stop_line: Option<usize>,
     /// Enclosing scope header lines to pin at the top of the viewport (VS Code
     /// "Sticky Scroll"), outermost first, set by `App` from the outline scope
     /// chain of the top visible line. Empty disables the feature (e.g. wrap
@@ -1605,6 +1610,7 @@ impl Editor {
             carets: Vec::new(),
             ghost_carets: Vec::new(),
             ghost_caret_labels: Vec::new(),
+            stream_stop_line: None,
             sticky_lines: Vec::new(),
             sticky_click_rows: Vec::new(),
             box_anchor: None,
@@ -1752,6 +1758,26 @@ impl Editor {
             return None;
         }
         crate::testing::locate::test_fn_on_line(&self.lines, line)
+    }
+
+    /// Whether `(col, row)` lands on the AI-stream stop button in the sign
+    /// margin: same geometry as [`test_glyph_at`](Self::test_glyph_at), only
+    /// on the streamed line's first visual row.
+    pub fn stream_stop_at(&self, col: u16, row: u16) -> bool {
+        let Some(stop_line) = self.stream_stop_line else {
+            return false;
+        };
+        if col != self.last_inner.x || row < self.last_inner.y {
+            return false;
+        }
+        let Some(&(line, start, _)) = self.last_wrap_rows.get((row - self.last_inner.y) as usize)
+        else {
+            return false;
+        };
+        if self.wrap_enabled() && start != 0 {
+            return false;
+        }
+        line == stop_line
     }
 
     /// 1-based breakpoint lines for `path`, ascending, for a DAP
@@ -6412,6 +6438,21 @@ impl Widget for &mut Editor {
                 }
             }
 
+            // AI-stream stop button (croft pair): while a pilot streams into
+            // this file, the row under its caret wears a stop square in the
+            // badge's orange; clicking it (or Cmd+K X) cancels and reverts
+            // the stream. Outranks the test play glyph; the debugger's
+            // glyphs above still win the shared cell.
+            if (!wrap || row_start == 0) && !sign_taken && self.stream_stop_line == Some(line_idx) {
+                buf.set_string(
+                    sign_x,
+                    y,
+                    "■",
+                    Style::default().fg(Color::Rgb(0xff, 0x9d, 0x2f)),
+                );
+                sign_taken = true;
+            }
+
             // Testing gutter glyph: the play button beside a test fn's
             // definition (VS Code's run bead, in its testing green), sharing
             // the sign cell with the debugger — whose stop arrow and
@@ -9303,6 +9344,50 @@ mod tests {
             None,
             "the fold-chevron column is not the play glyph"
         );
+    }
+
+    /// The AI-stream stop button: while `stream_stop_line` is set, that
+    /// line's sign cell wears the stop square (outranking the test play
+    /// glyph), and `stream_stop_at` maps clicks on exactly that cell.
+    #[test]
+    fn gutter_stream_stop_glyph_renders_maps_clicks_and_outranks_the_play_glyph() {
+        let mut e = editor_with("#[test]\nfn my_case() {}\nfn helper() {}");
+        e.stream_stop_line = Some(1); // 0-based: the test fn's line
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let sign_x = e.last_inner.x;
+        // Buffer line 1 paints on content row y = 2 (breadcrumb row above).
+        assert_eq!(
+            buf[(sign_x, 2)].symbol(),
+            "■",
+            "the streamed row's sign cell wears the stop square, not the play glyph"
+        );
+        assert!(e.stream_stop_at(sign_x, 2), "the stop cell is clickable");
+        assert!(
+            !e.stream_stop_at(sign_x + 1, 2),
+            "the fold-chevron column is not the button"
+        );
+        assert!(
+            !e.stream_stop_at(sign_x, 3),
+            "other rows are not the button"
+        );
+
+        // Stream over: the glyph clears and the play glyph returns.
+        e.stream_stop_line = None;
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        assert_eq!(
+            buf[(sign_x, 2)].symbol(),
+            "\u{eb2c}",
+            "without a stream the test play glyph owns the cell again"
+        );
+        assert!(!e.stream_stop_at(sign_x, 2));
     }
 
     #[test]

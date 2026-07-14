@@ -19032,6 +19032,65 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
     );
 }
 
+/// The cancel affordances around the AI stream: Cmd+K X and the palette
+/// entry both route through `collab_cancel_stream` (hint when idle), and
+/// the gutter stop button's row follows the pilot's caret in the streamed
+/// file, falling back to the top visible row.
+#[test]
+fn cmd_k_x_cancels_the_ai_stream_and_the_stop_row_follows_the_pilot_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "l0\nl1\nl2\nl3\nl4\nl5\nl6").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_at(&file, 0, 0).unwrap();
+
+    // The chord is always consumed; idle it hints instead of broadcasting.
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('x'), KeyModifiers::NONE)));
+    assert!(
+        app.status.to_lowercase().contains("no ai stream"),
+        "idle chord hints, got: {}",
+        app.status
+    );
+
+    // No stream: no stop row.
+    assert_eq!(app.stream_stop_row(), None);
+
+    // A stream into the active file with no pilot caret yet: the top
+    // visible row wears the button.
+    app.collab_stream = Some(CollabStreamInfo {
+        file: "f.txt".into(),
+        name: "pilot".into(),
+        site: 7,
+    });
+    assert_eq!(app.stream_stop_row(), Some(app.editor.scroll));
+
+    // The pilot's ghost caret pins the row.
+    app.collab_carets.insert(
+        7,
+        CollabCaret {
+            file: "f.txt".into(),
+            row: 5,
+            col: 2,
+            name: "pilot".into(),
+            last_moved: std::time::Instant::now(),
+        },
+    );
+    assert_eq!(app.stream_stop_row(), Some(5));
+
+    // A stream into a file that is not active here shows no button.
+    app.collab_stream.as_mut().unwrap().file = "other.txt".into();
+    assert_eq!(app.stream_stop_row(), None);
+
+    // The palette entry drives the same action.
+    app.status.clear();
+    app.run_command(crate::widgets::command_palette::Command::CollabCancelStream);
+    assert!(
+        app.status.to_lowercase().contains("no ai stream"),
+        "palette cancel hints when idle, got: {}",
+        app.status
+    );
+}
+
 /// The AI-stream badge lifecycle: a pilot's StreamState(active) sets
 /// `collab_stream` on a dirty tick, the cancel action broadcasts
 /// StreamCancel to the pilot, and StreamState(inactive) clears the badge.
