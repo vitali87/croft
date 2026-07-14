@@ -93,7 +93,15 @@ croft --help
 
 `croft attach` runs the session under croft's built-in session host, so its terminals, language servers, debugger, and open files keep running after you close the window (or lose the SSH connection). Close the window to detach; run `croft attach` again in the same folder to reattach exactly where you left off, and `croft ls` to see what is still running. This is the same persistence `croft remote` already gives you over SSH, now available locally, with no external dependency. It is also multiplayer: several people (or several of your own windows) can `croft attach` the same folder and share the session live. The first attacher holds write control and later attachers join as read-only observers, enforced by the host, with everyone's window sized to the smallest participant (see [docs/MULTIPLAYER.md](docs/MULTIPLAYER.md)). Inside croft, the status bar shows an "N attached" badge whenever someone else is on, and **Session: Participants** (`Cmd+K A`) lists everyone so you can grant or revoke write control or disconnect a participant. When several people hold control and take turns typing, each keeps their own caret: croft parks the previous typist's cursor, restores the new typist's, and shows everyone else's position as a colored ghost caret in the editor. Sessions started by an older croft under dtach keep reattaching through dtach until they end.
 
-Prefer your own screen instead of the shared one? Add `--solo` (`croft attach --solo <folder>`, or `croft remote <host> <path> --solo` over SSH) to open an **independent viewport** on the same workspace: your own croft process, scrolling and navigating freely, while edits to shared files replicate live between participants and always converge (a CRDT under the hood, no central server). Peers' cursors appear as colored ghost carets, and the session owner is the single writer to disk, so saves, history, and the file watcher see one author (see [docs/MULTIPLAYER.md](docs/MULTIPLAYER.md)).
+Prefer your own screen instead of the shared one? Add `--solo` (`croft attach --solo <folder>`, or `croft remote <host> <path> --solo` over SSH) to open an **independent viewport** on the same workspace: your own croft process, scrolling and navigating freely, while edits to shared files replicate live between participants and always converge (a CRDT under the hood, no central server). Peers' cursors appear as colored ghost carets wearing their owner's name while they move (VS Code Live Share style), and the session owner is the single writer to disk, so saves, history, and the file watcher see one author (see [docs/MULTIPLAYER.md](docs/MULTIPLAYER.md)).
+
+An AI can take a seat at the same table. Register croft's collab agent as an MCP server, for example with Claude Code:
+
+```sh
+claude mcp add croft-collab -- croft collab-agent --workspace /abs/path/to/project
+```
+
+The agent joins the running session as a guest with `collab_open` / `collab_read` / `collab_replace` / `collab_caret` / `collab_status` tools: its edits stream into your editor live, its caret shows up named (default `claude`, `--name` overrides), and it can never write your disk — the session owner persists what lands. Croft ships no LLM; any MCP-speaking agent can drive the seat.
 
 ## Platform setup
 

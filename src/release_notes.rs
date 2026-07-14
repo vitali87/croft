@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Live co-editing with independent viewports: run `croft attach --solo` (or `croft remote <host> <path> --solo`) to open your own croft on a shared workspace — scroll and navigate freely while edits to shared files replicate instantly between participants over a CRDT, with peers' carets ghosted in their colors and the session owner as the single writer to disk.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "AI collaborator with a live caret: register `croft collab-agent --workspace <path>` as an MCP server (e.g. `claude mcp add croft-collab -- ...`) and an external agent joins your co-editing session as a guest — its edits stream in live, it can never write your disk, and its caret shows up named.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Named caret tags in co-editing sessions: while a collaborator's caret moves it wears its owner's name on the row above (VS Code Live Share style), fading 2s after it rests; set yours with CROFT_COLLAB_NAME.",
+    },
+];

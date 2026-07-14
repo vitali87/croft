@@ -27,7 +27,9 @@ diff-based op extraction, the bootstrap handshake, and the per-participant
 session state machine) wired into the running app (`App::poll_collab`), with
 `croft attach --solo` / `croft remote <host> <path> --solo` as the opt-in
 launch. See "Slice 4 as shipped" below for what landed and the deliberate
-deviations. The rest of this document is the design the shipped phases
+deviations. 0.1.633 added named caret tags and `croft collab-agent`, an MCP
+seat that lets an external AI co-edit with a visible named caret (see "Named
+carets and the AI seat"). The rest of this document is the design the shipped phases
 followed. It exists so the multiplayer pillar starts from croft's real
 architecture instead of from a Live Share mental model that does not fit a
 single-process TUI.
@@ -325,6 +327,47 @@ The rest of the shipped shape:
 Still deferred (documented, not blockers): shared undo timeline (undo stays
 per-process; undoing a peer's edit is just an edit and converges), shared
 LSP (each croft syncs full text to its own servers), per-file save handoff.
+
+### Named carets and the AI seat (0.1.633)
+
+Two follow-ups on the shipped slice 4:
+
+- **Named caret tags.** `CollabMsg::Caret` now carries the sender's display
+  name (`#[serde(default)]`, so 0.1.632 peers interoperate in both
+  directions: their carets parse with an empty name and render as before).
+  Site ids are allocated per file bootstrap, so identity has to ride the
+  wire — never try to join carets across files by site id. While a peer's
+  caret moves or types, its name paints on the visual row above the caret
+  (below when the caret sits on the viewport's top row), VS Code Live Share
+  style, and disappears 2s after the caret rests. The fade needs exactly one
+  redraw with no accompanying wire traffic: `App::collab_labels_dirty` flips
+  a visible-set bit and feeds the tick's OR of dirty flags. A parked caret's
+  re-broadcast does not refresh its tag (only real moves do), and names are
+  truncated to 24 chars at both send and ingest so a hostile peer name can
+  never paint a whole row. The local name defaults to the mux identity
+  (`user@host`), overridable via `CROFT_COLLAB_NAME`.
+
+- **`croft collab-agent`: an AI participant with a visible caret.** A hidden
+  headless subcommand (`src/collab_agent.rs`) that joins the workspace's
+  relay as a regular guest and exposes the session as an MCP server on stdio
+  (JSON-RPC 2.0 over NDJSON, the same shapes croft's own MCP client speaks).
+  Register it once and any MCP-speaking agent gets a seat:
+
+      claude mcp add croft-collab -- croft collab-agent --workspace <abs path>
+
+  Five tools: `collab_open` (bootstrap a file and return its text; a clean
+  error after ~4s when no croft owner serves the workspace), `collab_read`,
+  `collab_replace` (whole-text replace; the diff engine turns it into minimal
+  convergent ops), `collab_caret` (0-based row/col — the named caret humans
+  watch), and `collab_status` (tracked files plus peers' last-seen carets).
+  A background thread pumps the session every 30ms so the replica stays
+  fresh between tool calls; the stdin loop answers requests; EOF ends the
+  seat. Croft contains no LLM code — the intelligence is whatever drives the
+  tools. The agent inherits every guest property for free: owner-only disk
+  writes (it cannot touch files; the owner persists what it sees), per-file
+  site ids, CRDT convergence, and the same trust boundary (the 0600 relay
+  socket under the same UNIX account). Default caret name `claude`; `--name`
+  overrides.
 
 ### Slice 3 design: op transport and the process model
 
