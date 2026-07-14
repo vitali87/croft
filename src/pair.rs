@@ -288,6 +288,7 @@ To edit a file, emit an edit fence directly in your text output:
 <<<END>>>
 
 Rules:
+- The header carries the file plus EXACTLY FOUR integers: START_ROW:START_COL-END_ROW:END_COL. Never omit the rows — for a single-line edit on line N the header reads <file>:N:C1-N:C2 (e.g. replacing columns 15..19 of line 0 of demo.txt is `<<<EDIT demo.txt:0:15-0:19>>>`, NOT `demo.txt:15:19`). A header without all four numbers is ignored as plain text and your edit does not happen.
 - <file> is the workspace-relative path. Coordinates are 0-based CHARACTER positions (not bytes) into the file's CURRENT text: the range start..end (start inclusive, end exclusive) is deleted and the fence body replaces it. To insert without deleting, use a zero-width range (start == end).
 - Compute coordinates against the buffer text in the latest user message (the --- CURRENT BUFFER --- block) or from the mcp__croft-collab__collab_read tool. If you emit several fences in one reply, later fences must use coordinates that account for your earlier fences' changes.
 - The header and <<<END>>> each sit alone on their own line. The body between them is applied verbatim: real code only, no markdown fences, no commentary.
@@ -360,6 +361,9 @@ impl Drop for ChildGuard {
 /// What the reader thread reports at each turn's `result` event.
 struct TurnEnd {
     is_error: bool,
+    /// The turn was cancelled by a participant (the interrupt surfaces as
+    /// an error result; the REPL names the real cause instead).
+    cancelled: bool,
     text: String,
 }
 
@@ -465,7 +469,7 @@ fn run_pilot(
     let child_stdin = child.stdin.take().context("claude stdin missing")?;
     let child_stdout = child.stdout.take().context("claude stdout missing")?;
     let child_stderr = child.stderr.take().context("claude stderr missing")?;
-    let _guard = ChildGuard(child);
+    let mut guard = ChildGuard(child);
     let writer: Arc<Mutex<Option<ChildStdin>>> = Arc::new(Mutex::new(Some(child_stdin)));
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -539,6 +543,7 @@ fn run_pilot(
         }
         send_turn(&state, &writer, &line)?;
         match turn_rx.recv() {
+            Ok(end) if end.cancelled => println!("\n[turn cancelled]"),
             Ok(end) if end.is_error => println!("\n[turn failed: {}]", end.text),
             Ok(_) => println!("\n[turn done]"),
             Err(_) => {
@@ -554,7 +559,22 @@ fn run_pilot(
         revert_region(&mut st);
     }
     stop.store(true, Ordering::Relaxed);
-    writer.lock().unwrap().take(); // EOF ends claude's conversation
+    writer.lock().unwrap().take(); // EOF asks claude to end the conversation
+    // The real claude CLI does not reliably exit on stdin EOF (MCP teardown
+    // lingers), and the reader joins only when claude's stdout closes — so
+    // give the polite exit a short grace, then kill. The pilot's exit must
+    // never hinge on a child's shutdown manners.
+    let grace = Instant::now() + Duration::from_secs(2);
+    loop {
+        match guard.0.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < grace => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = guard.0.kill();
+                break;
+            }
+        }
+    }
     let _ = pump.join();
     let _ = reader.join();
     Ok(())
@@ -594,6 +614,7 @@ fn handle_claude_event(
                 apply_fence_event(state, event);
             }
             let mut st = state.lock().unwrap();
+            let cancelled = st.cancelled;
             st.turn_active = false;
             st.cancelled = false;
             st.discarding = false;
@@ -603,6 +624,7 @@ fn handle_claude_event(
                     .get("is_error")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                cancelled,
                 text: msg
                     .get("result")
                     .and_then(Value::as_str)
@@ -914,6 +936,11 @@ else:
     delta("\n<<<END>>>\nDone.\n")
     emit({"type": "result", "subtype": "success",
           "is_error": False, "result": "ok"})
+if mode == "linger":
+    # The real claude CLI does NOT reliably exit on stdin EOF (MCP
+    # teardown lingers); the pilot must not gamble its own exit on it.
+    import time
+    time.sleep(60)
 "#;
 
     /// A relay plus a pumping owner session that serves `demo.txt`,
@@ -1073,6 +1100,37 @@ else:
             "the edit must arrive as multiple streamed ops, got {}",
             harness.remote_edit_count()
         );
+        pilot.join().unwrap().expect("pilot exits cleanly");
+    }
+
+    /// A claude child that never exits on stdin EOF (the real CLI's MCP
+    /// teardown can linger) must not hang the pilot's exit: cleanup kills
+    /// it after a short grace instead of joining the reader forever.
+    #[test]
+    fn pilot_exit_does_not_hang_on_a_lingering_claude() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+
+        let pilot = spawn_pilot(&harness.socket, &script, &log, "linger");
+        harness.wait_until("the streamed edit to converge", |h| {
+            h.doc().as_deref() == Some("hello streamed edit")
+        });
+        // The pilot's REPL input is already at EOF; once the turn ends it
+        // must return promptly despite the child sleeping for 60s.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pilot.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "pilot exit hung on the lingering claude child"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         pilot.join().unwrap().expect("pilot exits cleanly");
     }
 
