@@ -158,6 +158,29 @@ pub enum CliCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Pair with Claude inside a live croft session: an AI collaborator
+    /// whose edits stream into the shared buffers token by token (visible
+    /// as they are written, with a named caret riding the stream), and
+    /// which any participant can cancel mid-run from croft (the streamed
+    /// text is reverted). Run it in a workspace someone has open via
+    /// `croft attach`; type tasks at the prompt (`@<file> <task>` focuses
+    /// a buffer). See docs/MULTIPLAYER.md.
+    Pair {
+        /// The workspace whose collab session to join (defaults to the
+        /// current directory; keys the relay socket exactly like
+        /// `croft attach --solo` does).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Model handed to the claude CLI (--model), e.g. a cheaper one
+        /// for mechanical edits.
+        #[arg(long)]
+        model: Option<String>,
+        /// The name this collaborator's caret wears on peers' screens.
+        #[arg(long)]
+        name: Option<String>,
+        /// The first task; further tasks are read from stdin, one per line.
+        task: Option<String>,
+    },
     /// One-time setup for the cross-compile fast path used by `croft <host>`:
     /// installs cargo-zigbuild and adds the two rustup targets croft ships
     /// binaries for (x86_64 / aarch64 musl). After this finishes, the
@@ -265,6 +288,29 @@ impl Cli {
                 }
                 crate::collab::ensure_relay(&socket)?;
                 crate::collab_agent::run(&socket, name.unwrap_or_else(|| "claude".into()))
+            }
+            Some(CliCommand::Pair {
+                workspace,
+                model,
+                name,
+                task,
+            }) => {
+                let workspace = workspace
+                    .unwrap_or_else(|| std::env::current_dir().expect("cwd"))
+                    .canonicalize()
+                    .context("resolving workspace path")?;
+                let socket = crate::session::collab_socket_path(&workspace);
+                if let Some(dir) = socket.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                crate::collab::ensure_relay(&socket)?;
+                crate::pair::run(crate::pair::PairConfig {
+                    socket,
+                    workspace,
+                    name: name.unwrap_or_else(|| "claude".into()),
+                    model,
+                    task,
+                })
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
@@ -953,6 +999,46 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(CliCommand::CollabAgent { name: None, .. })
+        ));
+    }
+
+    #[test]
+    fn parses_pair_subcommand() {
+        let cli = Cli::parse_from([
+            "croft",
+            "pair",
+            "--workspace",
+            "/w",
+            "--model",
+            "claude-haiku-4-5-20251001",
+            "--name",
+            "navigator",
+            "fix the loop in src/f.rs",
+        ]);
+        match cli.command {
+            Some(CliCommand::Pair {
+                workspace,
+                model,
+                name,
+                task,
+            }) => {
+                assert_eq!(workspace, Some(PathBuf::from("/w")));
+                assert_eq!(model.as_deref(), Some("claude-haiku-4-5-20251001"));
+                assert_eq!(name.as_deref(), Some("navigator"));
+                assert_eq!(task.as_deref(), Some("fix the loop in src/f.rs"));
+            }
+            _ => panic!("expected Pair"),
+        }
+        // Everything defaults: workspace = cwd, task read from stdin.
+        let cli = Cli::parse_from(["croft", "pair"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Pair {
+                workspace: None,
+                model: None,
+                name: None,
+                task: None,
+            })
         ));
     }
 

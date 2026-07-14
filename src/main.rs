@@ -23,8 +23,6 @@ mod mcp;
 mod merge;
 mod outline_syntax;
 mod output;
-// Dead-code allow drops with the pilot runtime slice, which consumes it.
-#[allow(dead_code)]
 mod pair;
 mod pdf;
 mod port_detect;

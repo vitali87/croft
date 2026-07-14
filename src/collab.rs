@@ -296,10 +296,10 @@ pub fn text_delta_ops(doc: &mut CollabDoc, new: &str) -> Vec<Op> {
 /// formed by joining `lines` with `'\n'` — the linear coordinate CollabDoc and
 /// cola operate in. croft's editor addresses the buffer as `(row, char-column)`
 /// (`cursor_col` is a char index throughout src/widgets/editor.rs); cola
-/// addresses it as one byte offset. The live wiring only converts the other
-/// way ([`position`]; extraction is diff-based), so this direction exists for
-/// the round-trip tests that pin the bridge.
-#[allow(dead_code)]
+/// addresses it as one byte offset. The editor wiring only converts the other
+/// way ([`position`]; extraction is diff-based); this direction anchors the
+/// `croft pair` edit fences (src/pair.rs, `range_bytes`), whose coordinates
+/// arrive as char positions.
 pub fn byte_offset(lines: &[String], row: usize, col: usize) -> usize {
     let mut offset = 0;
     for line in lines.iter().take(row) {
@@ -772,8 +772,6 @@ impl CollabSession {
     /// ended. Not doc-gated (unlike carets): the pilot announces before the
     /// file may have bootstrapped; `site` is best-effort identity, `name` is
     /// the real one.
-    // Callers land with the croft pair pilot (follow-up slice).
-    #[allow(dead_code)]
     pub fn send_stream_state(&mut self, file: &str, active: bool) {
         let site = match self.docs.get(file) {
             Some(DocState::Live(doc)) => doc.site_id(),
