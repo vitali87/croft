@@ -2660,12 +2660,16 @@ pub struct App {
     /// Throttle for the lazy relay connect (the owner starts before any
     /// guest has spawned the relay, so the first attempts fail by design).
     last_collab_connect: Option<std::time::Instant>,
-    /// Peers' last-known carets by site id: (file key, row, col). Painted
-    /// as ghost carets in the peer's color when their file is active.
-    collab_carets: std::collections::HashMap<u64, (String, usize, usize)>,
+    /// Peers' last-known carets by site id. Painted as ghost carets in the
+    /// peer's color when their file is active, with a name tag while the
+    /// caret is inside its fade window.
+    collab_carets: std::collections::HashMap<u64, CollabCaret>,
     /// The last caret this croft broadcast, so an unmoved cursor sends
     /// nothing on the tick.
     collab_caret_sent: Option<(String, usize, usize)>,
+    /// Whether any caret name tag was inside its fade window last tick;
+    /// flipping to false is the one redraw an expiring tag needs.
+    collab_labels_visible: bool,
     /// Rolling log of git commands croft has run and their summaries, shown
     /// read-only by the "Show Git Output" action (VS Code's Git channel).
     pub git_output_log: Vec<String>,
@@ -3502,6 +3506,7 @@ impl App {
             last_collab_connect: None,
             collab_carets: std::collections::HashMap::new(),
             collab_caret_sent: None,
+            collab_labels_visible: false,
             git_output_log: Vec::new(),
             pending_discard_all: false,
             file_finder_index: None,
@@ -10509,7 +10514,9 @@ impl App {
                 _ => Vec::new(),
             };
             // Collab peers' carets (Phase D independent viewports): same
-            // ghost rendering, keyed by workspace-relative file.
+            // ghost rendering, keyed by workspace-relative file, plus a name
+            // tag while the caret is inside its fade window.
+            self.editor.ghost_caret_labels.clear();
             if !self.collab_carets.is_empty()
                 && let Some(active) = self
                     .editor
@@ -10517,12 +10524,19 @@ impl App {
                     .as_ref()
                     .and_then(|p| collab_file_key(&self.tree.root, p))
             {
-                self.editor.ghost_carets.extend(
-                    self.collab_carets
-                        .iter()
-                        .filter(|(_, (file, _, _))| *file == active)
-                        .map(|(site, (_, row, col))| (*row, *col, participant_color(*site))),
-                );
+                let now = std::time::Instant::now();
+                for (site, c) in &self.collab_carets {
+                    if c.file != active {
+                        continue;
+                    }
+                    let color = participant_color(*site);
+                    self.editor.ghost_carets.push((c.row, c.col, color));
+                    if !c.name.is_empty() && now.duration_since(c.last_moved) < CARET_LABEL_FADE {
+                        self.editor
+                            .ghost_caret_labels
+                            .push((c.row, c.col, c.name.clone(), color));
+                    }
+                }
             }
             // Render the editor group layout tree. The active group is hoisted
             // into `self.editor`; every other group lives in `editor_layout`.
@@ -15627,7 +15641,7 @@ impl App {
             }
             self.last_collab_connect = Some(std::time::Instant::now());
             match CollabChannel::connect(&socket, role) {
-                Some(ch) => self.collab = Some(CollabSession::new(ch)),
+                Some(ch) => self.collab = Some(CollabSession::new(ch, collab_display_name())),
                 None => return false,
             }
         }
@@ -15702,8 +15716,28 @@ impl App {
                     site,
                     row,
                     col,
+                    name,
                 } => {
-                    self.collab_carets.insert(site, (file, row, col));
+                    // Truncate at ingest so a peer's name can never paint a
+                    // whole row; refresh the fade clock only on real moves
+                    // (a re-broadcast of a parked caret keeps its old tag
+                    // age, or the tag would never fade).
+                    let name: String = name.chars().take(24).collect();
+                    let moved = self.collab_carets.get(&site).is_none_or(|c| {
+                        c.file != file || c.row != row || c.col != col || c.name != name
+                    });
+                    if moved {
+                        self.collab_carets.insert(
+                            site,
+                            CollabCaret {
+                                file,
+                                row,
+                                col,
+                                name,
+                                last_moved: std::time::Instant::now(),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -15724,7 +15758,21 @@ impl App {
         }
 
         self.collab = Some(session);
-        changed
+        changed | self.collab_labels_dirty()
+    }
+
+    /// One redraw when the set of visible caret name tags changes with no
+    /// accompanying wire traffic — i.e. the last tag crossing its 2s fade
+    /// window (appearances already redraw via the Caret event itself).
+    fn collab_labels_dirty(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let any = self
+            .collab_carets
+            .values()
+            .any(|c| now.duration_since(c.last_moved) < CARET_LABEL_FADE);
+        let flipped = any != self.collab_labels_visible;
+        self.collab_labels_visible = any;
+        flipped
     }
 
     /// The owner's current text for a file a guest asked to share: the open
@@ -30520,6 +30568,36 @@ struct SessionCaret {
     path: PathBuf,
     row: usize,
     col: usize,
+}
+
+/// How long a peer's caret keeps its name tag after it last moved (VS Code
+/// Live Share shows the name while the cursor works, then collapses to the
+/// bare colored cell).
+const CARET_LABEL_FADE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A collab peer's last-known caret: where it is, whose it is, and when it
+/// last moved (the name tag shows while `last_moved` is inside
+/// [`CARET_LABEL_FADE`]). Keyed by site id, which is per-file, so one peer
+/// legitimately holds one entry per shared file.
+struct CollabCaret {
+    file: String,
+    row: usize,
+    col: usize,
+    name: String,
+    last_moved: std::time::Instant,
+}
+
+/// The name this participant broadcasts on its carets: `CROFT_COLLAB_NAME`
+/// when set, else the mux's user@host. Truncated here (and again at ingest
+/// for remote names) so a tag can never paint a whole row.
+fn collab_display_name() -> String {
+    std::env::var("CROFT_COLLAB_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(crate::session_host::client_name)
+        .chars()
+        .take(24)
+        .collect()
 }
 
 /// The stable color a participant's ghost caret wears, from a small palette

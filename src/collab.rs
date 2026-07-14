@@ -388,12 +388,16 @@ pub enum CollabMsg {
         replica: Vec<u8>,
     },
     /// A participant's caret moved: peers with the file open paint it as a
-    /// ghost caret in that participant's color.
+    /// ghost caret in that participant's color, with a name tag while it
+    /// moves. `name` defaults empty so a 0.1.632 peer's carets still parse
+    /// (site ids are per-file, so identity has to ride the wire).
     Caret {
         file: String,
         site: u64,
         row: usize,
         col: usize,
+        #[serde(default)]
+        name: String,
     },
 }
 
@@ -609,6 +613,7 @@ pub enum CollabEvent {
         site: u64,
         row: usize,
         col: usize,
+        name: String,
     },
 }
 
@@ -629,16 +634,21 @@ pub struct CollabSession {
     /// from the process id so two guests' nonces never collide (replies are
     /// broadcast, and adopting another guest's reply would clone its site).
     next_nonce: u64,
+    /// This participant's display name; rides every caret broadcast so
+    /// peers can tag the ghost caret (site ids are per-file and carry no
+    /// identity across files).
+    name: String,
 }
 
 impl CollabSession {
-    pub fn new(channel: CollabChannel) -> Self {
+    pub fn new(channel: CollabChannel, name: String) -> Self {
         Self {
             role: channel.role,
             channel,
             docs: std::collections::HashMap::new(),
             next_site: OWNER_SITE + 1,
             next_nonce: (std::process::id() as u64) << 32,
+            name,
         }
     }
 
@@ -720,6 +730,7 @@ impl CollabSession {
             site,
             row,
             col,
+            name: self.name.clone(),
         });
     }
 
@@ -824,11 +835,13 @@ impl CollabSession {
                     site,
                     row,
                     col,
+                    name,
                 } => events.push(CollabEvent::Caret {
                     file,
                     site,
                     row,
                     col,
+                    name,
                 }),
             }
         }
@@ -1060,6 +1073,32 @@ mod tests {
         }
     }
 
+    /// A 0.1.632 peer's Caret (no `name` field on the wire) still parses —
+    /// the name defaults to empty — and a named caret round-trips.
+    #[test]
+    fn caret_without_name_parses_and_name_round_trips() {
+        let old = br#"{"Caret":{"file":"f","site":2,"row":0,"col":0}}"#;
+        let decoded: CollabMsg = serde_json::from_slice(old).expect("old caret parses");
+        match decoded {
+            CollabMsg::Caret { name, .. } => assert_eq!(name, ""),
+            other => panic!("expected caret, got {other:?}"),
+        }
+        let named = CollabMsg::Caret {
+            file: "f".into(),
+            site: 2,
+            row: 1,
+            col: 3,
+            name: "claude".into(),
+        };
+        let bytes = serde_json::to_vec(&named).expect("serialize");
+        match serde_json::from_slice::<CollabMsg>(&bytes).expect("deserialize") {
+            CollabMsg::Caret { name, row, col, .. } => {
+                assert_eq!((name.as_str(), row, col), ("claude", 1, 3));
+            }
+            other => panic!("expected caret, got {other:?}"),
+        }
+    }
+
     /// An op serializes and deserializes across the wire (the control channel
     /// will carry these), and integrating the decoded op matches integrating
     /// the original.
@@ -1246,13 +1285,14 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let owner = loop {
             if let Some(ch) = CollabChannel::connect(&socket, CollabRole::Owner) {
-                break CollabSession::new(ch);
+                break CollabSession::new(ch, "owner".into());
             }
             assert!(Instant::now() < deadline, "relay never came up");
             std::thread::sleep(Duration::from_millis(10));
         };
         let guest = CollabSession::new(
             CollabChannel::connect(&socket, CollabRole::Guest).expect("guest connects"),
+            "guest".into(),
         );
         (dir, owner, guest)
     }
@@ -1310,10 +1350,9 @@ mod tests {
                 && oe.iter().any(|e| matches!(e, CollabEvent::Caret { .. }))
         });
         assert_eq!(owner.doc_text("src/f.rs"), Some("hello brave world"));
-        assert!(
-            oe.iter()
-                .any(|e| matches!(e, CollabEvent::Caret { row: 0, col: 5, .. }))
-        );
+        assert!(oe.iter().any(
+            |e| matches!(e, CollabEvent::Caret { row: 0, col: 5, name, .. } if name == "guest")
+        ));
     }
 
     /// Concurrent edits on both sides converge to the identical text.

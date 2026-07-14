@@ -862,8 +862,9 @@ pub fn read_presence(path: &Path) -> Option<Vec<Participant>> {
     serde_json::from_str(&json).ok()
 }
 
-/// `user@host`, the identity other participants see in the roster.
-fn client_name() -> String {
+/// `user@host`, the identity other participants see in the roster (and the
+/// default name a collab caret broadcasts).
+pub(crate) fn client_name() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| String::from("user"));
     format!("{user}@{}", hostname())
 }

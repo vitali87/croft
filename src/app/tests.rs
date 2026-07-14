@@ -19031,3 +19031,34 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
         "owner save must persist the converged buffer"
     );
 }
+
+/// A caret name tag is visible while inside its 2s fade window and signals
+/// exactly one redraw when it appears and one when it expires — no redraw
+/// churn in between (the tick loop repaints only on `poll_collab() == true`).
+#[test]
+fn collab_caret_label_fade_signals_one_redraw_per_transition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        !app.collab_labels_dirty(),
+        "no carets, no labels, no redraw"
+    );
+
+    app.collab_carets.insert(
+        2,
+        CollabCaret {
+            file: "f.txt".into(),
+            row: 0,
+            col: 3,
+            name: "claude".into(),
+            last_moved: std::time::Instant::now(),
+        },
+    );
+    assert!(app.collab_labels_dirty(), "fresh tag: one redraw");
+    assert!(!app.collab_labels_dirty(), "still visible: quiet");
+
+    app.collab_carets.get_mut(&2).unwrap().last_moved =
+        std::time::Instant::now() - std::time::Duration::from_secs(3);
+    assert!(app.collab_labels_dirty(), "expired tag: one redraw");
+    assert!(!app.collab_labels_dirty(), "stays hidden: quiet");
+}

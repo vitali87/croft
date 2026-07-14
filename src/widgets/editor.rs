@@ -1387,6 +1387,12 @@ pub struct Editor {
     /// colored block cells like secondary carets; the App rebuilds this
     /// before each render from the session roster.
     pub ghost_carets: Vec<(usize, usize, Color)>,
+    /// Name tags for ghost carets still inside their fade window (VS Code
+    /// Live Share style): (caret row, caret char col, name, participant
+    /// color). Painted on the visual row above the caret, falling back
+    /// below when the caret sits on the viewport's top row. The App
+    /// rebuilds this before each render alongside `ghost_carets`.
+    pub ghost_caret_labels: Vec<(usize, usize, String, Color)>,
     /// Enclosing scope header lines to pin at the top of the viewport (VS Code
     /// "Sticky Scroll"), outermost first, set by `App` from the outline scope
     /// chain of the top visible line. Empty disables the feature (e.g. wrap
@@ -1598,6 +1604,7 @@ impl Editor {
             selection: None,
             carets: Vec::new(),
             ghost_carets: Vec::new(),
+            ghost_caret_labels: Vec::new(),
             sticky_lines: Vec::new(),
             sticky_click_rows: Vec::new(),
             box_anchor: None,
@@ -6717,6 +6724,55 @@ impl Widget for &mut Editor {
             // caret (DECSCUSR `BlinkingBar`); App calls
             // `frame.set_cursor_position(...)` so the blink/overlay never
             // hides the underlying character.
+        }
+
+        // Ghost caret name tags (VS Code Live Share): while a peer's caret is
+        // inside its fade window the App feeds a label here, painted on the
+        // visual row above the caret — below when the caret sits on the
+        // viewport's top row — at the caret's on-screen column. Painted after
+        // the row loop (a tag overlays a neighbouring row's content) but
+        // before sticky scroll, which floats above everything.
+        for (cl, cc, name, color) in &self.ghost_caret_labels {
+            let Some(caret_vidx) = visual_rows.iter().position(|&(li, s, e)| {
+                li == *cl && *cc >= s && (*cc < e || (*cc == e && e == self.line_char_len(li)))
+            }) else {
+                continue;
+            };
+            let label_vidx = if caret_vidx > 0 {
+                caret_vidx - 1
+            } else {
+                caret_vidx + 1
+            };
+            if label_vidx >= visual_rows.len() {
+                continue;
+            }
+            // The caret's on-screen column: translate through the caret row's
+            // own inlay map, exactly as its ghost cell was painted.
+            let (_, caret_start, caret_end) = visual_rows[caret_vidx];
+            let hint_cap = caret_end.min(self.line_char_len(*cl));
+            let hint_cells: Vec<(usize, usize)> = self
+                .row_inlay_spans(*cl)
+                .iter()
+                .filter(|(hc, _)| *hc >= caret_start && *hc <= hint_cap)
+                .map(|(hc, l)| (*hc, l.chars().count()))
+                .collect();
+            let col_cells = cc + inlay_cells_before(&hint_cells, *cc);
+            if col_cells < caret_start {
+                continue;
+            }
+            let x0 = (col_cells - caret_start) as u16;
+            let y = inner.y + label_vidx as u16;
+            let style = Style::default()
+                .fg(Color::Black)
+                .bg(*color)
+                .add_modifier(Modifier::BOLD);
+            for (i, ch) in name.chars().enumerate() {
+                let x = x0 + i as u16;
+                if x >= text_width {
+                    break;
+                }
+                buf[(text_x + x, y)].set_char(ch).set_style(style);
+            }
         }
 
         // Sticky scroll: pin the enclosing scope headers to the top of the
@@ -14575,5 +14631,50 @@ mod tests {
         assert_eq!(y, ed.last_inner.y, "ghost sits on the first content row");
         let text_x = ed.last_inner.x + ed.last_gutter_width + 1;
         assert_eq!(x, text_x + 6, "ghost sits at char column 6");
+    }
+
+    /// A ghost caret's name tag paints on the visual row above the caret at
+    /// the caret's column; on the viewport's top row it falls back below.
+    #[test]
+    fn ghost_caret_labels_paint_name_above_and_fall_back_below() {
+        let f = NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "hello world\nsecond line\nthird line\n").unwrap();
+        let mut ed = Editor::new();
+        ed.open(f.path()).unwrap();
+        let color = Color::Rgb(9, 8, 7);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let text_x = |ed: &Editor| ed.last_inner.x + ed.last_gutter_width + 1;
+
+        // Caret on line 1: the tag paints on the row above (line 0's row).
+        ed.ghost_caret_labels = vec![(1, 2, "alice".into(), color)];
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+        let x0 = text_x(&ed) + 2;
+        let y0 = ed.last_inner.y;
+        let shown: String = (0..5)
+            .map(|i| buf[(x0 + i, y0)].symbol().to_string())
+            .collect();
+        assert_eq!(shown, "alice", "tag paints above the caret at its column");
+        assert_eq!(
+            buf[(x0, y0)].style().bg,
+            Some(color),
+            "tag wears the participant color"
+        );
+
+        // Caret on the top row: the tag falls back to the row below.
+        ed.ghost_caret_labels = vec![(0, 0, "bob".into(), color)];
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+        let x1 = text_x(&ed);
+        let y1 = ed.last_inner.y + 1;
+        let shown: String = (0..3)
+            .map(|i| buf[(x1 + i, y1)].symbol().to_string())
+            .collect();
+        assert_eq!(shown, "bob", "tag falls back below on the top row");
     }
 }
