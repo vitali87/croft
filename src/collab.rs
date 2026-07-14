@@ -399,6 +399,21 @@ pub enum CollabMsg {
         #[serde(default)]
         name: String,
     },
+    /// An AI pilot's token stream into `file` started (`active`) or ended
+    /// (finished, cancelled, or reverted). Peers surface the state (badge,
+    /// stop button) while active. `site` is the pilot's site id in `file`
+    /// when the doc is live, 0 before bootstrap — identity is `name`, same
+    /// as carets. 0.1.633 peers drop this variant in `drain`.
+    StreamState {
+        site: u64,
+        name: String,
+        file: String,
+        active: bool,
+    },
+    /// Any participant asks the streaming pilot to stop and revert. Bare by
+    /// design: at most one stream runs per relay (one pilot seat), so there
+    /// is nothing to address.
+    StreamCancel {},
 }
 
 impl CollabMsg {
@@ -615,6 +630,17 @@ pub enum CollabEvent {
         col: usize,
         name: String,
     },
+    /// An AI pilot's stream into `file` started or ended.
+    // Consumed by the app's stream badge (croft pair follow-up slice).
+    #[allow(dead_code)]
+    StreamState {
+        file: String,
+        site: u64,
+        name: String,
+        active: bool,
+    },
+    /// A participant asked the streaming pilot to stop and revert.
+    StreamCancel,
 }
 
 /// One participant's collab state machine: per-file replicated documents
@@ -742,6 +768,32 @@ impl CollabSession {
         });
     }
 
+    /// Broadcast that this participant's AI stream into `file` started or
+    /// ended. Not doc-gated (unlike carets): the pilot announces before the
+    /// file may have bootstrapped; `site` is best-effort identity, `name` is
+    /// the real one.
+    // Callers land with the croft pair pilot (follow-up slice).
+    #[allow(dead_code)]
+    pub fn send_stream_state(&mut self, file: &str, active: bool) {
+        let site = match self.docs.get(file) {
+            Some(DocState::Live(doc)) => doc.site_id(),
+            _ => 0,
+        };
+        self.channel.send(&CollabMsg::StreamState {
+            site,
+            name: self.name.clone(),
+            file: file.to_string(),
+            active,
+        });
+    }
+
+    /// Ask whoever is streaming on this relay to stop and revert.
+    // Callers land with the cancel affordances (follow-up slice).
+    #[allow(dead_code)]
+    pub fn send_stream_cancel(&mut self) {
+        self.channel.send(&CollabMsg::StreamCancel {});
+    }
+
     /// Drain the channel and resolve everything into [`CollabEvent`]s
     /// (invariant 1b: the app extracts local edits before calling this).
     /// `owner_text` is the owner's buffer lookup for a file a guest wants
@@ -851,6 +903,18 @@ impl CollabSession {
                     col,
                     name,
                 }),
+                CollabMsg::StreamState {
+                    site,
+                    name,
+                    file,
+                    active,
+                } => events.push(CollabEvent::StreamState {
+                    file,
+                    site,
+                    name,
+                    active,
+                }),
+                CollabMsg::StreamCancel {} => events.push(CollabEvent::StreamCancel),
             }
         }
         // Give up on bootstraps nobody answered (no owner running).
@@ -1107,6 +1171,65 @@ mod tests {
         }
     }
 
+    /// The AI-stream wire messages round-trip: StreamState carries the
+    /// pilot's identity and target file, StreamCancel is a bare request any
+    /// participant may broadcast.
+    #[test]
+    fn stream_state_and_cancel_round_trip_through_serde() {
+        let state = CollabMsg::StreamState {
+            site: 2,
+            name: "claude".into(),
+            file: "src/f.rs".into(),
+            active: true,
+        };
+        let bytes = serde_json::to_vec(&state).expect("serialize");
+        match serde_json::from_slice::<CollabMsg>(&bytes).expect("deserialize") {
+            CollabMsg::StreamState {
+                site,
+                name,
+                file,
+                active,
+            } => {
+                assert_eq!(
+                    (site, name.as_str(), file.as_str(), active),
+                    (2, "claude", "src/f.rs", true)
+                );
+            }
+            other => panic!("expected stream state, got {other:?}"),
+        }
+        let cancel = CollabMsg::StreamCancel {};
+        let bytes = serde_json::to_vec(&cancel).expect("serialize");
+        assert!(matches!(
+            serde_json::from_slice::<CollabMsg>(&bytes).expect("deserialize"),
+            CollabMsg::StreamCancel {}
+        ));
+    }
+
+    /// A frame carrying a CollabMsg variant this build does not know (a newer
+    /// peer on the same relay) is skipped by drain, never an error — this is
+    /// the interop guarantee the new stream messages rely on against 0.1.633
+    /// peers.
+    #[test]
+    fn drain_skips_unknown_wire_variants() {
+        use std::io::Write;
+        let (mut tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let mut channel = CollabChannel {
+            stream: rx,
+            reader: crate::session_host::FrameReader::new(),
+            role: CollabRole::Guest,
+        };
+        let bogus = crate::session_host::encode_bytes_frame(br#"{"FutureVariant":{"whatever":1}}"#);
+        tx.write_all(&bogus).unwrap();
+        let known = CollabMsg::StreamCancel {};
+        tx.write_all(&known.encode()).unwrap();
+        tx.flush().unwrap();
+        // Both frames are already in the socketpair buffer; drain sees them.
+        let msgs = channel.drain();
+        assert_eq!(msgs.len(), 1, "bogus variant skipped, known one kept");
+        assert!(matches!(msgs[0], CollabMsg::StreamCancel {}));
+    }
+
     /// An op serializes and deserializes across the wire (the control channel
     /// will carry these), and integrating the decoded op matches integrating
     /// the original.
@@ -1361,6 +1484,31 @@ mod tests {
         assert!(oe.iter().any(
             |e| matches!(e, CollabEvent::Caret { row: 0, col: 5, name, .. } if name == "guest")
         ));
+    }
+
+    /// Stream state and cancel travel between sessions without any doc being
+    /// live (they are session-level, not doc-gated: the pilot may broadcast
+    /// before the file bootstraps, and anyone may cancel).
+    #[test]
+    fn collab_sessions_carry_stream_state_and_cancel() {
+        let (_dir, mut owner, mut guest) = session_pair();
+
+        guest.send_stream_state("src/f.rs", true);
+        let (oe, _) = pump(&mut owner, &mut guest, "unused", |oe, _| {
+            oe.iter()
+                .any(|e| matches!(e, CollabEvent::StreamState { .. }))
+        });
+        assert!(oe.iter().any(|e| matches!(
+            e,
+            CollabEvent::StreamState { file, name, active: true, .. }
+                if file == "src/f.rs" && name == "guest"
+        )));
+
+        owner.send_stream_cancel();
+        let (_, ge) = pump(&mut owner, &mut guest, "unused", |_, ge| {
+            ge.iter().any(|e| matches!(e, CollabEvent::StreamCancel))
+        });
+        assert!(ge.iter().any(|e| matches!(e, CollabEvent::StreamCancel)));
     }
 
     /// Concurrent edits on both sides converge to the identical text.

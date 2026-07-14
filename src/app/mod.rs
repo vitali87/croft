@@ -15739,6 +15739,8 @@ impl App {
                         );
                     }
                 }
+                // Surfaced by the AI-stream badge slice; nothing yet.
+                CollabEvent::StreamState { .. } | CollabEvent::StreamCancel => {}
             }
         }
 
