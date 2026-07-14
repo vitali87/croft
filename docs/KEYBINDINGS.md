@@ -42,6 +42,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 |------|--------|
 | `Cmd+K` `Cmd+T` | Open the Color Theme picker |
 | `Cmd+K` `A` | Session: Participants (who is attached to this persistent session); `Enter` on a row grants/revokes write control or disconnects them |
+| `Cmd+K` `X` | Collab: Cancel AI Stream — stop a `croft pair` collaborator streaming into a shared file; the streamed text is reverted (same action as clicking the orange `■` stop button in the editor gutter while a stream is live) |
 | `Cmd+K` `→` | Close the editor tabs to the right of the active one |
 | `Cmd+K` `S` | Select the active file as the compare anchor |
 | `Cmd+K` `C` | Diff the active file against the compare anchor |

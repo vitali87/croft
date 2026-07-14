@@ -29,7 +29,10 @@ session state machine) wired into the running app (`App::poll_collab`), with
 launch. See "Slice 4 as shipped" below for what landed and the deliberate
 deviations. 0.1.633 added named caret tags and `croft collab-agent`, an MCP
 seat that lets an external AI co-edit with a visible named caret (see "Named
-carets and the AI seat"). The rest of this document is the design the shipped phases
+carets and the AI seat"). 0.1.634 added `croft pair`, a real-time AI
+collaborator whose edits stream into the shared buffers token by token and
+which any participant can cancel mid-run (see "croft pair"). The rest of
+this document is the design the shipped phases
 followed. It exists so the multiplayer pillar starts from croft's real
 architecture instead of from a Live Share mental model that does not fit a
 single-process TUI.
@@ -368,6 +371,67 @@ Two follow-ups on the shipped slice 4:
   site ids, CRDT convergence, and the same trust boundary (the 0600 relay
   socket under the same UNIX account). Default caret name `claude`; `--name`
   overrides.
+
+### croft pair: a real-time AI collaborator (0.1.634)
+
+The MCP seat above proved the wiring but not the experience: MCP tool
+arguments arrive whole, so an AI edit lands as one bulk insert. `croft pair`
+(src/pair.rs) fixes that by owning the token stream itself. It spawns the
+`claude` CLI as a persistent stream-json conversation on stdio
+(`--input-format stream-json --output-format stream-json
+--include-partial-messages`), reads token-level `text_delta` events, and
+teaches the model — via `--append-system-prompt` — a fenced edit protocol in
+its ordinary streamed text:
+
+    <<<EDIT <file>:<start_row>:<start_col>-<end_row>:<end_col>>>>
+    <replacement text>
+    <<<END>>>
+
+Coordinates are 0-based CHARACTER positions against the file's current text
+(byte offsets only ever come from `collab::byte_offset`; a column is never
+bytes). The pilot parses the stream incrementally (`FenceMachine`, exact
+about deltas split anywhere, even mid-marker) and applies each body fragment
+through a regular collab guest seat: the fence's range is deleted in one
+replica change, then every `text_delta` inserts at a tracked byte `anchor`
+via `local_change`, so peers watch the edit appear token by token with the
+pilot's named caret riding the stream. Everything outside a well-formed
+fence is commentary printed to the pilot's terminal, never applied; a
+malformed header degrades the whole block to commentary, so bad model output
+can never corrupt a buffer.
+
+Concurrent human edits are safe: the pilot's pump transforms `start` and
+`anchor` through every incoming `RemoteEdit` span (before: shift by the size
+delta; straddling: clamp to the span's new end; after: unchanged). One
+documented loss: a human edit strictly INSIDE the streamed region is
+discarded if the stream is later cancelled (the revert restores the original
+slice over the whole region).
+
+Cancel is first-class, from any participant: two wire messages ride the
+relay (`CollabMsg::StreamState { site, name, file, active }`, broadcast by
+the pilot at stream start/end/cancel, and `CollabMsg::StreamCancel {}`; both
+serde-tolerant, so 0.1.633 peers just drop them). While a stream is active,
+croft shows an orange status badge and an orange `■` stop button in the
+editor gutter on the row under the pilot's caret; clicking it, `Cmd+K X`,
+or the palette's "Collab: Cancel AI Stream" broadcasts the cancel. The pilot
+then sends a `control_request` interrupt on claude's stdin (feature-detected
+via the init capabilities; the fallback simply drops the rest of the turn's
+deltas — the child is never killed, the conversation survives), reverts the
+streamed region in one `local_change`, broadcasts the stream inactive, and
+prepends a note to the next user turn so the model knows its edit was
+rejected. An unterminated fence at end of turn reverts the same way.
+
+Launch: `croft pair [--workspace <path>] [--model <m>] [--name <n>]
+["first task"]` in a workspace someone has open via `croft attach`; further
+tasks are read from the pilot's stdin, one per line, with `@<file> <task>`
+focusing a buffer (its current text is injected into the turn so the model's
+fence coordinates have a ground truth). The claude child is sandboxed to a
+read-only toolbox (`Read`/`Grep`/`Glob` plus a second, read-only
+`collab-agent` MCP seat named `<name>-reader` for live buffer queries,
+`--strict-mcp-config`); the ONLY write path is the fence through the pilot's
+seat. End-to-end tests drive the pilot against a scripted fake claude
+(python3, like the LSP fakes): streaming convergence, the StreamState
+lifecycle, and the cancel drill (revert + the interrupt landing on the
+fake's stdin) all assert headlessly.
 
 ### Slice 3 design: op transport and the process model
 

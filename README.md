@@ -103,6 +103,14 @@ claude mcp add croft-collab -- croft collab-agent --workspace /abs/path/to/proje
 
 The agent joins the running session as a guest with `collab_open` / `collab_read` / `collab_replace` / `collab_caret` / `collab_status` tools: its edits stream into your editor live, its caret shows up named (default `claude`, `--name` overrides), and it can never write your disk — the session owner persists what lands. Croft ships no LLM; any MCP-speaking agent can drive the seat.
 
+For a real pair-programming partner, use `croft pair` instead: it drives the `claude` CLI itself and streams the model's edits into the shared buffers **token by token**, the way a human types, with a named caret riding the stream:
+
+```sh
+croft pair --workspace /abs/path/to/project "tighten the error handling in src/main.rs"
+```
+
+Type further tasks at its prompt (`@<file> <task>` focuses a buffer). While it streams, croft shows an orange badge in the status bar and an orange `■` stop button in the editor gutter: click it (or press `Cmd+K X`) to cancel the stream mid-run — the streamed text is reverted and the conversation stays alive for your next instruction. The model's toolbox is read-only (`Read`/`Grep`/`Glob` plus a read-only collab seat); the only way it can change a buffer is the visible, cancellable stream (see [docs/MULTIPLAYER.md](docs/MULTIPLAYER.md)).
+
 ## Platform setup
 
 croft runs on macOS, Linux, Android, and Windows (via WSL2). Cross-platform basics are above; each platform has a short guide for its Nerd Font, terminal keybindings, and optional dependencies:

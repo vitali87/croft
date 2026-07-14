@@ -62,10 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "AI collaborator with a live caret: register `croft collab-agent --workspace <path>` as an MCP server (e.g. `claude mcp add croft-collab -- ...`) and an external agent joins your co-editing session as a guest — its edits stream in live, it can never write your disk, and its caret shows up named.",
+        summary: "`croft pair`: a real-time AI pair programmer — it drives the claude CLI and streams its edits into your shared buffers token by token, the way a human types, with a named caret riding the stream (no more bulk inserts).",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Named caret tags in co-editing sessions: while a collaborator's caret moves it wears its owner's name on the row above (VS Code Live Share style), fading 2s after it rests; set yours with CROFT_COLLAB_NAME.",
+        summary: "Cancel an AI stream mid-run from any seat: click the orange stop button in the editor gutter, press Cmd+K X, or run \"Collab: Cancel AI Stream\" — the streamed text is reverted and the conversation stays alive.",
     },
 ];
