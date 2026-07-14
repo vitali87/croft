@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod clipboard;
 mod collab;
+mod collab_agent;
 mod command_history;
 mod dap;
 mod file_ref;

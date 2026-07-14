@@ -143,6 +143,21 @@ pub enum CliCommand {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Internal: a headless collab participant exposed as an MCP server on
+    /// stdio (see docs/MULTIPLAYER.md). Joins the workspace's collab relay
+    /// as a guest so an external agent (e.g. Claude Code via
+    /// `claude mcp add croft-collab -- croft collab-agent --workspace <path>`)
+    /// co-edits with a live named caret. Not intended for manual use.
+    #[command(hide = true)]
+    CollabAgent {
+        /// The workspace whose collab session to join (keys the relay
+        /// socket exactly like `croft attach --solo` does).
+        #[arg(long)]
+        workspace: PathBuf,
+        /// The name this participant's caret wears on peers' screens.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// One-time setup for the cross-compile fast path used by `croft <host>`:
     /// installs cargo-zigbuild and adds the two rustup targets croft ships
     /// binaries for (x86_64 / aarch64 musl). After this finishes, the
@@ -239,6 +254,17 @@ impl Cli {
                 } else {
                     crate::collab::relay_serve(&socket)
                 }
+            }
+            Some(CliCommand::CollabAgent { workspace, name }) => {
+                let workspace = workspace
+                    .canonicalize()
+                    .with_context(|| format!("workspace not found: {}", workspace.display()))?;
+                let socket = crate::session::collab_socket_path(&workspace);
+                if let Some(dir) = socket.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                crate::collab::ensure_relay(&socket)?;
+                crate::collab_agent::run(&socket, name.unwrap_or_else(|| "claude".into()))
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
@@ -902,6 +928,31 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(CliCommand::CollabRelay { ensure: true, .. })
+        ));
+    }
+
+    #[test]
+    fn parses_collab_agent_subcommand() {
+        let cli = Cli::parse_from([
+            "croft",
+            "collab-agent",
+            "--workspace",
+            "/w",
+            "--name",
+            "bot",
+        ]);
+        match cli.command {
+            Some(CliCommand::CollabAgent { workspace, name }) => {
+                assert_eq!(workspace, PathBuf::from("/w"));
+                assert_eq!(name.as_deref(), Some("bot"));
+            }
+            _ => panic!("expected CollabAgent"),
+        }
+        // The name is optional; the dispatch defaults it.
+        let cli = Cli::parse_from(["croft", "collab-agent", "--workspace", "/w"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::CollabAgent { name: None, .. })
         ));
     }
 

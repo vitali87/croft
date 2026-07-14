@@ -662,14 +662,22 @@ impl CollabSession {
         matches!(self.docs.get(file), Some(DocState::Bootstrapping { .. }))
     }
 
-    /// The replicated text for `file`, when live. The tests assert
-    /// convergence through this; the app reads its own buffers.
-    #[allow(dead_code)]
+    /// The replicated text for `file`, when live. The collab agent serves
+    /// reads through this (it has no editor buffers); the app reads its own.
     pub fn doc_text(&self, file: &str) -> Option<&str> {
         match self.docs.get(file) {
             Some(DocState::Live(doc)) => Some(doc.text()),
             _ => None,
         }
+    }
+
+    /// Every file this session tracks, with whether it is live yet (false =
+    /// still bootstrapping). For status surfaces like `collab_status`.
+    pub fn tracked_files(&self) -> Vec<(String, bool)> {
+        self.docs
+            .iter()
+            .map(|(f, s)| (f.clone(), matches!(s, DocState::Live(_))))
+            .collect()
     }
 
     /// Guest: start sharing `file` — ask the owner for its current state and
