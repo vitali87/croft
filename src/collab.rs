@@ -631,8 +631,6 @@ pub enum CollabEvent {
         name: String,
     },
     /// An AI pilot's stream into `file` started or ended.
-    // Consumed by the app's stream badge (croft pair follow-up slice).
-    #[allow(dead_code)]
     StreamState {
         file: String,
         site: u64,

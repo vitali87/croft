@@ -2670,6 +2670,10 @@ pub struct App {
     /// Whether any caret name tag was inside its fade window last tick;
     /// flipping to false is the one redraw an expiring tag needs.
     collab_labels_visible: bool,
+    /// Some while an AI pilot (`croft pair`) streams an edit into a shared
+    /// file: drives the status badge and the gutter stop button; cleared by
+    /// the pilot's StreamState(inactive) broadcast.
+    collab_stream: Option<CollabStreamInfo>,
     /// Rolling log of git commands croft has run and their summaries, shown
     /// read-only by the "Show Git Output" action (VS Code's Git channel).
     pub git_output_log: Vec<String>,
@@ -3506,6 +3510,7 @@ impl App {
             last_collab_connect: None,
             collab_carets: std::collections::HashMap::new(),
             collab_caret_sent: None,
+            collab_stream: None,
             collab_labels_visible: false,
             git_output_log: Vec::new(),
             pending_discard_all: false,
@@ -11026,6 +11031,22 @@ impl App {
             ));
             spans.push(Span::raw("  "));
         }
+        // AI-stream badge: a pilot is streaming an edit into a shared file;
+        // orange like the persistence warning (attention, not decoration),
+        // naming the cancel chord so the stop path is one glance away.
+        if let Some(stream) = &self.collab_stream {
+            spans.push(Span::styled(
+                format!(
+                    " \u{23f9} {} streaming into {} (Cmd+K X to stop) ",
+                    stream.name, stream.file
+                ),
+                Style::default()
+                    .bg(Color::Rgb(0xff, 0x9d, 0x2f))
+                    .fg(Color::Rgb(0x10, 0x13, 0x1a))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("  "));
+        }
         // Diagnostics counts (click → PROBLEMS), VS Code-style, after git.
         // Always shown so the bar reads as a health indicator at a glance.
         let err_count = self.problems.error_count();
@@ -15739,8 +15760,20 @@ impl App {
                         );
                     }
                 }
-                // Surfaced by the AI-stream badge slice; nothing yet.
-                CollabEvent::StreamState { .. } | CollabEvent::StreamCancel => {}
+                CollabEvent::StreamState {
+                    file,
+                    site,
+                    name,
+                    active,
+                } => {
+                    // Truncate like caret names: a badge can never paint a
+                    // whole status row.
+                    let name: String = name.chars().take(24).collect();
+                    self.collab_stream = active.then_some(CollabStreamInfo { file, name, site });
+                }
+                // The cancel request is for the streaming pilot, not for
+                // viewers; the badge clears via StreamState(inactive).
+                CollabEvent::StreamCancel => {}
             }
         }
 
@@ -15775,6 +15808,25 @@ impl App {
         let flipped = any != self.collab_labels_visible;
         self.collab_labels_visible = any;
         flipped
+    }
+
+    /// Cancel the AI stream (gutter stop button, Cmd+K X, palette): ask the
+    /// streaming pilot over the relay to stop and revert. The badge clears
+    /// when the pilot broadcasts StreamState(inactive), not optimistically —
+    /// the revert is the pilot's to confirm.
+    // Callers land with the cancel affordances (follow-up slice).
+    #[allow(dead_code)]
+    pub fn collab_cancel_stream(&mut self) {
+        let Some(stream) = &self.collab_stream else {
+            self.status = "No AI stream is active".into();
+            return;
+        };
+        let Some(session) = &mut self.collab else {
+            self.status = "No AI stream is active".into();
+            return;
+        };
+        session.send_stream_cancel();
+        self.status = format!("Asked {} to stop streaming", stream.name);
     }
 
     /// The owner's current text for a file a guest asked to share: the open
@@ -30587,6 +30639,17 @@ struct CollabCaret {
     col: usize,
     name: String,
     last_moved: std::time::Instant,
+}
+
+/// A live AI stream announced over the relay (`CollabMsg::StreamState`):
+/// who is streaming, into which file, and the pilot's site id in that file
+/// (keys the pilot's ghost caret for the gutter stop button's row).
+struct CollabStreamInfo {
+    file: String,
+    name: String,
+    // Consumed by the gutter stop button (follow-up slice).
+    #[allow(dead_code)]
+    site: u64,
 }
 
 /// The name this participant broadcasts on its carets: `CROFT_COLLAB_NAME`

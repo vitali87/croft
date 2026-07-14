@@ -19032,6 +19032,96 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
     );
 }
 
+/// The AI-stream badge lifecycle: a pilot's StreamState(active) sets
+/// `collab_stream` on a dirty tick, the cancel action broadcasts
+/// StreamCancel to the pilot, and StreamState(inactive) clears the badge.
+/// With no active stream, cancel is a hint, not a broadcast.
+#[test]
+fn collab_stream_state_drives_the_badge_and_cancel_broadcasts() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello world").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.open_file_at_launch(&file);
+
+    // Cancel with no stream: a hint, nothing on the wire required yet.
+    owner.collab_cancel_stream();
+    assert!(
+        owner.status.to_lowercase().contains("no ai stream"),
+        "inactive cancel hints, got: {}",
+        owner.status
+    );
+
+    // A pilot stand-in seat on the same relay.
+    let mut pilot = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(ch) =
+                crate::collab::CollabChannel::connect(&socket, crate::collab::CollabRole::Guest)
+            {
+                break crate::collab::CollabSession::new(ch, "pilot".into());
+            }
+            assert!(Instant::now() < deadline, "pilot never connected");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    // Stream starts: the owner's badge state fills on a dirty tick.
+    pilot.send_stream_state("f.txt", true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut dirty_on_arrival = false;
+    while owner.collab_stream.is_none() {
+        assert!(Instant::now() < deadline, "badge never appeared");
+        dirty_on_arrival = owner.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(dirty_on_arrival, "the badge tick must request a redraw");
+    let stream = owner.collab_stream.as_ref().unwrap();
+    assert_eq!(
+        (stream.name.as_str(), stream.file.as_str()),
+        ("pilot", "f.txt")
+    );
+
+    // The owner cancels: the pilot's seat receives StreamCancel.
+    owner.collab_cancel_stream();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = pilot.poll(|_| None);
+        if events
+            .iter()
+            .any(|e| matches!(e, crate::collab::CollabEvent::StreamCancel))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "pilot never saw the cancel");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Stream ends: the badge clears.
+    pilot.send_stream_state("f.txt", false);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while owner.collab_stream.is_some() {
+        assert!(Instant::now() < deadline, "badge never cleared");
+        owner.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// A caret name tag is visible while inside its 2s fade window and signals
 /// exactly one redraw when it appears and one when it expires — no redraw
 /// churn in between (the tick loop repaints only on `poll_collab() == true`).
