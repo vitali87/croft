@@ -863,7 +863,262 @@ fn send_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collab::ResolvedSpan;
+    use crate::collab::{ResolvedSpan, relay_serve};
+    use crate::lsp::manager::is_on_path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A scripted claude: speaks just enough stream-json for the pilot.
+    /// argv: <log file> <mode>. Logs every stdin line (the e2e asserts the
+    /// interrupt landed there). "stream" mode streams one fenced edit split
+    /// across deltas (header split mid-marker on purpose); "cancel" mode
+    /// stops mid-body and BLOCKS on stdin — only the pilot's interrupt line
+    /// unblocks it — then streams more body the pilot must drop.
+    const FAKE_CLAUDE: &str = r#"
+import json, sys
+
+log = open(sys.argv[1], "a")
+mode = sys.argv[2]
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def delta(text):
+    emit({"type": "stream_event", "event": {
+        "type": "content_block_delta",
+        "delta": {"type": "text_delta", "text": text}}})
+
+emit({"type": "system", "subtype": "init",
+      "capabilities": ["interrupt_receipt_v1"]})
+
+line = sys.stdin.readline()
+if not line:
+    sys.exit(0)
+log.write(line)
+log.flush()
+
+delta("Let me fix that.\n")
+delta("<<<EDIT demo.txt:0:6-0:11>")
+delta(">>\n")
+delta("streamed")
+if mode == "cancel":
+    line2 = sys.stdin.readline()
+    log.write(line2)
+    log.flush()
+    delta(" MORE-AFTER-CANCEL")
+    delta("\n<<<END>>>\n")
+    emit({"type": "result", "subtype": "success",
+          "is_error": False, "result": "cancelled turn"})
+else:
+    delta(" edit")
+    delta("\n<<<END>>>\nDone.\n")
+    emit({"type": "result", "subtype": "success",
+          "is_error": False, "result": "ok"})
+"#;
+
+    /// A relay plus a pumping owner session that serves `demo.txt`,
+    /// collecting every owner-side event for the assertions.
+    struct OwnerHarness {
+        _dir: tempfile::TempDir,
+        socket: PathBuf,
+        owner: Arc<Mutex<CollabSession>>,
+        events: Arc<Mutex<Vec<CollabEvent>>>,
+        stop: Arc<AtomicBool>,
+        pump: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl OwnerHarness {
+        fn start(text: &'static str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("p.collab.sock");
+            {
+                let s = socket.clone();
+                std::thread::spawn(move || {
+                    let _ = relay_serve(&s);
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let owner = loop {
+                if let Some(ch) = CollabChannel::connect(&socket, CollabRole::Owner) {
+                    break CollabSession::new(ch, "owner".into());
+                }
+                assert!(Instant::now() < deadline, "relay never came up");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let owner = Arc::new(Mutex::new(owner));
+            let events: Arc<Mutex<Vec<CollabEvent>>> = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let pump = {
+                let (owner, events, stop) = (owner.clone(), events.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        {
+                            let mut o = owner.lock().unwrap();
+                            let ev = o.poll(|_| Some(text.to_string()));
+                            events.lock().unwrap().extend(ev);
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            };
+            Self {
+                _dir: dir,
+                socket,
+                owner,
+                events,
+                stop,
+                pump: Some(pump),
+            }
+        }
+
+        fn doc(&self) -> Option<String> {
+            self.owner
+                .lock()
+                .unwrap()
+                .doc_text("demo.txt")
+                .map(str::to_string)
+        }
+
+        fn wait_until(&self, what: &str, mut cond: impl FnMut(&Self) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !cond(self) {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn stream_states(&self) -> Vec<(String, bool)> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    CollabEvent::StreamState { name, active, .. } => Some((name.clone(), *active)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn remote_edit_count(&self) -> usize {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, CollabEvent::RemoteEdit { .. }))
+                .count()
+        }
+    }
+
+    impl Drop for OwnerHarness {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(p) = self.pump.take() {
+                let _ = p.join();
+            }
+        }
+    }
+
+    /// Spawn the pilot against the scripted claude on a background thread
+    /// (it blocks until the turn ends and its input hits EOF).
+    fn spawn_pilot(
+        socket: &Path,
+        script: &Path,
+        log: &Path,
+        mode: &str,
+    ) -> std::thread::JoinHandle<Result<()>> {
+        let mut cmd = Command::new("python3");
+        cmd.arg(script).arg(log).arg(mode);
+        let socket = socket.to_path_buf();
+        std::thread::spawn(move || {
+            run_pilot(
+                &socket,
+                "pilot",
+                Some("fix demo.txt".into()),
+                cmd,
+                &mut std::io::Cursor::new(Vec::new()),
+            )
+        })
+    }
+
+    /// End to end: the fake claude's fenced edit streams through the pilot
+    /// into the owner's replica as MULTIPLE ops (token streaming, not one
+    /// bulk insert), bracketed by StreamState active/inactive.
+    #[test]
+    fn pilot_streams_a_fenced_edit_into_the_owner() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+
+        let pilot = spawn_pilot(&harness.socket, &script, &log, "stream");
+
+        harness.wait_until("the streamed edit to converge", |h| {
+            h.doc().as_deref() == Some("hello streamed edit")
+        });
+        harness.wait_until("stream-state inactive", |h| {
+            h.stream_states().contains(&("pilot".to_string(), false))
+        });
+        assert!(
+            harness
+                .stream_states()
+                .contains(&("pilot".to_string(), true)),
+            "owner saw the stream start"
+        );
+        assert!(
+            harness.remote_edit_count() >= 3,
+            "the edit must arrive as multiple streamed ops, got {}",
+            harness.remote_edit_count()
+        );
+        pilot.join().unwrap().expect("pilot exits cleanly");
+    }
+
+    /// Cancel mid-stream: the owner broadcasts StreamCancel while the fake
+    /// claude is blocked mid-body; the pilot reverts the streamed text,
+    /// writes a control_request interrupt to claude's stdin, and drops the
+    /// post-cancel deltas. The conversation still ends its turn cleanly.
+    #[test]
+    fn pilot_cancel_reverts_and_interrupts() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+
+        let pilot = spawn_pilot(&harness.socket, &script, &log, "cancel");
+
+        // Wait until part of the body landed (stream mid-flight).
+        harness.wait_until("the partial body to converge", |h| {
+            h.doc().is_some_and(|d| d.contains("streamed"))
+        });
+        harness.owner.lock().unwrap().send_stream_cancel();
+
+        // The pilot reverts and the turn still completes.
+        harness.wait_until("the revert to converge", |h| {
+            h.doc().as_deref() == Some("hello world")
+        });
+        pilot.join().unwrap().expect("pilot exits cleanly");
+
+        assert_eq!(
+            harness.doc().as_deref(),
+            Some("hello world"),
+            "post-cancel deltas must never land"
+        );
+        harness.wait_until("stream-state inactive", |h| {
+            h.stream_states().contains(&("pilot".to_string(), false))
+        });
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            log_text.contains("control_request") && log_text.contains("interrupt"),
+            "the interrupt must land on claude's stdin: {log_text:?}"
+        );
+    }
 
     /// Feed `input` to a fresh machine in `chunk`-sized pieces plus finish,
     /// collecting every event.
