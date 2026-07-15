@@ -828,6 +828,39 @@ fn parse_task_line(line: &str) -> (Option<String>, String) {
     }
 }
 
+/// Compose one user turn: optional pending note, the task, and the target
+/// file context. The file is ALWAYS named when known — parse_task_line has
+/// already stripped the `@file` prefix, so a buffer that never went live
+/// must not erase the target from the task.
+fn compose_turn_text(
+    note: Option<&str>,
+    task: &str,
+    file: Option<&str>,
+    buffer: Option<&str>,
+) -> String {
+    let mut content = String::new();
+    if let Some(note) = note {
+        content.push_str(note);
+        content.push_str("\n\n");
+    }
+    content.push_str(task);
+    match (file, buffer) {
+        (Some(file), Some(text)) => {
+            content.push_str(&format!(
+                "\n\n--- CURRENT BUFFER ({file}) ---\n{text}\n--- END BUFFER ---"
+            ));
+        }
+        (Some(file), None) => {
+            content.push_str(&format!(
+                "\n\nTarget file: {file} (its buffer is not shared yet; \
+                 read it with the collab tools before editing)"
+            ));
+        }
+        (None, _) => {}
+    }
+    content
+}
+
 /// Compose and send one user turn: pending cancel note, the task, and the
 /// target file's current buffer (so the model's fence coordinates have a
 /// ground truth).
@@ -855,21 +888,20 @@ fn send_turn(
     }
     let content = {
         let mut st = state.lock().unwrap();
-        let mut content = String::new();
-        if let Some(note) = st.pending_note.take() {
-            content.push_str(&note);
-            content.push_str("\n\n");
-        }
-        content.push_str(&task);
-        if let Some(file) = st.target_file.clone()
-            && let Some(text) = st.session.doc_text(&file)
-        {
-            content.push_str(&format!(
-                "\n\n--- CURRENT BUFFER ({file}) ---\n{text}\n--- END BUFFER ---"
-            ));
+        let note = st.pending_note.take();
+        let file = st.target_file.clone();
+        let buffer = file
+            .as_deref()
+            .and_then(|f| st.session.doc_text(f))
+            .map(str::to_string);
+        if file.is_some() && buffer.is_none() {
+            eprintln!(
+                "[pair] target file is not live (no owner answered); \
+                 sending the task with the file name only"
+            );
         }
         st.turn_active = true;
-        content
+        compose_turn_text(note.as_deref(), &task, file.as_deref(), buffer.as_deref())
     };
     let msg = json!({
         "type": "user",
@@ -1486,5 +1518,26 @@ if mode == "linger":
         assert_eq!(start, crate::collab::byte_offset(&lines, 0, 10));
         assert_eq!(end, crate::collab::byte_offset(&lines, 1, 2));
         assert!(start < end);
+    }
+
+    /// Every composed turn names its target file, even when the buffer never
+    /// went live (field bug 2026-07-15: parse_task_line had stripped the
+    /// @file prefix, so a dead bootstrap left claude with no file at all).
+    #[test]
+    fn compose_turn_always_names_target_file() {
+        let live = compose_turn_text(None, "fix the error", Some("src/a.rs"), Some("body"));
+        assert!(live.contains("--- CURRENT BUFFER (src/a.rs) ---"));
+        assert!(live.contains("body"));
+
+        let dead = compose_turn_text(None, "fix the error", Some("src/a.rs"), None);
+        assert!(
+            dead.contains("src/a.rs"),
+            "file must be named without a live buffer: {dead}"
+        );
+        assert!(dead.contains("fix the error"));
+
+        let noted = compose_turn_text(Some("stream was cancelled"), "task", None, None);
+        assert!(noted.starts_with("stream was cancelled"));
+        assert!(noted.contains("task"));
     }
 }
