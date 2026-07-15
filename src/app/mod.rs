@@ -10576,9 +10576,20 @@ impl App {
             // hoisted group is the only one that shows it (clear the rest so
             // a group swap never leaves a stale button behind).
             self.editor.stream_stop_line = self.stream_stop_row();
+            // Navigator note diamonds for the active file, same hoisting
+            // rule (rows come from poll_pair's per-tick snapshot).
+            self.editor.note_lines = self
+                .editor
+                .path
+                .as_ref()
+                .and_then(|p| collab_file_key(&self.tree.root, p))
+                .and_then(|file| self.navigator_notes.get(&file))
+                .map(|notes| notes.iter().map(|(row, _)| *row).collect())
+                .unwrap_or_default();
             for group in self.editor_layout.inactive_groups_mut() {
                 for ed in &mut group.editors {
                     ed.stream_stop_line = None;
+                    ed.note_lines.clear();
                 }
             }
             // Render the editor group layout tree. The active group is hoisted

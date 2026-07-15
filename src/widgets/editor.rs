@@ -1398,6 +1398,11 @@ pub struct Editor {
     /// stream and reverts the streamed text. The App rebuilds this before
     /// each render from the stream state and the pilot's ghost caret.
     pub stream_stop_line: Option<usize>,
+    /// 0-based buffer lines carrying a navigator note (`croft pair`): each
+    /// wears an orange ◆ in the sign margin; clicking one opens the note
+    /// popup. The App rebuilds this per tick from the pilot host's
+    /// anchored-note snapshot for the active file.
+    pub note_lines: Vec<usize>,
     /// Enclosing scope header lines to pin at the top of the viewport (VS Code
     /// "Sticky Scroll"), outermost first, set by `App` from the outline scope
     /// chain of the top visible line. Empty disables the feature (e.g. wrap
@@ -1611,6 +1616,7 @@ impl Editor {
             ghost_carets: Vec::new(),
             ghost_caret_labels: Vec::new(),
             stream_stop_line: None,
+            note_lines: Vec::new(),
             sticky_lines: Vec::new(),
             sticky_click_rows: Vec::new(),
             box_anchor: None,
@@ -1778,6 +1784,22 @@ impl Editor {
             return false;
         }
         line == stop_line
+    }
+
+    /// The noted 0-based line when `(col, row)` lands on a navigator note
+    /// diamond in the sign margin: same geometry as
+    /// [`test_glyph_at`](Self::test_glyph_at), first visual row only.
+    pub fn note_glyph_at(&self, col: u16, row: u16) -> Option<usize> {
+        if col != self.last_inner.x || row < self.last_inner.y {
+            return None;
+        }
+        let &(line, start, _) = self
+            .last_wrap_rows
+            .get((row - self.last_inner.y) as usize)?;
+        if self.wrap_enabled() && start != 0 {
+            return None;
+        }
+        self.note_lines.contains(&line).then_some(line)
     }
 
     /// 1-based breakpoint lines for `path`, ascending, for a DAP
@@ -6453,6 +6475,20 @@ impl Widget for &mut Editor {
                 sign_taken = true;
             }
 
+            // Navigator note diamond (croft pair): the pilot pinned a remark
+            // to this line; clicking it opens the note popup. Below the
+            // debugger and the stream stop square, above the test play glyph
+            // (a note is rarer, so it wins their shared cell).
+            if (!wrap || row_start == 0) && !sign_taken && self.note_lines.contains(&line_idx) {
+                buf.set_string(
+                    sign_x,
+                    y,
+                    "◆",
+                    Style::default().fg(Color::Rgb(0xff, 0x9d, 0x2f)),
+                );
+                sign_taken = true;
+            }
+
             // Testing gutter glyph: the play button beside a test fn's
             // definition (VS Code's run bead, in its testing green), sharing
             // the sign cell with the debugger — whose stop arrow and
@@ -9388,6 +9424,47 @@ mod tests {
             "without a stream the test play glyph owns the cell again"
         );
         assert!(!e.stream_stop_at(sign_x, 2));
+    }
+
+    /// The navigator's note diamond: noted rows wear an orange ◆ in the
+    /// sign column, clicks on it map back to the noted line, and the AI
+    /// stream's stop square outranks it on a shared cell.
+    #[test]
+    fn gutter_note_diamond_renders_maps_clicks_and_yields_to_the_stop_square() {
+        let mut e = editor_with("first\nsecond\nthird");
+        e.note_lines = vec![1];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let sign_x = e.last_inner.x;
+        // Buffer line 1 paints on content row y = 2 (breadcrumb row above).
+        assert_eq!(
+            buf[(sign_x, 2)].symbol(),
+            "◆",
+            "the noted row's sign cell wears the diamond"
+        );
+        assert_eq!(e.note_glyph_at(sign_x, 2), Some(1), "click maps to line");
+        assert_eq!(e.note_glyph_at(sign_x + 1, 2), None);
+        assert_eq!(e.note_glyph_at(sign_x, 1), None, "unnoted rows do not");
+
+        // A stream stop on the same line outranks the diamond.
+        e.stream_stop_line = Some(1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        assert_eq!(buf[(sign_x, 2)].symbol(), "■");
+
+        // Notes cleared: the cell empties.
+        e.stream_stop_line = None;
+        e.note_lines.clear();
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        assert_eq!(buf[(sign_x, 2)].symbol(), " ");
+        assert_eq!(e.note_glyph_at(sign_x, 2), None);
     }
 
     #[test]
