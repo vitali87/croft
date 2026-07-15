@@ -19287,6 +19287,25 @@ fn resident_seating_never_replays_a_persisted_task() {
     );
 }
 
+/// F4 visits notes in file (row) order and wraps, regardless of the order
+/// they streamed in. Landing order [(10,..),(2,..)] must not strand the
+/// row-2 note or stick on row 10.
+#[test]
+fn next_note_by_row_walks_rows_in_order_and_wraps() {
+    let notes = vec![
+        (10usize, String::from("late")),
+        (2usize, String::from("early")),
+        (6usize, String::from("mid")),
+    ];
+    // From the top: nearest row strictly greater.
+    assert_eq!(notes[super::next_note_by_row(&notes, 0)].0, 2);
+    assert_eq!(notes[super::next_note_by_row(&notes, 2)].0, 6);
+    assert_eq!(notes[super::next_note_by_row(&notes, 6)].0, 10);
+    // Past the last note: wrap to the smallest row (not stick on row 10).
+    assert_eq!(notes[super::next_note_by_row(&notes, 10)].0, 2);
+    assert_eq!(notes[super::next_note_by_row(&notes, 99)].0, 2);
+}
+
 /// Only one croft self-appoints the navigator owner per workspace: a second
 /// plain croft is refused the single-host lock and must NOT seat (two owners
 /// would both claim collab site id 1 and corrupt the shared buffer).

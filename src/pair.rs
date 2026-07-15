@@ -497,7 +497,6 @@ impl PairState {
     /// Arm a host turn targeting `file`: mode, target, note supersession,
     /// and the last-seen bookkeeping the yield diff reads. Returns what the
     /// navigator previously saw of the file (None = first look).
-    #[allow(dead_code)]
     pub(crate) fn begin_turn(
         &mut self,
         file: &str,
@@ -998,6 +997,14 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
             let anchor = anchor.min(doc.len());
             let new = format!("{}{}{}", &doc[..anchor], delta, &doc[anchor..]);
             st.session.local_change(&file, &new);
+            // Our own insert moves any note anchored below it in this file
+            // (notes and edits can both land in one ask turn).
+            let span = ResolvedSpan {
+                at: anchor,
+                deleted: 0,
+                inserted: delta.clone(),
+            };
+            shift_notes(&mut st.notes, &file, std::slice::from_ref(&span));
             let next = anchor + delta.len();
             if let Some(r) = st.region.as_mut() {
                 r.anchor = next;
@@ -1058,21 +1065,26 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
                 return;
             }
             let mut st = state.lock().unwrap();
-            let Some(lines) = st
-                .session
-                .doc_text(&file)
-                .map(|t| t.split('\n').map(String::from).collect::<Vec<_>>())
-            else {
+            let Some(lines) = st.doc_lines(&file) else {
                 return;
             };
             let offset = note_offset(&lines, row);
             let row_now = position(&lines, offset).0;
-            if let Some(tx) = st.events.clone() {
-                let _ = tx.send(crate::pair_host::PairEvent::NoteAdded {
-                    file: file.clone(),
-                    row: row_now,
-                    body: body.clone(),
-                });
+            match st.events.clone() {
+                Some(tx) => {
+                    let _ = tx.send(crate::pair_host::PairEvent::NoteAdded {
+                        file: file.clone(),
+                        row: row_now,
+                        body: body.clone(),
+                    });
+                }
+                None => {
+                    // REPL driver: no event channel, so print the note or it
+                    // would be silently swallowed.
+                    drop(st);
+                    say(state, &format!("[note {file}:{}] {body}\n", row_now + 1));
+                    st = state.lock().unwrap();
+                }
             }
             st.notes.push(Note { file, offset, body });
         }
@@ -1100,6 +1112,13 @@ fn open_region(st: &mut PairState, file: &str, start: (usize, usize), end: (usiz
     let original = doc[s..e].to_string();
     let new = format!("{}{}", &doc[..s], &doc[e..]);
     st.session.local_change(file, &new);
+    // Our own delete moves any note anchored below the cut in this file.
+    let span = ResolvedSpan {
+        at: s,
+        deleted: e - s,
+        inserted: String::new(),
+    };
+    shift_notes(&mut st.notes, file, std::slice::from_ref(&span));
     st.region = Some(StreamRegion {
         file: file.to_string(),
         start: s,

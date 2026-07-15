@@ -2709,6 +2709,9 @@ pub struct App {
     /// Notes the navigator left since its turn started, so the TurnDone
     /// status can surface them instead of overwriting the NoteAdded status.
     pair_notes_this_turn: usize,
+    /// The file the turn's notes landed in (for the TurnDone hint; F4 only
+    /// cycles the active file, so naming it tells the user where to look).
+    pair_last_noted_file: Option<String>,
     /// Held while this croft is the self-appointed navigator owner: exactly
     /// one plain croft per workspace may host the pilot (and claim collab
     /// owner site 1). Released by the OS on exit, so a crashed host hands off.
@@ -3577,6 +3580,7 @@ impl App {
             last_pair_check: None,
             navigator_notes: std::collections::HashMap::new(),
             pair_notes_this_turn: 0,
+            pair_last_noted_file: None,
             pair_host_lock: None,
             navigator_down: false,
             note_popup: None,
@@ -15918,9 +15922,11 @@ impl App {
                     let snippet: String = body.chars().take(60).collect();
                     self.status = format!("{name} noted {file}:{}: {snippet}", row + 1);
                     self.pair_notes_this_turn += 1;
+                    self.pair_last_noted_file = Some(file);
                 }
                 crate::pair_host::PairEvent::TurnDone { cancelled, failed } => {
                     let notes = std::mem::take(&mut self.pair_notes_this_turn);
+                    let file = self.pair_last_noted_file.take();
                     self.status = if cancelled {
                         format!("{name}: turn cancelled")
                     } else if let Some(err) = failed {
@@ -15928,7 +15934,12 @@ impl App {
                         format!("{name}: turn failed: {err}")
                     } else if notes > 0 {
                         let plural = if notes == 1 { "note" } else { "notes" };
-                        format!("{name} finished: {notes} {plural} · F4 to review")
+                        match file {
+                            Some(f) => {
+                                format!("{name} finished: {notes} {plural} in {f} · F4 to review")
+                            }
+                            None => format!("{name} finished: {notes} {plural} · F4 to review"),
+                        }
                     } else {
                         format!("{name} finished its turn")
                     };
@@ -16124,7 +16135,7 @@ impl App {
             return;
         };
         let here = self.editor.cursor_row;
-        let idx = notes.iter().position(|(row, _)| *row > here).unwrap_or(0);
+        let idx = next_note_by_row(notes, here);
         let row = notes[idx].0.min(self.editor.lines.len().saturating_sub(1));
         let path = self.editor.path.clone().expect("checked above");
         match self.open_at(&path, row, 0) {
@@ -29214,6 +29225,21 @@ fn is_remote_jump_key(key: KeyEvent) -> bool {
 /// GlobalKeyMap forwarder (no menu relocation) to deliver it here.
 fn is_extensions_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'x')
+}
+
+/// Index of the next navigator note to visit from caret row `here`: the note
+/// with the smallest row strictly greater than `here`, wrapping to the
+/// smallest row overall. `notes` are in landing (stream) order, not row
+/// order, so a naive `position(row > here)` would skip notes and could stick.
+fn next_note_by_row(notes: &[(usize, String)], here: usize) -> usize {
+    notes
+        .iter()
+        .enumerate()
+        .filter(|(_, (row, _))| *row > here)
+        .min_by_key(|(_, (row, _))| *row)
+        .or_else(|| notes.iter().enumerate().min_by_key(|(_, (row, _))| *row))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
 fn is_drop_to_local_key(key: KeyEvent) -> bool {

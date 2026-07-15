@@ -183,6 +183,11 @@ impl PairHost {
             return Vec::new();
         };
         let st = p.state.lock().unwrap();
+        // Skip splitting the whole document (this runs every tick for the
+        // active file) when it has no notes to place.
+        if st.notes_in(file).next().is_none() {
+            return Vec::new();
+        }
         let Some(lines) = st.doc_lines(file) else {
             return Vec::new();
         };
