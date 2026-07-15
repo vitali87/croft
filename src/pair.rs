@@ -37,6 +37,8 @@ use crate::collab::{
 
 /// Start of an edit-fence header line.
 const EDIT_MARKER: &str = "<<<EDIT ";
+/// Start of a note-fence header line (anchored commentary, never applied).
+const NOTE_MARKER: &str = "<<<NOTE ";
 /// The whole terminator line.
 const END_MARKER: &str = "<<<END>>>";
 
@@ -62,6 +64,22 @@ pub enum FenceEvent {
     /// The turn ended mid-fence (risk R2): the pilot reverts whatever body
     /// already streamed in.
     EditAbort,
+    /// A well-formed header opened a note anchored to the 0-based `row` of
+    /// `file`: commentary tied to a line, accumulated and surfaced whole at
+    /// `NoteEnd`, never applied to any buffer.
+    // Dead-code allows: production reads land with the note-anchoring slice.
+    NoteStart {
+        #[allow(dead_code)]
+        file: String,
+        #[allow(dead_code)]
+        row: usize,
+    },
+    /// The next fragment of the current note's body, in stream order.
+    NoteBody(#[allow(dead_code)] String),
+    /// The note closed cleanly; its accumulated body may anchor.
+    NoteEnd,
+    /// The turn ended mid-note: nothing anchors.
+    NoteAbort,
 }
 
 /// Where the machine is between pushes.
@@ -72,9 +90,12 @@ enum FenceState {
     /// emitted (it may turn out to be the newline that separates the body
     /// from `<<<END>>>`, which is stripped). `at_line_start`: the unprocessed
     /// tail starts a fresh line, so it could still become the END marker.
+    /// `is_note`: the fence opened with NOTE, so body/end/abort events use
+    /// the note variants (same scanner, different consumer semantics).
     Body {
         held_newline: bool,
         at_line_start: bool,
+        is_note: bool,
     },
 }
 
@@ -112,6 +133,14 @@ impl FenceMachine {
                         self.state = FenceState::Body {
                             held_newline: false,
                             at_line_start: true,
+                            is_note: false,
+                        };
+                    } else if let Some(start) = parse_note_header(trimmed) {
+                        events.push(start);
+                        self.state = FenceState::Body {
+                            held_newline: false,
+                            at_line_start: true,
+                            is_note: true,
                         };
                     } else {
                         events.push(FenceEvent::Commentary(line));
@@ -120,7 +149,13 @@ impl FenceMachine {
                 FenceState::Body {
                     ref mut held_newline,
                     ref mut at_line_start,
+                    is_note,
                 } => {
+                    let body_event = if is_note {
+                        FenceEvent::NoteBody
+                    } else {
+                        FenceEvent::EditBody
+                    };
                     if *at_line_start {
                         match self.buf.find('\n') {
                             Some(nl) => {
@@ -128,7 +163,11 @@ impl FenceMachine {
                                     // The held newline separated body from
                                     // the marker: stripped, not body.
                                     self.buf.drain(..=nl);
-                                    events.push(FenceEvent::EditEnd);
+                                    events.push(if is_note {
+                                        FenceEvent::NoteEnd
+                                    } else {
+                                        FenceEvent::EditEnd
+                                    });
                                     self.state = FenceState::Outside;
                                 } else {
                                     // A complete body line: the held newline
@@ -140,7 +179,7 @@ impl FenceMachine {
                                     }
                                     body.push_str(&self.buf[..nl]);
                                     self.buf.drain(..=nl);
-                                    events.push(FenceEvent::EditBody(body));
+                                    events.push(body_event(body));
                                     *held_newline = true;
                                 }
                             }
@@ -158,7 +197,7 @@ impl FenceMachine {
                                 }
                                 body.push_str(&self.buf);
                                 self.buf.clear();
-                                events.push(FenceEvent::EditBody(body));
+                                events.push(body_event(body));
                                 *at_line_start = false;
                                 break;
                             }
@@ -167,7 +206,7 @@ impl FenceMachine {
                         match self.buf.find('\n') {
                             Some(nl) => {
                                 if nl > 0 {
-                                    events.push(FenceEvent::EditBody(self.buf[..nl].to_string()));
+                                    events.push(body_event(self.buf[..nl].to_string()));
                                 }
                                 self.buf.drain(..=nl);
                                 *held_newline = true;
@@ -175,8 +214,7 @@ impl FenceMachine {
                             }
                             None => {
                                 if !self.buf.is_empty() {
-                                    events
-                                        .push(FenceEvent::EditBody(std::mem::take(&mut self.buf)));
+                                    events.push(body_event(std::mem::take(&mut self.buf)));
                                 }
                                 break;
                             }
@@ -200,9 +238,19 @@ impl FenceMachine {
                     events.push(FenceEvent::Commentary(std::mem::take(&mut self.buf)));
                 }
             }
-            FenceState::Body { at_line_start, .. } => {
+            FenceState::Body {
+                at_line_start,
+                is_note,
+                ..
+            } => {
                 if at_line_start && self.buf == END_MARKER {
-                    events.push(FenceEvent::EditEnd);
+                    events.push(if is_note {
+                        FenceEvent::NoteEnd
+                    } else {
+                        FenceEvent::EditEnd
+                    });
+                } else if is_note {
+                    events.push(FenceEvent::NoteAbort);
                 } else {
                     events.push(FenceEvent::EditAbort);
                 }
@@ -230,6 +278,21 @@ fn parse_header(line: &str) -> Option<FenceEvent> {
         file: file.to_string(),
         start: (sr.parse().ok()?, sc.parse().ok()?),
         end: (er.parse().ok()?, ec.parse().ok()?),
+    })
+}
+
+/// Parse `<<<NOTE <file>:<row>>>>` into its [`FenceEvent::NoteStart`]. The
+/// row binds rightmost so the file name may itself contain ':'. None = not
+/// a well-formed header (the line degrades to commentary).
+fn parse_note_header(line: &str) -> Option<FenceEvent> {
+    let inner = line.strip_prefix(NOTE_MARKER)?.strip_suffix(">>>")?;
+    let (file, row) = inner.rsplit_once(':')?;
+    if file.is_empty() {
+        return None;
+    }
+    Some(FenceEvent::NoteStart {
+        file: file.to_string(),
+        row: row.parse().ok()?,
     })
 }
 
@@ -717,6 +780,13 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
             }
             revert_region(&mut st);
         }
+        // Notes anchor in the pilot state in the next slice; until then a
+        // note is inert (never printed as commentary: its markers already
+        // classified it, and it must never touch a buffer).
+        FenceEvent::NoteStart { .. }
+        | FenceEvent::NoteBody(_)
+        | FenceEvent::NoteEnd
+        | FenceEvent::NoteAbort => {}
     }
 }
 
@@ -1244,6 +1314,111 @@ if mode == "linger":
                 _ => None,
             })
             .collect()
+    }
+
+    /// Concatenated body of every NoteBody event.
+    fn note_body_of(events: &[FenceEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                FenceEvent::NoteBody(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A NOTE fence parses across arbitrary delta splits: the row binds
+    /// rightmost (file names may carry ':'), the body accumulates, and the
+    /// fence closes on END without leaking markers into commentary.
+    #[test]
+    fn note_fence_parses_across_delta_splits() {
+        let input = "Look at this.\n\
+                     <<<NOTE src/f.rs:12>>>\n\
+                     the caller in cli.rs:88\nstill expects Config\n\
+                     <<<END>>>\n\
+                     trailing\n";
+        for chunk in [1, 3, 7, input.len()] {
+            let events = run_chunks(input, chunk);
+            let start = events
+                .iter()
+                .find_map(|e| match e {
+                    FenceEvent::NoteStart { file, row } => Some((file.clone(), *row)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no NoteStart at chunk {chunk}"));
+            assert_eq!(start, ("src/f.rs".to_string(), 12), "chunk {chunk}");
+            assert_eq!(
+                note_body_of(&events),
+                "the caller in cli.rs:88\nstill expects Config",
+                "chunk {chunk}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, FenceEvent::NoteEnd))
+                    .count(),
+                1,
+                "chunk {chunk}"
+            );
+            let commentary = commentary_of(&events);
+            assert!(commentary.contains("Look at this."), "chunk {chunk}");
+            assert!(commentary.contains("trailing"), "chunk {chunk}");
+            assert!(!commentary.contains("<<<NOTE"), "chunk {chunk}");
+        }
+    }
+
+    /// Malformed NOTE headers degrade to commentary, exactly like EDIT ones.
+    #[test]
+    fn malformed_note_headers_become_commentary() {
+        for bad in [
+            "<<<NOTE src/f.rs>>>\nbody\n<<<END>>>\n",
+            "<<<NOTE src/f.rs:x>>>\nbody\n<<<END>>>\n",
+            "<<<NOTE :3>>>\nbody\n<<<END>>>\n",
+            "<<<NOTE>>>\nbody\n<<<END>>>\n",
+        ] {
+            let events = run_chunks(bad, 5);
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, FenceEvent::NoteStart { .. })),
+                "{bad:?} must not start a note"
+            );
+        }
+    }
+
+    /// A turn ending mid-note aborts it so nothing anchors.
+    #[test]
+    fn unterminated_note_aborts_at_finish() {
+        let mut m = FenceMachine::new();
+        let mut events = m.push("<<<NOTE f.rs:3>>>\nhalf a thought");
+        events.extend(m.finish());
+        assert!(events.iter().any(|e| matches!(e, FenceEvent::NoteAbort)));
+        assert!(!events.iter().any(|e| matches!(e, FenceEvent::NoteEnd)));
+    }
+
+    /// Interop guard: EDIT and NOTE fences coexist in one turn and neither
+    /// disturbs the other's events (the 0.1.634 edit protocol is unchanged).
+    #[test]
+    fn edit_and_note_fences_coexist_in_one_turn() {
+        let input = "<<<EDIT a.rs:0:0-0:0>>>\nnew\n<<<END>>>\n\
+                     <<<NOTE b.rs:4>>>\nremark\n<<<END>>>\n";
+        let events = run_chunks(input, 2);
+        assert_eq!(body_of(&events), "new");
+        assert_eq!(note_body_of(&events), "remark");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, FenceEvent::EditEnd))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, FenceEvent::NoteEnd))
+                .count(),
+            1
+        );
     }
 
     /// The core streaming property: a full fenced edit parses identically no
