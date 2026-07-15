@@ -438,30 +438,42 @@ landing on the fake's stdin) all assert headlessly.
 the pilot a workspace resident that croft itself hosts, and turns the
 interaction into turn-based driver/navigator pairing:
 
-- **Activation.** `croft pair [--workspace <p>] [--model <m>] [--name <n>]
-  ["first task"]` now writes a `<hash>.pair.json` sidecar (next to the
-  workspace's collab socket, `session::pair_record_path`), ensures the
-  relay, and exits. A running croft stats the record on a 1s cadence
+- **Activation.** `croft pair [--workspace <p>] [--model <m>] [--name <n>]`
+  now writes a `<hash>.pair.json` sidecar (next to the workspace's collab
+  socket, `session::pair_record_path`), ensures the relay, and exits. A
+  running croft stats the record on a 1s cadence
   (`App::maybe_seat_navigator`) and seats the pilot in-process
   (`src/pair_host.rs`, `PairHost` — the `run_pilot` bootstrap minus the
   REPL, its voice rerouted from stdio to `PairEvent`s the App drains each
-  tick). `croft pair --off` or the "Navigator: Activate or Deactivate"
-  palette entry unseats it; the hidden `--repl` flag keeps the old
-  terminal driver for debugging.
+  tick). The resident navigator takes its instructions in-editor
+  (`Cmd+K Q`), so a start task is not persisted — it would re-fire on every
+  launch, and an `@file` task would freeze the tick thread on seat (the
+  owner that must serve the file *is* that thread). The hidden `--repl`
+  flag still takes a one-shot task for the old terminal driver. `croft pair
+  --off` or the "Navigator: Activate or Deactivate" palette entry unseats
+  it.
 - **The owner-seat requirement.** The pilot's guest seat bootstraps files
   via SnapshotRequest, and only a collab OWNER answers. A plain `croft`
   launch has no collab session at all, so activation self-appoints it: the
   App creates the owner-role channel itself (ensure_relay + direct
   connect) before seating the pilot. Solo guests never host — the owner's
-  croft does. Two plain crofts on one workspace would both self-appoint
-  (site collision): a documented v1 limitation; `croft attach` remains the
-  multi-croft-safe path.
+  croft does. Exactly one croft may self-appoint per workspace: an advisory
+  `flock` on `<hash>.pair-host.lock` (`session::try_acquire_pair_host_lock`)
+  guards it, so a second window is refused ("hosted by another croft
+  window") instead of both claiming owner site 1 and corrupting the buffer.
+  The OS drops the lock when the holder exits, so a crashed host hands off
+  automatically. (The non-hosting window does not yet observe the owner's
+  edits as a guest — a documented follow-up; `croft attach` is the shared
+  path for that today.)
 - **Ask turns (may edit).** Right-click the gutter ("Ask Navigator"), a
   selection ("Ask Navigator About Selection"), or `Cmd+K Q`: an input box
   takes the instruction, and the turn carries the 0-based line/range, the
   selected text, and the buffer numbered `N|` per line (the prompt teaches
   that the prefix is a label, not content). Fence edits stream with the
-  full 0.1.634 cancel machinery.
+  full 0.1.634 cancel machinery. Only one turn runs at a time: an ask or
+  yield fired while another is still streaming is refused ("mid-turn; wait
+  for it to finish"), so the shared `comment_only` flag is never clobbered
+  mid-stream.
 - **Yield turns (comment-only, host-enforced).** `Cmd+K Y` hands the
   navigator the floor on the active file: the turn carries the unified
   diff since its last look plus the numbered buffer, and the host DISCARDS
@@ -469,9 +481,10 @@ interaction into turn-based driver/navigator pairing:
   result) — the prompt rule is advisory, the gate is not.
 - **Notes.** A new NOTE fence (`<<<NOTE <file>:<row>>>>` … `<<<END>>>`,
   0-based row) anchors commentary to lines. Notes live in the pilot as
-  byte offsets shifted through every RemoteEdit span (the same
-  `shift_offset` replay as the stream region), so they track concurrent
-  edits; the App snapshots them per tick into gutter `◆` diamonds. The
+  byte offsets shifted through every RemoteEdit span AND the pilot's own
+  streamed edits (the same `shift_offset` replay as the stream region), so
+  they track concurrent edits and the pilot's own same-turn edits; the App
+  snapshots them per tick into gutter `◆` diamonds. The
   caret landing on a noted row (or a `◆` click, or `F4` cycling) opens an
   anchored popup; `Esc` dismisses without costing the selection. A new
   turn targeting a file supersedes that file's notes; "Navigator: Clear
@@ -480,9 +493,14 @@ interaction into turn-based driver/navigator pairing:
   rides the relay, so 0.1.633/634 peers interop untouched.
 - **Presence.** While seated and idle the status bar wears a quiet
   `◆ <name> seated` badge; the orange streaming badge takes over whenever
-  it types. If the claude child dies, the host surfaces it and unseats
-  (no auto-respawn, matching the LSP-server precedent); re-activate to
-  reseat.
+  it types. If the claude child dies (or fails to seat), the host surfaces
+  it and unseats, and does NOT respawn it every second — the latch clears
+  only when the record is deactivated, so a `croft pair --off` / `croft
+  pair` (or palette off/on) re-activates. Teardown on unseat runs on a
+  detached thread so the 2s grace-kill never freezes the UI, and the exit
+  paths (drop-to-local, self-update exec) reap the child synchronously
+  first. The claude binary resolves to an absolute path when off `PATH`, so
+  a stripped GUI-launch environment can still seat it.
 
 ### Slice 3 design: op transport and the process model
 
