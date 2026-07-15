@@ -19222,7 +19222,10 @@ fn a_dead_navigator_is_not_respawned_until_reactivated() {
     enabled(&mut app);
     app.maybe_seat_navigator();
     assert_eq!(seats.get(), 1, "one seat attempt");
-    assert!(app.navigator_down, "a failed seat latches the navigator down");
+    assert!(
+        app.navigator_down,
+        "a failed seat latches the navigator down"
+    );
 
     // Many more ticks with the record still enabled: NO respawn storm.
     for _ in 0..5 {
@@ -19349,7 +19352,10 @@ fn only_one_croft_self_appoints_the_navigator_owner() {
     a.pair_spawn_override = Some(Box::new(|_| anyhow::bail!("no real child in test")));
     enable(&mut a);
     a.maybe_seat_navigator();
-    assert!(a.pair_host_lock.is_some(), "A must hold the single-host lock");
+    assert!(
+        a.pair_host_lock.is_some(),
+        "A must hold the single-host lock"
+    );
 
     // Croft B, same workspace: with a live relay, WITHOUT the lock gate it
     // would self-appoint and reach the spawn (panic). The gate must refuse it.
