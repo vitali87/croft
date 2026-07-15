@@ -118,7 +118,7 @@ impl PairHost {
     /// as a [`PairEvent::TurnDone`].
     pub fn send_task(&self, line: &str) -> Result<()> {
         let p = self.pilot.as_ref().context("navigator pilot is gone")?;
-        send_turn(&p.state, &p.writer, line)
+        send_turn(&p.state, &p.sink, line)
     }
 
     /// Ask turn: the navigator may edit. `range` is the invoked 0-based
@@ -138,7 +138,7 @@ impl PairHost {
         }
         p.state.lock().unwrap().begin_turn(file, content, false);
         let body = compose_ask_turn(file, range, selection, instruction, content);
-        write_user_turn(&p.state, &p.writer, body)
+        write_user_turn(&p.state, &p.sink, body)
     }
 
     /// Yield turn: the driver hands the navigator the floor. Comment-only,
@@ -156,7 +156,7 @@ impl PairHost {
                 .to_string()
         });
         let body = compose_yield_turn(file, content, diff.as_deref());
-        write_user_turn(&p.state, &p.writer, body)
+        write_user_turn(&p.state, &p.sink, body)
     }
 
     /// Drop every anchored note (the palette's "Navigator: Clear Notes").

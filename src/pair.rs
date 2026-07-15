@@ -543,6 +543,33 @@ fn wait_live(state: &Mutex<PairState>, file: &str) -> bool {
     }
 }
 
+/// Where a composed user turn goes. The claude backend wraps it in a
+/// stream-json user message on the child's stdin; a future local backend
+/// queues the raw body to its HTTP worker instead. Everything upstream of
+/// the sink (turn composition, pending notes, turn_active) is shared.
+#[derive(Clone)]
+pub(crate) enum TurnSink {
+    Claude(Arc<Mutex<Option<ChildStdin>>>),
+}
+
+impl TurnSink {
+    /// Deliver one composed user-turn body to the model conversation.
+    fn send_user(&self, content: &str) -> Result<()> {
+        match self {
+            TurnSink::Claude(writer) => {
+                let msg = json!({
+                    "type": "user",
+                    "message": { "role": "user", "content": content },
+                });
+                let mut w = writer.lock().unwrap();
+                let w = w.as_mut().context("claude stdin already closed")?;
+                writeln!(w, "{msg}").context("writing user turn to claude")?;
+                w.flush().context("flushing claude stdin")
+            }
+        }
+    }
+}
+
 /// Kill the claude child when the pilot unwinds, however it unwinds.
 struct ChildGuard(Child);
 
@@ -670,7 +697,7 @@ fn connect_session(socket: &Path, name: &str) -> Result<CollabSession> {
 /// in-process [`crate::pair_host::PairHost`] — run on top of this.
 pub(crate) struct Pilot {
     pub(crate) state: Arc<Mutex<PairState>>,
-    pub(crate) writer: Arc<Mutex<Option<ChildStdin>>>,
+    pub(crate) sink: TurnSink,
     pub(crate) turn_rx: Receiver<TurnEnd>,
     stop: Arc<AtomicBool>,
     guard: ChildGuard,
@@ -695,7 +722,8 @@ impl Pilot {
             revert_region(&mut st);
         }
         self.stop.store(true, Ordering::Relaxed);
-        self.writer.lock().unwrap().take(); // EOF asks claude to end
+        let TurnSink::Claude(writer) = &self.sink;
+        writer.lock().unwrap().take(); // EOF asks claude to end
         let grace = Instant::now() + Duration::from_secs(2);
         loop {
             match self.guard.0.try_wait() {
@@ -758,7 +786,7 @@ pub(crate) fn seat_pilot(
     let child_stdout = child.stdout.take().context("claude stdout missing")?;
     let child_stderr = child.stderr.take().context("claude stderr missing")?;
     let guard = ChildGuard(child);
-    let writer: Arc<Mutex<Option<ChildStdin>>> = Arc::new(Mutex::new(Some(child_stdin)));
+    let sink = TurnSink::Claude(Arc::new(Mutex::new(Some(child_stdin))));
 
     let stop = Arc::new(AtomicBool::new(false));
     let (turn_tx, turn_rx) = std::sync::mpsc::channel::<TurnEnd>();
@@ -812,12 +840,12 @@ pub(crate) fn seat_pilot(
     // Pump: remote spans shift the streamed region; StreamCancel cancels.
     let pump = {
         let state = Arc::clone(&state);
-        let writer = Arc::clone(&writer);
+        let sink = sink.clone();
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             let req_id = AtomicU64::new(0);
             while !stop.load(Ordering::Relaxed) {
-                pump_session(&state, &writer, &req_id);
+                pump_session(&state, &sink, &req_id);
                 std::thread::sleep(Duration::from_millis(25));
             }
         })
@@ -825,7 +853,7 @@ pub(crate) fn seat_pilot(
 
     Ok(Pilot {
         state,
-        writer,
+        sink,
         turn_rx,
         stop,
         guard,
@@ -864,7 +892,7 @@ fn run_pilot(
         if line.is_empty() {
             continue;
         }
-        send_turn(&pilot.state, &pilot.writer, &line)?;
+        send_turn(&pilot.state, &pilot.sink, &line)?;
         match pilot.turn_rx.recv() {
             Ok(end) if end.cancelled => println!("\n[turn cancelled]"),
             Ok(end) if end.is_error => println!("\n[turn failed: {}]", end.text),
@@ -1149,7 +1177,7 @@ fn revert_region(st: &mut PairState) {
 
 /// One pump tick: drain the relay; remote spans shift the streamed region's
 /// offsets (concurrent human edits), StreamCancel interrupts and reverts.
-fn pump_session(state: &Mutex<PairState>, writer: &Mutex<Option<ChildStdin>>, req_id: &AtomicU64) {
+fn pump_session(state: &Mutex<PairState>, sink: &TurnSink, req_id: &AtomicU64) {
     let mut interrupt = false;
     {
         let mut st = state.lock().unwrap();
@@ -1193,16 +1221,20 @@ fn pump_session(state: &Mutex<PairState>, writer: &Mutex<Option<ChildStdin>>, re
         }
     }
     // The claude write happens outside the state lock (lock order: state
-    // then writer, same as send_turn; never both held).
-    if interrupt && let Some(w) = writer.lock().unwrap().as_mut() {
-        let id = req_id.fetch_add(1, Ordering::Relaxed);
-        let msg = json!({
-            "type": "control_request",
-            "request_id": format!("croft-pair-{id}"),
-            "request": { "subtype": "interrupt" },
-        });
-        let _ = writeln!(w, "{msg}");
-        let _ = w.flush();
+    // then writer, same as send_turn; never both held). Only the claude
+    // backend can interrupt mid-turn; can_interrupt never arms elsewhere.
+    if interrupt {
+        let TurnSink::Claude(writer) = sink;
+        if let Some(w) = writer.lock().unwrap().as_mut() {
+            let id = req_id.fetch_add(1, Ordering::Relaxed);
+            let msg = json!({
+                "type": "control_request",
+                "request_id": format!("croft-pair-{id}"),
+                "request": { "subtype": "interrupt" },
+            });
+            let _ = writeln!(w, "{msg}");
+            let _ = w.flush();
+        }
     }
 }
 
@@ -1314,11 +1346,7 @@ pub(crate) fn compose_yield_turn(file: &str, content: &str, diff: Option<&str>) 
 /// Compose and send one user turn: pending cancel note, the task, and the
 /// target file's current buffer (so the model's fence coordinates have a
 /// ground truth).
-pub(crate) fn send_turn(
-    state: &Mutex<PairState>,
-    writer: &Mutex<Option<ChildStdin>>,
-    line: &str,
-) -> Result<()> {
+pub(crate) fn send_turn(state: &Mutex<PairState>, sink: &TurnSink, line: &str) -> Result<()> {
     let (file, task) = parse_task_line(line);
     if let Some(file) = &file {
         let mut st = state.lock().unwrap();
@@ -1353,15 +1381,15 @@ pub(crate) fn send_turn(
         );
     }
     let body = compose_turn_text(&task, file.as_deref(), buffer.as_deref());
-    write_user_turn(state, writer, body)
+    write_user_turn(state, sink, body)
 }
 
-/// Write one composed user turn to claude's stdin, prepending any pending
+/// Send one composed user turn through the sink, prepending any pending
 /// cancel note and marking the turn active. Lock order: state then writer,
 /// never both held.
 pub(crate) fn write_user_turn(
     state: &Mutex<PairState>,
-    writer: &Mutex<Option<ChildStdin>>,
+    sink: &TurnSink,
     body: String,
 ) -> Result<()> {
     let content = {
@@ -1370,15 +1398,7 @@ pub(crate) fn write_user_turn(
         st.turn_active = true;
         with_pending_note(note, body)
     };
-    let msg = json!({
-        "type": "user",
-        "message": { "role": "user", "content": content },
-    });
-    let mut w = writer.lock().unwrap();
-    let w = w.as_mut().context("claude stdin already closed")?;
-    writeln!(w, "{msg}").context("writing user turn to claude")?;
-    w.flush().context("flushing claude stdin")?;
-    Ok(())
+    sink.send_user(&content)
 }
 
 /// The pending cancel note rides in front of the next turn's body.
@@ -1601,6 +1621,33 @@ mod tests {
         text
     }
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The Claude sink wraps a turn body in a stream-json user message and
+    /// writes it to the child's stdin, byte-identical to the pre-TurnSink
+    /// path (`cat` echoes its stdin back so the test can read what landed).
+    #[test]
+    fn turn_sink_claude_writes_stream_json_to_stdin() {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn cat");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let sink = TurnSink::Claude(Arc::new(Mutex::new(Some(stdin))));
+        sink.send_user("hello\nworld").unwrap();
+        let TurnSink::Claude(w) = &sink;
+        w.lock().unwrap().take(); // EOF so cat exits
+        let mut line = String::new();
+        std::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .unwrap();
+        let _ = child.wait();
+        let v: Value = serde_json::from_str(&line).expect("one stream-json line");
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"], "hello\nworld");
+    }
 
     /// A relay plus a pumping owner session that serves `demo.txt`,
     /// collecting every owner-side event for the assertions.
