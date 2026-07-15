@@ -1360,6 +1360,8 @@ if mode == "notes":
     delta("<<<END>>>\n")
     emit({"type": "result", "subtype": "success",
           "is_error": False, "result": "ok"})
+    # Stay seated like the real CLI: wait for the next turn (or EOF).
+    sys.stdin.readline()
     sys.exit(0)
 
 delta("Let me fix that.\n")

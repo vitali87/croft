@@ -19332,6 +19332,88 @@ fn cmd_k_y_yields_the_active_file_and_commentary_reaches_output() {
     }
 }
 
+/// A clean turn that left notes must SAY so: the TurnDone status names the
+/// note count and the F4 review key instead of overwriting the NoteAdded
+/// status with a bare "finished its turn" in the same drain.
+#[test]
+fn turn_done_status_keeps_the_notes_visible() {
+    use std::time::{Duration, Instant};
+    if !crate::lsp::manager::is_on_path("python3") {
+        eprintln!("SKIPPED: python3 not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("demo.txt");
+    std::fs::write(&file, "a\nb\nc").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let script = tmp.path().join("fake_claude.py");
+    std::fs::write(&script, crate::pair::FAKE_CLAUDE).unwrap();
+    let log = tmp.path().join("stdin.log");
+
+    // Full seating (record + owner self-appointment): the app-side owner
+    // answers the pilot's SnapshotRequest so the NOTE can anchor.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+    app.pair_record_path = tmp.path().join("x.pair.json");
+    app.pair_socket = socket.clone();
+    let (script2, log2, socket2) = (script.clone(), log.clone(), socket.clone());
+    app.pair_spawn_override = Some(Box::new(move |cfg| {
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg(&script2).arg(&log2).arg("notes");
+        crate::pair_host::PairHost::spawn_cmd(&socket2, &cfg.name, cfg.task.as_deref(), cmd)
+    }));
+    crate::session::write_pair_record(
+        &app.pair_record_path,
+        &crate::session::PairRecord {
+            model: None,
+            name: "nav".into(),
+            enabled: true,
+            task: None,
+        },
+    )
+    .unwrap();
+    app.last_pair_check = None;
+    assert!(app.maybe_seat_navigator());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.collab.is_none() {
+        assert!(Instant::now() < deadline, "owner seat never connected");
+        app.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('y'), KeyModifiers::NONE)));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.poll_collab();
+        app.poll_pair();
+        if app.status.contains("finished") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "turn never finished; status: {}",
+            app.status
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        app.status.contains("1 note") && app.status.contains("F4"),
+        "TurnDone status must surface the notes, got: {}",
+        app.status
+    );
+}
+
 /// The ask box: Cmd+K Q opens the navigator input scoped to the caret line
 /// (or the selection), right-click menus carry the entries, and submitting
 /// sends the composed ask turn (instruction, 0-based range, numbered

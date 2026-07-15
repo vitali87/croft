@@ -2703,6 +2703,9 @@ pub struct App {
     /// notes, refreshed each tick from the host; drives the gutter ◆ marks
     /// and the note popup.
     navigator_notes: std::collections::HashMap<String, Vec<(usize, String)>>,
+    /// Notes the navigator left since its turn started, so the TurnDone
+    /// status can surface them instead of overwriting the NoteAdded status.
+    pair_notes_this_turn: usize,
     /// The open navigator note: (collab file key, index into that file's
     /// note snapshot). Opens when the caret lands on a noted row, on a ◆
     /// click, or via F4; Esc dismisses.
@@ -3559,6 +3562,7 @@ impl App {
             pair_socket: crate::session::collab_socket_path(&root),
             last_pair_check: None,
             navigator_notes: std::collections::HashMap::new(),
+            pair_notes_this_turn: 0,
             note_popup: None,
             note_probe: None,
             #[cfg(test)]
@@ -15865,13 +15869,18 @@ impl App {
                 crate::pair_host::PairEvent::NoteAdded { file, row, body } => {
                     let snippet: String = body.chars().take(60).collect();
                     self.status = format!("{name} noted {file}:{}: {snippet}", row + 1);
+                    self.pair_notes_this_turn += 1;
                 }
                 crate::pair_host::PairEvent::TurnDone { cancelled, failed } => {
+                    let notes = std::mem::take(&mut self.pair_notes_this_turn);
                     self.status = if cancelled {
                         format!("{name}: turn cancelled")
                     } else if let Some(err) = failed {
                         let err: String = err.chars().take(80).collect();
                         format!("{name}: turn failed: {err}")
+                    } else if notes > 0 {
+                        let plural = if notes == 1 { "note" } else { "notes" };
+                        format!("{name} finished: {notes} {plural} · F4 to review")
                     } else {
                         format!("{name} finished its turn")
                     };
