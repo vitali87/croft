@@ -15981,6 +15981,10 @@ impl App {
                 String::from("Navigator is not active (run croft pair in this workspace)");
             return;
         };
+        if host.is_busy() {
+            self.status = format!("{} is mid-turn; wait for it to finish", host.name());
+            return;
+        }
         let Some(file) = self
             .editor
             .path
@@ -16015,6 +16019,10 @@ impl App {
                 String::from("Navigator is not active (run croft pair in this workspace)");
             return;
         };
+        if host.is_busy() {
+            self.status = format!("{} is mid-turn; wait for it to finish", host.name());
+            return;
+        }
         let Some(file) = self
             .editor
             .path

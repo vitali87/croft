@@ -475,6 +475,14 @@ impl PairState {
         self.notes.iter().filter(move |n| n.file == file)
     }
 
+    /// True between sending a user turn and seeing its result. A new turn
+    /// must not be sent while this holds: the shared `comment_only` flag and
+    /// the target file would be clobbered mid-stream, defeating the
+    /// host-enforced comment-only guarantee on a yield.
+    pub(crate) fn turn_active(&self) -> bool {
+        self.turn_active
+    }
+
     /// Drop `file`'s notes: a new turn targeting the file supersedes its
     /// previous say.
     pub(crate) fn clear_notes(&mut self, file: &str) {
@@ -1353,6 +1361,13 @@ if not line:
 log.write(line)
 log.flush()
 
+if mode == "hang":
+    # Read one turn, then never respond: turn_active stays true so the host
+    # reports busy and rejects a second turn.
+    import time
+    time.sleep(60)
+    sys.exit(0)
+
 if mode == "notes":
     delta("Reviewing.\n")
     delta("<<<NOTE demo.txt:1>>>\n")
@@ -2092,6 +2107,45 @@ mod tests {
             vec![(1, "second line could be tighter".to_string())]
         );
         drop(host); // must not hang: the shutdown grace-kill path
+    }
+
+    /// A turn cannot be sent while one is still streaming: the host rejects
+    /// the overlapping turn (before begin_turn runs) so the shared
+    /// comment-only flag is never clobbered mid-stream. Without the guard, a
+    /// yield fired during an ask would flip comment_only and the yield's
+    /// edits could reach the buffer.
+    #[test]
+    fn a_turn_is_rejected_while_another_is_streaming() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("line zero\nline one");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script).arg(&log).arg("hang"); // reads one turn, never answers
+        let host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "nav", None, cmd).unwrap();
+
+        // First turn: an ask (edits allowed). turn_active is set synchronously
+        // when the turn is written, so the host is busy immediately.
+        host.send_ask_turn("demo.txt", (0, 0), "", "do a thing", "line zero\nline one")
+            .unwrap();
+        assert!(host.is_busy(), "the ask turn is streaming");
+
+        // A yield fired now must be rejected, and must NOT have flipped the
+        // in-flight turn into comment-only (begin_turn never ran).
+        let err = host
+            .send_yield_turn("demo.txt", "line zero\nline one")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("mid-turn"),
+            "expected a mid-turn rejection, got: {err}"
+        );
+        assert!(host.is_busy(), "the original ask turn is untouched");
+        drop(host);
     }
 
     /// The system prompt must teach the NOTE fence (with a concrete

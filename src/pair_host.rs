@@ -83,6 +83,14 @@ impl PairHost {
         &self.name
     }
 
+    /// True while a turn is streaming: a new ask/yield must wait for it to
+    /// finish, else the shared comment-only flag gets clobbered mid-stream.
+    pub fn is_busy(&self) -> bool {
+        self.pilot
+            .as_ref()
+            .is_some_and(|p| p.state.lock().unwrap().turn_active())
+    }
+
     /// Everything the pilot produced since the last tick: commentary and
     /// notes from its channel, turn ends from the reader, and a one-shot
     /// Died when claude's stdout closed.
@@ -125,6 +133,9 @@ impl PairHost {
         content: &str,
     ) -> Result<()> {
         let p = self.pilot.as_ref().context("navigator pilot is gone")?;
+        if p.state.lock().unwrap().turn_active() {
+            anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+        }
         p.state.lock().unwrap().begin_turn(file, content, false);
         let body = compose_ask_turn(file, range, selection, instruction, content);
         write_user_turn(&p.state, &p.writer, body)
@@ -134,6 +145,9 @@ impl PairHost {
     /// host-enforced; the turn carries the diff since its last look.
     pub fn send_yield_turn(&self, file: &str, content: &str) -> Result<()> {
         let p = self.pilot.as_ref().context("navigator pilot is gone")?;
+        if p.state.lock().unwrap().turn_active() {
+            anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+        }
         let old = p.state.lock().unwrap().begin_turn(file, content, true);
         let diff = old.filter(|o| o != content).map(|o| {
             similar::TextDiff::from_lines(o.as_str(), content)
