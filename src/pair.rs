@@ -639,12 +639,13 @@ fn wait_live(state: &Mutex<PairState>, file: &str) -> bool {
 }
 
 /// Where a composed user turn goes. The claude backend wraps it in a
-/// stream-json user message on the child's stdin; a future local backend
-/// queues the raw body to its HTTP worker instead. Everything upstream of
-/// the sink (turn composition, pending notes, turn_active) is shared.
+/// stream-json user message on the child's stdin; the local backend queues
+/// the raw body to its HTTP worker instead. Everything upstream of the sink
+/// (turn composition, pending notes, turn_active) is shared.
 #[derive(Clone)]
 pub(crate) enum TurnSink {
     Claude(Arc<Mutex<Option<ChildStdin>>>),
+    Local(Sender<String>),
 }
 
 impl TurnSink {
@@ -660,6 +661,13 @@ impl TurnSink {
                 let w = w.as_mut().context("claude stdin already closed")?;
                 writeln!(w, "{msg}").context("writing user turn to claude")?;
                 w.flush().context("flushing claude stdin")
+            }
+            TurnSink::Local(turns) => {
+                anyhow::ensure!(
+                    turns.send(content.to_string()).is_ok(),
+                    "the local turn worker is gone"
+                );
+                Ok(())
             }
         }
     }
@@ -787,51 +795,97 @@ fn connect_session(socket: &Path, name: &str) -> Result<CollabSession> {
     }
 }
 
-/// A seated pilot: the claude child plus the reader and pump threads over
-/// shared state. Both drivers — the debug REPL ([`run_pilot`]) and the
-/// in-process [`crate::pair_host::PairHost`] — run on top of this.
+/// A seated pilot: the transport's threads over shared state. Both drivers
+/// — the debug REPL ([`run_pilot`]) and the in-process
+/// [`crate::pair_host::PairHost`] — run on top of this.
 pub(crate) struct Pilot {
     pub(crate) state: Arc<Mutex<PairState>>,
     pub(crate) sink: TurnSink,
     pub(crate) turn_rx: Receiver<TurnEnd>,
     stop: Arc<AtomicBool>,
-    guard: ChildGuard,
-    reader: std::thread::JoinHandle<()>,
-    pump: std::thread::JoinHandle<()>,
+    transport: Transport,
+}
+
+/// The per-backend half of a seated pilot: what owns the conversation and
+/// which threads to reap at shutdown.
+enum Transport {
+    /// The claude CLI child: a persistent stream-json conversation over its
+    /// stdio, read by a dedicated thread.
+    Claude {
+        guard: ChildGuard,
+        reader: std::thread::JoinHandle<()>,
+        pump: std::thread::JoinHandle<()>,
+    },
+    /// A local Anthropic-compatible endpoint: no child; a detached worker
+    /// drains the queued turn bodies through one HTTP stream each and exits
+    /// when the queue closes (shutdown never joins it — a mid-stream read
+    /// can take minutes).
+    Local { pump: std::thread::JoinHandle<()> },
 }
 
 impl Pilot {
-    /// The claude child's stdout hit EOF: the conversation is gone.
+    /// The conversation is gone (claude's stdout hit EOF). A local seat has
+    /// no child to lose: endpoint failures surface per turn instead.
     pub(crate) fn reader_finished(&self) -> bool {
-        self.reader.is_finished()
+        match &self.transport {
+            Transport::Claude { reader, .. } => reader.is_finished(),
+            Transport::Local { .. } => false,
+        }
     }
 
-    /// Tear the seat down: leave no stream badge behind, hang up, then
-    /// grace-kill. The real claude CLI does not reliably exit on stdin EOF
-    /// (MCP teardown lingers), and the reader joins only when claude's
-    /// stdout closes — so the polite exit gets a short grace before the
-    /// kill. The caller's exit must never hinge on a child's manners.
-    pub(crate) fn shutdown(mut self) {
+    /// Tear the seat down: leave no stream badge behind, hang up, then reap.
+    /// Claude: the real CLI does not reliably exit on stdin EOF (MCP
+    /// teardown lingers), and the reader joins only when claude's stdout
+    /// closes — so the polite exit gets a short grace before the kill. The
+    /// caller's exit must never hinge on a child's manners. Local: closing
+    /// the turn queue ends the worker after its current stream; it is
+    /// detached, not joined, because a mid-stream HTTP read can take minutes
+    /// — the armed `cancelled` flag guarantees it applies nothing more.
+    pub(crate) fn shutdown(self) {
+        let Pilot {
+            state,
+            sink,
+            turn_rx: _,
+            stop,
+            transport,
+        } = self;
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = state.lock().unwrap();
             revert_region(&mut st);
         }
-        self.stop.store(true, Ordering::Relaxed);
-        let TurnSink::Claude(writer) = &self.sink;
-        writer.lock().unwrap().take(); // EOF asks claude to end
-        let grace = Instant::now() + Duration::from_secs(2);
-        loop {
-            match self.guard.0.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < grace => std::thread::sleep(Duration::from_millis(50)),
-                _ => {
-                    let _ = self.guard.0.kill();
-                    break;
+        stop.store(true, Ordering::Relaxed);
+        match transport {
+            Transport::Claude {
+                mut guard,
+                reader,
+                pump,
+            } => {
+                if let TurnSink::Claude(writer) = &sink {
+                    writer.lock().unwrap().take(); // EOF asks claude to end
                 }
+                let grace = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match guard.0.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) if Instant::now() < grace => {
+                            std::thread::sleep(Duration::from_millis(50))
+                        }
+                        _ => {
+                            let _ = guard.0.kill();
+                            break;
+                        }
+                    }
+                }
+                let _ = pump.join();
+                let _ = reader.join();
+            }
+            Transport::Local { pump } => {
+                // Nothing from a still-draining stream may land after this.
+                state.lock().unwrap().cancelled = true;
+                drop(sink); // closes the turn queue; the worker exits after its stream
+                let _ = pump.join();
             }
         }
-        let _ = self.pump.join();
-        let _ = self.reader.join();
     }
 }
 
@@ -937,9 +991,72 @@ pub(crate) fn seat_pilot(
         sink,
         turn_rx,
         stop,
-        guard,
-        reader,
-        pump,
+        transport: Transport::Claude {
+            guard,
+            reader,
+            pump,
+        },
+    })
+}
+
+/// Seat the pilot on a local Anthropic-compatible endpoint: the same collab
+/// guest seat and pump as the claude transport, but no child — a worker
+/// owns the conversation (the endpoint is stateless) and runs one blocking
+/// [`local::stream_turn`] per queued turn body.
+// Dead-code allow until the Provider dispatch (the next slice) calls it.
+#[allow(dead_code)]
+pub(crate) fn seat_local(
+    socket: &Path,
+    name: &str,
+    base_url: &str,
+    model: &str,
+    events: Option<Sender<crate::pair_host::PairEvent>>,
+) -> Result<Pilot> {
+    let session = connect_session(socket, name)?;
+    let state = Arc::new(Mutex::new(PairState::new(session, events)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (turns_tx, turns_rx) = std::sync::mpsc::channel::<String>();
+    let (end_tx, turn_rx) = std::sync::mpsc::channel::<TurnEnd>();
+    let sink = TurnSink::Local(turns_tx);
+
+    // Detached worker: owns the conversation, exits when the queue closes.
+    {
+        let state = Arc::clone(&state);
+        let (base_url, model) = (base_url.to_string(), model.to_string());
+        let system = system_prompt(&Provider::Local {
+            base_url: base_url.clone(),
+        })
+        .into_owned();
+        std::thread::spawn(move || {
+            let mut messages: Vec<Value> = Vec::new();
+            while let Ok(body) = turns_rx.recv() {
+                messages.push(json!({ "role": "user", "content": body }));
+                local::stream_turn(&base_url, &model, &system, &mut messages, &state, &end_tx);
+            }
+        });
+    }
+
+    // Pump: remote spans shift the streamed region; StreamCancel reverts
+    // (no interrupt to deliver — the local stream just stops applying).
+    let pump = {
+        let state = Arc::clone(&state);
+        let sink = sink.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let req_id = AtomicU64::new(0);
+            while !stop.load(Ordering::Relaxed) {
+                pump_session(&state, &sink, &req_id);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        })
+    };
+
+    Ok(Pilot {
+        state,
+        sink,
+        turn_rx,
+        stop,
+        transport: Transport::Local { pump },
     })
 }
 
@@ -1305,7 +1422,9 @@ fn pump_session(state: &Mutex<PairState>, sink: &TurnSink, req_id: &AtomicU64) {
     // then writer, same as send_turn; never both held). Only the claude
     // backend can interrupt mid-turn; can_interrupt never arms elsewhere.
     if interrupt {
-        let TurnSink::Claude(writer) = sink;
+        let TurnSink::Claude(writer) = sink else {
+            return; // can_interrupt only ever arms on the claude transport
+        };
         if let Some(w) = writer.lock().unwrap().as_mut() {
             let id = req_id.fetch_add(1, Ordering::Relaxed);
             let msg = json!({
@@ -1717,7 +1836,9 @@ mod tests {
         let stdout = child.stdout.take().unwrap();
         let sink = TurnSink::Claude(Arc::new(Mutex::new(Some(stdin))));
         sink.send_user("hello\nworld").unwrap();
-        let TurnSink::Claude(w) = &sink;
+        let TurnSink::Claude(w) = &sink else {
+            unreachable!()
+        };
         w.lock().unwrap().take(); // EOF so cat exits
         let mut line = String::new();
         std::io::BufReader::new(stdout)
@@ -1861,8 +1982,29 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 65536];
-            let _ = sock.read(&mut buf);
+            // Drain the WHOLE request (headers + Content-Length body) before
+            // responding: answering after the first read races the client's
+            // body write — the close RSTs the socket and eats the response.
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let content_length = text[..head_end]
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if req.len() >= head_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
             let mut body = String::new();
             for d in deltas {
                 let ev = json!({
@@ -1994,6 +2136,47 @@ mod tests {
         assert_eq!(messages.len(), 1, "no assistant message on a failed turn");
         stop.store(true, Ordering::Relaxed);
         pump.join().unwrap();
+    }
+
+    /// The childless local seat end to end: seat_local connects the guest
+    /// seat, the queued turn streams the stub endpoint's fenced edit into
+    /// the owner's replica, the turn ends cleanly, and shutdown returns
+    /// promptly (no child, no grace-kill).
+    #[test]
+    fn seat_local_drives_a_turn_end_to_end() {
+        let harness = OwnerHarness::start("hello world");
+        let (base_url, server) = serve_sse_once(vec![
+            "Let me fix that.\n",
+            "<<<EDIT demo.txt:0:6-0:11>",
+            ">>\n",
+            "streamed",
+            " edit",
+            "\n<<<END>>>\nDone.\n",
+        ]);
+        let pilot = seat_local(&harness.socket, "pilot", &base_url, "test-model", None).unwrap();
+        assert!(!pilot.reader_finished(), "a local seat never loses a child");
+
+        send_turn(&pilot.state, &pilot.sink, "fix demo.txt").unwrap();
+        let end = pilot
+            .turn_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("turn ends");
+        assert!(!end.is_error && !end.cancelled, "{}", end.text);
+        server.join().unwrap();
+
+        harness.wait_until("the streamed edit to converge", |h| {
+            h.doc().as_deref() == Some("hello streamed edit")
+        });
+        harness.wait_until("stream-state inactive", |h| {
+            h.stream_states().contains(&("pilot".to_string(), false))
+        });
+
+        let start = Instant::now();
+        pilot.shutdown();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "local shutdown must not block on a grace-kill"
+        );
     }
 
     /// Spawn the pilot against the scripted claude on a background thread
