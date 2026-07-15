@@ -20,6 +20,10 @@
 //! emits events; everything outside a well-formed fence is commentary and is
 //! never applied to a buffer.
 
+// Dead-code allow until seat_local (the next slice) drives it in-process.
+#[allow(dead_code)]
+pub(crate) mod local;
+
 use std::io::{BufRead, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -530,6 +534,30 @@ pub(crate) struct PairState {
 }
 
 impl PairState {
+    /// A fresh seat over `session`: no turn in flight, nothing streamed yet.
+    /// `events` seats the pilot inside croft (its voice becomes
+    /// [`crate::pair_host::PairEvent`]s); None keeps stdio.
+    pub(crate) fn new(
+        session: CollabSession,
+        events: Option<Sender<crate::pair_host::PairEvent>>,
+    ) -> Self {
+        Self {
+            session,
+            region: None,
+            discarding: false,
+            cancelled: false,
+            can_interrupt: false,
+            turn_active: false,
+            target_file: None,
+            pending_note: None,
+            notes: Vec::new(),
+            note_in_flight: None,
+            events,
+            comment_only: false,
+            last_seen: std::collections::HashMap::new(),
+        }
+    }
+
     /// The live replica text of `file`, split into lines (None = not live).
     pub(crate) fn doc_lines(&self, file: &str) -> Option<Vec<String>> {
         self.session
@@ -817,21 +845,7 @@ pub(crate) fn seat_pilot(
     events: Option<Sender<crate::pair_host::PairEvent>>,
 ) -> Result<Pilot> {
     let session = connect_session(socket, name)?;
-    let state = Arc::new(Mutex::new(PairState {
-        session,
-        region: None,
-        discarding: false,
-        cancelled: false,
-        can_interrupt: false,
-        turn_active: false,
-        target_file: None,
-        pending_note: None,
-        notes: Vec::new(),
-        note_in_flight: None,
-        events: events.clone(),
-        comment_only: false,
-        last_seen: std::collections::HashMap::new(),
-    }));
+    let state = Arc::new(Mutex::new(PairState::new(session, events.clone())));
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1837,6 +1851,149 @@ mod tests {
                 let _ = p.join();
             }
         }
+    }
+
+    /// A one-shot Anthropic-SSE stub: accepts one connection, drains the
+    /// request, and streams `deltas` as `content_block_delta`/`text_delta`
+    /// events followed by `message_stop`, closing to end the stream.
+    fn serve_sse_once(deltas: Vec<&'static str>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 65536];
+            let _ = sock.read(&mut buf);
+            let mut body = String::new();
+            for d in deltas {
+                let ev = json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": d },
+                });
+                body.push_str(&format!("event: content_block_delta\ndata: {ev}\n\n"));
+            }
+            body.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 connection: close\r\n\r\n{body}"
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        });
+        (base_url, server)
+    }
+
+    /// A guest PairState over the harness relay plus the same pump thread
+    /// the seated pilot runs (bootstraps only land when someone polls).
+    fn pumped_state(
+        harness: &OwnerHarness,
+    ) -> (
+        Arc<Mutex<PairState>>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let session = connect_session(&harness.socket, "pilot").unwrap();
+        let state = Arc::new(Mutex::new(PairState::new(session, None)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = {
+            let (state, stop) = (state.clone(), stop.clone());
+            let sink = TurnSink::Claude(Arc::new(Mutex::new(None)));
+            std::thread::spawn(move || {
+                let req_id = AtomicU64::new(0);
+                while !stop.load(Ordering::Relaxed) {
+                    pump_session(&state, &sink, &req_id);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        (state, stop, pump)
+    }
+
+    /// Offline slice of the local backend: one canned /v1/messages SSE turn
+    /// streams a fenced edit through the REAL fence machine and apply path
+    /// into the owner's replica, appends the assistant message, and ends
+    /// the turn cleanly. No Ollama needed.
+    #[test]
+    fn stream_turn_applies_a_fenced_edit() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let (base_url, server) = serve_sse_once(vec![
+            "Let me fix that.\n",
+            "<<<EDIT demo.txt:0:6-0:11>",
+            ">>\n",
+            "streamed",
+            " edit",
+            "\n<<<END>>>\nDone.\n",
+        ]);
+
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "fix demo.txt" })];
+        local::stream_turn(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+
+        harness.wait_until("the streamed edit to converge", |h| {
+            h.doc().as_deref() == Some("hello streamed edit")
+        });
+        assert!(
+            harness.remote_edit_count() >= 3,
+            "the edit must arrive as multiple streamed ops, got {}",
+            harness.remote_edit_count()
+        );
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(!end.is_error && !end.cancelled);
+        assert_eq!(messages.len(), 2, "assistant reply appended");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("<<<EDIT demo.txt:0:6-0:11>>>"),
+            "conversation history carries the fence verbatim"
+        );
+        assert!(!state.lock().unwrap().turn_active());
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// A dead endpoint fails the turn — naming the endpoint — instead of
+    /// wedging turn_active or killing the seat.
+    #[test]
+    fn stream_turn_names_a_dead_endpoint() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        // A bound-then-dropped port: connection refused.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn(
+            &dead,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error);
+        assert!(
+            end.text.contains(&dead),
+            "the failure names the endpoint: {}",
+            end.text
+        );
+        assert!(!state.lock().unwrap().turn_active());
+        assert_eq!(messages.len(), 1, "no assistant message on a failed turn");
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
     }
 
     /// Spawn the pilot against the scripted claude on a background thread
