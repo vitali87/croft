@@ -1701,21 +1701,19 @@ mod tests {
     use crate::collab::{ResolvedSpan, relay_serve};
     use crate::lsp::manager::is_on_path;
 
-    // ponytail: spike, not the production backend. Proves a local model can
-    // drive an ask-turn end-to-end through the REAL FenceMachine over a
-    // minimal /v1/messages call (no tools, no thinking, no beta) — the path
-    // the full `claude` CLI can't take against Ollama. Gated on a live
-    // endpoint so the normal suite/CI skips it.
+    // Live smoke of the WHOLE local backend — the real seat_local worker,
+    // fence machine, collab apply, and owner convergence — against a real
+    // Anthropic-compatible endpoint. Gated so the normal suite/CI skips it.
     //
     //   CROFT_SPIKE_OLLAMA=1 \
     //   CROFT_SPIKE_OLLAMA_URL=http://localhost:11434 \
     //   CROFT_SPIKE_OLLAMA_MODEL=qwen3-coder:30b \
-    //   cargo test --release ollama_spike -- --nocapture --ignored
+    //   cargo test --release ollama_live -- --nocapture --ignored
     #[test]
     #[ignore = "needs a live Ollama; run explicitly with CROFT_SPIKE_OLLAMA=1"]
-    fn ollama_spike_drives_an_ask_turn_through_the_fence_machine() {
+    fn ollama_live_smoke_drives_seat_local_end_to_end() {
         if std::env::var("CROFT_SPIKE_OLLAMA").is_err() {
-            eprintln!("skip: set CROFT_SPIKE_OLLAMA=1 to run the live spike");
+            eprintln!("skip: set CROFT_SPIKE_OLLAMA=1 to run the live smoke");
             return;
         }
         let url = std::env::var("CROFT_SPIKE_OLLAMA_URL")
@@ -1723,114 +1721,31 @@ mod tests {
         let model =
             std::env::var("CROFT_SPIKE_OLLAMA_MODEL").unwrap_or_else(|_| "qwen3-coder:30b".into());
 
-        // A numbered buffer + an ask, exactly as the pilot frames an ask turn.
-        let buffer = "def greet(name):\n    return \"hi \" + name\n";
-        let numbered: String = buffer
-            .lines()
-            .enumerate()
-            .map(|(i, l)| format!("{i}|{l}\n"))
-            .collect();
-        let user = format!(
-            "--- CURRENT BUFFER (greet.py) ---\n{numbered}\
-             --- ASK ---\nOn an ask turn. Rewrite greet to return the \
-             f-string f\"Hello, {{name}}!\" instead of concatenation. \
-             Edit greet.py with an EDIT fence."
-        );
-        let req = serde_json::json!({
-            "model": model,
-            "max_tokens": 400,
-            "stream": true,
-            "system": PAIR_SYSTEM_PROMPT,
-            "messages": [{ "role": "user", "content": user }],
+        let harness = OwnerHarness::start("def greet(name):\n    return \"hi \" + name\n");
+        let pilot = seat_local(&harness.socket, "pilot", &url, &model, None).unwrap();
+        send_turn(
+            &pilot.state,
+            &pilot.sink,
+            "@demo.txt Rewrite greet to return the f-string f\"Hello, {name}!\" \
+             instead of concatenation, using an EDIT fence.",
+        )
+        .unwrap();
+        let end = pilot
+            .turn_rx
+            .recv_timeout(Duration::from_secs(300))
+            .expect("turn ends");
+        assert!(!end.is_error, "turn failed: {}", end.text);
+        harness.wait_until("the f-string edit to converge", |h| {
+            h.doc().is_some_and(|d| d.contains("f\"Hello, {name}!\""))
         });
-
-        let resp = ureq::post(&format!("{url}/v1/messages"))
-            .set("content-type", "application/json")
-            .set("x-api-key", "ollama") // ignored by Ollama, present for parity
-            .timeout(Duration::from_secs(180))
-            .send_string(&req.to_string())
-            .expect("POST /v1/messages");
-
-        // Stream the Anthropic SSE, feed each text_delta to the real machine.
-        let mut machine = FenceMachine::new();
-        let mut events = Vec::new();
-        let reader = std::io::BufReader::new(resp.into_reader());
-        for line in std::io::BufRead::lines(reader) {
-            let line = line.expect("read SSE line");
-            let Some(data) = line.strip_prefix("data: ") else {
-                continue;
-            };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue;
-            };
-            if v["type"] == "content_block_delta"
-                && v["delta"]["type"] == "text_delta"
-                && let Some(t) = v["delta"]["text"].as_str()
-            {
-                events.extend(machine.push(t));
-            }
-        }
-        events.extend(machine.finish());
-
-        // Apply the fence(s) to the buffer with the same char-range semantics
-        // the pilot uses, and prove the edit landed.
-        let applied = apply_fence_events(buffer, &events);
-        eprintln!("--- fence events ---\n{events:#?}\n--- result ---\n{applied}");
+        let doc = harness.doc().unwrap();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, FenceEvent::EditStart { .. })),
-            "model never emitted a valid EDIT fence; got: {events:#?}"
+            !doc.contains("+ name"),
+            "the old concatenation must be gone:\n{doc}"
         );
-        assert!(
-            applied.contains("f\"Hello, {name}!\""),
-            "edit did not produce the f-string; result:\n{applied}"
-        );
+        pilot.shutdown();
     }
 
-    /// Apply a stream of fence events to `buffer` using 0-based char coords,
-    /// exactly the range semantics the pilot applies (start inclusive, end
-    /// exclusive). Spike-local; the production backend reuses the collab
-    /// apply path instead.
-    #[cfg(test)]
-    fn apply_fence_events(buffer: &str, events: &[FenceEvent]) -> String {
-        type PendingEdit = ((usize, usize), (usize, usize), String);
-        let mut text = buffer.to_string();
-        let mut pending: Option<PendingEdit> = None;
-        let char_off = |s: &str, row: usize, col: usize| -> usize {
-            let mut off = 0;
-            for (i, line) in s.split_inclusive('\n').enumerate() {
-                if i == row {
-                    return off + line.chars().take(col).map(char::len_utf8).sum::<usize>();
-                }
-                off += line.len();
-            }
-            off
-        };
-        for ev in events {
-            match ev {
-                FenceEvent::EditStart { start, end, .. } => {
-                    pending = Some((*start, *end, String::new()));
-                }
-                FenceEvent::EditBody(b) => {
-                    if let Some((_, _, body)) = pending.as_mut() {
-                        body.push_str(b);
-                    }
-                }
-                FenceEvent::EditEnd => {
-                    if let Some((start, end, body)) = pending.take() {
-                        let s = char_off(&text, start.0, start.1);
-                        let e = char_off(&text, end.0, end.1);
-                        if s <= e && e <= text.len() {
-                            text.replace_range(s..e, &body);
-                        }
-                    }
-                }
-                _ => pending = None,
-            }
-        }
-        text
-    }
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// The Claude sink wraps a turn body in a stream-json user message and

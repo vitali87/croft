@@ -502,6 +502,45 @@ interaction into turn-based driver/navigator pairing:
   first. The claude binary resolves to an absolute path when off `PATH`, so
   a stripped GUI-launch environment can still seat it.
 
+### Local models (0.1.636)
+
+The navigator is not claude-only: `--provider ollama` seats the same pilot on
+any local Anthropic-compatible endpoint (Ollama, LM Studio, llama.cpp, vLLM):
+
+```sh
+croft pair --provider ollama --model qwen3-coder:30b            # localhost:11434
+croft pair --base-url http://box:8080 --model qwen3-coder:30b   # implies ollama
+```
+
+- **Why a second transport, not a passthrough.** Pointing the claude CLI at a
+  local endpoint (`ANTHROPIC_BASE_URL`, or `ollama launch claude`) sends the
+  full agent turn: ~107 tool schemas, adaptive thinking, beta extensions —
+  ~213 KB before the user says a word. Measured 2026-07: that prefill 500s on
+  Ollama 0.18 AND 0.32, at 7B and 30B, and `--allowedTools` does not shrink it
+  (it gates execution, not schemas). A minimal `/v1/messages` call — system
+  prompt + conversation, no tools — streams a valid fence in seconds. croft's
+  protocol is text fences, so local models do not need the agent at all.
+- **The seam.** Everything downstream of a text delta is shared: the fence
+  machine, the apply path, notes, comment-only yields, cancel/revert. Only
+  turn injection differs (`TurnSink`: claude stdin vs an HTTP worker's queue)
+  and the event source (`Transport`: the child's stdout reader vs one SSE
+  stream per turn, `pair/local.rs`). The endpoint is stateless, so the worker
+  owns the conversation as a message list; the model has no tools — the turn
+  carries everything.
+- **Whole-line fences.** Character columns trip weaker models, so the local
+  system prompt steers them to a two-integer header form —
+  `<<<EDIT <file>:<start_row>-<end_row>>>>`, rows inclusive — that replaces
+  whole lines (a truncated four-int header is rejected, never misread as a
+  path). Both forms parse on both backends.
+- **Semantics that differ, by design.** Cancel still reverts instantly, but
+  the local stream has no interrupt: the in-flight HTTP body drains and
+  applies nothing. A dead endpoint fails that turn (status names the URL) and
+  the seat stays; the next ask retries. The idle badge names the model:
+  `◆ claude (qwen3-coder:30b) seated`.
+- **Auth.** Keyed Anthropic-compatible gateways read `ANTHROPIC_AUTH_TOKEN`
+  from croft's environment; `pair.json` records only provider, base_url, and
+  model — never a token.
+
 ### Slice 3 design: op transport and the process model
 
 The single-broadcast mux cannot give two people different viewports: there is

@@ -171,8 +171,10 @@ pub enum CliCommand {
         /// `croft attach --solo` does).
         #[arg(long)]
         workspace: Option<PathBuf>,
-        /// Model handed to the claude CLI (--model), e.g. a cheaper one
-        /// for mechanical edits.
+        /// The model that takes the seat: handed to the claude CLI on the
+        /// default provider (e.g. a cheaper one for mechanical edits), or
+        /// the local model name on --provider ollama (required there,
+        /// e.g. qwen3-coder:30b).
         #[arg(long)]
         model: Option<String>,
         /// The name this collaborator's caret wears on peers' screens.

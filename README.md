@@ -117,6 +117,15 @@ The command records the activation and exits; the running croft (or the next one
 
 The model's toolbox is read-only (`Read`/`Grep`/`Glob` plus a read-only collab seat); the only way it can change a buffer is the visible, cancellable stream. `croft pair --off` (or the "Navigator: Activate or Deactivate" palette entry) unseats it (see [docs/MULTIPLAYER.md](docs/MULTIPLAYER.md)).
 
+The navigator is not claude-only. Point it at any local Anthropic-compatible endpoint — Ollama, LM Studio, llama.cpp, vLLM — and your own open-weight model takes the seat, same fences, same streaming, same cancel:
+
+```sh
+croft pair --provider ollama --model qwen3-coder:30b          # Ollama on localhost:11434
+croft pair --base-url http://box:8080 --model qwen3-coder:30b # any compatible server (implies ollama)
+```
+
+Local turns go straight to `/v1/messages` with a minimal payload (the claude CLI's ~213 KB tool-schema prefill is exactly what local servers choke on), and the badge names who is typing: `◆ claude (qwen3-coder:30b) seated`.
+
 ## Platform setup
 
 croft runs on macOS, Linux, Android, and Windows (via WSL2). Cross-platform basics are above; each platform has a short guide for its Nerd Font, terminal keybindings, and optional dependencies:
