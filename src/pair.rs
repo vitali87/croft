@@ -256,11 +256,20 @@ impl FenceMachine {
     }
 }
 
-/// Parse `<<<EDIT <file>:SR:SC-ER:EC>>>` into its [`FenceEvent::EditStart`].
-/// Coordinates bind rightmost so the file name may itself contain ':' or
-/// '-'. None = not a well-formed header (the line degrades to commentary).
+/// Parse an EDIT header into its [`FenceEvent::EditStart`]. Two forms:
+/// four integers `<file>:SR:SC-ER:EC` (character range), or two integers
+/// `<file>:SR-ER` (whole rows, inclusive — start column 0, end column
+/// `usize::MAX`, which [`crate::collab::byte_offset`] clamps to the end of
+/// row ER). Coordinates bind rightmost so the file name may itself contain
+/// ':' or '-'. None = not a well-formed header (the line degrades to
+/// commentary).
 fn parse_header(line: &str) -> Option<FenceEvent> {
     let inner = line.strip_prefix(EDIT_MARKER)?.strip_suffix(">>>")?;
+    parse_char_range_header(inner).or_else(|| parse_whole_line_header(inner))
+}
+
+/// The four-int form: `<file>:SR:SC-ER:EC`.
+fn parse_char_range_header(inner: &str) -> Option<FenceEvent> {
     let (rest, ec) = inner.rsplit_once(':')?;
     let (rest, mid) = rest.rsplit_once(':')?;
     let (sc, er) = mid.split_once('-')?;
@@ -272,6 +281,29 @@ fn parse_header(line: &str) -> Option<FenceEvent> {
         file: file.to_string(),
         start: (sr.parse().ok()?, sc.parse().ok()?),
         end: (er.parse().ok()?, ec.parse().ok()?),
+    })
+}
+
+/// The two-int whole-line form: `<file>:SR-ER`, both rows inclusive. A file
+/// part that itself ends in `:<digits>` is a TRUNCATED four-int header
+/// (`file:SR:SC-ER` missing its end column), not a path — rejected so it
+/// degrades to commentary instead of editing a bogus file.
+fn parse_whole_line_header(inner: &str) -> Option<FenceEvent> {
+    let (file, range) = inner.rsplit_once(':')?;
+    let (sr, er) = range.split_once('-')?;
+    if file.is_empty() {
+        return None;
+    }
+    if let Some((_, tail)) = file.rsplit_once(':')
+        && !tail.is_empty()
+        && tail.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(FenceEvent::EditStart {
+        file: file.to_string(),
+        start: (sr.parse().ok()?, 0),
+        end: (er.parse().ok()?, usize::MAX),
     })
 }
 
@@ -2138,6 +2170,49 @@ mod tests {
             .filter(|e| matches!(e, FenceEvent::EditBody(_)))
             .count();
         assert!(bodies > 1, "body must stream, got {bodies} event(s)");
+    }
+
+    /// The whole-line header form `<file>:SR-ER` (two integers) opens an
+    /// edit covering those entire rows, inclusive: start (SR,0) and an end
+    /// column that clamps to the end of row ER.
+    #[test]
+    fn parse_header_accepts_whole_line_range() {
+        let event = parse_header("<<<EDIT demo.txt:3-5>>>").expect("whole-line header parses");
+        let FenceEvent::EditStart { file, start, end } = event else {
+            panic!("not an EditStart: {event:?}");
+        };
+        assert_eq!(file, "demo.txt");
+        assert_eq!(start, (3, 0));
+        assert_eq!(end, (5, usize::MAX));
+    }
+
+    /// The spike's coordinate slip, fixed: a whole-line fence on the exact
+    /// spike buffer replaces the row entirely — no `+ name` leftover — using
+    /// the same range_bytes clamping the pilot's open_region applies.
+    #[test]
+    fn whole_line_edit_replaces_entire_rows() {
+        let buffer = "def greet(name):\n    return \"hi \" + name\n";
+        let input = "<<<EDIT greet.py:1-1>>>\n    return f\"Hello, {name}!\"\n<<<END>>>\n";
+        let events = run_chunks(input, 3);
+        let (start, end) = events
+            .iter()
+            .find_map(|e| match e {
+                FenceEvent::EditStart { start, end, .. } => Some((*start, *end)),
+                _ => None,
+            })
+            .expect("whole-line fence opens an edit");
+        let lines: Vec<String> = buffer.split('\n').map(String::from).collect();
+        let (s, e) = range_bytes(&lines, start, end);
+        let result = format!("{}{}{}", &buffer[..s], body_of(&events), &buffer[e..]);
+        assert_eq!(result, "def greet(name):\n    return f\"Hello, {name}!\"\n");
+    }
+
+    /// A truncated four-int header (`file:SR:SC-ER`, missing its end column)
+    /// must NOT fall back to the whole-line form: its "file" would be the
+    /// bogus `file:SR`. It stays commentary.
+    #[test]
+    fn truncated_four_int_header_stays_commentary() {
+        assert!(parse_header("<<<EDIT src/f.rs:3:0-5>>>").is_none());
     }
 
     /// A header that fails to parse is commentary, never an edit.
