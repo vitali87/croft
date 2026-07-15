@@ -394,6 +394,40 @@ Turn kinds:
 
 A participant can cancel your stream mid-edit; the streamed text is then reverted and your next user message starts with a note saying so. When that happens, stop that approach and ask what they want instead."#;
 
+/// Appended to [`PAIR_SYSTEM_PROMPT`] for local models only: character
+/// columns trip weaker models (the spike's under-covered range), so they are
+/// steered to the whole-line header form instead.
+const LOCAL_MODEL_PROMPT_SUFFIX: &str = r#"Local-model addendum:
+- PREFER the whole-line EDIT header form: <<<EDIT <file>:<start_row>-<end_row>>>> with exactly TWO integers. It replaces those entire lines — both rows 0-based, both INCLUSIVE — with the fence body, so you never count characters. Replacing line 1 whole is `<<<EDIT greet.py:1-1>>>`.
+- Rewrite whole lines instead of splicing inside a line; use the four-integer form only when you must keep part of a line.
+- You have no tools: everything you need is in the message. Keep replies short — the fences plus at most a couple of commentary lines."#;
+
+/// Which conversation transport seats the navigator: the claude CLI child
+/// (the full agent) or a direct Anthropic-compatible `/v1/messages` endpoint
+/// (Ollama, LM Studio, llama.cpp, vLLM — the minimal payload those can
+/// actually serve; see docs/MULTIPLAYER.md).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Provider {
+    Claude,
+    // Constructed by `croft pair --provider ollama` once the CLI slice
+    // lands; until then only the prompt tests reach it.
+    #[allow(dead_code)]
+    Local {
+        base_url: String,
+    },
+}
+
+/// The system prompt a provider's model is taught: the shared fence
+/// protocol, plus the whole-line guidance for local models.
+pub(crate) fn system_prompt(provider: &Provider) -> std::borrow::Cow<'static, str> {
+    match provider {
+        Provider::Claude => std::borrow::Cow::Borrowed(PAIR_SYSTEM_PROMPT),
+        Provider::Local { .. } => std::borrow::Cow::Owned(format!(
+            "{PAIR_SYSTEM_PROMPT}\n\n{LOCAL_MODEL_PROMPT_SUFFIX}"
+        )),
+    }
+}
+
 /// Everything `croft pair` needs to sit down: the relay socket, the
 /// workspace (cwd and MCP reader seat), the caret name, and the claude
 /// launch knobs.
@@ -403,6 +437,7 @@ pub struct PairConfig {
     pub name: String,
     pub model: Option<String>,
     pub task: Option<String>,
+    pub provider: Provider,
 }
 
 /// The fence currently streaming into a buffer: byte offsets into the
@@ -659,7 +694,7 @@ pub(crate) fn claude_command(cfg: &PairConfig) -> Result<Command> {
         .args(["--allowedTools", ALLOWED_TOOLS])
         .arg("--strict-mcp-config")
         .args(["--mcp-config", &mcp_config.to_string()])
-        .args(["--append-system-prompt", PAIR_SYSTEM_PROMPT])
+        .args(["--append-system-prompt", &system_prompt(&cfg.provider)])
         .current_dir(&cfg.workspace);
     if let Some(model) = &cfg.model {
         cmd.args(["--model", model]);
@@ -1647,6 +1682,27 @@ mod tests {
         assert_eq!(v["type"], "user");
         assert_eq!(v["message"]["role"], "user");
         assert_eq!(v["message"]["content"], "hello\nworld");
+    }
+
+    /// The local backend appends the whole-line-fence guidance to the shared
+    /// pair prompt: weaker models are steered to row ranges instead of
+    /// character columns (the spike's coordinate slip).
+    #[test]
+    fn local_provider_appends_line_range_guidance() {
+        let prompt = system_prompt(&Provider::Local {
+            base_url: String::from("http://localhost:11434"),
+        });
+        assert!(prompt.starts_with(PAIR_SYSTEM_PROMPT));
+        assert!(
+            prompt.contains("<start_row>-<end_row>"),
+            "suffix must teach the two-integer whole-line header"
+        );
+    }
+
+    /// The claude backend's prompt is byte-identical to what 0.1.635 shipped.
+    #[test]
+    fn claude_provider_prompt_is_unchanged() {
+        assert_eq!(system_prompt(&Provider::Claude), PAIR_SYSTEM_PROMPT);
     }
 
     /// A relay plus a pumping owner session that serves `demo.txt`,

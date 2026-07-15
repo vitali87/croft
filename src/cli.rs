@@ -335,6 +335,7 @@ impl Cli {
                         name,
                         model,
                         task,
+                        provider: crate::pair::Provider::Claude,
                     });
                 }
                 crate::session::write_pair_record(
