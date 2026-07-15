@@ -2706,6 +2706,12 @@ pub struct App {
     /// Notes the navigator left since its turn started, so the TurnDone
     /// status can surface them instead of overwriting the NoteAdded status.
     pair_notes_this_turn: usize,
+    /// Set when the pilot died or failed to seat: suppresses the 1s re-seat
+    /// so a broken claude (unauthenticated, missing, crashing) is not
+    /// respawned forever. Cleared when the record is deactivated, so an
+    /// explicit off/on (or toggle) re-activates. Matches the LSP precedent:
+    /// no auto-respawn within a session; a fresh croft retries.
+    navigator_down: bool,
     /// The open navigator note: (collab file key, index into that file's
     /// note snapshot). Opens when the caret lands on a noted row, on a ◆
     /// click, or via F4; Esc dismisses.
@@ -3563,6 +3569,7 @@ impl App {
             last_pair_check: None,
             navigator_notes: std::collections::HashMap::new(),
             pair_notes_this_turn: 0,
+            navigator_down: false,
             note_popup: None,
             note_probe: None,
             #[cfg(test)]
@@ -15794,6 +15801,9 @@ impl App {
         let record = crate::session::read_pair_record(&self.pair_record_path);
         let want = record.as_ref().is_some_and(|r| r.enabled);
         if !want {
+            // Deactivation clears the death latch, so `croft pair --off`
+            // then `croft pair` (or a palette off/on) re-activates.
+            self.navigator_down = false;
             if self.pair_host.is_some() {
                 self.pair_host = None; // Drop tears the seat down
                 self.navigator_notes.clear();
@@ -15803,6 +15813,11 @@ impl App {
             return false;
         }
         if self.pair_host.is_some() {
+            return false;
+        }
+        // The pilot died or failed to seat: do not respawn it every second.
+        // The user re-activates (off/on) to try again; a fresh croft retries.
+        if self.navigator_down {
             return false;
         }
         if self
@@ -15843,7 +15858,10 @@ impl App {
                 );
                 self.pair_host = Some(host);
             }
-            Err(e) => self.status = format!("Navigator failed to seat: {e}"),
+            Err(e) => {
+                self.status = format!("Navigator failed to seat: {e}");
+                self.navigator_down = true; // no 1s retry storm
+            }
         }
         true
     }
@@ -15894,6 +15912,7 @@ impl App {
         if died {
             self.pair_host = None;
             self.navigator_notes.clear();
+            self.navigator_down = true; // no auto-respawn; re-activate to retry
             return true;
         }
         // Refresh the active file's snapshot every tick: rows move under

@@ -19181,6 +19181,73 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     assert!(app.pair_host.is_none(), "pilot must unseat");
 }
 
+/// A dead pilot is not respawned every second: after a death (or a failed
+/// seat) the navigator stays down until the record is deactivated and
+/// re-enabled, matching the "re-activate to reseat" contract and the LSP
+/// no-auto-respawn precedent.
+#[test]
+fn a_dead_navigator_is_not_respawned_until_reactivated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    let seats = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pair_record_path = tmp.path().join("x.pair.json");
+    app.pair_socket = socket.clone();
+    // Already the owner (skip the relay bootstrap): the test exercises the
+    // death latch, not collab connect.
+    app.collab_config = Some((socket, crate::collab::CollabRole::Owner));
+    let seats2 = seats.clone();
+    app.pair_spawn_override = Some(Box::new(move |_cfg| {
+        seats2.set(seats2.get() + 1);
+        anyhow::bail!("scripted seat failure");
+    }));
+
+    let enabled = |a: &mut App| {
+        crate::session::write_pair_record(
+            &a.pair_record_path,
+            &crate::session::PairRecord {
+                model: None,
+                name: "nav".into(),
+                enabled: true,
+                task: None,
+            },
+        )
+        .unwrap();
+        a.last_pair_check = None;
+    };
+
+    // First tick: it tries once, fails, and latches down.
+    enabled(&mut app);
+    app.maybe_seat_navigator();
+    assert_eq!(seats.get(), 1, "one seat attempt");
+    assert!(app.navigator_down, "a failed seat latches the navigator down");
+
+    // Many more ticks with the record still enabled: NO respawn storm.
+    for _ in 0..5 {
+        app.last_pair_check = None;
+        app.maybe_seat_navigator();
+    }
+    assert_eq!(seats.get(), 1, "a latched navigator must not be respawned");
+
+    // Deactivate, then re-enable: the latch clears and it tries again.
+    crate::session::write_pair_record(
+        &app.pair_record_path,
+        &crate::session::PairRecord {
+            model: None,
+            name: "nav".into(),
+            enabled: false,
+            task: None,
+        },
+    )
+    .unwrap();
+    app.last_pair_check = None;
+    app.maybe_seat_navigator();
+    assert!(!app.navigator_down, "deactivation clears the latch");
+    enabled(&mut app);
+    app.maybe_seat_navigator();
+    assert_eq!(seats.get(), 2, "re-activation retries the seat");
+}
+
 /// A solo guest viewport never hosts the navigator: the owner's croft does,
 /// or two hosts would fight over one seat.
 #[test]
