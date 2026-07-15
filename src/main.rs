@@ -24,6 +24,7 @@ mod merge;
 mod outline_syntax;
 mod output;
 mod pair;
+mod pair_host;
 mod pdf;
 mod port_detect;
 mod prefs;

@@ -24,7 +24,7 @@ use std::io::{BufRead, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -415,9 +415,9 @@ pub struct Note {
 
 /// Shared pilot state: the collab seat plus per-turn stream bookkeeping.
 /// Locked briefly by the reader thread (apply), the pump thread (remote
-/// shifts, cancel), and the REPL (turn injection); never held across a
+/// shifts, cancel), and the driver (turn injection); never held across a
 /// sleep or a child-process write.
-struct PairState {
+pub(crate) struct PairState {
     session: CollabSession,
     region: Option<StreamRegion>,
     /// The current fence's body is being dropped (unusable header, missing
@@ -440,6 +440,60 @@ struct PairState {
     note_in_flight: Option<(String, usize, String)>,
     /// Monotonic id for the next anchored note.
     next_note_id: u64,
+    /// The in-process host's sink: when seated inside croft the pilot's
+    /// voice (commentary, notes, diagnostics) goes here instead of
+    /// stdout/stderr, which belong to the TUI. None = terminal REPL.
+    events: Option<Sender<crate::pair_host::PairEvent>>,
+}
+
+// Dead-code allows below: called from pair_host, which the App consumes in
+// the app-hosting slice; until then the chain is dead in non-test builds.
+impl PairState {
+    /// The live replica text of `file`, split into lines (None = not live).
+    #[allow(dead_code)]
+    pub(crate) fn doc_lines(&self, file: &str) -> Option<Vec<String>> {
+        self.session
+            .doc_text(file)
+            .map(|t| t.split('\n').map(String::from).collect())
+    }
+
+    /// The anchored notes sitting in `file`, in landing order.
+    #[allow(dead_code)]
+    pub(crate) fn notes_in<'a>(&'a self, file: &'a str) -> impl Iterator<Item = &'a Note> {
+        self.notes.iter().filter(move |n| n.file == file)
+    }
+}
+
+/// The pilot's voice: an event to the in-process host when seated inside
+/// croft (stdout belongs to the TUI there), else the debug REPL's stdout.
+fn say(state: &Mutex<PairState>, text: &str) {
+    let sink = state.lock().unwrap().events.clone();
+    match sink {
+        Some(tx) => {
+            let _ = tx.send(crate::pair_host::PairEvent::Commentary(text.to_string()));
+        }
+        None => {
+            print!("{text}");
+            let _ = std::io::Stdout::flush(&mut std::io::stdout());
+        }
+    }
+}
+
+/// Bounded wait for a requested file's bootstrap ([`LIVE_TIMEOUT`]). True
+/// when the file went live; false when nobody answered (no owner).
+fn wait_live(state: &Mutex<PairState>, file: &str) -> bool {
+    let deadline = Instant::now() + LIVE_TIMEOUT;
+    loop {
+        let st = state.lock().unwrap();
+        if st.session.is_live(file) {
+            return true;
+        }
+        if !st.session.is_bootstrapping(file) || Instant::now() >= deadline {
+            return false;
+        }
+        drop(st);
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Kill the claude child when the pilot unwinds, however it unwinds.
@@ -453,19 +507,19 @@ impl Drop for ChildGuard {
 }
 
 /// What the reader thread reports at each turn's `result` event.
-struct TurnEnd {
-    is_error: bool,
+pub(crate) struct TurnEnd {
+    pub(crate) is_error: bool,
     /// The turn was cancelled by a participant (the interrupt surfaces as
-    /// an error result; the REPL names the real cause instead).
-    cancelled: bool,
-    text: String,
+    /// an error result; the driver names the real cause instead).
+    pub(crate) cancelled: bool,
+    pub(crate) text: String,
 }
 
 /// The claude CLI invocation for a pair session: a persistent stream-json
 /// conversation over stdio, sandboxed to the read-only toolbox, with the
 /// fence protocol appended to its system prompt and a read-only collab-agent
 /// seat as its MCP server.
-fn claude_command(cfg: &PairConfig) -> Result<Command> {
+pub(crate) fn claude_command(cfg: &PairConfig) -> Result<Command> {
     let exe = std::env::current_exe().context("resolving croft binary path")?;
     let mcp_config = json!({
         "mcpServers": {
@@ -522,16 +576,64 @@ fn connect_session(socket: &Path, name: &str) -> Result<CollabSession> {
     }
 }
 
-/// The pilot proper, claude-command-agnostic so the e2e tests can drive it
-/// with a scripted fake. Blocks until `input` (the pilot's own terminal)
-/// hits EOF or the claude child's stdout closes mid-turn.
-fn run_pilot(
+/// A seated pilot: the claude child plus the reader and pump threads over
+/// shared state. Both drivers — the debug REPL ([`run_pilot`]) and the
+/// in-process [`crate::pair_host::PairHost`] — run on top of this.
+pub(crate) struct Pilot {
+    pub(crate) state: Arc<Mutex<PairState>>,
+    pub(crate) writer: Arc<Mutex<Option<ChildStdin>>>,
+    pub(crate) turn_rx: Receiver<TurnEnd>,
+    stop: Arc<AtomicBool>,
+    guard: ChildGuard,
+    reader: std::thread::JoinHandle<()>,
+    pump: std::thread::JoinHandle<()>,
+}
+
+impl Pilot {
+    /// The claude child's stdout hit EOF: the conversation is gone.
+    /// (Dead-code allow: see the PairState accessors above.)
+    #[allow(dead_code)]
+    pub(crate) fn reader_finished(&self) -> bool {
+        self.reader.is_finished()
+    }
+
+    /// Tear the seat down: leave no stream badge behind, hang up, then
+    /// grace-kill. The real claude CLI does not reliably exit on stdin EOF
+    /// (MCP teardown lingers), and the reader joins only when claude's
+    /// stdout closes — so the polite exit gets a short grace before the
+    /// kill. The caller's exit must never hinge on a child's manners.
+    pub(crate) fn shutdown(mut self) {
+        {
+            let mut st = self.state.lock().unwrap();
+            revert_region(&mut st);
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        self.writer.lock().unwrap().take(); // EOF asks claude to end
+        let grace = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.guard.0.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < grace => std::thread::sleep(Duration::from_millis(50)),
+                _ => {
+                    let _ = self.guard.0.kill();
+                    break;
+                }
+            }
+        }
+        let _ = self.pump.join();
+        let _ = self.reader.join();
+    }
+}
+
+/// Connect the collab seat, spawn the claude child, and start the reader,
+/// stderr, and pump threads. `events` seats the pilot inside croft (its
+/// voice becomes [`crate::pair_host::PairEvent`]s); None keeps stdio.
+pub(crate) fn seat_pilot(
     socket: &Path,
     name: &str,
-    task: Option<String>,
     mut cmd: Command,
-    input: &mut dyn BufRead,
-) -> Result<()> {
+    events: Option<Sender<crate::pair_host::PairEvent>>,
+) -> Result<Pilot> {
     let session = connect_session(socket, name)?;
     let state = Arc::new(Mutex::new(PairState {
         session,
@@ -545,6 +647,7 @@ fn run_pilot(
         notes: Vec::new(),
         note_in_flight: None,
         next_note_id: 0,
+        events: events.clone(),
     }));
 
     cmd.stdin(Stdio::piped())
@@ -566,7 +669,7 @@ fn run_pilot(
     let child_stdin = child.stdin.take().context("claude stdin missing")?;
     let child_stdout = child.stdout.take().context("claude stdout missing")?;
     let child_stderr = child.stderr.take().context("claude stderr missing")?;
-    let mut guard = ChildGuard(child);
+    let guard = ChildGuard(child);
     let writer: Arc<Mutex<Option<ChildStdin>>> = Arc::new(Mutex::new(Some(child_stdin)));
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -594,18 +697,29 @@ fn run_pilot(
     };
 
     // Stderr tee, same as the DAP transport: claude's diagnostics reach the
-    // pilot's terminal without touching the protocol stream.
-    std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(child_stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => eprint!("[claude] {line}"),
+    // driver without touching the protocol stream.
+    {
+        let events = events.clone();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(child_stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => match &events {
+                        Some(tx) => {
+                            let _ = tx.send(crate::pair_host::PairEvent::Commentary(format!(
+                                "[claude] {}",
+                                line.trim_end()
+                            )));
+                        }
+                        None => eprint!("[claude] {line}"),
+                    },
+                }
             }
-        }
-    });
+        });
+    }
 
     // Pump: remote spans shift the streamed region; StreamCancel cancels.
     let pump = {
@@ -621,9 +735,33 @@ fn run_pilot(
         })
     };
 
+    Ok(Pilot {
+        state,
+        writer,
+        turn_rx,
+        stop,
+        guard,
+        reader,
+        pump,
+    })
+}
+
+/// The debug REPL driver (hidden `--repl`), claude-command-agnostic so the
+/// e2e tests can drive it with a scripted fake. Blocks until `input` (the
+/// pilot's own terminal) hits EOF or the claude child hangs up mid-turn.
+fn run_pilot(
+    socket: &Path,
+    name: &str,
+    task: Option<String>,
+    cmd: Command,
+    input: &mut dyn BufRead,
+) -> Result<()> {
+    let pilot = seat_pilot(socket, name, cmd, None)?;
+
     // REPL: the initial --task then the pilot's stdin, one turn per line.
     println!("croft pair: '{name}' seated; type a task ('@<file> <task>' to focus a buffer)");
     let mut pending = task;
+    let mut hung_up = false;
     loop {
         let line = match pending.take() {
             Some(t) => t,
@@ -638,42 +776,20 @@ fn run_pilot(
         if line.is_empty() {
             continue;
         }
-        send_turn(&state, &writer, &line)?;
-        match turn_rx.recv() {
+        send_turn(&pilot.state, &pilot.writer, &line)?;
+        match pilot.turn_rx.recv() {
             Ok(end) if end.cancelled => println!("\n[turn cancelled]"),
             Ok(end) if end.is_error => println!("\n[turn failed: {}]", end.text),
             Ok(_) => println!("\n[turn done]"),
             Err(_) => {
                 // Reader gone: claude hung up mid-turn.
-                anyhow::bail!("claude exited mid-conversation");
-            }
-        }
-    }
-
-    // Cleanup: leave no stream badge behind, hang up, kill via the guard.
-    {
-        let mut st = state.lock().unwrap();
-        revert_region(&mut st);
-    }
-    stop.store(true, Ordering::Relaxed);
-    writer.lock().unwrap().take(); // EOF asks claude to end the conversation
-    // The real claude CLI does not reliably exit on stdin EOF (MCP teardown
-    // lingers), and the reader joins only when claude's stdout closes — so
-    // give the polite exit a short grace, then kill. The pilot's exit must
-    // never hinge on a child's shutdown manners.
-    let grace = Instant::now() + Duration::from_secs(2);
-    loop {
-        match guard.0.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < grace => std::thread::sleep(Duration::from_millis(50)),
-            _ => {
-                let _ = guard.0.kill();
+                hung_up = true;
                 break;
             }
         }
     }
-    let _ = pump.join();
-    let _ = reader.join();
+    pilot.shutdown();
+    anyhow::ensure!(!hung_up, "claude exited mid-conversation");
     Ok(())
 }
 
@@ -739,8 +855,7 @@ fn handle_claude_event(
 fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
     match event {
         FenceEvent::Commentary(text) => {
-            print!("{text}");
-            let _ = std::io::stdout().flush();
+            say(state, &text);
         }
         FenceEvent::EditStart { file, start, end } => {
             {
@@ -752,24 +867,18 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
                 st.target_file = Some(file.clone());
                 st.session.request_file(&file);
             }
-            let deadline = Instant::now() + LIVE_TIMEOUT;
-            loop {
+            if wait_live(state, &file) {
                 let mut st = state.lock().unwrap();
-                if st.session.is_live(&file) {
-                    open_region(&mut st, &file, start, end);
-                    return;
-                }
-                if !st.session.is_bootstrapping(&file) || Instant::now() >= deadline {
-                    st.discarding = true;
-                    drop(st);
-                    eprintln!(
+                open_region(&mut st, &file, start, end);
+            } else {
+                state.lock().unwrap().discarding = true;
+                say(
+                    state,
+                    &format!(
                         "[pair] no live croft session serves {file}; edit dropped \
-                         (start croft in this workspace first)"
-                    );
-                    return;
-                }
-                drop(st);
-                std::thread::sleep(Duration::from_millis(20));
+                         (start croft in this workspace first)\n"
+                    ),
+                );
             }
         }
         FenceEvent::EditBody(delta) => {
@@ -831,15 +940,22 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
             }
         }
         FenceEvent::NoteEnd => {
-            let mut st = state.lock().unwrap();
-            let Some((file, row, body)) = st.note_in_flight.take() else {
+            let pending = {
+                let mut st = state.lock().unwrap();
+                let pending = st.note_in_flight.take();
+                if st.cancelled { None } else { pending }
+            };
+            let Some((file, row, body)) = pending else {
                 return;
             };
-            if st.cancelled {
+            // NoteStart's request_file may still be bootstrapping (a fast
+            // fence outruns the 25ms pump); give it the same bounded wait
+            // an edit gets. Still no live doc = the owner never served the
+            // file: nothing to anchor to (mirrors the edit-drop path).
+            if !wait_live(state, &file) {
                 return;
             }
-            // No live doc = the owner never served the file: nothing to
-            // anchor to (mirrors the edit-drop path above).
+            let mut st = state.lock().unwrap();
             let Some(lines) = st
                 .session
                 .doc_text(&file)
@@ -848,8 +964,17 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
                 return;
             };
             let offset = note_offset(&lines, row);
+            let row_now = position(&lines, offset).0;
             let id = st.next_note_id;
             st.next_note_id += 1;
+            if let Some(tx) = st.events.clone() {
+                let _ = tx.send(crate::pair_host::PairEvent::NoteAdded {
+                    file: file.clone(),
+                    row: row_now,
+                    body: body.clone(),
+                    id,
+                });
+            }
             st.notes.push(Note {
                 file,
                 offset,
@@ -941,7 +1066,14 @@ fn pump_session(state: &Mutex<PairState>, writer: &Mutex<Option<ChildStdin>>, re
                     );
                     revert_region(&mut st);
                     interrupt = st.can_interrupt;
-                    println!("\n[stream cancelled by a participant; reverted]");
+                    match st.events.clone() {
+                        Some(tx) => {
+                            let _ = tx.send(crate::pair_host::PairEvent::Commentary(
+                                "[stream cancelled by a participant; reverted]".to_string(),
+                            ));
+                        }
+                        None => println!("\n[stream cancelled by a participant; reverted]"),
+                    }
                 }
                 _ => {}
             }
@@ -1008,7 +1140,7 @@ fn compose_turn_text(
 /// Compose and send one user turn: pending cancel note, the task, and the
 /// target file's current buffer (so the model's fence coordinates have a
 /// ground truth).
-fn send_turn(
+pub(crate) fn send_turn(
     state: &Mutex<PairState>,
     writer: &Mutex<Option<ChildStdin>>,
     line: &str,
@@ -1094,6 +1226,15 @@ if not line:
     sys.exit(0)
 log.write(line)
 log.flush()
+
+if mode == "notes":
+    delta("Reviewing.\n")
+    delta("<<<NOTE demo.txt:1>>>\n")
+    delta("second line could be tighter\n")
+    delta("<<<END>>>\n")
+    emit({"type": "result", "subtype": "success",
+          "is_error": False, "result": "ok"})
+    sys.exit(0)
 
 delta("Let me fix that.\n")
 delta("<<<EDIT demo.txt:0:6-0:11>")
@@ -1767,6 +1908,55 @@ if mode == "linger":
         assert_eq!(start, crate::collab::byte_offset(&lines, 0, 10));
         assert_eq!(end, crate::collab::byte_offset(&lines, 1, 2));
         assert!(start < end);
+    }
+
+    /// The in-process host: a NOTE fence from the scripted claude surfaces
+    /// as a PairEvent::NoteAdded, the snapshot converts its offset back to a
+    /// row against the live replica, and the turn's end is observable.
+    #[test]
+    fn pair_host_emits_note_added_and_snapshots_rows() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world\nsecond line");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script).arg(&log).arg("notes");
+        let mut host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "navigator", None, cmd).unwrap();
+        host.send_task("@demo.txt look this over").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut events: Vec<crate::pair_host::PairEvent> = Vec::new();
+        while !events
+            .iter()
+            .any(|e| matches!(e, crate::pair_host::PairEvent::TurnDone { .. }))
+        {
+            assert!(Instant::now() < deadline, "no TurnDone; saw {events:?}");
+            events.extend(host.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let note = events
+            .iter()
+            .find_map(|e| match e {
+                crate::pair_host::PairEvent::NoteAdded {
+                    file, row, body, ..
+                } => Some((file.clone(), *row, body.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no NoteAdded; saw {events:?}"));
+        assert_eq!(note.0, "demo.txt");
+        assert_eq!(note.1, 1, "anchored to the fenced row");
+        assert!(note.2.contains("second line could be tighter"));
+        assert_eq!(
+            host.notes_snapshot("demo.txt"),
+            vec![(1, "second line could be tighter".to_string())]
+        );
+        drop(host); // must not hang: the shutdown grace-kill path
     }
 
     /// Remote-edit spans shift every note anchored in the edited file, and
