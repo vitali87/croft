@@ -59,6 +59,15 @@ pub enum InputPurpose {
     ReloadConflict {
         paths: Vec<PathBuf>,
     },
+    /// Instruction for the resident navigator (`croft pair`), scoped to the
+    /// 0-based inclusive line `range` of `file`; `selection` carries the
+    /// selected text when the scope came from a selection. Submitting sends
+    /// the ask turn (the navigator may edit on it).
+    AskNavigator {
+        file: String,
+        range: (usize, usize),
+        selection: String,
+    },
 }
 
 pub struct InputPrompt {

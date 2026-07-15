@@ -116,8 +116,6 @@ impl PairHost {
     /// Ask turn: the navigator may edit. `range` is the invoked 0-based
     /// line span (a single line when both ends match), `selection` the
     /// selected text (may be empty), `content` the caller's current buffer.
-    /// (Dead-code allow: the ask-box slice wires the App to this.)
-    #[allow(dead_code)]
     pub fn send_ask_turn(
         &self,
         file: &str,

@@ -19209,6 +19209,117 @@ fn solo_guest_never_hosts_the_navigator() {
     assert!(app.pair_host.is_none());
 }
 
+/// The ask box: Cmd+K Q opens the navigator input scoped to the caret line
+/// (or the selection), right-click menus carry the entries, and submitting
+/// sends the composed ask turn (instruction, 0-based range, numbered
+/// buffer) to the pilot's claude stdin.
+#[test]
+fn ask_box_opens_from_chord_and_menus_and_sends_the_ask_turn() {
+    use crate::widgets::input_prompt::InputPurpose;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use std::time::{Duration, Instant};
+    if !crate::lsp::manager::is_on_path("python3") {
+        eprintln!("SKIPPED: python3 not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "a\nb\nc\nd\ne").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let script = tmp.path().join("fake_claude.py");
+    std::fs::write(&script, crate::pair::FAKE_CLAUDE).unwrap();
+    let log = tmp.path().join("stdin.log");
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script).arg(&log).arg("notes");
+    app.pair_host =
+        Some(crate::pair_host::PairHost::spawn_cmd(&socket, "navigator", None, cmd).unwrap());
+
+    // Cmd+K Q on the caret line (no selection): single-line scope, 1-based
+    // title, Esc closes through the shared input-prompt path.
+    app.editor.cursor_row = 2;
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('q'), KeyModifiers::NONE)));
+    {
+        let p = app.input_prompt.as_ref().expect("ask box opens");
+        assert!(
+            matches!(&p.purpose, InputPurpose::AskNavigator { range: (2, 2), .. }),
+            "caret-line scope"
+        );
+        assert!(p.title.contains("line 3"), "title: {}", p.title);
+    }
+    app.handle_input_prompt_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.input_prompt.is_none());
+
+    // With a selection the chord scopes to the selected lines; submitting
+    // sends the composed turn to the pilot.
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (1, 0),
+        head: (3, 1),
+    });
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('q'), KeyModifiers::NONE)));
+    assert!(matches!(
+        &app.input_prompt.as_ref().unwrap().purpose,
+        InputPurpose::AskNavigator { range: (1, 3), .. }
+    ));
+    for c in "tighten this".chars() {
+        app.handle_input_prompt_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_input_prompt_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.input_prompt.is_none(), "submit closes the box");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let sent = std::fs::read_to_string(&log).unwrap_or_default();
+        if sent.contains("tighten this") && sent.contains("lines 1-3") && sent.contains("2|c") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "composed ask never reached claude; log: {sent}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The gutter right-click menu offers the ask entry; the body menu adds
+    // the selection-scoped one while a selection is active.
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let gutter_col = app.editor.last_inner.x;
+    let row = app.editor.last_inner.y + 1;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        gutter_col,
+        row,
+    ));
+    let labels = menu_labels(&app.context_menu.as_ref().unwrap().items);
+    assert!(labels.contains(&"Ask Navigator"), "gutter menu: {labels:?}");
+    app.context_menu = None;
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (2, 1),
+    });
+    let text_x = app.editor.last_inner.x + app.editor.last_gutter_width + 2;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), text_x, row));
+    let labels = menu_labels(&app.context_menu.as_ref().unwrap().items);
+    assert!(
+        labels.contains(&"Ask Navigator About Selection"),
+        "body menu: {labels:?}"
+    );
+}
+
 /// The navigator note popup: opens when the caret LANDS on a noted line
 /// (staying put never re-triggers), Esc dismisses it without eating the
 /// selection, F4 cycles through the file's notes (wrapping) and jumps the

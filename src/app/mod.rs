@@ -1009,6 +1009,17 @@ enum MenuAction {
     EditLogpointAt {
         line: usize,
     },
+    /// Editor gutter: ask the resident navigator about 0-based `line`
+    /// (opens the ask box scoped to that line).
+    AskNavigatorAt {
+        line: usize,
+    },
+    /// Editor body: ask the navigator about the selected 0-based inclusive
+    /// line span (the selection's text rides the turn).
+    AskNavigatorSelection {
+        start: usize,
+        end: usize,
+    },
     /// Editor body: one level of the call hierarchy for the symbol at buffer
     /// `(row, col)` — callers when `incoming`, callees otherwise.
     ShowCallsAt {
@@ -1142,6 +1153,8 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ToggleBreakpointAt { .. } => Some("F9"),
         MenuAction::EditBreakpointConditionAt { .. } => Some("⇧F9"),
         MenuAction::EditLogpointAt { .. } => Some("⇧⌥F9"),
+        MenuAction::AskNavigatorAt { .. } => Some("⌘K Q"),
+        MenuAction::AskNavigatorSelection { .. } => Some("⌘K Q"),
         MenuAction::ShowCallsAt { incoming: true, .. } => Some("⌘K H"),
         MenuAction::ShowCallsAt {
             incoming: false, ..
@@ -12388,6 +12401,19 @@ impl App {
                 self.collab_cancel_stream();
                 true
             }
+            // Cmd+K Q: ask the navigator about the caret line, or the
+            // selected lines when a selection is active (Q for question).
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'q') => {
+                let (range, selection) = match self.editor.selection_rows() {
+                    Some(rows) => (rows, self.editor.selection_text()),
+                    None => {
+                        let row = self.editor.cursor_row;
+                        ((row, row), String::new())
+                    }
+                };
+                self.open_ask_navigator(range, selection);
+                true
+            }
             // Cmd+K Shift+Cmd+\: open a second view of the active file beside it
             // ("Split in Group"). Must precede the plain Cmd+\ (Split Up) arm,
             // which ignores Shift. Shift+\ may arrive as '|' on some layouts.
@@ -15537,6 +15563,24 @@ impl App {
                     n => self.status = format!("Reloaded {n} files from disk"),
                 }
             }
+            InputPurpose::AskNavigator {
+                file,
+                range,
+                selection,
+            } => {
+                self.close_input_prompt();
+                let Some(host) = &self.pair_host else {
+                    self.status = String::from("Navigator is not active");
+                    return;
+                };
+                let content = self.editor.lines.join("\n");
+                match host.send_ask_turn(&file, range, &selection, &value, &content) {
+                    Ok(()) => {
+                        self.status = format!("Asked {} about {file}:{}", host.name(), range.0 + 1);
+                    }
+                    Err(e) => self.status = format!("Ask Navigator failed: {e}"),
+                }
+            }
         }
     }
 
@@ -15885,6 +15929,41 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Open the ask box: an instruction input for the resident navigator,
+    /// scoped to a 0-based inclusive line `range` of the active file, with
+    /// `selection` carrying selected text when the scope came from one.
+    /// Cmd+K Q, the gutter menu, and the body menu all land here.
+    fn open_ask_navigator(&mut self, range: (usize, usize), selection: String) {
+        let Some(host) = &self.pair_host else {
+            self.status =
+                String::from("Navigator is not active (run croft pair in this workspace)");
+            return;
+        };
+        let Some(file) = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&self.tree.root, p))
+        else {
+            self.status = String::from("Ask Navigator: no active workspace file");
+            return;
+        };
+        let scope = if range.0 == range.1 {
+            format!("line {}", range.0 + 1)
+        } else {
+            format!("lines {}-{}", range.0 + 1, range.1 + 1)
+        };
+        self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
+            crate::widgets::input_prompt::InputPurpose::AskNavigator {
+                file: file.clone(),
+                range,
+                selection,
+            },
+            format!("Ask {} · {file} · {scope}", host.name()),
+            "What should it look at or do?",
+        ));
     }
 
     /// F4: jump the caret to the active file's next navigator note (by row,
@@ -24223,11 +24302,21 @@ impl App {
                     } else {
                         String::from("Add Logpoint")
                     };
-                    let items = vec![
+                    let mut items = vec![
                         (toggle_label, MenuAction::ToggleBreakpointAt { line }),
                         (cond_label, MenuAction::EditBreakpointConditionAt { line }),
                         (log_label, MenuAction::EditLogpointAt { line }),
                     ];
+                    // The resident navigator's line-scoped ask, only while
+                    // one is seated (`line` here is 1-based, the box 0-based).
+                    if self.pair_host.is_some() {
+                        items.push((
+                            String::from("Ask Navigator"),
+                            MenuAction::AskNavigatorAt {
+                                line: line.saturating_sub(1),
+                            },
+                        ));
+                    }
                     self.context_menu = Some(ContextMenu::flat(
                         (m.column, m.row),
                         items,
@@ -24322,6 +24411,16 @@ impl App {
                         items.push((
                             String::from("Quick Fix"),
                             MenuAction::QuickFixAt { row, col },
+                        ));
+                    }
+                    // The navigator's selection-scoped ask (GitHub-review
+                    // style), only while one is seated and lines are selected.
+                    if self.pair_host.is_some()
+                        && let Some((start, end)) = self.editor.selection_rows()
+                    {
+                        items.push((
+                            String::from("Ask Navigator About Selection"),
+                            MenuAction::AskNavigatorSelection { start, end },
                         ));
                     }
                     self.context_menu = Some(ContextMenu::flat(
@@ -26622,6 +26721,15 @@ impl App {
             MenuAction::EditLogpointAt { line } => {
                 self.focus_pane(Pane::Editor);
                 self.debug_edit_logpoint_line(line);
+            }
+            MenuAction::AskNavigatorAt { line } => {
+                self.focus_pane(Pane::Editor);
+                self.open_ask_navigator((line, line), String::new());
+            }
+            MenuAction::AskNavigatorSelection { start, end } => {
+                self.focus_pane(Pane::Editor);
+                let selection = self.editor.selection_text();
+                self.open_ask_navigator((start, end), selection);
             }
             MenuAction::ShowCallsAt { row, col, incoming } => {
                 self.editor.cursor_row = row;
