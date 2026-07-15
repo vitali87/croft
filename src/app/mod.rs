@@ -11146,7 +11146,7 @@ impl App {
             // Resident navigator seated and idle: presence, not attention —
             // the stream badge above takes over whenever it is typing.
             spans.push(Span::styled(
-                format!(" \u{25c6} {} seated ", host.name()),
+                format!(" \u{25c6} {} seated ", host.title()),
                 Style::default()
                     .bg(Color::Rgb(0x3c, 0x41, 0x4f))
                     .fg(Color::Rgb(0xff, 0x9d, 0x2f))
@@ -15892,7 +15892,7 @@ impl App {
             Ok(host) => {
                 self.status = format!(
                     "Navigator '{}' seated (Cmd+K Q asks, Cmd+K Y yields)",
-                    host.name()
+                    host.title()
                 );
                 self.pair_host = Some(host);
             }

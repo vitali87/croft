@@ -2251,6 +2251,31 @@ mod tests {
         });
     }
 
+    /// The badge title names who is actually typing: bare caret name on the
+    /// claude backend, "name (model)" on a local one.
+    #[test]
+    fn local_navigator_badge_names_the_model() {
+        let harness = OwnerHarness::start("hello world");
+        let host = crate::pair_host::PairHost::spawn(PairConfig {
+            socket: harness.socket.clone(),
+            workspace: harness._dir.path().to_path_buf(),
+            name: String::from("claude"),
+            model: Some(String::from("test-model")),
+            task: None,
+            provider: Provider::Local {
+                base_url: String::from("http://127.0.0.1:9"),
+            },
+        })
+        .unwrap();
+        assert_eq!(host.title(), "claude (test-model)");
+
+        let mut cmd = Command::new("cat");
+        cmd.stdin(Stdio::piped());
+        let host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "navigator", None, cmd).unwrap();
+        assert_eq!(host.title(), "navigator");
+    }
+
     /// Spawn the pilot against the scripted claude on a background thread
     /// (it blocks until the turn ends and its input hits EOF).
     fn spawn_pilot(

@@ -50,6 +50,9 @@ pub struct PairHost {
     pilot: Option<Pilot>,
     events: Receiver<PairEvent>,
     name: String,
+    /// The local model this seat rides (None on the claude backend, whose
+    /// child owns model selection); shown in the idle badge via [`Self::title`].
+    model_label: Option<String>,
     died: bool,
 }
 
@@ -70,7 +73,9 @@ impl PairHost {
                     .context("a local provider needs --model (there is no CLI default)")?;
                 let (tx, rx) = channel();
                 let pilot = seat_local(&cfg.socket, &cfg.name, base_url, model, Some(tx))?;
-                Self::seated(pilot, rx, &cfg.name, cfg.task.as_deref())
+                let mut host = Self::seated(pilot, rx, &cfg.name, cfg.task.as_deref())?;
+                host.model_label = Some(model.to_string());
+                Ok(host)
             }
         }
     }
@@ -94,6 +99,7 @@ impl PairHost {
             pilot: Some(pilot),
             events,
             name: name.to_string(),
+            model_label: None,
             died: false,
         };
         if let Some(task) = task {
@@ -105,6 +111,15 @@ impl PairHost {
     /// The caret name the navigator sits under.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The badge label: the caret name, plus the local model when this seat
+    /// rides a local endpoint (so the badge says who is actually typing).
+    pub fn title(&self) -> String {
+        match &self.model_label {
+            Some(model) => format!("{} ({model})", self.name),
+            None => self.name.clone(),
+        }
     }
 
     /// True while a turn is streaming: a new ask/yield must wait for it to
