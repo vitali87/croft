@@ -16000,6 +16000,47 @@ impl App {
         }
     }
 
+    /// Palette toggle: flip the workspace's pair record and let the next
+    /// activation check seat or unseat the pilot (within a second).
+    fn toggle_navigator(&mut self) {
+        let current = crate::session::read_pair_record(&self.pair_record_path);
+        let enabled = !current.as_ref().is_some_and(|r| r.enabled);
+        let record = crate::session::PairRecord {
+            model: current.as_ref().and_then(|r| r.model.clone()),
+            name: current
+                .map(|r| r.name)
+                .unwrap_or_else(|| String::from("claude")),
+            enabled,
+            task: None,
+        };
+        if let Some(dir) = self.pair_record_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match crate::session::write_pair_record(&self.pair_record_path, &record) {
+            Ok(()) => {
+                self.last_pair_check = None; // act on this tick, not in 1s
+                self.status = if enabled {
+                    format!("Navigator '{}' activated; seating", record.name)
+                } else {
+                    String::from("Navigator deactivated; unseating")
+                };
+            }
+            Err(e) => self.status = format!("Navigator toggle failed: {e}"),
+        }
+    }
+
+    /// Palette: drop every navigator note — the pilot's anchors, the
+    /// per-file snapshots, the gutter diamonds, and any open popup.
+    fn clear_navigator_notes(&mut self) {
+        if let Some(host) = &self.pair_host {
+            host.clear_notes();
+        }
+        self.navigator_notes.clear();
+        self.editor.note_lines.clear();
+        self.note_popup = None;
+        self.status = String::from("Navigator notes cleared");
+    }
+
     /// F4: jump the caret to the active file's next navigator note (by row,
     /// wrapping) and open its popup.
     fn cycle_navigator_note(&mut self) {
@@ -21951,6 +21992,19 @@ impl App {
             Cmd::ColorTheme => self.open_theme_picker(),
             Cmd::SessionParticipants => self.open_participants_picker(),
             Cmd::CollabCancelStream => self.collab_cancel_stream(),
+            Cmd::AskNavigator => {
+                let (range, selection) = match self.editor.selection_rows() {
+                    Some(rows) => (rows, self.editor.selection_text()),
+                    None => {
+                        let row = self.editor.cursor_row;
+                        ((row, row), String::new())
+                    }
+                };
+                self.open_ask_navigator(range, selection);
+            }
+            Cmd::YieldToNavigator => self.yield_to_navigator(),
+            Cmd::ToggleNavigator => self.toggle_navigator(),
+            Cmd::ClearNavigatorNotes => self.clear_navigator_notes(),
             Cmd::RunTask => self.open_run_task_picker(),
             Cmd::RunBuildTask => self.run_build_task(),
             Cmd::RerunLastTask => self.rerun_last_task(),

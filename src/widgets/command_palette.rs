@@ -119,6 +119,17 @@ pub enum Command {
     /// Cancel the AI pilot's token stream into a shared file; the pilot
     /// reverts the streamed text (`croft pair`, docs/MULTIPLAYER.md).
     CollabCancelStream,
+    /// Ask the resident navigator about the caret line or selection (opens
+    /// the instruction box; the navigator may edit on the resulting turn).
+    AskNavigator,
+    /// Hand the navigator the floor on the active file: a comment-only
+    /// review turn, its say anchored as gutter diamonds.
+    YieldToNavigator,
+    /// Activate or deactivate the workspace's resident navigator (writes
+    /// the pair record `croft pair` uses; the tick loop seats or unseats).
+    ToggleNavigator,
+    /// Drop every navigator note (gutter diamonds and popup).
+    ClearNavigatorNotes,
 }
 
 /// Every command, in palette display order. Single source of truth for both
@@ -214,6 +225,10 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::SearchFromTerminal,
     Command::SessionParticipants,
     Command::CollabCancelStream,
+    Command::AskNavigator,
+    Command::YieldToNavigator,
+    Command::ToggleNavigator,
+    Command::ClearNavigatorNotes,
 ];
 
 impl Command {
@@ -311,6 +326,10 @@ impl Command {
             Command::SearchFromTerminal => "Terminal: Search & Replace from Last grep/rg",
             Command::SessionParticipants => "Session: Participants",
             Command::CollabCancelStream => "Collab: Cancel AI Stream",
+            Command::AskNavigator => "Navigator: Ask About Line or Selection",
+            Command::YieldToNavigator => "Navigator: Yield the Turn",
+            Command::ToggleNavigator => "Navigator: Activate or Deactivate",
+            Command::ClearNavigatorNotes => "Navigator: Clear Notes",
         }
     }
 
@@ -412,6 +431,10 @@ impl Command {
             Command::SearchFromTerminal => "",
             Command::SessionParticipants => "Cmd+K A",
             Command::CollabCancelStream => "Cmd+K X",
+            Command::AskNavigator => "Cmd+K Q",
+            Command::YieldToNavigator => "Cmd+K Y",
+            Command::ToggleNavigator => "",
+            Command::ClearNavigatorNotes => "",
         }
         // No catch-all: every Command must carry an accelerator (croft tenet),
         // so adding a variant fails to compile until its hint is supplied.
@@ -510,6 +533,10 @@ impl Command {
             Command::SearchFromTerminal => "search_from_terminal",
             Command::SessionParticipants => "session_participants",
             Command::CollabCancelStream => "collab_cancel_stream",
+            Command::AskNavigator => "navigator_ask",
+            Command::YieldToNavigator => "navigator_yield",
+            Command::ToggleNavigator => "navigator_toggle",
+            Command::ClearNavigatorNotes => "navigator_clear_notes",
             Command::RunTask => "run_task",
             Command::RunBuildTask => "run_build_task",
             Command::RerunLastTask => "rerun_last_task",

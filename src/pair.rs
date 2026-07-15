@@ -481,6 +481,11 @@ impl PairState {
         self.notes.retain(|n| n.file != file);
     }
 
+    /// Drop every note in every file (the user asked for a clean slate).
+    pub(crate) fn clear_all_notes(&mut self) {
+        self.notes.clear();
+    }
+
     /// Arm a host turn targeting `file`: mode, target, note supersession,
     /// and the last-seen bookkeeping the yield diff reads. Returns what the
     /// navigator previously saw of the file (None = first look).

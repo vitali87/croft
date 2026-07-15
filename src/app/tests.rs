@@ -19209,6 +19209,51 @@ fn solo_guest_never_hosts_the_navigator() {
     assert!(app.pair_host.is_none());
 }
 
+/// The four navigator palette commands exist, hint their chords, and their
+/// hostless paths hint instead of panicking; Toggle records activation for
+/// the tick loop to seat.
+#[test]
+fn palette_carries_the_navigator_commands() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    for cmd in [
+        Command::AskNavigator,
+        Command::YieldToNavigator,
+        Command::ToggleNavigator,
+        Command::ClearNavigatorNotes,
+    ] {
+        assert!(ALL_COMMANDS.contains(&cmd), "{cmd:?} missing from palette");
+    }
+    assert_eq!(Command::AskNavigator.keybinding_hint(), "Cmd+K Q");
+    assert_eq!(Command::YieldToNavigator.keybinding_hint(), "Cmd+K Y");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "a\nb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pair_record_path = tmp.path().join("x.pair.json");
+    app.open_file_at_launch(&file);
+
+    app.run_command(Command::AskNavigator);
+    assert!(app.status.to_lowercase().contains("not active"));
+    app.run_command(Command::YieldToNavigator);
+    assert!(app.status.to_lowercase().contains("not active"));
+
+    app.navigator_notes
+        .insert("f.txt".into(), vec![(0, "n".into())]);
+    app.note_popup = Some(("f.txt".into(), 0));
+    app.run_command(Command::ClearNavigatorNotes);
+    assert!(app.navigator_notes.is_empty());
+    assert!(app.note_popup.is_none());
+
+    app.run_command(Command::ToggleNavigator);
+    let record =
+        crate::session::read_pair_record(&app.pair_record_path).expect("toggle writes the record");
+    assert!(record.enabled);
+    app.run_command(Command::ToggleNavigator);
+    let record = crate::session::read_pair_record(&app.pair_record_path).unwrap();
+    assert!(!record.enabled);
+}
+
 /// Cmd+K Y yields the active file to the navigator (a COMMENT-ONLY turn
 /// carrying the numbered buffer), and the pilot's commentary lands in the
 /// Navigator OUTPUT channel via poll_pair.

@@ -145,6 +145,13 @@ impl PairHost {
         write_user_turn(&p.state, &p.writer, body)
     }
 
+    /// Drop every anchored note (the palette's "Navigator: Clear Notes").
+    pub fn clear_notes(&self) {
+        if let Some(p) = &self.pilot {
+            p.state.lock().unwrap().clear_all_notes();
+        }
+    }
+
     /// (0-based row, body) of every note anchored in `file`, rows computed
     /// against the live replica so they track concurrent edits.
     pub fn notes_snapshot(&self, file: &str) -> Vec<(usize, String)> {
