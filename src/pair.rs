@@ -443,12 +443,20 @@ const LOCAL_MODEL_PROMPT_SUFFIX: &str = r#"Local-model addendum:
 #[derive(Clone, Debug, PartialEq)]
 pub enum Provider {
     Claude,
-    // Constructed by `croft pair --provider ollama` once the CLI slice
-    // lands; until then only the prompt tests reach it.
-    #[allow(dead_code)]
-    Local {
-        base_url: String,
-    },
+    Local { base_url: String },
+}
+
+impl Provider {
+    /// Map a pair record's stringly provider to the transport it names.
+    /// Absent or unrecognized = Claude (every 0.1.635 record is claude).
+    pub fn from_record(provider: Option<&str>, base_url: Option<&str>) -> Self {
+        match provider {
+            Some("ollama") => Provider::Local {
+                base_url: base_url.unwrap_or("http://localhost:11434").to_string(),
+            },
+            _ => Provider::Claude,
+        }
+    }
 }
 
 /// The system prompt a provider's model is taught: the shared fence

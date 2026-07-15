@@ -180,6 +180,15 @@ pub enum CliCommand {
         name: Option<String>,
         /// A first task to send once seated.
         task: Option<String>,
+        /// Backend that seats the pilot: "claude" (default, the claude CLI)
+        /// or "ollama" (a direct Anthropic-compatible local endpoint —
+        /// Ollama, LM Studio, llama.cpp, vLLM; requires --model).
+        #[arg(long, value_parser = ["claude", "ollama"])]
+        provider: Option<String>,
+        /// The local endpoint for --provider ollama (implies it); defaults
+        /// to http://localhost:11434.
+        #[arg(long)]
+        base_url: Option<String>,
         /// Deactivate the navigator for the workspace instead.
         #[arg(long, default_value_t = false)]
         off: bool,
@@ -301,6 +310,8 @@ impl Cli {
                 model,
                 name,
                 task,
+                provider,
+                base_url,
                 off,
                 repl,
             }) => {
@@ -309,6 +320,12 @@ impl Cli {
                     .canonicalize()
                     .context("resolving workspace path")?;
                 let name = name.unwrap_or_else(|| "claude".into());
+                let (provider, base_url) = resolve_pair_provider(provider, base_url);
+                anyhow::ensure!(
+                    provider.as_deref() != Some("ollama") || model.is_some(),
+                    "--provider ollama needs --model <name> (e.g. --model qwen3-coder:30b); \
+                     a local endpoint has no CLI default"
+                );
                 let record_path = crate::session::pair_record_path(&workspace);
                 if let Some(dir) = record_path.parent() {
                     std::fs::create_dir_all(dir)?;
@@ -337,7 +354,10 @@ impl Cli {
                         name,
                         model,
                         task,
-                        provider: crate::pair::Provider::Claude,
+                        provider: crate::pair::Provider::from_record(
+                            provider.as_deref(),
+                            base_url.as_deref(),
+                        ),
                     });
                 }
                 crate::session::write_pair_record(
@@ -350,8 +370,8 @@ impl Cli {
                         // instructions in-editor (Cmd+K Q). A persisted task
                         // would re-fire on every launch.
                         task: None,
-                        provider: None,
-                        base_url: None,
+                        provider,
+                        base_url,
                     },
                 )?;
                 // The relay is up before croft looks, so the seat connects
@@ -390,6 +410,21 @@ impl Cli {
             }
         }
     }
+}
+
+/// Resolve the pair provider flags as recorded: `--base-url` alone implies
+/// ollama, and ollama without an explicit endpoint gets the standard local
+/// port. A plain claude activation records neither.
+fn resolve_pair_provider(
+    provider: Option<String>,
+    base_url: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let provider = provider.or_else(|| base_url.is_some().then(|| String::from("ollama")));
+    let base_url = match provider.as_deref() {
+        Some("ollama") => base_url.or_else(|| Some(String::from("http://localhost:11434"))),
+        _ => base_url,
+    };
+    (provider, base_url)
 }
 
 fn setup_terminal(font: &str, size: u32, yes: bool) -> Result<()> {
@@ -1081,6 +1116,8 @@ mod tests {
                 model,
                 name,
                 task,
+                provider: None,
+                base_url: None,
                 off: false,
                 repl: false,
             }) => {
@@ -1100,6 +1137,8 @@ mod tests {
                 model: None,
                 name: None,
                 task: None,
+                provider: None,
+                base_url: None,
                 off: false,
                 repl: false,
             })
@@ -1115,6 +1154,54 @@ mod tests {
             cli.command,
             Some(CliCommand::Pair { repl: true, .. })
         ));
+    }
+
+    /// `--provider ollama --base-url <url>` parses; anything but
+    /// claude/ollama is refused at parse time.
+    #[test]
+    fn parse_pair_provider_ollama_with_base_url() {
+        let cli = Cli::parse_from([
+            "croft",
+            "pair",
+            "--provider",
+            "ollama",
+            "--base-url",
+            "http://localhost:11434",
+            "--model",
+            "qwen3-coder:30b",
+        ]);
+        match cli.command {
+            Some(CliCommand::Pair {
+                provider,
+                base_url,
+                model,
+                ..
+            }) => {
+                assert_eq!(provider.as_deref(), Some("ollama"));
+                assert_eq!(base_url.as_deref(), Some("http://localhost:11434"));
+                assert_eq!(model.as_deref(), Some("qwen3-coder:30b"));
+            }
+            _ => panic!("expected Pair"),
+        }
+        assert!(Cli::try_parse_from(["croft", "pair", "--provider", "openai"]).is_err());
+    }
+
+    /// `--base-url` alone implies the ollama provider, and ollama without an
+    /// explicit endpoint defaults to the standard local port. Plain claude
+    /// activations record neither.
+    #[test]
+    fn base_url_implies_ollama() {
+        let (p, b) = resolve_pair_provider(None, Some(String::from("http://x:1234")));
+        assert_eq!(p.as_deref(), Some("ollama"));
+        assert_eq!(b.as_deref(), Some("http://x:1234"));
+
+        let (p, b) = resolve_pair_provider(Some(String::from("ollama")), None);
+        assert_eq!(p.as_deref(), Some("ollama"));
+        assert_eq!(b.as_deref(), Some("http://localhost:11434"));
+
+        let (p, b) = resolve_pair_provider(None, None);
+        assert_eq!(p, None);
+        assert_eq!(b, None);
     }
 
     #[test]
