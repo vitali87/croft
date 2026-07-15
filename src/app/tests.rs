@@ -19186,6 +19186,52 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     assert!(app.pair_host.is_none(), "pilot must unseat");
 }
 
+/// A record activated with `--provider ollama` seats the pilot with the
+/// Local provider and its recorded endpoint, not the claude default.
+#[test]
+fn app_seats_local_provider_from_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    let seen: std::rc::Rc<std::cell::RefCell<Option<(crate::pair::Provider, Option<String>)>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pair_record_path = tmp.path().join("x.pair.json");
+    app.pair_socket = socket.clone();
+    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
+    // Already the owner (skip the relay bootstrap): the test exercises the
+    // provider mapping, not collab connect.
+    app.collab_config = Some((socket, crate::collab::CollabRole::Owner));
+    let seen2 = seen.clone();
+    app.pair_spawn_override = Some(Box::new(move |cfg| {
+        *seen2.borrow_mut() = Some((cfg.provider.clone(), cfg.model.clone()));
+        anyhow::bail!("captured the config; no seat needed")
+    }));
+    crate::session::write_pair_record(
+        &app.pair_record_path,
+        &crate::session::PairRecord {
+            model: Some("qwen3-coder:30b".into()),
+            name: "navigator".into(),
+            enabled: true,
+            task: None,
+            provider: Some("ollama".into()),
+            base_url: Some("http://localhost:11500".into()),
+        },
+    )
+    .unwrap();
+    app.last_pair_check = None;
+    assert!(app.maybe_seat_navigator());
+    assert_eq!(
+        *seen.borrow(),
+        Some((
+            crate::pair::Provider::Local {
+                base_url: "http://localhost:11500".into()
+            },
+            Some(String::from("qwen3-coder:30b")),
+        )),
+        "the recorded provider and model must reach the seat config"
+    );
+}
+
 /// A dead pilot is not respawned every second: after a death (or a failed
 /// seat) the navigator stays down until the record is deactivated and
 /// re-enabled, matching the "re-activate to reseat" contract and the LSP

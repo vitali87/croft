@@ -15876,7 +15876,10 @@ impl App {
             // very thread). Instructions come from Cmd+K Q. The --repl driver
             // still takes a one-shot task via PairConfig directly.
             task: None,
-            provider: crate::pair::Provider::Claude,
+            provider: crate::pair::Provider::from_record(
+                record.provider.as_deref(),
+                record.base_url.as_deref(),
+            ),
         };
         #[cfg(test)]
         let spawned = match &self.pair_spawn_override {
