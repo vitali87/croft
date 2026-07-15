@@ -321,6 +321,8 @@ impl Cli {
                             name,
                             enabled: false,
                             task: None,
+                            provider: None,
+                            base_url: None,
                         },
                     )?;
                     println!("navigator deactivated for {}", workspace.display());
@@ -348,6 +350,8 @@ impl Cli {
                         // instructions in-editor (Cmd+K Q). A persisted task
                         // would re-fire on every launch.
                         task: None,
+                        provider: None,
+                        base_url: None,
                     },
                 )?;
                 // The relay is up before croft looks, so the seat connects

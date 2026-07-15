@@ -123,6 +123,15 @@ pub(crate) struct PairRecord {
     /// from Cmd+K Q; the --repl driver still takes a one-shot task directly.
     #[serde(default)]
     pub(crate) task: Option<String>,
+    /// Which backend seats the pilot: None or "claude" = the claude CLI;
+    /// "ollama" = a local Anthropic-compatible endpoint (absent on 0.1.635
+    /// records, which are all claude).
+    #[serde(default)]
+    pub(crate) provider: Option<String>,
+    /// The local endpoint, e.g. http://localhost:11434. Never a token — auth
+    /// for keyed gateways stays in the environment (ANTHROPIC_AUTH_TOKEN).
+    #[serde(default)]
+    pub(crate) base_url: Option<String>,
 }
 
 pub(crate) fn write_pair_record(path: &Path, record: &PairRecord) -> Result<()> {
@@ -413,6 +422,8 @@ mod tests {
             name: "navigator".into(),
             enabled: true,
             task: Some("look around".into()),
+            provider: None,
+            base_url: None,
         };
         write_pair_record(&path, &record).unwrap();
         assert_eq!(read_pair_record(&path), Some(record));
@@ -423,6 +434,40 @@ mod tests {
             keyed.parent(),
             collab_socket_path(Path::new("/work/repo")).parent()
         );
+    }
+
+    /// A record activated for a local provider keeps the provider and its
+    /// endpoint across the write/read cycle.
+    #[test]
+    fn pair_record_roundtrips_local_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pair.json");
+        let record = PairRecord {
+            model: Some("qwen3-coder:30b".into()),
+            name: "navigator".into(),
+            enabled: true,
+            task: None,
+            provider: Some("ollama".into()),
+            base_url: Some("http://localhost:11434".into()),
+        };
+        write_pair_record(&path, &record).unwrap();
+        assert_eq!(read_pair_record(&path), Some(record));
+    }
+
+    /// A 0.1.635 record (no provider fields) still reads: absent fields mean
+    /// the claude provider, exactly what those records were written for.
+    #[test]
+    fn legacy_record_without_provider_is_claude() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pair.json");
+        std::fs::write(
+            &path,
+            r#"{"model":null,"name":"claude","enabled":true,"task":null}"#,
+        )
+        .unwrap();
+        let record = read_pair_record(&path).expect("legacy record reads");
+        assert_eq!(record.provider, None);
+        assert_eq!(record.base_url, None);
     }
 
     #[test]

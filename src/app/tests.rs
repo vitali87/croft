@@ -19141,6 +19141,8 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
             name: "navigator".into(),
             enabled: true,
             task: None,
+            provider: None,
+            base_url: None,
         },
     )
     .unwrap();
@@ -19174,6 +19176,8 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
             name: "navigator".into(),
             enabled: false,
             task: None,
+            provider: None,
+            base_url: None,
         },
     )
     .unwrap();
@@ -19212,6 +19216,8 @@ fn a_dead_navigator_is_not_respawned_until_reactivated() {
                 name: "nav".into(),
                 enabled: true,
                 task: None,
+                provider: None,
+                base_url: None,
             },
         )
         .unwrap();
@@ -19242,6 +19248,8 @@ fn a_dead_navigator_is_not_respawned_until_reactivated() {
             name: "nav".into(),
             enabled: false,
             task: None,
+            provider: None,
+            base_url: None,
         },
     )
     .unwrap();
@@ -19278,6 +19286,8 @@ fn resident_seating_never_replays_a_persisted_task() {
             name: "nav".into(),
             enabled: true,
             task: Some("delete the deprecated helpers".into()),
+            provider: None,
+            base_url: None,
         },
     )
     .unwrap();
@@ -19337,6 +19347,8 @@ fn only_one_croft_self_appoints_the_navigator_owner() {
                 name: "nav".into(),
                 enabled: true,
                 task: None,
+                provider: None,
+                base_url: None,
             },
         )
         .unwrap();
@@ -19396,6 +19408,8 @@ fn solo_guest_never_hosts_the_navigator() {
             name: "navigator".into(),
             enabled: true,
             task: None,
+            provider: None,
+            base_url: None,
         },
     )
     .unwrap();
@@ -19576,6 +19590,8 @@ fn turn_done_status_keeps_the_notes_visible() {
             name: "nav".into(),
             enabled: true,
             task: None,
+            provider: None,
+            base_url: None,
         },
     )
     .unwrap();

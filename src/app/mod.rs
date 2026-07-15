@@ -16090,6 +16090,8 @@ impl App {
                 .unwrap_or_else(|| String::from("claude")),
             enabled,
             task: None,
+            provider: None,
+            base_url: None,
         };
         if let Some(dir) = self.pair_record_path.parent() {
             let _ = std::fs::create_dir_all(dir);
