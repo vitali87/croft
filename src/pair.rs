@@ -67,15 +67,9 @@ pub enum FenceEvent {
     /// A well-formed header opened a note anchored to the 0-based `row` of
     /// `file`: commentary tied to a line, accumulated and surfaced whole at
     /// `NoteEnd`, never applied to any buffer.
-    // Dead-code allows: production reads land with the note-anchoring slice.
-    NoteStart {
-        #[allow(dead_code)]
-        file: String,
-        #[allow(dead_code)]
-        row: usize,
-    },
+    NoteStart { file: String, row: usize },
     /// The next fragment of the current note's body, in stream order.
-    NoteBody(#[allow(dead_code)] String),
+    NoteBody(String),
     /// The note closed cleanly; its accumulated body may anchor.
     NoteEnd,
     /// The turn ended mid-note: nothing anchors.
@@ -306,6 +300,23 @@ pub fn range_bytes(lines: &[String], start: (usize, usize), end: (usize, usize))
     )
 }
 
+/// Byte offset of the start of `row` in `lines`, clamped to the last line
+/// (models sometimes cite a row just past EOF).
+fn note_offset(lines: &[String], row: usize) -> usize {
+    let row = row.min(lines.len().saturating_sub(1));
+    crate::collab::byte_offset(lines, row, 0)
+}
+
+/// Replay remote-edit spans over every note anchored in `file`, keeping
+/// their offsets true while other participants type.
+fn shift_notes(notes: &mut [Note], file: &str, spans: &[ResolvedSpan]) {
+    for n in notes.iter_mut().filter(|n| n.file == file) {
+        for span in spans {
+            n.offset = shift_offset(n.offset, span);
+        }
+    }
+}
+
 /// Transform a tracked byte offset through one remote edit span, the same
 /// sequential replay the buffers do: a span entirely before the offset
 /// shifts it by the size delta (an insert exactly at the offset counts as
@@ -388,6 +399,20 @@ struct StreamRegion {
     original: String,
 }
 
+/// One anchored navigator note: a byte offset into `file`'s replica text
+/// (kept fresh against concurrent edits exactly like the stream region)
+/// plus the accumulated body.
+pub struct Note {
+    pub file: String,
+    pub offset: usize,
+    // Dead-code allows: read when the host snapshots notes for the App
+    // (the PairHost slice).
+    #[allow(dead_code)]
+    pub body: String,
+    #[allow(dead_code)]
+    pub id: u64,
+}
+
 /// Shared pilot state: the collab seat plus per-turn stream bookkeeping.
 /// Locked briefly by the reader thread (apply), the pump thread (remote
 /// shifts, cancel), and the REPL (turn injection); never held across a
@@ -409,6 +434,12 @@ struct PairState {
     target_file: Option<String>,
     /// Prepended to the next user turn (set by cancel).
     pending_note: Option<String>,
+    /// Anchored navigator notes; offsets kept fresh by the pump.
+    notes: Vec<Note>,
+    /// The NOTE fence currently streaming: (file, 0-based row, body so far).
+    note_in_flight: Option<(String, usize, String)>,
+    /// Monotonic id for the next anchored note.
+    next_note_id: u64,
 }
 
 /// Kill the claude child when the pilot unwinds, however it unwinds.
@@ -511,6 +542,9 @@ fn run_pilot(
         turn_active: false,
         target_file: None,
         pending_note: None,
+        notes: Vec::new(),
+        note_in_flight: None,
+        next_note_id: 0,
     }));
 
     cmd.stdin(Stdio::piped())
@@ -780,13 +814,52 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
             }
             revert_region(&mut st);
         }
-        // Notes anchor in the pilot state in the next slice; until then a
-        // note is inert (never printed as commentary: its markers already
-        // classified it, and it must never touch a buffer).
-        FenceEvent::NoteStart { .. }
-        | FenceEvent::NoteBody(_)
-        | FenceEvent::NoteEnd
-        | FenceEvent::NoteAbort => {}
+        FenceEvent::NoteStart { file, row } => {
+            let mut st = state.lock().unwrap();
+            if st.cancelled {
+                return;
+            }
+            // Non-blocking: the offset resolves lazily at NoteEnd, so a
+            // bootstrap kicked off here has the body's stream time to land.
+            st.session.request_file(&file);
+            st.note_in_flight = Some((file, row, String::new()));
+        }
+        FenceEvent::NoteBody(delta) => {
+            let mut st = state.lock().unwrap();
+            if let Some((_, _, body)) = st.note_in_flight.as_mut() {
+                body.push_str(&delta);
+            }
+        }
+        FenceEvent::NoteEnd => {
+            let mut st = state.lock().unwrap();
+            let Some((file, row, body)) = st.note_in_flight.take() else {
+                return;
+            };
+            if st.cancelled {
+                return;
+            }
+            // No live doc = the owner never served the file: nothing to
+            // anchor to (mirrors the edit-drop path above).
+            let Some(lines) = st
+                .session
+                .doc_text(&file)
+                .map(|t| t.split('\n').map(String::from).collect::<Vec<_>>())
+            else {
+                return;
+            };
+            let offset = note_offset(&lines, row);
+            let id = st.next_note_id;
+            st.next_note_id += 1;
+            st.notes.push(Note {
+                file,
+                offset,
+                body,
+                id,
+            });
+        }
+        FenceEvent::NoteAbort => {
+            state.lock().unwrap().note_in_flight = None;
+        }
     }
 }
 
@@ -854,6 +927,7 @@ fn pump_session(state: &Mutex<PairState>, writer: &Mutex<Option<ChildStdin>>, re
                             r.anchor = shift_offset(r.anchor, span);
                         }
                     }
+                    shift_notes(&mut st.notes, &file, &spans);
                 }
                 CollabEvent::StreamCancel => {
                     if !st.turn_active || st.cancelled {
@@ -1693,6 +1767,53 @@ if mode == "linger":
         assert_eq!(start, crate::collab::byte_offset(&lines, 0, 10));
         assert_eq!(end, crate::collab::byte_offset(&lines, 1, 2));
         assert!(start < end);
+    }
+
+    /// Remote-edit spans shift every note anchored in the edited file, and
+    /// only that file (the same replay the stream region does).
+    #[test]
+    fn note_offsets_shift_on_remote_edit() {
+        let mut notes = vec![
+            Note {
+                file: "a.rs".into(),
+                offset: 10,
+                body: "n1".into(),
+                id: 1,
+            },
+            Note {
+                file: "b.rs".into(),
+                offset: 10,
+                body: "n2".into(),
+                id: 2,
+            },
+        ];
+        let spans = [
+            // 3 bytes inserted at 0: before the offset, shifts it right.
+            ResolvedSpan {
+                at: 0,
+                deleted: 0,
+                inserted: "abc".into(),
+            },
+            // Delete far after: no effect.
+            ResolvedSpan {
+                at: 40,
+                deleted: 2,
+                inserted: String::new(),
+            },
+        ];
+        shift_notes(&mut notes, "a.rs", &spans);
+        assert_eq!(notes[0].offset, 13);
+        assert_eq!(notes[1].offset, 10, "other file's note must not move");
+    }
+
+    /// A note row just past EOF clamps to the last line instead of panicking
+    /// or anchoring nowhere.
+    #[test]
+    fn note_anchor_row_clamps_past_eof() {
+        let lines: Vec<String> = ["ab", "cd"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(note_offset(&lines, 0), 0);
+        assert_eq!(note_offset(&lines, 1), 3);
+        assert_eq!(note_offset(&lines, 99), 3);
     }
 
     /// Every composed turn names its target file, even when the buffer never
