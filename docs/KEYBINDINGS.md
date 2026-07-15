@@ -43,6 +43,9 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `Cmd+T` | Open the Color Theme picker |
 | `Cmd+K` `A` | Session: Participants (who is attached to this persistent session); `Enter` on a row grants/revokes write control or disconnects them |
 | `Cmd+K` `X` | Collab: Cancel AI Stream — stop a `croft pair` collaborator streaming into a shared file; the streamed text is reverted (same action as clicking the orange `■` stop button in the editor gutter while a stream is live) |
+| `Cmd+K` `Q` | Navigator: ask the resident AI pair programmer about the caret line, or the selected lines when a selection is active (opens the instruction box; also on the gutter and body right-click menus) |
+| `Cmd+K` `Y` | Navigator: yield the turn — it reviews the active file comment-only; its remarks land as orange `◆` note diamonds in the gutter and in the Navigator OUTPUT channel |
+| `F4` | Jump to the active file's next navigator note (wraps) and open its popup; `Esc` dismisses an open note popup |
 | `Cmd+K` `→` | Close the editor tabs to the right of the active one |
 | `Cmd+K` `S` | Select the active file as the compare anchor |
 | `Cmd+K` `C` | Diff the active file against the compare anchor |

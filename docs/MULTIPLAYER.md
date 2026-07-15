@@ -31,8 +31,11 @@ deviations. 0.1.633 added named caret tags and `croft collab-agent`, an MCP
 seat that lets an external AI co-edit with a visible named caret (see "Named
 carets and the AI seat"). 0.1.634 added `croft pair`, a real-time AI
 collaborator whose edits stream into the shared buffers token by token and
-which any participant can cancel mid-run (see "croft pair"). The rest of
-this document is the design the shipped phases
+which any participant can cancel mid-run (see "croft pair"). 0.1.635 made
+that pilot a croft-hosted **resident navigator**: activate once per
+workspace, ask it on a line or selection, yield it comment-only review
+turns, and read its line-anchored notes in the editor (see "The resident
+navigator"). The rest of this document is the design the shipped phases
 followed. It exists so the multiplayer pillar starts from croft's real
 architecture instead of from a Live Share mental model that does not fit a
 single-process TUI.
@@ -420,18 +423,66 @@ streamed region in one `local_change`, broadcasts the stream inactive, and
 prepends a note to the next user turn so the model knows its edit was
 rejected. An unterminated fence at end of turn reverts the same way.
 
-Launch: `croft pair [--workspace <path>] [--model <m>] [--name <n>]
-["first task"]` in a workspace someone has open via `croft attach`; further
-tasks are read from the pilot's stdin, one per line, with `@<file> <task>`
-focusing a buffer (its current text is injected into the turn so the model's
-fence coordinates have a ground truth). The claude child is sandboxed to a
-read-only toolbox (`Read`/`Grep`/`Glob` plus a second, read-only
-`collab-agent` MCP seat named `<name>-reader` for live buffer queries,
-`--strict-mcp-config`); the ONLY write path is the fence through the pilot's
-seat. End-to-end tests drive the pilot against a scripted fake claude
-(python3, like the LSP fakes): streaming convergence, the StreamState
-lifecycle, and the cancel drill (revert + the interrupt landing on the
-fake's stdin) all assert headlessly.
+The claude child is sandboxed to a read-only toolbox (`Read`/`Grep`/`Glob`
+plus a second, read-only `collab-agent` MCP seat named `<name>-reader` for
+live buffer queries, `--strict-mcp-config`); the ONLY write path is the
+fence through the pilot's seat. End-to-end tests drive the pilot against a
+scripted fake claude (python3, like the LSP fakes): streaming convergence,
+the StreamState lifecycle, and the cancel drill (revert + the interrupt
+landing on the fake's stdin) all assert headlessly.
+
+### The resident navigator (0.1.635)
+
+0.1.634's pilot was a terminal REPL: a second terminal to keep open and a
+`croft attach` prerequisite the user rightly called clanky. 0.1.635 makes
+the pilot a workspace resident that croft itself hosts, and turns the
+interaction into turn-based driver/navigator pairing:
+
+- **Activation.** `croft pair [--workspace <p>] [--model <m>] [--name <n>]
+  ["first task"]` now writes a `<hash>.pair.json` sidecar (next to the
+  workspace's collab socket, `session::pair_record_path`), ensures the
+  relay, and exits. A running croft stats the record on a 1s cadence
+  (`App::maybe_seat_navigator`) and seats the pilot in-process
+  (`src/pair_host.rs`, `PairHost` — the `run_pilot` bootstrap minus the
+  REPL, its voice rerouted from stdio to `PairEvent`s the App drains each
+  tick). `croft pair --off` or the "Navigator: Activate or Deactivate"
+  palette entry unseats it; the hidden `--repl` flag keeps the old
+  terminal driver for debugging.
+- **The owner-seat requirement.** The pilot's guest seat bootstraps files
+  via SnapshotRequest, and only a collab OWNER answers. A plain `croft`
+  launch has no collab session at all, so activation self-appoints it: the
+  App creates the owner-role channel itself (ensure_relay + direct
+  connect) before seating the pilot. Solo guests never host — the owner's
+  croft does. Two plain crofts on one workspace would both self-appoint
+  (site collision): a documented v1 limitation; `croft attach` remains the
+  multi-croft-safe path.
+- **Ask turns (may edit).** Right-click the gutter ("Ask Navigator"), a
+  selection ("Ask Navigator About Selection"), or `Cmd+K Q`: an input box
+  takes the instruction, and the turn carries the 0-based line/range, the
+  selected text, and the buffer numbered `N|` per line (the prompt teaches
+  that the prefix is a label, not content). Fence edits stream with the
+  full 0.1.634 cancel machinery.
+- **Yield turns (comment-only, host-enforced).** `Cmd+K Y` hands the
+  navigator the floor on the active file: the turn carries the unified
+  diff since its last look plus the numbered buffer, and the host DISCARDS
+  any EDIT fence it emits (`PairState::comment_only`, reset at the turn's
+  result) — the prompt rule is advisory, the gate is not.
+- **Notes.** A new NOTE fence (`<<<NOTE <file>:<row>>>>` … `<<<END>>>`,
+  0-based row) anchors commentary to lines. Notes live in the pilot as
+  byte offsets shifted through every RemoteEdit span (the same
+  `shift_offset` replay as the stream region), so they track concurrent
+  edits; the App snapshots them per tick into gutter `◆` diamonds. The
+  caret landing on a noted row (or a `◆` click, or `F4` cycling) opens an
+  anchored popup; `Esc` dismisses without costing the selection. A new
+  turn targeting a file supersedes that file's notes; "Navigator: Clear
+  Notes" drops them all. Non-anchored commentary goes to the Navigator
+  OUTPUT channel. The NOTE fence is model-protocol only — nothing new
+  rides the relay, so 0.1.633/634 peers interop untouched.
+- **Presence.** While seated and idle the status bar wears a quiet
+  `◆ <name> seated` badge; the orange streaming badge takes over whenever
+  it types. If the claude child dies, the host surfaces it and unseats
+  (no auto-respawn, matching the LSP-server precedent); re-activate to
+  reseat.
 
 ### Slice 3 design: op transport and the process model
 

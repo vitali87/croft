@@ -103,13 +103,19 @@ claude mcp add croft-collab -- croft collab-agent --workspace /abs/path/to/proje
 
 The agent joins the running session as a guest with `collab_open` / `collab_read` / `collab_replace` / `collab_caret` / `collab_status` tools: its edits stream into your editor live, its caret shows up named (default `claude`, `--name` overrides), and it can never write your disk — the session owner persists what lands. Croft ships no LLM; any MCP-speaking agent can drive the seat.
 
-For a real pair-programming partner, use `croft pair` instead: it drives the `claude` CLI itself and streams the model's edits into the shared buffers **token by token**, the way a human types, with a named caret riding the stream:
+For a real pair-programming partner, activate the **resident navigator**: an AI driver/navigator seat that croft itself hosts — no second terminal to babysit:
 
 ```sh
-croft pair --workspace /abs/path/to/project "tighten the error handling in src/main.rs"
+croft pair --workspace /abs/path/to/project --model claude-haiku-4-5-20251001 --name navigator
 ```
 
-Type further tasks at its prompt (`@<file> <task>` focuses a buffer). While it streams, croft shows an orange badge in the status bar and an orange `■` stop button in the editor gutter: click it (or press `Cmd+K X`) to cancel the stream mid-run — the streamed text is reverted and the conversation stays alive for your next instruction. The model's toolbox is read-only (`Read`/`Grep`/`Glob` plus a read-only collab seat); the only way it can change a buffer is the visible, cancellable stream (see [docs/MULTIPLAYER.md](docs/MULTIPLAYER.md)).
+The command records the activation and exits; the running croft (or the next one you start there) seats the pilot within a second and wears a `◆ navigator seated` badge. Then, inside the editor:
+
+- **Ask it** about a line or a selection — right-click the gutter ("Ask Navigator"), right-click a selection ("Ask Navigator About Selection"), or press `Cmd+K Q`. Its edits stream into the buffer **token by token**, the way a human types, with a named caret riding the stream.
+- **Yield it the turn** with `Cmd+K Y`: it reviews the active file *comment-only* — its remarks pin to lines as orange `◆` diamonds (the caret landing on one opens the note; `F4` cycles, `Esc` dismisses), and free-form commentary lands in the Navigator OUTPUT channel. Any edit it attempts on a yielded turn is discarded by the host, not just discouraged.
+- **Cancel a stream mid-run**: click the orange `■` stop button in the gutter or press `Cmd+K X` — the streamed text is reverted and the conversation stays alive for your next instruction.
+
+The model's toolbox is read-only (`Read`/`Grep`/`Glob` plus a read-only collab seat); the only way it can change a buffer is the visible, cancellable stream. `croft pair --off` (or the "Navigator: Activate or Deactivate" palette entry) unseats it (see [docs/MULTIPLAYER.md](docs/MULTIPLAYER.md)).
 
 ## Platform setup
 

@@ -62,10 +62,14 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "`croft pair`: a real-time AI pair programmer — it drives the claude CLI and streams its edits into your shared buffers token by token, the way a human types, with a named caret riding the stream (no more bulk inserts).",
+        summary: "The resident navigator: `croft pair --workspace $(pwd)` now activates an AI pair programmer that croft itself hosts and exits — no second terminal. Ask it about a line or selection (right-click the gutter or body, or Cmd+K Q), or yield it the turn with Cmd+K Y for a comment-only review of the active file.",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Cancel an AI stream mid-run from any seat: click the orange stop button in the editor gutter, press Cmd+K X, or run \"Collab: Cancel AI Stream\" — the streamed text is reverted and the conversation stays alive.",
+        summary: "Navigator notes: its remarks anchor to lines as orange ◆ diamonds in the gutter; the caret landing on one (or a click, or F4 to cycle) opens the note in an anchored popup, Esc dismisses. Free-form commentary lands in the new Navigator OUTPUT channel.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Yielded turns are comment-only by contract AND by enforcement: any edit fence the model emits on one is discarded by the host. Ask turns still stream edits token by token with the 0.1.634 cancel machinery (gutter ■, Cmd+K X, full revert).",
     },
 ];
