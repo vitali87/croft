@@ -61,6 +61,40 @@ fn meta_path(socket: &Path) -> PathBuf {
     socket.with_extension("json")
 }
 
+/// Sidecar recording the resident navigator's activation for a workspace:
+/// `croft pair` writes it and exits; a running croft notices it (or reads it
+/// at startup) and seats the pilot in-process. Same keying as the other
+/// workspace sidecars.
+pub(crate) fn pair_record_path(workspace: &Path) -> PathBuf {
+    sessions_dir().join(format!("{}.pair.json", socket_name(workspace)))
+}
+
+/// What `croft pair` records for the workspace's resident navigator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PairRecord {
+    /// Model handed to the claude CLI (None = its default).
+    pub(crate) model: Option<String>,
+    /// The caret name the navigator sits under.
+    pub(crate) name: String,
+    /// False = explicitly deactivated (`croft pair --off` / palette toggle).
+    pub(crate) enabled: bool,
+    /// A first task to send once seated.
+    #[serde(default)]
+    pub(crate) task: Option<String>,
+}
+
+pub(crate) fn write_pair_record(path: &Path, record: &PairRecord) -> Result<()> {
+    let json = serde_json::to_string(record).context("serializing pair record")?;
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+}
+
+// Dead-code allow: the App reads the record in the app-hosting slice.
+#[allow(dead_code)]
+pub(crate) fn read_pair_record(path: &Path) -> Option<PairRecord> {
+    let json = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
 /// Sidecar recorded next to a socket: the socket name is only a hash, so `ls`
 /// reads this to show the real workspace path and the session's age.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -305,6 +339,30 @@ mod tests {
                 "/usr/local/bin/croft",
                 "/work/repo",
             ]
+        );
+    }
+
+    /// The navigator activation record: written by `croft pair`, read by a
+    /// running croft; keyed like the other workspace sidecars; roundtrips.
+    #[test]
+    fn pair_record_roundtrips_and_shares_the_workspace_keying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pair.json");
+        assert_eq!(read_pair_record(&path), None);
+        let record = PairRecord {
+            model: Some("claude-haiku-4-5-20251001".into()),
+            name: "navigator".into(),
+            enabled: true,
+            task: Some("look around".into()),
+        };
+        write_pair_record(&path, &record).unwrap();
+        assert_eq!(read_pair_record(&path), Some(record));
+
+        let keyed = pair_record_path(Path::new("/work/repo"));
+        assert!(keyed.to_string_lossy().ends_with(".pair.json"));
+        assert_eq!(
+            keyed.parent(),
+            collab_socket_path(Path::new("/work/repo")).parent()
         );
     }
 

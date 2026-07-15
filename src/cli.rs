@@ -158,15 +158,15 @@ pub enum CliCommand {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Pair with Claude inside a live croft session: an AI collaborator
-    /// whose edits stream into the shared buffers token by token (visible
-    /// as they are written, with a named caret riding the stream), and
-    /// which any participant can cancel mid-run from croft (the streamed
-    /// text is reverted). Run it in a workspace someone has open via
-    /// `croft attach`; type tasks at the prompt (`@<file> <task>` focuses
-    /// a buffer). See docs/MULTIPLAYER.md.
+    /// Activate the resident navigator for a workspace: an AI pair
+    /// programmer that croft itself hosts. This command records the
+    /// activation and exits; the running croft (or the next one to start
+    /// there) seats the pilot. Inside croft: ask it on a line or selection
+    /// (right-click the gutter, or Cmd+K Q), yield it the turn to review
+    /// (Cmd+K Y, comment-only), watch its edits stream in token by token,
+    /// and cancel them mid-run (Cmd+K X). See docs/MULTIPLAYER.md.
     Pair {
-        /// The workspace whose collab session to join (defaults to the
+        /// The workspace to activate the navigator for (defaults to the
         /// current directory; keys the relay socket exactly like
         /// `croft attach --solo` does).
         #[arg(long)]
@@ -178,8 +178,15 @@ pub enum CliCommand {
         /// The name this collaborator's caret wears on peers' screens.
         #[arg(long)]
         name: Option<String>,
-        /// The first task; further tasks are read from stdin, one per line.
+        /// A first task to send once seated.
         task: Option<String>,
+        /// Deactivate the navigator for the workspace instead.
+        #[arg(long, default_value_t = false)]
+        off: bool,
+        /// Debug driver: run the pilot in THIS terminal with a line-based
+        /// REPL instead of activating the croft-hosted seat.
+        #[arg(long, default_value_t = false, hide = true)]
+        repl: bool,
     },
     /// One-time setup for the cross-compile fast path used by `croft <host>`:
     /// installs cargo-zigbuild and adds the two rustup targets croft ships
@@ -294,23 +301,61 @@ impl Cli {
                 model,
                 name,
                 task,
+                off,
+                repl,
             }) => {
                 let workspace = workspace
                     .unwrap_or_else(|| std::env::current_dir().expect("cwd"))
                     .canonicalize()
                     .context("resolving workspace path")?;
-                let socket = crate::session::collab_socket_path(&workspace);
-                if let Some(dir) = socket.parent() {
+                let name = name.unwrap_or_else(|| "claude".into());
+                let record_path = crate::session::pair_record_path(&workspace);
+                if let Some(dir) = record_path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
+                if off {
+                    crate::session::write_pair_record(
+                        &record_path,
+                        &crate::session::PairRecord {
+                            model,
+                            name,
+                            enabled: false,
+                            task: None,
+                        },
+                    )?;
+                    println!("navigator deactivated for {}", workspace.display());
+                    return Ok(());
+                }
+                if repl {
+                    let socket = crate::session::collab_socket_path(&workspace);
+                    crate::collab::ensure_relay(&socket)?;
+                    return crate::pair::run(crate::pair::PairConfig {
+                        socket,
+                        workspace,
+                        name,
+                        model,
+                        task,
+                    });
+                }
+                crate::session::write_pair_record(
+                    &record_path,
+                    &crate::session::PairRecord {
+                        model,
+                        name: name.clone(),
+                        enabled: true,
+                        task,
+                    },
+                )?;
+                // The relay is up before croft looks, so the seat connects
+                // on the first tick that notices the record.
+                let socket = crate::session::collab_socket_path(&workspace);
                 crate::collab::ensure_relay(&socket)?;
-                crate::pair::run(crate::pair::PairConfig {
-                    socket,
-                    workspace,
-                    name: name.unwrap_or_else(|| "claude".into()),
-                    model,
-                    task,
-                })
+                println!(
+                    "navigator '{name}' active for {}; a running croft seats it \
+                     within a second (croft pair --off deactivates)",
+                    workspace.display()
+                );
+                Ok(())
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
@@ -1021,6 +1066,8 @@ mod tests {
                 model,
                 name,
                 task,
+                off: false,
+                repl: false,
             }) => {
                 assert_eq!(workspace, Some(PathBuf::from("/w")));
                 assert_eq!(model.as_deref(), Some("claude-haiku-4-5-20251001"));
@@ -1029,7 +1076,7 @@ mod tests {
             }
             _ => panic!("expected Pair"),
         }
-        // Everything defaults: workspace = cwd, task read from stdin.
+        // Everything defaults: workspace = cwd, activation only.
         let cli = Cli::parse_from(["croft", "pair"]);
         assert!(matches!(
             cli.command,
@@ -1038,7 +1085,20 @@ mod tests {
                 model: None,
                 name: None,
                 task: None,
+                off: false,
+                repl: false,
             })
+        ));
+        // --off deactivates; --repl keeps the debug terminal driver.
+        let cli = Cli::parse_from(["croft", "pair", "--off"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Pair { off: true, .. })
+        ));
+        let cli = Cli::parse_from(["croft", "pair", "--repl", "do a thing"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Pair { repl: true, .. })
         ));
     }
 
