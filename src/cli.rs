@@ -343,7 +343,10 @@ impl Cli {
                         model,
                         name: name.clone(),
                         enabled: true,
-                        task,
+                        // Never persisted: the resident navigator takes its
+                        // instructions in-editor (Cmd+K Q). A persisted task
+                        // would re-fire on every launch.
+                        task: None,
                     },
                 )?;
                 // The relay is up before croft looks, so the seat connects
@@ -355,6 +358,13 @@ impl Cli {
                      within a second (croft pair --off deactivates)",
                     workspace.display()
                 );
+                if task.is_some() {
+                    println!(
+                        "note: the resident navigator ignores a start task; \
+                         ask it in-editor with Cmd+K Q (use --repl for the \
+                         one-shot terminal driver)"
+                    );
+                }
                 Ok(())
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),

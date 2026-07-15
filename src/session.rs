@@ -78,7 +78,10 @@ pub(crate) struct PairRecord {
     pub(crate) name: String,
     /// False = explicitly deactivated (`croft pair --off` / palette toggle).
     pub(crate) enabled: bool,
-    /// A first task to send once seated.
+    /// Vestigial: older records may carry a start task, but resident seating
+    /// never replays it (a persisted task would re-fire on every launch, and
+    /// an @file task would freeze the UI thread on seat). Instructions come
+    /// from Cmd+K Q; the --repl driver still takes a one-shot task directly.
     #[serde(default)]
     pub(crate) task: Option<String>,
 }

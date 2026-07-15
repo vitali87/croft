@@ -15841,7 +15841,12 @@ impl App {
             workspace: self.tree.root.clone(),
             name: record.name.clone(),
             model: record.model.clone(),
-            task: record.task.clone(),
+            // Resident seating never replays a task: a persisted task would
+            // re-execute on every launch, and an @file task would freeze the
+            // UI thread on seat (the owner that must serve the file is this
+            // very thread). Instructions come from Cmd+K Q. The --repl driver
+            // still takes a one-shot task via PairConfig directly.
+            task: None,
         };
         #[cfg(test)]
         let spawned = match &self.pair_spawn_override {

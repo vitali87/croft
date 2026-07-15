@@ -19248,6 +19248,42 @@ fn a_dead_navigator_is_not_respawned_until_reactivated() {
     assert_eq!(seats.get(), 2, "re-activation retries the seat");
 }
 
+/// Resident seating never replays a persisted task: a stale record carrying
+/// a task must not re-execute an instruction against the buffer on every
+/// launch (and an @file task would freeze the UI thread on seat).
+#[test]
+fn resident_seating_never_replays_a_persisted_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    let seen_task = std::rc::Rc::new(std::cell::RefCell::new(Some(String::from("sentinel"))));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pair_record_path = tmp.path().join("x.pair.json");
+    app.pair_socket = socket.clone();
+    app.collab_config = Some((socket, crate::collab::CollabRole::Owner));
+    let seen2 = seen_task.clone();
+    app.pair_spawn_override = Some(Box::new(move |cfg| {
+        *seen2.borrow_mut() = cfg.task.clone();
+        anyhow::bail!("stop before a real child");
+    }));
+    crate::session::write_pair_record(
+        &app.pair_record_path,
+        &crate::session::PairRecord {
+            model: None,
+            name: "nav".into(),
+            enabled: true,
+            task: Some("delete the deprecated helpers".into()),
+        },
+    )
+    .unwrap();
+    app.last_pair_check = None;
+    app.maybe_seat_navigator();
+    assert_eq!(
+        *seen_task.borrow(),
+        None,
+        "the seat must never carry a persisted task"
+    );
+}
+
 /// A solo guest viewport never hosts the navigator: the owner's croft does,
 /// or two hosts would fight over one seat.
 #[test]
