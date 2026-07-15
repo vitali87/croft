@@ -6,10 +6,6 @@
 //! as the standalone REPL did (src/pair.rs, 0.1.634). Nothing here touches
 //! stdout/stderr: seated inside croft, the pilot's voice is [`PairEvent`]s.
 
-// Dead-code allow: the App consumes PairHost in the app-hosting slice; until
-// then only the e2e tests drive it.
-#![allow(dead_code)]
-
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc::{Receiver, channel};
@@ -32,7 +28,6 @@ pub enum PairEvent {
         file: String,
         row: usize,
         body: String,
-        id: u64,
     },
     /// A turn finished. `failed` carries claude's error text when the turn
     /// errored for a reason other than a cancel.
@@ -121,6 +116,8 @@ impl PairHost {
     /// Ask turn: the navigator may edit. `range` is the invoked 0-based
     /// line span (a single line when both ends match), `selection` the
     /// selected text (may be empty), `content` the caller's current buffer.
+    /// (Dead-code allow: the ask-box slice wires the App to this.)
+    #[allow(dead_code)]
     pub fn send_ask_turn(
         &self,
         file: &str,
@@ -137,6 +134,8 @@ impl PairHost {
 
     /// Yield turn: the driver hands the navigator the floor. Comment-only,
     /// host-enforced; the turn carries the diff since its last look.
+    /// (Dead-code allow: the Cmd+K Y slice wires the App to this.)
+    #[allow(dead_code)]
     pub fn send_yield_turn(&self, file: &str, content: &str) -> Result<()> {
         let p = self.pilot.as_ref().context("navigator pilot is gone")?;
         let old = p.state.lock().unwrap().begin_turn(file, content, true);

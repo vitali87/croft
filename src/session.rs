@@ -88,8 +88,6 @@ pub(crate) fn write_pair_record(path: &Path, record: &PairRecord) -> Result<()> 
     std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
 }
 
-// Dead-code allow: the App reads the record in the app-hosting slice.
-#[allow(dead_code)]
 pub(crate) fn read_pair_record(path: &Path) -> Option<PairRecord> {
     let json = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&json).ok()

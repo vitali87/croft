@@ -19091,6 +19091,124 @@ fn cmd_k_x_cancels_the_ai_stream_and_the_stop_row_follows_the_pilot_caret() {
     );
 }
 
+/// The resident navigator: an enabled pair record seats the pilot within a
+/// throttled tick, a plain-launch croft self-appoints the collab OWNER seat
+/// (nobody else would answer the pilot's snapshot requests), and a disabled
+/// record unseats it.
+#[test]
+fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
+    use std::time::{Duration, Instant};
+    if !crate::lsp::manager::is_on_path("python3") {
+        eprintln!("SKIPPED: python3 not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let script = tmp.path().join("fake_claude.py");
+    std::fs::write(&script, crate::pair::FAKE_CLAUDE).unwrap();
+    let log = tmp.path().join("stdin.log");
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pair_record_path = tmp.path().join("x.pair.json");
+    app.pair_socket = socket.clone();
+    let (script2, log2, socket2) = (script.clone(), log.clone(), socket.clone());
+    app.pair_spawn_override = Some(Box::new(move |cfg| {
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg(&script2).arg(&log2).arg("notes");
+        crate::pair_host::PairHost::spawn_cmd(&socket2, &cfg.name, cfg.task.as_deref(), cmd)
+    }));
+
+    // No record yet: nothing seats.
+    assert!(!app.maybe_seat_navigator());
+    assert!(app.pair_host.is_none());
+
+    crate::session::write_pair_record(
+        &app.pair_record_path,
+        &crate::session::PairRecord {
+            model: None,
+            name: "navigator".into(),
+            enabled: true,
+            task: None,
+        },
+    )
+    .unwrap();
+    assert!(app.collab_config.is_none(), "plain launch precondition");
+    app.last_pair_check = None;
+    assert!(app.maybe_seat_navigator());
+    assert!(app.pair_host.is_some(), "pilot must seat");
+    assert_eq!(
+        app.collab_config,
+        Some((socket.clone(), crate::collab::CollabRole::Owner)),
+        "plain launch self-appoints the owner seat"
+    );
+    assert!(
+        app.status.to_lowercase().contains("seated"),
+        "got: {}",
+        app.status
+    );
+    // The self-appointed seat actually connects.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.collab.is_none() {
+        assert!(Instant::now() < deadline, "owner seat never connected");
+        app.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Disabled record: the host unseats on the next check.
+    crate::session::write_pair_record(
+        &app.pair_record_path,
+        &crate::session::PairRecord {
+            model: None,
+            name: "navigator".into(),
+            enabled: false,
+            task: None,
+        },
+    )
+    .unwrap();
+    app.last_pair_check = None;
+    assert!(app.maybe_seat_navigator());
+    assert!(app.pair_host.is_none(), "pilot must unseat");
+}
+
+/// A solo guest viewport never hosts the navigator: the owner's croft does,
+/// or two hosts would fight over one seat.
+#[test]
+fn solo_guest_never_hosts_the_navigator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pair_record_path = tmp.path().join("x.pair.json");
+    app.pair_socket = socket.clone();
+    app.collab_config = Some((socket, crate::collab::CollabRole::Guest));
+    app.pair_spawn_override = Some(Box::new(|_| {
+        panic!("a solo guest must never spawn the pilot");
+    }));
+    crate::session::write_pair_record(
+        &app.pair_record_path,
+        &crate::session::PairRecord {
+            model: None,
+            name: "navigator".into(),
+            enabled: true,
+            task: None,
+        },
+    )
+    .unwrap();
+    app.last_pair_check = None;
+    app.maybe_seat_navigator();
+    assert!(app.pair_host.is_none());
+}
+
 /// The AI-stream badge lifecycle: a pilot's StreamState(active) sets
 /// `collab_stream` on a dirty tick, the cancel action broadcasts
 /// StreamCancel to the pilot, and StreamState(inactive) clears the badge.

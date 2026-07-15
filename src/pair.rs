@@ -421,12 +421,7 @@ struct StreamRegion {
 pub struct Note {
     pub file: String,
     pub offset: usize,
-    // Dead-code allows: read when the host snapshots notes for the App
-    // (the PairHost slice).
-    #[allow(dead_code)]
     pub body: String,
-    #[allow(dead_code)]
-    pub id: u64,
 }
 
 /// Shared pilot state: the collab seat plus per-turn stream bookkeeping.
@@ -454,8 +449,6 @@ pub(crate) struct PairState {
     notes: Vec<Note>,
     /// The NOTE fence currently streaming: (file, 0-based row, body so far).
     note_in_flight: Option<(String, usize, String)>,
-    /// Monotonic id for the next anchored note.
-    next_note_id: u64,
     /// The in-process host's sink: when seated inside croft the pilot's
     /// voice (commentary, notes, diagnostics) goes here instead of
     /// stdout/stderr, which belong to the TUI. None = terminal REPL.
@@ -469,11 +462,8 @@ pub(crate) struct PairState {
     last_seen: std::collections::HashMap<String, String>,
 }
 
-// Dead-code allows below: called from pair_host, which the App consumes in
-// the app-hosting slice; until then the chain is dead in non-test builds.
 impl PairState {
     /// The live replica text of `file`, split into lines (None = not live).
-    #[allow(dead_code)]
     pub(crate) fn doc_lines(&self, file: &str) -> Option<Vec<String>> {
         self.session
             .doc_text(file)
@@ -481,14 +471,12 @@ impl PairState {
     }
 
     /// The anchored notes sitting in `file`, in landing order.
-    #[allow(dead_code)]
     pub(crate) fn notes_in<'a>(&'a self, file: &'a str) -> impl Iterator<Item = &'a Note> {
         self.notes.iter().filter(move |n| n.file == file)
     }
 
     /// Drop `file`'s notes: a new turn targeting the file supersedes its
     /// previous say.
-    #[allow(dead_code)]
     pub(crate) fn clear_notes(&mut self, file: &str) {
         self.notes.retain(|n| n.file != file);
     }
@@ -638,8 +626,6 @@ pub(crate) struct Pilot {
 
 impl Pilot {
     /// The claude child's stdout hit EOF: the conversation is gone.
-    /// (Dead-code allow: see the PairState accessors above.)
-    #[allow(dead_code)]
     pub(crate) fn reader_finished(&self) -> bool {
         self.reader.is_finished()
     }
@@ -693,7 +679,6 @@ pub(crate) fn seat_pilot(
         pending_note: None,
         notes: Vec::new(),
         note_in_flight: None,
-        next_note_id: 0,
         events: events.clone(),
         comment_only: false,
         last_seen: std::collections::HashMap::new(),
@@ -1027,22 +1012,14 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
             };
             let offset = note_offset(&lines, row);
             let row_now = position(&lines, offset).0;
-            let id = st.next_note_id;
-            st.next_note_id += 1;
             if let Some(tx) = st.events.clone() {
                 let _ = tx.send(crate::pair_host::PairEvent::NoteAdded {
                     file: file.clone(),
                     row: row_now,
                     body: body.clone(),
-                    id,
                 });
             }
-            st.notes.push(Note {
-                file,
-                offset,
-                body,
-                id,
-            });
+            st.notes.push(Note { file, offset, body });
         }
         FenceEvent::NoteAbort => {
             state.lock().unwrap().note_in_flight = None;
@@ -1338,20 +1315,16 @@ fn with_pending_note(note: Option<String>, body: String) -> String {
     }
 }
 
+/// A scripted claude: speaks just enough stream-json for the pilot.
+/// argv: <log file> <mode>. Logs every stdin line (the e2es assert the
+/// interrupt landed there). "stream" mode streams one fenced edit split
+/// across deltas (header split mid-marker on purpose); "cancel" mode stops
+/// mid-body and BLOCKS on stdin — only the pilot's interrupt line unblocks
+/// it — then streams more body the pilot must drop; "notes" pins one NOTE
+/// fence; "linger" refuses to exit on stdin EOF. Crate-visible so the App's
+/// navigator tests drive the same fake.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::collab::{ResolvedSpan, relay_serve};
-    use crate::lsp::manager::is_on_path;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// A scripted claude: speaks just enough stream-json for the pilot.
-    /// argv: <log file> <mode>. Logs every stdin line (the e2e asserts the
-    /// interrupt landed there). "stream" mode streams one fenced edit split
-    /// across deltas (header split mid-marker on purpose); "cancel" mode
-    /// stops mid-body and BLOCKS on stdin — only the pilot's interrupt line
-    /// unblocks it — then streams more body the pilot must drop.
-    const FAKE_CLAUDE: &str = r#"
+pub(crate) const FAKE_CLAUDE: &str = r#"
 import json, sys
 
 log = open(sys.argv[1], "a")
@@ -1407,6 +1380,13 @@ if mode == "linger":
     import time
     time.sleep(60)
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collab::{ResolvedSpan, relay_serve};
+    use crate::lsp::manager::is_on_path;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A relay plus a pumping owner session that serves `demo.txt`,
     /// collecting every owner-side event for the assertions.
@@ -2216,13 +2196,11 @@ if mode == "linger":
                 file: "a.rs".into(),
                 offset: 10,
                 body: "n1".into(),
-                id: 1,
             },
             Note {
                 file: "b.rs".into(),
                 offset: 10,
                 body: "n2".into(),
-                id: 2,
             },
         ];
         let spans = [

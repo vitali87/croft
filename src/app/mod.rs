@@ -2674,6 +2674,28 @@ pub struct App {
     /// file: drives the status badge and the gutter stop button; cleared by
     /// the pilot's StreamState(inactive) broadcast.
     collab_stream: Option<CollabStreamInfo>,
+    /// The resident navigator (docs/MULTIPLAYER.md): the in-process pilot
+    /// host, seated while the workspace's pair record is enabled. Dropping
+    /// it tears the seat down (revert, hang up, grace-kill).
+    pair_host: Option<crate::pair_host::PairHost>,
+    /// Where the workspace's pair activation record lives. A field so tests
+    /// point it at a tempdir instead of the real sessions dir.
+    pair_record_path: PathBuf,
+    /// The collab socket the navigator (and a self-appointed owner seat)
+    /// uses. A field for the same test reason.
+    pair_socket: PathBuf,
+    /// Cadence gate for the pair-record stat (1s, not every tick).
+    last_pair_check: Option<std::time::Instant>,
+    /// Per-file (0-based row, body) snapshots of the navigator's anchored
+    /// notes, refreshed each tick from the host; drives the gutter ◆ marks
+    /// and the note popup.
+    navigator_notes: std::collections::HashMap<String, Vec<(usize, String)>>,
+    /// Test seam: builds the PairHost from the config (the real path spawns
+    /// the claude CLI, which a test must never do).
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pair_spawn_override:
+        Option<Box<dyn Fn(&crate::pair::PairConfig) -> anyhow::Result<crate::pair_host::PairHost>>>,
     /// Rolling log of git commands croft has run and their summaries, shown
     /// read-only by the "Show Git Output" action (VS Code's Git channel).
     pub git_output_log: Vec<String>,
@@ -3511,6 +3533,13 @@ impl App {
             collab_carets: std::collections::HashMap::new(),
             collab_caret_sent: None,
             collab_stream: None,
+            pair_host: None,
+            pair_record_path: crate::session::pair_record_path(&root),
+            pair_socket: crate::session::collab_socket_path(&root),
+            last_pair_check: None,
+            navigator_notes: std::collections::HashMap::new(),
+            #[cfg(test)]
+            pair_spawn_override: None,
             collab_labels_visible: false,
             git_output_log: Vec::new(),
             pending_discard_all: false,
@@ -11055,6 +11084,17 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw("  "));
+        } else if let Some(host) = &self.pair_host {
+            // Resident navigator seated and idle: presence, not attention —
+            // the stream badge above takes over whenever it is typing.
+            spans.push(Span::styled(
+                format!(" \u{25c6} {} seated ", host.name()),
+                Style::default()
+                    .bg(Color::Rgb(0x3c, 0x41, 0x4f))
+                    .fg(Color::Rgb(0xff, 0x9d, 0x2f))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("  "));
         }
         // Diagnostics counts (click → PROBLEMS), VS Code-style, after git.
         // Always shown so the bar reads as a health indicator at a glance.
@@ -15658,6 +15698,138 @@ impl App {
             self.editor.cursor_row = row;
             self.editor.cursor_col = col;
         }
+    }
+
+    /// The resident navigator's activation check (docs/MULTIPLAYER.md):
+    /// stat the workspace's pair record on a 1s cadence, seat or unseat the
+    /// pilot on `enabled` transitions, and — on a plain launch with no
+    /// collab session — self-appoint the OWNER seat first, because only an
+    /// owner answers the pilot's snapshot requests. Solo guests never host:
+    /// the owner's croft does.
+    fn maybe_seat_navigator(&mut self) -> bool {
+        let due = self
+            .last_pair_check
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1));
+        if !due {
+            return false;
+        }
+        self.last_pair_check = Some(std::time::Instant::now());
+        let record = crate::session::read_pair_record(&self.pair_record_path);
+        let want = record.as_ref().is_some_and(|r| r.enabled);
+        if !want {
+            if self.pair_host.is_some() {
+                self.pair_host = None; // Drop tears the seat down
+                self.navigator_notes.clear();
+                self.status = String::from("Navigator unseated");
+                return true;
+            }
+            return false;
+        }
+        if self.pair_host.is_some() {
+            return false;
+        }
+        if self
+            .collab_config
+            .as_ref()
+            .is_some_and(|(_, role)| *role == crate::collab::CollabRole::Guest)
+        {
+            return false;
+        }
+        let record = record.expect("want implies a record");
+        if self.collab_config.is_none() {
+            if let Err(e) = crate::collab::ensure_relay(&self.pair_socket) {
+                self.status = format!("Navigator: relay failed: {e}");
+                return true;
+            }
+            self.collab_config = Some((self.pair_socket.clone(), crate::collab::CollabRole::Owner));
+            self.last_collab_connect = None; // connect this tick, not in 2s
+        }
+        let cfg = crate::pair::PairConfig {
+            socket: self.pair_socket.clone(),
+            workspace: self.tree.root.clone(),
+            name: record.name.clone(),
+            model: record.model.clone(),
+            task: record.task.clone(),
+        };
+        #[cfg(test)]
+        let spawned = match &self.pair_spawn_override {
+            Some(spawn) => spawn(&cfg),
+            None => crate::pair_host::PairHost::spawn(cfg),
+        };
+        #[cfg(not(test))]
+        let spawned = crate::pair_host::PairHost::spawn(cfg);
+        match spawned {
+            Ok(host) => {
+                self.status = format!(
+                    "Navigator '{}' seated (Cmd+K Q asks, Cmd+K Y yields)",
+                    host.name()
+                );
+                self.pair_host = Some(host);
+            }
+            Err(e) => self.status = format!("Navigator failed to seat: {e}"),
+        }
+        true
+    }
+
+    /// Drain the navigator's per-tick events: commentary to the Navigator
+    /// OUTPUT channel, note/turn/death news to the status line, and the
+    /// active file's note snapshot for the gutter marks and popup.
+    fn poll_pair(&mut self) -> bool {
+        let Some(host) = self.pair_host.as_mut() else {
+            return false;
+        };
+        let name = host.name().to_string();
+        let events = host.poll();
+        let mut changed = !events.is_empty();
+        let mut died = false;
+        for event in events {
+            match event {
+                crate::pair_host::PairEvent::Commentary(text) => {
+                    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                        crate::output::push("Navigator", crate::output::OutputLevel::Info, line);
+                    }
+                }
+                crate::pair_host::PairEvent::NoteAdded { file, row, body } => {
+                    let snippet: String = body.chars().take(60).collect();
+                    self.status = format!("{name} noted {file}:{}: {snippet}", row + 1);
+                }
+                crate::pair_host::PairEvent::TurnDone { cancelled, failed } => {
+                    self.status = if cancelled {
+                        format!("{name}: turn cancelled")
+                    } else if let Some(err) = failed {
+                        let err: String = err.chars().take(80).collect();
+                        format!("{name}: turn failed: {err}")
+                    } else {
+                        format!("{name} finished its turn")
+                    };
+                }
+                crate::pair_host::PairEvent::Died(reason) => {
+                    self.status = format!("Navigator: {reason}");
+                    died = true;
+                }
+            }
+        }
+        if died {
+            self.pair_host = None;
+            self.navigator_notes.clear();
+            return true;
+        }
+        // Refresh the active file's snapshot every tick: rows move under
+        // concurrent edits without any new event arriving.
+        if let Some(file) = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&self.tree.root, p))
+            && let Some(host) = &self.pair_host
+        {
+            let snap = host.notes_snapshot(&file);
+            if self.navigator_notes.get(&file) != Some(&snap) {
+                self.navigator_notes.insert(file, snap);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Phase D per-tick collab pump (docs/MULTIPLAYER.md): connect lazily,
@@ -31326,6 +31498,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let dap_changed = app.poll_dap();
         let tests_changed = app.test_worker.drain(&mut app.testing);
         let mcp_changed = app.poll_mcp();
+        let pair_changed = app.maybe_seat_navigator() | app.poll_pair();
         let voice_changed = app.drain_voice();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.
@@ -31349,6 +31522,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let non_pty_dirty = needs_redraw
             || fs_changed
             || mcp_changed
+            || pair_changed
             || tests_changed
             || blink_changed
             || spinner_changed
