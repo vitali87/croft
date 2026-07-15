@@ -19192,7 +19192,8 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
 fn app_seats_local_provider_from_record() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("collab.sock");
-    let seen: std::rc::Rc<std::cell::RefCell<Option<(crate::pair::Provider, Option<String>)>>> =
+    type SeenConfig = Option<(crate::pair::Provider, Option<String>)>;
+    let seen: std::rc::Rc<std::cell::RefCell<SeenConfig>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.pair_record_path = tmp.path().join("x.pair.json");
