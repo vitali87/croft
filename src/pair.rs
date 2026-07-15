@@ -565,6 +565,48 @@ pub(crate) struct TurnEnd {
 
 /// The claude CLI invocation for a pair session: a persistent stream-json
 /// conversation over stdio, sandboxed to the read-only toolbox, with the
+/// Install dirs to probe for the claude CLI when it is not on PATH (npm
+/// global bin, the native installer's `~/.claude/local`, homebrew).
+fn claude_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".claude").join("local"));
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".npm-global").join("bin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs
+}
+
+/// Resolve the claude CLI to a spawnable program string. A terminal launch
+/// has claude on PATH and spawns it by bare name; a macOS GUI launch
+/// (Croft.app) inherits the stripped launchd PATH, so `Command::new("claude")`
+/// fails with ENOENT and the navigator can never seat. When claude is absent
+/// from PATH we probe the usual install dirs and pin the absolute path,
+/// mirroring the LSP path-only resolution. `None` means fall back to the bare
+/// name so the spawn error still surfaces to the user.
+fn resolve_claude_in(on_path: bool, dirs: &[PathBuf]) -> Option<String> {
+    if on_path {
+        return Some(String::from("claude"));
+    }
+    dirs.iter()
+        .map(|d| d.join("claude"))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// The claude program to spawn, resolved to an absolute path on a stripped
+/// GUI PATH (see [`resolve_claude_in`]).
+fn claude_program() -> String {
+    resolve_claude_in(
+        crate::lsp::manager::is_on_path("claude"),
+        &claude_search_dirs(),
+    )
+    .unwrap_or_else(|| String::from("claude"))
+}
+
 /// fence protocol appended to its system prompt and a read-only collab-agent
 /// seat as its MCP server.
 pub(crate) fn claude_command(cfg: &PairConfig) -> Result<Command> {
@@ -581,7 +623,7 @@ pub(crate) fn claude_command(cfg: &PairConfig) -> Result<Command> {
             }
         }
     });
-    let mut cmd = Command::new("claude");
+    let mut cmd = Command::new(claude_program());
     cmd.arg("-p")
         .args(["--input-format", "stream-json"])
         .args(["--output-format", "stream-json"])
@@ -2184,6 +2226,36 @@ mod tests {
             t.elapsed() < Duration::from_secs(1),
             "Drop blocked on the grace-kill for {:?}; teardown must be detached",
             t.elapsed()
+        );
+    }
+
+    /// claude resolves by bare name when on PATH, but a stripped GUI PATH
+    /// falls back to probing install dirs and pinning the absolute path so
+    /// the navigator can still seat on Croft.app launches.
+    #[test]
+    fn claude_resolves_to_an_absolute_path_off_a_stripped_path() {
+        // On PATH: spawn by bare name (PATH resolves it).
+        assert_eq!(
+            resolve_claude_in(true, &[]).as_deref(),
+            Some("claude"),
+            "an on-PATH claude spawns by bare name"
+        );
+        // Off PATH, not in any probed dir: fall back to the bare name so the
+        // spawn error surfaces (caller uses unwrap_or("claude")).
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_claude_in(false, &[empty.path().to_path_buf()]),
+            None
+        );
+        // Off PATH but present in a probed dir: pin the absolute path.
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude");
+        std::fs::write(&claude, "#!/bin/sh\n").unwrap();
+        let got = resolve_claude_in(false, &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(got, claude.to_string_lossy());
+        assert!(
+            Path::new(&got).is_absolute(),
+            "GUI launch must get an absolute path, got {got}"
         );
     }
 
