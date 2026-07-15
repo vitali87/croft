@@ -444,6 +444,13 @@ pub(crate) struct PairState {
     /// voice (commentary, notes, diagnostics) goes here instead of
     /// stdout/stderr, which belong to the TUI. None = terminal REPL.
     events: Option<Sender<crate::pair_host::PairEvent>>,
+    /// This turn is a yielded one: the navigator may only comment. EDIT
+    /// fences are discarded at the host, not just discouraged in the
+    /// prompt. Reset at each turn's result.
+    comment_only: bool,
+    /// What the navigator last saw of each file (yield turns diff against
+    /// this instead of resending history).
+    last_seen: std::collections::HashMap<String, String>,
 }
 
 // Dead-code allows below: called from pair_host, which the App consumes in
@@ -461,6 +468,30 @@ impl PairState {
     #[allow(dead_code)]
     pub(crate) fn notes_in<'a>(&'a self, file: &'a str) -> impl Iterator<Item = &'a Note> {
         self.notes.iter().filter(move |n| n.file == file)
+    }
+
+    /// Drop `file`'s notes: a new turn targeting the file supersedes its
+    /// previous say.
+    #[allow(dead_code)]
+    pub(crate) fn clear_notes(&mut self, file: &str) {
+        self.notes.retain(|n| n.file != file);
+    }
+
+    /// Arm a host turn targeting `file`: mode, target, note supersession,
+    /// and the last-seen bookkeeping the yield diff reads. Returns what the
+    /// navigator previously saw of the file (None = first look).
+    #[allow(dead_code)]
+    pub(crate) fn begin_turn(
+        &mut self,
+        file: &str,
+        content: &str,
+        comment_only: bool,
+    ) -> Option<String> {
+        self.comment_only = comment_only;
+        self.target_file = Some(file.to_string());
+        self.session.request_file(file);
+        self.clear_notes(file);
+        self.last_seen.insert(file.to_string(), content.to_string())
     }
 }
 
@@ -648,6 +679,8 @@ pub(crate) fn seat_pilot(
         note_in_flight: None,
         next_note_id: 0,
         events: events.clone(),
+        comment_only: false,
+        last_seen: std::collections::HashMap::new(),
     }));
 
     cmd.stdin(Stdio::piped())
@@ -831,6 +864,7 @@ fn handle_claude_event(
             st.turn_active = false;
             st.cancelled = false;
             st.discarding = false;
+            st.comment_only = false;
             drop(st);
             let _ = turn_tx.send(TurnEnd {
                 is_error: msg
@@ -862,6 +896,18 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
                 let mut st = state.lock().unwrap();
                 if st.cancelled {
                     st.discarding = true;
+                    return;
+                }
+                if st.comment_only {
+                    // The host gate, not just a prompt rule: a yielded turn
+                    // may never touch a buffer, whatever the model says.
+                    st.discarding = true;
+                    drop(st);
+                    say(
+                        state,
+                        "[pair] edit suppressed: this is a yielded, \
+                         comment-only turn\n",
+                    );
                     return;
                 }
                 st.target_file = Some(file.clone());
@@ -1104,21 +1150,13 @@ fn parse_task_line(line: &str) -> (Option<String>, String) {
     }
 }
 
-/// Compose one user turn: optional pending note, the task, and the target
-/// file context. The file is ALWAYS named when known — parse_task_line has
-/// already stripped the `@file` prefix, so a buffer that never went live
-/// must not erase the target from the task.
-fn compose_turn_text(
-    note: Option<&str>,
-    task: &str,
-    file: Option<&str>,
-    buffer: Option<&str>,
-) -> String {
+/// Compose one user turn: the task and the target file context. The file
+/// is ALWAYS named when known — parse_task_line has already stripped the
+/// `@file` prefix, so a buffer that never went live must not erase the
+/// target from the task. (The pending cancel note rides in at write time,
+/// [`with_pending_note`].)
+fn compose_turn_text(task: &str, file: Option<&str>, buffer: Option<&str>) -> String {
     let mut content = String::new();
-    if let Some(note) = note {
-        content.push_str(note);
-        content.push_str("\n\n");
-    }
     content.push_str(task);
     match (file, buffer) {
         (Some(file), Some(text)) => {
@@ -1135,6 +1173,75 @@ fn compose_turn_text(
         (None, _) => {}
     }
     content
+}
+
+/// `content` with each line prefixed `N|` (0-based), the numbering the ask
+/// and yield turns use so NOTE rows have an unambiguous ground truth.
+fn numbered(content: &str) -> String {
+    content
+        .split('\n')
+        .enumerate()
+        .map(|(i, l)| format!("{i}|{l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Compose an ask turn: the instruction, where it was invoked (a 0-based
+/// line or line range), the selected text when there is one, and the
+/// numbered buffer.
+pub(crate) fn compose_ask_turn(
+    file: &str,
+    range: (usize, usize),
+    selection: &str,
+    instruction: &str,
+    content: &str,
+) -> String {
+    let mut text = String::new();
+    let (s, e) = range;
+    if s == e {
+        text.push_str(&format!(
+            "Your partner invoked you on {file} at line {s} (0-based).\n"
+        ));
+    } else {
+        text.push_str(&format!(
+            "Your partner invoked you on {file} at lines {s}-{e} (0-based).\n"
+        ));
+    }
+    if !selection.is_empty() {
+        text.push_str(&format!(
+            "--- SELECTED LINES ---\n{selection}\n--- END SELECTED ---\n"
+        ));
+    }
+    text.push_str(&format!("\nTask: {instruction}\n"));
+    text.push_str(&format!(
+        "\n--- CURRENT BUFFER ({file}, each line prefixed with its 0-based \
+         number and '|') ---\n{}\n--- END BUFFER ---",
+        numbered(content)
+    ));
+    text
+}
+
+/// Compose a yield turn: the driver handed the navigator the floor. Comment
+/// only — the host discards EDIT fences on this turn — with the diff since
+/// the navigator last saw the file, and the numbered buffer.
+pub(crate) fn compose_yield_turn(file: &str, content: &str, diff: Option<&str>) -> String {
+    let mut text = String::from(
+        "Your partner yielded the turn: review the file below and speak \
+         through NOTE fences anchored to the lines you mean. This turn is \
+         COMMENT-ONLY: any EDIT fence will be discarded by the host. \
+         Propose changes in your notes and wait to be asked.\n",
+    );
+    if let Some(diff) = diff {
+        text.push_str(&format!(
+            "\n--- CHANGES SINCE YOUR LAST LOOK ---\n{diff}\n--- END CHANGES ---\n"
+        ));
+    }
+    text.push_str(&format!(
+        "\n--- CURRENT BUFFER ({file}, each line prefixed with its 0-based \
+         number and '|') ---\n{}\n--- END BUFFER ---",
+        numbered(content)
+    ));
+    text
 }
 
 /// Compose and send one user turn: pending cancel note, the task, and the
@@ -1162,22 +1269,39 @@ pub(crate) fn send_turn(
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    let content = {
-        let mut st = state.lock().unwrap();
-        let note = st.pending_note.take();
+    let (file, buffer) = {
+        let st = state.lock().unwrap();
         let file = st.target_file.clone();
         let buffer = file
             .as_deref()
             .and_then(|f| st.session.doc_text(f))
             .map(str::to_string);
-        if file.is_some() && buffer.is_none() {
-            eprintln!(
-                "[pair] target file is not live (no owner answered); \
-                 sending the task with the file name only"
-            );
-        }
+        (file, buffer)
+    };
+    if file.is_some() && buffer.is_none() {
+        say(
+            state,
+            "[pair] target file is not live (no owner answered); \
+             sending the task with the file name only\n",
+        );
+    }
+    let body = compose_turn_text(&task, file.as_deref(), buffer.as_deref());
+    write_user_turn(state, writer, body)
+}
+
+/// Write one composed user turn to claude's stdin, prepending any pending
+/// cancel note and marking the turn active. Lock order: state then writer,
+/// never both held.
+pub(crate) fn write_user_turn(
+    state: &Mutex<PairState>,
+    writer: &Mutex<Option<ChildStdin>>,
+    body: String,
+) -> Result<()> {
+    let content = {
+        let mut st = state.lock().unwrap();
+        let note = st.pending_note.take();
         st.turn_active = true;
-        compose_turn_text(note.as_deref(), &task, file.as_deref(), buffer.as_deref())
+        with_pending_note(note, body)
     };
     let msg = json!({
         "type": "user",
@@ -1188,6 +1312,14 @@ pub(crate) fn send_turn(
     writeln!(w, "{msg}").context("writing user turn to claude")?;
     w.flush().context("flushing claude stdin")?;
     Ok(())
+}
+
+/// The pending cancel note rides in front of the next turn's body.
+fn with_pending_note(note: Option<String>, body: String) -> String {
+    match note {
+        Some(n) => format!("{n}\n\n{body}"),
+        None => body,
+    }
 }
 
 #[cfg(test)]
@@ -1959,6 +2091,94 @@ if mode == "linger":
         drop(host); // must not hang: the shutdown grace-kill path
     }
 
+    /// The ask-turn composer: instruction, invoked range, selected text,
+    /// and the numbered buffer all ride the turn.
+    #[test]
+    fn compose_ask_turn_numbers_content_and_includes_selection() {
+        let text = compose_ask_turn(
+            "src/a.rs",
+            (3, 5),
+            "let x = 1;\nlet y = 2;",
+            "simplify these",
+            "l0\nl1\nl2\nlet x = 1;\nmid\nlet y = 2;",
+        );
+        assert!(text.contains("simplify these"));
+        assert!(text.contains("lines 3-5"));
+        assert!(text.contains("0-based"));
+        assert!(text.contains("--- SELECTED LINES ---"));
+        assert!(text.contains("let y = 2;"));
+        assert!(text.contains("0|l0"));
+        assert!(text.contains("3|let x = 1;"));
+
+        // Single line, no selection: the range names one line and the
+        // selected block is omitted.
+        let one = compose_ask_turn("src/a.rs", (2, 2), "", "why is this here", "a\nb\nc");
+        assert!(one.contains("line 2"));
+        assert!(!one.contains("--- SELECTED LINES ---"));
+        assert!(one.contains("2|c"));
+    }
+
+    /// The yield-turn composer: comment-only rule, the diff since the
+    /// navigator last saw the file, and the numbered buffer.
+    #[test]
+    fn compose_yield_turn_carries_diff_and_forbids_edits() {
+        let with_diff = compose_yield_turn(
+            "src/a.rs",
+            "line one\nline 2\n",
+            Some("@@ -1,2 +1,2 @@\n line one\n-line two\n+line 2\n"),
+        );
+        assert!(with_diff.contains("COMMENT-ONLY"));
+        assert!(with_diff.contains("--- CHANGES SINCE YOUR LAST LOOK ---"));
+        assert!(with_diff.contains("+line 2"));
+        assert!(with_diff.contains("0|line one"));
+
+        let first_look = compose_yield_turn("src/a.rs", "just this\n", None);
+        assert!(first_look.contains("COMMENT-ONLY"));
+        assert!(!first_look.contains("--- CHANGES SINCE YOUR LAST LOOK ---"));
+    }
+
+    /// Host-enforced comment-only: the scripted claude streams an EDIT fence
+    /// during a yielded turn; the owner's buffer must stay byte-identical
+    /// and the suppression must be spoken.
+    #[test]
+    fn yield_turn_suppresses_edits() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script).arg(&log).arg("stream"); // streams an EDIT fence
+        let mut host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "navigator", None, cmd).unwrap();
+        host.send_yield_turn("demo.txt", "hello world").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut events: Vec<crate::pair_host::PairEvent> = Vec::new();
+        while !events
+            .iter()
+            .any(|e| matches!(e, crate::pair_host::PairEvent::TurnDone { .. }))
+        {
+            assert!(Instant::now() < deadline, "no TurnDone; saw {events:?}");
+            events.extend(host.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The owner never saw an edit land.
+        assert_eq!(harness.remote_edit_count(), 0, "edit must be suppressed");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                crate::pair_host::PairEvent::Commentary(c) if c.contains("suppressed")
+            )),
+            "suppression must be spoken; saw {events:?}"
+        );
+        drop(host);
+    }
+
     /// Remote-edit spans shift every note anchored in the edited file, and
     /// only that file (the same replay the stream region does).
     #[test]
@@ -2011,18 +2231,18 @@ if mode == "linger":
     /// @file prefix, so a dead bootstrap left claude with no file at all).
     #[test]
     fn compose_turn_always_names_target_file() {
-        let live = compose_turn_text(None, "fix the error", Some("src/a.rs"), Some("body"));
+        let live = compose_turn_text("fix the error", Some("src/a.rs"), Some("body"));
         assert!(live.contains("--- CURRENT BUFFER (src/a.rs) ---"));
         assert!(live.contains("body"));
 
-        let dead = compose_turn_text(None, "fix the error", Some("src/a.rs"), None);
+        let dead = compose_turn_text("fix the error", Some("src/a.rs"), None);
         assert!(
             dead.contains("src/a.rs"),
             "file must be named without a live buffer: {dead}"
         );
         assert!(dead.contains("fix the error"));
 
-        let noted = compose_turn_text(Some("stream was cancelled"), "task", None, None);
+        let noted = with_pending_note(Some("stream was cancelled".into()), "task".into());
         assert!(noted.starts_with("stream was cancelled"));
         assert!(noted.contains("task"));
     }

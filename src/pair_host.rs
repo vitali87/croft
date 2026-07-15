@@ -17,7 +17,10 @@ use std::sync::mpsc::{Receiver, channel};
 use anyhow::{Context, Result};
 
 use crate::collab::position;
-use crate::pair::{PairConfig, Pilot, claude_command, seat_pilot, send_turn};
+use crate::pair::{
+    PairConfig, Pilot, claude_command, compose_ask_turn, compose_yield_turn, seat_pilot, send_turn,
+    write_user_turn,
+};
 
 /// What the pilot surfaces to the App, drained by `poll` once per tick.
 #[derive(Debug)]
@@ -113,6 +116,38 @@ impl PairHost {
     pub fn send_task(&self, line: &str) -> Result<()> {
         let p = self.pilot.as_ref().context("navigator pilot is gone")?;
         send_turn(&p.state, &p.writer, line)
+    }
+
+    /// Ask turn: the navigator may edit. `range` is the invoked 0-based
+    /// line span (a single line when both ends match), `selection` the
+    /// selected text (may be empty), `content` the caller's current buffer.
+    pub fn send_ask_turn(
+        &self,
+        file: &str,
+        range: (usize, usize),
+        selection: &str,
+        instruction: &str,
+        content: &str,
+    ) -> Result<()> {
+        let p = self.pilot.as_ref().context("navigator pilot is gone")?;
+        p.state.lock().unwrap().begin_turn(file, content, false);
+        let body = compose_ask_turn(file, range, selection, instruction, content);
+        write_user_turn(&p.state, &p.writer, body)
+    }
+
+    /// Yield turn: the driver hands the navigator the floor. Comment-only,
+    /// host-enforced; the turn carries the diff since its last look.
+    pub fn send_yield_turn(&self, file: &str, content: &str) -> Result<()> {
+        let p = self.pilot.as_ref().context("navigator pilot is gone")?;
+        let old = p.state.lock().unwrap().begin_turn(file, content, true);
+        let diff = old.filter(|o| o != content).map(|o| {
+            similar::TextDiff::from_lines(o.as_str(), content)
+                .unified_diff()
+                .context_radius(2)
+                .to_string()
+        });
+        let body = compose_yield_turn(file, content, diff.as_deref());
+        write_user_turn(&p.state, &p.writer, body)
     }
 
     /// (0-based row, body) of every note anchored in `file`, rows computed
