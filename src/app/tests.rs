@@ -19122,6 +19122,7 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.pair_record_path = tmp.path().join("x.pair.json");
     app.pair_socket = socket.clone();
+    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
     let (script2, log2, socket2) = (script.clone(), log.clone(), socket.clone());
     app.pair_spawn_override = Some(Box::new(move |cfg| {
         let mut cmd = std::process::Command::new("python3");
@@ -19193,6 +19194,7 @@ fn a_dead_navigator_is_not_respawned_until_reactivated() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.pair_record_path = tmp.path().join("x.pair.json");
     app.pair_socket = socket.clone();
+    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
     // Already the owner (skip the relay bootstrap): the test exercises the
     // death latch, not collab connect.
     app.collab_config = Some((socket, crate::collab::CollabRole::Owner));
@@ -19259,6 +19261,7 @@ fn resident_seating_never_replays_a_persisted_task() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.pair_record_path = tmp.path().join("x.pair.json");
     app.pair_socket = socket.clone();
+    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
     app.collab_config = Some((socket, crate::collab::CollabRole::Owner));
     let seen2 = seen_task.clone();
     app.pair_spawn_override = Some(Box::new(move |cfg| {
@@ -19284,6 +19287,69 @@ fn resident_seating_never_replays_a_persisted_task() {
     );
 }
 
+/// Only one croft self-appoints the navigator owner per workspace: a second
+/// plain croft is refused the single-host lock and must NOT seat (two owners
+/// would both claim collab site id 1 and corrupt the shared buffer).
+#[test]
+fn only_one_croft_self_appoints_the_navigator_owner() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    let lock_path = tmp.path().join("host.lock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let enable = |a: &mut App| {
+        crate::session::write_pair_record(
+            &a.pair_record_path,
+            &crate::session::PairRecord {
+                model: None,
+                name: "nav".into(),
+                enabled: true,
+                task: None,
+            },
+        )
+        .unwrap();
+        a.last_pair_check = None;
+    };
+
+    // Croft A grabs the single-host lock and self-appoints (the spawn bails,
+    // but the lock is taken first and held).
+    let mut a = App::new(tmp.path().to_path_buf()).unwrap();
+    a.pair_record_path = tmp.path().join("a.pair.json");
+    a.pair_socket = socket.clone();
+    a.pair_host_lock_path = lock_path.clone();
+    a.pair_spawn_override = Some(Box::new(|_| anyhow::bail!("no real child in test")));
+    enable(&mut a);
+    a.maybe_seat_navigator();
+    assert!(a.pair_host_lock.is_some(), "A must hold the single-host lock");
+
+    // Croft B, same workspace: with a live relay, WITHOUT the lock gate it
+    // would self-appoint and reach the spawn (panic). The gate must refuse it.
+    let mut b = App::new(tmp.path().to_path_buf()).unwrap();
+    b.pair_record_path = tmp.path().join("b.pair.json");
+    b.pair_socket = socket.clone();
+    b.pair_host_lock_path = lock_path.clone();
+    b.pair_spawn_override = Some(Box::new(|_| panic!("a second croft must never host")));
+    enable(&mut b);
+    b.maybe_seat_navigator();
+    assert!(b.pair_host.is_none(), "B must not host");
+    assert!(b.pair_host_lock.is_none(), "B must not hold the lock");
+    assert!(
+        b.status.to_lowercase().contains("another croft"),
+        "B must say another croft hosts it, got: {}",
+        b.status
+    );
+}
+
 /// A solo guest viewport never hosts the navigator: the owner's croft does,
 /// or two hosts would fight over one seat.
 #[test]
@@ -19293,6 +19359,7 @@ fn solo_guest_never_hosts_the_navigator() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.pair_record_path = tmp.path().join("x.pair.json");
     app.pair_socket = socket.clone();
+    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
     app.collab_config = Some((socket, crate::collab::CollabRole::Guest));
     app.pair_spawn_override = Some(Box::new(|_| {
         panic!("a solo guest must never spawn the pilot");
@@ -19470,6 +19537,7 @@ fn turn_done_status_keeps_the_notes_visible() {
     app.open_file_at_launch(&file);
     app.pair_record_path = tmp.path().join("x.pair.json");
     app.pair_socket = socket.clone();
+    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
     let (script2, log2, socket2) = (script.clone(), log.clone(), socket.clone());
     app.pair_spawn_override = Some(Box::new(move |cfg| {
         let mut cmd = std::process::Command::new("python3");

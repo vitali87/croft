@@ -69,6 +69,45 @@ pub(crate) fn pair_record_path(workspace: &Path) -> PathBuf {
     sessions_dir().join(format!("{}.pair.json", socket_name(workspace)))
 }
 
+/// Advisory lock guarding self-appointed navigator ownership for a workspace:
+/// exactly one plain croft may host the pilot (and claim collab owner site 1)
+/// per workspace. The lock is held for the App's lifetime and released by the
+/// OS on exit, so a crashed host hands off to the next croft automatically.
+pub(crate) fn pair_host_lock_path(workspace: &Path) -> PathBuf {
+    sessions_dir().join(format!("{}.pair-host.lock", socket_name(workspace)))
+}
+
+/// Holds the workspace's pair-host lock; the flock releases when this (and its
+/// file) drop.
+pub(crate) struct PairHostLock {
+    _file: std::fs::File,
+}
+
+/// Try to claim the single-host lock at `path` without blocking. `Some` means
+/// this croft may self-appoint owner; `None` means another croft already holds
+/// it and this one must not host (else two owners would both claim site 1 and
+/// corrupt the shared buffer).
+pub(crate) fn try_acquire_pair_host_lock(path: &Path) -> Option<PairHostLock> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // flock is per open-file-description, so two independent opens contend
+        // even within one process — the mutual exclusion we want across croft
+        // instances. LOCK_NB: fail fast instead of blocking the tick.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return None;
+        }
+    }
+    Some(PairHostLock { _file: file })
+}
+
 /// What `croft pair` records for the workspace's resident navigator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PairRecord {
@@ -320,6 +359,25 @@ pub fn list() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The single-host lock is exclusive: a second acquirer is refused while
+    /// the first holds it, and the lock frees when the holder drops (the OS
+    /// releases it, which is how a crashed host hands off).
+    #[test]
+    fn pair_host_lock_is_exclusive_and_frees_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pair-host.lock");
+        let first = try_acquire_pair_host_lock(&path).expect("first acquires");
+        assert!(
+            try_acquire_pair_host_lock(&path).is_none(),
+            "a second croft must be refused while the first holds the lock"
+        );
+        drop(first);
+        assert!(
+            try_acquire_pair_host_lock(&path).is_some(),
+            "the lock frees when the holder drops"
+        );
+    }
 
     #[test]
     fn dtach_attach_argv_has_expected_flags_and_inner() {

@@ -2697,6 +2697,9 @@ pub struct App {
     /// The collab socket the navigator (and a self-appointed owner seat)
     /// uses. A field for the same test reason.
     pair_socket: PathBuf,
+    /// Path of the single-host lock (see [`pair_host_lock`]). A field for the
+    /// same test reason.
+    pair_host_lock_path: PathBuf,
     /// Cadence gate for the pair-record stat (1s, not every tick).
     last_pair_check: Option<std::time::Instant>,
     /// Per-file (0-based row, body) snapshots of the navigator's anchored
@@ -2706,6 +2709,10 @@ pub struct App {
     /// Notes the navigator left since its turn started, so the TurnDone
     /// status can surface them instead of overwriting the NoteAdded status.
     pair_notes_this_turn: usize,
+    /// Held while this croft is the self-appointed navigator owner: exactly
+    /// one plain croft per workspace may host the pilot (and claim collab
+    /// owner site 1). Released by the OS on exit, so a crashed host hands off.
+    pair_host_lock: Option<crate::session::PairHostLock>,
     /// Set when the pilot died or failed to seat: suppresses the 1s re-seat
     /// so a broken claude (unauthenticated, missing, crashing) is not
     /// respawned forever. Cleared when the record is deactivated, so an
@@ -3566,9 +3573,11 @@ impl App {
             pair_host: None,
             pair_record_path: crate::session::pair_record_path(&root),
             pair_socket: crate::session::collab_socket_path(&root),
+            pair_host_lock_path: crate::session::pair_host_lock_path(&root),
             last_pair_check: None,
             navigator_notes: std::collections::HashMap::new(),
             pair_notes_this_turn: 0,
+            pair_host_lock: None,
             navigator_down: false,
             note_popup: None,
             note_probe: None,
@@ -15829,6 +15838,22 @@ impl App {
         }
         let record = record.expect("want implies a record");
         if self.collab_config.is_none() {
+            // Only one croft may self-appoint owner per workspace: two owners
+            // would both claim site id 1 and corrupt the shared buffer. Claim
+            // the single-host lock first; if another croft holds it, do not
+            // host (keep checking — take over when that croft exits).
+            if self.pair_host_lock.is_none() {
+                match crate::session::try_acquire_pair_host_lock(&self.pair_host_lock_path) {
+                    Some(lock) => self.pair_host_lock = Some(lock),
+                    None => {
+                        self.status = format!(
+                            "Navigator '{}' is hosted by another croft window in this workspace",
+                            record.name
+                        );
+                        return true;
+                    }
+                }
+            }
             if let Err(e) = crate::collab::ensure_relay(&self.pair_socket) {
                 self.status = format!("Navigator: relay failed: {e}");
                 return true;
