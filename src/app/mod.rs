@@ -31513,6 +31513,14 @@ pub fn run(
     .ok();
     terminal.show_cursor().ok();
 
+    // Reap the navigator's claude child before any exit: drop-to-local
+    // (process::exit) and self-update (exec) below both bypass Drop, and even
+    // a normal return races the detached Drop thread against process exit.
+    // shutdown_blocking reverts, hangs up, and grace-kills synchronously.
+    if let Some(host) = app.pair_host.take() {
+        host.shutdown_blocking();
+    }
+
     result?;
     if app.drop_to_local {
         std::process::exit(crate::remote::DROP_TO_LOCAL_EXIT_CODE);

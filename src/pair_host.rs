@@ -166,6 +166,16 @@ impl PairHost {
         }
     }
 
+    /// Tear the seat down synchronously (revert, hang up, grace-kill, join).
+    /// Blocks up to the grace period, so call this only on an exit path where
+    /// the child MUST be reaped before the process ends — never on the tick
+    /// loop, where `Drop` detaches the same work instead.
+    pub fn shutdown_blocking(mut self) {
+        if let Some(p) = self.pilot.take() {
+            p.shutdown();
+        }
+    }
+
     /// (0-based row, body) of every note anchored in `file`, rows computed
     /// against the live replica so they track concurrent edits.
     pub fn notes_snapshot(&self, file: &str) -> Vec<(usize, String)> {
@@ -184,8 +194,14 @@ impl PairHost {
 
 impl Drop for PairHost {
     fn drop(&mut self) {
+        // Detach the teardown: the grace-kill blocks up to 2s (claude lingers
+        // on stdin EOF), and this Drop runs on the App's tick thread when the
+        // navigator is unseated (toggle off / disabled record). The detached
+        // thread owns the pilot and reverts, hangs up, and grace-kills on its
+        // own. Exit paths that must reap the child first use
+        // `shutdown_blocking` instead.
         if let Some(p) = self.pilot.take() {
-            p.shutdown();
+            std::thread::spawn(move || p.shutdown());
         }
     }
 }

@@ -2148,6 +2148,45 @@ mod tests {
         drop(host);
     }
 
+    /// Dropping the host (unseat / toggle-off) must not block the UI thread
+    /// on the 2s grace-kill: teardown runs on a detached thread. The claude
+    /// CLI lingers on stdin EOF, so the synchronous path would freeze the TUI
+    /// for the full grace period on every deactivation.
+    #[test]
+    fn dropping_the_host_does_not_block_the_ui_thread() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("line zero\nline one");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script).arg(&log).arg("linger"); // streams a turn, then sleeps 60s
+        let mut host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "nav", None, cmd).unwrap();
+        // Drive one turn so the child reaches its sleep (ignoring stdin EOF).
+        host.send_ask_turn("demo.txt", (0, 0), "", "do a thing", "line zero\nline one")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !host
+            .poll()
+            .iter()
+            .any(|e| matches!(e, crate::pair_host::PairEvent::TurnDone { .. }))
+        {
+            assert!(Instant::now() < deadline, "turn never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let t = Instant::now();
+        drop(host);
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "Drop blocked on the grace-kill for {:?}; teardown must be detached",
+            t.elapsed()
+        );
+    }
+
     /// The system prompt must teach the NOTE fence (with a concrete
     /// example), the numbered-buffer convention, and the yield rules the
     /// host enforces.
