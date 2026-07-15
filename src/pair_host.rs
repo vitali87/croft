@@ -132,8 +132,6 @@ impl PairHost {
 
     /// Yield turn: the driver hands the navigator the floor. Comment-only,
     /// host-enforced; the turn carries the diff since its last look.
-    /// (Dead-code allow: the Cmd+K Y slice wires the App to this.)
-    #[allow(dead_code)]
     pub fn send_yield_turn(&self, file: &str, content: &str) -> Result<()> {
         let p = self.pilot.as_ref().context("navigator pilot is gone")?;
         let old = p.state.lock().unwrap().begin_turn(file, content, true);

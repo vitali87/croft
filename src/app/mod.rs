@@ -12414,6 +12414,13 @@ impl App {
                 self.open_ask_navigator(range, selection);
                 true
             }
+            // Cmd+K Y: yield the turn — the navigator reviews the active
+            // file comment-only; its say lands as gutter diamonds and
+            // OUTPUT commentary, never as edits.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'y') => {
+                self.yield_to_navigator();
+                true
+            }
             // Cmd+K Shift+Cmd+\: open a second view of the active file beside it
             // ("Split in Group"). Must precede the plain Cmd+\ (Split Up) arm,
             // which ignores Shift. Shift+\ may arrive as '|' on some layouts.
@@ -15964,6 +15971,33 @@ impl App {
             format!("Ask {} · {file} · {scope}", host.name()),
             "What should it look at or do?",
         ));
+    }
+
+    /// Cmd+K Y: hand the navigator the floor on the active file. The turn
+    /// is comment-only (host-enforced): its say lands as anchored notes and
+    /// commentary, and it must ask before editing.
+    fn yield_to_navigator(&mut self) {
+        let Some(host) = &self.pair_host else {
+            self.status =
+                String::from("Navigator is not active (run croft pair in this workspace)");
+            return;
+        };
+        let Some(file) = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&self.tree.root, p))
+        else {
+            self.status = String::from("Yield: no active workspace file");
+            return;
+        };
+        let content = self.editor.lines.join("\n");
+        match host.send_yield_turn(&file, &content) {
+            Ok(()) => {
+                self.status = format!("Yielded {file} to {} (comment-only turn)", host.name());
+            }
+            Err(e) => self.status = format!("Yield failed: {e}"),
+        }
     }
 
     /// F4: jump the caret to the active file's next navigator note (by row,

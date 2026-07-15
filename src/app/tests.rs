@@ -19209,6 +19209,84 @@ fn solo_guest_never_hosts_the_navigator() {
     assert!(app.pair_host.is_none());
 }
 
+/// Cmd+K Y yields the active file to the navigator (a COMMENT-ONLY turn
+/// carrying the numbered buffer), and the pilot's commentary lands in the
+/// Navigator OUTPUT channel via poll_pair.
+#[test]
+fn cmd_k_y_yields_the_active_file_and_commentary_reaches_output() {
+    use std::time::{Duration, Instant};
+    if !crate::lsp::manager::is_on_path("python3") {
+        eprintln!("SKIPPED: python3 not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "a\nb\nc").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let script = tmp.path().join("fake_claude.py");
+    std::fs::write(&script, crate::pair::FAKE_CLAUDE).unwrap();
+    let log = tmp.path().join("stdin.log");
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+
+    // Without a host the chord hints instead of panicking.
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('y'), KeyModifiers::NONE)));
+    assert!(
+        app.status.to_lowercase().contains("not active"),
+        "got: {}",
+        app.status
+    );
+
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script).arg(&log).arg("notes");
+    app.pair_host =
+        Some(crate::pair_host::PairHost::spawn_cmd(&socket, "navigator", None, cmd).unwrap());
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('y'), KeyModifiers::NONE)));
+    assert!(
+        app.status.to_lowercase().contains("yielded"),
+        "got: {}",
+        app.status
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let sent = std::fs::read_to_string(&log).unwrap_or_default();
+        if sent.contains("COMMENT-ONLY") && sent.contains("0|a") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "yield turn never reached claude; log: {sent}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The fake's "Reviewing." commentary flows to the Navigator channel.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.poll_pair();
+        let lines = crate::output::snapshot("Navigator").unwrap_or_default();
+        if lines.iter().any(|l| l.text.contains("Reviewing.")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "commentary never reached OUTPUT; got {lines:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// The ask box: Cmd+K Q opens the navigator input scoped to the caret line
 /// (or the selection), right-click menus carry the entries, and submitting
 /// sends the composed ask turn (instruction, 0-based range, numbered
