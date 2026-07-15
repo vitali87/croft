@@ -376,6 +376,22 @@ fn renamed() -> u32 {
 }
 <<<END>>>
 
+To pin a remark to a specific line WITHOUT editing anything, emit a note fence:
+
+<<<NOTE <file>:<row>>>>
+<what you want to say about that line>
+<<<END>>>
+
+Note rules:
+- The header carries the file plus EXACTLY ONE integer, the 0-based row the note speaks about (e.g. `<<<NOTE demo.txt:4>>>` pins a remark to line 4 of demo.txt). Your partner sees it attached to that line in their editor.
+- Notes never change any buffer. Use them for review remarks, questions, and change proposals.
+
+Some user messages number the buffer: each line arrives prefixed with `N|` where N is its 0-based row. The prefix is a label, not content — character columns still count from the first character AFTER the first `|`, and NOTE/EDIT rows use exactly those N values.
+
+Turn kinds:
+- An ask turn names a task and where you were invoked: you may edit with EDIT fences and remark with NOTE fences.
+- A yielded turn says it is COMMENT-ONLY: your partner handed you the floor to review, not to type. EDIT fences on such a turn are DISCARDED by the editor. Speak in NOTE fences anchored to the lines you mean, propose changes there, and wait to be asked before editing.
+
 A participant can cancel your stream mid-edit; the streamed text is then reverted and your next user message starts with a note saying so. When that happens, stop that approach and ask what they want instead."#;
 
 /// Everything `croft pair` needs to sit down: the relay socket, the
@@ -2089,6 +2105,18 @@ if mode == "linger":
             vec![(1, "second line could be tighter".to_string())]
         );
         drop(host); // must not hang: the shutdown grace-kill path
+    }
+
+    /// The system prompt must teach the NOTE fence (with a concrete
+    /// example), the numbered-buffer convention, and the yield rules the
+    /// host enforces.
+    #[test]
+    fn system_prompt_teaches_note_fence_and_yield_rules() {
+        assert!(PAIR_SYSTEM_PROMPT.contains("<<<NOTE <file>:<row>>>>"));
+        assert!(PAIR_SYSTEM_PROMPT.contains("<<<NOTE demo.txt:4>>>"));
+        assert!(PAIR_SYSTEM_PROMPT.contains("COMMENT-ONLY"));
+        assert!(PAIR_SYSTEM_PROMPT.contains("N|"));
+        assert!(PAIR_SYSTEM_PROMPT.contains("0-based row"));
     }
 
     /// The ask-turn composer: instruction, invoked range, selected text,
