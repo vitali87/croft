@@ -14,8 +14,8 @@ use anyhow::{Context, Result};
 
 use crate::collab::position;
 use crate::pair::{
-    PairConfig, Pilot, claude_command, compose_ask_turn, compose_yield_turn, seat_pilot, send_turn,
-    write_user_turn,
+    PairConfig, Pilot, Provider, claude_command, compose_ask_turn, compose_yield_turn, seat_local,
+    seat_pilot, send_turn, write_user_turn,
 };
 
 /// What the pilot surfaces to the App, drained by `poll` once per tick.
@@ -54,11 +54,25 @@ pub struct PairHost {
 }
 
 impl PairHost {
-    /// Seat the navigator for a workspace: build the real claude command
-    /// from `cfg` and spawn the pilot on it.
+    /// Seat the navigator for a workspace on its configured provider: the
+    /// real claude CLI, or a childless seat over a local Anthropic-compatible
+    /// endpoint.
     pub fn spawn(cfg: PairConfig) -> Result<Self> {
-        let cmd = claude_command(&cfg)?;
-        Self::spawn_cmd(&cfg.socket, &cfg.name, cfg.task.as_deref(), cmd)
+        match &cfg.provider {
+            Provider::Claude => {
+                let cmd = claude_command(&cfg)?;
+                Self::spawn_cmd(&cfg.socket, &cfg.name, cfg.task.as_deref(), cmd)
+            }
+            Provider::Local { base_url } => {
+                let model = cfg
+                    .model
+                    .as_deref()
+                    .context("a local provider needs --model (there is no CLI default)")?;
+                let (tx, rx) = channel();
+                let pilot = seat_local(&cfg.socket, &cfg.name, base_url, model, Some(tx))?;
+                Self::seated(pilot, rx, &cfg.name, cfg.task.as_deref())
+            }
+        }
     }
 
     /// Seat the navigator on an explicit command (the e2e tests drive this
@@ -66,9 +80,19 @@ impl PairHost {
     pub fn spawn_cmd(socket: &Path, name: &str, task: Option<&str>, cmd: Command) -> Result<Self> {
         let (tx, rx) = channel();
         let pilot = seat_pilot(socket, name, cmd, Some(tx))?;
+        Self::seated(pilot, rx, name, task)
+    }
+
+    /// Wrap a seated pilot and send its start task, if any.
+    fn seated(
+        pilot: Pilot,
+        events: Receiver<PairEvent>,
+        name: &str,
+        task: Option<&str>,
+    ) -> Result<Self> {
         let host = Self {
             pilot: Some(pilot),
-            events: rx,
+            events,
             name: name.to_string(),
             died: false,
         };

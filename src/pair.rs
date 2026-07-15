@@ -20,8 +20,6 @@
 //! emits events; everything outside a well-formed fence is commentary and is
 //! never applied to a buffer.
 
-// Dead-code allow until seat_local (the next slice) drives it in-process.
-#[allow(dead_code)]
 pub(crate) mod local;
 
 use std::io::{BufRead, Read as _, Write as _};
@@ -770,12 +768,21 @@ pub(crate) fn claude_command(cfg: &PairConfig) -> Result<Command> {
     Ok(cmd)
 }
 
-/// `croft pair`: join the workspace's collab relay as the pilot seat, spawn
-/// claude, and run the REPL until stdin closes.
+/// `croft pair --repl`: join the workspace's collab relay as the pilot seat
+/// on the configured provider and run the REPL until stdin closes.
 pub fn run(cfg: PairConfig) -> Result<()> {
-    let cmd = claude_command(&cfg)?;
+    let pilot = match &cfg.provider {
+        Provider::Claude => seat_pilot(&cfg.socket, &cfg.name, claude_command(&cfg)?, None)?,
+        Provider::Local { base_url } => {
+            let model = cfg
+                .model
+                .as_deref()
+                .context("a local provider needs --model (there is no CLI default)")?;
+            seat_local(&cfg.socket, &cfg.name, base_url, model, None)?
+        }
+    };
     let stdin = std::io::stdin();
-    run_pilot(&cfg.socket, &cfg.name, cfg.task, cmd, &mut stdin.lock())
+    run_pilot(pilot, &cfg.name, cfg.task, &mut stdin.lock())
 }
 
 /// Connect the pilot's collab seat, retrying briefly (the dispatch just
@@ -1003,8 +1010,6 @@ pub(crate) fn seat_pilot(
 /// guest seat and pump as the claude transport, but no child — a worker
 /// owns the conversation (the endpoint is stateless) and runs one blocking
 /// [`local::stream_turn`] per queued turn body.
-// Dead-code allow until the Provider dispatch (the next slice) calls it.
-#[allow(dead_code)]
 pub(crate) fn seat_local(
     socket: &Path,
     name: &str,
@@ -1060,18 +1065,16 @@ pub(crate) fn seat_local(
     })
 }
 
-/// The debug REPL driver (hidden `--repl`), claude-command-agnostic so the
-/// e2e tests can drive it with a scripted fake. Blocks until `input` (the
-/// pilot's own terminal) hits EOF or the claude child hangs up mid-turn.
+/// The debug REPL driver (hidden `--repl`), transport-agnostic so the e2e
+/// tests can drive it with a scripted fake. Blocks until `input` (the
+/// pilot's own terminal) hits EOF or the model conversation hangs up
+/// mid-turn.
 fn run_pilot(
-    socket: &Path,
+    pilot: Pilot,
     name: &str,
     task: Option<String>,
-    cmd: Command,
     input: &mut dyn BufRead,
 ) -> Result<()> {
-    let pilot = seat_pilot(socket, name, cmd, None)?;
-
     // REPL: the initial --task then the pilot's stdin, one turn per line.
     println!("croft pair: '{name}' seated; type a task ('@<file> <task>' to focus a buffer)");
     let mut pending = task;
@@ -2179,6 +2182,67 @@ mod tests {
         );
     }
 
+    /// PairHost::spawn dispatches on the provider: a Local config refuses to
+    /// seat without a model (there is no CLI default to fall back to), and
+    /// with one it seats childless and drives a whole-line ask turn from the
+    /// endpoint into the owner's replica.
+    #[test]
+    fn pair_host_spawns_local_backend_without_a_child() {
+        let harness = OwnerHarness::start("hello world");
+        let no_model = PairConfig {
+            socket: harness.socket.clone(),
+            workspace: harness._dir.path().to_path_buf(),
+            name: String::from("claude"),
+            model: None,
+            task: None,
+            provider: Provider::Local {
+                base_url: String::from("http://127.0.0.1:9"),
+            },
+        };
+        let err = match crate::pair_host::PairHost::spawn(no_model) {
+            Err(e) => e,
+            Ok(_) => panic!("a local provider without a model must refuse to seat"),
+        };
+        assert!(
+            err.to_string().contains("--model"),
+            "the refusal must hint at --model: {err}"
+        );
+
+        let (base_url, server) = serve_sse_once(vec![
+            "<<<EDIT demo.txt:0-0>",
+            ">>\nhello streamed edit\n",
+            "<<<END>>>\n",
+        ]);
+        let mut host = crate::pair_host::PairHost::spawn(PairConfig {
+            socket: harness.socket.clone(),
+            workspace: harness._dir.path().to_path_buf(),
+            name: String::from("claude"),
+            model: Some(String::from("test-model")),
+            task: None,
+            provider: Provider::Local { base_url },
+        })
+        .unwrap();
+        assert!(!host.is_busy());
+        host.send_ask_turn("demo.txt", (0, 0), "", "rewrite line 0", "hello world")
+            .unwrap();
+        server.join().unwrap();
+        harness.wait_until("the whole-line edit to converge", |h| {
+            h.doc().as_deref() == Some("hello streamed edit")
+        });
+        harness.wait_until("the turn to end", |h| {
+            let _ = h; // the turn end arrives on the host's own channel
+            host.poll().iter().any(|e| {
+                matches!(
+                    e,
+                    crate::pair_host::PairEvent::TurnDone {
+                        cancelled: false,
+                        failed: None
+                    }
+                )
+            })
+        });
+    }
+
     /// Spawn the pilot against the scripted claude on a background thread
     /// (it blocks until the turn ends and its input hits EOF).
     fn spawn_pilot(
@@ -2191,11 +2255,11 @@ mod tests {
         cmd.arg(script).arg(log).arg(mode);
         let socket = socket.to_path_buf();
         std::thread::spawn(move || {
+            let pilot = seat_pilot(&socket, "pilot", cmd, None)?;
             run_pilot(
-                &socket,
+                pilot,
                 "pilot",
                 Some("fix demo.txt".into()),
-                cmd,
                 &mut std::io::Cursor::new(Vec::new()),
             )
         })
