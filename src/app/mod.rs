@@ -2690,6 +2690,14 @@ pub struct App {
     /// notes, refreshed each tick from the host; drives the gutter ◆ marks
     /// and the note popup.
     navigator_notes: std::collections::HashMap<String, Vec<(usize, String)>>,
+    /// The open navigator note: (collab file key, index into that file's
+    /// note snapshot). Opens when the caret lands on a noted row, on a ◆
+    /// click, or via F4; Esc dismisses.
+    note_popup: Option<(String, usize)>,
+    /// The caret position `refresh_note_popup` last judged, so the popup
+    /// opens on ARRIVAL at a noted row (a parked caret never re-opens what
+    /// Esc dismissed).
+    note_probe: Option<(PathBuf, usize)>,
     /// Test seam: builds the PairHost from the config (the real path spawns
     /// the claude CLI, which a test must never do).
     #[cfg(test)]
@@ -3538,6 +3546,8 @@ impl App {
             pair_socket: crate::session::collab_socket_path(&root),
             last_pair_check: None,
             navigator_notes: std::collections::HashMap::new(),
+            note_popup: None,
+            note_probe: None,
             #[cfg(test)]
             pair_spawn_override: None,
             collab_labels_visible: false,
@@ -11244,6 +11254,7 @@ impl App {
                 frame.render_widget(&*popup, area);
             }
         }
+        self.render_note_popup(frame);
         self.render_port_toast(frame);
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);
@@ -15843,6 +15854,119 @@ impl App {
         changed
     }
 
+    /// Note-popup arrival check, once per tick: the popup opens when the
+    /// caret LANDS on a noted row and closes when it leaves one. A parked
+    /// caret changes nothing, so Esc stays dismissed until the caret moves.
+    fn refresh_note_popup(&mut self) -> bool {
+        let Some(path) = self.editor.path.clone() else {
+            return false;
+        };
+        let row = self.editor.cursor_row;
+        if self.note_probe.as_ref() == Some(&(path.clone(), row)) {
+            return false;
+        }
+        self.note_probe = Some((path.clone(), row));
+        let file = collab_file_key(&self.tree.root, &path);
+        let landed = file.as_ref().and_then(|f| {
+            self.navigator_notes
+                .get(f)
+                .and_then(|notes| notes.iter().position(|(r, _)| *r == row))
+        });
+        match (landed, file) {
+            (Some(idx), Some(file)) => {
+                self.note_popup = Some((file, idx));
+                true
+            }
+            _ => {
+                if self.note_popup.is_some() {
+                    self.note_popup = None;
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
+    /// F4: jump the caret to the active file's next navigator note (by row,
+    /// wrapping) and open its popup.
+    fn cycle_navigator_note(&mut self) {
+        let Some(file) = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&self.tree.root, p))
+        else {
+            self.status = String::from("Navigator notes: no active file");
+            return;
+        };
+        let Some(notes) = self.navigator_notes.get(&file).filter(|n| !n.is_empty()) else {
+            self.status = String::from("No navigator notes in this file");
+            return;
+        };
+        let here = self.editor.cursor_row;
+        let idx = notes.iter().position(|(row, _)| *row > here).unwrap_or(0);
+        let row = notes[idx].0.min(self.editor.lines.len().saturating_sub(1));
+        let path = self.editor.path.clone().expect("checked above");
+        match self.open_at(&path, row, 0) {
+            Ok(()) => {
+                self.note_probe = Some((path, self.editor.cursor_row));
+                self.note_popup = Some((file, idx));
+            }
+            Err(e) => self.status = format!("Navigator note jump failed: {e}"),
+        }
+    }
+
+    /// The navigator note popup, anchored to its noted line: a bordered
+    /// box whose header names the navigator, the line, and the dismiss and
+    /// cycle keys. Painted only while the noted file is active and its row
+    /// is on screen.
+    fn render_note_popup(&mut self, frame: &mut ratatui::Frame) {
+        let Some((file, idx)) = self.note_popup.clone() else {
+            return;
+        };
+        let active = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&self.tree.root, p));
+        if active.as_deref() != Some(file.as_str()) {
+            return;
+        }
+        let note = self
+            .navigator_notes
+            .get(&file)
+            .and_then(|n| n.get(idx))
+            .cloned();
+        let Some((row, body)) = note else {
+            self.note_popup = None; // the note was superseded
+            return;
+        };
+        // Anchor at the note's first visual row in this frame's geometry
+        // (scrolled off screen = nothing to anchor to).
+        let Some(anchor_y) = self.editor.screen_row_of_line(row) else {
+            return;
+        };
+        let name = self
+            .pair_host
+            .as_ref()
+            .map(|h| h.name().to_string())
+            .unwrap_or_else(|| String::from("navigator"));
+        let header = format!("\u{25c6} {name} · line {} · Esc dismiss · F4 next", row + 1);
+        let inner = self.editor.last_inner;
+        let mut popup = crate::widgets::hover_popup::HoverPopup::new(
+            format!("{header}\n{body}"),
+            (
+                inner.x.saturating_add(self.editor.last_gutter_width + 1),
+                anchor_y,
+            ),
+        );
+        popup.gradient = self.popup_gradient();
+        let area = popup.area_for(frame.area());
+        if area.width > 0 && area.height > 0 {
+            frame.render_widget(&popup, area);
+        }
+    }
+
     /// Phase D per-tick collab pump (docs/MULTIPLAYER.md): connect lazily,
     /// have guests bootstrap newly opened workspace files, extract local
     /// edits into ops BEFORE applying inbound ones (the echo-storm
@@ -17557,6 +17681,17 @@ impl App {
         // Esc then falls through to clear the selection / collapse cursors.
         if self.signature_help_popup.is_some() && matches!(key.code, KeyCode::Esc) {
             self.dismiss_signature_help();
+            return;
+        }
+        // Esc dismisses the navigator note popup next, before the selection
+        // clear below — reading a note must not cost the selection.
+        if self.note_popup.is_some() && matches!(key.code, KeyCode::Esc) {
+            self.note_popup = None;
+            return;
+        }
+        // F4: cycle to the active file's next navigator note.
+        if matches!(key.code, KeyCode::F(4)) && key.modifiers.is_empty() {
+            self.cycle_navigator_note();
             return;
         }
         if is_completion_trigger_key(key) {
@@ -25073,6 +25208,22 @@ impl App {
                         self.collab_cancel_stream();
                         return;
                     }
+                    // Navigator note diamond: open the clicked line's note
+                    // popup (same borrowed cell rules as the stop button).
+                    if let Some(line) = self.editor.note_glyph_at(m.column, m.row)
+                        && let Some(file) = self
+                            .editor
+                            .path
+                            .as_ref()
+                            .and_then(|p| collab_file_key(&self.tree.root, p))
+                        && let Some(idx) = self
+                            .navigator_notes
+                            .get(&file)
+                            .and_then(|notes| notes.iter().position(|(r, _)| *r == line))
+                    {
+                        self.note_popup = Some((file, idx));
+                        return;
+                    }
                     // Gutter play glyph: run the test fn defined on the
                     // clicked line (VS Code's run bead); Alt+click debugs it
                     // instead. Sits in the sign margin one cell left of the
@@ -31509,7 +31660,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let dap_changed = app.poll_dap();
         let tests_changed = app.test_worker.drain(&mut app.testing);
         let mcp_changed = app.poll_mcp();
-        let pair_changed = app.maybe_seat_navigator() | app.poll_pair();
+        let pair_changed = app.maybe_seat_navigator() | app.poll_pair() | app.refresh_note_popup();
         let voice_changed = app.drain_voice();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.

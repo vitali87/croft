@@ -1786,6 +1786,15 @@ impl Editor {
         line == stop_line
     }
 
+    /// This frame's screen row of `line`'s first visual row, when visible
+    /// (None = scrolled off or folded away). Anchors line-tied popups.
+    pub fn screen_row_of_line(&self, line: usize) -> Option<u16> {
+        self.last_wrap_rows
+            .iter()
+            .position(|&(l, _, _)| l == line)
+            .map(|idx| self.last_inner.y.saturating_add(idx as u16))
+    }
+
     /// The noted 0-based line when `(col, row)` lands on a navigator note
     /// diamond in the sign margin: same geometry as
     /// [`test_glyph_at`](Self::test_glyph_at), first visual row only.

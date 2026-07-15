@@ -19209,6 +19209,59 @@ fn solo_guest_never_hosts_the_navigator() {
     assert!(app.pair_host.is_none());
 }
 
+/// The navigator note popup: opens when the caret LANDS on a noted line
+/// (staying put never re-triggers), Esc dismisses it without eating the
+/// selection, F4 cycles through the file's notes (wrapping) and jumps the
+/// caret, and moving off a noted line closes it.
+#[test]
+fn note_popup_opens_on_caret_landing_esc_dismisses_and_f4_cycles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "a\nb\nc\nd\ne").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+    app.navigator_notes.insert(
+        "f.txt".into(),
+        vec![(1, "first note".into()), (3, "second note".into())],
+    );
+
+    // Caret at 0,0: nothing opens.
+    app.refresh_note_popup();
+    assert!(app.note_popup.is_none());
+
+    // Landing on a noted row opens its popup on a dirty tick.
+    app.editor.cursor_row = 1;
+    assert!(app.refresh_note_popup());
+    assert_eq!(app.note_popup, Some(("f.txt".to_string(), 0)));
+    assert!(!app.refresh_note_popup(), "staying put is quiet");
+
+    // Esc dismisses the popup FIRST; the selection survives for its own Esc.
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (1, 1),
+    });
+    app.handle_editor_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.note_popup.is_none());
+    assert!(
+        app.editor.selection.is_some(),
+        "the popup consumed Esc; the selection is untouched"
+    );
+    assert!(!app.refresh_note_popup(), "no reopen while parked");
+
+    // F4 jumps to the next note and opens it; a second F4 wraps.
+    app.handle_editor_key(key(KeyCode::F(4), KeyModifiers::NONE));
+    assert_eq!(app.editor.cursor_row, 3);
+    assert_eq!(app.note_popup, Some(("f.txt".to_string(), 1)));
+    app.handle_editor_key(key(KeyCode::F(4), KeyModifiers::NONE));
+    assert_eq!(app.editor.cursor_row, 1);
+    assert_eq!(app.note_popup, Some(("f.txt".to_string(), 0)));
+
+    // Moving off a noted line closes the popup.
+    app.editor.cursor_row = 4;
+    assert!(app.refresh_note_popup());
+    assert!(app.note_popup.is_none());
+}
+
 /// The AI-stream badge lifecycle: a pilot's StreamState(active) sets
 /// `collab_stream` on a dirty tick, the cancel action broadcasts
 /// StreamCancel to the pilot, and StreamState(inactive) clears the badge.
