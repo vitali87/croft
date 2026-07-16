@@ -19866,6 +19866,60 @@ fn f4_focuses_comment_boxes_typing_edits_the_draft_and_esc_releases() {
     );
 }
 
+/// Re-rooting the workspace (Cmd+Z jump / Make Root) rebinds the resident
+/// navigator: the activation record, relay socket, and single-host lock all
+/// key off the root, so a `croft pair` run in the NEW root must be seen by
+/// this window. The old workspace's seat (and its comment boxes) unseats.
+#[test]
+fn reroot_rebinds_the_navigator_activation_watch() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    std::fs::write(a.path().join("a.txt"), "a").unwrap();
+    std::fs::write(b.path().join("b.txt"), "b").unwrap();
+    let mut app = App::new(a.path().to_path_buf()).unwrap();
+    assert_eq!(
+        app.pair_record_path,
+        crate::session::pair_record_path(a.path())
+    );
+
+    // A seat and its boxes from root A are torn down by the move.
+    app.navigator_notes
+        .insert("a.txt".into(), vec![(1, 0, "n".into())]);
+    app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+        id: 1,
+        reply: String::new(),
+        cursor: 0,
+    });
+    app.navigator_down = true; // a dead pilot in A must not block B
+    app.last_pair_check = Some(std::time::Instant::now());
+
+    app.change_workspace_root(b.path().to_path_buf());
+
+    assert_eq!(
+        app.pair_record_path,
+        crate::session::pair_record_path(b.path()),
+        "the activation watch follows the root"
+    );
+    assert_eq!(
+        app.pair_socket,
+        crate::session::collab_socket_path(b.path())
+    );
+    assert_eq!(
+        app.pair_host_lock_path,
+        crate::session::pair_host_lock_path(b.path())
+    );
+    assert!(app.navigator_notes.is_empty(), "old root's boxes are gone");
+    assert!(app.editor.comment_focus.is_none());
+    assert!(
+        !app.navigator_down,
+        "the death latch belongs to the old root"
+    );
+    assert!(
+        app.last_pair_check.is_none(),
+        "the new record is checked on the next tick, not in 1s"
+    );
+}
+
 /// Enter in a focused comment box sends the reply turn: the composed
 /// message (note context, the reply, COMMENT-ONLY, numbered buffer) reaches
 /// the pilot's claude stdin, and the focus releases.

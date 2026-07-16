@@ -26729,6 +26729,30 @@ impl App {
         self.file_finder_index_rx = None;
         self.file_finder_index_dirty = false;
         self.kick_file_finder_index_rebuild();
+        // Rebind the resident navigator: the activation record, relay
+        // socket, and single-host lock are all keyed by workspace root
+        // (captured at App::new), so without this a `croft pair` run in the
+        // NEW root writes a record this window never reads and the
+        // navigator can never seat again after a re-root. Any seat from the
+        // old root is torn down with its comment boxes; if this window had
+        // self-appointed the old root's collab owner, that session goes too
+        // (a fresh activation self-appoints against the new root).
+        if self.pair_host.take().is_some() {
+            self.status = String::from("Navigator unseated (workspace changed)");
+        }
+        self.navigator_notes.clear();
+        self.pair_commentary_buf.clear();
+        self.pair_turn_origin = None;
+        self.editor.comment_focus = None;
+        if self.pair_host_lock.take().is_some() {
+            self.collab = None;
+            self.collab_config = None;
+        }
+        self.pair_record_path = crate::session::pair_record_path(&new_root);
+        self.pair_socket = crate::session::collab_socket_path(&new_root);
+        self.pair_host_lock_path = crate::session::pair_host_lock_path(&new_root);
+        self.navigator_down = false; // the death latch belonged to the old root
+        self.last_pair_check = None; // read the new record this tick, not in 1s
         self.status = if shell_synced {
             format!("Workspace root: {display}")
         } else {

@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "The navigator now speaks through comment boxes in the file: unnumbered blocks between the lines they belong to (never part of the buffer, never saved), each with a reply field and a ✕ Ignore button — type back and Enter continues the conversation in place as a comment-only turn.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "F4 hops to the next comment box, Shift+F4 ignores one, Esc releases the keyboard, and boxes persist across turns until you close them; the gutter ◆ diamonds, the note popup, and the Navigator OUTPUT channel are gone — turn commentary lands as a box at the line you asked from.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Fix,
+    summary: "Re-rooting the workspace (Cmd+Z jump / Make Root) now rebinds the resident navigator: `croft pair` run in the new root seats within a second, instead of the window silently watching the launch directory's activation record forever.",
+}];
