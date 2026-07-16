@@ -123,13 +123,18 @@ pub enum Command {
     /// the instruction box; the navigator may edit on the resulting turn).
     AskNavigator,
     /// Hand the navigator the floor on the active file: a comment-only
-    /// review turn, its say anchored as gutter diamonds.
+    /// review turn, its say anchored as comment boxes.
     YieldToNavigator,
     /// Activate or deactivate the workspace's resident navigator (writes
     /// the pair record `croft pair` uses; the tick loop seats or unseats).
     ToggleNavigator,
-    /// Drop every navigator note (gutter diamonds and popup).
+    /// Drop every navigator comment box.
     ClearNavigatorNotes,
+    /// Focus the active file's next navigator comment box (F4).
+    NextComment,
+    /// Ignore the focused navigator comment box, or the next one from the
+    /// caret (Shift+F4).
+    IgnoreComment,
 }
 
 /// Every command, in palette display order. Single source of truth for both
@@ -229,6 +234,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::YieldToNavigator,
     Command::ToggleNavigator,
     Command::ClearNavigatorNotes,
+    Command::NextComment,
+    Command::IgnoreComment,
 ];
 
 impl Command {
@@ -329,7 +336,9 @@ impl Command {
             Command::AskNavigator => "Navigator: Ask About Line or Selection",
             Command::YieldToNavigator => "Navigator: Yield the Turn",
             Command::ToggleNavigator => "Navigator: Activate or Deactivate",
-            Command::ClearNavigatorNotes => "Navigator: Clear Notes",
+            Command::ClearNavigatorNotes => "Navigator: Clear Comments",
+            Command::NextComment => "Navigator: Next Comment",
+            Command::IgnoreComment => "Navigator: Ignore Comment",
         }
     }
 
@@ -435,6 +444,8 @@ impl Command {
             Command::YieldToNavigator => "Cmd+K Y",
             Command::ToggleNavigator => "",
             Command::ClearNavigatorNotes => "",
+            Command::NextComment => "F4",
+            Command::IgnoreComment => "Shift+F4",
         }
         // No catch-all: every Command must carry an accelerator (croft tenet),
         // so adding a variant fails to compile until its hint is supplied.
@@ -537,6 +548,8 @@ impl Command {
             Command::YieldToNavigator => "navigator_yield",
             Command::ToggleNavigator => "navigator_toggle",
             Command::ClearNavigatorNotes => "navigator_clear_notes",
+            Command::NextComment => "navigator_next_comment",
+            Command::IgnoreComment => "navigator_ignore_comment",
             Command::RunTask => "run_task",
             Command::RunBuildTask => "run_build_task",
             Command::RerunLastTask => "rerun_last_task",

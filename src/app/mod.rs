@@ -2705,7 +2705,14 @@ pub struct App {
     /// Per-file (0-based row, body) snapshots of the navigator's anchored
     /// notes, refreshed each tick from the host; drives the gutter ◆ marks
     /// and the note popup.
-    navigator_notes: std::collections::HashMap<String, Vec<(usize, String)>>,
+    navigator_notes: std::collections::HashMap<String, Vec<(u64, usize, String)>>,
+    /// The navigator's prose accumulated over the streaming turn; lands as
+    /// one comment box at the turn's origin when the turn ends (boxes are
+    /// the navigator's single voice — there is no OUTPUT channel for it).
+    pair_commentary_buf: String,
+    /// Where the current turn was invoked: (collab file key, 0-based row).
+    /// Anchors the turn's commentary box.
+    pair_turn_origin: Option<(String, usize)>,
     /// Notes the navigator left since its turn started, so the TurnDone
     /// status can surface them instead of overwriting the NoteAdded status.
     pair_notes_this_turn: usize,
@@ -2722,14 +2729,6 @@ pub struct App {
     /// explicit off/on (or toggle) re-activates. Matches the LSP precedent:
     /// no auto-respawn within a session; a fresh croft retries.
     navigator_down: bool,
-    /// The open navigator note: (collab file key, index into that file's
-    /// note snapshot). Opens when the caret lands on a noted row, on a ◆
-    /// click, or via F4; Esc dismisses.
-    note_popup: Option<(String, usize)>,
-    /// The caret position `refresh_note_popup` last judged, so the popup
-    /// opens on ARRIVAL at a noted row (a parked caret never re-opens what
-    /// Esc dismissed).
-    note_probe: Option<(PathBuf, usize)>,
     /// Test seam: builds the PairHost from the config (the real path spawns
     /// the claude CLI, which a test must never do).
     #[cfg(test)]
@@ -3579,12 +3578,12 @@ impl App {
             pair_host_lock_path: crate::session::pair_host_lock_path(&root),
             last_pair_check: None,
             navigator_notes: std::collections::HashMap::new(),
+            pair_commentary_buf: String::new(),
+            pair_turn_origin: None,
             pair_notes_this_turn: 0,
             pair_last_noted_file: None,
             pair_host_lock: None,
             navigator_down: false,
-            note_popup: None,
-            note_probe: None,
             #[cfg(test)]
             pair_spawn_override: None,
             collab_labels_visible: false,
@@ -10623,20 +10622,43 @@ impl App {
             // hoisted group is the only one that shows it (clear the rest so
             // a group swap never leaves a stale button behind).
             self.editor.stream_stop_line = self.stream_stop_row();
-            // Navigator note diamonds for the active file, same hoisting
-            // rule (rows come from poll_pair's per-tick snapshot).
-            self.editor.note_lines = self
+            // The navigator's comment boxes for the active file, same
+            // hoisting rule (rows come from poll_pair's per-tick snapshot).
+            let author = self
+                .pair_host
+                .as_ref()
+                .map(|h| h.name().to_string())
+                .unwrap_or_default();
+            self.editor.comment_boxes = self
                 .editor
                 .path
                 .as_ref()
                 .and_then(|p| collab_file_key(&self.tree.root, p))
                 .and_then(|file| self.navigator_notes.get(&file))
-                .map(|notes| notes.iter().map(|(row, _)| *row).collect())
+                .map(|notes| {
+                    notes
+                        .iter()
+                        .map(|(id, row, body)| crate::widgets::editor::CommentBox {
+                            id: *id,
+                            line: *row,
+                            author: author.clone(),
+                            body: body.clone(),
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
+            // A focused box that vanished (ignored elsewhere, cleared, or
+            // re-anchored away) releases the keyboard back to the buffer.
+            if let Some(focus) = &self.editor.comment_focus
+                && !self.editor.comment_boxes.iter().any(|b| b.id == focus.id)
+            {
+                self.editor.comment_focus = None;
+            }
             for group in self.editor_layout.inactive_groups_mut() {
                 for ed in &mut group.editors {
                     ed.stream_stop_line = None;
-                    ed.note_lines.clear();
+                    ed.comment_boxes.clear();
+                    ed.comment_focus = None;
                 }
             }
             // Render the editor group layout tree. The active group is hoisted
@@ -11291,7 +11313,6 @@ impl App {
                 frame.render_widget(&*popup, area);
             }
         }
-        self.render_note_popup(frame);
         self.render_port_toast(frame);
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);
@@ -12800,6 +12821,13 @@ impl App {
             && let Some(cmd) = self.keymap.command_for(key)
         {
             self.run_command(cmd);
+            return Ok(());
+        }
+        // A focused comment-box reply field owns the keyboard: typing edits
+        // the draft, Enter sends, Esc leaves, F4 hops on. Sits below the
+        // real modals (palette, prompts) and above every editor key.
+        if self.editor.comment_focus.is_some() && self.focus == Pane::Editor {
+            self.handle_comment_focus_key(key);
             return Ok(());
         }
         if matches!(key.code, KeyCode::F(1)) {
@@ -15608,6 +15636,8 @@ impl App {
                 match host.send_ask_turn(&file, range, &selection, &value, &content) {
                     Ok(()) => {
                         self.status = format!("Asked {} about {file}:{}", host.name(), range.0 + 1);
+                        // Anchor the turn's prose commentary where it was asked.
+                        self.pair_turn_origin = Some((file, range.0));
                     }
                     Err(e) => self.status = format!("Ask Navigator failed: {e}"),
                 }
@@ -15820,6 +15850,9 @@ impl App {
             if self.pair_host.is_some() {
                 self.pair_host = None; // Drop tears the seat down
                 self.navigator_notes.clear();
+                self.pair_commentary_buf.clear();
+                self.pair_turn_origin = None;
+                self.editor.comment_focus = None;
                 self.status = String::from("Navigator unseated");
                 return true;
             }
@@ -15918,26 +15951,61 @@ impl App {
         for event in events {
             match event {
                 crate::pair_host::PairEvent::Commentary(text) => {
-                    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                        crate::output::push("Navigator", crate::output::OutputLevel::Info, line);
+                    // The navigator's voice is its comment boxes: prose
+                    // accumulates and lands as one box when the turn ends.
+                    if !text.trim().is_empty() {
+                        if !self.pair_commentary_buf.is_empty() {
+                            self.pair_commentary_buf.push('\n');
+                        }
+                        self.pair_commentary_buf.push_str(text.trim_end());
                     }
                 }
                 crate::pair_host::PairEvent::NoteAdded { file, row, body } => {
                     let snippet: String = body.chars().take(60).collect();
-                    self.status = format!("{name} noted {file}:{}: {snippet}", row + 1);
+                    self.status = format!("{name} commented on {file}:{}: {snippet}", row + 1);
                     self.pair_notes_this_turn += 1;
                     self.pair_last_noted_file = Some(file);
                 }
                 crate::pair_host::PairEvent::TurnDone { cancelled, failed } => {
-                    let notes = std::mem::take(&mut self.pair_notes_this_turn);
-                    let file = self.pair_last_noted_file.take();
+                    let mut notes = std::mem::take(&mut self.pair_notes_this_turn);
+                    let mut file = self.pair_last_noted_file.take();
+                    let prose = std::mem::take(&mut self.pair_commentary_buf);
+                    let origin = self.pair_turn_origin.take();
+                    if !cancelled && !prose.trim().is_empty() {
+                        // Anchor the turn's prose at its invocation point (or
+                        // where it last commented). A file that is not live
+                        // any more falls back to the OUTPUT channel rather
+                        // than losing the navigator's words.
+                        let anchor =
+                            origin.or_else(|| file.clone().map(|f| (f, self.editor.cursor_row)));
+                        let landed = anchor.as_ref().and_then(|(f, row)| {
+                            self.pair_host
+                                .as_ref()
+                                .and_then(|h| h.add_note_now(f, *row, prose.trim()))
+                        });
+                        match (landed, anchor) {
+                            (Some(_), Some((f, _))) => {
+                                notes += 1;
+                                file.get_or_insert(f);
+                            }
+                            _ => {
+                                for line in prose.lines().filter(|l| !l.trim().is_empty()) {
+                                    crate::output::push(
+                                        "Navigator",
+                                        crate::output::OutputLevel::Info,
+                                        line,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     self.status = if cancelled {
                         format!("{name}: turn cancelled")
                     } else if let Some(err) = failed {
                         let err: String = err.chars().take(80).collect();
                         format!("{name}: turn failed: {err}")
                     } else if notes > 0 {
-                        let plural = if notes == 1 { "note" } else { "notes" };
+                        let plural = if notes == 1 { "comment" } else { "comments" };
                         match file {
                             Some(f) => {
                                 format!("{name} finished: {notes} {plural} in {f} · F4 to review")
@@ -15957,6 +16025,9 @@ impl App {
         if died {
             self.pair_host = None;
             self.navigator_notes.clear();
+            self.pair_commentary_buf.clear();
+            self.pair_turn_origin = None;
+            self.editor.comment_focus = None;
             self.navigator_down = true; // no auto-respawn; re-activate to retry
             return true;
         }
@@ -15978,37 +16049,171 @@ impl App {
         changed
     }
 
-    /// Note-popup arrival check, once per tick: the popup opens when the
-    /// caret LANDS on a noted row and closes when it leaves one. A parked
-    /// caret changes nothing, so Esc stays dismissed until the caret moves.
-    fn refresh_note_popup(&mut self) -> bool {
-        let Some(path) = self.editor.path.clone() else {
-            return false;
+    /// Keys while a comment box's reply field has focus: type into the
+    /// draft, Enter sends the reply turn, Esc leaves the box (its draft
+    /// survives until the box goes), F4 hops to the next box, Shift+F4
+    /// ignores this one.
+    fn handle_comment_focus_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::F(4)) {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.ignore_focused_comment();
+            } else {
+                self.cycle_comment_box();
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.editor.comment_focus = None;
+                return;
+            }
+            KeyCode::Enter => {
+                self.submit_comment_reply();
+                return;
+            }
+            _ => {}
+        }
+        let Some(focus) = self.editor.comment_focus.as_mut() else {
+            return;
         };
-        let row = self.editor.cursor_row;
-        if self.note_probe.as_ref() == Some(&(path.clone(), row)) {
-            return false;
-        }
-        self.note_probe = Some((path.clone(), row));
-        let file = collab_file_key(&self.tree.root, &path);
-        let landed = file.as_ref().and_then(|f| {
-            self.navigator_notes
-                .get(f)
-                .and_then(|notes| notes.iter().position(|(r, _)| *r == row))
-        });
-        match (landed, file) {
-            (Some(idx), Some(file)) => {
-                self.note_popup = Some((file, idx));
-                true
+        match key.code {
+            KeyCode::Backspace if focus.cursor > 0 => {
+                let idx = focus
+                    .reply
+                    .char_indices()
+                    .nth(focus.cursor - 1)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                focus.reply.remove(idx);
+                focus.cursor -= 1;
             }
-            _ => {
-                if self.note_popup.is_some() {
-                    self.note_popup = None;
-                    return true;
-                }
-                false
+            KeyCode::Left => focus.cursor = focus.cursor.saturating_sub(1),
+            KeyCode::Right => {
+                focus.cursor = (focus.cursor + 1).min(focus.reply.chars().count());
             }
+            KeyCode::Char(c)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                let idx = focus
+                    .reply
+                    .char_indices()
+                    .nth(focus.cursor)
+                    .map(|(i, _)| i)
+                    .unwrap_or(focus.reply.len());
+                focus.reply.insert(idx, c);
+                focus.cursor += 1;
+            }
+            _ => {}
         }
+    }
+
+    /// Enter in the focused box: append the reply to the box (the running
+    /// conversation stays visible) and send it to the navigator as a
+    /// comment-only turn carrying the note's context.
+    fn submit_comment_reply(&mut self) {
+        let Some(focus) = self.editor.comment_focus.clone() else {
+            return;
+        };
+        let reply = focus.reply.trim().to_string();
+        if reply.is_empty() {
+            return;
+        }
+        let Some(host) = &self.pair_host else {
+            self.status =
+                String::from("Navigator is not active (run croft pair in this workspace)");
+            return;
+        };
+        if host.is_busy() {
+            self.status = format!("{} is mid-turn; wait for it to finish", host.name());
+            return;
+        }
+        let Some(file) = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&self.tree.root, p))
+        else {
+            self.status = String::from("Reply: no active workspace file");
+            return;
+        };
+        let Some((_, row, note_body)) = self
+            .navigator_notes
+            .get(&file)
+            .and_then(|notes| notes.iter().find(|(id, ..)| *id == focus.id))
+            .cloned()
+        else {
+            self.status = String::from("That comment is gone");
+            self.editor.comment_focus = None;
+            return;
+        };
+        let content = self.editor.lines.join("\n");
+        host.append_to_note(focus.id, &format!("you: {reply}"));
+        match host.send_reply_turn(&file, row, &note_body, &reply, &content) {
+            Ok(()) => {
+                self.pair_turn_origin = Some((file, row));
+                self.status = format!("Replied to {}", host.name());
+                self.editor.comment_focus = None;
+            }
+            Err(e) => self.status = format!("Reply failed: {e}"),
+        }
+    }
+
+    /// Dismiss one comment box: drop the note from the pilot's state and
+    /// from the local snapshot (the next poll would resurrect it otherwise
+    /// only if the pilot still had it).
+    fn ignore_comment_box(&mut self, id: u64) {
+        if let Some(host) = &self.pair_host {
+            host.remove_note(id);
+        }
+        for notes in self.navigator_notes.values_mut() {
+            notes.retain(|(nid, ..)| *nid != id);
+        }
+        if self
+            .editor
+            .comment_focus
+            .as_ref()
+            .is_some_and(|f| f.id == id)
+        {
+            self.editor.comment_focus = None;
+        }
+        self.status = String::from("Comment ignored");
+    }
+
+    /// Shift+F4 / palette: ignore the focused box, or the next one from the
+    /// caret when none is focused.
+    fn ignore_focused_comment(&mut self) {
+        let id = self
+            .editor
+            .comment_focus
+            .as_ref()
+            .map(|f| f.id)
+            .or_else(|| self.next_comment_from_caret().map(|(id, _)| id));
+        match id {
+            Some(id) => self.ignore_comment_box(id),
+            None => self.status = String::from("No navigator comments in this file"),
+        }
+    }
+
+    /// The active file's next comment from the caret (by row, wrapping):
+    /// (id, row).
+    fn next_comment_from_caret(&self) -> Option<(u64, usize)> {
+        let file = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&self.tree.root, p))?;
+        let notes = self.navigator_notes.get(&file).filter(|n| !n.is_empty())?;
+        let here = self
+            .editor
+            .comment_focus
+            .as_ref()
+            .and_then(|f| notes.iter().find(|(id, ..)| *id == f.id))
+            .map(|(_, row, _)| *row)
+            .unwrap_or(self.editor.cursor_row);
+        let idx = next_note_by_row(notes, here);
+        Some((notes[idx].0, notes[idx].1))
     }
 
     /// Open the ask box: an instruction input for the resident navigator,
@@ -16076,6 +16281,8 @@ impl App {
         match host.send_yield_turn(&file, &content) {
             Ok(()) => {
                 self.status = format!("Yielded {file} to {} (comment-only turn)", host.name());
+                // Anchor the turn's prose commentary at the caret.
+                self.pair_turn_origin = Some((file, self.editor.cursor_row));
             }
             Err(e) => self.status = format!("Yield failed: {e}"),
         }
@@ -16112,95 +16319,36 @@ impl App {
         }
     }
 
-    /// Palette: drop every navigator note — the pilot's anchors, the
-    /// per-file snapshots, the gutter diamonds, and any open popup.
+    /// Palette: drop every navigator comment — the pilot's anchors, the
+    /// per-file snapshots, and the boxes they feed.
     fn clear_navigator_notes(&mut self) {
         if let Some(host) = &self.pair_host {
             host.clear_notes();
         }
         self.navigator_notes.clear();
-        self.editor.note_lines.clear();
-        self.note_popup = None;
-        self.status = String::from("Navigator notes cleared");
+        self.editor.comment_boxes.clear();
+        self.editor.comment_focus = None;
+        self.status = String::from("Navigator comments cleared");
     }
 
-    /// F4: jump the caret to the active file's next navigator note (by row,
-    /// wrapping) and open its popup.
-    fn cycle_navigator_note(&mut self) {
-        let Some(file) = self
-            .editor
-            .path
-            .as_ref()
-            .and_then(|p| collab_file_key(&self.tree.root, p))
-        else {
-            self.status = String::from("Navigator notes: no active file");
+    /// F4: focus the active file's next comment box (by row, wrapping),
+    /// jumping the caret to its anchor line so the box scrolls into view.
+    fn cycle_comment_box(&mut self) {
+        let Some((id, row)) = self.next_comment_from_caret() else {
+            self.status = String::from("No navigator comments in this file");
             return;
         };
-        let Some(notes) = self.navigator_notes.get(&file).filter(|n| !n.is_empty()) else {
-            self.status = String::from("No navigator notes in this file");
-            return;
-        };
-        let here = self.editor.cursor_row;
-        let idx = next_note_by_row(notes, here);
-        let row = notes[idx].0.min(self.editor.lines.len().saturating_sub(1));
-        let path = self.editor.path.clone().expect("checked above");
+        let row = row.min(self.editor.lines.len().saturating_sub(1));
+        let path = self.editor.path.clone().expect("comments imply a file");
         match self.open_at(&path, row, 0) {
             Ok(()) => {
-                self.note_probe = Some((path, self.editor.cursor_row));
-                self.note_popup = Some((file, idx));
+                self.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+                    id,
+                    reply: String::new(),
+                    cursor: 0,
+                });
             }
-            Err(e) => self.status = format!("Navigator note jump failed: {e}"),
-        }
-    }
-
-    /// The navigator note popup, anchored to its noted line: a bordered
-    /// box whose header names the navigator, the line, and the dismiss and
-    /// cycle keys. Painted only while the noted file is active and its row
-    /// is on screen.
-    fn render_note_popup(&mut self, frame: &mut ratatui::Frame) {
-        let Some((file, idx)) = self.note_popup.clone() else {
-            return;
-        };
-        let active = self
-            .editor
-            .path
-            .as_ref()
-            .and_then(|p| collab_file_key(&self.tree.root, p));
-        if active.as_deref() != Some(file.as_str()) {
-            return;
-        }
-        let note = self
-            .navigator_notes
-            .get(&file)
-            .and_then(|n| n.get(idx))
-            .cloned();
-        let Some((row, body)) = note else {
-            self.note_popup = None; // the note was superseded
-            return;
-        };
-        // Anchor at the note's first visual row in this frame's geometry
-        // (scrolled off screen = nothing to anchor to).
-        let Some(anchor_y) = self.editor.screen_row_of_line(row) else {
-            return;
-        };
-        let name = self
-            .pair_host
-            .as_ref()
-            .map(|h| h.name().to_string())
-            .unwrap_or_else(|| String::from("navigator"));
-        let header = format!("\u{25c6} {name} · line {} · Esc dismiss · F4 next", row + 1);
-        let inner = self.editor.last_inner;
-        let mut popup = crate::widgets::hover_popup::HoverPopup::new(
-            format!("{header}\n{body}"),
-            (
-                inner.x.saturating_add(self.editor.last_gutter_width + 1),
-                anchor_y,
-            ),
-        );
-        popup.gradient = self.popup_gradient();
-        let area = popup.area_for(frame.area());
-        if area.width > 0 && area.height > 0 {
-            frame.render_widget(&popup, area);
+            Err(e) => self.status = format!("Comment jump failed: {e}"),
         }
     }
 
@@ -17920,16 +18068,17 @@ impl App {
             self.dismiss_signature_help();
             return;
         }
-        // Esc dismisses the navigator note popup next, before the selection
-        // clear below — reading a note must not cost the selection.
-        if self.note_popup.is_some() && matches!(key.code, KeyCode::Esc) {
-            self.note_popup = None;
-            return;
-        }
-        // F4: cycle to the active file's next navigator note.
-        if matches!(key.code, KeyCode::F(4)) && key.modifiers.is_empty() {
-            self.cycle_navigator_note();
-            return;
+        // F4: focus the active file's next navigator comment box;
+        // Shift+F4 ignores the nearest one.
+        if matches!(key.code, KeyCode::F(4)) {
+            if key.modifiers == KeyModifiers::SHIFT {
+                self.ignore_focused_comment();
+                return;
+            }
+            if key.modifiers.is_empty() {
+                self.cycle_comment_box();
+                return;
+            }
         }
         if is_completion_trigger_key(key) {
             self.trigger_completion();
@@ -22088,6 +22237,8 @@ impl App {
             Cmd::YieldToNavigator => self.yield_to_navigator(),
             Cmd::ToggleNavigator => self.toggle_navigator(),
             Cmd::ClearNavigatorNotes => self.clear_navigator_notes(),
+            Cmd::NextComment => self.cycle_comment_box(),
+            Cmd::IgnoreComment => self.ignore_focused_comment(),
             Cmd::RunTask => self.open_run_task_picker(),
             Cmd::RunBuildTask => self.run_build_task(),
             Cmd::RerunLastTask => self.rerun_last_task(),
@@ -25478,21 +25629,40 @@ impl App {
                         self.collab_cancel_stream();
                         return;
                     }
-                    // Navigator note diamond: open the clicked line's note
-                    // popup (same borrowed cell rules as the stop button).
-                    if let Some(line) = self.editor.note_glyph_at(m.column, m.row)
-                        && let Some(file) = self
-                            .editor
-                            .path
-                            .as_ref()
-                            .and_then(|p| collab_file_key(&self.tree.root, p))
-                        && let Some(idx) = self
-                            .navigator_notes
-                            .get(&file)
-                            .and_then(|notes| notes.iter().position(|(r, _)| *r == line))
-                    {
-                        self.note_popup = Some((file, idx));
+                    // Comment-box surfaces: ✕ Ignore dismisses the box; the
+                    // footer's reply field (or the body) focuses it, placing
+                    // the caret where the click landed in the field.
+                    if let Some((id, hit)) = self.editor.comment_box_hit(m.column, m.row) {
+                        use crate::widgets::editor::CommentHit;
+                        match hit {
+                            CommentHit::Ignore => self.ignore_comment_box(id),
+                            CommentHit::Reply | CommentHit::Body => {
+                                let keep = self.editor.comment_focus.take().filter(|f| f.id == id);
+                                let mut focus =
+                                    keep.unwrap_or(crate::widgets::editor::CommentFocus {
+                                        id,
+                                        reply: String::new(),
+                                        cursor: 0,
+                                    });
+                                if hit == CommentHit::Reply {
+                                    let text_x = self.editor.last_inner.x
+                                        + self.editor.last_gutter_width
+                                        + 1;
+                                    // `╰ ❯ ` occupies 4 cells before the field.
+                                    let rel = (m.column.saturating_sub(text_x) as usize)
+                                        .saturating_sub(4);
+                                    focus.cursor = rel.min(focus.reply.chars().count());
+                                } else {
+                                    focus.cursor = focus.reply.chars().count();
+                                }
+                                self.editor.comment_focus = Some(focus);
+                            }
+                        }
                         return;
+                    }
+                    // Any other editor press releases a focused reply field.
+                    if self.editor.comment_focus.is_some() {
+                        self.editor.comment_focus = None;
                     }
                     // Gutter play glyph: run the test fn defined on the
                     // clicked line (VS Code's run bead); Alt+click debugs it
@@ -29237,13 +29407,13 @@ fn is_extensions_jump_key(key: KeyEvent) -> bool {
 /// with the smallest row strictly greater than `here`, wrapping to the
 /// smallest row overall. `notes` are in landing (stream) order, not row
 /// order, so a naive `position(row > here)` would skip notes and could stick.
-fn next_note_by_row(notes: &[(usize, String)], here: usize) -> usize {
+fn next_note_by_row(notes: &[(u64, usize, String)], here: usize) -> usize {
     notes
         .iter()
         .enumerate()
-        .filter(|(_, (row, _))| *row > here)
-        .min_by_key(|(_, (row, _))| *row)
-        .or_else(|| notes.iter().enumerate().min_by_key(|(_, (row, _))| *row))
+        .filter(|(_, (_, row, _))| *row > here)
+        .min_by_key(|(_, (_, row, _))| *row)
+        .or_else(|| notes.iter().enumerate().min_by_key(|(_, (_, row, _))| *row))
         .map(|(i, _)| i)
         .unwrap_or(0)
 }
@@ -31962,7 +32132,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let dap_changed = app.poll_dap();
         let tests_changed = app.test_worker.drain(&mut app.testing);
         let mcp_changed = app.poll_mcp();
-        let pair_changed = app.maybe_seat_navigator() | app.poll_pair() | app.refresh_note_popup();
+        let pair_changed = app.maybe_seat_navigator() | app.poll_pair();
         let voice_changed = app.drain_voice();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.

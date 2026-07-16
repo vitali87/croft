@@ -1162,6 +1162,66 @@ impl ExternalReloadReport {
     }
 }
 
+/// The navigator's accent color (the same orange its note ◆ wore).
+const COMMENT_BOX_ACCENT: Color = Color::Rgb(0xff, 0x9d, 0x2f);
+/// Columns of the comment-box footer tail ` ✕ Ignore ╯`.
+const IGNORE_TAIL_COLS: usize = 11;
+
+/// One comment box: the AI pair programmer's voice, anchored below a buffer
+/// line. Rendered as an unnumbered block (title, body, reply field + Ignore
+/// button); it never touches the buffer text and is never saved. The App
+/// feeds these per tick from the pair host's note snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommentBox {
+    /// The note's stable id in the pilot's state (Ignore removes it, a
+    /// reply appends to it).
+    pub id: u64,
+    /// 0-based buffer line the box hangs under.
+    pub line: usize,
+    /// The navigator's caret name, shown in the title row.
+    pub author: String,
+    /// Body text; replies append as further lines.
+    pub body: String,
+}
+
+/// What a click inside a comment box landed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommentHit {
+    /// The title or body area: focus the box.
+    Body,
+    /// The footer's reply field: focus and place the caret.
+    Reply,
+    /// The footer's ✕ Ignore button: dismiss the box.
+    Ignore,
+}
+
+/// The reply draft in the focused box's footer field. While set, typing goes
+/// here instead of the buffer (the App routes keys).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommentFocus {
+    /// Which box is focused (its [`CommentBox::id`]).
+    pub id: u64,
+    /// The draft text.
+    pub reply: String,
+    /// Caret position in chars within `reply`.
+    pub cursor: usize,
+}
+
+/// One visual row of the painted layout: a buffer line's wrap segment
+/// (`Text`), or one row of a comment box, which belongs to no buffer line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VisRow {
+    /// `line`'s chars `[start, end)` (the whole visible span when not
+    /// wrapping).
+    Text {
+        line: usize,
+        start: usize,
+        end: usize,
+    },
+    /// Row `box_row` (0-based within the block) of `comment_boxes[box_idx]`.
+    Box { box_idx: usize, box_row: usize },
+}
+
 /// The line-ending style of the open buffer, shown in the status bar and
 /// applied when saving. Detected on open (CRLF if any `\r\n` is present);
 /// the user can switch it from the status bar, converting on the next save.
@@ -1372,7 +1432,8 @@ pub struct Editor {
     /// one entry per visible line with the range `[scroll_col, scroll_col +
     /// text_width)`. `cursor_screen_pos`/`buffer_pos_at` invert it so the
     /// cursor and clicks land on the right cell regardless of wrapping.
-    last_wrap_rows: Vec<(usize, usize, usize)>,
+    /// Comment-box rows appear inline as `VisRow::Box` entries.
+    last_wrap_rows: Vec<VisRow>,
     pub last_gutter_width: u16,
     pub selection: Option<EditorSelection>,
     /// Secondary carets for multi-cursor editing (VS Code "Change All
@@ -1398,11 +1459,15 @@ pub struct Editor {
     /// stream and reverts the streamed text. The App rebuilds this before
     /// each render from the stream state and the pilot's ghost caret.
     pub stream_stop_line: Option<usize>,
-    /// 0-based buffer lines carrying a navigator note (`croft pair`): each
-    /// wears an orange ◆ in the sign margin; clicking one opens the note
-    /// popup. The App rebuilds this per tick from the pilot host's
-    /// anchored-note snapshot for the active file.
-    pub note_lines: Vec<usize>,
+    /// The AI pair programmer's comment boxes for this buffer: each renders
+    /// as an unnumbered block between its anchor line and the next line
+    /// (title, body, reply field + Ignore button). The App rebuilds this per
+    /// tick from the pilot host's anchored-note snapshot for the active
+    /// file; boxes belong to no buffer line and never touch the text.
+    pub comment_boxes: Vec<CommentBox>,
+    /// The reply draft riding the focused box's footer field. While set,
+    /// the App routes typing here instead of the buffer.
+    pub comment_focus: Option<CommentFocus>,
     /// Enclosing scope header lines to pin at the top of the viewport (VS Code
     /// "Sticky Scroll"), outermost first, set by `App` from the outline scope
     /// chain of the top visible line. Empty disables the feature (e.g. wrap
@@ -1616,7 +1681,8 @@ impl Editor {
             ghost_carets: Vec::new(),
             ghost_caret_labels: Vec::new(),
             stream_stop_line: None,
-            note_lines: Vec::new(),
+            comment_boxes: Vec::new(),
+            comment_focus: None,
             sticky_lines: Vec::new(),
             sticky_click_rows: Vec::new(),
             box_anchor: None,
@@ -1722,7 +1788,7 @@ impl Editor {
         let line = if self.last_wrap_rows.is_empty() {
             self.scroll + vis_row
         } else {
-            self.last_wrap_rows.get(vis_row)?.0
+            self.text_row(vis_row)?.0
         };
         (line < self.lines.len()).then_some(line)
     }
@@ -1734,8 +1800,7 @@ impl Editor {
         if col != self.last_inner.x + 1 || row < self.last_inner.y {
             return false;
         }
-        let Some(&(line, start, _)) = self.last_wrap_rows.get((row - self.last_inner.y) as usize)
-        else {
+        let Some((line, start, _)) = self.text_row((row - self.last_inner.y) as usize) else {
             return false;
         };
         // The chevron draws only on a header's first visual row.
@@ -1756,9 +1821,7 @@ impl Editor {
         if col != self.last_inner.x || row < self.last_inner.y {
             return None;
         }
-        let &(line, start, _) = self
-            .last_wrap_rows
-            .get((row - self.last_inner.y) as usize)?;
+        let (line, start, _) = self.text_row((row - self.last_inner.y) as usize)?;
         // The glyph draws only on the definition's first visual row.
         if self.wrap_enabled() && start != 0 {
             return None;
@@ -1776,8 +1839,7 @@ impl Editor {
         if col != self.last_inner.x || row < self.last_inner.y {
             return false;
         }
-        let Some(&(line, start, _)) = self.last_wrap_rows.get((row - self.last_inner.y) as usize)
-        else {
+        let Some((line, start, _)) = self.text_row((row - self.last_inner.y) as usize) else {
             return false;
         };
         if self.wrap_enabled() && start != 0 {
@@ -1791,24 +1853,8 @@ impl Editor {
     pub fn screen_row_of_line(&self, line: usize) -> Option<u16> {
         self.last_wrap_rows
             .iter()
-            .position(|&(l, _, _)| l == line)
+            .position(|r| matches!(r, VisRow::Text { line: l, .. } if *l == line))
             .map(|idx| self.last_inner.y.saturating_add(idx as u16))
-    }
-
-    /// The noted 0-based line when `(col, row)` lands on a navigator note
-    /// diamond in the sign margin: same geometry as
-    /// [`test_glyph_at`](Self::test_glyph_at), first visual row only.
-    pub fn note_glyph_at(&self, col: u16, row: u16) -> Option<usize> {
-        if col != self.last_inner.x || row < self.last_inner.y {
-            return None;
-        }
-        let &(line, start, _) = self
-            .last_wrap_rows
-            .get((row - self.last_inner.y) as usize)?;
-        if self.wrap_enabled() && start != 0 {
-            return None;
-        }
-        self.note_lines.contains(&line).then_some(line)
     }
 
     /// 1-based breakpoint lines for `path`, ascending, for a DAP
@@ -2026,6 +2072,200 @@ impl Editor {
         cols
     }
 
+    // -- Comment-box geometry ----------------------------------------------
+    // Comment boxes are unnumbered blocks rendered between a buffer line and
+    // the next. They add visual rows without owning buffer positions; every
+    // helper here is O(#boxes) and short-circuits to zero when no box is
+    // present, so the hot path pays nothing.
+
+    /// The layout entry at visual index `i` when it is a buffer-text row
+    /// (None = out of range or a comment-box row). The one funnel every
+    /// visual-row inversion goes through.
+    fn text_row(&self, i: usize) -> Option<(usize, usize, usize)> {
+        match self.last_wrap_rows.get(i)? {
+            VisRow::Text { line, start, end } => Some((*line, *start, *end)),
+            VisRow::Box { .. } => None,
+        }
+    }
+
+    /// The wrapped display lines of a box body at `bw` columns (its inner
+    /// text width). Bodies are short; this allocates only while boxes exist.
+    fn comment_body_lines(body: &str, bw: usize) -> Vec<String> {
+        let bw = bw.max(8);
+        let mut out = Vec::new();
+        for line in body.split('\n') {
+            let chars: Vec<char> = line.chars().collect();
+            for &(s, e) in &wrap_segments(&chars, bw) {
+                out.push(chars[s..e].iter().collect());
+            }
+        }
+        if out.is_empty() {
+            out.push(String::new());
+        }
+        out
+    }
+
+    /// Total rows `comment_boxes[idx]` occupies at text width `tw`:
+    /// title + wrapped body + footer.
+    fn comment_box_height(&self, idx: usize, tw: usize) -> usize {
+        let body = &self.comment_boxes[idx].body;
+        2 + Self::comment_body_lines(body, tw.saturating_sub(4)).len()
+    }
+
+    /// Rows contributed by the boxes anchored under `line` at width `tw`.
+    fn box_rows_at_line(&self, line: usize, tw: usize) -> usize {
+        if self.comment_boxes.is_empty() {
+            return 0;
+        }
+        (0..self.comment_boxes.len())
+            .filter(|&i| self.comment_boxes[i].line == line)
+            .map(|i| self.comment_box_height(i, tw))
+            .sum()
+    }
+
+    /// Rows contributed by boxes anchored under lines `[from, to)`.
+    fn box_rows_between(&self, from: usize, to: usize, tw: usize) -> usize {
+        if self.comment_boxes.is_empty() {
+            return 0;
+        }
+        (0..self.comment_boxes.len())
+            .filter(|&i| {
+                let l = self.comment_boxes[i].line;
+                l >= from && l < to
+            })
+            .map(|i| self.comment_box_height(i, tw))
+            .sum()
+    }
+
+    /// Paint one row of a comment box: blank unnumbered gutter, then the
+    /// block chrome. Rows: 0 = title (author), middle = body, last = footer
+    /// (reply field left, ✕ Ignore right).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_comment_box_row(
+        &self,
+        buf: &mut ratatui::buffer::Buffer,
+        inner: Rect,
+        y: u16,
+        gutter_width: u16,
+        text_x: u16,
+        text_width: u16,
+        box_idx: usize,
+        box_row: usize,
+    ) {
+        // The whole gutter goes blank: no number, no glyphs, no git bar.
+        buf.set_line(
+            inner.x,
+            y,
+            &Line::from(" ".repeat(gutter_width as usize + 1)),
+            gutter_width + 1,
+        );
+        let w = text_width as usize;
+        if w < 8 {
+            return;
+        }
+        let b = &self.comment_boxes[box_idx];
+        let accent = Style::default()
+            .fg(COMMENT_BOX_ACCENT)
+            .bg(self.theme.sticky_scroll_bg());
+        let body_st = Style::default().bg(self.theme.sticky_scroll_bg());
+        let dim = Style::default()
+            .fg(Color::DarkGray)
+            .bg(self.theme.sticky_scroll_bg());
+        let height = self.comment_box_height(box_idx, w);
+        let pad = |s: &str, n: usize| -> String {
+            let mut out: String = s.chars().take(n).collect();
+            while out.chars().count() < n {
+                out.push(' ');
+            }
+            out
+        };
+        let line = if box_row == 0 {
+            let head = format!("\u{256d}\u{2500} \u{25c6} {} ", b.author);
+            let fill = w.saturating_sub(head.chars().count() + 1);
+            Line::from(Span::styled(
+                format!("{head}{}\u{256e}", "\u{2500}".repeat(fill)),
+                accent,
+            ))
+        } else if box_row + 1 < height {
+            let body_lines = Self::comment_body_lines(&b.body, w.saturating_sub(4));
+            let text = body_lines.get(box_row - 1).cloned().unwrap_or_default();
+            Line::from(vec![
+                Span::styled("\u{2502} ", accent),
+                Span::styled(pad(&text, w - 4), body_st),
+                Span::styled(" \u{2502}", accent),
+            ])
+        } else {
+            // Footer: `╰ ❯ <reply>            ✕ Ignore ╯`
+            let focus = self.comment_focus.as_ref().filter(|f| f.id == b.id);
+            let field_w = w.saturating_sub(4 + IGNORE_TAIL_COLS);
+            let (draft, style) = match focus {
+                Some(f) => (pad(&f.reply, field_w), body_st),
+                None => (pad("Reply", field_w), dim),
+            };
+            let mut spans = vec![
+                Span::styled("\u{2570} ", accent),
+                Span::styled("\u{276f} ", accent),
+            ];
+            match focus {
+                Some(f) if f.cursor < field_w => {
+                    // Split the draft around the caret cell so it shows.
+                    let chars: Vec<char> = draft.chars().collect();
+                    let before: String = chars[..f.cursor].iter().collect();
+                    let at: String = chars[f.cursor..=f.cursor].iter().collect();
+                    let after: String = chars[f.cursor + 1..].iter().collect();
+                    spans.push(Span::styled(before, style));
+                    spans.push(Span::styled(
+                        at,
+                        style.add_modifier(ratatui::style::Modifier::REVERSED),
+                    ));
+                    spans.push(Span::styled(after, style));
+                }
+                _ => spans.push(Span::styled(draft, style)),
+            }
+            spans.push(Span::styled(" \u{2715} Ignore ", accent));
+            spans.push(Span::styled("\u{256f}", accent));
+            Line::from(spans)
+        };
+        buf.set_line(text_x, y, &line, text_width);
+        // Ensure the block's background reaches the right edge even when a
+        // span fell short (padding already covers the normal case).
+        for x in text_x..text_x + text_width {
+            if buf[(x, y)].symbol() == " " && buf[(x, y)].style().bg.is_none() {
+                buf[(x, y)].set_style(body_st);
+            }
+        }
+    }
+
+    /// What a click at screen `(col, row)` hits inside a comment box:
+    /// Ignore on the footer's ✕ Ignore cells, Reply on the rest of the
+    /// footer, Body anywhere else in the block. None = not a box row.
+    pub fn comment_box_hit(&self, col: u16, row: u16) -> Option<(u64, CommentHit)> {
+        if self.comment_boxes.is_empty() {
+            return None;
+        }
+        let inner = self.last_inner;
+        if row < inner.y || col < inner.x {
+            return None;
+        }
+        let VisRow::Box { box_idx, box_row } =
+            *self.last_wrap_rows.get((row - inner.y) as usize)?
+        else {
+            return None;
+        };
+        let b = &self.comment_boxes[box_idx];
+        let text_x = inner.x + self.last_gutter_width + 1;
+        let w = self.visible_text_width();
+        if box_row + 1 == self.comment_box_height(box_idx, w) {
+            // Footer: the ` ✕ Ignore ╯` tail owns its cells.
+            let rel = (col.saturating_sub(text_x)) as usize;
+            if rel + IGNORE_TAIL_COLS >= w && rel < w {
+                return Some((b.id, CommentHit::Ignore));
+            }
+            return Some((b.id, CommentHit::Reply));
+        }
+        Some((b.id, CommentHit::Body))
+    }
+
     // -- Soft-wrap visual-row geometry ------------------------------------
     // In wrap mode a logical line maps to one or more visual rows. These
     // helpers convert between logical positions and the flattened visual-row
@@ -2056,30 +2296,45 @@ impl Editor {
         }
     }
 
-    /// Total visual rows across the whole buffer, cached per text width.
+    /// Visual rows of `line`'s whole group: its wrap segments plus the
+    /// comment-box rows hanging under it. All flattened visual-row math
+    /// (totals, viewport top, cursor row, decomposition) speaks group rows
+    /// so boxes shift everything below them consistently.
+    fn group_visual_rows(&self, line: usize, width: usize) -> usize {
+        self.line_visual_rows(line, width) + self.box_rows_at_line(line, width)
+    }
+
+    /// Total visual rows across the whole buffer. The text-only total is
+    /// cached per width; box rows are added fresh (boxes are few and can
+    /// change between frames without touching the buffer).
     fn total_visual_rows(&mut self, width: usize) -> usize {
-        if let Some(&(_, total)) = self.wrap_total_cache.iter().find(|&&(w, _)| w == width) {
-            return total;
-        }
-        let total: usize = (0..self.lines.len())
-            .map(|l| self.line_visual_rows(l, width))
-            .sum();
-        self.wrap_total_cache.push((width, total));
-        total
+        let text =
+            if let Some(&(_, total)) = self.wrap_total_cache.iter().find(|&&(w, _)| w == width) {
+                total
+            } else {
+                let total: usize = (0..self.lines.len())
+                    .map(|l| self.line_visual_rows(l, width))
+                    .sum();
+                self.wrap_total_cache.push((width, total));
+                total
+            };
+        text + self.box_rows_between(0, self.lines.len(), width)
     }
 
     /// Visual-row index of the current viewport top `(scroll, scroll_sub)`.
     fn top_visual_row(&self, width: usize) -> usize {
         (0..self.scroll)
-            .map(|l| self.line_visual_rows(l, width))
+            .map(|l| self.group_visual_rows(l, width))
             .sum::<usize>()
             + self.scroll_sub
     }
 
-    /// Visual-row index of the segment containing the cursor.
+    /// Visual-row index of the segment containing the cursor. A box under
+    /// the cursor's own line renders below its segments, so only boxes on
+    /// earlier lines shift the cursor.
     fn cursor_visual_row(&self, width: usize) -> usize {
         let before: usize = (0..self.cursor_row)
-            .map(|l| self.line_visual_rows(l, width))
+            .map(|l| self.group_visual_rows(l, width))
             .sum();
         before + self.segment_index_of_col(self.cursor_row, self.cursor_col, width)
     }
@@ -2104,30 +2359,54 @@ impl Editor {
     fn set_top_to_visual_row(&mut self, target: usize, width: usize) {
         let mut acc = 0;
         for line in 0..self.lines.len() {
-            let n = self.line_visual_rows(line, width);
+            let n = self.group_visual_rows(line, width);
             if acc + n > target {
                 self.scroll = line;
+                // scroll_sub may point into the line's box region (past its
+                // segments); the layout builder starts mid-box then.
                 self.scroll_sub = target - acc;
                 return;
             }
             acc += n;
         }
         self.scroll = self.lines.len().saturating_sub(1);
-        self.scroll_sub = self.line_visual_rows(self.scroll, width).saturating_sub(1);
+        self.scroll_sub = self.group_visual_rows(self.scroll, width).saturating_sub(1);
     }
 
     /// Logical `(line, char_col)` at the start of a global visual row -
-    /// the inverse of `cursor_visual_row` for the row's first column.
+    /// the inverse of `cursor_visual_row` for the row's first column. A
+    /// target inside a line's comment-box region snaps to that line's last
+    /// segment (a box row has no buffer position of its own).
     fn logical_pos_at_visual_row(&self, target: usize, width: usize) -> (usize, usize) {
         let mut acc = 0;
         for line in 0..self.lines.len() {
             let segs = self.line_segments(line, width);
-            if acc + segs.len() > target {
-                return (line, segs[target - acc].0);
+            let group = segs.len() + self.box_rows_at_line(line, width);
+            if acc + group > target {
+                let idx = (target - acc).min(segs.len().saturating_sub(1));
+                return (line, segs[idx].0);
             }
-            acc += segs.len();
+            acc += group;
         }
         (self.lines.len().saturating_sub(1), 0)
+    }
+
+    /// True when global visual row `target` falls inside a comment-box
+    /// region (no buffer position). Cursor motion steps over these.
+    fn visual_row_is_box(&self, target: usize, width: usize) -> bool {
+        if self.comment_boxes.is_empty() {
+            return false;
+        }
+        let mut acc = 0;
+        for line in 0..self.lines.len() {
+            let segs = self.line_visual_rows(line, width);
+            let group = segs + self.box_rows_at_line(line, width);
+            if acc + group > target {
+                return target - acc >= segs;
+            }
+            acc += group;
+        }
+        false
     }
 
     /// Move the wrap viewport so the given visual row is at the top, clamped to
@@ -2169,8 +2448,13 @@ impl Editor {
         let seg_idx = self.segment_index_of_col(self.cursor_row, self.cursor_col, width);
         let goal_col = self.cursor_col - segs[seg_idx].0;
         let current = self.cursor_visual_row(width) as isize;
-        let target = current + dir;
-        if target < 0 || target as usize >= self.total_visual_rows(width) {
+        let total = self.total_visual_rows(width) as isize;
+        let mut target = current + dir;
+        // Step over comment-box rows: the caret never enters a box.
+        while target >= 0 && target < total && self.visual_row_is_box(target as usize, width) {
+            target += dir;
+        }
+        if target < 0 || target >= total {
             return;
         }
         let (line, seg_start) = self.logical_pos_at_visual_row(target as usize, width);
@@ -5500,11 +5784,21 @@ impl Editor {
         // the last visual row clamps to it. The map is empty only before the
         // first paint, when nothing can be wrapped or folded and the linear
         // map is exact.
-        let (target_line, target_col) = match self
-            .last_wrap_rows
-            .get(row_idx.min(self.last_wrap_rows.len().saturating_sub(1)))
+        // A press on a comment-box row leaves the caret alone (the App
+        // intercepts box clicks; this is the belt-and-braces path). A press
+        // below the last visual row clamps to the nearest text row above.
+        let clamped = row_idx.min(self.last_wrap_rows.len().saturating_sub(1));
+        let nearest_text = (0..=clamped)
+            .rev()
+            .find_map(|i| self.text_row(i).map(|t| (i, t)));
+        if !self.last_wrap_rows.is_empty()
+            && row_idx < self.last_wrap_rows.len()
+            && self.text_row(row_idx).is_none()
         {
-            Some(&(line, start, end)) => {
+            return;
+        }
+        let (target_line, target_col) = match nearest_text {
+            Some((_, (line, start, end))) => {
                 // In wrap mode a drag past a segment's right edge stops at the
                 // segment end; non-wrap keeps the click-to-line-end behaviour.
                 let cap = if self.wrap_enabled() { end } else { usize::MAX };
@@ -5532,9 +5826,7 @@ impl Editor {
             // a click lands on the right logical line/column even when wrapped.
             // The blank tail of a folded row maps to the segment end, letting
             // you click to end-of-visual-line.
-            let &(line, start, end) = self
-                .last_wrap_rows
-                .get((row - self.last_inner.y) as usize)?;
+            let (line, start, end) = self.text_row((row - self.last_inner.y) as usize)?;
             if col < text_x {
                 return None;
             }
@@ -5542,11 +5834,16 @@ impl Editor {
             let char_col = (start + visible_col).min(end).min(self.line_char_len(line));
             return Some((line, char_col));
         }
-        // Non-wrap: one row per line, horizontally scrolled by `scroll_col`.
+        // Non-wrap: map through the painted layout (comment boxes shift the
+        // rows below them); before the first paint the linear map is exact.
         if row >= self.last_inner.y + self.last_inner.height {
             return None;
         }
-        let line = self.scroll + (row - self.last_inner.y) as usize;
+        let line = if self.last_wrap_rows.is_empty() {
+            self.scroll + (row - self.last_inner.y) as usize
+        } else {
+            self.text_row((row - self.last_inner.y) as usize)?.0
+        };
         if line >= self.lines.len() || col < text_x {
             return None;
         }
@@ -6301,10 +6598,27 @@ impl Widget for &mut Editor {
                 } else if self.cursor_row >= self.scroll + text_height {
                     self.scroll = self.cursor_row + 1 - text_height;
                 }
+                // Comment boxes between the top and the cursor consume rows;
+                // scroll further until the cursor's painted row fits. Boxes
+                // are measured at the pre-scrollbar width, one column
+                // narrower than the final text column, which can only
+                // overestimate their height (the cursor stays visible).
+                if !self.comment_boxes.is_empty() {
+                    let bw = inner.width.saturating_sub(gutter_width + 3) as usize;
+                    while self.cursor_row + self.box_rows_between(self.scroll, self.cursor_row, bw)
+                        >= self.scroll + text_height
+                    {
+                        self.scroll += 1;
+                    }
+                }
             }
+            let box_rows = {
+                let bw = inner.width.saturating_sub(gutter_width + 3) as usize;
+                self.box_rows_between(0, self.lines.len(), bw)
+            };
             let metrics = scrollbar::vertical_metrics(
                 scrollbar_area,
-                self.lines.len(),
+                self.lines.len() + box_rows,
                 text_height,
                 self.scroll,
             );
@@ -6338,7 +6652,36 @@ impl Widget for &mut Editor {
         // char_end). Non-wrap: one row per visible line, range [scroll_col,
         // scroll_col + text_width). Wrap: the wrapped segments from
         // (scroll, scroll_sub) down, capped at the viewport height.
-        let mut visual_rows: Vec<(usize, usize, usize)> = Vec::with_capacity(text_height);
+        let mut visual_rows: Vec<VisRow> = Vec::with_capacity(text_height);
+        // The boxes hanging under a line, emitted right after its last
+        // segment. `group_pos` is the row's index within the line's whole
+        // group (segments first, then box rows) so a wrap viewport top that
+        // decomposed into a box region resumes mid-box.
+        let push_box_rows = |rows: &mut Vec<VisRow>,
+                             ed: &Editor,
+                             line: usize,
+                             skip: usize,
+                             seg_count: usize,
+                             tw: usize| {
+            if ed.comment_boxes.is_empty() {
+                return;
+            }
+            let mut group_pos = seg_count;
+            for idx in 0..ed.comment_boxes.len() {
+                if ed.comment_boxes[idx].line != line {
+                    continue;
+                }
+                for box_row in 0..ed.comment_box_height(idx, tw) {
+                    if group_pos >= skip && rows.len() < text_height {
+                        rows.push(VisRow::Box {
+                            box_idx: idx,
+                            box_row,
+                        });
+                    }
+                    group_pos += 1;
+                }
+            }
+        };
         if wrap {
             let tw = text_width as usize;
             let mut line = self.scroll;
@@ -6348,29 +6691,37 @@ impl Widget for &mut Editor {
                     line += 1;
                     continue;
                 }
-                for (i, &(s, e)) in self.line_segments(line, tw).iter().enumerate() {
+                let segs = self.line_segments(line, tw);
+                for (i, &(s, e)) in segs.iter().enumerate() {
                     if i < skip {
                         continue;
                     }
-                    visual_rows.push((line, s, e));
                     if visual_rows.len() >= text_height {
                         break;
                     }
+                    visual_rows.push(VisRow::Text {
+                        line,
+                        start: s,
+                        end: e,
+                    });
                 }
+                push_box_rows(&mut visual_rows, self, line, skip, segs.len(), tw);
                 skip = 0;
                 line += 1;
             }
         } else {
             // Collect up to `text_height` VISIBLE logical lines from `scroll`,
             // skipping any hidden inside a collapsed fold.
+            let tw = text_width as usize;
             let mut line = self.scroll;
             while line < self.lines.len() && visual_rows.len() < text_height {
                 if !self.is_line_hidden(line) {
-                    visual_rows.push((
+                    visual_rows.push(VisRow::Text {
                         line,
-                        self.scroll_col,
-                        self.scroll_col + text_width as usize,
-                    ));
+                        start: self.scroll_col,
+                        end: self.scroll_col + text_width as usize,
+                    });
+                    push_box_rows(&mut visual_rows, self, line, 0, 1, tw);
                 }
                 line += 1;
             }
@@ -6390,8 +6741,24 @@ impl Widget for &mut Editor {
             None
         };
 
-        for (row_idx, &(line_idx, row_start, row_end)) in visual_rows.iter().enumerate() {
+        for (row_idx, vis_row) in visual_rows.iter().enumerate() {
             let y = inner.y + row_idx as u16;
+            let (line_idx, row_start, row_end) = match *vis_row {
+                VisRow::Box { box_idx, box_row } => {
+                    self.paint_comment_box_row(
+                        buf,
+                        inner,
+                        y,
+                        gutter_width,
+                        text_x,
+                        text_width,
+                        box_idx,
+                        box_row,
+                    );
+                    continue;
+                }
+                VisRow::Text { line, start, end } => (line, start, end),
+            };
             // The line number shows once per logical line - on its first visual
             // row; wrapped continuation rows get a blank gutter, like VS Code.
             if !wrap || row_start == 0 {
@@ -6479,20 +6846,6 @@ impl Widget for &mut Editor {
                     sign_x,
                     y,
                     "■",
-                    Style::default().fg(Color::Rgb(0xff, 0x9d, 0x2f)),
-                );
-                sign_taken = true;
-            }
-
-            // Navigator note diamond (croft pair): the pilot pinned a remark
-            // to this line; clicking it opens the note popup. Below the
-            // debugger and the stream stop square, above the test play glyph
-            // (a note is rarer, so it wins their shared cell).
-            if (!wrap || row_start == 0) && !sign_taken && self.note_lines.contains(&line_idx) {
-                buf.set_string(
-                    sign_x,
-                    y,
-                    "◆",
                     Style::default().fg(Color::Rgb(0xff, 0x9d, 0x2f)),
                 );
                 sign_taken = true;
@@ -6819,8 +7172,10 @@ impl Widget for &mut Editor {
         // the row loop (a tag overlays a neighbouring row's content) but
         // before sticky scroll, which floats above everything.
         for (cl, cc, name, color) in &self.ghost_caret_labels {
-            let Some(caret_vidx) = visual_rows.iter().position(|&(li, s, e)| {
-                li == *cl && *cc >= s && (*cc < e || (*cc == e && e == self.line_char_len(li)))
+            let Some(caret_vidx) = visual_rows.iter().position(|r| {
+                matches!(r, VisRow::Text { line: li, start: s, end: e }
+                    if *li == *cl && *cc >= *s
+                        && (*cc < *e || (*cc == *e && *e == self.line_char_len(*li))))
             }) else {
                 continue;
             };
@@ -6834,7 +7189,14 @@ impl Widget for &mut Editor {
             }
             // The caret's on-screen column: translate through the caret row's
             // own inlay map, exactly as its ghost cell was painted.
-            let (_, caret_start, caret_end) = visual_rows[caret_vidx];
+            let VisRow::Text {
+                start: caret_start,
+                end: caret_end,
+                ..
+            } = visual_rows[caret_vidx]
+            else {
+                continue;
+            };
             let hint_cap = caret_end.min(self.line_char_len(*cl));
             let hint_cells: Vec<(usize, usize)> = self
                 .row_inlay_spans(*cl)
@@ -7013,24 +7375,34 @@ impl Editor {
             // Find the visual row holding the cursor in the layout the last
             // render captured (a logical line spans several wrapped rows). A
             // column on a wrap boundary belongs to the next row's start.
-            let idx = self.last_wrap_rows.iter().position(|&(line, start, end)| {
-                line == self.cursor_row
-                    && self.cursor_col >= start
-                    && (self.cursor_col < end
-                        || (self.cursor_col == end && end == self.line_char_len(line)))
+            let idx = self.last_wrap_rows.iter().position(|r| {
+                matches!(r, VisRow::Text { line, start, end }
+                    if *line == self.cursor_row
+                        && self.cursor_col >= *start
+                        && (self.cursor_col < *end
+                            || (self.cursor_col == *end
+                                && *end == self.line_char_len(*line))))
             })?;
-            let (_, start, end) = self.last_wrap_rows[idx];
+            let (_, start, end) = self.text_row(idx)?;
             let visible_col = self.cursor_col - start;
             if end == start || visible_col >= end - start {
                 return None;
             }
             return Some((text_x + visible_col as u16, self.last_inner.y + idx as u16));
         }
-        // Non-wrap: one row per line, horizontally scrolled by `scroll_col`.
+        // Non-wrap: one row per line, horizontally scrolled by `scroll_col`;
+        // comment boxes shift the rows below them, so map through the
+        // painted layout when one exists.
         if self.cursor_row < self.scroll {
             return None;
         }
-        let row_in_view = self.cursor_row - self.scroll;
+        let row_in_view = if self.last_wrap_rows.is_empty() {
+            self.cursor_row - self.scroll
+        } else {
+            self.last_wrap_rows
+                .iter()
+                .position(|r| matches!(r, VisRow::Text { line, .. } if *line == self.cursor_row))?
+        };
         if (row_in_view as u16) >= self.last_inner.height {
             return None;
         }
@@ -9435,45 +9807,194 @@ mod tests {
         assert!(!e.stream_stop_at(sign_x, 2));
     }
 
-    /// The navigator's note diamond: noted rows wear an orange ◆ in the
-    /// sign column, clicks on it map back to the noted line, and the AI
-    /// stream's stop square outranks it on a shared cell.
+    /// A comment box anchored to line 0 renders as an unnumbered block
+    /// between line 0 and line 1: title row naming the author, body, and a
+    /// footer with the reply field and Ignore button. The gutter's number
+    /// column stays blank on box rows, and every following line paints
+    /// (and reports its screen row) shifted down by the box height.
     #[test]
-    fn gutter_note_diamond_renders_maps_clicks_and_yields_to_the_stop_square() {
+    fn comment_box_renders_unnumbered_rows_between_lines() {
         let mut e = editor_with("first\nsecond\nthird");
-        e.note_lines = vec![1];
+        e.comment_boxes = vec![CommentBox {
+            id: 7,
+            line: 0,
+            author: "navigator".into(),
+            body: "tighten this".into(),
+        }];
         let area = Rect {
             x: 0,
             y: 0,
             width: 60,
-            height: 6,
+            height: 10,
         };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         (&mut e as &mut Editor).render(area, &mut buf);
-        let sign_x = e.last_inner.x;
-        // Buffer line 1 paints on content row y = 2 (breadcrumb row above).
+
+        let row_text = |y: u16| -> String {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        };
+        // Breadcrumb row at y=0; line 0 at y=1 with its number.
+        assert!(row_text(1).contains("first"));
+        assert!(row_text(1).contains('1'), "line 0 keeps its number");
+        // Box: title (author), body, footer (reply + Ignore) at y=2..=4.
+        assert!(row_text(2).contains("navigator"), "title names the author");
+        assert!(row_text(3).contains("tighten this"), "body renders");
+        assert!(row_text(4).contains("Ignore"), "footer has the button");
+        let gutter = e.last_gutter_width;
+        for y in 2..=4u16 {
+            let g: String = (0..gutter)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            assert!(
+                g.chars().all(|c| !c.is_ascii_digit()),
+                "box rows are unnumbered, got gutter {g:?} at y={y}"
+            );
+        }
+        // Line 1 shifted below the box, with its own number.
+        assert!(row_text(5).contains("second"));
+        assert!(row_text(5).contains('2'));
         assert_eq!(
-            buf[(sign_x, 2)].symbol(),
-            "◆",
-            "the noted row's sign cell wears the diamond"
+            e.screen_row_of_line(1),
+            Some(5),
+            "screen row mapping shifts by the box height"
         );
-        assert_eq!(e.note_glyph_at(sign_x, 2), Some(1), "click maps to line");
-        assert_eq!(e.note_glyph_at(sign_x + 1, 2), None);
-        assert_eq!(e.note_glyph_at(sign_x, 1), None, "unnoted rows do not");
+    }
 
-        // A stream stop on the same line outranks the diamond.
-        e.stream_stop_line = Some(1);
+    /// Box rows belong to no buffer line: a click inside the box maps to no
+    /// buffer position, and a click on the line below the box maps to that
+    /// line at its shifted screen row.
+    #[test]
+    fn clicks_map_through_comment_box_rows() {
+        let mut e = editor_with("first\nsecond\nthird");
+        e.comment_boxes = vec![CommentBox {
+            id: 7,
+            line: 0,
+            author: "navigator".into(),
+            body: "tighten this".into(),
+        }];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         (&mut e as &mut Editor).render(area, &mut buf);
-        assert_eq!(buf[(sign_x, 2)].symbol(), "■");
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(
+            e.buffer_pos_at(text_x, 3),
+            None,
+            "a box row is not a buffer cell"
+        );
+        assert_eq!(
+            e.buffer_pos_at(text_x, 5),
+            Some((1, 0)),
+            "the line below the box maps at its shifted row"
+        );
+    }
 
-        // Notes cleared: the cell empties.
-        e.stream_stop_line = None;
-        e.note_lines.clear();
+    /// The box's mouse surface: the footer's ✕ Ignore cells hit Ignore, the
+    /// rest of the footer hits Reply, body rows hit Body, and buffer-text
+    /// rows hit nothing.
+    #[test]
+    fn comment_box_hit_finds_reply_ignore_and_body() {
+        let mut e = editor_with("first\nsecond\nthird");
+        e.comment_boxes = vec![CommentBox {
+            id: 7,
+            line: 0,
+            author: "navigator".into(),
+            body: "tighten this".into(),
+        }];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         (&mut e as &mut Editor).render(area, &mut buf);
-        assert_eq!(buf[(sign_x, 2)].symbol(), " ");
-        assert_eq!(e.note_glyph_at(sign_x, 2), None);
+        // Find the ✕ on the footer row rather than hard-coding geometry.
+        let ignore_x = (0..area.width)
+            .find(|&x| buf[(x, 4)].symbol() == "\u{2715}")
+            .expect("the footer renders the ✕ Ignore button");
+        assert_eq!(
+            e.comment_box_hit(ignore_x, 4),
+            Some((7, CommentHit::Ignore))
+        );
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(
+            e.comment_box_hit(text_x + 2, 4),
+            Some((7, CommentHit::Reply)),
+            "the rest of the footer is the reply field"
+        );
+        assert_eq!(
+            e.comment_box_hit(text_x + 2, 3),
+            Some((7, CommentHit::Body))
+        );
+        assert_eq!(e.comment_box_hit(text_x + 2, 1), None, "text rows miss");
+        assert_eq!(e.comment_box_hit(text_x + 2, 5), None);
+    }
+
+    /// In wrap mode (visual-row cursor motion) the caret steps over a box:
+    /// down from line 0 lands on line 1, never inside the block.
+    #[test]
+    fn cursor_skips_comment_box_rows_in_wrap_mode() {
+        let mut e = editor_with("first\nsecond\nthird");
+        e.wrap_override = Some(true);
+        e.comment_boxes = vec![CommentBox {
+            id: 7,
+            line: 0,
+            author: "navigator".into(),
+            body: "tighten this".into(),
+        }];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.move_down();
+        assert_eq!(e.cursor_row, 1, "the caret skips the box");
+        e.move_up();
+        assert_eq!(e.cursor_row, 0);
+    }
+
+    /// The focused box renders the typed reply in its footer field.
+    #[test]
+    fn focused_comment_box_renders_the_reply_draft() {
+        let mut e = editor_with("first\nsecond\nthird");
+        e.comment_boxes = vec![CommentBox {
+            id: 7,
+            line: 0,
+            author: "navigator".into(),
+            body: "tighten this".into(),
+        }];
+        e.comment_focus = Some(CommentFocus {
+            id: 7,
+            reply: String::from("why here?"),
+            cursor: 9,
+        });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let footer: String = (0..area.width)
+            .map(|x| buf[(x, 4)].symbol().to_string())
+            .collect();
+        assert!(
+            footer.contains("why here?"),
+            "the reply draft renders in the footer: {footer:?}"
+        );
     }
 
     #[test]
@@ -12812,7 +13333,11 @@ mod tests {
             "wrapped markdown must not show a horizontal scrollbar"
         );
         assert_eq!(e.scroll_col, 0, "wrap mode never scrolls horizontally");
-        let rows_for_line0 = e.last_wrap_rows.iter().filter(|&&(l, _, _)| l == 0).count();
+        let rows_for_line0 = e
+            .last_wrap_rows
+            .iter()
+            .filter(|r| matches!(r, VisRow::Text { line: 0, .. }))
+            .count();
         assert!(
             rows_for_line0 > 1,
             "a 200-char paragraph must fold onto multiple visual rows"
@@ -12834,7 +13359,7 @@ mod tests {
     fn markdown_cursor_screen_pos_lands_on_the_wrapped_row() {
         let mut e = md_editor(&"a".repeat(100));
         render_at(&mut e, 30, 10);
-        let (_, seg0_start, seg0_end) = e.last_wrap_rows[0];
+        let (_, seg0_start, seg0_end) = e.text_row(0).unwrap();
         assert_eq!(seg0_start, 0);
         // A column just past the first visual row's content sits on row 2.
         e.cursor_row = 0;
@@ -12851,7 +13376,7 @@ mod tests {
     fn markdown_click_on_second_visual_row_maps_into_the_line() {
         let mut e = md_editor(&"a".repeat(100));
         render_at(&mut e, 30, 10);
-        let seg0_end = e.last_wrap_rows[0].2;
+        let seg0_end = e.text_row(0).unwrap().2;
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
         let (line, col) = e
             .buffer_pos_at(text_x, e.last_inner.y + 1)
@@ -12874,7 +13399,7 @@ mod tests {
         let vis_row = e
             .last_wrap_rows
             .iter()
-            .position(|&(l, _, _)| l == 1)
+            .position(|r| matches!(r, VisRow::Text { line: 1, .. }))
             .expect("line 1 is on screen");
         assert!(vis_row > 1, "line 0 must wrap for the rows to be displaced");
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
@@ -12906,10 +13431,10 @@ mod tests {
         // via sub-line (segment) scroll.
         let mut e = md_editor(&"a".repeat(400));
         render_at(&mut e, 30, 6);
-        let before = e.last_wrap_rows[0];
+        let before = e.text_row(0).unwrap();
         e.scroll_down(3);
         render_at(&mut e, 30, 6);
-        let after = e.last_wrap_rows[0];
+        let after = e.text_row(0).unwrap();
         assert_eq!(after.0, 0, "still the single logical line");
         assert!(
             after.1 > before.1,
@@ -14721,7 +15246,9 @@ mod tests {
         let mut e = editor_with("fn a() {\n    x\n    y\n}\nfn b() {}");
         e.toggle_fold(0);
         render_at(&mut e, 40, 10);
-        let shown: Vec<usize> = e.last_wrap_rows.iter().map(|&(l, _, _)| l).collect();
+        let shown: Vec<usize> = (0..e.last_wrap_rows.len())
+            .filter_map(|i| e.text_row(i).map(|t| t.0))
+            .collect();
         assert!(shown.contains(&0), "the header row is drawn");
         assert!(!shown.contains(&1), "a folded body line is not drawn");
         assert!(!shown.contains(&2), "a folded body line is not drawn");

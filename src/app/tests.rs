@@ -19353,17 +19353,17 @@ fn resident_seating_never_replays_a_persisted_task() {
 #[test]
 fn next_note_by_row_walks_rows_in_order_and_wraps() {
     let notes = vec![
-        (10usize, String::from("late")),
-        (2usize, String::from("early")),
-        (6usize, String::from("mid")),
+        (1u64, 10usize, String::from("late")),
+        (2u64, 2usize, String::from("early")),
+        (3u64, 6usize, String::from("mid")),
     ];
     // From the top: nearest row strictly greater.
-    assert_eq!(notes[super::next_note_by_row(&notes, 0)].0, 2);
-    assert_eq!(notes[super::next_note_by_row(&notes, 2)].0, 6);
-    assert_eq!(notes[super::next_note_by_row(&notes, 6)].0, 10);
+    assert_eq!(notes[super::next_note_by_row(&notes, 0)].1, 2);
+    assert_eq!(notes[super::next_note_by_row(&notes, 2)].1, 6);
+    assert_eq!(notes[super::next_note_by_row(&notes, 6)].1, 10);
     // Past the last note: wrap to the smallest row (not stick on row 10).
-    assert_eq!(notes[super::next_note_by_row(&notes, 10)].0, 2);
-    assert_eq!(notes[super::next_note_by_row(&notes, 99)].0, 2);
+    assert_eq!(notes[super::next_note_by_row(&notes, 10)].1, 2);
+    assert_eq!(notes[super::next_note_by_row(&notes, 99)].1, 2);
 }
 
 /// Only one croft self-appoints the navigator owner per workspace: a second
@@ -19495,11 +19495,15 @@ fn palette_carries_the_navigator_commands() {
     assert!(app.status.to_lowercase().contains("not active"));
 
     app.navigator_notes
-        .insert("f.txt".into(), vec![(0, "n".into())]);
-    app.note_popup = Some(("f.txt".into(), 0));
+        .insert("f.txt".into(), vec![(1, 0, "n".into())]);
+    app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+        id: 1,
+        reply: String::new(),
+        cursor: 0,
+    });
     app.run_command(Command::ClearNavigatorNotes);
     assert!(app.navigator_notes.is_empty());
-    assert!(app.note_popup.is_none());
+    assert!(app.editor.comment_focus.is_none());
 
     app.run_command(Command::ToggleNavigator);
     let record =
@@ -19511,8 +19515,10 @@ fn palette_carries_the_navigator_commands() {
 }
 
 /// Cmd+K Y yields the active file to the navigator (a COMMENT-ONLY turn
-/// carrying the numbered buffer), and the pilot's commentary lands in the
-/// Navigator OUTPUT channel via poll_pair.
+/// carrying the numbered buffer). Commentary normally lands as a comment
+/// box; here no owner serves the file (the host was seated by hand, no
+/// self-appointment), so the words fall back to the Navigator OUTPUT
+/// channel rather than being lost.
 #[test]
 fn cmd_k_y_yields_the_active_file_and_commentary_reaches_output() {
     use std::time::{Duration, Instant};
@@ -19588,9 +19594,11 @@ fn cmd_k_y_yields_the_active_file_and_commentary_reaches_output() {
     }
 }
 
-/// A clean turn that left notes must SAY so: the TurnDone status names the
-/// note count and the F4 review key instead of overwriting the NoteAdded
-/// status with a bare "finished its turn" in the same drain.
+/// A clean turn that left comments must SAY so: the TurnDone status names
+/// the comment count and the F4 review key. The fake's turn leaves TWO
+/// boxes: its NOTE fence, plus its prose commentary ("Reviewing."), which
+/// lands as a comment box at the turn's origin — never in OUTPUT (boxes are
+/// the navigator's single voice).
 #[test]
 fn turn_done_status_keeps_the_notes_visible() {
     use std::time::{Duration, Instant};
@@ -19667,9 +19675,19 @@ fn turn_done_status_keeps_the_notes_visible() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
-        app.status.contains("1 note") && app.status.contains("F4"),
-        "TurnDone status must surface the notes, got: {}",
+        app.status.contains("2 comments") && app.status.contains("F4"),
+        "TurnDone status must surface the comments, got: {}",
         app.status
+    );
+    // The prose landed as an anchored box (poll_pair's match makes box vs
+    // OUTPUT mutually exclusive; the fallback path has its own test, and
+    // the OUTPUT channel is process-global so it cannot be asserted empty
+    // under the parallel suite).
+    let host = app.pair_host.as_ref().expect("still seated");
+    let snap = host.notes_snapshot("demo.txt");
+    assert!(
+        snap.iter().any(|(_, _, body)| body.contains("Reviewing.")),
+        "commentary must land as a comment box; snapshot: {snap:?}"
     );
 }
 
@@ -19789,7 +19807,7 @@ fn ask_box_opens_from_chord_and_menus_and_sends_the_ask_turn() {
 /// selection, F4 cycles through the file's notes (wrapping) and jumps the
 /// caret, and moving off a noted line closes it.
 #[test]
-fn note_popup_opens_on_caret_landing_esc_dismisses_and_f4_cycles() {
+fn f4_focuses_comment_boxes_typing_edits_the_draft_and_esc_releases() {
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("f.txt");
     std::fs::write(&file, "a\nb\nc\nd\ne").unwrap();
@@ -19797,44 +19815,122 @@ fn note_popup_opens_on_caret_landing_esc_dismisses_and_f4_cycles() {
     app.open_file_at_launch(&file);
     app.navigator_notes.insert(
         "f.txt".into(),
-        vec![(1, "first note".into()), (3, "second note".into())],
+        vec![(1, 1, "first note".into()), (2, 3, "second note".into())],
     );
 
-    // Caret at 0,0: nothing opens.
-    app.refresh_note_popup();
-    assert!(app.note_popup.is_none());
-
-    // Landing on a noted row opens its popup on a dirty tick.
-    app.editor.cursor_row = 1;
-    assert!(app.refresh_note_popup());
-    assert_eq!(app.note_popup, Some(("f.txt".to_string(), 0)));
-    assert!(!app.refresh_note_popup(), "staying put is quiet");
-
-    // Esc dismisses the popup FIRST; the selection survives for its own Esc.
-    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
-        anchor: (0, 0),
-        head: (1, 1),
-    });
-    app.handle_editor_key(key(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(app.note_popup.is_none());
-    assert!(
-        app.editor.selection.is_some(),
-        "the popup consumed Esc; the selection is untouched"
-    );
-    assert!(!app.refresh_note_popup(), "no reopen while parked");
-
-    // F4 jumps to the next note and opens it; a second F4 wraps.
-    app.handle_editor_key(key(KeyCode::F(4), KeyModifiers::NONE));
-    assert_eq!(app.editor.cursor_row, 3);
-    assert_eq!(app.note_popup, Some(("f.txt".to_string(), 1)));
-    app.handle_editor_key(key(KeyCode::F(4), KeyModifiers::NONE));
+    // F4 focuses the next box from the caret (id 1 on row 1) and jumps to
+    // its anchor; a second F4 hops to the next box; a third wraps.
+    app.handle_key(key(KeyCode::F(4), KeyModifiers::NONE))
+        .unwrap();
     assert_eq!(app.editor.cursor_row, 1);
-    assert_eq!(app.note_popup, Some(("f.txt".to_string(), 0)));
+    assert_eq!(app.editor.comment_focus.as_ref().map(|f| f.id), Some(1));
+    app.handle_key(key(KeyCode::F(4), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 3);
+    assert_eq!(app.editor.comment_focus.as_ref().map(|f| f.id), Some(2));
+    app.handle_key(key(KeyCode::F(4), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.comment_focus.as_ref().map(|f| f.id), Some(1));
 
-    // Moving off a noted line closes the popup.
-    app.editor.cursor_row = 4;
-    assert!(app.refresh_note_popup());
-    assert!(app.note_popup.is_none());
+    // Typing edits the reply draft, never the buffer.
+    let before = app.editor.lines.clone();
+    for c in ['w', 'h', 'y'] {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.comment_focus.as_ref().map(|f| f.reply.as_str()),
+        Some("why")
+    );
+    assert_eq!(app.editor.lines, before, "the buffer is untouched");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.comment_focus.as_ref().map(|f| f.reply.as_str()),
+        Some("wh")
+    );
+
+    // Esc releases the keyboard back to the buffer.
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.comment_focus.is_none());
+
+    // Shift+F4 ignores the nearest box: it leaves the snapshot immediately.
+    app.editor.cursor_row = 0;
+    app.handle_key(key(KeyCode::F(4), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.navigator_notes.get("f.txt").map(|n| n.len()),
+        Some(1),
+        "the ignored box is gone from the snapshot"
+    );
+}
+
+/// Enter in a focused comment box sends the reply turn: the composed
+/// message (note context, the reply, COMMENT-ONLY, numbered buffer) reaches
+/// the pilot's claude stdin, and the focus releases.
+#[test]
+fn enter_in_a_focused_comment_box_sends_the_reply_turn() {
+    use std::time::{Duration, Instant};
+    if !crate::lsp::manager::is_on_path("python3") {
+        eprintln!("SKIPPED: python3 not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "a\nb\nc").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let script = tmp.path().join("fake_claude.py");
+    std::fs::write(&script, crate::pair::FAKE_CLAUDE).unwrap();
+    let log = tmp.path().join("stdin.log");
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script).arg(&log).arg("notes");
+    app.pair_host = Some(crate::pair_host::PairHost::spawn_cmd(&socket, "nav", None, cmd).unwrap());
+    app.navigator_notes
+        .insert("f.txt".into(), vec![(1, 1, "seed note".into())]);
+    app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+        id: 1,
+        reply: String::from("is this hot?"),
+        cursor: 12,
+    });
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.comment_focus.is_none(),
+        "a sent reply releases the focus; status: {}",
+        app.status
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let sent = std::fs::read_to_string(&log).unwrap_or_default();
+        if sent.contains("replied to your note on f.txt at line 1")
+            && sent.contains("seed note")
+            && sent.contains("is this hot?")
+            && sent.contains("COMMENT-ONLY")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reply turn never reached claude; log: {sent}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// The AI-stream badge lifecycle: a pilot's StreamState(active) sets

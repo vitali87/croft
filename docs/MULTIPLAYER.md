@@ -479,18 +479,33 @@ interaction into turn-based driver/navigator pairing:
   diff since its last look plus the numbered buffer, and the host DISCARDS
   any EDIT fence it emits (`PairState::comment_only`, reset at the turn's
   result) — the prompt rule is advisory, the gate is not.
-- **Notes.** A new NOTE fence (`<<<NOTE <file>:<row>>>>` … `<<<END>>>`,
-  0-based row) anchors commentary to lines. Notes live in the pilot as
-  byte offsets shifted through every RemoteEdit span AND the pilot's own
-  streamed edits (the same `shift_offset` replay as the stream region), so
-  they track concurrent edits and the pilot's own same-turn edits; the App
-  snapshots them per tick into gutter `◆` diamonds. The
-  caret landing on a noted row (or a `◆` click, or `F4` cycling) opens an
-  anchored popup; `Esc` dismisses without costing the selection. A new
-  turn targeting a file supersedes that file's notes; "Navigator: Clear
-  Notes" drops them all. Non-anchored commentary goes to the Navigator
-  OUTPUT channel. The NOTE fence is model-protocol only — nothing new
-  rides the relay, so 0.1.633/634 peers interop untouched.
+- **Comment boxes (the navigator's single voice).** A NOTE fence
+  (`<<<NOTE <file>:<row>>>>` … `<<<END>>>`, 0-based row) anchors a remark
+  to a line. Each note renders as a **comment box** in the editor: an
+  unnumbered block between its anchor line and the next, shifting the
+  rows below it, owning no buffer position and never touching the saved
+  file (`VisRow::Box` rows in the editor's layout). The box shows the
+  author, the body, and a footer with a reply field and a `✕ Ignore`
+  button. Notes live in the pilot as byte offsets shifted through every
+  RemoteEdit span AND the pilot's own streamed edits (the same
+  `shift_offset` replay as the stream region), so boxes track concurrent
+  edits; each carries a stable id (`Note::id`) so Ignore removes exactly
+  one and a reply appends to exactly one.
+- **Replying and dismissing.** Clicking a box (or `F4`, which hops to the
+  next box by row, wrapping) focuses its reply field: typing edits the
+  draft, `Enter` sends it as a comment-only reply turn (the note's body,
+  the reply, and the numbered buffer — `compose_reply_turn`), `Esc`
+  releases the keyboard, and the box keeps the running conversation as
+  `you:` lines. `✕ Ignore` (or `Shift+F4`) dismisses one box;
+  "Navigator: Clear Comments" drops them all. Boxes persist across turns
+  — the old turn-supersession rule is gone, only the driver closes a box.
+- **Turn commentary.** The model's non-fence prose accumulates over the
+  turn and lands as ONE comment box at the turn's origin (the asked line,
+  the yield caret, or the replied note) when the turn ends. There is no
+  Navigator OUTPUT channel any more; only when the origin file is no
+  longer live does the prose fall back to OUTPUT rather than being lost.
+  The NOTE fence is model-protocol only — nothing new rides the relay, so
+  0.1.633/634 peers interop untouched.
 - **Presence.** While seated and idle the status bar wears a quiet
   `◆ <name> seated` badge; the orange streaming badge takes over whenever
   it types. If the claude child dies (or fails to seat), the host surfaces

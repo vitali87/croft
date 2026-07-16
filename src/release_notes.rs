@@ -62,14 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Local models take the navigator seat: `croft pair --provider ollama --model qwen3-coder:30b` seats your own open-weight model from any Anthropic-compatible endpoint (Ollama, LM Studio, llama.cpp, vLLM; --base-url picks the server) — same fences, same token-by-token streaming, same Cmd+K Q / Cmd+K Y / cancel.",
+        summary: "The navigator now speaks through comment boxes in the file: unnumbered blocks between the lines they belong to (never part of the buffer, never saved), each with a reply field and a ✕ Ignore button — type back and Enter continues the conversation in place as a comment-only turn.",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Local turns speak minimal /v1/messages directly (the claude CLI's ~213 KB tool-schema prefill is what local servers 500 on), the idle badge names who is typing — ◆ claude (qwen3-coder:30b) seated — and a dead endpoint fails one turn, naming the URL, without losing the seat.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Whole-line edit fences: EDIT headers now also take `<file>:<start_row>-<end_row>` (rows inclusive, no column counting) — the form local models are steered to, parsed on every backend.",
+        summary: "F4 hops to the next comment box, Shift+F4 ignores one, Esc releases the keyboard, and boxes persist across turns until you close them; the gutter ◆ diamonds, the note popup, and the Navigator OUTPUT channel are gone — turn commentary lands as a box at the line you asked from.",
     },
 ];

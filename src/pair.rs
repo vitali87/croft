@@ -496,6 +496,9 @@ struct StreamRegion {
 /// (kept fresh against concurrent edits exactly like the stream region)
 /// plus the accumulated body.
 pub struct Note {
+    /// Stable identity for the note's comment box: Ignore removes exactly
+    /// this note, a reply appends to exactly this note. Monotonic per seat.
+    pub id: u64,
     pub file: String,
     pub offset: usize,
     pub body: String,
@@ -524,6 +527,8 @@ pub(crate) struct PairState {
     pending_note: Option<String>,
     /// Anchored navigator notes; offsets kept fresh by the pump.
     notes: Vec<Note>,
+    /// Next note id (monotonic; ids are never reused within a seat).
+    next_note_id: u64,
     /// The NOTE fence currently streaming: (file, 0-based row, body so far).
     note_in_flight: Option<(String, usize, String)>,
     /// The in-process host's sink: when seated inside croft the pilot's
@@ -557,6 +562,7 @@ impl PairState {
             target_file: None,
             pending_note: None,
             notes: Vec::new(),
+            next_note_id: 1,
             note_in_flight: None,
             events,
             comment_only: false,
@@ -584,20 +590,35 @@ impl PairState {
         self.turn_active
     }
 
-    /// Drop `file`'s notes: a new turn targeting the file supersedes its
-    /// previous say.
-    pub(crate) fn clear_notes(&mut self, file: &str) {
-        self.notes.retain(|n| n.file != file);
-    }
-
     /// Drop every note in every file (the user asked for a clean slate).
     pub(crate) fn clear_all_notes(&mut self) {
         self.notes.clear();
     }
 
-    /// Arm a host turn targeting `file`: mode, target, note supersession,
-    /// and the last-seen bookkeeping the yield diff reads. Returns what the
-    /// navigator previously saw of the file (None = first look).
+    /// Drop exactly one note (the driver ignored its comment box).
+    pub(crate) fn remove_note(&mut self, id: u64) {
+        self.notes.retain(|n| n.id != id);
+    }
+
+    /// Append one line to a note's body (the driver replied in its box, so
+    /// the box keeps the running conversation).
+    pub(crate) fn append_to_note(&mut self, id: u64, line: &str) {
+        if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
+            n.body.push('\n');
+            n.body.push_str(line);
+        }
+    }
+
+    /// The next note id (monotonic within the seat).
+    fn take_note_id(&mut self) -> u64 {
+        let id = self.next_note_id;
+        self.next_note_id += 1;
+        id
+    }
+
+    /// Arm a host turn targeting `file`: mode, target, and the last-seen
+    /// bookkeeping the yield diff reads. Returns what the navigator
+    /// previously saw of the file (None = first look).
     pub(crate) fn begin_turn(
         &mut self,
         file: &str,
@@ -607,7 +628,8 @@ impl PairState {
         self.comment_only = comment_only;
         self.target_file = Some(file.to_string());
         self.session.request_file(file);
-        self.clear_notes(file);
+        // Notes deliberately survive the new turn: they are open comment
+        // boxes, and only the driver closes them (Ignore / Clear All).
         self.last_seen.insert(file.to_string(), content.to_string())
     }
 }
@@ -1323,7 +1345,13 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
                     st = state.lock().unwrap();
                 }
             }
-            st.notes.push(Note { file, offset, body });
+            let id = st.take_note_id();
+            st.notes.push(Note {
+                id,
+                file,
+                offset,
+                body,
+            });
         }
         FenceEvent::NoteAbort => {
             state.lock().unwrap().note_in_flight = None;
@@ -1552,6 +1580,76 @@ pub(crate) fn compose_yield_turn(file: &str, content: &str, diff: Option<&str>) 
         numbered(content)
     ));
     text
+}
+
+/// Compose a reply turn: the driver answered one of the navigator's notes
+/// inside its comment box. Names the note, carries the reply, stays
+/// comment-only (writes are granted elsewhere), and grounds the model with
+/// the numbered buffer.
+pub(crate) fn compose_reply_turn(
+    file: &str,
+    row: usize,
+    note_body: &str,
+    reply: &str,
+    content: &str,
+) -> String {
+    format!(
+        "Your partner replied to your note on {file} at line {row} (0-based).\n\
+         --- YOUR NOTE ---\n{note_body}\n--- END NOTE ---\n\
+         --- THEIR REPLY ---\n{reply}\n--- END REPLY ---\n\
+         Answer with NOTE fences (anchor follow-ups to the lines you mean; \
+         re-anchoring to line {row} continues this box). This turn is \
+         COMMENT-ONLY: any EDIT fence will be discarded by the host.\n\
+         \n--- CURRENT BUFFER ({file}, each line prefixed with its 0-based \
+         number and '|') ---\n{}\n--- END BUFFER ---",
+        numbered(content)
+    )
+}
+
+/// Anchor a note into `file` at `row` from the app side (commentary landing
+/// as a comment box). Mirrors the NoteEnd path: request the file, give the
+/// bootstrap the same bounded wait, then anchor by byte offset. None = the
+/// owner never served the file.
+/// Test-only: the e2e suite anchors seed notes right after a spawn, before
+/// the bootstrap settles; production (the App tick thread) must never block
+/// and uses [`inject_note_now`].
+#[cfg(test)]
+pub(crate) fn inject_note(
+    state: &Mutex<PairState>,
+    file: &str,
+    row: usize,
+    body: &str,
+) -> Option<u64> {
+    state.lock().unwrap().session.request_file(file);
+    if !wait_live(state, file) {
+        return None;
+    }
+    inject_note_now(state, file, row, body)
+}
+
+/// Non-blocking [`inject_note`]: anchors only when `file` is already live.
+/// The App's tick thread lands turn commentary through this — it must never
+/// sit out a bootstrap wait.
+pub(crate) fn inject_note_now(
+    state: &Mutex<PairState>,
+    file: &str,
+    row: usize,
+    body: &str,
+) -> Option<u64> {
+    let mut st = state.lock().unwrap();
+    if !st.session.is_live(file) {
+        return None;
+    }
+    let lines = st.doc_lines(file)?;
+    let offset = note_offset(&lines, row);
+    let id = st.take_note_id();
+    st.notes.push(Note {
+        id,
+        file: file.to_string(),
+        offset,
+        body: body.to_string(),
+    });
+    Some(id)
 }
 
 /// Compose and send one user turn: pending cancel note, the task, and the
@@ -2826,7 +2924,8 @@ mod tests {
         assert!(note.2.contains("second line could be tighter"));
         assert_eq!(
             host.notes_snapshot("demo.txt"),
-            vec![(1, "second line could be tighter".to_string())]
+            vec![(1, 1, "second line could be tighter".to_string())],
+            "(id, row, body): the first note of the seat gets id 1"
         );
         drop(host); // must not hang: the shutdown grace-kill path
     }
@@ -2868,6 +2967,129 @@ mod tests {
         );
         assert!(host.is_busy(), "the original ask turn is untouched");
         drop(host);
+    }
+
+    /// Comment boxes need stable identity: the host can inject a note
+    /// (commentary landing as a box), append the driver's reply to it, and
+    /// remove exactly one note by id (the box's Ignore button). Ids are
+    /// distinct and survive removal of a sibling.
+    #[test]
+    fn host_adds_appends_and_removes_notes_by_id() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world\nsecond line");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script).arg(&log).arg("notes");
+        let host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "nav", None, cmd).unwrap();
+
+        let id_a = host
+            .add_note("demo.txt", 0, "turn summary")
+            .expect("demo.txt is served by the owner");
+        let id_b = host.add_note("demo.txt", 1, "second thought").unwrap();
+        assert_ne!(id_a, id_b, "every note gets its own id");
+
+        let snap = host.notes_snapshot("demo.txt");
+        assert_eq!(
+            snap,
+            vec![
+                (id_a, 0, "turn summary".to_string()),
+                (id_b, 1, "second thought".to_string()),
+            ]
+        );
+
+        host.append_to_note(id_a, "you: tell me more");
+        let snap = host.notes_snapshot("demo.txt");
+        assert_eq!(snap[0].2, "turn summary\nyou: tell me more");
+
+        host.remove_note(id_a);
+        let snap = host.notes_snapshot("demo.txt");
+        assert_eq!(snap.len(), 1, "only the ignored note is gone");
+        assert_eq!(snap[0].0, id_b);
+        drop(host);
+    }
+
+    /// Boxes persist until the driver ignores them: a new turn on the same
+    /// file must NOT wipe its existing notes (the old supersession rule is
+    /// gone — under the box model it would close every open conversation on
+    /// each ask or reply).
+    #[test]
+    fn notes_survive_a_new_turn_on_the_same_file() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world\nsecond line");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script).arg(&log).arg("notes");
+        let mut host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "nav", None, cmd).unwrap();
+        host.send_task("@demo.txt look this over").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !host
+            .poll()
+            .iter()
+            .any(|e| matches!(e, crate::pair_host::PairEvent::TurnDone { .. }))
+        {
+            assert!(Instant::now() < deadline, "no TurnDone");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before = host.notes_snapshot("demo.txt");
+        assert_eq!(before.len(), 1, "the scripted note landed");
+
+        // A follow-up turn targeting the same file: begin_turn runs
+        // synchronously inside send_yield_turn.
+        host.send_yield_turn("demo.txt", "hello world\nsecond line")
+            .unwrap();
+        assert_eq!(
+            host.notes_snapshot("demo.txt"),
+            before,
+            "open boxes survive the next turn"
+        );
+        drop(host);
+    }
+
+    /// The reply composer: the driver answered a note's box. The turn names
+    /// the note (file, 0-based row, its body), carries the reply, stays
+    /// comment-only, and grounds the model with the numbered buffer.
+    #[test]
+    fn compose_reply_turn_carries_note_context_and_buffer() {
+        let text = compose_reply_turn(
+            "demo.txt",
+            3,
+            "this loop allocates per iteration",
+            "is that actually hot?",
+            "a\nb",
+        );
+        assert!(
+            text.contains("replied to your note on demo.txt at line 3 (0-based)"),
+            "names the note's anchor: {text}"
+        );
+        assert!(
+            text.contains("this loop allocates per iteration"),
+            "quotes the note body: {text}"
+        );
+        assert!(
+            text.contains("is that actually hot?"),
+            "carries the reply: {text}"
+        );
+        assert!(
+            text.contains("COMMENT-ONLY"),
+            "reply turns stay comment-only: {text}"
+        );
+        assert!(
+            text.contains("0|a\n1|b"),
+            "grounds the model with the numbered buffer: {text}"
+        );
     }
 
     /// Dropping the host (unseat / toggle-off) must not block the UI thread
@@ -3045,11 +3267,13 @@ mod tests {
     fn note_offsets_shift_on_remote_edit() {
         let mut notes = vec![
             Note {
+                id: 1,
                 file: "a.rs".into(),
                 offset: 10,
                 body: "n1".into(),
             },
             Note {
+                id: 2,
                 file: "b.rs".into(),
                 offset: 10,
                 body: "n2".into(),

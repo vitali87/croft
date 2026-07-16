@@ -205,6 +205,56 @@ impl PairHost {
         }
     }
 
+    /// Test-only blocking variant of [`Self::add_note_now`]: waits out the
+    /// file's bootstrap so an e2e can seed notes right after a spawn.
+    #[cfg(test)]
+    pub fn add_note(&self, file: &str, row: usize, body: &str) -> Option<u64> {
+        let p = self.pilot.as_ref()?;
+        crate::pair::inject_note(&p.state, file, row, body)
+    }
+
+    /// Anchor a note from the app side (turn commentary landing as a
+    /// comment box) when the file is already live — no bootstrap wait, the
+    /// App's tick thread must never block. None = not live, nothing to
+    /// anchor to.
+    pub fn add_note_now(&self, file: &str, row: usize, body: &str) -> Option<u64> {
+        let p = self.pilot.as_ref()?;
+        crate::pair::inject_note_now(&p.state, file, row, body)
+    }
+
+    /// Drop exactly one note (the box's Ignore button).
+    pub fn remove_note(&self, id: u64) {
+        if let Some(p) = &self.pilot {
+            p.state.lock().unwrap().remove_note(id);
+        }
+    }
+
+    /// Append one line to a note's body (the driver replied in its box).
+    pub fn append_to_note(&self, id: u64, line: &str) {
+        if let Some(p) = &self.pilot {
+            p.state.lock().unwrap().append_to_note(id, line);
+        }
+    }
+
+    /// Reply turn: the driver answered a note inside its comment box.
+    /// Comment-only, host-enforced, like a yield.
+    pub fn send_reply_turn(
+        &self,
+        file: &str,
+        row: usize,
+        note_body: &str,
+        reply: &str,
+        content: &str,
+    ) -> Result<()> {
+        let p = self.pilot.as_ref().context("navigator pilot is gone")?;
+        if p.state.lock().unwrap().turn_active() {
+            anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+        }
+        p.state.lock().unwrap().begin_turn(file, content, true);
+        let body = crate::pair::compose_reply_turn(file, row, note_body, reply, content);
+        write_user_turn(&p.state, &p.sink, body)
+    }
+
     /// Tear the seat down synchronously (revert, hang up, grace-kill, join).
     /// Blocks up to the grace period, so call this only on an exit path where
     /// the child MUST be reaped before the process ends — never on the tick
@@ -215,9 +265,9 @@ impl PairHost {
         }
     }
 
-    /// (0-based row, body) of every note anchored in `file`, rows computed
-    /// against the live replica so they track concurrent edits.
-    pub fn notes_snapshot(&self, file: &str) -> Vec<(usize, String)> {
+    /// (id, 0-based row, body) of every note anchored in `file`, rows
+    /// computed against the live replica so they track concurrent edits.
+    pub fn notes_snapshot(&self, file: &str) -> Vec<(u64, usize, String)> {
         let Some(p) = &self.pilot else {
             return Vec::new();
         };
@@ -231,7 +281,7 @@ impl PairHost {
             return Vec::new();
         };
         st.notes_in(file)
-            .map(|n| (position(&lines, n.offset).0, n.body.clone()))
+            .map(|n| (n.id, position(&lines, n.offset).0, n.body.clone()))
             .collect()
     }
 }
