@@ -97,7 +97,7 @@ For a real pair-programming partner, activate the **resident navigator**: an AI 
 croft pair --workspace /abs/path/to/project --model claude-haiku-4-5-20251001 --name navigator
 ```
 
-The command records the activation and exits; the running croft (or the next one you start there) seats the pilot within a second and wears a `◆ navigator seated` badge. Then, inside the editor:
+The command records the activation and exits; the running croft (or the next one you start there) seats the pilot within a second and wears a `◆ navigator seated` badge. While seated it keeps its own orange caret in the file — parked wherever you last engaged it, at every comment it leaves, and riding its edits as they stream. Then, inside the editor:
 
 - **Ask it** about a line or a selection — right-click the gutter ("Ask Navigator"), right-click a selection ("Ask Navigator About Selection"), or press `Cmd+K Q`. Its edits stream into the buffer **token by token**, the way a human types, with a named caret riding the stream.
 - **Yield it the turn** with `Cmd+K Y`: it reviews the active file *comment-only* — everything it says appears as **comment boxes** right in the file, unnumbered blocks between the lines they belong to (never part of the buffer, never saved). Each box carries a reply field and an **Ignore** button: type back and press `Enter` to continue the conversation in place, or dismiss it and keep working. `F4` hops to the next box, `Shift+F4` ignores one. Any edit it attempts on a yielded turn is discarded by the host, not just discouraged.

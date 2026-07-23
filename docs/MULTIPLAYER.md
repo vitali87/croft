@@ -506,6 +506,20 @@ interaction into turn-based driver/navigator pairing:
   longer live does the prose fall back to OUTPUT rather than being lost.
   The NOTE fence is model-protocol only — nothing new rides the relay, so
   0.1.633/634 peers interop untouched.
+- **The navigator's caret (0.1.639).** The seat has a persistent, visible
+  caret in the editor, painted in the navigator's identity orange (the
+  same accent as its comment boxes) instead of the join-order palette a
+  human guest gets. It parks wherever the navigator's attention goes: the
+  asked line on `Cmd+K Q`, the answered note's row on a reply, the anchor
+  of every comment it lands, and it rides along token by token while an
+  edit streams. Parks on a file still bootstrapping resolve as soon as
+  the snapshot lands (`PairState::pending_caret`, resolved by the pump;
+  a streamed edit or landed note taking over supersedes a stale park);
+  rows past the end clamp to the last line. The navigator is identified
+  by its site ids (`PairHost::caret_sites`), never by display name —
+  names are neither unique nor length-stable — so a human who picks the
+  same name keeps the palette. Unseating (deactivate, death, or a
+  workspace re-root) removes exactly the seat's carets.
 - **Presence.** While seated and idle the status bar wears a quiet
   `◆ <name> seated` badge; the orange streaming badge takes over whenever
   it types. If the claude child dies (or fails to seat), the host surfaces

@@ -1162,8 +1162,10 @@ impl ExternalReloadReport {
     }
 }
 
-/// The navigator's accent color (the same orange its note ◆ wore).
-const COMMENT_BOX_ACCENT: Color = Color::Rgb(0xff, 0x9d, 0x2f);
+/// The navigator's identity color: its comment boxes and its caret (the
+/// same orange its note ◆ wore). Fixed like the git decoration colors —
+/// legible on every dark background.
+pub(crate) const NAVIGATOR_ACCENT: Color = Color::Rgb(0xff, 0x9d, 0x2f);
 /// Columns of the comment-box footer tail ` ✕ Ignore ╯`.
 const IGNORE_TAIL_COLS: usize = 11;
 
@@ -2165,7 +2167,7 @@ impl Editor {
         }
         let b = &self.comment_boxes[box_idx];
         let accent = Style::default()
-            .fg(COMMENT_BOX_ACCENT)
+            .fg(NAVIGATOR_ACCENT)
             .bg(self.theme.sticky_scroll_bg());
         let body_st = Style::default().bg(self.theme.sticky_scroll_bg());
         let dim = Style::default()

@@ -19103,6 +19103,7 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("f.txt"), "l0\nl1\nl2").unwrap();
     let socket = tmp.path().join("collab.sock");
     {
         let s = socket.clone();
@@ -19168,6 +19169,39 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
         std::thread::sleep(Duration::from_millis(5));
     }
 
+    // A real parked caret: an ask turn on f.txt (served by this window's
+    // owner seat) bootstraps the pilot's replica and parks its caret at the
+    // asked row. The seat's identity is its site ids, never its name.
+    app.pair_host
+        .as_ref()
+        .unwrap()
+        .send_ask_turn("f.txt", (1, 1), "", "look here", "l0\nl1\nl2")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pilot_sites = loop {
+        app.poll_collab();
+        let sites = app.pair_host.as_ref().unwrap().caret_sites();
+        if sites.iter().any(|s| app.collab_carets.contains_key(s)) {
+            break sites;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pilot's parked caret never reached the app"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // A human who picked the very same display name is not the navigator.
+    app.collab_carets.insert(
+        9999,
+        CollabCaret {
+            file: "f.txt".into(),
+            row: 0,
+            col: 0,
+            name: "navigator".into(),
+            last_moved: Instant::now(),
+        },
+    );
+
     // Disabled record: the host unseats on the next check.
     crate::session::write_pair_record(
         &app.pair_record_path,
@@ -19184,6 +19218,31 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     app.last_pair_check = None;
     assert!(app.maybe_seat_navigator());
     assert!(app.pair_host.is_none(), "pilot must unseat");
+    assert!(
+        !pilot_sites
+            .iter()
+            .any(|s| app.collab_carets.contains_key(s)),
+        "the unseated navigator's caret must not linger"
+    );
+    assert!(
+        app.collab_carets.contains_key(&9999),
+        "a human named like the navigator keeps their caret"
+    );
+}
+
+/// The navigator's caret wears its fixed identity accent (the same orange
+/// as its comment boxes); human collaborators keep the join-order palette.
+/// Identity is the seat's site ids, never its display name: names are
+/// neither unique (a human may pick the same one) nor length-stable (caret
+/// names truncate to 24 chars at ingest).
+#[test]
+fn navigator_caret_wears_its_accent_and_humans_keep_the_palette() {
+    assert_eq!(
+        collab_caret_color(&[3, 7], 3),
+        crate::widgets::editor::NAVIGATOR_ACCENT
+    );
+    assert_eq!(collab_caret_color(&[3, 7], 5), participant_color(5));
+    assert_eq!(collab_caret_color(&[], 3), participant_color(3));
 }
 
 /// A record activated with `--provider ollama` seats the pilot with the

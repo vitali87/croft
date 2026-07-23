@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Re-rooting the workspace (Cmd+Z jump / Make Root) now rebinds the resident navigator: `croft pair` run in the new root seats within a second, instead of the window silently watching the launch directory's activation record forever.",
+    kind: NoteKind::Feature,
+    summary: "The navigator now has a persistent caret in the same orange as its comment boxes: it parks where you ask (Cmd+K Q), where you reply, and at every comment it lands, so your AI pair programmer is always visibly somewhere — and it leaves with the seat.",
 }];

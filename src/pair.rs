@@ -539,6 +539,10 @@ pub(crate) struct PairState {
     /// fences are discarded at the host, not just discouraged in the
     /// prompt. Reset at each turn's result.
     comment_only: bool,
+    /// Where the seat wants its visible caret parked (file, 0-based row)
+    /// once the file's bootstrap lands; the pump resolves it. The caret is
+    /// the navigator's persistent presence between edits.
+    pending_caret: Option<(String, usize)>,
     /// What the navigator last saw of each file (yield turns diff against
     /// this instead of resending history).
     last_seen: std::collections::HashMap<String, String>,
@@ -566,6 +570,7 @@ impl PairState {
             note_in_flight: None,
             events,
             comment_only: false,
+            pending_caret: None,
             last_seen: std::collections::HashMap::new(),
         }
     }
@@ -631,6 +636,49 @@ impl PairState {
         // Notes deliberately survive the new turn: they are open comment
         // boxes, and only the driver closes them (Ignore / Clear All).
         self.last_seen.insert(file.to_string(), content.to_string())
+    }
+
+    /// Park the navigator's visible caret at `row` (0-based, column 0):
+    /// broadcast now when the file is live, else once its bootstrap lands
+    /// (the pump resolves it). A newer park supersedes an unresolved one.
+    pub(crate) fn park_caret(&mut self, file: &str, row: usize) {
+        self.pending_caret = (!self.send_parked_caret(file, row)).then(|| (file.to_string(), row));
+    }
+
+    /// Broadcast the caret at an exact position and drop any unresolved
+    /// pending park — a streamed edit or a landed note is newer attention,
+    /// and a stale park firing afterwards would yank the caret back.
+    fn caret_now(&mut self, file: &str, row: usize, col: usize) {
+        self.pending_caret = None;
+        self.session.send_caret(file, row, col);
+    }
+
+    /// This seat's site id in every live file: the navigator's wire
+    /// identity (the App keys caret color and unseat cleanup off these).
+    pub(crate) fn my_site_ids(&self) -> Vec<u64> {
+        self.session.my_site_ids()
+    }
+
+    /// Broadcast the parked caret when `file` is live, the row clamped to
+    /// the document's last line. False = not live yet.
+    fn send_parked_caret(&mut self, file: &str, row: usize) -> bool {
+        let Some(lines) = self.doc_lines(file) else {
+            return false;
+        };
+        let row = row.min(lines.len().saturating_sub(1));
+        self.session.send_caret(file, row, 0);
+        true
+    }
+
+    /// Resolve a pending caret park (one pump tick): broadcast it if the
+    /// file went live, drop it if the bootstrap died unanswered.
+    fn resolve_pending_caret(&mut self) {
+        let Some((file, row)) = self.pending_caret.clone() else {
+            return;
+        };
+        if self.send_parked_caret(&file, row) || !self.session.is_bootstrapping(&file) {
+            self.pending_caret = None;
+        }
     }
 }
 
@@ -1270,7 +1318,7 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
             }
             let lines: Vec<String> = new.split('\n').map(String::from).collect();
             let (row, col) = position(&lines, next);
-            st.session.send_caret(&file, row, col);
+            st.caret_now(&file, row, col);
         }
         FenceEvent::EditEnd => {
             let mut st = state.lock().unwrap();
@@ -1345,6 +1393,8 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
                     st = state.lock().unwrap();
                 }
             }
+            // The AI is visibly "looking" where it just commented.
+            st.caret_now(&file, row_now, 0);
             let id = st.take_note_id();
             st.notes.push(Note {
                 id,
@@ -1394,7 +1444,7 @@ fn open_region(st: &mut PairState, file: &str, start: (usize, usize), end: (usiz
     st.session.send_stream_state(file, true);
     let lines: Vec<String> = new.split('\n').map(String::from).collect();
     let (row, col) = position(&lines, s);
-    st.session.send_caret(file, row, col);
+    st.caret_now(file, row, col);
 }
 
 /// Put the streamed region's original slice back (cancel, abort, or exit)
@@ -1456,6 +1506,7 @@ fn pump_session(state: &Mutex<PairState>, sink: &TurnSink, req_id: &AtomicU64) {
                 _ => {}
             }
         }
+        st.resolve_pending_caret();
     }
     // The claude write happens outside the state lock (lock order: state
     // then writer, same as send_turn; never both held). Only the claude
@@ -1642,6 +1693,8 @@ pub(crate) fn inject_note_now(
     }
     let lines = st.doc_lines(file)?;
     let offset = note_offset(&lines, row);
+    // The AI is visibly "looking" where it just commented.
+    st.caret_now(file, position(&lines, offset).0, 0);
     let id = st.take_note_id();
     st.notes.push(Note {
         id,
@@ -1987,6 +2040,18 @@ mod tests {
                 .filter(|e| matches!(e, CollabEvent::RemoteEdit { .. }))
                 .count()
         }
+
+        fn carets(&self) -> Vec<(String, usize, usize)> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    CollabEvent::Caret { name, row, col, .. } => Some((name.clone(), *row, *col)),
+                    _ => None,
+                })
+                .collect()
+        }
     }
 
     impl Drop for OwnerHarness {
@@ -2072,6 +2137,122 @@ mod tests {
             })
         };
         (state, stop, pump)
+    }
+
+    /// The persistent AI caret: a park before the file is live resolves as
+    /// soon as the bootstrap lands (the pump broadcasts it), and a park on a
+    /// live file broadcasts immediately, clamped to the last line.
+    #[test]
+    fn park_caret_waits_for_bootstrap_then_broadcasts() {
+        let harness = OwnerHarness::start("l0\nl1\nl2");
+        let (state, stop, pump) = pumped_state(&harness);
+        {
+            let mut st = state.lock().unwrap();
+            st.begin_turn("demo.txt", "l0\nl1\nl2", false); // requests the file
+            st.park_caret("demo.txt", 1); // not live yet: pending
+        }
+        harness.wait_until("the parked caret to broadcast", |h| {
+            h.carets()
+                .iter()
+                .any(|(n, r, c)| n == "pilot" && *r == 1 && *c == 0)
+        });
+        // Live now: an out-of-range park clamps to the last line.
+        state.lock().unwrap().park_caret("demo.txt", 99);
+        harness.wait_until("the clamped caret", |h| {
+            h.carets().iter().any(|(n, r, _)| n == "pilot" && *r == 2)
+        });
+        stop.store(true, Ordering::Relaxed);
+        let _ = pump.join();
+    }
+
+    /// Every landed note parks the pilot's caret at its anchor row: the AI
+    /// is visibly "looking" where it just commented.
+    #[test]
+    fn a_landed_note_parks_the_pilot_caret_at_its_row() {
+        let harness = OwnerHarness::start("l0\nl1\nl2");
+        let (state, stop, pump) = pumped_state(&harness);
+        apply_fence_event(
+            &state,
+            FenceEvent::NoteStart {
+                file: "demo.txt".into(),
+                row: 2,
+            },
+        );
+        apply_fence_event(&state, FenceEvent::NoteBody("look here".into()));
+        apply_fence_event(&state, FenceEvent::NoteEnd);
+        harness.wait_until("the note's caret", |h| {
+            h.carets().iter().any(|(n, r, _)| n == "pilot" && *r == 2)
+        });
+        stop.store(true, Ordering::Relaxed);
+        let _ = pump.join();
+    }
+
+    /// Ask and reply turns park the navigator's caret at their focus row
+    /// (the invoked range start / the answered note's row), so the caret is
+    /// visible from the first interaction even on comment-only turns.
+    #[test]
+    fn ask_and_reply_turns_park_the_navigator_caret() {
+        let harness = OwnerHarness::start("l0\nl1\nl2");
+        let mut cmd = Command::new("cat");
+        cmd.stdin(Stdio::piped());
+        let asker =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "asker", None, cmd).unwrap();
+        asker
+            .send_ask_turn("demo.txt", (1, 1), "", "look at this", "l0\nl1\nl2")
+            .unwrap();
+        harness.wait_until("the ask turn's caret", |h| {
+            h.carets().iter().any(|(n, r, _)| n == "asker" && *r == 1)
+        });
+        assert!(
+            !asker.caret_sites().is_empty(),
+            "the seat exposes its per-file site ids (its wire identity)"
+        );
+
+        let mut cmd = Command::new("cat");
+        cmd.stdin(Stdio::piped());
+        let replier =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "replier", None, cmd).unwrap();
+        replier
+            .send_reply_turn("demo.txt", 2, "seed note", "why here?", "l0\nl1\nl2")
+            .unwrap();
+        harness.wait_until("the reply turn's caret", |h| {
+            h.carets().iter().any(|(n, r, _)| n == "replier" && *r == 2)
+        });
+    }
+
+    /// An edit taking over the caret supersedes an unresolved pending park:
+    /// once the region opens (and parks the caret at its start), the stale
+    /// ask-row park must never fire afterwards and yank the caret back.
+    #[test]
+    fn an_open_region_supersedes_a_pending_caret_park() {
+        let harness = OwnerHarness::start("l0\nl1\nl2");
+        let session = connect_session(&harness.socket, "pilot").unwrap();
+        let state = Mutex::new(PairState::new(session, None));
+        {
+            let mut st = state.lock().unwrap();
+            st.begin_turn("demo.txt", "l0\nl1\nl2", false);
+            st.park_caret("demo.txt", 1);
+            assert!(st.pending_caret.is_some(), "not live yet: the park waits");
+        }
+        // Ingest the bootstrap by hand (no pump thread, so nothing can
+        // resolve the pending park before the edit lands).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut st = state.lock().unwrap();
+            let _ = st.session.poll(|_| None);
+            if st.session.is_live("demo.txt") {
+                break;
+            }
+            drop(st);
+            assert!(Instant::now() < deadline, "demo.txt never went live");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut st = state.lock().unwrap();
+        open_region(&mut st, "demo.txt", (0, 0), (0, 0));
+        assert!(
+            st.pending_caret.is_none(),
+            "the edit's caret supersedes the pending park"
+        );
     }
 
     /// Offline slice of the local backend: one canned /v1/messages SSE turn

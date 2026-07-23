@@ -113,6 +113,18 @@ impl PairHost {
         &self.name
     }
 
+    /// This seat's site id in every live file: the navigator's wire
+    /// identity. The App paints these carets in the navigator accent and
+    /// clears exactly them on unseat — display names are neither unique (a
+    /// human may pick the same one) nor length-stable (carets truncate
+    /// their name to 24 chars at ingest).
+    pub fn caret_sites(&self) -> Vec<u64> {
+        self.pilot
+            .as_ref()
+            .map(|p| p.state.lock().unwrap().my_site_ids())
+            .unwrap_or_default()
+    }
+
     /// The badge label: the caret name, plus the local model when this seat
     /// rides a local endpoint (so the badge says who is actually typing).
     pub fn title(&self) -> String {
@@ -175,7 +187,11 @@ impl PairHost {
         if p.state.lock().unwrap().turn_active() {
             anyhow::bail!("the navigator is mid-turn; wait for it to finish");
         }
-        p.state.lock().unwrap().begin_turn(file, content, false);
+        {
+            let mut st = p.state.lock().unwrap();
+            st.begin_turn(file, content, false);
+            st.park_caret(file, range.0); // visible presence at the ask site
+        }
         let body = compose_ask_turn(file, range, selection, instruction, content);
         write_user_turn(&p.state, &p.sink, body)
     }
@@ -250,7 +266,11 @@ impl PairHost {
         if p.state.lock().unwrap().turn_active() {
             anyhow::bail!("the navigator is mid-turn; wait for it to finish");
         }
-        p.state.lock().unwrap().begin_turn(file, content, true);
+        {
+            let mut st = p.state.lock().unwrap();
+            st.begin_turn(file, content, true);
+            st.park_caret(file, row); // visible presence at the answered note
+        }
         let body = crate::pair::compose_reply_turn(file, row, note_body, reply, content);
         write_user_turn(&p.state, &p.sink, body)
     }

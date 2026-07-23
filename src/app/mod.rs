@@ -10595,7 +10595,8 @@ impl App {
             };
             // Collab peers' carets (Phase D independent viewports): same
             // ghost rendering, keyed by workspace-relative file, plus a name
-            // tag while the caret is inside its fade window.
+            // tag while the caret is inside its fade window. The seated
+            // navigator's caret wears its identity accent.
             self.editor.ghost_caret_labels.clear();
             if !self.collab_carets.is_empty()
                 && let Some(active) = self
@@ -10604,12 +10605,17 @@ impl App {
                     .as_ref()
                     .and_then(|p| collab_file_key(&self.tree.root, p))
             {
+                let navigator_sites = self
+                    .pair_host
+                    .as_ref()
+                    .map(|h| h.caret_sites())
+                    .unwrap_or_default();
                 let now = std::time::Instant::now();
                 for (site, c) in &self.collab_carets {
                     if c.file != active {
                         continue;
                     }
-                    let color = participant_color(*site);
+                    let color = collab_caret_color(&navigator_sites, *site);
                     self.editor.ghost_carets.push((c.row, c.col, color));
                     if !c.name.is_empty() && now.duration_since(c.last_moved) < CARET_LABEL_FADE {
                         self.editor
@@ -15847,8 +15853,10 @@ impl App {
             // Deactivation clears the death latch, so `croft pair --off`
             // then `croft pair` (or a palette off/on) re-activates.
             self.navigator_down = false;
-            if self.pair_host.is_some() {
-                self.pair_host = None; // Drop tears the seat down
+            if let Some(host) = self.pair_host.take() {
+                // Drop tears the seat down; its parked caret goes with it.
+                let sites = host.caret_sites();
+                self.collab_carets.retain(|s, _| !sites.contains(s));
                 self.navigator_notes.clear();
                 self.pair_commentary_buf.clear();
                 self.pair_turn_origin = None;
@@ -16023,7 +16031,12 @@ impl App {
             }
         }
         if died {
-            self.pair_host = None;
+            let sites = self
+                .pair_host
+                .take()
+                .map(|h| h.caret_sites())
+                .unwrap_or_default();
+            self.collab_carets.retain(|s, _| !sites.contains(s));
             self.navigator_notes.clear();
             self.pair_commentary_buf.clear();
             self.pair_turn_origin = None;
@@ -26737,7 +26750,9 @@ impl App {
         // old root is torn down with its comment boxes; if this window had
         // self-appointed the old root's collab owner, that session goes too
         // (a fresh activation self-appoints against the new root).
-        if self.pair_host.take().is_some() {
+        if let Some(host) = self.pair_host.take() {
+            let sites = host.caret_sites();
+            self.collab_carets.retain(|s, _| !sites.contains(s));
             self.status = String::from("Navigator unseated (workspace changed)");
         }
         self.navigator_notes.clear();
@@ -31544,6 +31559,19 @@ fn participant_color(id: u64) -> Color {
         Color::Rgb(0xe0, 0x6c, 0x75), // red
     ];
     PALETTE[(id % PALETTE.len() as u64) as usize]
+}
+
+/// The color a collab caret paints in: the seated navigator's carets wear
+/// its fixed identity accent (the same orange as its comment boxes) so the
+/// AI's presence is unmistakable; humans keep the join-order palette.
+/// Identity is the seat's site ids, never its display name — names are
+/// neither unique nor length-stable (truncated to 24 chars at ingest).
+fn collab_caret_color(navigator_sites: &[u64], site: u64) -> Color {
+    if navigator_sites.contains(&site) {
+        crate::widgets::editor::NAVIGATOR_ACCENT
+    } else {
+        participant_color(site)
+    }
 }
 
 /// The workspace-relative key a file replicates under in a collab session

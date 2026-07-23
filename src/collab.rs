@@ -751,6 +751,21 @@ impl CollabSession {
         sent
     }
 
+    /// This participant's site id in every live file: its wire identity.
+    /// The owner is always site 1; every guest file-join is allocated a
+    /// fresh id from the owner's one counter, so a guest's ids are unique
+    /// across the whole relay — unlike display names, which are neither
+    /// unique nor length-stable.
+    pub fn my_site_ids(&self) -> Vec<u64> {
+        self.docs
+            .values()
+            .filter_map(|d| match d {
+                DocState::Live(doc) => Some(doc.site_id()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Broadcast this participant's caret position in a live file.
     pub fn send_caret(&mut self, file: &str, row: usize, col: usize) {
         let Some(DocState::Live(doc)) = self.docs.get(file) else {
