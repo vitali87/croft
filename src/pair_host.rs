@@ -125,6 +125,15 @@ impl PairHost {
             .unwrap_or_default()
     }
 
+    /// What the navigator last saw of `file` (None = it never looked
+    /// there). The proactive trigger compares the live buffer against this
+    /// to decide whether a NEW construct completed.
+    pub fn last_seen(&self, file: &str) -> Option<String> {
+        self.pilot
+            .as_ref()
+            .and_then(|p| p.state.lock().unwrap().last_seen_of(file))
+    }
+
     /// The badge label: the caret name, plus the local model when this seat
     /// rides a local endpoint (so the badge says who is actually typing).
     pub fn title(&self) -> String {

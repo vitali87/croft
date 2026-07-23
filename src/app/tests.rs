@@ -19979,6 +19979,95 @@ fn reroot_rebinds_the_navigator_activation_watch() {
     );
 }
 
+/// The proactive trigger: after the navigator's first look at a file, a
+/// newly COMPLETED construct plus a typing pause makes it take a
+/// comment-only look on its own. A pause alone never fires, the pref kills
+/// the behavior, and one buffer state never fires twice.
+#[test]
+fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
+    use std::time::{Duration, Instant};
+    if !crate::lsp::manager::is_on_path("python3") {
+        eprintln!("SKIPPED: python3 not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.rs");
+    std::fs::write(&file, "fn alpha() {}\n").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let script = tmp.path().join("fake_claude.py");
+    std::fs::write(&script, crate::pair::FAKE_CLAUDE).unwrap();
+    let log = tmp.path().join("stdin.log");
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+    // Own the workspace's collab session so the pilot's bootstraps answer.
+    app.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    app.last_collab_connect = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.collab.is_none() {
+        assert!(Instant::now() < deadline, "owner seat never connected");
+        app.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script).arg(&log).arg("notes");
+    app.pair_host = Some(crate::pair_host::PairHost::spawn_cmd(&socket, "nav", None, cmd).unwrap());
+
+    // The navigator's first look: a manual yield; wait the turn out.
+    app.yield_to_navigator();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while app.pair_host.as_ref().unwrap().is_busy() {
+        assert!(Instant::now() < deadline, "the first look never finished");
+        app.poll_collab();
+        app.poll_pair();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // A pause with no new construct never fires.
+    app.editor.last_edit_at = Some(Instant::now() - Duration::from_secs(3));
+    app.editor.edit_seq += 1;
+    assert!(!app.tick_proactive_navigator(), "no new construct: no look");
+
+    // Complete a new function, pause — but the pref is off: no fire.
+    let beta_row = app.editor.lines.len(); // where the new fn will sit
+    app.editor.lines.push("fn beta() {}".into());
+    app.editor.edit_seq += 1;
+    app.editor.last_edit_at = Some(Instant::now() - Duration::from_secs(3));
+    app.proactive_navigator_enabled = false;
+    assert!(
+        !app.tick_proactive_navigator(),
+        "the pref must gate the look"
+    );
+
+    // Pref back on: the completed construct fires a comment-only look
+    // anchored at the new function's row.
+    app.proactive_navigator_enabled = true;
+    assert!(app.tick_proactive_navigator(), "new fn + pause must fire");
+    assert_eq!(
+        app.pair_turn_origin,
+        Some((String::from("f.rs"), beta_row)),
+        "the look anchors at the completed construct"
+    );
+    assert!(
+        app.pair_host.as_ref().unwrap().is_busy(),
+        "the proactive look is a real turn"
+    );
+
+    // The same buffer state never fires twice (latch + busy host).
+    assert!(!app.tick_proactive_navigator());
+}
+
 /// Enter in a focused comment box sends the reply turn: the composed
 /// message (note context, the reply, COMMENT-ONLY, numbered buffer) reaches
 /// the pilot's claude stdin, and the focus releases.

@@ -520,6 +520,17 @@ interaction into turn-based driver/navigator pairing:
   names are neither unique nor length-stable — so a human who picks the
   same name keeps the palette. Unseating (deactivate, death, or a
   workspace re-root) removes exactly the seat's carets.
+- **Proactive looks (0.1.640).** The navigator re-engages on its own as
+  the driver works: when tree-sitter sees a NEW completed construct in the
+  active file (an outline symbol for code — a half-typed `fn foo(` parses
+  as an error and never fires — or a new heading / added paragraph in
+  markdown, `src/pair/proactive.rs`) and typing pauses for 2s, the App
+  hands it the same comment-only yield turn `Cmd+K Y` would, anchored at
+  the new construct. Only files the navigator has already looked at
+  re-engage it (re-engagement, not ambush); one buffer state is scanned at
+  most once; edits inside existing constructs never fire. Opt out with
+  "Navigator: Toggle Proactive Comments" (persisted as
+  `disable_proactive_navigator`).
 - **Presence.** While seated and idle the status bar wears a quiet
   `◆ <name> seated` badge; the orange streaming badge takes over whenever
   it types. If the claude child dies (or fails to seat), the host surfaces

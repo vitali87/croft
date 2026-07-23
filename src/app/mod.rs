@@ -2729,6 +2729,15 @@ pub struct App {
     /// explicit off/on (or toggle) re-activates. Matches the LSP precedent:
     /// no auto-respawn within a session; a fresh croft retries.
     navigator_down: bool,
+    /// Proactive navigator looks (docs/MULTIPLAYER.md): a completed new
+    /// construct plus a typing pause hands the seated navigator a
+    /// comment-only turn on its own. Opt-out via
+    /// `Prefs::disable_proactive_navigator` / the palette toggle.
+    proactive_navigator_enabled: bool,
+    /// Per file, the edit_seq the proactive trigger last scanned: one
+    /// buffer state is parsed at most once, however long the pause lasts
+    /// and however often the driver switches tabs across visited files.
+    proactive_scanned: std::collections::HashMap<PathBuf, u64>,
     /// Test seam: builds the PairHost from the config (the real path spawns
     /// the claude CLI, which a test must never do).
     #[cfg(test)]
@@ -3584,6 +3593,8 @@ impl App {
             pair_last_noted_file: None,
             pair_host_lock: None,
             navigator_down: false,
+            proactive_navigator_enabled: !loaded_prefs.disable_proactive_navigator,
+            proactive_scanned: std::collections::HashMap::new(),
             #[cfg(test)]
             pair_spawn_override: None,
             collab_labels_visible: false,
@@ -16301,6 +16312,78 @@ impl App {
         }
     }
 
+    /// Proactive navigator look (docs/MULTIPLAYER.md): when the driver
+    /// completes a NEW construct in the active file (tree-sitter judged —
+    /// half-typed code never parses as one) and pauses typing, the seated
+    /// navigator takes the same comment-only turn Cmd+K Y hands it, anchored
+    /// at the new construct. Only files the navigator has already looked at
+    /// re-engage it (this is RE-engagement, not ambush), and a buffer state
+    /// is scanned at most once. Runs once per frame tick; true = turn sent.
+    fn tick_proactive_navigator(&mut self) -> bool {
+        if !self.proactive_navigator_enabled {
+            return false;
+        }
+        let Some(host) = &self.pair_host else {
+            return false;
+        };
+        if host.is_busy() || self.editor.comment_focus.is_some() {
+            return false;
+        }
+        let Some(edited) = self.editor.last_edit_at else {
+            return false;
+        };
+        if edited.elapsed() < PROACTIVE_PAUSE {
+            return false;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            return false;
+        };
+        let seq = self.editor.edit_seq;
+        if self.proactive_scanned.get(&path) == Some(&seq) {
+            return false;
+        }
+        self.proactive_scanned.insert(path.clone(), seq);
+        let Some(file) = collab_file_key(&self.tree.root, &path) else {
+            return false;
+        };
+        let Some(kind) = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(crate::highlight::lang_for_extension)
+        else {
+            return false;
+        };
+        let Some(old) = host.last_seen(&file) else {
+            return false; // it never looked at this file; no self-invite
+        };
+        let content = self.editor.lines.join("\n");
+        let Some(row) = crate::pair::proactive::new_construct_row(kind, &old, &content) else {
+            return false;
+        };
+        match host.send_yield_turn(&file, &content) {
+            Ok(()) => {
+                self.status = format!("{} is taking a look at {file}:{}", host.name(), row + 1);
+                self.pair_turn_origin = Some((file, row));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Palette toggle for the proactive looks, persisted like the inline
+    /// blame preference.
+    fn toggle_proactive_navigator(&mut self) {
+        self.proactive_navigator_enabled = !self.proactive_navigator_enabled;
+        self.status = if self.proactive_navigator_enabled {
+            String::from("Navigator proactive comments: on")
+        } else {
+            String::from("Navigator proactive comments: off")
+        };
+        if !cfg!(test) {
+            let _ = crate::prefs::save_proactive_navigator(self.proactive_navigator_enabled);
+        }
+    }
+
     /// Palette toggle: flip the workspace's pair record and let the next
     /// activation check seat or unseat the pilot (within a second).
     fn toggle_navigator(&mut self) {
@@ -22250,6 +22333,7 @@ impl App {
             Cmd::YieldToNavigator => self.yield_to_navigator(),
             Cmd::ToggleNavigator => self.toggle_navigator(),
             Cmd::ClearNavigatorNotes => self.clear_navigator_notes(),
+            Cmd::ToggleProactiveNavigator => self.toggle_proactive_navigator(),
             Cmd::NextComment => self.cycle_comment_box(),
             Cmd::IgnoreComment => self.ignore_focused_comment(),
             Cmd::RunTask => self.open_run_task_picker(),
@@ -31512,6 +31596,11 @@ struct SessionCaret {
 /// bare colored cell).
 const CARET_LABEL_FADE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The typing pause that arms a proactive navigator look: long enough that
+/// mid-thought keystrokes never fire it, short enough to feel like a pair
+/// partner glancing over (double the 1s auto-save delay).
+const PROACTIVE_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A collab peer's last-known caret: where it is, whose it is, and when it
 /// last moved (the name tag shows while `last_moved` is inside
 /// [`CARET_LABEL_FADE`]). Keyed by site id, which is per-file, so one peer
@@ -32184,7 +32273,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let dap_changed = app.poll_dap();
         let tests_changed = app.test_worker.drain(&mut app.testing);
         let mcp_changed = app.poll_mcp();
-        let pair_changed = app.maybe_seat_navigator() | app.poll_pair();
+        let pair_changed =
+            app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
         let voice_changed = app.drain_voice();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.

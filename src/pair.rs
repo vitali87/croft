@@ -21,6 +21,7 @@
 //! never applied to a buffer.
 
 pub(crate) mod local;
+pub(crate) mod proactive;
 
 use std::io::{BufRead, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -657,6 +658,12 @@ impl PairState {
     /// identity (the App keys caret color and unseat cleanup off these).
     pub(crate) fn my_site_ids(&self) -> Vec<u64> {
         self.session.my_site_ids()
+    }
+
+    /// What the navigator last saw of `file` (None = it never looked).
+    /// The proactive trigger diffs the live buffer against this.
+    pub(crate) fn last_seen_of(&self, file: &str) -> Option<String> {
+        self.last_seen.get(file).cloned()
     }
 
     /// Broadcast the parked caret when `file` is live, the row clamped to

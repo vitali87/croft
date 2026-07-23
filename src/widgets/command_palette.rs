@@ -130,6 +130,9 @@ pub enum Command {
     ToggleNavigator,
     /// Drop every navigator comment box.
     ClearNavigatorNotes,
+    /// Toggle the navigator's proactive comment-only looks (a completed
+    /// construct plus a typing pause hands it the floor on its own).
+    ToggleProactiveNavigator,
     /// Focus the active file's next navigator comment box (F4).
     NextComment,
     /// Ignore the focused navigator comment box, or the next one from the
@@ -234,6 +237,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::YieldToNavigator,
     Command::ToggleNavigator,
     Command::ClearNavigatorNotes,
+    Command::ToggleProactiveNavigator,
     Command::NextComment,
     Command::IgnoreComment,
 ];
@@ -337,6 +341,7 @@ impl Command {
             Command::YieldToNavigator => "Navigator: Yield the Turn",
             Command::ToggleNavigator => "Navigator: Activate or Deactivate",
             Command::ClearNavigatorNotes => "Navigator: Clear Comments",
+            Command::ToggleProactiveNavigator => "Navigator: Toggle Proactive Comments",
             Command::NextComment => "Navigator: Next Comment",
             Command::IgnoreComment => "Navigator: Ignore Comment",
         }
@@ -444,6 +449,7 @@ impl Command {
             Command::YieldToNavigator => "Cmd+K Y",
             Command::ToggleNavigator => "",
             Command::ClearNavigatorNotes => "",
+            Command::ToggleProactiveNavigator => "",
             Command::NextComment => "F4",
             Command::IgnoreComment => "Shift+F4",
         }
@@ -548,6 +554,7 @@ impl Command {
             Command::YieldToNavigator => "navigator_yield",
             Command::ToggleNavigator => "navigator_toggle",
             Command::ClearNavigatorNotes => "navigator_clear_notes",
+            Command::ToggleProactiveNavigator => "navigator_toggle_proactive",
             Command::NextComment => "navigator_next_comment",
             Command::IgnoreComment => "navigator_ignore_comment",
             Command::RunTask => "run_task",

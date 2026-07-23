@@ -170,6 +170,12 @@ pub struct Prefs {
     /// config both mean "hints shown".
     #[serde(default)]
     pub disable_inlay_hints: bool,
+    /// Opt-out for the navigator's proactive comment-only looks (a newly
+    /// completed construct plus a typing pause hands it the floor). On by
+    /// default while a navigator is seated; stored as the disable flag so
+    /// the derived `Default` and an older config both mean "proactive".
+    #[serde(default)]
+    pub disable_proactive_navigator: bool,
     /// Copy a finished terminal mouse selection straight to the clipboard
     /// (VS Code's `terminal.integrated.copyOnSelection`). Off by default,
     /// matching VS Code.
@@ -338,6 +344,13 @@ pub fn save_inlay_hints(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disable_inlay_hints = !enabled;
+    prefs.save(&path)
+}
+
+pub fn save_proactive_navigator(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.disable_proactive_navigator = !enabled;
     prefs.save(&path)
 }
 
