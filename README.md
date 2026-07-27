@@ -2,6 +2,21 @@
   <img src="assets/logo-tight.png" alt="croft" width="180">
 </div>
 
+> [!CAUTION]
+> # ⚠️ THIS PROJECT IS MOVING TO A NEW HOME ⚠️
+>
+> **croft is leaving Codeberg.** Codeberg's Terms of Use now forbid hosting projects that
+> "mostly consist of code written by 'generative AI'-tools (including services such as
+> *Claude*, *OpenAI Codex*)", on the grounds of "unclear copyright status" and "little
+> safeguards to ensure that they do not include harmful code" (§ 7).
+>
+> croft is written by AI, out in the open, with some human review. A hosting platform deciding
+> *how* you are allowed to write your code, rather than *what* the code does, is not a
+> community rule. It is a dictatorship dressed up as a vote. The code is public, auditable,
+> and tested.
+>
+> **Watch this space for the new home. Clone the repo now if you want a copy.**
+
 # croft
 
 A VS Code style three pane workspace that runs entirely inside your terminal. Written in Rust and shipped as a single static binary.
