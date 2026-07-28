@@ -5799,17 +5799,27 @@ impl Editor {
         {
             return;
         }
+        // `start + visible` is a DISPLAY column, so inlay hints spliced into
+        // the row have to be mapped back out of it — the same inversion
+        // `buffer_pos_at` (and therefore hover) applies. Without this the
+        // caret lands `hint` cells right of the pointer.
         let (target_line, target_col) = match nearest_text {
             Some((_, (line, start, end))) => {
                 // In wrap mode a drag past a segment's right edge stops at the
                 // segment end; non-wrap keeps the click-to-line-end behaviour.
                 let cap = if self.wrap_enabled() { end } else { usize::MAX };
-                (line, (start + visible).min(cap))
+                (
+                    line,
+                    self.buffer_col_at_display(line, start + visible).min(cap),
+                )
             }
-            None => (
-                (self.scroll + row_idx).min(self.lines.len().saturating_sub(1)),
-                visible + self.scroll_col,
-            ),
+            None => {
+                let line = (self.scroll + row_idx).min(self.lines.len().saturating_sub(1));
+                (
+                    line,
+                    self.buffer_col_at_display(line, visible + self.scroll_col),
+                )
+            }
         };
         self.cursor_row = target_line;
         self.cursor_col = target_col.min(self.line_char_len(target_line));
@@ -5857,30 +5867,36 @@ impl Editor {
         if visible_col >= text_width as usize {
             return None;
         }
+        Some((
+            line,
+            self.buffer_col_at_display(line, self.scroll_col + visible_col),
+        ))
+    }
+
+    /// Invert the hint-splice display map: the first buffer column of `line`
+    /// whose display cell reaches absolute display column `display_col`. A
+    /// point landing inside a hint's own cells resolves to its anchor column,
+    /// so the caret snaps beside the code the hint annotates. Without hints
+    /// this is the identity (clamped to the line length).
+    fn buffer_col_at_display(&self, line: usize, display_col: usize) -> usize {
         let line_len = self.line_char_len(line);
         let hints = self.row_inlay_spans(line);
-        if !hints.is_empty() {
-            // Invert the hint-splice display map: the first buffer column
-            // whose display cell reaches the click. A click landing inside a
-            // hint's own cells resolves to its anchor column, so the caret
-            // snaps beside the code the hint annotates.
-            let target = self.scroll_col + visible_col;
-            let mut c = self.scroll_col;
-            while c < line_len {
-                let extra: usize = hints
-                    .iter()
-                    .filter(|(hc, _)| *hc >= self.scroll_col && *hc <= c)
-                    .map(|(_, l)| l.chars().count())
-                    .sum();
-                if c + extra >= target {
-                    break;
-                }
-                c += 1;
-            }
-            return Some((line, c.min(line_len)));
+        if hints.is_empty() {
+            return display_col.min(line_len);
         }
-        let char_col = (visible_col + self.scroll_col).min(line_len);
-        Some((line, char_col))
+        let mut c = self.scroll_col;
+        while c < line_len {
+            let extra: usize = hints
+                .iter()
+                .filter(|(hc, _)| *hc >= self.scroll_col && *hc <= c)
+                .map(|(_, l)| l.chars().count())
+                .sum();
+            if c + extra >= display_col {
+                break;
+            }
+            c += 1;
+        }
+        c.min(line_len)
     }
 
     pub fn word_at(&self, line: usize, col: usize) -> Option<(usize, usize)> {
@@ -10143,6 +10159,36 @@ mod tests {
             e.cursor_screen_pos(),
             Some((text_x + 5, e.last_inner.y)),
             "the caret at the anchor must sit before the hint"
+        );
+    }
+
+    #[test]
+    fn click_and_word_select_map_through_inlay_hints() {
+        // Repro: with a type hint spliced into the row, the caret / selection
+        // landed `hint` cells right of the pointer while hover (which goes
+        // through `buffer_pos_at`) resolved the symbol under it correctly.
+        let mut e = editor_with("let x = f(y);");
+        let p = std::path::PathBuf::from("/tmp/hints.rs");
+        e.path = Some(p.clone());
+        e.apply_inlay_hints(p, vec![inlay(0, 5, ": i32")]);
+        let _ = first_row_text(&mut e);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y;
+
+        // `f` displays at col 13 (buffer col 8 plus the five hint cells).
+        e.click(text_x + 13, y);
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (0, 8),
+            "the caret must land where the pointer is, not past the hint"
+        );
+
+        // Double-click on the shifted `y` selects `y`, not a neighbour.
+        e.select_word_at(text_x + 15, y);
+        assert_eq!(
+            e.selection.map(|s| (s.anchor, s.head)),
+            Some(((0, 10), (0, 11))),
+            "word select must resolve the word under the pointer"
         );
     }
 

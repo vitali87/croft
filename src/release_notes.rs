@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Right-click menus and popups opened over an image or PDF preview now paint on top of the picture instead of vanishing behind it.",
+    summary: "Clicking, dragging, and double-clicking on a line carrying inlay hints now lands where the pointer is; the caret used to jump right by the width of the type annotation.",
 }];
