@@ -27530,13 +27530,19 @@ impl App {
             crate::iterm2_inline::fit_image_auto(&image.bytes, canvas_w, canvas_h, bg)
         };
         if let Ok(baked) = baked
-            && let Some(raw) = crate::iterm2_inline::build_inline_image(
+            && let Some(raw) = crate::iterm2_inline::build_inline_image_z(
                 self.inline_protocol,
                 &baked,
                 cell_w,
                 cell_h,
                 false,
                 crate::iterm2_inline::KITTY_ID_EDITOR_BASE + side as u32,
+                // Below text and below non-default background cells, so a
+                // right-click menu or any other opaque popup paints fully on
+                // top. The preview still shows: the editor widget fills its
+                // canvas with the DEFAULT bg (`Color::Reset`), which this z
+                // stays above. Same placement the sidebar illustrations use.
+                crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             )
         {
             let osc = crate::iterm2_inline::maybe_tmux_wrap(

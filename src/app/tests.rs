@@ -20266,3 +20266,44 @@ fn collab_caret_label_fade_signals_one_redraw_per_transition() {
     assert!(app.collab_labels_dirty(), "expired tag: one redraw");
     assert!(!app.collab_labels_dirty(), "stays hidden: quiet");
 }
+
+/// A right-click menu opened over an image tab was painted *under* the
+/// picture: on Kitty the editor preview was placed at the default z=0, which
+/// the spec puts above text. Placing it below text AND below non-default
+/// background cells (the same trick the sidebar illustrations use) lets any
+/// opaque popup box paint fully on top, while the preview still shows through
+/// the pane's default-bg canvas.
+#[test]
+fn editor_image_preview_sits_below_text_so_popups_paint_over_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("shot.png");
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 200, 30, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode test png");
+    std::fs::write(&path, &png).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.cell_pixel = Some((8, 16));
+    app.editor.open(&path).unwrap();
+    app.update_editor_image_overlay(
+        0,
+        ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        },
+    );
+
+    let (osc, _) = app.editor_image_payload(0).expect("preview must bake");
+    assert!(
+        osc.contains(&format!(
+            "z={}",
+            crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG
+        )),
+        "the preview must be placed below text so menus draw on top: {:?}",
+        &osc[..osc.len().min(120)]
+    );
+}

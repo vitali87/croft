@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "The navigator now re-engages on its own: finish a new function, struct, or markdown section, pause for two seconds, and it takes another comment-only look at the spot — tree-sitter judged, so half-typed code never triggers it. Opt out via \"Navigator: Toggle Proactive Comments\".",
+    kind: NoteKind::Fix,
+    summary: "Right-click menus and popups opened over an image or PDF preview now paint on top of the picture instead of vanishing behind it.",
 }];
