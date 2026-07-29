@@ -67,6 +67,14 @@ This builds a `Croft.app` bundle (with croft's logo as its icon) in `/Applicatio
 
 It works by launching `open -na Ghostty.app --args --initial-command="croft <dir>"`. `--initial-command` sets the command for only that launch's first window, so your normal Ghostty windows stay a plain shell and your Ghostty config is untouched. Unlike Ghostty's `-e` flag, it does not trigger the macOS "Allow Ghostty to Execute" prompt. Re-run the command any time to point the launcher at a different folder.
 
+### Opening files with it
+
+`Croft.app` also accepts documents, so you can open a file straight from Finder. Drop a file on the app, or right-click it and pick Croft under **Open With**. The workspace roots itself at the file's folder and the file opens in the editor, the same as `croft <file>` on the command line.
+
+To make Croft the permanent handler for a file type, select a file in Finder, press `⌘I`, and under **Open With** choose Croft and click **Change All**. Do this in Finder rather than with `duti`: file types that no installed app declares (`.tex` is a common one) get a *dynamic* type identifier, and LaunchServices rejects `duti -s` for those with `error -50` no matter which app you name.
+
+The launcher is an AppleScript applet rather than a shell script for this reason: macOS hands a double-clicked document to an app as an Apple Event, which a `#!/bin/sh` bundle executable cannot receive. It would launch with empty arguments and silently open the default folder instead of the file.
+
 ## Inline previews
 
 iTerm2 renders inline image, PDF, and spreadsheet previews via OSC 1337; kitty and Ghostty use the Kitty graphics protocol; sixel-capable terminals (detected at startup via a DA1 probe) use DEC sixel. Other terminals fall back to a metadata header line.

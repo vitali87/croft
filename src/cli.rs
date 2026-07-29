@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SETUP_FONT_PS_NAME: &str = "MesloLGSNFM-Regular";
@@ -13,7 +13,8 @@ const ITERM2_FONT_SIZE: u32 = 13;
 #[derive(Parser, Debug)]
 #[command(name = "croft", version, about = "Terminal-based VS Code replica")]
 pub struct Cli {
-    /// Workspace folder to open (defaults to current directory)
+    /// Workspace folder to open (defaults to current directory). A file works
+    /// too: the workspace roots at its parent and the file opens in the editor.
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 
@@ -402,13 +403,9 @@ impl Cli {
             None => {
                 let path = self
                     .path
-                    .unwrap_or_else(|| std::env::current_dir().expect("cwd"))
-                    .canonicalize()
-                    .context("resolving workspace path")?;
-                if !path.is_dir() {
-                    anyhow::bail!("{} is not a directory", path.display());
-                }
-                crate::app::run(path, self.restore_session, self.open_file, self.zen)
+                    .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+                let (path, open_file) = resolve_workspace(&path, self.open_file)?;
+                crate::app::run(path, self.restore_session, open_file, self.zen)
             }
         }
     }
@@ -693,6 +690,26 @@ fn setup_ghostty(yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// Split the `PATH` argument into the workspace root and the file to open in
+/// the editor. Handing croft a *file* roots the workspace at its parent and
+/// opens the file, so `croft pitch_deck.tex` works and the macOS launcher can
+/// pass a double-clicked document straight through. An explicit `--open-file`
+/// always wins.
+fn resolve_workspace(
+    path: &Path,
+    open_file: Option<PathBuf>,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    let path = path.canonicalize().context("resolving workspace path")?;
+    if path.is_dir() {
+        return Ok((path, open_file));
+    }
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?
+        .to_path_buf();
+    Ok((parent, open_file.or(Some(path))))
+}
+
 fn install_launcher(path: Option<PathBuf>, user: bool, yes: bool) -> Result<()> {
     if !cfg!(target_os = "macos") {
         anyhow::bail!("install-launcher is macOS-only");
@@ -720,6 +737,8 @@ fn install_launcher(path: Option<PathBuf>, user: bool, yes: bool) -> Result<()> 
         open_dir.display()
     );
     println!("  Reachable from Spotlight (Cmd+Space, type 'Croft'), Launchpad, and the Dock.");
+    println!("  Also opens files: drop one on the app, or right-click it in Finder and pick Croft");
+    println!("            under Open With (Get Info > Change All makes it the default).");
     println!(
         "  Your normal Ghostty windows are unaffected (this only sets the launcher's window)."
     );
@@ -858,6 +877,35 @@ fn install_rust_target_if_missing(triple: &str) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn file_path_roots_the_workspace_at_its_parent_and_opens_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pitch_deck.tex");
+        std::fs::write(&file, "hi").unwrap();
+        let (root, open) = resolve_workspace(&file, None).unwrap();
+        assert_eq!(root, dir.path().canonicalize().unwrap());
+        assert_eq!(open, Some(file.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn directory_path_stays_the_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, open) = resolve_workspace(dir.path(), None).unwrap();
+        assert_eq!(root, dir.path().canonicalize().unwrap());
+        assert_eq!(open, None);
+    }
+
+    #[test]
+    fn explicit_open_file_wins_over_the_derived_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.tex");
+        std::fs::write(&file, "hi").unwrap();
+        let other = dir.path().join("b.rs");
+        let (root, open) = resolve_workspace(&file, Some(other.clone())).unwrap();
+        assert_eq!(root, dir.path().canonicalize().unwrap());
+        assert_eq!(open, Some(other));
+    }
 
     #[test]
     fn parses_no_args() {

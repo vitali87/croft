@@ -14,39 +14,60 @@ use anyhow::{Context, Result};
 
 const APP_NAME: &str = "Croft";
 
-/// The launcher's executable: open a fresh Ghostty instance whose first window
-/// runs croft at `open_dir`. `-n` forces a new instance so a window appears
-/// even when Ghostty is already running. Both paths are absolute so the GUI
-/// launch environment (which lacks `~/.cargo/bin` on `PATH`) still resolves
-/// croft.
+/// The launcher's script: open a fresh Ghostty instance whose first window runs
+/// croft. `-n` forces a new instance so a window appears even when Ghostty is
+/// already running. Both paths are absolute so the GUI launch environment
+/// (which lacks `~/.cargo/bin` on `PATH`) still resolves croft.
+///
+/// This is AppleScript, not `#!/bin/sh`, because of `on open`. Double-clicking a
+/// document hands it to the app as an `odoc` Apple Event, which a shell script
+/// cannot receive: a `/bin/sh` bundle executable is launched with *empty* argv
+/// and would silently open the default folder instead of the file. An applet
+/// built by `osacompile` is a real Cocoa app, so its `on open` handler gets the
+/// path. `croft <file>` then roots the workspace at the file's parent
+/// (`cli::resolve_workspace`).
 fn launcher_script(croft_bin: &str, open_dir: &str) -> String {
     format!(
-        "#!/bin/sh\nexec open -na Ghostty.app --args --initial-command=\"{croft_bin} {open_dir}\"\n"
+        r#"on run
+	do shell script "open -na Ghostty.app --args --initial-command=" & quoted form of "{croft_bin} '{open_dir}'"
+end run
+
+on open theFiles
+	set f to POSIX path of (item 1 of theFiles)
+	set inner to "{croft_bin} " & quoted form of f
+	do shell script "open -na Ghostty.app --args --initial-command=" & quoted form of inner
+end open
+"#
     )
 }
 
-/// Minimal app-bundle metadata. `CFBundleIconFile=icon` points at
-/// `Resources/icon.icns`.
-fn info_plist() -> String {
-    String::from(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>Croft</string>
-  <key>CFBundleDisplayName</key><string>Croft</string>
-  <key>CFBundleIdentifier</key><string>com.vitali87.croft-launcher</string>
-  <key>CFBundleExecutable</key><string>Croft</string>
-  <key>CFBundleIconFile</key><string>icon</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleVersion</key><string>1.0</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>LSMinimumSystemVersion</key><string>11.0</string>
-  <key>NSHighResolutionCapable</key><true/>
-</dict>
-</plist>
-"#,
-    )
+/// `PlistBuddy` edits applied to the bundle `osacompile` generates. It writes a
+/// working applet plist but nothing that identifies the app: no bundle id (so
+/// `duti`/Finder cannot name it) and, for the document types its `on open`
+/// handler earns it, only the legacy `CFBundleTypeExtensions = *` wildcard.
+/// `LSItemContentTypes = public.item` is the modern claim that puts Croft in
+/// Finder's "Open With" for every file.
+fn plist_edits() -> Vec<String> {
+    [
+        "Add :CFBundleIdentifier string com.vitali87.croft-launcher",
+        "Set :CFBundleName Croft",
+        "Add :CFBundleDisplayName string Croft",
+        "Add :CFBundleShortVersionString string 1.0",
+        // Our icon, not osacompile's applet.icns. CFBundleIconName points at
+        // the generated Assets.car and would otherwise win.
+        "Set :CFBundleIconFile croft",
+        "Delete :CFBundleIconName",
+        "Delete :CFBundleDocumentTypes",
+        "Add :CFBundleDocumentTypes array",
+        "Add :CFBundleDocumentTypes:0:CFBundleTypeName string \"Any File\"",
+        "Add :CFBundleDocumentTypes:0:CFBundleTypeRole string Editor",
+        "Add :CFBundleDocumentTypes:0:LSHandlerRank string Alternate",
+        "Add :CFBundleDocumentTypes:0:LSItemContentTypes array",
+        "Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string public.item",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
 }
 
 /// Where the bundle lives: system-wide `/Applications` (default) or per-user
@@ -107,23 +128,52 @@ fn write_icon(dest: &Path) -> Result<()> {
 /// path. Any existing bundle of the same name is replaced so re-running keeps
 /// the binary path and open directory current.
 pub fn install(app_dir: &Path, croft_bin: &str, open_dir: &str) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let app = app_dir.join(format!("{APP_NAME}.app"));
     let _ = std::fs::remove_dir_all(&app);
-    let macos = app.join("Contents/MacOS");
-    let resources = app.join("Contents/Resources");
-    std::fs::create_dir_all(&macos).with_context(|| format!("creating {}", macos.display()))?;
-    std::fs::create_dir_all(&resources)
-        .with_context(|| format!("creating {}", resources.display()))?;
 
-    write_icon(&resources.join("icon.icns")).context("building the launcher icon")?;
-    std::fs::write(app.join("Contents/Info.plist"), info_plist()).context("writing Info.plist")?;
+    let src =
+        std::env::temp_dir().join(format!("croft-launcher-{}.applescript", std::process::id()));
+    std::fs::write(&src, launcher_script(croft_bin, open_dir))
+        .with_context(|| format!("writing {}", src.display()))?;
+    let status = Command::new("osacompile")
+        .arg("-o")
+        .arg(&app)
+        .arg(&src)
+        .stdout(Stdio::null())
+        .status()
+        .context("running osacompile")?;
+    let _ = std::fs::remove_file(&src);
+    if !status.success() {
+        anyhow::bail!("osacompile failed building the launcher applet");
+    }
 
-    let exe = macos.join(APP_NAME);
-    std::fs::write(&exe, launcher_script(croft_bin, open_dir))
-        .context("writing launcher script")?;
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
-        .context("making the launcher script executable")?;
+    write_icon(&app.join("Contents/Resources/croft.icns")).context("building the launcher icon")?;
+
+    let plist = app.join("Contents/Info.plist");
+    let mut buddy = Command::new("/usr/libexec/PlistBuddy");
+    for edit in plist_edits() {
+        buddy.arg("-c").arg(edit);
+    }
+    let status = buddy
+        .arg(&plist)
+        .stdout(Stdio::null())
+        .status()
+        .context("running PlistBuddy")?;
+    if !status.success() {
+        anyhow::bail!("PlistBuddy failed writing {}", plist.display());
+    }
+
+    // Editing Info.plist invalidates osacompile's signature; without a fresh
+    // ad-hoc one macOS refuses to launch the applet.
+    let status = Command::new("codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(&app)
+        .stderr(Stdio::null())
+        .status()
+        .context("running codesign")?;
+    if !status.success() {
+        anyhow::bail!("codesign failed re-signing the launcher");
+    }
 
     // Nudge Launch Services so the icon and Spotlight entry register promptly.
     let _ = Command::new("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister")
@@ -140,16 +190,31 @@ mod tests {
     #[test]
     fn script_opens_ghostty_with_initial_command_and_both_paths() {
         let s = launcher_script("/Users/v/.cargo/bin/croft", "/Users/v/Documents");
-        assert!(s.starts_with("#!/bin/sh\n"));
+        assert!(s.contains("on run"));
         assert!(s.contains("open -na Ghostty.app --args"));
-        assert!(s.contains("--initial-command=\"/Users/v/.cargo/bin/croft /Users/v/Documents\""));
+        assert!(s.contains("/Users/v/.cargo/bin/croft '/Users/v/Documents'"));
+    }
+
+    /// A plain `#!/bin/sh` bundle executable never sees the opened document:
+    /// macOS delivers it as an `odoc` Apple Event, so argv arrives empty. Only
+    /// an AppleScript applet's `on open` handler receives it.
+    #[test]
+    fn script_handles_opened_documents_through_an_open_handler() {
+        let s = launcher_script("/Users/v/.cargo/bin/croft", "/Users/v/Documents");
+        assert!(s.contains("on open theFiles"));
+        assert!(s.contains("POSIX path of (item 1 of theFiles)"));
+        // The dropped path is passed through as croft's workspace argument;
+        // croft itself roots a file at its parent (see cli::resolve_workspace).
+        assert!(s.contains("quoted form of f"));
     }
 
     #[test]
-    fn info_plist_declares_executable_and_icon() {
-        let p = info_plist();
-        assert!(p.contains("<key>CFBundleExecutable</key><string>Croft</string>"));
-        assert!(p.contains("<key>CFBundleIconFile</key><string>icon</string>"));
+    fn plist_edits_claim_every_file_type_and_set_the_bundle_id() {
+        let e = plist_edits().join(" ");
+        assert!(e.contains("CFBundleIdentifier string com.vitali87.croft-launcher"));
+        assert!(e.contains("LSItemContentTypes:0 string public.item"));
+        assert!(e.contains("CFBundleTypeRole string Editor"));
+        assert!(e.contains("Set :CFBundleIconFile croft"));
     }
 
     #[test]

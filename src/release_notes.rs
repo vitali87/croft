@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Clicking, dragging, and double-clicking on a line carrying inlay hints now lands where the pointer is; the caret used to jump right by the width of the type annotation.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Croft.app now opens files from Finder: drop one on the launcher, or pick Croft under Open With, and the workspace roots at the file's folder with the file in the editor.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Passing croft a file instead of a folder works on the command line too, so `croft notes.md` no longer errors with \"is not a directory\".",
+    },
+];
