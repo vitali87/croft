@@ -25612,10 +25612,16 @@ impl App {
                                 Ok(()) => {
                                     self.sync_open_file_poll_mtime();
                                     self.status = self.editor.status.clone();
-                                    if is_double {
-                                        self.focus_pane(Pane::Editor);
-                                        self.poke_cursor();
-                                    }
+                                    // Opening a FILE hands the keyboard to the
+                                    // editor (VS Code parity), single click or
+                                    // double: otherwise the new tab's own
+                                    // navigation keys are dead and a PDF sits
+                                    // frozen on page 1 while the arrows walk
+                                    // the file list. `activate()` returns None
+                                    // for a folder, so a folder click never
+                                    // reaches here and browsing keeps focus.
+                                    self.focus_pane(Pane::Editor);
+                                    self.poke_cursor();
                                 }
                                 Err(e) => self.status = format!("Error: {e}"),
                             }

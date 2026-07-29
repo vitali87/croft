@@ -141,12 +141,14 @@ fn rasterize_with_sips(pdf: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 fn unique_temp_dir(stem: &str) -> std::io::Result<PathBuf> {
+    // pid + a process-wide counter, never a clock reading: two renders that
+    // landed in the same nanosecond bucket used to pick the same directory,
+    // and the second one's `remove_dir_all` below deleted the first one's
+    // output from under `pdftoppm` - a page turn that silently did nothing.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("{stem}-{pid}-{nanos}"));
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("{stem}-{pid}-{seq}"));
     if path.exists() {
         std::fs::remove_dir_all(&path)?;
     }
@@ -165,6 +167,24 @@ impl Drop for TempDirGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two renders in flight at once must never share a scratch directory:
+    /// the loser's `remove_dir_all` used to delete the winner's PNG before it
+    /// was read, and the page turn silently did nothing.
+    #[test]
+    fn concurrent_scratch_dirs_are_distinct() {
+        let dirs: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| s.spawn(|| unique_temp_dir("croft-pdf-test").unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let unique: std::collections::HashSet<_> = dirs.iter().collect();
+        assert_eq!(unique.len(), dirs.len(), "every render needs its own dir");
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 
     #[test]
     fn parses_page_count_from_pdfinfo_output() {

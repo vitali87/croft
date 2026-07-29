@@ -62,10 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A PDF opened from the Explorer no longer sits frozen on page 1: opening a file hands the keyboard to the editor, so its navigation keys work at once.",
+        summary: "Clicking a file in the Explorer now moves the keyboard into the editor, so a PDF opened with the mouse turns pages instead of sitting frozen on page 1.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The wheel now pages a PDF and scrolls a spreadsheet under the pointer, and End really does jump to the last page.",
+        summary: "Two PDF page renders at once no longer delete each other's scratch directory, which could make a page turn silently do nothing.",
     },
 ];

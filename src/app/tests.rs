@@ -20743,3 +20743,106 @@ fn turning_a_pdf_page_rebakes_the_inline_image_overlay() {
         "the overlay must re-bake on a page turn, or the reader stares at a frozen page"
     );
 }
+
+/// Click a file's row in the Explorer, the way a user opens a file with the
+/// mouse. Returns nothing: the assertions live in the callers.
+fn click_open_in_explorer(app: &mut App, name: &str) {
+    app.tree.last_area = Rect {
+        x: 4,
+        y: 0,
+        width: 32,
+        height: 20,
+    };
+    app.tree.last_inner = Rect {
+        x: 5,
+        y: 1,
+        width: 30,
+        height: 18,
+    };
+    app.focus_pane(Pane::Tree);
+    let idx = app
+        .tree
+        .nodes
+        .iter()
+        .position(|n| n.path.file_name().is_some_and(|f| f == name))
+        .unwrap_or_else(|| panic!("{name} must be visible in the Explorer"));
+    let row = app.tree.last_inner.y + idx as u16;
+    let col = app.tree.last_inner.x + 2;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+}
+
+/// The gesture the bug report actually used: one click on the PDF in the
+/// Explorer, then the arrow keys. A single click opened the file but left the
+/// keyboard on the tree, so every page-turn key walked the file list instead.
+#[test]
+fn a_pdf_opened_with_one_click_in_the_explorer_pages_with_the_arrow_keys() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    write_three_page_pdf(&tmp.path().join("doc.pdf"));
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    click_open_in_explorer(&mut app, "doc.pdf");
+    assert_eq!(current_pdf_page(&app), 1, "the click must open the PDF");
+    assert!(
+        matches!(app.focus, Pane::Editor),
+        "one click on a file must hand the keyboard to the editor, as VS Code does"
+    );
+
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&app), 2, "Right must turn the page");
+    app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&app), 3, "Space must turn the page");
+}
+
+#[test]
+fn clicking_any_file_type_in_the_explorer_lands_the_keyboard_in_the_editor() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("plain.txt"), "alpha\nbeta\n").unwrap();
+    std::fs::write(tmp.path().join("data.csv"), csv_body(5)).unwrap();
+    std::fs::write(tmp.path().join("notes.md"), "# Title\n").unwrap();
+    write_test_png(&tmp.path().join("shot.png"));
+    write_three_page_pdf(&tmp.path().join("doc.pdf"));
+
+    for name in ["plain.txt", "data.csv", "notes.md", "shot.png", "doc.pdf"] {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        click_open_in_explorer(&mut app, name);
+        assert!(
+            matches!(app.focus, Pane::Editor),
+            "{name}: one click must hand the keyboard to the editor"
+        );
+    }
+}
+
+/// A click on a spreadsheet must leave the arrow keys scrolling the grid, not
+/// the file list - the same defect as the PDF, one tab type over.
+#[test]
+fn a_spreadsheet_opened_with_one_click_scrolls_with_the_arrow_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("data.csv"), csv_body(40)).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    click_open_in_explorer(&mut app, "data.csv");
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(sheet_scroll(&app).0, 1, "Down must scroll the grid");
+}
+
+/// Selecting a folder row must not move focus: the click is a tree gesture and
+/// the user is still browsing.
+#[test]
+fn clicking_a_folder_in_the_explorer_keeps_the_keyboard_in_the_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    click_open_in_explorer(&mut app, "src");
+    assert!(
+        matches!(app.focus, Pane::Tree),
+        "expanding a folder is a tree gesture: the keyboard stays in the Explorer"
+    );
+}
