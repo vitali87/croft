@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Clicking a file in the Explorer now moves the keyboard into the editor, so a PDF opened with the mouse turns pages instead of sitting frozen on page 1.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Two PDF page renders at once no longer delete each other's scratch directory, which could make a page turn silently do nothing.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Fix,
+    summary: "Launching from Croft.app no longer hides every tool you have installed: croft now recovers your login shell's PATH, so PDFs page through poppler instead of freezing on page 1.",
+}];

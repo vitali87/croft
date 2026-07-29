@@ -239,6 +239,10 @@ impl Cli {
         // PTYs/watchers/LSPs and especially the spawned cross-link (~250
         // rlibs open at once) need far more. Children inherit the raise.
         crate::remote::raise_fd_limit();
+        // ...and a PATH with nothing but the four system directories in it,
+        // so every tool croft shells out to (pdftoppm, git, ripgrep, the
+        // language servers) would be invisible. Children inherit the repair.
+        crate::gui_path::repair();
         match self.command {
             Some(CliCommand::SetupTerminal { font, size, yes }) => setup_terminal(&font, size, yes),
             Some(CliCommand::Keys { mouse }) => keys_diagnostic(mouse),

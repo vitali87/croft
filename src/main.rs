@@ -9,6 +9,7 @@ mod file_ref;
 mod ghostty;
 mod git;
 mod gradient;
+mod gui_path;
 mod highlight;
 mod history;
 mod icons;
