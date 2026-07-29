@@ -124,7 +124,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `↑` / `↓` | Move selection |
 | `Enter` | Open a file and move the keyboard into the editor, so the new tab's own navigation keys work straight away (VS Code parity); on a folder, expand or collapse it |
 | `→` | Preview a file without leaving the tree, so `↑`/`↓` keep walking the list; on a folder, expand it |
-| Double-click a file | Pin its tab (a single click opens the file in the replaceable preview tab) |
+| Click a file | Open it in the replaceable preview tab and move the keyboard into the editor, so the tab's own navigation keys (PDF pages, spreadsheet rows) work at once; double-click pins the tab. Clicking a folder just expands it and keeps focus in the tree |
 | `←` | Collapse a folder |
 | `Shift`+`↑` / `↓` / `PageUp` / `PageDown` / `Home` / `End` | Extend multi-selection from the anchor row |
 | `Shift`+click | Extend multi-selection across a range |
