@@ -61,11 +61,11 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "A file opened from Finder now fills the window, with the Explorer and terminal hidden until you want them back with Cmd+B or Cmd+J.",
+        kind: NoteKind::Fix,
+        summary: "A PDF opened from the Explorer no longer sits frozen on page 1: opening a file hands the keyboard to the editor, so its navigation keys work at once.",
     },
     ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Croft.app opens files from Finder: drop one on the launcher, or pick Croft under Open With, and the workspace roots at the file's folder.",
+        kind: NoteKind::Fix,
+        summary: "The wheel now pages a PDF and scrolls a spreadsheet under the pointer, and End really does jump to the last page.",
     },
 ];

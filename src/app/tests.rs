@@ -11826,6 +11826,7 @@ fn closing_image_tab_requests_overlay_clear_on_next_render() {
             cell_w: 10,
             cell_h: 10,
             path: tmp.path().join("doomed.png"),
+            page: 1,
         }),
         true,
     );
@@ -14986,6 +14987,7 @@ fn editor_image_overlay_is_dual_slot_and_clear_ors_both_columns() {
         cell_w: 10,
         cell_h: 10,
         path: tmp.path().join(name),
+        page: 1,
     };
     // Both physical columns can hold an inline image at once.
     app.overlays.editor[0].set_test_state(Some("left-osc".into()), Some(layout("l.png")), true);
@@ -20305,5 +20307,439 @@ fn editor_image_preview_sits_below_text_so_popups_paint_over_it() {
         )),
         "the preview must be placed below text so menus draw on top: {:?}",
         &osc[..osc.len().min(120)]
+    );
+}
+
+// --- Preview navigation (PDF pages, spreadsheet rows, Markdown, text) -----
+//
+// Every tab type must stay navigable right after it is opened, from the
+// keyboard and from the wheel. Opening a file from the Explorer used to leave
+// focus on the tree, so arrows walked the file list and a PDF looked frozen on
+// page 1; the wheel over a PDF or a spreadsheet did nothing at all.
+
+/// A three-page PDF written inline, so the tests need no fixture file.
+/// Poppler repairs the missing xref table, so exact offsets are unnecessary.
+fn write_three_page_pdf(path: &std::path::Path) {
+    let pdf = concat!(
+        "%PDF-1.4\n",
+        "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+        "2 0 obj<</Type/Pages/Kids[3 0 R 4 0 R 5 0 R]/Count 3>>endobj\n",
+        "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 6 0 R>>endobj\n",
+        "4 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 7 0 R>>endobj\n",
+        "5 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 8 0 R>>endobj\n",
+        "6 0 obj<</Length 27>>stream\n0 0 1 rg 10 10 100 100 re f\nendstream endobj\n",
+        "7 0 obj<</Length 27>>stream\n1 0 0 rg 10 10 100 100 re f\nendstream endobj\n",
+        "8 0 obj<</Length 27>>stream\n0 1 0 rg 10 10 100 100 re f\nendstream endobj\n",
+        "trailer<</Root 1 0 R/Size 9>>\n%%EOF\n",
+    );
+    std::fs::write(path, pdf).unwrap();
+}
+
+fn write_test_png(path: &std::path::Path) {
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([10, 200, 30, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode test png");
+    std::fs::write(path, &png).unwrap();
+}
+
+fn csv_body(rows: usize) -> String {
+    let mut s = String::from("name,qty,price\n");
+    for i in 0..rows {
+        s.push_str(&format!("row{i},{i},{i}.50\n"));
+    }
+    s
+}
+
+fn current_pdf_page(app: &App) -> u32 {
+    app.editor
+        .image
+        .as_ref()
+        .and_then(|i| i.pdf.as_ref())
+        .expect("a PDF tab must carry page state")
+        .current_page
+}
+
+fn sheet_scroll(app: &App) -> (usize, usize) {
+    let sheet = app.editor.sheet.as_ref().expect("a spreadsheet tab");
+    let data = &sheet.sheets[sheet.current_sheet];
+    (data.scroll_row, data.scroll_col)
+}
+
+/// Open `name` the way a user does: select it in the Explorer and press Enter.
+fn open_from_explorer(app: &mut App, name: &str) {
+    let idx = app
+        .tree
+        .nodes
+        .iter()
+        .position(|n| n.path.file_name().is_some_and(|f| f == name))
+        .unwrap_or_else(|| panic!("{name} must be visible in the Explorer"));
+    app.tree.selected = idx;
+    app.focus_pane(Pane::Tree);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+}
+
+/// Give the editor pane a real rectangle so wheel events land inside it.
+fn place_editor_pane(app: &mut App) -> (u16, u16) {
+    let area = Rect {
+        x: 20,
+        y: 2,
+        width: 60,
+        height: 30,
+    };
+    app.editor.last_area = area;
+    app.editor.last_full_area = area;
+    app.editor.last_inner = Rect {
+        x: area.x + 1,
+        y: area.y + 2,
+        width: area.width - 2,
+        height: area.height - 3,
+    };
+    (area.x + 10, area.y + 10)
+}
+
+fn wheel(app: &mut App, kind: crossterm::event::MouseEventKind, col: u16, row: u16) {
+    app.handle_mouse(mouse(kind, col, row));
+}
+
+fn require_pdf_backend() {
+    assert!(
+        crate::pdf::detect_backend().is_some(),
+        "these tests need a PDF rasteriser (poppler's pdftoppm, or sips on macOS)"
+    );
+}
+
+#[test]
+fn arrow_keys_page_through_an_open_pdf() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert_eq!(current_pdf_page(&app), 1);
+
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&app), 2, "Right must go to the next page");
+
+    app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&app), 1, "Left must go back a page");
+
+    app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&app), 2, "PageDown pages forward");
+
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&app), 3, "End jumps to the last page");
+
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&app), 1, "Home jumps back to page 1");
+}
+
+#[test]
+fn a_pdf_opened_from_the_explorer_pages_with_the_arrow_keys() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    write_three_page_pdf(&tmp.path().join("doc.pdf"));
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_from_explorer(&mut app, "doc.pdf");
+    assert!(
+        matches!(app.focus, Pane::Editor),
+        "opening a file must hand the keyboard to the editor, or its navigation keys are dead"
+    );
+
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        current_pdf_page(&app),
+        2,
+        "a PDF opened from the Explorer must page with Right"
+    );
+}
+
+#[test]
+fn the_wheel_pages_a_pdf_under_the_pointer() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(current_pdf_page(&app), 2, "wheel down pages forward");
+    wheel(&mut app, MouseEventKind::ScrollUp, col, row);
+    assert_eq!(current_pdf_page(&app), 1, "wheel up pages back");
+}
+
+#[test]
+fn a_spreadsheet_opened_from_the_explorer_scrolls_with_the_arrow_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("data.csv"), csv_body(40)).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_from_explorer(&mut app, "data.csv");
+    assert!(app.editor.sheet.is_some(), "a .csv opens as a spreadsheet");
+    assert!(matches!(app.focus, Pane::Editor));
+
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(sheet_scroll(&app).0, 1, "Down scrolls the sheet by a row");
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        sheet_scroll(&app).1,
+        1,
+        "Right scrolls the sheet by a column"
+    );
+}
+
+#[test]
+fn the_wheel_scrolls_a_spreadsheet_under_the_pointer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("data.csv");
+    std::fs::write(&path, csv_body(40)).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(sheet_scroll(&app).0, 3, "wheel down scrolls the sheet rows");
+    wheel(&mut app, MouseEventKind::ScrollUp, col, row);
+    assert_eq!(sheet_scroll(&app).0, 0, "wheel up scrolls back");
+}
+
+#[test]
+fn a_tsv_preview_scrolls_the_same_way_as_a_csv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("data.tsv");
+    std::fs::write(&path, "a\tb\n1\t2\n3\t4\n5\t6\n7\t8\n").unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+    assert!(app.editor.sheet.is_some(), "a .tsv opens as a spreadsheet");
+
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(sheet_scroll(&app).0, 3, "wheel down scrolls a TSV too");
+}
+
+#[test]
+fn a_markdown_file_opened_from_the_explorer_scrolls_its_preview() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (0..200).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(tmp.path().join("notes.md"), body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_from_explorer(&mut app, "notes.md");
+    assert!(matches!(app.focus, Pane::Editor));
+    app.toggle_markdown_preview();
+    assert!(app.editor.markdown_preview.is_some());
+
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    let scrolled = app
+        .editor
+        .markdown_preview
+        .as_ref()
+        .map(|p| p.scroll)
+        .unwrap();
+    assert!(scrolled > 0, "Down must scroll the rendered Markdown");
+}
+
+#[test]
+fn the_wheel_scrolls_a_markdown_preview_under_the_pointer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.md");
+    let body: String = (0..200).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&path, body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+    app.toggle_markdown_preview();
+
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    let scrolled = app
+        .editor
+        .markdown_preview
+        .as_ref()
+        .map(|p| p.scroll)
+        .unwrap();
+    assert!(scrolled > 0, "the wheel must scroll the rendered Markdown");
+}
+
+#[test]
+fn a_text_file_opened_from_the_explorer_takes_the_arrow_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_from_explorer(&mut app, "main.rs");
+    let before = app.tree.selected;
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 1, "Down moves the caret in the file");
+    assert_eq!(
+        app.tree.selected, before,
+        "the Explorer selection must not move once the file is open"
+    );
+}
+
+#[test]
+fn the_wheel_still_scrolls_a_long_text_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("long.txt");
+    let body: String = (0..500).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&path, body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(app.editor.scroll, 3, "wheel down still scrolls text");
+    wheel(&mut app, MouseEventKind::ScrollUp, col, row);
+    assert_eq!(app.editor.scroll, 0, "wheel up still scrolls text back");
+}
+
+#[test]
+fn an_image_preview_swallows_navigation_without_disturbing_the_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_test_png(&tmp.path().join("shot.png"));
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_from_explorer(&mut app, "shot.png");
+    assert!(app.editor.image.is_some());
+    let (col, row) = place_editor_pane(&mut app);
+
+    for code in [
+        KeyCode::Right,
+        KeyCode::Left,
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::PageDown,
+        KeyCode::Home,
+        KeyCode::End,
+        KeyCode::Char('x'),
+    ] {
+        app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+    }
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    wheel(&mut app, MouseEventKind::ScrollUp, col, row);
+    assert_eq!(
+        app.editor.lines,
+        vec![String::new()],
+        "an image tab is read-only: no key may reach the buffer"
+    );
+}
+
+#[test]
+fn right_arrow_in_the_explorer_previews_a_file_without_stealing_focus() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("peek.txt"), "hello\n").unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = app
+        .tree
+        .nodes
+        .iter()
+        .position(|n| n.path.file_name().is_some_and(|f| f == "peek.txt"))
+        .expect("peek.txt in the tree");
+    app.tree.selected = idx;
+    app.focus_pane(Pane::Tree);
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+
+    assert_eq!(app.editor.lines[0], "hello");
+    assert!(
+        matches!(app.focus, Pane::Tree),
+        "Right is an Explorer navigation gesture: it previews but keeps the keyboard in the tree"
+    );
+}
+
+/// The invariant behind every test above, applied to one file of each kind
+/// croft previews: opening a file must leave the keyboard where that file's
+/// navigation keys are handled. Add a new preview type, add a row here.
+#[test]
+fn opening_any_file_type_from_the_explorer_lands_the_keyboard_in_the_editor() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("plain.txt"), "alpha\nbeta\n").unwrap();
+    std::fs::write(tmp.path().join("code.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(tmp.path().join("notes.md"), "# Title\n\nbody\n").unwrap();
+    std::fs::write(tmp.path().join("data.csv"), csv_body(5)).unwrap();
+    std::fs::write(tmp.path().join("data.tsv"), "a\tb\n1\t2\n").unwrap();
+    std::fs::write(tmp.path().join("conf.json"), "{\"a\": 1}\n").unwrap();
+    write_test_png(&tmp.path().join("shot.png"));
+    write_three_page_pdf(&tmp.path().join("doc.pdf"));
+
+    for name in [
+        "plain.txt",
+        "code.rs",
+        "notes.md",
+        "data.csv",
+        "data.tsv",
+        "conf.json",
+        "shot.png",
+        "doc.pdf",
+    ] {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        open_from_explorer(&mut app, name);
+        assert!(
+            matches!(app.focus, Pane::Editor),
+            "{name}: opening it must hand the keyboard to the editor, or its navigation keys are dead"
+        );
+    }
+}
+
+/// Root cause of the frozen preview: the overlay's re-emit key held the path
+/// and the rect but not the page, so a page turn looked like "same layout" and
+/// the picture on screen never changed. Baking twice across a page turn must
+/// produce two different payloads.
+#[test]
+fn turning_a_pdf_page_rebakes_the_inline_image_overlay() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.cell_pixel = Some((8, 16));
+    app.editor.open(&path).unwrap();
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: 30,
+    };
+    app.update_editor_image_overlay(0, area);
+    let page1 = app
+        .editor_image_payload(0)
+        .map(|(osc, _)| osc.to_string())
+        .expect("page 1 must bake");
+
+    assert!(app.editor.change_pdf_page(1));
+    app.update_editor_image_overlay(0, area);
+    let page2 = app
+        .editor_image_payload(0)
+        .map(|(osc, _)| osc.to_string())
+        .expect("page 2 must bake");
+
+    assert_ne!(
+        page1, page2,
+        "the overlay must re-bake on a page turn, or the reader stares at a frozen page"
     );
 }

@@ -2793,6 +2793,11 @@ pub struct EditorImageLayout {
     pub cell_w: u16,
     pub cell_h: u16,
     pub path: PathBuf,
+    /// Which page of a PDF is baked into this overlay (1 for anything else).
+    /// Part of the re-emit key so paging re-bakes on its own: without it the
+    /// path and rect are unchanged on a page turn and the stale picture stays
+    /// on screen unless every call site remembers to invalidate the layout.
+    pub page: u32,
 }
 
 /// Re-emit key for the terminal pane's inline-image overlay: the cell rect
@@ -18003,9 +18008,14 @@ impl App {
                         Ok(()) => {
                             self.sync_open_file_poll_mtime();
                             self.status = self.editor.status.clone();
-                            // Stay focused on the tree so Delete / arrows still
-                            // act on the explorer; click into the editor pane
-                            // to start typing.
+                            // Hand the keyboard to the editor, as VS Code does
+                            // on Enter. Without this every navigation key the
+                            // new tab defines is dead on arrival - arrows walk
+                            // the file list while a PDF sits frozen on page 1
+                            // and a spreadsheet never scrolls. Right-arrow
+                            // (below) is the gesture that previews *without*
+                            // leaving the tree.
+                            self.focus_pane(Pane::Editor);
                         }
                         Err(e) => {
                             self.status = format!("Error: {e}");
@@ -18457,38 +18467,20 @@ impl App {
             self.handle_sheet_key(key);
             return;
         }
-        // Image preview tabs are read-only. PDF tabs allow page navigation
-        // via Left/Right + PageUp/PageDown; everything else is swallowed.
+        // Image preview tabs are read-only. PDF tabs page with every
+        // navigation key (arrows, PageUp/PageDown, Space, Home/End) and with
+        // the wheel; everything else is swallowed.
         if self.editor.image.is_some() {
-            if self.editor.image.as_ref().is_some_and(|i| i.pdf.is_some()) {
-                let delta: i32 = match key.code {
-                    KeyCode::Right | KeyCode::PageDown | KeyCode::Char(' ') => 1,
-                    KeyCode::Left | KeyCode::PageUp => -1,
-                    KeyCode::Home => i32::MIN,
-                    KeyCode::End => i32::MAX,
-                    _ => 0,
-                };
-                if delta != 0 {
-                    let absolute = matches!(key.code, KeyCode::Home | KeyCode::End);
-                    let stepped = if absolute {
-                        let target_page: i32 = if delta < 0 { 1 } else { i32::MAX };
-                        let cur = self
-                            .editor
-                            .image
-                            .as_ref()
-                            .and_then(|i| i.pdf.as_ref())
-                            .map(|p| p.current_page as i32)
-                            .unwrap_or(1);
-                        self.editor.change_pdf_page(target_page - cur)
-                    } else {
-                        self.editor.change_pdf_page(delta)
-                    };
-                    if stepped {
-                        // Force the OSC overlay to re-bake on next render.
-                        let side = self.focused_image_side();
-                        self.overlays.editor[side].invalidate_layout();
-                    }
+            match key.code {
+                KeyCode::Right | KeyCode::PageDown | KeyCode::Down | KeyCode::Char(' ') => {
+                    self.step_pdf_page(1);
                 }
+                KeyCode::Left | KeyCode::PageUp | KeyCode::Up => {
+                    self.step_pdf_page(-1);
+                }
+                KeyCode::Home => self.jump_pdf_page(1),
+                KeyCode::End => self.jump_pdf_page(u32::MAX),
+                _ => {}
             }
             return;
         }
@@ -26202,6 +26194,8 @@ impl App {
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
                         diff.scroll_down_by(3);
+                    } else if self.editor.pdf_page().is_some() {
+                        self.step_pdf_page(1);
                     } else {
                         self.editor.scroll_down(3);
                     }
@@ -26257,6 +26251,8 @@ impl App {
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
                         diff.scroll_up_by(3);
+                    } else if self.editor.pdf_page().is_some() {
+                        self.step_pdf_page(-1);
                     } else {
                         self.editor.scroll_up(3);
                     }
@@ -27439,6 +27435,17 @@ impl App {
 
     /// Physical overlay-slot index of the focused group: its depth-first leaf
     /// index (0 when unsplit or focused-left, 1 when focused-right).
+    /// Step the focused PDF preview by `delta` pages. The overlay re-bakes on
+    /// its own (the page is part of its re-emit key), so this is the single
+    /// entry point every gesture - arrows, wheel, menu - can call.
+    fn step_pdf_page(&mut self, delta: i32) {
+        self.editor.change_pdf_page(delta);
+    }
+
+    fn jump_pdf_page(&mut self, page: u32) {
+        self.editor.set_pdf_page(page);
+    }
+
     fn focused_image_side(&self) -> usize {
         if self.editor_layout.is_split() {
             self.editor_layout.active_dfs_index()
@@ -27504,6 +27511,11 @@ impl App {
             cell_w,
             cell_h,
             path,
+            page: self
+                .group_on_side(side)
+                .and_then(|g| g.image.as_ref())
+                .and_then(|i| i.pdf.as_ref())
+                .map_or(1, |p| p.current_page),
         };
         // Skip the bake when nothing about the layout changed - this is
         // the hot path on every frame an image is on screen.

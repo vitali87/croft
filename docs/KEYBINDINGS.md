@@ -122,7 +122,8 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | Keys | Action |
 |------|--------|
 | `↑` / `↓` | Move selection |
-| `Enter` or `→` | Open a file; expand or collapse a folder |
+| `Enter` | Open a file and move the keyboard into the editor, so the new tab's own navigation keys work straight away (VS Code parity); on a folder, expand or collapse it |
+| `→` | Preview a file without leaving the tree, so `↑`/`↓` keep walking the list; on a folder, expand it |
 | Double-click a file | Pin its tab (a single click opens the file in the replaceable preview tab) |
 | `←` | Collapse a folder |
 | `Shift`+`↑` / `↓` / `PageUp` / `PageDown` / `Home` / `End` | Extend multi-selection from the anchor row |
@@ -290,9 +291,10 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 
 | Keys | Action |
 |------|--------|
-| `→` / `Page Down` / `Space` | Next page |
-| `←` / `Page Up` | Previous page |
+| `→` / `↓` / `Page Down` / `Space` | Next page |
+| `←` / `↑` / `Page Up` | Previous page |
 | `Home` / `End` | First / last page |
+| Wheel down / up over the page | Next / previous page |
 
 **Spreadsheet (`.csv`, `.tsv`, `.xlsx`, `.xls`, `.xlsb`, `.ods`)**
 
@@ -302,6 +304,7 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 | `PageUp` / `PageDown` | Pan a full viewport vertically |
 | `Home` | Jump to row 1, column 1 |
 | `End` | Jump to the last visible page |
+| Wheel down / up over the grid | Pan three rows |
 | `Tab` / `Shift+Tab` | Switch worksheet |
 
 ## Run & Debug

@@ -2671,15 +2671,17 @@ impl Editor {
         Ok(())
     }
 
-    /// Re-rasterise the active PDF preview at a new page. Returns true if
-    /// the page actually changed, so the caller can flag the OSC overlay
-    /// for re-bake. Wraps around at the document boundaries when the page
-    /// count is known; clamps at page 1 below otherwise.
+    /// The page an open PDF preview is showing, if this tab is one.
+    pub fn pdf_page(&self) -> Option<u32> {
+        self.image.as_ref()?.pdf.as_ref().map(|p| p.current_page)
+    }
+
+    /// Step the active PDF preview by `delta` pages. Returns true if the page
+    /// actually changed, so the caller can flag the OSC overlay for re-bake.
+    /// Wraps around at the document boundaries when the page count is known;
+    /// clamps at page 1 below otherwise.
     pub fn change_pdf_page(&mut self, delta: i32) -> bool {
-        let Some(image) = self.image.as_mut() else {
-            return false;
-        };
-        let Some(pdf) = image.pdf.clone() else {
+        let Some(pdf) = self.image.as_ref().and_then(|i| i.pdf.clone()) else {
             return false;
         };
         let new_page = if let Some(total) = pdf.page_count {
@@ -2693,6 +2695,28 @@ impl Editor {
             pdf.current_page.saturating_add(delta as u32)
         } else {
             pdf.current_page.saturating_sub((-delta) as u32).max(1)
+        };
+        self.render_pdf_page(new_page)
+    }
+
+    /// Jump the active PDF preview to an absolute page, clamped to the
+    /// document. `u32::MAX` therefore means "last page" without the caller
+    /// knowing the count - which is what Home / End need, and what stepping
+    /// by a huge delta cannot express (a step wraps).
+    pub fn set_pdf_page(&mut self, page: u32) -> bool {
+        let Some(pdf) = self.image.as_ref().and_then(|i| i.pdf.clone()) else {
+            return false;
+        };
+        let last = pdf.page_count.unwrap_or(u32::MAX).max(1);
+        self.render_pdf_page(page.clamp(1, last))
+    }
+
+    fn render_pdf_page(&mut self, new_page: u32) -> bool {
+        let Some(image) = self.image.as_mut() else {
+            return false;
+        };
+        let Some(pdf) = image.pdf.clone() else {
+            return false;
         };
         if new_page == pdf.current_page {
             return false;
@@ -5526,8 +5550,26 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// Scroll an open spreadsheet preview by `rows` (negative scrolls up).
+    /// Returns true when this tab is a spreadsheet, so the generic scroll
+    /// paths can hand it off instead of moving the (empty) text buffer.
+    pub fn scroll_sheet_rows(&mut self, rows: isize) -> bool {
+        let Some(sheet) = self.sheet.as_mut() else {
+            return false;
+        };
+        let Some(data) = sheet.sheets.get_mut(sheet.current_sheet) else {
+            return false;
+        };
+        let last = data.rows.len().saturating_sub(1);
+        data.scroll_row = data.scroll_row.saturating_add_signed(rows).min(last);
+        true
+    }
+
     pub fn scroll_up(&mut self, n: usize) {
         if self.scroll_markdown_preview(-(n as i32)) {
+            return;
+        }
+        if self.scroll_sheet_rows(-(n as isize)) {
             return;
         }
         if self.wrap_enabled() {
@@ -5540,6 +5582,9 @@ impl Editor {
 
     pub fn scroll_down(&mut self, n: usize) {
         if self.scroll_markdown_preview(n as i32) {
+            return;
+        }
+        if self.scroll_sheet_rows(n as isize) {
             return;
         }
         if self.wrap_enabled() {
