@@ -26,6 +26,11 @@ const APP_NAME: &str = "Croft";
 /// built by `osacompile` is a real Cocoa app, so its `on open` handler gets the
 /// path. `croft <file>` then roots the workspace at the file's parent
 /// (`cli::resolve_workspace`).
+///
+/// An opened document launches `--zen`: someone double-clicking a file wants to
+/// read that file, not land in a full IDE, so the editor fills the window and
+/// the Explorer and terminal stay one keystroke away (Cmd+B / Cmd+J). Clicking
+/// the launcher itself opens the workspace with the normal layout.
 fn launcher_script(croft_bin: &str, open_dir: &str) -> String {
     format!(
         r#"on run
@@ -34,7 +39,7 @@ end run
 
 on open theFiles
 	set f to POSIX path of (item 1 of theFiles)
-	set inner to "{croft_bin} " & quoted form of f
+	set inner to "{croft_bin} " & quoted form of f & " --zen"
 	do shell script "open -na Ghostty.app --args --initial-command=" & quoted form of inner
 end open
 "#
@@ -206,6 +211,17 @@ mod tests {
         // The dropped path is passed through as croft's workspace argument;
         // croft itself roots a file at its parent (see cli::resolve_workspace).
         assert!(s.contains("quoted form of f"));
+    }
+
+    /// Opening a document means "show me this file", so the window starts with
+    /// the Explorer and terminal hidden and the editor filling it. A plain
+    /// click on the launcher opens the workspace and keeps the full layout.
+    #[test]
+    fn opened_documents_start_zen_but_a_plain_click_does_not() {
+        let s = launcher_script("/Users/v/.cargo/bin/croft", "/Users/v/Documents");
+        let (run, open) = s.split_once("on open theFiles").unwrap();
+        assert!(open.contains("--zen"));
+        assert!(!run.contains("--zen"));
     }
 
     #[test]

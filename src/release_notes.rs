@@ -62,10 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Croft.app now opens files from Finder: drop one on the launcher, or pick Croft under Open With, and the workspace roots at the file's folder with the file in the editor.",
+        summary: "A file opened from Finder now fills the window, with the Explorer and terminal hidden until you want them back with Cmd+B or Cmd+J.",
     },
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Passing croft a file instead of a folder works on the command line too, so `croft notes.md` no longer errors with \"is not a directory\".",
+        summary: "Croft.app opens files from Finder: drop one on the launcher, or pick Croft under Open With, and the workspace roots at the file's folder.",
     },
 ];

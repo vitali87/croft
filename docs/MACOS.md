@@ -71,6 +71,8 @@ It works by launching `open -na Ghostty.app --args --initial-command="croft <dir
 
 `Croft.app` also accepts documents, so you can open a file straight from Finder. Drop a file on the app, or right-click it and pick Croft under **Open With**. The workspace roots itself at the file's folder and the file opens in the editor, the same as `croft <file>` on the command line.
 
+An opened document fills the window: the Explorer and terminal start hidden, because double-clicking a file means "show me this file" rather than "give me an IDE". Bring either back with `Cmd+B` and `Cmd+J`. Clicking the launcher itself (no document) keeps the normal layout.
+
 To make Croft the permanent handler for a file type, select a file in Finder, press `⌘I`, and under **Open With** choose Croft and click **Change All**. Do this in Finder rather than with `duti`: file types that no installed app declares (`.tex` is a common one) get a *dynamic* type identifier, and LaunchServices rejects `duti -s` for those with `error -50` no matter which app you name.
 
 The launcher is an AppleScript applet rather than a shell script for this reason: macOS hands a double-clicked document to an app as an Apple Event, which a `#!/bin/sh` bundle executable cannot receive. It would launch with empty arguments and silently open the default folder instead of the file.
