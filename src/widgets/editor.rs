@@ -12106,6 +12106,76 @@ mod tests {
         assert_eq!(a_tab.lines[0], "a NEW");
     }
 
+    /// The field gesture behind the pdftoppm stderr fix: a PDF is open while
+    /// pdflatex rewrites it. Mid-write the file is truncated garbage - the
+    /// FS-sync sweep must fail quietly and keep the last good page, then
+    /// reload once the write completes.
+    #[test]
+    fn open_pdf_tab_keeps_last_good_page_through_a_mid_write_sweep() {
+        assert!(
+            crate::pdf::detect_backend().is_some(),
+            "this test needs a PDF rasteriser (poppler's pdftoppm, or sips on macOS)"
+        );
+        let one_page_pdf = concat!(
+            "%PDF-1.4\n",
+            "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+            "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n",
+            "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R>>endobj\n",
+            "4 0 obj<</Length 27>>stream\n0 0 1 rg 10 10 100 100 re f\nendstream endobj\n",
+            "trailer<</Root 1 0 R/Size 5>>\n%%EOF\n",
+        );
+        let bump_mtime = |path: &Path, secs: u64| {
+            let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(secs);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(newer)
+                .unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presentation.pdf");
+        std::fs::write(&path, one_page_pdf).unwrap();
+        let mut tabs = EditorTabs::new();
+        tabs.open_pinned(&path).unwrap();
+        let good_bytes = {
+            let tab = tabs.iter_tabs().next().unwrap();
+            tab.image
+                .as_ref()
+                .expect("PDF tab renders a page")
+                .bytes
+                .clone()
+        };
+        // pdflatex truncates and starts rewriting the file.
+        std::fs::write(&path, b"%PDF-1.7\ntruncated mid-write, no xref").unwrap();
+        bump_mtime(&path, 2);
+        let report = tabs.reload_externally_changed_tabs(&|_| false);
+        assert!(
+            report.reloaded.is_empty(),
+            "a failed render is not a reload"
+        );
+        assert!(
+            report.conflicts.is_empty(),
+            "a clean tab is never a conflict"
+        );
+        let tab = tabs.iter_tabs().next().unwrap();
+        assert_eq!(
+            tab.image
+                .as_ref()
+                .expect("last good page must survive")
+                .bytes,
+            good_bytes,
+            "mid-write failure must keep showing the last good render"
+        );
+        // The write completes; the next sweep picks it up.
+        std::fs::write(&path, one_page_pdf).unwrap();
+        bump_mtime(&path, 4);
+        let report = tabs.reload_externally_changed_tabs(&|_| false);
+        assert_eq!(report.reloaded, vec![path.clone()]);
+        let tab = tabs.iter_tabs().next().unwrap();
+        assert!(tab.image.is_some(), "completed write renders again");
+    }
+
     #[test]
     fn insert_str_inserts_newlines() {
         let mut e = editor_with("");

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Launching from Croft.app no longer hides every tool you have installed: croft now recovers your login shell's PATH, so PDFs page through poppler instead of freezing on page 1.",
+    summary: "Rebuilding an open PDF (pdflatex, typst) no longer corrupts the screen: the rasteriser's errors are captured instead of spraying over the UI, and the last good page stays up until the write completes.",
 }];

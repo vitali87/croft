@@ -102,7 +102,10 @@ fn rasterize_with_pdftoppm(pdf: &Path, page: u32) -> std::io::Result<Vec<u8>> {
     let dir = unique_temp_dir("croft-pdf")?;
     let _guard = TempDirGuard(dir.clone());
     let prefix = dir.join("page");
-    let status = Command::new("pdftoppm")
+    // .output(), never .status(): the child must not inherit croft's TTY.
+    // A half-written PDF (pdflatex rewriting the open file) made pdftoppm
+    // spray "Syntax Error: Couldn't find trailer dictionary" over the UI.
+    let out = Command::new("pdftoppm")
         .arg("-f")
         .arg(page.to_string())
         .arg("-l")
@@ -112,10 +115,13 @@ fn rasterize_with_pdftoppm(pdf: &Path, page: u32) -> std::io::Result<Vec<u8>> {
         .args(["-png", "-singlefile"])
         .arg(pdf)
         .arg(&prefix)
-        .status()?;
-    if !status.success() {
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(std::io::Error::other(format!(
-            "pdftoppm exited with {status}"
+            "pdftoppm exited with {}: {}",
+            out.status,
+            stderr.trim()
         )));
     }
     let png_path = prefix.with_extension("png");
@@ -184,6 +190,28 @@ mod tests {
         for d in dirs {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// pdftoppm's stderr must be captured into the returned error, never
+    /// inherited: with a half-written PDF (pdflatex rewriting the open file)
+    /// the child used to spray "Syntax Error: Couldn't find trailer
+    /// dictionary" straight onto croft's TTY, corrupting the whole UI.
+    #[test]
+    fn pdftoppm_failure_captures_stderr_instead_of_writing_to_tty() {
+        if which("pdftoppm").is_none() {
+            eprintln!("skipping: pdftoppm not installed");
+            return;
+        }
+        let dir = unique_temp_dir("croft-pdf-test-stderr").unwrap();
+        let truncated = dir.join("half-written.pdf");
+        std::fs::write(&truncated, b"%PDF-1.7\ntruncated mid-write, no xref").unwrap();
+        let err = rasterize_with_pdftoppm(&truncated, 1).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Syntax Error") || msg.contains("trailer"),
+            "error must carry the child's stderr, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
