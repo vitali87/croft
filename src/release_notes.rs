@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Rebuilding an open PDF (pdflatex, typst) no longer corrupts the screen: the rasteriser's errors are captured instead of spraying over the UI, and the last good page stays up until the write completes.",
+    summary: "The debugger's helper commands (compiling your file, first-time debugpy/js-debug setup) no longer spray compiler and installer output over the UI: their errors are captured and reported in the status line, completing the v0.1.648 PDF-rasteriser fix.",
 }];

@@ -14532,10 +14532,16 @@ impl App {
                 ],
             ),
         };
-        let status = Command::new(program).args(&args).status()?;
-        if !status.success() {
+        // .output(), never .status(): the compiler must not inherit croft's
+        // TTY - a compile error would spray its diagnostics over the UI
+        // (same class as the pdftoppm trailer-dictionary spray).
+        let cmd_out = Command::new(program).args(&args).output()?;
+        if !cmd_out.status.success() {
+            let stderr = String::from_utf8_lossy(&cmd_out.stderr);
             return Err(std::io::Error::other(format!(
-                "{program} exited with {status}"
+                "{program} exited with {}: {}",
+                cmd_out.status,
+                stderr.trim()
             )));
         }
         Ok(out)

@@ -49,23 +49,32 @@ pub fn ensure_debug_venv() -> Result<PathBuf> {
     }
     let dir = debug_venv_dir().context("$HOME unset")?;
 
+    // .output(), never .status(): uv paints progress bars on stderr, and an
+    // inherited TTY would spray them over the running TUI (same class as the
+    // pdftoppm trailer-dictionary spray).
     let venv = Command::new("uv")
         .args(["venv", "-p", PYTHON_VERSION])
         .arg(&dir)
-        .status()
+        .output()
         .context("running `uv venv` (is uv installed and on PATH?)")?;
-    if !venv.success() {
-        bail!("`uv venv -p {PYTHON_VERSION}` failed (is CPython {PYTHON_VERSION} available?)");
+    if !venv.status.success() {
+        bail!(
+            "`uv venv -p {PYTHON_VERSION}` failed (is CPython {PYTHON_VERSION} available?): {}",
+            String::from_utf8_lossy(&venv.stderr).trim()
+        );
     }
 
     let pip = Command::new("uv")
         .args(["pip", "install", "--python"])
         .arg(&py)
         .arg("debugpy")
-        .status()
+        .output()
         .context("running `uv pip install debugpy`")?;
-    if !pip.success() {
-        bail!("`uv pip install debugpy` failed");
+    if !pip.status.success() {
+        bail!(
+            "`uv pip install debugpy` failed: {}",
+            String::from_utf8_lossy(&pip.stderr).trim()
+        );
     }
     Ok(py)
 }
@@ -183,16 +192,19 @@ pub fn ensure_js_debug() -> Result<PathBuf> {
 
     // The asset extracts a top-level `js-debug/` directory; -C lands it under
     // ~/.croft/js-debug so the server is at js-debug/src/dapDebugServer.js.
-    let status = Command::new("tar")
+    let tar = Command::new("tar")
         .arg("-xzf")
         .arg(&tarball)
         .arg("-C")
         .arg(&dir)
-        .status()
+        .output()
         .context("running `tar -xzf` on the js-debug release")?;
     let _ = std::fs::remove_file(&tarball);
-    if !status.success() {
-        bail!("extracting the js-debug release failed");
+    if !tar.status.success() {
+        bail!(
+            "extracting the js-debug release failed: {}",
+            String::from_utf8_lossy(&tar.stderr).trim()
+        );
     }
     if !server.exists() {
         bail!("js-debug release did not contain dapDebugServer.js (layout changed?)");
