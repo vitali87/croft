@@ -589,9 +589,13 @@ const OWNER_SITE: u64 = 1;
 /// plain local editing instead of staying read-only forever.
 const BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// How often an unanswered SnapshotRequest is re-sent while bootstrapping.
+/// How long the first unanswered SnapshotRequest waits before a re-send.
 /// The relay has no replay: a request broadcast before the owner's
-/// connection is registered is otherwise lost forever.
+/// connection is registered is otherwise lost forever. Every further
+/// unanswered resend doubles the wait: a guest cannot tell a lost request
+/// from a large reply still arriving, and a fixed cadence made the owner
+/// re-serialize and blocking-write the whole document every 500ms while a
+/// slow snapshot was already in flight.
 const SNAPSHOT_RESEND: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Per-file replication state on one participant.
@@ -605,6 +609,9 @@ enum DocState {
         deadline: std::time::Instant,
         /// When to re-send the request if no reply has landed yet.
         resend_at: std::time::Instant,
+        /// The wait after the next resend fires (doubles each time, see
+        /// [`SNAPSHOT_RESEND`]).
+        resend_every: std::time::Duration,
         buffered: Vec<Envelope>,
     },
     // Boxed: CollabDoc is an order of magnitude larger than the bootstrap
@@ -730,6 +737,7 @@ impl CollabSession {
                 nonce,
                 deadline: now + BOOTSTRAP_TIMEOUT,
                 resend_at: now + SNAPSHOT_RESEND,
+                resend_every: SNAPSHOT_RESEND,
                 buffered: Vec::new(),
             },
         );
@@ -957,11 +965,15 @@ impl CollabSession {
         let mut resend = Vec::new();
         for (file, state) in self.docs.iter_mut() {
             if let DocState::Bootstrapping {
-                nonce, resend_at, ..
+                nonce,
+                resend_at,
+                resend_every,
+                ..
             } = state
                 && now >= *resend_at
             {
-                *resend_at = now + SNAPSHOT_RESEND;
+                *resend_every *= 2;
+                *resend_at = now + *resend_every;
                 resend.push((file.clone(), *nonce));
             }
         }
@@ -1632,6 +1644,58 @@ mod tests {
     /// lost for good: the relay has no replay, so the guest must re-send
     /// while bootstrapping and an owner that appears moments later still
     /// answers.
+    #[test]
+    fn snapshot_resend_backs_off_exponentially() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.collab.sock");
+        {
+            let s = socket.clone();
+            std::thread::spawn(move || {
+                let _ = relay_serve(&s);
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut guest = loop {
+            if let Some(ch) = CollabChannel::connect(&socket, CollabRole::Guest) {
+                break CollabSession::new(ch, "guest".into());
+            }
+            assert!(Instant::now() < deadline, "relay never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        guest.request_file("src/f.rs");
+        // Fire three resends back to back (pulling the timer into the past
+        // each time) and read how far out each one rescheduled itself. A
+        // resend exists to cover a lost request; a reply that is merely
+        // large and still arriving must not be met with a train of
+        // duplicate full-document snapshots on a fixed 500ms cadence, so
+        // every unanswered resend must at least double the wait.
+        let mut waits: Vec<Duration> = Vec::new();
+        for _ in 0..3 {
+            {
+                let Some(DocState::Bootstrapping {
+                    resend_at,
+                    deadline,
+                    ..
+                }) = guest.docs.get_mut("src/f.rs")
+                else {
+                    panic!("guest must still be bootstrapping");
+                };
+                *resend_at = Instant::now() - Duration::from_millis(1);
+                *deadline = Instant::now() + Duration::from_secs(60);
+            }
+            let _ = guest.poll(|_| None);
+            let Some(DocState::Bootstrapping { resend_at, .. }) = guest.docs.get("src/f.rs") else {
+                panic!("guest must still be bootstrapping");
+            };
+            waits.push(resend_at.saturating_duration_since(Instant::now()));
+        }
+        assert!(
+            waits[1] >= waits[0] + waits[0] / 2 && waits[2] >= waits[1] + waits[1] / 2,
+            "unanswered resends must back off, got {waits:?}"
+        );
+    }
+
     #[test]
     fn guest_resends_snapshot_request_until_an_owner_answers() {
         use std::time::{Duration, Instant};
