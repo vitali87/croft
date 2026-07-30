@@ -301,12 +301,17 @@ The rest of the shipped shape:
   arriving mid-bootstrap are buffered and replayed (duplicates integrate as
   no-ops). The relay has no replay, so an unanswered request is **re-sent
   while bootstrapping, starting at 500ms and doubling on every further
-  unanswered resend** — the original broadcast can miss an owner whose
-  connection the relay has not yet registered (RED-tested via a registered
-  observer that proves the first broadcast completed ownerless), but a guest
-  cannot tell a lost request from a large reply still in flight, and a fixed
-  cadence made the owner re-serialize and blocking-write the whole document
-  every 500ms while a slow snapshot was already arriving.
+  unanswered resend, capped at 1s** — the original broadcast can miss an
+  owner whose connection the relay has not yet registered (RED-tested via a
+  registered observer that proves the first broadcast completed ownerless),
+  but a guest cannot tell a lost request from a large reply still in flight,
+  and a fixed cadence made the owner re-serialize and blocking-write the
+  whole document every 500ms while a slow snapshot was already arriving.
+  The cap matters as much as the doubling: unbounded, the third resend
+  landed past the 3s bootstrap deadline (0.5s, 1.5s, 3.5s) and an owner
+  registering in the back half of the window was never re-asked; capped,
+  the schedule is 0.5s, 1.5s, 2.5s — the same late-owner coverage as the
+  old fixed cadence at half the duplicate-snapshot spam.
   The file is input-gated (one gate, at the editor key dispatch)
   until the snapshot lands; with **no owner on the relay the bootstrap times
   out after 3s** and the file degrades to plain local editing — a deviation
