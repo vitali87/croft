@@ -33,18 +33,25 @@ impl PageLinks {
     /// `(x0, y0, x1, y1)` (0..1 on both axes, top-left origin). The caller
     /// passes the whole area a terminal cell covers, so a click needs no
     /// pixel-perfect aim on the (thin) text-line rects poppler reports.
+    /// Adjacent TOC lines produce rects that overlap each other and one
+    /// coarse cell can straddle two of them, so among several hits the link
+    /// covering the largest share of the cell wins - not the first one in
+    /// document order.
     pub fn link_at(&self, frac: (f64, f64, f64, f64)) -> Option<&PdfLink> {
         if self.page_w == 0 || self.page_h == 0 {
             return None;
         }
         let (w, h) = (self.page_w as f64, self.page_h as f64);
-        self.links.iter().find(|l| {
-            let (lx0, ly0, lx1, ly1) = l.rect;
-            frac.0 < lx1 as f64 / w
-                && frac.2 > lx0 as f64 / w
-                && frac.1 < ly1 as f64 / h
-                && frac.3 > ly0 as f64 / h
-        })
+        self.links
+            .iter()
+            .filter_map(|l| {
+                let (lx0, ly0, lx1, ly1) = l.rect;
+                let ox = (frac.2.min(lx1 as f64 / w) - frac.0.max(lx0 as f64 / w)).max(0.0);
+                let oy = (frac.3.min(ly1 as f64 / h) - frac.1.max(ly0 as f64 / h)).max(0.0);
+                (ox > 0.0 && oy > 0.0).then_some((l, ox * oy))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(l, _)| l)
     }
 }
 
@@ -114,22 +121,74 @@ pub fn parse_pdf2xml_links(xml: &str, page: u32) -> Option<PageLinks> {
         ) else {
             continue;
         };
-        // Every <a> in the run shares the run's rect; more than one is rare
-        // (two links inside one text run) and both stay clickable.
-        let mut rest = tag;
+        // poppler often wraps only part of the run in the <a> (") is another "
+        // inside a longer sentence), and pdf2xml carries no per-<a> geometry.
+        // Each link therefore gets the proportional horizontal slice of the
+        // run rect its own characters cover, so the words next to a link do
+        // not become clickable with it.
+        let Some(gt) = tag.find('>') else { continue };
+        let content = tag[gt + 1..].split("</text>").next().unwrap_or("");
+        let total = visible_chars(content);
+        let mut pre = 0usize;
+        let mut rest = content;
         while let Some(pos) = rest.find("<a href=\"") {
+            pre += visible_chars(&rest[..pos]);
             let after = &rest[pos + "<a href=\"".len()..];
             let Some(end) = after.find('"') else { break };
-            if let Some(target) = classify_href(&xml_unescape(&after[..end])) {
+            let href = xml_unescape(&after[..end]);
+            let Some(tag_close) = after[end..].find('>') else {
+                break;
+            };
+            let (inner, after_anchor) = after[end + tag_close + 1..]
+                .split_once("</a>")
+                .unwrap_or((&after[end + tag_close + 1..], ""));
+            let inner_len = visible_chars(inner);
+            if let Some(target) = classify_href(&href) {
+                let (x0, x1) = if total == 0 {
+                    (left, left + w)
+                } else {
+                    let at = |chars: usize| {
+                        left + (w as f64 * chars as f64 / total as f64).round() as u32
+                    };
+                    let x0 = at(pre);
+                    (x0, at(pre + inner_len).max(x0 + 1))
+                };
                 out.links.push(PdfLink {
-                    rect: (left, top, left + w, top + h),
+                    rect: (x0, top, x1, top + h),
                     target,
                 });
             }
-            rest = &after[end..];
+            pre += inner_len;
+            rest = after_anchor;
         }
     }
     found.then_some(out)
+}
+
+/// Visible character count of a pdf2xml text-run fragment: markup tags
+/// contribute nothing and an escaped entity counts as the one character it
+/// stands for.
+fn visible_chars(s: &str) -> usize {
+    let mut n = 0;
+    let mut in_tag = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            '&' if !in_tag => {
+                for c in chars.by_ref() {
+                    if c == ';' {
+                        break;
+                    }
+                }
+                n += 1;
+            }
+            _ if !in_tag => n += 1,
+            _ => {}
+        }
+    }
+    n
 }
 
 /// `name="value"` attribute lookup on a single tag line. Values poppler emits
@@ -141,11 +200,19 @@ fn attr_u32(tag: &str, name: &str) -> Option<u32> {
     rest[..rest.find('"')?].parse().ok()
 }
 
-/// External hrefs keep their scheme; internal page links come out as
+/// External hrefs open through the OS - but a document-supplied URI is
+/// untrusted input, so only web and mail schemes qualify (`file://` or a
+/// registered custom scheme would be a one-click app launch from a click on
+/// what looks like plain text). Internal page links come out as
 /// `docname.html#page`. Anything else (a relative file link) is dropped.
 fn classify_href(href: &str) -> Option<LinkTarget> {
-    if href.contains("://") || href.starts_with("mailto:") {
+    let lower = href.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
+    {
         return Some(LinkTarget::Url(href.to_string()));
+    }
+    if lower.contains("://") {
+        return None;
     }
     let (_, frag) = href.rsplit_once('#')?;
     frag.parse().ok().map(LinkTarget::Page)
@@ -419,6 +486,85 @@ mod tests {
         assert!(
             parse_pdf2xml_links(xml, 3).is_none(),
             "a page absent from the output has no links"
+        );
+    }
+
+    /// poppler often wraps only part of a text run in the `<a>`: the link
+    /// rect must cover just the linked words (proportionally by character),
+    /// not the whole run, or clicking plain text next to a link opens it.
+    /// Real shape from a published PDF where the link text is ") is another "
+    /// (13 of the run's 28 visible characters).
+    #[test]
+    fn a_partial_run_link_covers_only_its_own_words() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<pdf2xml producer="poppler" version="25.04.0">
+<page number="1" position="absolute" top="0" left="0" height="1188" width="918">
+<text top="700" left="514" width="196" height="21" font="3"><a href="https://pycoders.com">) is another </a>popular weekly </text>
+</page>
+</pdf2xml>
+"##;
+        let p = parse_pdf2xml_links(xml, 1).unwrap();
+        assert_eq!(p.links.len(), 1);
+        let (x0, y0, x1, y1) = p.links[0].rect;
+        assert_eq!((x0, y0, y1), (514, 700, 721));
+        // 13/28 of the 196-wide run is 91: the rect ends near 605, well
+        // short of the run's right edge at 710 where "popular weekly" sits.
+        assert!(
+            (600..=610).contains(&x1),
+            "link rect must stop at the linked words, got x1={x1}"
+        );
+    }
+
+    /// Adjacent TOC lines produce thin rects that genuinely overlap each
+    /// other, and one coarse terminal cell can straddle two of them. The
+    /// click must resolve to the link covering most of the cell, not the
+    /// first overlapping one in document order.
+    #[test]
+    fn overlapping_toc_rects_resolve_to_the_most_covered_link() {
+        let links = PageLinks {
+            page_w: 1000,
+            page_h: 1188,
+            links: vec![
+                PdfLink {
+                    rect: (100, 189, 400, 212),
+                    target: LinkTarget::Page(509),
+                },
+                PdfLink {
+                    rect: (100, 208, 400, 231),
+                    target: LinkTarget::Page(511),
+                },
+            ],
+        };
+        // A cell row covering page-y 203.7..237.6 (a 35-row canvas over a
+        // 1188-tall page): 8 units of the first rect, 23 of the second.
+        let hit = links
+            .link_at((0.15, 203.7 / 1188.0, 0.30, 237.6 / 1188.0))
+            .expect("the cell overlaps both rects");
+        assert_eq!(hit.target, LinkTarget::Page(511));
+    }
+
+    /// A document-supplied href is untrusted input: only web and mail links
+    /// may reach the OS opener. `file://` (one-click app launch on macOS)
+    /// and arbitrary registered schemes must be dropped, not opened.
+    #[test]
+    fn only_web_and_mail_hrefs_open_externally() {
+        assert_eq!(
+            classify_href("file:///System/Applications/Calculator.app"),
+            None
+        );
+        assert_eq!(classify_href("vscode://extension/whatever"), None);
+        assert_eq!(classify_href("ssh://root@host"), None);
+        assert_eq!(
+            classify_href("https://a.b/c"),
+            Some(LinkTarget::Url(String::from("https://a.b/c")))
+        );
+        assert_eq!(
+            classify_href("HTTPS://A.B/c"),
+            Some(LinkTarget::Url(String::from("HTTPS://A.B/c")))
+        );
+        assert_eq!(
+            classify_href("mailto:x@y.z"),
+            Some(LinkTarget::Url(String::from("mailto:x@y.z")))
         );
     }
 
