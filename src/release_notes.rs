@@ -59,7 +59,29 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Arrow keys now control Python's interactive REPL (and any app that enables application cursor keys): the terminal honors DECCKM and sends the SS3 sequences such apps expect, instead of the normal-mode form they ignore.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Clicking a PDF in a grid of three or more editor groups no longer crashes croft, and the preview bakes into the focused group.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "PDF links open exactly what you clicked: each link covers only its own words, overlapping TOC lines resolve to the most-covered one, and only web and mail links may leave croft (a document's file:// or custom scheme is dropped).",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "A PDF rebuilt on disk (pdflatex finishing) reloads back to the page you were reading instead of snapping to page 1.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "GUI-launch PATH repair now survives rc files that background helpers, works under fish and tcsh, and never delays the instant remote-attach probes.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Broadcast input encodes arrows per pane, so a zsh pane and a bash pane each receive the form their own shell asked for.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Stray errors from the OS opener, Reveal in Finder, and new-window AppleScript can no longer scribble on the screen, and JS debugging finds node even when a chatty login shell overflows the pipe.",
+    },
+];
