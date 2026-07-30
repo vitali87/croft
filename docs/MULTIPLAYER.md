@@ -300,9 +300,13 @@ The rest of the shipped shape:
   from the process id so two guests never adopt each other's reply). Ops
   arriving mid-bootstrap are buffered and replayed (duplicates integrate as
   no-ops). The relay has no replay, so an unanswered request is **re-sent
-  every 500ms while bootstrapping** — the original broadcast can miss an
-  owner whose connection the relay has not yet registered (RED-tested via a
-  registered observer that proves the first broadcast completed ownerless).
+  while bootstrapping, starting at 500ms and doubling on every further
+  unanswered resend** — the original broadcast can miss an owner whose
+  connection the relay has not yet registered (RED-tested via a registered
+  observer that proves the first broadcast completed ownerless), but a guest
+  cannot tell a lost request from a large reply still in flight, and a fixed
+  cadence made the owner re-serialize and blocking-write the whole document
+  every 500ms while a slow snapshot was already arriving.
   The file is input-gated (one gate, at the editor key dispatch)
   until the snapshot lands; with **no owner on the relay the bootstrap times
   out after 3s** and the file degrades to plain local editing — a deviation
