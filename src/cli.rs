@@ -235,6 +235,17 @@ pub enum CliCommand {
 
 impl Cli {
     pub fn run(self) -> Result<()> {
+        // Pure liveness probes answer before anything else runs: the remote
+        // launch script fires them over SSH on every connect, and a remote
+        // host handing SSH sessions a stripped PATH (macOS does) must not
+        // buy them a login-shell probe - remote attach never waits.
+        if matches!(
+            self.command,
+            Some(CliCommand::SessionHost { probe: true, .. })
+                | Some(CliCommand::CollabRelay { probe: true, .. })
+        ) {
+            return Ok(());
+        }
         // macOS launchd starts croft with a 256-fd soft limit; the editor's
         // PTYs/watchers/LSPs and especially the spawned cross-link (~250
         // rlibs open at once) need far more. Children inherit the raise.

@@ -69,13 +69,25 @@ fn merge(current: Option<&str>, probed: &str) -> String {
 
 /// Ask `shell` for its PATH. `-l -i` so both the login files (`.zprofile`,
 /// `.bash_profile`) and the interactive ones (`.zshrc`) get a say, since
-/// either may be where the user builds their PATH. stdin is closed so a shell
-/// that prompts gets EOF instead of blocking, and the whole thing is bounded
-/// by [`PROBE_TIMEOUT`].
+/// either may be where the user builds their PATH (csh/tcsh accept `-l` only
+/// as the sole argument, so that family runs `-i` alone). The value is
+/// printed by an inner `/bin/sh` reading the *environment*: fish expands its
+/// own quoted `$PATH` list space-joined, while the exported variable is
+/// colon-joined in every shell. stdin is closed so a shell that prompts gets
+/// EOF instead of blocking, and the whole thing is bounded by
+/// [`PROBE_TIMEOUT`].
 fn probe(shell: &str) -> Option<String> {
     let mut cmd = Command::new(shell);
-    cmd.args(["-l", "-i", "-c"])
-        .arg(format!(r#"printf '{BEGIN}%s{END}' "$PATH""#));
+    let csh = std::path::Path::new(shell)
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().ends_with("csh"));
+    if csh {
+        cmd.arg("-i");
+    } else {
+        cmd.args(["-l", "-i"]);
+    }
+    cmd.arg("-c")
+        .arg(format!(r#"/bin/sh -c 'printf "{BEGIN}%s{END}" "$PATH"'"#));
     run_probe(cmd, PROBE_TIMEOUT)
 }
 
@@ -90,16 +102,35 @@ fn run_probe(mut cmd: Command, timeout: Duration) -> Option<String> {
         .ok()?;
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
+    // Read until the END marker, not EOF: a backgrounded grandchild from an
+    // rc file (`(brew update &)`, an agent start) inherits the pipe's write
+    // end and holds EOF back long after the shell answered and exited.
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        let mut chunk = [0u8; 4096];
+        loop {
+            match std::io::Read::read(&mut stdout, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if String::from_utf8_lossy(&buf).contains(END) {
+                        break;
+                    }
+                }
+            }
+        }
         let _ = tx.send(buf);
     });
     let out = rx.recv_timeout(timeout).ok();
-    // Either it answered and has exited, or it is wedged and must not outlive
-    // the probe holding a pipe open.
+    // Either it answered, or it is wedged and must not outlive the probe
+    // holding a pipe open. The reap runs off-thread: a shell stuck in
+    // uninterruptible sleep (rc file stat'ing a dead network mount) cannot
+    // be killed, and a synchronous wait() on it would wedge startup after
+    // all.
     let _ = child.kill();
-    let _ = child.wait();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     extract(&String::from_utf8_lossy(&out?))
 }
 
@@ -255,28 +286,70 @@ mod tests {
         assert!(path.contains("/bin"), "got {path:?}");
     }
 
-    /// The whole chain against this machine's own login shell: the PATH a
-    /// Dock click really produces must come back with directories neither
-    /// launchd nor the launching app put there. Without this, croft can see
-    /// nothing the user installed (`pdftoppm`, `git`, `rg`, the language
-    /// servers) whenever it is started from Croft.app.
+    /// The whole chain, end to end through a real process spawn: the PATH a
+    /// Dock click produces must come back with the login shell's own
+    /// directories merged in front, or croft can see nothing the user
+    /// installed (`pdftoppm`, `git`, `rg`, the language servers) when
+    /// started from Croft.app. A stub login shell stands in for the user's:
+    /// the suite must not depend on (or execute) a developer's rc files.
     #[test]
     fn a_dock_launch_ends_up_seeing_the_users_own_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub-shell");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\nprintf '{BEGIN}/stub/tools/bin:/usr/bin{END}'\n"),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&stub, perm).unwrap();
         let dock = "/usr/bin:/bin:/usr/sbin:/sbin:/Applications/Ghostty.app/Contents/MacOS";
-        let fixed = repaired(Some(dock), || probe(&login_shell()))
+        let fixed = repaired(Some(dock), || probe(&stub.display().to_string()))
             .expect("a Dock launch must have its PATH repaired");
-        let gained: Vec<&str> = fixed
-            .split(':')
-            .filter(|e| !e.contains(".app/") && !LAUNCHD_DIRS.contains(&e.trim_end_matches('/')))
-            .collect();
         assert!(
-            !gained.is_empty(),
-            "the login shell contributed nothing to {fixed:?}"
+            fixed.starts_with("/stub/tools/bin:"),
+            "the shell's directories must lead, got {fixed:?}"
         );
         // And nothing we started with is lost on the way.
         for entry in dock.split(':') {
             assert!(fixed.split(':').any(|e| e == entry), "{entry} dropped");
         }
+    }
+
+    /// An rc file that backgrounds a helper (`(brew update &)`, an agent
+    /// start) leaves the pipe's write end open in the grandchild after the
+    /// shell itself exits. The probe must return the moment the END marker
+    /// arrives instead of waiting for an EOF that only comes when the
+    /// grandchild eventually dies.
+    #[test]
+    fn a_backgrounded_grandchild_does_not_stall_the_probe() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!("printf '{BEGIN}/opt/x:/usr/bin{END}'; sleep 5 &"),
+        ]);
+        let start = std::time::Instant::now();
+        let out = run_probe(cmd, Duration::from_millis(1500));
+        assert_eq!(out.as_deref(), Some("/opt/x:/usr/bin"));
+        assert!(
+            start.elapsed() < Duration::from_millis(1200),
+            "the probe waited {:?} on a grandchild's pipe",
+            start.elapsed()
+        );
+    }
+
+    /// tcsh rejects `-l` combined with any other flag (`-l` must be the sole
+    /// argument), and fish expands a quoted `$PATH` space-joined. The probe
+    /// must still get a colon-joined PATH out of both families.
+    #[test]
+    fn a_csh_family_login_shell_still_answers() {
+        if !std::path::Path::new("/bin/tcsh").exists() {
+            eprintln!("skipping: tcsh not installed");
+            return;
+        }
+        let path = probe("/bin/tcsh").expect("tcsh must report a PATH");
+        assert!(path.contains("/bin"), "got {path:?}");
     }
 
     /// A shell wedged on its own rc file must not wedge croft.
