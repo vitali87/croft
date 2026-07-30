@@ -4123,12 +4123,19 @@ impl Editor {
         let prev_row = self.cursor_row;
         let prev_col = self.cursor_col;
         let prev_scroll = self.scroll;
+        let prev_pdf_page = self.pdf_page();
         let result = self.open(&path);
         // Clamp the restored cursor to the new contents so it stays valid
         // even if the file shrank.
         self.cursor_row = prev_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = prev_col.min(self.line_char_len(self.cursor_row));
         self.scroll = prev_scroll.min(self.lines.len().saturating_sub(1));
+        // A PDF's page is its cursor: a rebuild on disk (pdflatex finishing)
+        // must not snap the reader back to page 1. `set_pdf_page` clamps to
+        // the new page count if the document shrank.
+        if let Some(page) = prev_pdf_page.filter(|&p| p > 1) {
+            self.set_pdf_page(page);
+        }
         result
     }
 
@@ -12118,10 +12125,10 @@ mod tests {
     /// reload once the write completes.
     #[test]
     fn open_pdf_tab_keeps_last_good_page_through_a_mid_write_sweep() {
-        assert!(
-            crate::pdf::detect_backend().is_some(),
-            "this test needs a PDF rasteriser (poppler's pdftoppm, or sips on macOS)"
-        );
+        if crate::pdf::detect_backend().is_none() {
+            eprintln!("skipping: no PDF rasteriser installed");
+            return;
+        }
         let one_page_pdf = concat!(
             "%PDF-1.4\n",
             "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
@@ -12180,6 +12187,51 @@ mod tests {
         assert_eq!(report.reloaded, vec![path.clone()]);
         let tab = tabs.iter_tabs().next().unwrap();
         assert!(tab.image.is_some(), "completed write renders again");
+    }
+
+    /// Reading page 2 of a deck while pdflatex rebuilds the file: the
+    /// FS-sync reload must come back on page 2, not snap the reader to
+    /// page 1 and lose their place.
+    #[test]
+    fn pdf_reload_keeps_the_current_page() {
+        if crate::pdf::detect_backend().is_none() {
+            eprintln!("skipping: no PDF rasteriser installed");
+            return;
+        }
+        let two_page_pdf = concat!(
+            "%PDF-1.4\n",
+            "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+            "2 0 obj<</Type/Pages/Kids[3 0 R 5 0 R]/Count 2>>endobj\n",
+            "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R>>endobj\n",
+            "4 0 obj<</Length 27>>stream\n0 0 1 rg 10 10 100 100 re f\nendstream endobj\n",
+            "5 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 6 0 R>>endobj\n",
+            "6 0 obj<</Length 27>>stream\n1 0 0 rg 10 10 100 100 re f\nendstream endobj\n",
+            "trailer<</Root 1 0 R/Size 7>>\n%%EOF\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deck.pdf");
+        std::fs::write(&path, two_page_pdf).unwrap();
+        let mut tabs = EditorTabs::new();
+        tabs.open_pinned(&path).unwrap();
+        assert!(tabs.change_pdf_page(1), "two pages, so page 2 renders");
+        assert_eq!(tabs.pdf_page(), Some(2));
+        // pdflatex rewrites the file (same content is enough; only the
+        // disk stamp needs to move).
+        std::fs::write(&path, two_page_pdf).unwrap();
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(newer)
+            .unwrap();
+        let report = tabs.reload_externally_changed_tabs(&|_| false);
+        assert_eq!(report.reloaded, vec![path.clone()]);
+        assert_eq!(
+            tabs.pdf_page(),
+            Some(2),
+            "an external rebuild must not move the reader back to page 1"
+        );
     }
 
     #[test]
