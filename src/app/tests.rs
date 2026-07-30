@@ -14860,6 +14860,24 @@ fn split_right_then_split_down_yields_three_tiled_groups() {
     assert_eq!(app.editor_layout.active_dfs_index(), 2);
 }
 
+/// There are physically two image-overlay slots (left/right column); any
+/// layout other than the two-column split bakes the active group into slot 0.
+/// The focused side must therefore never index past the array: clicking a PDF
+/// in the lower-right group of a three-way split panicked with
+/// index-out-of-bounds before this was clamped.
+#[test]
+fn focused_image_side_stays_within_the_two_overlay_slots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    app.split_editor_dir(editor_layout::SplitDir::Vertical, true);
+    assert_eq!(app.editor_layout.active_dfs_index(), 2);
+    assert!(
+        app.focused_image_side() < 2,
+        "focused_image_side must stay within overlays.editor"
+    );
+}
+
 #[test]
 fn move_right_with_no_neighbor_creates_a_new_group_with_the_moved_tab() {
     let tmp = tempfile::tempdir().unwrap();
@@ -18760,6 +18778,69 @@ fn arrow_keys_reach_an_app_cursor_mode_child_as_ss3() {
             break;
         }
         assert!(waited < 8000, "the key presses never reached the child");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+}
+
+/// Broadcast input fans one keystroke out to panes whose children disagree
+/// about DECCKM. Each pane must receive the form its own child asked for
+/// (bash's readline leaves DECCKM off while zsh turns it on, so mixed panes
+/// are the normal case): pane 0 stays in normal mode and must get CSI, pane
+/// 1 turns application cursor keys on and must get SS3.
+#[test]
+fn broadcast_arrows_encode_per_pane_cursor_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sink_a = tmp.path().join("a.bin");
+    let sink_b = tmp.path().join("b.bin");
+    // Runtime-assembled sentinel: the pane header echoes the script text.
+    let script_a = format!(
+        "s=REA; printf \"${{s}}DY_MARK\"; stty raw -echo 2>/dev/null; dd bs=1 count=3 of={} 2>/dev/null; sleep 30",
+        sink_a.display()
+    );
+    let script_b = format!(
+        "s=REA; printf '\\033[?1h'; printf \"${{s}}DY_MARK\"; stty raw -echo 2>/dev/null; dd bs=1 count=3 of={} 2>/dev/null; sleep 30",
+        sink_b.display()
+    );
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), script_a],
+        tmp.path(),
+    )
+    .unwrap();
+    app.terminals.push(
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), script_b],
+            tmp.path(),
+        )
+        .unwrap(),
+    );
+    app.active_terminal = 0;
+    app.broadcast_input = true;
+    app.focus_pane(Pane::Terminal);
+    let mut waited = 0u32;
+    while !app
+        .terminals
+        .iter()
+        .all(|t| t.grid_lines().0.iter().any(|l| l.contains("READY_MARK")))
+    {
+        assert!(waited < 8000, "the children never reached their prompts");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    app.handle_terminal_key(key(KeyCode::Up, KeyModifiers::NONE));
+    let mut waited = 0u32;
+    loop {
+        let a = std::fs::read(&sink_a).unwrap_or_default();
+        let b = std::fs::read(&sink_b).unwrap_or_default();
+        if a.len() == 3 && b.len() == 3 {
+            assert_eq!(a, b"\x1b[A", "normal-mode pane must get the CSI form");
+            assert_eq!(b, b"\x1bOA", "DECCKM pane must get the SS3 form");
+            break;
+        }
+        assert!(waited < 8000, "the broadcast never reached both panes");
         std::thread::sleep(std::time::Duration::from_millis(20));
         waited += 20;
     }

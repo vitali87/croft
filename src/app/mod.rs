@@ -3161,6 +3161,12 @@ fn open_url(url: &str) -> Result<()> {
         c.arg(url);
         c
     };
+    // Detach the opener's stdio: croft is on the alternate screen in raw
+    // mode, and `open`/`xdg-open` chatter ("No application knows how to
+    // open URL ...") would land straight on the grid.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     cmd.spawn().with_context(|| format!("opening {url}"))?;
     Ok(())
 }
@@ -9689,24 +9695,10 @@ impl App {
         };
     }
 
-    /// Shell-bound bytes from the focused terminal: normally just the active
-    /// pane, mirrored to every non-excluded pane while broadcast is on (the
-    /// focused pane always receives its own input).
-    fn write_terminal_input(&mut self, bytes: &[u8]) {
-        if self.broadcast_input {
-            let active = self.active_terminal;
-            for (i, t) in self.terminals.iter_mut().enumerate() {
-                if i == active || !t.broadcast_excluded {
-                    t.write_input(bytes);
-                }
-            }
-        } else {
-            self.terminal_mut().write_input(bytes);
-        }
-    }
-
-    /// Paste counterpart of [`Self::write_terminal_input`] (bracketed-paste
-    /// aware per pane).
+    /// Paste counterpart of [`Self::write_terminal_key`] (bracketed-paste
+    /// aware per pane): normally just the active pane, mirrored to every
+    /// non-excluded pane while broadcast is on (the focused pane always
+    /// receives its own input).
     fn paste_terminal_input(&mut self, payload: &[u8]) {
         if self.broadcast_input {
             let active = self.active_terminal;
@@ -19798,9 +19790,30 @@ impl App {
         if self.terminal().selection().is_some() {
             self.terminal_mut().clear_selection();
         }
-        let bytes = key_to_bytes(key, self.terminal().app_cursor_keys());
-        if !bytes.is_empty() {
-            self.write_terminal_input(&bytes);
+        self.write_terminal_key(key);
+    }
+
+    /// Shell-bound keystroke from the focused terminal: normally just the
+    /// active pane, mirrored to every non-excluded pane while broadcast is
+    /// on. Encoded per pane because DECCKM is per-PTY state: every pane gets
+    /// the form its own child asked for (a zsh pane wants SS3 arrows while a
+    /// bash pane wants CSI), not the focused pane's.
+    fn write_terminal_key(&mut self, key: KeyEvent) {
+        if self.broadcast_input {
+            let active = self.active_terminal;
+            for (i, t) in self.terminals.iter_mut().enumerate() {
+                if i == active || !t.broadcast_excluded {
+                    let bytes = key_to_bytes(key, t.app_cursor_keys());
+                    if !bytes.is_empty() {
+                        t.write_input(&bytes);
+                    }
+                }
+            }
+        } else {
+            let bytes = key_to_bytes(key, self.terminal().app_cursor_keys());
+            if !bytes.is_empty() {
+                self.terminal_mut().write_input(&bytes);
+            }
         }
     }
 
@@ -27442,6 +27455,9 @@ impl App {
             self.status = if std::process::Command::new("open")
                 .arg("-R")
                 .arg(&path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()
                 .is_ok()
             {
@@ -27527,7 +27543,12 @@ impl App {
     }
 
     fn focused_image_side(&self) -> usize {
-        if self.editor_layout.is_split() {
+        // There are physically two overlay slots (left/right column), and
+        // only the two-column split keys them by group: every other layout -
+        // unsplit, or a grid of three or more groups - bakes the active
+        // group into slot 0 (see the render path). Indexing by DFS position
+        // here panicked on a PDF click in the third group of a grid.
+        if self.editor_layout.leaf_count() == 2 {
             self.editor_layout.active_dfs_index()
         } else {
             0
@@ -29137,6 +29158,9 @@ fn spawn_new_window(root: &std::path::Path, file: &std::path::Path) -> std::io::
         HostTerminal::Ghostty => {
             std::process::Command::new("open")
                 .args(ghostty_open_argv(&exe, root, file))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()?;
             Ok(())
         }
@@ -29147,6 +29171,9 @@ fn spawn_new_window(root: &std::path::Path, file: &std::path::Path) -> std::io::
             std::process::Command::new("osascript")
                 .arg("-e")
                 .arg(iterm2_new_window_script(&exe, root, file))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()?;
             Ok(())
         }
@@ -29154,6 +29181,9 @@ fn spawn_new_window(root: &std::path::Path, file: &std::path::Path) -> std::io::
             std::process::Command::new("osascript")
                 .arg("-e")
                 .arg(apple_terminal_new_window_script(&exe, root, file))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()?;
             Ok(())
         }
