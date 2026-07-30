@@ -144,17 +144,20 @@ pub fn parse_pdf2xml_links(xml: &str, page: u32) -> Option<PageLinks> {
                 .unwrap_or((&after[end + tag_close + 1..], ""));
             let inner_len = visible_chars(inner);
             if let Some(target) = classify_href(&href) {
+                // Extents clamp to at least one page unit: the hit test
+                // demands positive overlap area, so a zero-width or
+                // zero-height run would otherwise be unclickable forever.
                 let (x0, x1) = if total == 0 {
-                    (left, left + w)
+                    (left, left + w.max(1))
                 } else {
                     let at = |chars: usize| {
-                        left + (w as f64 * chars as f64 / total as f64).round() as u32
+                        left + (w as f64 * chars.min(total) as f64 / total as f64).round() as u32
                     };
                     let x0 = at(pre);
                     (x0, at(pre + inner_len).max(x0 + 1))
                 };
                 out.links.push(PdfLink {
-                    rect: (x0, top, x1, top + h),
+                    rect: (x0, top, x1, top + h.max(1)),
                     target,
                 });
             }
@@ -167,19 +170,29 @@ pub fn parse_pdf2xml_links(xml: &str, page: u32) -> Option<PageLinks> {
 
 /// Visible character count of a pdf2xml text-run fragment: markup tags
 /// contribute nothing and an escaped entity counts as the one character it
-/// stands for.
+/// stands for. Only a well-formed entity (`&` + a short alphanumeric/`#`
+/// name + `;`) collapses; a bare `&` counts as itself - swallowing to some
+/// distant `;` (or the end) would make the counts on the two sides of an
+/// anchor disagree and push a link's slice past its own run rect.
 fn visible_chars(s: &str) -> usize {
     let mut n = 0;
     let mut in_tag = false;
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
+    let mut it = s.char_indices();
+    while let Some((i, c)) = it.next() {
         match c {
             '<' => in_tag = true,
             '>' => in_tag = false,
             '&' if !in_tag => {
-                for c in chars.by_ref() {
-                    if c == ';' {
-                        break;
+                let rest = &s[i + 1..];
+                if let Some(semi) = rest.find(';')
+                    && (1..=8).contains(&semi)
+                    && rest[..semi]
+                        .chars()
+                        .all(|c| c == '#' || c.is_ascii_alphanumeric())
+                {
+                    // The name is ASCII (just checked), so chars == bytes.
+                    for _ in 0..=semi {
+                        it.next();
                     }
                 }
                 n += 1;
@@ -566,6 +579,65 @@ mod tests {
             classify_href("mailto:x@y.z"),
             Some(LinkTarget::Url(String::from("mailto:x@y.z")))
         );
+    }
+
+    /// A degenerate run (`height="0"` or `width="0"`, which the parser must
+    /// tolerate even if poppler is not known to emit it) still yields a rect
+    /// the positive-area hit test can match: extents clamp to at least one
+    /// page unit, or the link is silently unclickable forever.
+    #[test]
+    fn a_zero_extent_run_still_yields_a_clickable_rect() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<pdf2xml producer="poppler" version="25.04.0">
+<page number="1" position="absolute" top="0" left="0" height="1000" width="1000">
+<text top="100" left="50" width="120" height="0"><a href="https://a.b/">flat</a></text>
+<text top="300" left="50" width="0" height="12"><a href="https://c.d/"></a></text>
+</page>
+</pdf2xml>
+"##;
+        let p = parse_pdf2xml_links(xml, 1).unwrap();
+        assert_eq!(p.links.len(), 2);
+        for l in &p.links {
+            let (x0, y0, x1, y1) = l.rect;
+            assert!(x1 > x0 && y1 > y0, "degenerate rect survived: {:?}", l.rect);
+        }
+        // And a cell over each degenerate run actually hits it.
+        assert!(p.link_at((0.05, 0.099, 0.18, 0.102)).is_some());
+        assert!(p.link_at((0.049, 0.30, 0.052, 0.312)).is_some());
+    }
+
+    /// A bare `&` (no terminating `;`) must count as a plain character, not
+    /// swallow the rest of the fragment as a half-open entity: the counts on
+    /// the two sides of the anchor would disagree and the link's slice could
+    /// extend past its own run rect, making unrelated text clickable.
+    #[test]
+    fn an_unterminated_entity_cannot_push_a_link_past_its_run() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<pdf2xml producer="poppler" version="25.04.0">
+<page number="1" position="absolute" top="0" left="0" height="1000" width="1000">
+<text top="100" left="200" width="120" height="12">a & b<a href="https://a.b/">L</a></text>
+</page>
+</pdf2xml>
+"##;
+        let p = parse_pdf2xml_links(xml, 1).unwrap();
+        assert_eq!(p.links.len(), 1);
+        let (x0, _, x1, _) = p.links[0].rect;
+        assert!(
+            x0 >= 200 && x1 <= 320 && x0 < x1,
+            "the link slice must stay inside its run rect (200..320), got {x0}..{x1}"
+        );
+        // Terminated entities still count as the single character they
+        // stand for: "&amp; " is 2 visible chars, so the anchor's slice
+        // starts past the midpoint of this 6-char run, not at its left edge.
+        let ent = r##"<?xml version="1.0" encoding="UTF-8"?>
+<pdf2xml producer="poppler" version="25.04.0">
+<page number="1" position="absolute" top="0" left="0" height="1000" width="1000">
+<text top="100" left="0" width="600" height="12">&amp; ab<a href="https://a.b/">cd</a></text>
+</page>
+</pdf2xml>
+"##;
+        let p = parse_pdf2xml_links(ent, 1).unwrap();
+        assert_eq!(p.links[0].rect.0, 400, "4 of 6 chars precede the anchor");
     }
 
     /// The whole cell area is hit-tested, so a click one row under a thin
