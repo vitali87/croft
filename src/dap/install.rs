@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -135,8 +135,10 @@ fn resolve_node_via_login_shell() -> Option<String> {
 }
 
 /// Run `program args...` capturing stdout, killing it if it outlives `timeout`
-/// (a login shell with a chatty/blocking rc must never wedge croft). Returns the
-/// captured stdout on a clean exit, else `None`.
+/// (a login shell with a chatty/blocking rc must never wedge croft). Stdout is
+/// drained *while* the child runs: an rc that prints more than the OS pipe
+/// buffer would otherwise block in write() and never exit. Returns the
+/// captured stdout, `None` on timeout or spawn failure.
 fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     use std::io::Read;
     let mut child = Command::new(program)
@@ -146,22 +148,17 @@ fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> Option<String
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => return None,
-        }
-    }
-    let mut buf = String::new();
-    child.stdout.take()?.read_to_string(&mut buf).ok()?;
-    Some(buf)
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let out = rx.recv_timeout(timeout).ok();
+    let _ = child.kill();
+    let _ = child.wait();
+    out
 }
 
 /// Whether `bin` resolves on PATH (a `command -v` check via the shell-less
@@ -231,6 +228,21 @@ fn download_to_file(url: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A login shell with a chatty rc (a `fastfetch` banner, `set -x`
+    /// tracing) can emit more than the OS pipe buffer. The child then blocks
+    /// in write() and never exits, so waiting for exit before reading
+    /// deadlocks until the timeout and reports node as missing. Output must
+    /// be drained while the child runs.
+    #[test]
+    fn run_bounded_survives_output_larger_than_the_pipe_buffer() {
+        let out = run_bounded(
+            "/bin/sh",
+            &["-c", "yes croft | head -c 200000"],
+            Duration::from_secs(3),
+        );
+        assert_eq!(out.map(|s| s.len()), Some(200000));
+    }
 
     #[test]
     fn node_bin_dir_is_the_parent_of_an_absolute_node_path() {
