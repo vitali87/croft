@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Links in PDF previews are now clickable: a click on a hyperlink opens it in your browser, and a click on an internal reference jumps to its page, just like a desktop PDF viewer (needs poppler's pdftohtml).",
+    kind: NoteKind::Fix,
+    summary: "Opening a shared file no longer fails with a false \"no live croft session answered\" when the request races the owner's connection: unanswered snapshot requests are now re-sent until the owner replies or the bootstrap deadline passes.",
 }];

@@ -299,7 +299,11 @@ The rest of the shipped shape:
   site 1 and the single allocator, so ids never collide; nonces are seeded
   from the process id so two guests never adopt each other's reply). Ops
   arriving mid-bootstrap are buffered and replayed (duplicates integrate as
-  no-ops). The file is input-gated (one gate, at the editor key dispatch)
+  no-ops). The relay has no replay, so an unanswered request is **re-sent
+  every 500ms while bootstrapping** — the original broadcast can miss an
+  owner whose connection the relay has not yet registered (RED-tested via a
+  registered observer that proves the first broadcast completed ownerless).
+  The file is input-gated (one gate, at the editor key dispatch)
   until the snapshot lands; with **no owner on the relay the bootstrap times
   out after 3s** and the file degrades to plain local editing — a deviation
   from "read-only until ready", chosen so a lone solo guest is not read-only

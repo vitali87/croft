@@ -589,6 +589,11 @@ const OWNER_SITE: u64 = 1;
 /// plain local editing instead of staying read-only forever.
 const BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How often an unanswered SnapshotRequest is re-sent while bootstrapping.
+/// The relay has no replay: a request broadcast before the owner's
+/// connection is registered is otherwise lost forever.
+const SNAPSHOT_RESEND: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Per-file replication state on one participant.
 enum DocState {
     /// Guest waiting for the owner's [`CollabMsg::SnapshotReply`]. Ops for
@@ -598,6 +603,8 @@ enum DocState {
     Bootstrapping {
         nonce: u64,
         deadline: std::time::Instant,
+        /// When to re-send the request if no reply has landed yet.
+        resend_at: std::time::Instant,
         buffered: Vec<Envelope>,
     },
     // Boxed: CollabDoc is an order of magnitude larger than the bootstrap
@@ -716,11 +723,13 @@ impl CollabSession {
             file: file.to_string(),
             nonce,
         });
+        let now = std::time::Instant::now();
         self.docs.insert(
             file.to_string(),
             DocState::Bootstrapping {
                 nonce,
-                deadline: std::time::Instant::now() + BOOTSTRAP_TIMEOUT,
+                deadline: now + BOOTSTRAP_TIMEOUT,
+                resend_at: now + SNAPSHOT_RESEND,
                 buffered: Vec::new(),
             },
         );
@@ -941,6 +950,24 @@ impl CollabSession {
         for file in timed_out {
             self.docs.remove(&file);
             events.push(CollabEvent::BootstrapTimedOut { file });
+        }
+        // Re-send unanswered requests: the relay has no replay, so the
+        // original broadcast may have missed an owner whose connection was
+        // not yet registered (or who connected moments later).
+        let mut resend = Vec::new();
+        for (file, state) in self.docs.iter_mut() {
+            if let DocState::Bootstrapping {
+                nonce, resend_at, ..
+            } = state
+                && now >= *resend_at
+            {
+                *resend_at = now + SNAPSHOT_RESEND;
+                resend.push((file.clone(), *nonce));
+            }
+        }
+        for (file, nonce) in resend {
+            self.channel
+                .send(&CollabMsg::SnapshotRequest { file, nonce });
         }
         events
     }
@@ -1599,6 +1626,67 @@ mod tests {
         }
         assert!(!guest.is_bootstrapping("src/f.rs"));
         assert!(!guest.is_live("src/f.rs"));
+    }
+
+    /// A SnapshotRequest broadcast before the owner is reachable is not
+    /// lost for good: the relay has no replay, so the guest must re-send
+    /// while bootstrapping and an owner that appears moments later still
+    /// answers.
+    #[test]
+    fn guest_resends_snapshot_request_until_an_owner_answers() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.collab.sock");
+        {
+            let s = socket.clone();
+            std::thread::spawn(move || {
+                let _ = relay_serve(&s);
+            });
+        }
+        // A registered observer proves when the relay has actually
+        // broadcast the request (frames broadcast when the relay reads
+        // them, not when the guest writes them).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observer = loop {
+            if let Some(ch) = CollabChannel::connect(&socket, CollabRole::Guest) {
+                break ch;
+            }
+            assert!(Instant::now() < deadline, "relay never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut guest = CollabSession::new(
+            CollabChannel::connect(&socket, CollabRole::Guest).expect("guest connects"),
+            "guest".into(),
+        );
+        guest.request_file("src/f.rs");
+        // Once the observer sees the request, the broadcast is over — and
+        // no owner was connected to receive it. That copy is gone forever.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !observer
+            .drain()
+            .iter()
+            .any(|m| matches!(m, CollabMsg::SnapshotRequest { .. }))
+        {
+            assert!(Instant::now() < deadline, "relay never broadcast");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut owner = CollabSession::new(
+            CollabChannel::connect(&socket, CollabRole::Owner).expect("owner connects"),
+            "owner".into(),
+        );
+        let (_, ge) = pump(&mut owner, &mut guest, "hello world", |_, ge| {
+            ge.iter().any(|e| {
+                matches!(
+                    e,
+                    CollabEvent::Bootstrapped { .. } | CollabEvent::BootstrapTimedOut { .. }
+                )
+            })
+        });
+        assert!(
+            ge.iter()
+                .any(|e| matches!(e, CollabEvent::Bootstrapped { .. })),
+            "guest gave up instead of re-sending: {ge:?}"
+        );
     }
 
     /// End-to-end transport: two participants connected through the relay
