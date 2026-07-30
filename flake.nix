@@ -36,6 +36,16 @@
           pkgs.xsel
         ];
 
+        # Same idea for the PDF preview (pdftoppm/pdfinfo/pdftohtml) and the
+        # csh-family login-shell probe: with these on PATH the PDF paging /
+        # reload tests and the tcsh gui_path tests run for real everywhere
+        # instead of skipping on machines without poppler or tcsh (macOS has
+        # sips and /bin/tcsh built in; Linux boxes often have neither).
+        capabilityTestTools = [
+          pkgs.poppler_utils
+          pkgs.tcsh
+        ];
+
         # croft's terminal clipboard FFI links objc + AppKit; notify uses
         # CoreServices (FSEvents). Linux needs none of these.
         darwinFrameworks = lib.optionals stdenv.isDarwin (with pkgs.darwin.apple_sdk.frameworks; [
@@ -56,6 +66,7 @@
         buildInputs = lib.flatten [
           rustToolchain
           linuxClipboard
+          capabilityTestTools
           darwinFrameworks
         ];
 
