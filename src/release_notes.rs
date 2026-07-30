@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Opening a shared file no longer fails with a false \"no live croft session answered\" when the request races the owner's connection: unanswered snapshot requests are now re-sent until the owner replies or the bootstrap deadline passes.",
+    summary: "Arrow keys now control Python's interactive REPL (and any app that enables application cursor keys): the terminal honors DECCKM and sends the SS3 sequences such apps expect, instead of the normal-mode form they ignore.",
 }];

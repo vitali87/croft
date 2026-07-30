@@ -909,6 +909,14 @@ impl PtyTerminal {
         self.term.lock().mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// Whether the child enabled application cursor keys (DECCKM, `\e[?1h`).
+    /// Arrows and Home/End must then arrive as SS3 (`\eOA`…) — the form
+    /// terminfo advertises, and the only one apps that bind keys from
+    /// terminfo (Python's REPL, less) recognize.
+    pub fn app_cursor_keys(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::APP_CURSOR)
+    }
+
     /// The viewport's scroll offset into history (0 = live bottom). Public
     /// so the app can map an anchor's grid line to a viewport row.
     pub fn scroll_display_offset(&self) -> i32 {

@@ -19798,7 +19798,7 @@ impl App {
         if self.terminal().selection().is_some() {
             self.terminal_mut().clear_selection();
         }
-        let bytes = key_to_bytes(key);
+        let bytes = key_to_bytes(key, self.terminal().app_cursor_keys());
         if !bytes.is_empty() {
             self.write_terminal_input(&bytes);
         }
@@ -26247,7 +26247,11 @@ impl App {
                             mouse_mods(&m),
                         );
                     } else if !t.scroll_down(3) {
-                        t.write_input(b"\x1b[B\x1b[B\x1b[B");
+                        if t.app_cursor_keys() {
+                            t.write_input(b"\x1bOB\x1bOB\x1bOB");
+                        } else {
+                            t.write_input(b"\x1b[B\x1b[B\x1b[B");
+                        }
                     }
                 }
             }
@@ -26300,7 +26304,11 @@ impl App {
                             mouse_mods(&m),
                         );
                     } else if !t.scroll_up(3) {
-                        t.write_input(b"\x1b[A\x1b[A\x1b[A");
+                        if t.app_cursor_keys() {
+                            t.write_input(b"\x1bOA\x1bOA\x1bOA");
+                        } else {
+                            t.write_input(b"\x1b[A\x1b[A\x1b[A");
+                        }
                     }
                 }
             }
@@ -31545,24 +31553,29 @@ struct TerminalPaneButtons {
     max: Option<Rect>,
 }
 
-fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
+/// `app_cursor` is the pane's DECCKM state: cursor keys switch from the
+/// normal CSI form (`\e[A`) to SS3 (`\eOA`), the form terminfo advertises —
+/// apps that bind keys from terminfo (Python's REPL, less) only match SS3.
+fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
     use KeyCode::*;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let cursor =
+        |app: &'static [u8], normal: &'static [u8]| if app_cursor { app } else { normal }.to_vec();
     match key.code {
         Enter => vec![b'\r'],
         Tab => vec![b'\t'],
         BackTab => b"\x1b[Z".to_vec(),
         Backspace => vec![0x7f],
         Esc => vec![0x1b],
-        Up => b"\x1b[A".to_vec(),
-        Down => b"\x1b[B".to_vec(),
+        Up => cursor(b"\x1bOA", b"\x1b[A"),
+        Down => cursor(b"\x1bOB", b"\x1b[B"),
         Right if alt => b"\x1bf".to_vec(),
         Left if alt => b"\x1bb".to_vec(),
-        Right => b"\x1b[C".to_vec(),
-        Left => b"\x1b[D".to_vec(),
-        Home => b"\x1b[H".to_vec(),
-        End => b"\x1b[F".to_vec(),
+        Right => cursor(b"\x1bOC", b"\x1b[C"),
+        Left => cursor(b"\x1bOD", b"\x1b[D"),
+        Home => cursor(b"\x1bOH", b"\x1b[H"),
+        End => cursor(b"\x1bOF", b"\x1b[F"),
         PageUp => b"\x1b[5~".to_vec(),
         PageDown => b"\x1b[6~".to_vec(),
         Insert => b"\x1b[2~".to_vec(),

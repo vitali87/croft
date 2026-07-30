@@ -3324,52 +3324,82 @@ fn welcome_tagline_constant_is_present() {
 #[test]
 fn key_to_bytes_arrows() {
     assert_eq!(
-        key_to_bytes(key(KeyCode::Up, KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::Up, KeyModifiers::NONE), false),
         b"\x1b[A"
     );
     assert_eq!(
-        key_to_bytes(key(KeyCode::Down, KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::Down, KeyModifiers::NONE), false),
         b"\x1b[B"
     );
     assert_eq!(
-        key_to_bytes(key(KeyCode::Right, KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::Right, KeyModifiers::NONE), false),
         b"\x1b[C"
     );
     assert_eq!(
-        key_to_bytes(key(KeyCode::Left, KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::Left, KeyModifiers::NONE), false),
         b"\x1b[D"
+    );
+}
+
+/// DECCKM on: cursor keys switch to the SS3 form; keys outside the cursor
+/// group are unaffected.
+#[test]
+fn key_to_bytes_arrows_in_app_cursor_mode_use_ss3() {
+    for (code, seq) in [
+        (KeyCode::Up, b"\x1bOA"),
+        (KeyCode::Down, b"\x1bOB"),
+        (KeyCode::Right, b"\x1bOC"),
+        (KeyCode::Left, b"\x1bOD"),
+        (KeyCode::Home, b"\x1bOH"),
+        (KeyCode::End, b"\x1bOF"),
+    ] {
+        assert_eq!(key_to_bytes(key(code, KeyModifiers::NONE), true), seq);
+    }
+    assert_eq!(
+        key_to_bytes(key(KeyCode::PageUp, KeyModifiers::NONE), true),
+        b"\x1b[5~"
+    );
+    assert_eq!(
+        key_to_bytes(key(KeyCode::Enter, KeyModifiers::NONE), true),
+        b"\r"
     );
 }
 
 #[test]
 fn key_to_bytes_enter_tab_backspace() {
-    assert_eq!(key_to_bytes(key(KeyCode::Enter, KeyModifiers::NONE)), b"\r");
-    assert_eq!(key_to_bytes(key(KeyCode::Tab, KeyModifiers::NONE)), b"\t");
     assert_eq!(
-        key_to_bytes(key(KeyCode::Backspace, KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::Enter, KeyModifiers::NONE), false),
+        b"\r"
+    );
+    assert_eq!(
+        key_to_bytes(key(KeyCode::Tab, KeyModifiers::NONE), false),
+        b"\t"
+    );
+    assert_eq!(
+        key_to_bytes(key(KeyCode::Backspace, KeyModifiers::NONE), false),
         &[0x7f]
     );
 }
 
 #[test]
 fn key_to_bytes_ctrl_letter_maps_to_control_byte() {
-    let bytes = key_to_bytes(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    let bytes = key_to_bytes(key(KeyCode::Char('c'), KeyModifiers::CONTROL), false);
     assert_eq!(bytes, vec![0x03]);
-    let bytes = key_to_bytes(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    let bytes = key_to_bytes(key(KeyCode::Char('a'), KeyModifiers::CONTROL), false);
     assert_eq!(bytes, vec![0x01]);
-    let bytes = key_to_bytes(key(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    let bytes = key_to_bytes(key(KeyCode::Char('z'), KeyModifiers::CONTROL), false);
     assert_eq!(bytes, vec![0x1a]);
 }
 
 #[test]
 fn key_to_bytes_alt_letter_prefixes_esc() {
-    let bytes = key_to_bytes(key(KeyCode::Char('x'), KeyModifiers::ALT));
+    let bytes = key_to_bytes(key(KeyCode::Char('x'), KeyModifiers::ALT), false);
     assert_eq!(bytes, vec![0x1b, b'x']);
 }
 
 #[test]
 fn key_to_bytes_alt_left_emits_esc_b_for_readline_backward_word() {
-    let bytes = key_to_bytes(key(KeyCode::Left, KeyModifiers::ALT));
+    let bytes = key_to_bytes(key(KeyCode::Left, KeyModifiers::ALT), false);
     assert_eq!(
         bytes, b"\x1bb",
         "Option+Left in the terminal must send ESC b so zsh/bash readline runs backward-word"
@@ -3378,7 +3408,7 @@ fn key_to_bytes_alt_left_emits_esc_b_for_readline_backward_word() {
 
 #[test]
 fn key_to_bytes_alt_right_emits_esc_f_for_readline_forward_word() {
-    let bytes = key_to_bytes(key(KeyCode::Right, KeyModifiers::ALT));
+    let bytes = key_to_bytes(key(KeyCode::Right, KeyModifiers::ALT), false);
     assert_eq!(
         bytes, b"\x1bf",
         "Option+Right in the terminal must send ESC f so zsh/bash readline runs forward-word"
@@ -3388,11 +3418,11 @@ fn key_to_bytes_alt_right_emits_esc_f_for_readline_forward_word() {
 #[test]
 fn key_to_bytes_plain_arrows_unchanged_when_alt_not_held() {
     assert_eq!(
-        key_to_bytes(key(KeyCode::Left, KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::Left, KeyModifiers::NONE), false),
         b"\x1b[D"
     );
     assert_eq!(
-        key_to_bytes(key(KeyCode::Right, KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::Right, KeyModifiers::NONE), false),
         b"\x1b[C"
     );
 }
@@ -3400,11 +3430,11 @@ fn key_to_bytes_plain_arrows_unchanged_when_alt_not_held() {
 #[test]
 fn key_to_bytes_plain_char_utf8() {
     assert_eq!(
-        key_to_bytes(key(KeyCode::Char('a'), KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::Char('a'), KeyModifiers::NONE), false),
         b"a"
     );
     assert_eq!(
-        key_to_bytes(key(KeyCode::Char('é'), KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::Char('é'), KeyModifiers::NONE), false),
         "é".as_bytes()
     );
 }
@@ -3412,22 +3442,22 @@ fn key_to_bytes_plain_char_utf8() {
 #[test]
 fn key_to_bytes_function_keys() {
     assert_eq!(
-        key_to_bytes(key(KeyCode::F(1), KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::F(1), KeyModifiers::NONE), false),
         b"\x1bOP"
     );
     assert_eq!(
-        key_to_bytes(key(KeyCode::F(5), KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::F(5), KeyModifiers::NONE), false),
         b"\x1b[15~"
     );
     assert_eq!(
-        key_to_bytes(key(KeyCode::F(12), KeyModifiers::NONE)),
+        key_to_bytes(key(KeyCode::F(12), KeyModifiers::NONE), false),
         b"\x1b[24~"
     );
 }
 
 #[test]
 fn key_to_bytes_unknown_returns_empty() {
-    assert!(key_to_bytes(key(KeyCode::CapsLock, KeyModifiers::NONE)).is_empty());
+    assert!(key_to_bytes(key(KeyCode::CapsLock, KeyModifiers::NONE), false).is_empty());
 }
 
 #[test]
@@ -18668,6 +18698,68 @@ fn a_plain_click_on_the_prompt_row_moves_the_shell_cursor() {
             waited < 8000,
             "the click's arrow keys never reached the shell"
         );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+}
+
+/// An app that enables application cursor keys (DECCKM, `\e[?1h`) — Python's
+/// REPL binds arrows from terminfo's application-mode entries — must receive
+/// arrows and Home/End as SS3 (`\eOA`…), not the normal-mode CSI form the
+/// REPL does not recognize (vitali87/croft#1).
+#[test]
+fn arrow_keys_reach_an_app_cursor_mode_child_as_ss3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sink = tmp.path().join("keys.bin");
+    // The child turns on DECCKM, then `dd` captures exactly what the six
+    // key presses write to the PTY (six 3-byte sequences).
+    // The sentinel is assembled at runtime ("${s}DY_MARK") because the pane
+    // header echoes this script text verbatim; a literal sentinel would match
+    // before the child has run at all.
+    let script = format!(
+        "s=REA; printf '\\033[?1h'; printf \"${{s}}DY_MARK\"; stty raw -echo 2>/dev/null; dd bs=1 count=18 of={} 2>/dev/null; sleep 30",
+        sink.display()
+    );
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), script],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    let mut waited = 0u32;
+    while !app.terminals[0]
+        .grid_lines()
+        .0
+        .iter()
+        .any(|l| l.contains("READY_MARK"))
+    {
+        assert!(waited < 8000, "the child never turned on app cursor mode");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    for code in [
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Right,
+        KeyCode::Left,
+        KeyCode::Home,
+        KeyCode::End,
+    ] {
+        app.handle_terminal_key(key(code, KeyModifiers::NONE));
+    }
+    let mut waited = 0u32;
+    loop {
+        let got = std::fs::read(&sink).unwrap_or_default();
+        if got.len() == 18 {
+            assert_eq!(
+                got, b"\x1bOA\x1bOB\x1bOC\x1bOD\x1bOH\x1bOF",
+                "DECCKM is on: keys must arrive in the SS3 application form"
+            );
+            break;
+        }
+        assert!(waited < 8000, "the key presses never reached the child");
         std::thread::sleep(std::time::Duration::from_millis(20));
         waited += 20;
     }
