@@ -153,8 +153,12 @@ pub fn parse_pdf2xml_links(xml: &str, page: u32) -> Option<PageLinks> {
                     let at = |chars: usize| {
                         left + (w as f64 * chars.min(total) as f64 / total as f64).round() as u32
                     };
-                    let x0 = at(pre);
-                    (x0, at(pre + inner_len).max(x0 + 1))
+                    // The forced one-unit width of an empty anchor is carved
+                    // out of the run (x0 shifts left at the right edge), so
+                    // no slice ever extends past the run into its neighbour.
+                    let run_right = left + w.max(1);
+                    let x0 = at(pre).min(run_right - 1);
+                    (x0, at(pre + inner_len).clamp(x0 + 1, run_right))
                 };
                 out.links.push(PdfLink {
                     rect: (x0, top, x1, top + h.max(1)),
@@ -604,6 +608,27 @@ mod tests {
         // And a cell over each degenerate run actually hits it.
         assert!(p.link_at((0.05, 0.099, 0.18, 0.102)).is_some());
         assert!(p.link_at((0.049, 0.30, 0.052, 0.312)).is_some());
+    }
+
+    /// An empty anchor sitting at the right edge of a run with text: the
+    /// forced one-unit width must be carved out of the run, not appended
+    /// past its edge where it would make the neighbouring run clickable.
+    #[test]
+    fn an_empty_anchor_at_the_run_edge_stays_inside_the_run() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<pdf2xml producer="poppler" version="25.04.0">
+<page number="1" position="absolute" top="0" left="0" height="1000" width="1000">
+<text top="100" left="200" width="120" height="12">text<a href="https://a.b/"></a></text>
+</page>
+</pdf2xml>
+"##;
+        let p = parse_pdf2xml_links(xml, 1).unwrap();
+        assert_eq!(p.links.len(), 1);
+        let (x0, _, x1, _) = p.links[0].rect;
+        assert!(
+            x0 >= 200 && x1 <= 320 && x0 < x1,
+            "the forced width must stay inside the run rect (200..320), got {x0}..{x1}"
+        );
     }
 
     /// A bare `&` (no terminating `;`) must count as a plain character, not
