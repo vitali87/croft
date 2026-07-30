@@ -295,6 +295,7 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 | `←` / `↑` / `Page Up` | Previous page |
 | `Home` / `End` | First / last page |
 | Wheel down / up over the page | Next / previous page |
+| Click a link on the page | Open it: an external URL opens in the browser, an internal target flips to its page (needs `pdftohtml` from poppler; only links anchored to text are detected) |
 
 **Spreadsheet (`.csv`, `.tsv`, `.xlsx`, `.xls`, `.xlsb`, `.ods`)**
 

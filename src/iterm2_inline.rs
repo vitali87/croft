@@ -605,6 +605,41 @@ pub fn fit_image_auto(
     Ok(out)
 }
 
+/// Inverse of [`fit_image_auto`]'s placement: the fraction of the SOURCE
+/// image (0..1, top-left origin) that terminal cell `(cell_col, cell_row)`
+/// — 0-based within the canvas rect — covers. Mirrors the bake's exact
+/// scale/round/centre math, so a hit-test through this function lands on
+/// the same pixels the user sees. `None` when the cell lies entirely in
+/// the letterbox padding around the scaled image.
+pub fn cell_source_fraction(
+    (cell_col, cell_row): (u16, u16),
+    (cell_w_px, cell_h_px): (u32, u32),
+    (canvas_w_cells, canvas_h_cells): (u16, u16),
+    (src_w, src_h): (u32, u32),
+) -> Option<(f64, f64, f64, f64)> {
+    if src_w == 0 || src_h == 0 || cell_col >= canvas_w_cells || cell_row >= canvas_h_cells {
+        return None;
+    }
+    // Identical to fit_image_auto: min-scale, rounded, centred.
+    let canvas_w = canvas_w_cells as f64 * cell_w_px as f64;
+    let canvas_h = canvas_h_cells as f64 * cell_h_px as f64;
+    let scale = f64::min(canvas_w / src_w as f64, canvas_h / src_h as f64);
+    let new_w = ((src_w as f64 * scale).round()).max(1.0);
+    let new_h = ((src_h as f64 * scale).round()).max(1.0);
+    let off_x = ((canvas_w - new_w) / 2.0).floor();
+    let off_y = ((canvas_h - new_h) / 2.0).floor();
+    // The cell's pixel span, clamped to the scaled image's span; an empty
+    // intersection is letterbox padding.
+    let x0 = (cell_col as f64 * cell_w_px as f64 - off_x).clamp(0.0, new_w);
+    let x1 = ((cell_col + 1) as f64 * cell_w_px as f64 - off_x).clamp(0.0, new_w);
+    let y0 = (cell_row as f64 * cell_h_px as f64 - off_y).clamp(0.0, new_h);
+    let y1 = ((cell_row + 1) as f64 * cell_h_px as f64 - off_y).clamp(0.0, new_h);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0 / new_w, y0 / new_h, x1 / new_w, y1 / new_h))
+}
+
 pub fn build_inline_image_osc(
     png: &[u8],
     width_cells: u16,
@@ -1698,6 +1733,43 @@ mod tests {
         assert!(
             build_inline_image(InlineImageProtocol::None, b"PNGDATA", 4, 3, false, 11).is_none(),
             "no inline protocol → no sequence"
+        );
+    }
+
+    /// Canvas 100×40 cells of 10×20 px = 1000×800 px; source 500×200 px.
+    /// fit_image_auto scales by min(1000/500, 800/200) = 2 → 1000×400 px,
+    /// centred with a 200 px letterbox band above and below.
+    #[test]
+    fn cell_source_fraction_inverts_the_fit_placement() {
+        // Cell (0, 10): cols 0..10 of 1000 → x 0..0.01; rows 200..220 px =
+        // scaled rows 0..20 of 400 → y 0..0.05.
+        assert_eq!(
+            cell_source_fraction((0, 10), (10, 20), (100, 40), (500, 200)),
+            Some((0.0, 0.0, 0.01, 0.05))
+        );
+        // Cell (50, 20): cols 500..510 → 0.5..0.51; rows 400..420 px are
+        // scaled rows 200..220 → source 100..110 of 200 → 0.5..0.55.
+        assert_eq!(
+            cell_source_fraction((50, 20), (10, 20), (100, 40), (500, 200)),
+            Some((0.5, 0.5, 0.51, 0.55))
+        );
+        // Cell (0, 0) sits fully inside the top letterbox band.
+        assert_eq!(
+            cell_source_fraction((0, 0), (10, 20), (100, 40), (500, 200)),
+            None
+        );
+        // Cell (0, 9) rows 180..200 only touch the image's top edge at a
+        // single point — an empty intersection is a miss, not a hit.
+        assert_eq!(
+            cell_source_fraction((0, 9), (10, 20), (100, 40), (500, 200)),
+            None
+        );
+        // A 500×250 source scales to 1000×500 with off_y = 150: cell (0, 7)
+        // rows 140..160 straddle the band edge and clamp to scaled rows
+        // 0..10 of 500 → y 0..0.02.
+        assert_eq!(
+            cell_source_fraction((0, 7), (10, 20), (100, 40), (500, 250)),
+            Some((0.0, 0.0, 0.01, 0.02))
         );
     }
 }

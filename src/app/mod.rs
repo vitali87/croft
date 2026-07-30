@@ -25684,6 +25684,26 @@ impl App {
                     // pane only, so anchoring one in the editor drops any
                     // leftover terminal selection (issue #23).
                     self.terminal_mut().clear_selection();
+                    // PDF preview: a plain click activates the link under the
+                    // pointer — an external URL opens in the browser, an
+                    // internal target flips to its page — matching every
+                    // desktop PDF viewer. Only links anchored to text are
+                    // found (pdftohtml reports link annotations through the
+                    // text runs they cover), which is what hyperref/beamer
+                    // emit. A non-link click just focuses the pane, above.
+                    if self.editor.image.as_ref().is_some_and(|i| i.pdf.is_some()) {
+                        match self.pdf_link_target_at(m.column, m.row) {
+                            Some(crate::pdf::LinkTarget::Url(url)) => {
+                                self.status = match open_url(&url) {
+                                    Ok(()) => format!("Opened {url}"),
+                                    Err(e) => format!("Could not open {url}: {e}"),
+                                };
+                            }
+                            Some(crate::pdf::LinkTarget::Page(page)) => self.jump_pdf_page(page),
+                            None => {}
+                        }
+                        return;
+                    }
                     // Diff header arrows: take precedence over selection so a
                     // click on the ‹ / › glyph jumps to prev/next change
                     // instead of anchoring a selection at the header row.
@@ -27456,6 +27476,46 @@ impl App {
 
     fn jump_pdf_page(&mut self, page: u32) {
         self.editor.set_pdf_page(page);
+    }
+
+    /// Resolve the PDF link under a click at screen cell (`col`, `row`) on
+    /// the focused PDF preview, extracting the current page's link regions
+    /// on first use (and caching them on the tab until the page changes).
+    fn pdf_link_target_at(&mut self, col: u16, row: u16) -> Option<crate::pdf::LinkTarget> {
+        let side = self.focused_image_side();
+        let (cw_px, ch_px) = self.cell_pixel?;
+        let frac = {
+            let image = self.editor.image.as_ref()?;
+            let pdf = image.pdf.as_ref()?;
+            let layout = self.overlays.editor[side].layout()?;
+            // A stale overlay (different tab, or a page flip the next frame
+            // hasn't baked yet) must not hit-test the wrong page's geometry.
+            if layout.path != pdf.source_path || layout.page != pdf.current_page {
+                return None;
+            }
+            crate::iterm2_inline::cell_source_fraction(
+                (
+                    col.checked_sub(layout.cell_x)?,
+                    row.checked_sub(layout.cell_y)?,
+                ),
+                (cw_px, ch_px),
+                (layout.cell_w, layout.cell_h),
+                (image.pixel_w, image.pixel_h),
+            )?
+        };
+        let pdf = self.editor.image.as_mut()?.pdf.as_mut()?;
+        if pdf.links.is_none() {
+            match crate::pdf::page_links(&pdf.source_path, pdf.current_page) {
+                Ok(links) => pdf.links = Some(links),
+                // Not cached: a mid-write extraction failure (pdflatex
+                // rebuilding the file) heals on the next click.
+                Err(e) => {
+                    self.status = format!("PDF links unavailable: {e}");
+                    return None;
+                }
+            }
+        }
+        Some(pdf.links.as_ref()?.link_at(frac)?.target.clone())
     }
 
     fn focused_image_side(&self) -> usize {

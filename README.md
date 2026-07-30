@@ -35,7 +35,7 @@ See **[LAYOUT.md](docs/LAYOUT.md)** for the full pane-by-pane reference: every e
 | A Nerd Font as your terminal font | File and activity-bar icons are Nerd Font glyphs. Without one they render as `[?]` boxes. |
 | A 256 color or truecolor terminal | Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
 | iTerm2, WezTerm, Ghostty, kitty, or a sixel terminal (optional) | Inline image / PDF / spreadsheet previews. Elsewhere croft shows a metadata header line instead. |
-| `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview. Without it, page 1 only on macOS via `sips`. |
+| `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview with clickable links. Without it, page 1 only on macOS via `sips`. |
 | Node.js + npm (optional) | TypeScript / JavaScript LSP; croft auto-installs the `vtsls` server on first use. |
 
 Per-platform setup (Nerd Font, terminal keybindings, optional dependencies) lives in the platform guides linked under [Platform setup](#platform-setup).

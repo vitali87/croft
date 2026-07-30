@@ -1,6 +1,166 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// What activating a link region on a PDF page does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// External target (`https://…`, `mailto:…`) opened with the OS opener.
+    Url(String),
+    /// Internal link to another page of the same document (1-based).
+    Page(u32),
+}
+
+/// One link region on a PDF page. `rect` is (left, top, right, bottom) in the
+/// coordinate space declared by the owning [`PageLinks`] (top-left origin).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PdfLink {
+    pub rect: (u32, u32, u32, u32),
+    pub target: LinkTarget,
+}
+
+/// The clickable link regions of one PDF page, in pdftohtml's page space.
+/// Kept in integer page units (not fractions) so the type stays `Eq` for the
+/// editor's tab-state comparisons; [`Self::link_at`] does the normalising.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PageLinks {
+    pub page_w: u32,
+    pub page_h: u32,
+    pub links: Vec<PdfLink>,
+}
+
+impl PageLinks {
+    /// The link whose region intersects the page-fraction rect
+    /// `(x0, y0, x1, y1)` (0..1 on both axes, top-left origin). The caller
+    /// passes the whole area a terminal cell covers, so a click needs no
+    /// pixel-perfect aim on the (thin) text-line rects poppler reports.
+    pub fn link_at(&self, frac: (f64, f64, f64, f64)) -> Option<&PdfLink> {
+        if self.page_w == 0 || self.page_h == 0 {
+            return None;
+        }
+        let (w, h) = (self.page_w as f64, self.page_h as f64);
+        self.links.iter().find(|l| {
+            let (lx0, ly0, lx1, ly1) = l.rect;
+            frac.0 < lx1 as f64 / w
+                && frac.2 > lx0 as f64 / w
+                && frac.1 < ly1 as f64 / h
+                && frac.3 > ly0 as f64 / h
+        })
+    }
+}
+
+/// Extract the link regions of `page` (1-based) via `pdftohtml -xml`, which
+/// reports each text run a link annotation covers as `<text top= left= …>
+/// <a href=…>`. Text-anchored only: a link drawn over a bare image has no
+/// text run and is not reported — the common case (hyperref/beamer URLs)
+/// is always text.
+pub fn page_links(pdf: &Path, page: u32) -> std::io::Result<PageLinks> {
+    which("pdftohtml")
+        .ok_or_else(|| std::io::Error::other("install poppler (pdftohtml) to open PDF links"))?;
+    let p = page.to_string();
+    // .output(), never .status(): the child must not inherit croft's TTY
+    // (the pdftoppm trailer-dictionary spray, same class).
+    let out = Command::new("pdftohtml")
+        .args(["-xml", "-stdout", "-i", "-f", &p, "-l", &p])
+        .arg(pdf)
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(std::io::Error::other(format!(
+            "pdftohtml exited with {}: {}",
+            out.status,
+            stderr.trim()
+        )));
+    }
+    Ok(parse_pdf2xml_links(&String::from_utf8_lossy(&out.stdout), page).unwrap_or_default())
+}
+
+/// Parse pdftohtml's `-xml` output, returning the links of `page` (matched
+/// against the `<page number=…>` attribute — poppler keeps original numbers
+/// when a `-f`/`-l` range is used). None when that page is absent.
+pub fn parse_pdf2xml_links(xml: &str, page: u32) -> Option<PageLinks> {
+    let mut in_page = false;
+    let mut out = PageLinks::default();
+    let mut found = false;
+    // pdftohtml emits one element per line, but poppler also chats onto
+    // stdout (a GoTo annotation prints " link to page N" glued to the
+    // start of the <page> line), so elements are located with find(), never
+    // by line prefix.
+    for line in xml.lines() {
+        if let Some(pos) = line.find("<page ") {
+            let tag = &line[pos + "<page ".len()..];
+            in_page = attr_u32(tag, "number") == Some(page);
+            if in_page {
+                found = true;
+                out.page_w = attr_u32(tag, "width").unwrap_or(0);
+                out.page_h = attr_u32(tag, "height").unwrap_or(0);
+            }
+            continue;
+        }
+        if !in_page {
+            continue;
+        }
+        if line.contains("</page>") {
+            break;
+        }
+        let Some(pos) = line.find("<text ") else {
+            continue;
+        };
+        let tag = &line[pos + "<text ".len()..];
+        let (Some(left), Some(top), Some(w), Some(h)) = (
+            attr_u32(tag, "left"),
+            attr_u32(tag, "top"),
+            attr_u32(tag, "width"),
+            attr_u32(tag, "height"),
+        ) else {
+            continue;
+        };
+        // Every <a> in the run shares the run's rect; more than one is rare
+        // (two links inside one text run) and both stay clickable.
+        let mut rest = tag;
+        while let Some(pos) = rest.find("<a href=\"") {
+            let after = &rest[pos + "<a href=\"".len()..];
+            let Some(end) = after.find('"') else { break };
+            if let Some(target) = classify_href(&xml_unescape(&after[..end])) {
+                out.links.push(PdfLink {
+                    rect: (left, top, left + w, top + h),
+                    target,
+                });
+            }
+            rest = &after[end..];
+        }
+    }
+    found.then_some(out)
+}
+
+/// `name="value"` attribute lookup on a single tag line. Values poppler emits
+/// here are plain integers.
+fn attr_u32(tag: &str, name: &str) -> Option<u32> {
+    let pat = format!("{name}=\"");
+    let start = tag.find(&pat)? + pat.len();
+    let rest = &tag[start..];
+    rest[..rest.find('"')?].parse().ok()
+}
+
+/// External hrefs keep their scheme; internal page links come out as
+/// `docname.html#page`. Anything else (a relative file link) is dropped.
+fn classify_href(href: &str) -> Option<LinkTarget> {
+    if href.contains("://") || href.starts_with("mailto:") {
+        return Some(LinkTarget::Url(href.to_string()));
+    }
+    let (_, frag) = href.rsplit_once('#')?;
+    frag.parse().ok().map(LinkTarget::Page)
+}
+
+/// The five entities pdftohtml escapes in attribute values.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 /// Rasteriser preference order:
 /// 1. `pdftoppm` (poppler) — supports page selection, cross-platform when
 ///    poppler-utils is installed (`brew install poppler`, `apt install
@@ -212,6 +372,75 @@ mod tests {
             "error must carry the child's stderr, got: {msg}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Real pdftohtml -xml shape: link runs are `<a href>` inside a `<text>`
+    /// element carrying the rect; external hrefs keep their scheme, internal
+    /// ones are `docname.html#page`; `&amp;` needs unescaping; the requested
+    /// page is selected by its `number` attribute.
+    #[test]
+    fn parses_links_from_pdf2xml_output() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<pdf2xml producer="poppler" version="25.04.0">
+ link to page 2 <page number="1" position="absolute" top="0" left="0" height="1188" width="918">
+<text top="192" left="223" width="55" height="13" font="0">Jump to</text>
+<text top="192" left="283" width="65" height="13" font="1"><a href="ilink.html#2">the target</a></text>
+</page>
+<page number="2" position="absolute" top="0" left="0" height="1188" width="918">
+<text top="192" left="511" width="58" height="13" font="3"><a href="https://a.b/c?d=1&amp;e=2">amp link</a></text>
+<text top="300" left="100" width="90" height="12" font="2"><a href="mailto:x@y.z">mailto:x@y.z</a></text>
+<text top="500" left="100" width="90" height="12" font="0">plain text</text>
+</page>
+</pdf2xml>
+"##;
+        let p1 = parse_pdf2xml_links(xml, 1).unwrap();
+        assert_eq!((p1.page_w, p1.page_h), (918, 1188));
+        assert_eq!(
+            p1.links,
+            vec![PdfLink {
+                rect: (283, 192, 348, 205),
+                target: LinkTarget::Page(2),
+            }]
+        );
+        let p2 = parse_pdf2xml_links(xml, 2).unwrap();
+        assert_eq!(
+            p2.links,
+            vec![
+                PdfLink {
+                    rect: (511, 192, 569, 205),
+                    target: LinkTarget::Url(String::from("https://a.b/c?d=1&e=2")),
+                },
+                PdfLink {
+                    rect: (100, 300, 190, 312),
+                    target: LinkTarget::Url(String::from("mailto:x@y.z")),
+                },
+            ]
+        );
+        assert!(
+            parse_pdf2xml_links(xml, 3).is_none(),
+            "a page absent from the output has no links"
+        );
+    }
+
+    /// The whole cell area is hit-tested, so a click one row under a thin
+    /// text-line rect still lands: any overlap counts, containment is not
+    /// required. Misses stay misses.
+    #[test]
+    fn link_at_matches_on_overlap_not_containment() {
+        let links = PageLinks {
+            page_w: 1000,
+            page_h: 1000,
+            links: vec![PdfLink {
+                rect: (100, 100, 200, 113),
+                target: LinkTarget::Page(2),
+            }],
+        };
+        // A cell straddling the rect's bottom edge (y 0.110..0.130) hits.
+        assert!(links.link_at((0.15, 0.110, 0.16, 0.130)).is_some());
+        // A cell fully past the rect misses.
+        assert!(links.link_at((0.15, 0.120, 0.16, 0.140)).is_none());
+        // A cell left of the rect misses.
+        assert!(links.link_at((0.05, 0.105, 0.09, 0.110)).is_none());
     }
 
     #[test]

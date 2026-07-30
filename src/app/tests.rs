@@ -241,6 +241,126 @@ fn clicking_the_gutter_play_glyph_runs_that_test() {
     );
 }
 
+/// A minimal two-page PDF whose page 1 carries the text "go to two" under a
+/// GoTo link annotation targeting page 2. Hand-assembled (correct xref
+/// offsets included) so the test needs no pdflatex, only poppler to read it.
+fn two_page_pdf_with_internal_link() -> Vec<u8> {
+    let s1 = b"BT /F1 12 Tf 20 50 Td (go to two) Tj ET";
+    let s2 = b"BT /F1 12 Tf 20 50 Td (second page) Tj ET";
+    let objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R \
+           /Resources << /Font << /F1 6 0 R >> >> /Annots [7 0 R] >>"
+            .to_vec(),
+        [
+            format!("<< /Length {} >>\nstream\n", s1.len()).into_bytes(),
+            s1.to_vec(),
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 8 0 R \
+           /Resources << /Font << /F1 6 0 R >> >> >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Link /Rect [18 44 92 64] /Border [0 0 0] \
+           /A << /S /GoTo /D [5 0 R /Fit] >> >>"
+            .to_vec(),
+        [
+            format!("<< /Length {} >>\nstream\n", s2.len()).into_bytes(),
+            s2.to_vec(),
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+    ];
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", objs.len() + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for off in &offsets {
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objs.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// The user's gesture end to end: a PDF preview is on screen and a click on
+/// a link flips to its target page — through the REAL mouse dispatch, the
+/// real overlay geometry from a rendered frame, and real poppler extraction.
+#[test]
+fn clicking_an_internal_pdf_link_flips_to_its_page() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    if crate::pdf::detect_backend() != Some(crate::pdf::PdfBackend::PdftoppmCli)
+        || crate::pdf::page_links(std::path::Path::new("/nonexistent"), 1)
+            .err()
+            .is_some_and(|e| e.to_string().contains("install poppler"))
+    {
+        eprintln!("skipping: poppler (pdftoppm + pdftohtml) not installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("linked.pdf");
+    std::fs::write(&pdf, two_page_pdf_with_internal_link()).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A real terminal would have reported these during startup; the overlay
+    // bake (whose layout the hit-test reads) is gated on both.
+    app.cell_pixel = Some((10, 20));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.editor.open_pinned(&pdf).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let layout = app.overlays.editor[0]
+        .layout()
+        .expect("rendering a PDF tab bakes the image overlay")
+        .clone();
+    let image = app.editor.image.as_ref().unwrap();
+    let (px_w, px_h) = (image.pixel_w, image.pixel_h);
+    // The link's text run "go to two" sits around (0.22, 0.47) of the page
+    // (measured: x 30..103 of 300, y 62..79 of 150 in pdftohtml space).
+    // Find the screen cell covering that point instead of hardcoding one,
+    // so the test survives font-metric drift across poppler versions.
+    let (mut col, mut row) = (0u16, 0u16);
+    'outer: for r in 0..layout.cell_h {
+        for c in 0..layout.cell_w {
+            if let Some((x0, y0, x1, y1)) = crate::iterm2_inline::cell_source_fraction(
+                (c, r),
+                (10, 20),
+                (layout.cell_w, layout.cell_h),
+                (px_w, px_h),
+            ) && x0 <= 0.22
+                && 0.22 < x1
+                && y0 <= 0.47
+                && 0.47 < y1
+            {
+                (col, row) = (layout.cell_x + c, layout.cell_y + r);
+                break 'outer;
+            }
+        }
+    }
+    assert!(col > 0, "some cell must cover the link's page position");
+    assert_eq!(app.editor.pdf_page(), Some(1));
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert_eq!(
+        app.editor.pdf_page(),
+        Some(2),
+        "clicking the internal link must flip the preview to page 2"
+    );
+}
+
 #[test]
 fn cmd_k_shift_enter_debugs_instead_of_running_the_test_at_cursor() {
     // The Shift arm must precede the plain-Enter run arm, or the chord

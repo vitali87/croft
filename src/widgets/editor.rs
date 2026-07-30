@@ -52,6 +52,10 @@ pub struct PdfState {
     pub page_count: Option<u32>,
     pub backend: crate::pdf::PdfBackend,
     pub source_byte_size: u64,
+    /// Link regions of `current_page`, extracted lazily on the first click
+    /// (never on render — a page flip must not pay a second subprocess).
+    /// `None` = not extracted yet; cleared on every page change.
+    pub links: Option<crate::pdf::PageLinks>,
 }
 
 fn render_image_placeholder(image: &ImageView, path: Option<&Path>, inner: Rect, buf: &mut Buffer) {
@@ -2664,6 +2668,7 @@ impl Editor {
                 page_count,
                 backend,
                 source_byte_size: meta.len(),
+                links: None,
             }),
         });
         self.sheet = None;
@@ -2737,6 +2742,7 @@ impl Editor {
         image.pixel_h = pixel_h;
         if let Some(state) = image.pdf.as_mut() {
             state.current_page = new_page;
+            state.links = None;
         }
         true
     }

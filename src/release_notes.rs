@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "The debugger's helper commands (compiling your file, first-time debugpy/js-debug setup) no longer spray compiler and installer output over the UI: their errors are captured and reported in the status line, completing the v0.1.648 PDF-rasteriser fix.",
+    kind: NoteKind::Feature,
+    summary: "Links in PDF previews are now clickable: a click on a hyperlink opens it in your browser, and a click on an internal reference jumps to its page, just like a desktop PDF viewer (needs poppler's pdftohtml).",
 }];
