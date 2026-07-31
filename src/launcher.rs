@@ -32,18 +32,33 @@ const APP_NAME: &str = "Croft";
 /// the Explorer and terminal stay one keystroke away (Cmd+B / Cmd+J). Clicking
 /// the launcher itself opens the workspace with the normal layout.
 fn launcher_script(croft_bin: &str, open_dir: &str) -> String {
+    // The command crosses two shells (`do shell script`, then Ghostty runs
+    // `--initial-command` through `/bin/sh -c`), so each path is its own
+    // `quoted form of` component - hand-rolled quotes died on an apostrophe
+    // in the workspace path. `on open` receives every selected/dropped file
+    // in one event; each gets its own window.
+    let bin = applescript_lit(croft_bin);
+    let dir = applescript_lit(open_dir);
     format!(
         r#"on run
-	do shell script "open -na Ghostty.app --args --initial-command=" & quoted form of "{croft_bin} '{open_dir}'"
+	set inner to quoted form of {bin} & " " & quoted form of {dir}
+	do shell script "open -na Ghostty.app --args --initial-command=" & quoted form of inner
 end run
 
 on open theFiles
-	set f to POSIX path of (item 1 of theFiles)
-	set inner to "{croft_bin} " & quoted form of f & " --zen"
-	do shell script "open -na Ghostty.app --args --initial-command=" & quoted form of inner
+	repeat with f in theFiles
+		set inner to quoted form of {bin} & " " & quoted form of (POSIX path of f) & " --zen"
+		do shell script "open -na Ghostty.app --args --initial-command=" & quoted form of inner
+	end repeat
 end open
 "#
     )
+}
+
+/// A string as an AppleScript literal: backslashes and quotes escaped, so an
+/// arbitrary path can never break out of (or fail to compile) the script.
+fn applescript_lit(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// `PlistBuddy` edits applied to the bundle `osacompile` generates. It writes a
@@ -197,7 +212,8 @@ mod tests {
         let s = launcher_script("/Users/v/.cargo/bin/croft", "/Users/v/Documents");
         assert!(s.contains("on run"));
         assert!(s.contains("open -na Ghostty.app --args"));
-        assert!(s.contains("/Users/v/.cargo/bin/croft '/Users/v/Documents'"));
+        assert!(s.contains(r#"quoted form of "/Users/v/.cargo/bin/croft""#));
+        assert!(s.contains(r#"quoted form of "/Users/v/Documents""#));
     }
 
     /// A plain `#!/bin/sh` bundle executable never sees the opened document:
@@ -207,10 +223,9 @@ mod tests {
     fn script_handles_opened_documents_through_an_open_handler() {
         let s = launcher_script("/Users/v/.cargo/bin/croft", "/Users/v/Documents");
         assert!(s.contains("on open theFiles"));
-        assert!(s.contains("POSIX path of (item 1 of theFiles)"));
         // The dropped path is passed through as croft's workspace argument;
         // croft itself roots a file at its parent (see cli::resolve_workspace).
-        assert!(s.contains("quoted form of f"));
+        assert!(s.contains("quoted form of (POSIX path of f)"));
     }
 
     /// Opening a document means "show me this file", so the window starts with
@@ -222,6 +237,56 @@ mod tests {
         let (run, open) = s.split_once("on open theFiles").unwrap();
         assert!(open.contains("--zen"));
         assert!(!run.contains("--zen"));
+    }
+
+    /// Ghostty runs `--initial-command` through `/bin/sh -c`, and the outer
+    /// `do shell script` is a second shell: every path component must go
+    /// through AppleScript's `quoted form of` individually. Hand-rolled
+    /// single quotes died on an apostrophe in the workspace path, and a raw
+    /// binary path broke on spaces.
+    #[test]
+    fn an_apostrophe_in_a_path_survives_both_shell_layers() {
+        let s = launcher_script("/Users/v/my tools/croft", "/Users/v/Vitali's Docs");
+        assert!(
+            s.contains(r#"quoted form of "/Users/v/Vitali's Docs""#),
+            "the workspace dir must be quoted as its own component: {s}"
+        );
+        assert!(
+            s.contains(r#"quoted form of "/Users/v/my tools/croft""#),
+            "the binary path must be quoted as its own component: {s}"
+        );
+        assert!(
+            !s.contains("croft '"),
+            "no hand-rolled single quotes may remain: {s}"
+        );
+    }
+
+    /// A quote or backslash in a path must be escaped into the AppleScript
+    /// string literal, or `osacompile` fails after the old bundle was
+    /// already deleted.
+    #[test]
+    fn quotes_and_backslashes_cannot_break_the_applescript_source() {
+        let s = launcher_script("/Users/v/.cargo/bin/croft", r#"/Users/v/say "hi"\now"#);
+        assert!(
+            s.contains(r#""/Users/v/say \"hi\"\\now""#),
+            "the literal must escape quotes and backslashes: {s}"
+        );
+    }
+
+    /// Selecting several files in Finder (or dropping several on the Dock
+    /// icon) delivers them all in one `on open`; every one must open, not
+    /// just the first.
+    #[test]
+    fn every_dropped_file_opens_not_just_the_first() {
+        let s = launcher_script("/Users/v/.cargo/bin/croft", "/Users/v/Documents");
+        assert!(
+            s.contains("repeat with"),
+            "the open handler must loop over theFiles: {s}"
+        );
+        assert!(
+            !s.contains("item 1 of theFiles"),
+            "no file may be silently dropped: {s}"
+        );
     }
 
     #[test]
