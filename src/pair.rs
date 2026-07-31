@@ -491,6 +491,12 @@ struct StreamRegion {
     start: usize,
     anchor: usize,
     original: String,
+    /// Notes whose anchors sat at or inside the fence's range when it
+    /// opened, as `(note id, offset - start)`: the delete collapses them
+    /// and the streamed inserts drag them along, so the revert can only
+    /// restore them from these recorded deltas (`start` keeps tracking
+    /// remote edits, so `start + delta` stays exact in the restored text).
+    displaced: Vec<(u64, usize)>,
 }
 
 /// One anchored navigator note: a byte offset into `file`'s replica text
@@ -1384,31 +1390,36 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
             };
             let offset = note_offset(&lines, row);
             let row_now = position(&lines, offset).0;
-            match st.events.clone() {
+            // The AI is visibly "looking" where it just commented.
+            st.caret_now(&file, row_now, 0);
+            let id = st.take_note_id();
+            let sink = st.events.clone();
+            // Pushed under the SAME lock as the offset computation: pushing
+            // after the REPL's say() left a window where a concurrent
+            // remote edit shifted every note EXCEPT this not-yet-pushed
+            // one, stranding its anchor below the edit.
+            st.notes.push(Note {
+                id,
+                file: file.clone(),
+                offset,
+                body: body.clone(),
+            });
+            match sink {
                 Some(tx) => {
                     let _ = tx.send(crate::pair_host::PairEvent::NoteAdded {
-                        file: file.clone(),
+                        file,
                         row: row_now,
-                        body: body.clone(),
+                        body,
                     });
                 }
                 None => {
                     // REPL driver: no event channel, so print the note or it
-                    // would be silently swallowed.
+                    // would be silently swallowed (say re-locks internally,
+                    // hence the drop).
                     drop(st);
                     say(state, &format!("[note {file}:{}] {body}\n", row_now + 1));
-                    st = state.lock().unwrap();
                 }
             }
-            // The AI is visibly "looking" where it just commented.
-            st.caret_now(&file, row_now, 0);
-            let id = st.take_note_id();
-            st.notes.push(Note {
-                id,
-                file,
-                offset,
-                body,
-            });
         }
         FenceEvent::NoteAbort => {
             state.lock().unwrap().note_in_flight = None;
@@ -1443,6 +1454,15 @@ fn open_region(st: &mut PairState, file: &str, start: (usize, usize), end: (usiz
     let original = doc[s..e].to_string();
     let new = format!("{}{}", &doc[..s], &doc[e..]);
     st.session.local_change(file, &new);
+    // Anchors at or inside the range are about to be collapsed by the
+    // delete (and then dragged along by the streamed inserts): record
+    // their pre-edit deltas so a revert can put them back exactly.
+    let displaced: Vec<(u64, usize)> = st
+        .notes
+        .iter()
+        .filter(|n| n.file == file && (s..e).contains(&n.offset))
+        .map(|n| (n.id, n.offset - s))
+        .collect();
     // Our own delete moves any note anchored below the cut in this file.
     let span = ResolvedSpan {
         at: s,
@@ -1455,6 +1475,7 @@ fn open_region(st: &mut PairState, file: &str, start: (usize, usize), end: (usiz
         start: s,
         anchor: s,
         original,
+        displaced,
     });
     st.discarding = false;
     st.session.send_stream_state(file, true);
@@ -1474,6 +1495,28 @@ fn revert_region(st: &mut PairState) {
         let anchor = r.anchor.clamp(start, doc.len());
         let new = format!("{}{}{}", &doc[..start], r.original, &doc[anchor..]);
         st.session.local_change(&r.file, &new);
+        // The inverse of the shifts open_region and EditBody applied: the
+        // revert deletes the streamed bytes and puts the original back, so
+        // notes the edit moved must move back with it.
+        let span = ResolvedSpan {
+            at: start,
+            deleted: anchor - start,
+            inserted: r.original.clone(),
+        };
+        shift_notes(&mut st.notes, &r.file, std::slice::from_ref(&span));
+        // Anchors that sat inside the range cannot be un-shifted (the
+        // delete collapsed them); restore them from the deltas recorded at
+        // open. `start` tracked remote edits all along, so `start + delta`
+        // lands exactly where the anchor sat in the restored slice.
+        for (id, delta) in &r.displaced {
+            if let Some(n) = st
+                .notes
+                .iter_mut()
+                .find(|n| n.id == *id && n.file == r.file)
+            {
+                n.offset = start + delta;
+            }
+        }
     }
     st.session.send_stream_state(&r.file, false);
 }
@@ -2158,6 +2201,41 @@ mod tests {
             })
         };
         (state, stop, pump)
+    }
+
+    /// An unseat moments before exit must still reap the pilot's child:
+    /// Drop detaches its grace-kill onto a thread, and a thread that dies
+    /// with the process leaves the child running (orphaned, still holding
+    /// its MCP subprocesses). join_teardowns() is the exit path's barrier
+    /// for every detached teardown.
+    #[test]
+    fn join_teardowns_reaps_a_dropped_hosts_child() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world");
+        let marker = format!("croft-teardown-{}", std::process::id());
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg("-c")
+            .arg("import time; time.sleep(120)")
+            .arg(&marker);
+        let host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "nav", None, cmd).unwrap();
+        let alive = |m: &str| {
+            std::process::Command::new("pgrep")
+                .args(["-f", m])
+                .output()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false)
+        };
+        assert!(alive(&marker), "the sleeper child must be running");
+        drop(host);
+        crate::pair_host::join_teardowns();
+        assert!(
+            !alive(&marker),
+            "after join_teardowns the dropped host's child must be reaped"
+        );
     }
 
     /// The persistent AI caret: a park before the file is live resolves as
@@ -3929,6 +4007,61 @@ mod tests {
         shift_notes(&mut notes, "a.rs", &spans);
         assert_eq!(notes[0].offset, 13);
         assert_eq!(notes[1].offset, 10, "other file's note must not move");
+    }
+
+    /// Aborting a streamed edit must also un-shift the notes that edit
+    /// moved: open_region shifts notes for its delete and every EditBody
+    /// shifts them for its insert, so the revert has to apply the inverse
+    /// span. Without it, every cancel or abort left the turn's notes
+    /// permanently drifted from the rows the model anchored them to.
+    #[test]
+    fn an_aborted_edit_un_shifts_the_notes_it_moved() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        {
+            let mut st = state.lock().unwrap();
+            st.begin_turn("demo.txt", "hello world", false);
+            // Anchors below, AT, and INSIDE the edited span [0, 5): the
+            // below one is shifted and must shift back; the at/inside ones
+            // are collapsed by the delete and ride the streamed inserts,
+            // so only their recorded pre-edit offsets can restore them.
+            for offset in [8usize, 0, 2] {
+                let id = st.take_note_id();
+                st.notes.push(Note {
+                    id,
+                    file: String::from("demo.txt"),
+                    offset,
+                    body: String::from("remark"),
+                });
+            }
+        }
+        apply_fence_event(
+            &state,
+            FenceEvent::EditStart {
+                file: String::from("demo.txt"),
+                start: (0, 0),
+                end: (0, 5),
+            },
+        );
+        apply_fence_event(
+            &state,
+            FenceEvent::EditBody(String::from("hi there friend")),
+        );
+        apply_fence_event(&state, FenceEvent::EditAbort);
+        let offsets: Vec<usize> = state
+            .lock()
+            .unwrap()
+            .notes
+            .iter()
+            .map(|n| n.offset)
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![8, 0, 2],
+            "the revert must restore every note anchor the edit had moved"
+        );
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
     }
 
     /// A note row just past EOF clamps to the last line instead of panicking

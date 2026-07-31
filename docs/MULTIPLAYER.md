@@ -561,11 +561,18 @@ interaction into turn-based driver/navigator pairing:
   `◆ <name> seated` badge; the orange streaming badge takes over whenever
   it types. If the claude child dies (or fails to seat), the host surfaces
   it and unseats, and does NOT respawn it every second — the latch clears
-  only when the record is deactivated, so a `croft pair --off` / `croft
-  pair` (or palette off/on) re-activates. Teardown on unseat runs on a
+  when the record is deactivated OR rewritten, so `croft pair --off` /
+  `croft pair`, a palette off/on, or simply re-running `croft pair` after
+  fixing the backend all re-activate. A window whose spawn failed also
+  releases the single-host lock (and its same-tick owner self-appointment),
+  so another croft window in the workspace can host instead; the losing
+  window announces the refusal once and keeps polling silently for
+  takeover. Teardown on unseat runs on a
   detached thread so the 2s grace-kill never freezes the UI, and the exit
   paths (drop-to-local, self-update exec) reap the child synchronously
-  first. The claude binary resolves to an absolute path when off `PATH`, so
+  first, then join every teardown a recent unseat detached — a thread that
+  died with the process used to leave the claude child running. The claude
+  binary resolves to an absolute path when off `PATH`, so
   a stripped GUI-launch environment can still seat it.
 
 ### Local models (0.1.636)

@@ -2722,19 +2722,36 @@ pub struct App {
     /// Notes the navigator left since its turn started, so the TurnDone
     /// status can surface them instead of overwriting the NoteAdded status.
     pair_notes_this_turn: usize,
-    /// The file the turn's notes landed in (for the TurnDone hint; F4 only
-    /// cycles the active file, so naming it tells the user where to look).
+    /// The file the turn's notes LAST landed in (anchors the turn's prose
+    /// when the invocation origin is unknown).
     pair_last_noted_file: Option<String>,
+    /// Every file the turn's notes landed in: the TurnDone hint names the
+    /// file only when there is exactly one ("3 comments in b.rs" was a lie
+    /// when two of them sat in a.rs).
+    pair_noted_files: std::collections::BTreeSet<String>,
     /// Held while this croft is the self-appointed navigator owner: exactly
     /// one plain croft per workspace may host the pilot (and claim collab
     /// owner site 1). Released by the OS on exit, so a crashed host hands off.
     pair_host_lock: Option<crate::session::PairHostLock>,
     /// Set when the pilot died or failed to seat: suppresses the 1s re-seat
     /// so a broken claude (unauthenticated, missing, crashing) is not
-    /// respawned forever. Cleared when the record is deactivated, so an
-    /// explicit off/on (or toggle) re-activates. Matches the LSP precedent:
-    /// no auto-respawn within a session; a fresh croft retries.
+    /// respawned forever. Cleared when the record is deactivated OR
+    /// rewritten (any `croft pair` run re-arms seating, as the CLI
+    /// promises), so an explicit off/on (or toggle) re-activates. Matches
+    /// the LSP precedent: no auto-respawn within a session; a fresh croft
+    /// retries.
     navigator_down: bool,
+    /// The pair record's raw bytes at the last 1s check: changed bytes mean
+    /// someone ran `croft pair` (even enabled→enabled — every write stamps
+    /// the record, so no rewrite is byte-identical) and clear
+    /// [`navigator_down`]. Content, not mtime: a same-grain rewrite on a
+    /// coarse-timestamp filesystem keeps its mtime.
+    last_pair_record_raw: Option<Vec<u8>>,
+    /// Whether the "hosted by another croft window" refusal has already
+    /// been announced: the losing window keeps polling for takeover every
+    /// second, and re-announcing each poll clobbered its status line
+    /// forever (and forced a 1 Hz repaint).
+    pair_lock_denied: bool,
     /// Proactive navigator looks (docs/MULTIPLAYER.md): a completed new
     /// construct plus a typing pause hands the seated navigator a
     /// comment-only turn on its own. Opt-out via
@@ -3616,6 +3633,9 @@ impl App {
             pair_last_noted_file: None,
             pair_host_lock: None,
             navigator_down: false,
+            last_pair_record_raw: None,
+            pair_lock_denied: false,
+            pair_noted_files: std::collections::BTreeSet::new(),
             proactive_navigator_enabled: !loaded_prefs.disable_proactive_navigator,
             proactive_scanned: std::collections::HashMap::new(),
             #[cfg(test)]
@@ -15671,15 +15691,21 @@ impl App {
                 range,
                 selection,
             } => {
-                self.close_input_prompt();
+                // The prompt closes only on a SENT ask: a failure (navigator
+                // gone or gone busy while the user typed) keeps the box open
+                // with the draft intact for a retry, like a failed comment
+                // reply keeps its draft.
                 let Some(host) = &self.pair_host else {
                     self.status = String::from("Navigator is not active");
                     return;
                 };
                 let content = self.editor.lines.join("\n");
-                match host.send_ask_turn(&file, range, &selection, &value, &content) {
+                let name = host.name().to_string();
+                let result = host.send_ask_turn(&file, range, &selection, &value, &content);
+                match result {
                     Ok(()) => {
-                        self.status = format!("Asked {} about {file}:{}", host.name(), range.0 + 1);
+                        self.close_input_prompt();
+                        self.status = format!("Asked {name} about {file}:{}", range.0 + 1);
                         // Anchor the turn's prose commentary where it was asked.
                         self.pair_turn_origin = Some((file, range.0));
                     }
@@ -15885,12 +15911,28 @@ impl App {
             return false;
         }
         self.last_pair_check = Some(std::time::Instant::now());
-        let record = crate::session::read_pair_record(&self.pair_record_path);
+        // A rewritten record re-arms seating: after a failed seat the user
+        // re-runs `croft pair`, and the CLI promises "a running croft seats
+        // it within a second" — but an enabled→enabled rewrite has no other
+        // observable transition. The record's BYTES are the signal (every
+        // write stamps them, and mtime misses a same-grain rewrite on a
+        // coarse-timestamp filesystem).
+        let raw = std::fs::read(&self.pair_record_path).ok();
+        if self.last_pair_record_raw != raw {
+            if self.last_pair_record_raw.is_some() {
+                self.navigator_down = false;
+            }
+            self.last_pair_record_raw = raw.clone();
+        }
+        let record: Option<crate::session::PairRecord> = raw
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice(bytes).ok());
         let want = record.as_ref().is_some_and(|r| r.enabled);
         if !want {
             // Deactivation clears the death latch, so `croft pair --off`
             // then `croft pair` (or a palette off/on) re-activates.
             self.navigator_down = false;
+            self.pair_lock_denied = false;
             if let Some(host) = self.pair_host.take() {
                 // Drop tears the seat down; its parked caret goes with it.
                 let sites = host.caret_sites();
@@ -15898,6 +15940,11 @@ impl App {
                 self.navigator_notes.clear();
                 self.pair_commentary_buf.clear();
                 self.pair_turn_origin = None;
+                // The turn counters die with the seat: leaking them made
+                // the NEXT seat's first TurnDone report a dead seat's notes.
+                self.pair_notes_this_turn = 0;
+                self.pair_last_noted_file = None;
+                self.pair_noted_files.clear();
                 self.editor.comment_focus = None;
                 self.status = String::from("Navigator unseated");
                 return true;
@@ -15920,6 +15967,7 @@ impl App {
             return false;
         }
         let record = record.expect("want implies a record");
+        let mut self_appointed_now = false;
         if self.collab_config.is_none() {
             // Only one croft may self-appoint owner per workspace: two owners
             // would both claim site id 1 and corrupt the shared buffer. Claim
@@ -15927,8 +15975,18 @@ impl App {
             // host (keep checking — take over when that croft exits).
             if self.pair_host_lock.is_none() {
                 match crate::session::try_acquire_pair_host_lock(&self.pair_host_lock_path) {
-                    Some(lock) => self.pair_host_lock = Some(lock),
+                    Some(lock) => {
+                        self.pair_host_lock = Some(lock);
+                        self.pair_lock_denied = false;
+                    }
                     None => {
+                        // Announced ONCE: the takeover poll keeps running
+                        // every second, and re-announcing clobbered the
+                        // window's status line forever at a 1 Hz repaint.
+                        if self.pair_lock_denied {
+                            return false;
+                        }
+                        self.pair_lock_denied = true;
                         self.status = format!(
                             "Navigator '{}' is hosted by another croft window in this workspace",
                             record.name
@@ -15939,10 +15997,16 @@ impl App {
             }
             if let Err(e) = crate::collab::ensure_relay(&self.pair_socket) {
                 self.status = format!("Navigator: relay failed: {e}");
+                // The spawn failure's sibling: this window holds the lock
+                // but cannot host without a relay. Release it so another
+                // window can try; this one retries next second and may
+                // re-acquire.
+                self.pair_host_lock = None;
                 return true;
             }
             self.collab_config = Some((self.pair_socket.clone(), crate::collab::CollabRole::Owner));
             self.last_collab_connect = None; // connect this tick, not in 2s
+            self_appointed_now = true;
         }
         let cfg = crate::pair::PairConfig {
             socket: self.pair_socket.clone(),
@@ -15978,6 +16042,16 @@ impl App {
             Err(e) => {
                 self.status = format!("Navigator failed to seat: {e}");
                 self.navigator_down = true; // no 1s retry storm
+                if self_appointed_now {
+                    // A window that cannot host must not block one that can:
+                    // undo the self-appointment made moments ago (nothing
+                    // has connected yet within this same call) and release
+                    // the lock so another croft may claim the seat. A host
+                    // whose PILOT died later keeps both — it is still the
+                    // live collab owner and re-seats on re-activation.
+                    self.collab_config = None;
+                    self.pair_host_lock = None;
+                }
             }
         }
         true
@@ -16010,11 +16084,13 @@ impl App {
                     let snippet: String = body.chars().take(60).collect();
                     self.status = format!("{name} commented on {file}:{}: {snippet}", row + 1);
                     self.pair_notes_this_turn += 1;
+                    self.pair_noted_files.insert(file.clone());
                     self.pair_last_noted_file = Some(file);
                 }
                 crate::pair_host::PairEvent::TurnDone { cancelled, failed } => {
                     let mut notes = std::mem::take(&mut self.pair_notes_this_turn);
-                    let mut file = self.pair_last_noted_file.take();
+                    let mut files = std::mem::take(&mut self.pair_noted_files);
+                    let file = self.pair_last_noted_file.take();
                     let prose = std::mem::take(&mut self.pair_commentary_buf);
                     let origin = self.pair_turn_origin.take();
                     if !cancelled && !prose.trim().is_empty() {
@@ -16051,7 +16127,7 @@ impl App {
                         match (landed, anchor) {
                             (Some(_), Some((f, _))) => {
                                 notes += 1;
-                                file.get_or_insert(f);
+                                files.insert(f);
                             }
                             _ => {
                                 for line in prose.lines().filter(|l| !l.trim().is_empty()) {
@@ -16070,13 +16146,10 @@ impl App {
                         let err: String = err.chars().take(80).collect();
                         format!("{name}: turn failed: {err}")
                     } else if notes > 0 {
-                        let plural = if notes == 1 { "comment" } else { "comments" };
-                        match file {
-                            Some(f) => {
-                                format!("{name} finished: {notes} {plural} in {f} · F4 to review")
-                            }
-                            None => format!("{name} finished: {notes} {plural} · F4 to review"),
-                        }
+                        format!(
+                            "{name} finished: {} · F4 to review",
+                            turn_note_summary(notes, &files)
+                        )
                     } else {
                         format!("{name} finished its turn")
                     };
@@ -16097,6 +16170,10 @@ impl App {
             self.navigator_notes.clear();
             self.pair_commentary_buf.clear();
             self.pair_turn_origin = None;
+            // The turn counters die with the seat (see the unseat twin).
+            self.pair_notes_this_turn = 0;
+            self.pair_last_noted_file = None;
+            self.pair_noted_files.clear();
             self.editor.comment_focus = None;
             self.navigator_down = true; // no auto-respawn; re-activate to retry
             return true;
@@ -16376,6 +16453,13 @@ impl App {
             return false;
         };
         if host.is_busy() || self.editor.comment_focus.is_some() {
+            return false;
+        }
+        // The user is mid-typing in a prompt (the ask box included):
+        // stealing the seat now would make their Enter land on a busy host
+        // and fail. Suppress WITHOUT consuming the scan latch below, so the
+        // look fires once the prompt closes.
+        if self.input_prompt.is_some() {
             return false;
         }
         let Some(edited) = self.editor.last_edit_at else {
@@ -29774,6 +29858,22 @@ fn is_extensions_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'x')
 }
 
+/// The TurnDone status fragment for a turn's notes: the file is named only
+/// when every note landed in the SAME file. "3 comments in b.rs" was a lie
+/// when two of them sat in a.rs (F4 only cycles the active file, so the
+/// name tells the user where to look).
+fn turn_note_summary(notes: usize, files: &std::collections::BTreeSet<String>) -> String {
+    let plural = if notes == 1 { "comment" } else { "comments" };
+    match files.len() {
+        0 => format!("{notes} {plural}"),
+        1 => format!(
+            "{notes} {plural} in {}",
+            files.iter().next().expect("len checked")
+        ),
+        n => format!("{notes} {plural} across {n} files"),
+    }
+}
+
 /// Index of the next navigator note to visit from `here` = (row, index of
 /// the currently focused note, or `usize::MAX` when the walk starts from a
 /// bare caret row): the note with the smallest (row, index) strictly greater
@@ -32149,6 +32249,10 @@ pub fn run(
     if let Some(host) = app.pair_host.take() {
         host.shutdown_blocking();
     }
+    // And every teardown a recent unseat DETACHED (toggle off, record
+    // disabled, pilot death): those threads race process exit, and a thread
+    // that dies mid-grace-kill leaves the claude child running.
+    crate::pair_host::join_teardowns();
 
     result?;
     if app.drop_to_local {
