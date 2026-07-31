@@ -1428,7 +1428,16 @@ fn open_region(st: &mut PairState, file: &str, start: (usize, usize), end: (usiz
     let (s, e) = (s.min(doc.len()), e.min(doc.len()));
     if s > e {
         st.discarding = true;
-        eprintln!("[pair] fence range is inverted; edit dropped");
+        // The OUTPUT channel, never stderr: the resident navigator runs
+        // in-process, so an eprintln! lands on the alternate screen and
+        // corrupts the render (the pdftoppm/DAP capture class). The
+        // whole-line header form makes an inverted range a one-token slip
+        // for a weak local model.
+        crate::output::push(
+            "Navigator",
+            crate::output::OutputLevel::Warn,
+            "fence range is inverted; edit dropped",
+        );
         return;
     }
     let original = doc[s..e].to_string();
@@ -2264,6 +2273,52 @@ mod tests {
         assert!(
             st.pending_caret.is_none(),
             "the edit's caret supersedes the pending park"
+        );
+    }
+
+    /// A PARSEABLE whole-line header with an inverted range (`5-3`) drops
+    /// the edit through the OUTPUT channel, never stderr: the resident
+    /// navigator runs in-process, so an eprintln! would land on the
+    /// alternate screen and corrupt the render. The inverted header is a
+    /// one-token slip for the weak local models the whole-line form serves.
+    #[test]
+    fn an_inverted_fence_range_drops_the_edit_via_output_not_stderr() {
+        let harness = OwnerHarness::start("l0\nl1\nl2\nl3\nl4\nl5");
+        let session = connect_session(&harness.socket, "pilot").unwrap();
+        let state = Mutex::new(PairState::new(session, None));
+        state
+            .lock()
+            .unwrap()
+            .begin_turn("demo.txt", "l0\nl1\nl2\nl3\nl4\nl5", false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut st = state.lock().unwrap();
+            let _ = st.session.poll(|_| None);
+            if st.session.is_live("demo.txt") {
+                break;
+            }
+            drop(st);
+            assert!(Instant::now() < deadline, "demo.txt never went live");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let baseline = crate::output::snapshot("Navigator")
+            .unwrap_or_default()
+            .len();
+        let mut st = state.lock().unwrap();
+        open_region(&mut st, "demo.txt", (4, 0), (2, usize::MAX));
+        assert!(st.discarding, "the inverted edit's body must be discarded");
+        assert_eq!(
+            st.session.doc_text("demo.txt").as_deref(),
+            Some("l0\nl1\nl2\nl3\nl4\nl5"),
+            "nothing may be applied"
+        );
+        let lines = crate::output::snapshot("Navigator").unwrap_or_default();
+        assert!(
+            lines
+                .iter()
+                .skip(baseline)
+                .any(|l| l.text.contains("inverted")),
+            "the drop is reported on the OUTPUT channel"
         );
     }
 
