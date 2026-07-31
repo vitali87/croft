@@ -601,8 +601,13 @@ croft pair --base-url http://box:8080 --model qwen3-coder:30b   # implies ollama
   the seat stays; the next ask retries. The idle badge names the model:
   `◆ claude (qwen3-coder:30b) seated`.
 - **Auth.** Keyed Anthropic-compatible gateways read `ANTHROPIC_AUTH_TOKEN`
-  from croft's environment; `pair.json` records only provider, base_url, and
-  model — never a token.
+  from croft's environment, sent as `Authorization: Bearer` (Anthropic's own
+  convention for that variable) and mirrored into `x-api-key` for gateways
+  of the other style, alongside `anthropic-version`. The credential only
+  ever travels over https or to a loopback host — a cleartext remote
+  `--base-url http://box:8080` gets a harmless placeholder instead, so the
+  token cannot be sniffed off the wire. `pair.json` records only provider,
+  base_url, and model — never a token.
 
 ### Slice 3 design: op transport and the process model
 
