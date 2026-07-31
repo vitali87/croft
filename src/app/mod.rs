@@ -2741,10 +2741,12 @@ pub struct App {
     /// the LSP precedent: no auto-respawn within a session; a fresh croft
     /// retries.
     navigator_down: bool,
-    /// The pair record's mtime at the last 1s check: a changed mtime means
-    /// someone ran `croft pair` (even enabled→enabled, where no other
-    /// transition is observable) and clears [`navigator_down`].
-    last_pair_record_mtime: Option<std::time::SystemTime>,
+    /// The pair record's raw bytes at the last 1s check: changed bytes mean
+    /// someone ran `croft pair` (even enabled→enabled — every write stamps
+    /// the record, so no rewrite is byte-identical) and clear
+    /// [`navigator_down`]. Content, not mtime: a same-grain rewrite on a
+    /// coarse-timestamp filesystem keeps its mtime.
+    last_pair_record_raw: Option<Vec<u8>>,
     /// Whether the "hosted by another croft window" refusal has already
     /// been announced: the losing window keeps polling for takeover every
     /// second, and re-announcing each poll clobbered its status line
@@ -3631,7 +3633,7 @@ impl App {
             pair_last_noted_file: None,
             pair_host_lock: None,
             navigator_down: false,
-            last_pair_record_mtime: None,
+            last_pair_record_raw: None,
             pair_lock_denied: false,
             pair_noted_files: std::collections::BTreeSet::new(),
             proactive_navigator_enabled: !loaded_prefs.disable_proactive_navigator,
@@ -15912,18 +15914,19 @@ impl App {
         // A rewritten record re-arms seating: after a failed seat the user
         // re-runs `croft pair`, and the CLI promises "a running croft seats
         // it within a second" — but an enabled→enabled rewrite has no other
-        // observable transition. The mtime is the signal (the contents may
-        // be byte-identical).
-        let mtime = std::fs::metadata(&self.pair_record_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        if self.last_pair_record_mtime != mtime {
-            if self.last_pair_record_mtime.is_some() {
+        // observable transition. The record's BYTES are the signal (every
+        // write stamps them, and mtime misses a same-grain rewrite on a
+        // coarse-timestamp filesystem).
+        let raw = std::fs::read(&self.pair_record_path).ok();
+        if self.last_pair_record_raw != raw {
+            if self.last_pair_record_raw.is_some() {
                 self.navigator_down = false;
             }
-            self.last_pair_record_mtime = mtime;
+            self.last_pair_record_raw = raw.clone();
         }
-        let record = crate::session::read_pair_record(&self.pair_record_path);
+        let record: Option<crate::session::PairRecord> = raw
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice(bytes).ok());
         let want = record.as_ref().is_some_and(|r| r.enabled);
         if !want {
             // Deactivation clears the death latch, so `croft pair --off`

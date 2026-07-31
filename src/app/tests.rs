@@ -20120,14 +20120,20 @@ fn a_record_rewrite_re_arms_a_downed_navigator() {
     assert!(app.pair_host.is_none());
 
     // The user fixes the backend and re-runs `croft pair`: the rewritten
-    // record (bumped mtime; contents may be identical) re-arms seating.
+    // record re-arms seating — even when the rewrite lands within the same
+    // mtime grain (coarse-timestamp filesystems): pin the mtime to the old
+    // value so only the CONTENT can carry the signal (every write stamps
+    // the record, so an enabled→enabled rewrite is never byte-identical).
+    let old_mtime = std::fs::metadata(&app.pair_record_path)
+        .unwrap()
+        .modified()
+        .unwrap();
     crate::session::write_pair_record(&app.pair_record_path, &record).unwrap();
     let f = std::fs::File::options()
         .write(true)
         .open(&app.pair_record_path)
         .unwrap();
-    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(2))
-        .unwrap();
+    f.set_modified(old_mtime).unwrap();
     app.pair_spawn_override = Some(Box::new(local_test_spawn));
     app.last_pair_check = None;
     app.maybe_seat_navigator();

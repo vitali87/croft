@@ -135,8 +135,19 @@ pub(crate) struct PairRecord {
 }
 
 pub(crate) fn write_pair_record(path: &Path, record: &PairRecord) -> Result<()> {
-    let json = serde_json::to_string(record).context("serializing pair record")?;
-    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+    let mut v = serde_json::to_value(record).context("serializing pair record")?;
+    // Every write is observable: the App re-arms a downed navigator when
+    // the record CHANGES, and an enabled→enabled rewrite (`croft pair`
+    // after a failed seat) would otherwise be byte-identical — and mtime
+    // alone misses a same-grain rewrite on coarse-timestamp filesystems.
+    // The read path ignores the stamp (serde skips unknown fields).
+    v["written_at_nanos"] = serde_json::Value::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    );
+    std::fs::write(path, v.to_string()).with_context(|| format!("writing {}", path.display()))
 }
 
 pub(crate) fn read_pair_record(path: &Path) -> Option<PairRecord> {
