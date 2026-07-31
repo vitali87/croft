@@ -27477,11 +27477,17 @@ impl App {
     /// the active group, so which physical column it sits in depends on the
     /// active leaf's depth-first index in `editor_layout`.
     fn group_on_side(&self, side: usize) -> Option<&EditorTabs> {
-        if !self.editor_layout.is_split() {
+        // Physical column maps directly to depth-first leaf index only in
+        // the two-column layout. Every other layout - unsplit, or a grid of
+        // three or more groups - bakes the ACTIVE group into slot 0 and
+        // leaves slot 1 dark (see the render path), the same clamp
+        // `focused_image_side` applies: resolving by DFS position here made
+        // the image gate and the layout key read one group while the baked
+        // pixels came from another.
+        if self.editor_layout.leaf_count() != 2 {
             return (side == 0).then_some(&self.editor);
         }
-        // Physical column maps directly to depth-first leaf index in the
-        // two-column layout. The active group is hoisted into `self.editor`.
+        // The active group is hoisted into `self.editor`.
         if side == self.editor_layout.active_dfs_index() {
             Some(&self.editor)
         } else {
@@ -27489,8 +27495,6 @@ impl App {
         }
     }
 
-    /// Physical overlay-slot index of the focused group: its depth-first leaf
-    /// index (0 when unsplit or focused-left, 1 when focused-right).
     /// Step the focused PDF preview by `delta` pages. The overlay re-bakes on
     /// its own (the page is part of its re-emit key), so this is the single
     /// entry point every gesture - arrows, wheel, menu - can call.
@@ -27627,17 +27631,12 @@ impl App {
         let canvas_w = cell_w as u32 * cw_px;
         let canvas_h = cell_h as u32 * ch_px;
         let bg = self.theme_bg_pixel();
-        // Borrow the image bytes from the group on this side directly (a
-        // disjoint-field borrow from `self.overlays`); the borrow ends at
-        // the last use inside the bake, before we store into the slot.
+        // The bytes come from the same `group_on_side` resolution the gate
+        // and the layout key above used, so all three always describe one
+        // group; the borrow ends at the last use inside the bake, before we
+        // store into the slot.
         let baked = {
-            let Some(image) = (if side == self.focused_image_side() {
-                self.editor.image.as_ref()
-            } else {
-                self.editor_layout
-                    .group_ref_at_dfs(side)
-                    .and_then(|g| g.image.as_ref())
-            }) else {
+            let Some(image) = self.group_on_side(side).and_then(|g| g.image.as_ref()) else {
                 return;
             };
             crate::iterm2_inline::fit_image_auto(&image.bytes, canvas_w, canvas_h, bg)

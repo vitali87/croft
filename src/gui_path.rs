@@ -77,18 +77,31 @@ fn merge(current: Option<&str>, probed: &str) -> String {
 /// EOF instead of blocking, and the whole thing is bounded by
 /// [`PROBE_TIMEOUT`].
 fn probe(shell: &str) -> Option<String> {
+    run_probe(probe_cmd(shell), PROBE_TIMEOUT)
+}
+
+/// The probe invocation for `shell`, before it is spawned. Split from
+/// [`probe`] so a test can inject an environment (`HOME`) around it.
+fn probe_cmd(shell: &str) -> Command {
     let mut cmd = Command::new(shell);
-    let csh = std::path::Path::new(shell)
+    let name = std::path::Path::new(shell)
         .file_name()
-        .is_some_and(|n| n.to_string_lossy().ends_with("csh"));
-    if csh {
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.ends_with("csh") {
+        // csh/tcsh accept `-l` only as the sole argument, so the login-shell
+        // marking goes the other way: a leading dash in argv[0], the same
+        // convention login(1) uses. Without it tcsh reads `.cshrc` but never
+        // `~/.login` - the conventional place a csh user builds `path` - and
+        // the probe recovers nothing for the csh family.
+        std::os::unix::process::CommandExt::arg0(&mut cmd, format!("-{name}"));
         cmd.arg("-i");
     } else {
         cmd.args(["-l", "-i"]);
     }
     cmd.arg("-c")
         .arg(format!(r#"/bin/sh -c 'printf "{BEGIN}%s{END}" "$PATH"'"#));
-    run_probe(cmd, PROBE_TIMEOUT)
+    cmd
 }
 
 /// Run a prepared probe command and return the PATH it printed, giving up
@@ -290,15 +303,25 @@ mod tests {
     /// Dock click produces must come back with the login shell's own
     /// directories merged in front, or croft can see nothing the user
     /// installed (`pdftoppm`, `git`, `rg`, the language servers) when
-    /// started from Croft.app. A stub login shell stands in for the user's:
-    /// the suite must not depend on (or execute) a developer's rc files.
+    /// started from Croft.app. A stub login shell stands in for the user's
+    /// (the suite must not depend on, or execute, a developer's rc files),
+    /// but a strict one: it refuses any argv other than the probe's real
+    /// `-l -i -c <script>` shape, contributes a directory the way a login
+    /// shell does (into the exported environment), and runs the probe
+    /// script through a real `/bin/sh` so the nested quoting is exercised.
     #[test]
     fn a_dock_launch_ends_up_seeing_the_users_own_directories() {
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("stub-shell");
         std::fs::write(
             &stub,
-            format!("#!/bin/sh\nprintf '{BEGIN}/stub/tools/bin:/usr/bin{END}'\n"),
+            "#!/bin/sh\n\
+             [ \"$1\" = -l ] || exit 64\n\
+             [ \"$2\" = -i ] || exit 64\n\
+             [ \"$3\" = -c ] || exit 64\n\
+             [ $# -eq 4 ] || exit 64\n\
+             PATH=\"/stub/tools/bin:$PATH\"; export PATH\n\
+             exec /bin/sh -c \"$4\"\n",
         )
         .unwrap();
         let mut perm = std::fs::metadata(&stub).unwrap().permissions();
@@ -350,6 +373,33 @@ mod tests {
         }
         let path = probe("/bin/tcsh").expect("tcsh must report a PATH");
         assert!(path.contains("/bin"), "got {path:?}");
+    }
+
+    /// `~/.login` is the conventional place a csh user builds `path` (it is
+    /// the login-only file), and tcsh refuses `-l` next to any other flag -
+    /// so the probe must mark itself a login shell the way login(1) does,
+    /// with a leading dash in argv[0]. Runs the real tcsh against a stub
+    /// HOME: if `.login` is never sourced, the probe recovered nothing and
+    /// the whole module is dead for the csh family.
+    #[test]
+    fn a_csh_family_probe_reads_the_login_file() {
+        if !std::path::Path::new("/bin/tcsh").exists() {
+            eprintln!("skipping: tcsh not installed");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".login"),
+            "setenv PATH /from/login:$PATH\n",
+        )
+        .unwrap();
+        let mut cmd = probe_cmd("/bin/tcsh");
+        cmd.env("HOME", home.path());
+        let path = run_probe(cmd, PROBE_TIMEOUT).expect("tcsh must answer");
+        assert!(
+            path.split(':').any(|e| e == "/from/login"),
+            "~/.login was not sourced; the csh user's PATH is lost: {path:?}"
+        );
     }
 
     /// A shell wedged on its own rc file must not wedge croft.

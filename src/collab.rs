@@ -592,11 +592,20 @@ const BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3)
 /// How long the first unanswered SnapshotRequest waits before a re-send.
 /// The relay has no replay: a request broadcast before the owner's
 /// connection is registered is otherwise lost forever. Every further
-/// unanswered resend doubles the wait: a guest cannot tell a lost request
-/// from a large reply still arriving, and a fixed cadence made the owner
-/// re-serialize and blocking-write the whole document every 500ms while a
-/// slow snapshot was already in flight.
+/// unanswered resend doubles the wait, capped at [`SNAPSHOT_RESEND_CAP`]:
+/// a guest cannot tell a lost request from a large reply still arriving,
+/// and a fixed cadence made the owner re-serialize and blocking-write the
+/// whole document every 500ms while a slow snapshot was already in flight.
 const SNAPSHOT_RESEND: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Ceiling on the resend backoff. Unbounded doubling scheduled the third
+/// resend past [`BOOTSTRAP_TIMEOUT`] (0.5s, 1.5s, then 3.5s), so an owner
+/// whose relay connection registered in the back half of the bootstrap
+/// window was never re-asked and the guest silently degraded the file to
+/// local-only. Capped at 1s the schedule is 0.5s, 1.5s, 2.5s: the same
+/// late-owner coverage the pre-backoff fixed cadence had, at half the
+/// duplicate-snapshot spam.
+const SNAPSHOT_RESEND_CAP: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Per-file replication state on one participant.
 enum DocState {
@@ -609,8 +618,8 @@ enum DocState {
         deadline: std::time::Instant,
         /// When to re-send the request if no reply has landed yet.
         resend_at: std::time::Instant,
-        /// The wait after the next resend fires (doubles each time, see
-        /// [`SNAPSHOT_RESEND`]).
+        /// The wait after the next resend fires (doubles each time, capped:
+        /// see [`SNAPSHOT_RESEND`] and [`SNAPSHOT_RESEND_CAP`]).
         resend_every: std::time::Duration,
         buffered: Vec<Envelope>,
     },
@@ -972,7 +981,7 @@ impl CollabSession {
             } = state
                 && now >= *resend_at
             {
-                *resend_every *= 2;
+                *resend_every = (*resend_every * 2).min(SNAPSHOT_RESEND_CAP);
                 *resend_at = now + *resend_every;
                 resend.push((file.clone(), *nonce));
             }
@@ -1640,12 +1649,16 @@ mod tests {
         assert!(!guest.is_live("src/f.rs"));
     }
 
-    /// A SnapshotRequest broadcast before the owner is reachable is not
-    /// lost for good: the relay has no replay, so the guest must re-send
-    /// while bootstrapping and an owner that appears moments later still
-    /// answers.
+    /// An unanswered resend backs off (a guest cannot tell a lost request
+    /// from a large reply still arriving, and a fixed 500ms cadence made
+    /// the owner re-serialize the whole document while a slow snapshot was
+    /// already in flight) - but the backoff is capped so the schedule still
+    /// fits inside [`BOOTSTRAP_TIMEOUT`]. Unbounded doubling put the third
+    /// resend past the deadline: an owner whose relay connection registered
+    /// between 1.5s and 3s was never re-asked, and the guest silently
+    /// degraded that file to local-only editing.
     #[test]
-    fn snapshot_resend_backs_off_exponentially() {
+    fn snapshot_resend_backs_off_but_stays_inside_the_bootstrap_window() {
         use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("s.collab.sock");
@@ -1665,11 +1678,7 @@ mod tests {
         };
         guest.request_file("src/f.rs");
         // Fire three resends back to back (pulling the timer into the past
-        // each time) and read how far out each one rescheduled itself. A
-        // resend exists to cover a lost request; a reply that is merely
-        // large and still arriving must not be met with a train of
-        // duplicate full-document snapshots on a fixed 500ms cadence, so
-        // every unanswered resend must at least double the wait.
+        // each time) and read how far out each one rescheduled itself.
         let mut waits: Vec<Duration> = Vec::new();
         for _ in 0..3 {
             {
@@ -1691,11 +1700,28 @@ mod tests {
             waits.push(resend_at.saturating_duration_since(Instant::now()));
         }
         assert!(
-            waits[1] >= waits[0] + waits[0] / 2 && waits[2] >= waits[1] + waits[1] / 2,
-            "unanswered resends must back off, got {waits:?}"
+            waits[0] > SNAPSHOT_RESEND,
+            "an unanswered resend must back off past the initial cadence, got {waits:?}"
+        );
+        for w in &waits {
+            assert!(
+                *w <= Duration::from_secs(1),
+                "the backoff must cap at 1s so every resend fits inside the \
+                 bootstrap window, got {waits:?}"
+            );
+        }
+        // And the capped schedule provably fits: initial wait plus two
+        // capped waits still lands the third resend before the deadline.
+        assert!(
+            SNAPSHOT_RESEND + Duration::from_secs(2) < BOOTSTRAP_TIMEOUT,
+            "the resend schedule no longer fits inside BOOTSTRAP_TIMEOUT"
         );
     }
 
+    /// A SnapshotRequest broadcast before the owner is reachable is not
+    /// lost for good: the relay has no replay, so the guest must re-send
+    /// while bootstrapping and an owner that appears moments later still
+    /// answers.
     #[test]
     fn guest_resends_snapshot_request_until_an_owner_answers() {
         use std::time::{Duration, Instant};

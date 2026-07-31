@@ -62,26 +62,18 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Clicking a PDF in a grid of three or more editor groups no longer crashes croft, and the preview bakes into the focused group.",
+        summary: "In a grid of three or more editor groups the focused group's PDF preview really shows now: the overlay's gate, key and pixels all resolve to the focused group instead of the first one, so pages turn and links click.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "PDF links open exactly what you clicked: each link covers only its own words, overlapping TOC lines resolve to the most-covered one, and only web and mail links may leave croft (a document's file:// or custom scheme is dropped).",
+        summary: "A tcsh or csh user's PATH survives a Dock launch: the probe marks itself a login shell the way login(1) does, so ~/.login is finally read.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A PDF rebuilt on disk (pdflatex finishing) reloads back to the page you were reading instead of snapping to page 1.",
+        summary: "A collab guest keeps re-asking for the owner's snapshot through the whole bootstrap window (the backoff now caps at 1s), so an owner that connects a moment late is still caught instead of the file silently going local-only.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "GUI-launch PATH repair now survives rc files that background helpers, works under fish and tcsh, and never delays the instant remote-attach probes.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Broadcast input encodes arrows per pane, so a zsh pane and a bash pane each receive the form their own shell asked for.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Stray errors from the OS opener, Reveal in Finder, and new-window AppleScript can no longer scribble on the screen, and JS debugging finds node even when a chatty login shell overflows the pipe.",
+        summary: "PDF link slicing survives malformed text runs: a bare ampersand or a zero-extent run can no longer push a link over neighbouring text or make it unclickable.",
     },
 ];

@@ -14878,6 +14878,34 @@ fn focused_image_side_stays_within_the_two_overlay_slots() {
     );
 }
 
+/// In a grid of three or more groups the render path bakes the ACTIVE group
+/// into overlay slot 0 (`update_editor_image_overlay(0, active_area)`), so
+/// slot 0's image gate, layout key and baked pixels must all resolve to the
+/// active group. They used to resolve to the depth-first-0 group instead:
+/// a focused PDF in the third group either got no preview at all (when the
+/// dfs-0 group held a text file) or was keyed under the dfs-0 group's path
+/// and froze on its first baked page.
+#[test]
+fn slot_zero_of_a_grid_resolves_to_the_active_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    app.split_editor_dir(editor_layout::SplitDir::Vertical, true);
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "B").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    assert_eq!(app.editor_layout.active_dfs_index(), 2);
+    assert_eq!(
+        app.group_on_side(0).and_then(|g| g.path.as_deref()),
+        Some(b.as_path()),
+        "slot 0 must be the active group in a 3+ grid"
+    );
+    assert!(
+        app.group_on_side(1).is_none(),
+        "slot 1 is dark in a 3+ grid; nothing may bake into it"
+    );
+}
+
 #[test]
 fn move_right_with_no_neighbor_creates_a_new_group_with_the_moved_tab() {
     let tmp = tempfile::tempdir().unwrap();
