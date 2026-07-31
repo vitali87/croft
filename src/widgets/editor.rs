@@ -39,10 +39,22 @@ pub struct ImageView {
     pub pixel_w: u32,
     pub pixel_h: u32,
     pub byte_size: u64,
+    /// Monotonic content stamp, fresh on every (re)load of the bytes. Part
+    /// of the overlay's re-emit key: a PDF rebuilt on disk reloads to the
+    /// same path, rect and page, and without this stamp the baked overlay
+    /// kept showing the pre-rebuild pixels until a page turn.
+    pub generation: u64,
     /// Set when this preview was rasterised from a PDF page; tracks the
     /// page-navigation state so re-renders on Page Down/Up know which
     /// page to ask the rasteriser for next.
     pub pdf: Option<PdfState>,
+}
+
+/// Next value for [`ImageView::generation`]: process-wide monotonic counter,
+/// bumped on every byte (re)load anywhere.
+fn next_image_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2602,6 +2614,7 @@ impl Editor {
             pixel_w,
             pixel_h,
             byte_size: meta.len(),
+            generation: next_image_generation(),
             pdf: None,
         });
         self.sheet = None;
@@ -2662,6 +2675,7 @@ impl Editor {
             pixel_w,
             pixel_h,
             byte_size: meta.len(),
+            generation: next_image_generation(),
             pdf: Some(PdfState {
                 source_path: path.to_path_buf(),
                 current_page: 1,
@@ -2738,6 +2752,7 @@ impl Editor {
             Err(_) => return false,
         };
         image.bytes = bytes;
+        image.generation = next_image_generation();
         image.pixel_w = pixel_w;
         image.pixel_h = pixel_h;
         if let Some(state) = image.pdf.as_mut() {
@@ -11836,6 +11851,31 @@ mod tests {
         assert!(e.path.is_some());
         assert!(e.lang.is_none());
         assert!(!e.dirty);
+    }
+
+    /// A file rebuilt on disk reloads to the same path (and, for a PDF, the
+    /// same page and rect) - the overlay's re-emit key tells the loads apart
+    /// only through the content generation, so every reload must stamp a
+    /// fresh one even when the bytes happen to be identical.
+    #[test]
+    fn a_reloaded_image_carries_a_fresh_generation() {
+        let img: image::RgbaImage = image::ImageBuffer::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pic.png");
+        std::fs::write(&path, &buf).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        let first = e.image.as_ref().unwrap().generation;
+        e.open(&path).unwrap();
+        let second = e.image.as_ref().unwrap().generation;
+        assert_ne!(
+            first, second,
+            "a reload must stamp fresh content, or the baked overlay stays stale"
+        );
     }
 
     #[test]

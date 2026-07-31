@@ -2802,6 +2802,11 @@ pub struct EditorImageLayout {
     /// path and rect are unchanged on a page turn and the stale picture stays
     /// on screen unless every call site remembers to invalidate the layout.
     pub page: u32,
+    /// Content stamp of the baked bytes ([`crate::widgets::editor::ImageView::generation`]).
+    /// Part of the re-emit key so a file rebuilt on disk re-bakes even when
+    /// the path, rect and page are all unchanged (a pdflatex rebuild lands
+    /// on the same page the reader was on).
+    pub generation: u64,
 }
 
 /// Re-emit key for the terminal pane's inline-image overlay: the cell rect
@@ -27663,6 +27668,10 @@ impl App {
                 .and_then(|g| g.image.as_ref())
                 .and_then(|i| i.pdf.as_ref())
                 .map_or(1, |p| p.current_page),
+            generation: self
+                .group_on_side(side)
+                .and_then(|g| g.image.as_ref())
+                .map_or(0, |i| i.generation),
         };
         // Skip the bake when nothing about the layout changed - this is
         // the hot path on every frame an image is on screen.

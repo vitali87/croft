@@ -11977,6 +11977,7 @@ fn closing_image_tab_requests_overlay_clear_on_next_render() {
             cell_h: 10,
             path: tmp.path().join("doomed.png"),
             page: 1,
+            generation: 0,
         }),
         true,
     );
@@ -15184,6 +15185,7 @@ fn editor_image_overlay_is_dual_slot_and_clear_ors_both_columns() {
         cell_h: 10,
         path: tmp.path().join(name),
         page: 1,
+        generation: 0,
     };
     // Both physical columns can hold an inline image at once.
     app.overlays.editor[0].set_test_state(Some("left-osc".into()), Some(layout("l.png")), true);
