@@ -21,6 +21,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use tree_sitter::Parser;
 
 use crate::highlight::LangKind;
+use crate::lsp::manager::{OutlineKind, OutlineSymbol};
 use crate::outline_syntax::symbols_for;
 
 /// The 0-based row of a construct present in `new` but not in `old` (the
@@ -40,11 +41,27 @@ pub fn new_construct_row(kind: LangKind, old: &str, new: &str) -> Option<usize> 
 /// likely just typed. The population must GROW: a rename swaps one key
 /// for another without adding anything, and is an edit, not a construct.
 fn code_new_row(kind: LangKind, old: &str, new: &str) -> Option<usize> {
-    let fresh = symbols_for(kind, new.as_bytes());
+    // Member-level symbols (a struct field, an enum variant, an object key)
+    // are edits INSIDE a construct, not completed constructs: typing one
+    // `label: String,` into an existing struct must not summon the
+    // navigator. The outline keeps them; only this trigger filters.
+    fn construct(s: &OutlineSymbol) -> bool {
+        !matches!(
+            s.kind,
+            OutlineKind::Field | OutlineKind::EnumMember | OutlineKind::Property | OutlineKind::Key
+        )
+    }
+    let fresh: Vec<OutlineSymbol> = symbols_for(kind, new.as_bytes())
+        .into_iter()
+        .filter(construct)
+        .collect();
     if fresh.is_empty() {
         return None; // no outline query for this language, or nothing parsed
     }
-    let old_syms = symbols_for(kind, old.as_bytes());
+    let old_syms: Vec<OutlineSymbol> = symbols_for(kind, old.as_bytes())
+        .into_iter()
+        .filter(construct)
+        .collect();
     if fresh.len() <= old_syms.len() {
         return None; // nothing added — at most edits, moves, or renames
     }
@@ -98,10 +115,27 @@ fn markdown_new_row(old: &str, new: &str) -> Option<usize> {
     if new_paras.len() <= old_paras.len() {
         return None;
     }
-    let old_hashes: std::collections::HashSet<u64> = old_paras.iter().map(|(h, _)| *h).collect();
+    // Pure addition only: every old paragraph must survive intact. A split
+    // grows the count but destroys the original's hash - that is a reshape
+    // of existing prose (the module contract: reshapes never fire), and
+    // firing would anchor at the wrong half anyway.
+    let mut new_counts: HashMap<u64, usize> = HashMap::new();
+    for (h, _) in &new_paras {
+        *new_counts.entry(*h).or_default() += 1;
+    }
+    let mut old_counts: HashMap<u64, usize> = HashMap::new();
+    for (h, _) in &old_paras {
+        *old_counts.entry(*h).or_default() += 1;
+    }
+    if old_counts
+        .iter()
+        .any(|(h, n)| new_counts.get(h).copied().unwrap_or(0) < *n)
+    {
+        return None;
+    }
     new_paras
         .iter()
-        .find(|(h, _)| !old_hashes.contains(h))
+        .find(|(h, _)| new_counts[h] > old_counts.get(h).copied().unwrap_or(0))
         .or(new_paras.last())
         .map(|(_, r)| *r)
 }
@@ -127,6 +161,13 @@ fn markdown_scan(src: &str) -> (Headings, Paragraphs) {
     let mut paras = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
+        // A list bullet and a block-quote line each wrap their text in a
+        // `paragraph` node in tree-sitter-md; those are not prose
+        // paragraphs (a TODO list must not read as one new paragraph per
+        // bullet), so their subtrees are not walked at all.
+        if matches!(node.kind(), "list" | "block_quote") {
+            continue;
+        }
         match node.kind() {
             "atx_heading" | "setext_heading" => {
                 let text = node
@@ -214,6 +255,47 @@ mod tests {
             new_construct_row(LangKind::Markdown, old_md, reworded),
             None
         );
+    }
+
+    /// A struct field or enum variant is an edit INSIDE a construct, not a
+    /// completed construct: typing one `label: String,` into an existing
+    /// struct must not summon the navigator.
+    #[test]
+    fn a_single_member_addition_is_an_edit_not_a_construct() {
+        let old = "struct S {\n    a: u32,\n}\n";
+        let field = "struct S {\n    a: u32,\n    label: String,\n}\n";
+        assert_eq!(new_construct_row(LangKind::Rust, old, field), None);
+        let old_e = "enum E {\n    A,\n}\n";
+        let variant = "enum E {\n    A,\n    B,\n}\n";
+        assert_eq!(new_construct_row(LangKind::Rust, old_e, variant), None);
+        // A whole new struct still fires.
+        let grown = "struct S {\n    a: u32,\n}\n\nstruct T {\n    b: u32,\n}\n";
+        assert_eq!(new_construct_row(LangKind::Rust, old, grown), Some(4));
+    }
+
+    /// tree-sitter-md wraps every list bullet and block-quote line in a
+    /// `paragraph` node: those are not prose paragraphs, and writing a TODO
+    /// list must not fire one unsolicited turn per bullet.
+    #[test]
+    fn a_list_bullet_is_not_a_new_paragraph() {
+        let old = "intro prose.\n\n- one\n- two\n";
+        let bullet = "intro prose.\n\n- one\n- two\n- three\n";
+        assert_eq!(new_construct_row(LangKind::Markdown, old, bullet), None);
+        let quote = "intro prose.\n\n- one\n- two\n\n> quoted line\n";
+        assert_eq!(new_construct_row(LangKind::Markdown, old, quote), None);
+    }
+
+    /// Splitting one paragraph in two reshapes existing prose (the module
+    /// contract: reshapes must never fire) - both halves are new hashes but
+    /// the original hash disappeared, so it is not a pure addition.
+    #[test]
+    fn splitting_a_paragraph_is_a_reshape_not_an_addition() {
+        let old = "alpha beta gamma delta.\n";
+        let split = "alpha beta.\n\ngamma delta.\n";
+        assert_eq!(new_construct_row(LangKind::Markdown, old, split), None);
+        // A genuinely new paragraph with the old ones intact still fires.
+        let added = "alpha beta gamma delta.\n\nfresh thought.\n";
+        assert_eq!(new_construct_row(LangKind::Markdown, old, added), Some(2));
     }
 
     #[test]
