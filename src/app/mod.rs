@@ -15997,6 +15997,11 @@ impl App {
             }
             if let Err(e) = crate::collab::ensure_relay(&self.pair_socket) {
                 self.status = format!("Navigator: relay failed: {e}");
+                // The spawn failure's sibling: this window holds the lock
+                // but cannot host without a relay. Release it so another
+                // window can try; this one retries next second and may
+                // re-acquire.
+                self.pair_host_lock = None;
                 return true;
             }
             self.collab_config = Some((self.pair_socket.clone(), crate::collab::CollabRole::Owner));

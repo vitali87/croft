@@ -20076,6 +20076,47 @@ fn turn_note_summary_only_names_a_single_file() {
     assert_eq!(super::turn_note_summary(2, &BTreeSet::new()), "2 comments");
 }
 
+/// Relay startup failure is the spawn failure's sibling: the window has
+/// already acquired the workspace host lock, cannot host without a relay,
+/// and must release the lock on the way out so another window can try.
+/// Holding it made every other window report "hosted by another croft
+/// window" while nobody hosted anything.
+#[test]
+fn a_relay_failure_releases_the_host_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pair_record_path = tmp.path().join("x.pair.json");
+    // A socket inside a directory that does not exist: the relay can never
+    // bind it, so ensure_relay fails after its aliveness poll.
+    app.pair_socket = tmp.path().join("missing-dir").join("collab.sock");
+    app.pair_host_lock_path = tmp.path().join("x.host.lock");
+    app.pair_spawn_override = Some(Box::new(|_| panic!("must not reach the spawn")));
+    crate::session::write_pair_record(
+        &app.pair_record_path,
+        &crate::session::PairRecord {
+            model: None,
+            name: "nav".into(),
+            enabled: true,
+            task: None,
+            provider: None,
+            base_url: None,
+        },
+    )
+    .unwrap();
+    app.last_pair_check = None;
+    app.maybe_seat_navigator();
+    assert!(app.pair_host.is_none());
+    assert!(
+        app.status.contains("relay failed"),
+        "the failure is announced: {}",
+        app.status
+    );
+    assert!(
+        app.pair_host_lock.is_none(),
+        "a window without a relay cannot host; the lock must be released"
+    );
+}
+
 /// Re-running `croft pair` after a failed seat must retry: the CLI promises
 /// "a running croft seats it within a second", but an enabled→enabled
 /// rewrite has no transition for the death latch to observe. The record's
