@@ -244,13 +244,19 @@ pub(crate) fn serve_with_token(
     if crate::session::is_alive(socket) {
         anyhow::bail!("a session host is already running on {}", socket.display());
     }
-    // A crashed server leaves a stale socket file behind (unix sockets are
-    // not auto-unlinked); the liveness probe above proved nobody owns it.
-    let _ = std::fs::remove_file(socket);
     // Possession of the account is the trust boundary (same as dtach); never
-    // let another user attach.
-    let listener = crate::session::bind_socket_0600(socket)
-        .with_context(|| format!("binding {}", socket.display()))?;
+    // let another user attach. Stale-file removal and creation serialization
+    // live inside the binder: a racer that loses the per-target lock is told
+    // the winner is alive instead of silently replacing its socket.
+    let listener = match crate::session::bind_socket_0600(socket) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            anyhow::bail!("a session host is already running on {}", socket.display());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("binding {}", socket.display())));
+        }
+    };
     if let Some(ws) = workspace {
         crate::session::write_meta_preserving_created(socket, ws)?;
     }

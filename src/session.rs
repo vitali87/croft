@@ -371,7 +371,34 @@ pub fn list() -> Result<()> {
 /// another user must never be able to connect. Shared by both binders so the
 /// permission discipline lives in exactly one place.
 pub fn bind_socket_0600(socket: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+    // Creation is serialized per target through an owner-only lock file held
+    // across the liveness probe, the stale-file removal, the bind and the
+    // publication. Without it, two attach-or-create racers could both probe
+    // "nobody alive", both publish, and the later publisher replaced the
+    // earlier one's directory entry - a live but pathless listener, i.e. a
+    // stranded session host invisible to every future client. The loser now
+    // finds the winner alive under the lock and is told to attach instead
+    // (`AddrInUse`). The flock releases on drop (or on crash, by the OS).
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(socket.with_extension("bind.lock"))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if is_alive(socket) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!("a listener is already serving {}", socket.display()),
+        ));
+    }
+    // Proven dead under the lock: a crashed owner's stale file (unix sockets
+    // are not auto-unlinked) must not block the next creator.
+    let _ = std::fs::remove_file(socket);
     // `bind` starts accepting connections the instant it returns, and the
     // socket file's mode comes from the process umask. A save/restore umask
     // dance around the bind is process-global state: two concurrent binds
@@ -404,6 +431,59 @@ pub fn bind_socket_0600(socket: &Path) -> std::io::Result<std::os::unix::net::Un
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two attach-or-create racers for the SAME target must never both
+    /// publish: before creation was serialized, the later publisher replaced
+    /// the earlier one's directory entry, leaving a live but pathless
+    /// listener (a stranded session host, invisible to every future client).
+    /// Exactly one racer may win; the loser is told the address is in use so
+    /// it attaches to the winner instead.
+    #[test]
+    fn racing_binds_on_one_target_produce_exactly_one_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("same.sock");
+        let outcomes: Vec<std::io::Result<std::os::unix::net::UnixListener>> =
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..2)
+                    .map(|_| {
+                        let sock = sock.clone();
+                        s.spawn(move || bind_socket_0600(&sock))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+        let winners = outcomes.iter().filter(|o| o.is_ok()).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one racer may publish a listener on one target"
+        );
+        for o in &outcomes {
+            if let Err(e) = o {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::AddrInUse,
+                    "the loser must be told to attach, got {e:?}"
+                );
+            }
+        }
+        // And the published listener is the live one: a client reaches it.
+        let l = outcomes.into_iter().find_map(|o| o.ok()).unwrap();
+        let _c = std::os::unix::net::UnixStream::connect(&sock)
+            .expect("the surviving pathname must reach the winning listener");
+        drop(l);
+    }
+
+    /// A stale socket file (its owner crashed; nobody accepts) must not block
+    /// the next creator: the binder proves it dead and replaces it.
+    #[test]
+    fn a_dead_stale_socket_file_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("stale.sock");
+        drop(bind_socket_0600(&sock).expect("first bind"));
+        assert!(sock.exists(), "a dropped listener leaves its file behind");
+        let _l = bind_socket_0600(&sock).expect("a dead socket file must be replaced");
+        std::os::unix::net::UnixStream::connect(&sock).expect("the new listener answers");
+    }
 
     /// Every croft socket is owner-only from its first observable instant.
     #[test]

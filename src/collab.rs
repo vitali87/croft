@@ -432,18 +432,22 @@ impl CollabMsg {
 /// (`<hash>.collab.sock`), so it never carries terminal bytes.
 pub fn relay_serve(socket: &std::path::Path) -> anyhow::Result<()> {
     // Attach-or-create: a live relay already owns the socket; binding over
-    // it would strand that relay's connected clients mid-session. (Two
-    // creators racing past this check is the same benign window
-    // session_host::attach_or_create accepts.)
+    // it would strand that relay's connected clients mid-session. The
+    // liveness check here is only a fast path - creation itself (stale-file
+    // removal included) is serialized inside the binder, so two creators
+    // racing past this line cannot both publish: the loser is told the
+    // winner is alive and attaches, which is exactly these semantics.
     if crate::session::is_alive(socket) {
         return Ok(());
     }
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let _ = std::fs::remove_file(socket);
-    // Bind 0600 with no TOCTOU window (same fix as the mux socket).
-    let listener = crate::session::bind_socket_0600(socket)?;
+    let listener = match crate::session::bind_socket_0600(socket) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
 
     let clients: std::sync::Arc<std::sync::Mutex<Vec<Peer>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
