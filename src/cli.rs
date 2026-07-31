@@ -338,31 +338,39 @@ impl Cli {
                     .canonicalize()
                     .context("resolving workspace path")?;
                 let name = name.unwrap_or_else(|| "claude".into());
-                let (provider, base_url) = resolve_pair_provider(provider, base_url);
-                anyhow::ensure!(
-                    provider.as_deref() != Some("ollama") || model.is_some(),
-                    "--provider ollama needs --model <name> (e.g. --model qwen3-coder:30b); \
-                     a local endpoint has no CLI default"
-                );
+                let (provider, base_url) = resolve_pair_provider(provider, base_url)?;
                 let record_path = crate::session::pair_record_path(&workspace);
                 if let Some(dir) = record_path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
                 if off {
+                    // Deactivation preserves the recorded backend (and takes
+                    // no flag validation: `--provider ollama --off` must
+                    // simply turn the seat off). Erasing provider/base_url
+                    // here made the documented off/on recovery silently
+                    // convert a local seat into a cloud claude seat.
+                    let current = crate::session::read_pair_record(&record_path);
                     crate::session::write_pair_record(
                         &record_path,
                         &crate::session::PairRecord {
-                            model,
+                            model: model.or_else(|| current.as_ref().and_then(|r| r.model.clone())),
                             name,
                             enabled: false,
                             task: None,
-                            provider: None,
-                            base_url: None,
+                            provider: provider
+                                .or_else(|| current.as_ref().and_then(|r| r.provider.clone())),
+                            base_url: base_url
+                                .or_else(|| current.as_ref().and_then(|r| r.base_url.clone())),
                         },
                     )?;
                     println!("navigator deactivated for {}", workspace.display());
                     return Ok(());
                 }
+                anyhow::ensure!(
+                    provider.as_deref() != Some("ollama") || model.is_some(),
+                    "--provider ollama needs --model <name> (e.g. --model qwen3-coder:30b); \
+                     a local endpoint has no CLI default"
+                );
                 if repl {
                     let socket = crate::session::collab_socket_path(&workspace);
                     crate::collab::ensure_relay(&socket)?;
@@ -432,13 +440,27 @@ impl Cli {
 fn resolve_pair_provider(
     provider: Option<String>,
     base_url: Option<String>,
-) -> (Option<String>, Option<String>) {
+) -> Result<(Option<String>, Option<String>)> {
     let provider = provider.or_else(|| base_url.is_some().then(|| String::from("ollama")));
+    // Validate at activation time, when the user is watching: a malformed
+    // endpoint otherwise surfaces hours later as an opaque failure on the
+    // first turn. A trailing slash would build `...//v1/messages`, which
+    // routers 301 and ureq follows by downgrading POST to GET.
+    let base_url = base_url
+        .map(|u| {
+            let u = u.trim_end_matches('/').to_string();
+            anyhow::ensure!(
+                u.starts_with("http://") || u.starts_with("https://"),
+                "--base-url must start with http:// or https:// (got {u})"
+            );
+            Ok(u)
+        })
+        .transpose()?;
     let base_url = match provider.as_deref() {
         Some("ollama") => base_url.or_else(|| Some(String::from("http://localhost:11434"))),
         _ => base_url,
     };
-    (provider, base_url)
+    Ok((provider, base_url))
 }
 
 fn setup_terminal(font: &str, size: u32, yes: bool) -> Result<()> {
@@ -1256,17 +1278,32 @@ mod tests {
     /// activations record neither.
     #[test]
     fn base_url_implies_ollama() {
-        let (p, b) = resolve_pair_provider(None, Some(String::from("http://x:1234")));
+        let (p, b) = resolve_pair_provider(None, Some(String::from("http://x:1234"))).unwrap();
         assert_eq!(p.as_deref(), Some("ollama"));
         assert_eq!(b.as_deref(), Some("http://x:1234"));
 
-        let (p, b) = resolve_pair_provider(Some(String::from("ollama")), None);
+        let (p, b) = resolve_pair_provider(Some(String::from("ollama")), None).unwrap();
         assert_eq!(p.as_deref(), Some("ollama"));
         assert_eq!(b.as_deref(), Some("http://localhost:11434"));
 
-        let (p, b) = resolve_pair_provider(None, None);
+        let (p, b) = resolve_pair_provider(None, None).unwrap();
         assert_eq!(p, None);
         assert_eq!(b, None);
+    }
+
+    /// Validation happens at activation, when the user is watching: a
+    /// trailing slash built `...//v1/messages` (a 301 that ureq follows by
+    /// downgrading POST to GET), and a missing scheme only exploded hours
+    /// later on the first turn.
+    #[test]
+    fn base_url_is_normalised_and_validated_at_activation() {
+        let (_, b) =
+            resolve_pair_provider(None, Some(String::from("http://localhost:11434/"))).unwrap();
+        assert_eq!(b.as_deref(), Some("http://localhost:11434"));
+        assert!(
+            resolve_pair_provider(None, Some(String::from("localhost:11434"))).is_err(),
+            "a schemeless endpoint must be refused up front"
+        );
     }
 
     #[test]

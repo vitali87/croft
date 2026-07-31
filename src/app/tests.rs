@@ -19759,6 +19759,36 @@ fn next_note_by_row_walks_rows_in_order_and_wraps() {
     );
 }
 
+/// The palette off/on round trip must keep the seat's backend: writing
+/// `provider: None` silently reseated a local-only ollama navigator on the
+/// cloud claude CLI - shipping the workspace to a remote service the user
+/// explicitly avoided, under a model name claude does not have.
+#[test]
+fn toggling_the_navigator_preserves_its_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pair_record_path = tmp.path().join("pair.json");
+    crate::session::write_pair_record(
+        &app.pair_record_path,
+        &crate::session::PairRecord {
+            model: Some(String::from("qwen3-coder:30b")),
+            name: String::from("navigator"),
+            enabled: true,
+            task: None,
+            provider: Some(String::from("ollama")),
+            base_url: Some(String::from("http://localhost:11434")),
+        },
+    )
+    .unwrap();
+    app.toggle_navigator(); // off
+    app.toggle_navigator(); // back on
+    let r = crate::session::read_pair_record(&app.pair_record_path).unwrap();
+    assert!(r.enabled);
+    assert_eq!(r.provider.as_deref(), Some("ollama"));
+    assert_eq!(r.base_url.as_deref(), Some("http://localhost:11434"));
+    assert_eq!(r.model.as_deref(), Some("qwen3-coder:30b"));
+}
+
 /// Collab carets are keyed by root-relative file paths: after a re-root, a
 /// same-named file under the new root would wear a departed peer's caret
 /// from the old workspace. Re-rooting clears them; a live session
