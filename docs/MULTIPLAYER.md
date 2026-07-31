@@ -54,7 +54,10 @@ deterministic byte assertions:
 - The control holder's keystrokes reached the PTY and broadcast to both; the
   read-only client's keystrokes appeared in neither output (server-side
   enforcement, not advisory).
-- The socket was mode `0600` from creation (umask fix), and two clients that
+- The socket was mode `0600` from creation (bound in a private 0700 staging
+  dir and renamed into place — `session::bind_socket_0600`, shared with the
+  collab relay; the earlier umask save/restore was process-global and racing
+  binds could corrupt it), and two clients that
   reported `0x0` size did not shrink the shared PTY (zero-winsize guard).
 - An inner `exit 7` propagated through the mux and back over SSH as exit 7
   (the drop-to-local code path).
