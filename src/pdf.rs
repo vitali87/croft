@@ -398,7 +398,12 @@ fn unique_temp_dir(stem: &str) -> std::io::Result<PathBuf> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let pid = std::process::id();
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("{stem}-{pid}-{seq}"));
+    // Under croft's own cache dir, never the system temp dir: /tmp is
+    // world-writable on Linux, so a same-named leftover owned by another
+    // user would make the remove_dir_all below fail and the render with it.
+    let base = crate::session_state::dirs_cache_croft().join("tmp");
+    std::fs::create_dir_all(&base)?;
+    let path = base.join(format!("{stem}-{pid}-{seq}"));
     if path.exists() {
         std::fs::remove_dir_all(&path)?;
     }

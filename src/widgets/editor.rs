@@ -2726,6 +2726,13 @@ impl Editor {
         let Some(pdf) = self.image.as_ref().and_then(|i| i.pdf.clone()) else {
             return false;
         };
+        // "Last page" is unanswerable without a page count (sips-only Macs
+        // where mdls reports nothing): rendering the sentinel itself would
+        // just spray "PDF page 4294967295 failed" into the status bar.
+        if page == u32::MAX && pdf.page_count.is_none() {
+            self.status = String::from("PDF page count unknown; cannot jump to the last page");
+            return false;
+        }
         let last = pdf.page_count.unwrap_or(u32::MAX).max(1);
         self.render_pdf_page(page.clamp(1, last))
     }
@@ -11876,6 +11883,38 @@ mod tests {
             first, second,
             "a reload must stamp fresh content, or the baked overlay stays stale"
         );
+    }
+
+    /// End means "last page", which is unanswerable when the page count is
+    /// unknown (sips-only Macs where mdls reports nothing): the sentinel
+    /// must not be rendered literally, which sprayed
+    /// "PDF page 4294967295 failed" into the status bar.
+    #[test]
+    fn end_with_an_unknown_page_count_reports_instead_of_rendering_the_sentinel() {
+        let mut e = Editor::new();
+        e.image = Some(ImageView {
+            bytes: Vec::new(),
+            format_label: String::from("PDF"),
+            pixel_w: 1,
+            pixel_h: 1,
+            byte_size: 0,
+            generation: 0,
+            pdf: Some(PdfState {
+                source_path: PathBuf::from("/nonexistent/doc.pdf"),
+                current_page: 1,
+                page_count: None,
+                backend: crate::pdf::PdfBackend::SipsCli,
+                source_byte_size: 0,
+                links: None,
+            }),
+        });
+        assert!(!e.set_pdf_page(u32::MAX));
+        assert!(
+            !e.status.contains("4294967295"),
+            "the sentinel page must not leak into the status: {}",
+            e.status
+        );
+        assert_eq!(e.pdf_page(), Some(1), "the page must not move");
     }
 
     #[test]
