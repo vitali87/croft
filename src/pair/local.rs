@@ -208,7 +208,7 @@ pub(crate) fn stream_turn_until(
         // Checked even while data flows: a peer flooding bytes faster than
         // they drain must not starve the deadline.
         if std::time::Instant::now() > deadline {
-            stream_error = Some(String::from("turn exceeded the 10 minute ceiling"));
+            stream_error = Some(ceiling_msg());
             break;
         }
         // A single SSE line has no business being megabytes long; a cap
@@ -221,7 +221,7 @@ pub(crate) fn stream_turn_until(
             Ok(0) => break, // hung up; finish() reverts open fences
             Ok(n) => n,
             Err(e) if is_timeout(&e) => {
-                stream_error = Some(String::from("turn exceeded the 10 minute ceiling"));
+                stream_error = Some(ceiling_msg());
                 break;
             }
             Err(_) => break, // hung up; finish() reverts open fences
@@ -303,16 +303,29 @@ pub(crate) fn stream_turn_until(
     }
 }
 
-/// Total wall-clock ceiling for one turn (the socket timeout is per read).
+/// Total wall-clock ceiling for one turn, enforced by the transport's
+/// global timeout.
 const TURN_DEADLINE: Duration = Duration::from_secs(600);
+
+/// The ceiling failure text, derived from [`TURN_DEADLINE`] so the message
+/// can never drift from the enforced value. (A test-supplied shorter
+/// deadline reuses it; those tests assert the outcome, not the wording.)
+fn ceiling_msg() -> String {
+    format!(
+        "turn exceeded the {} minute ceiling",
+        TURN_DEADLINE.as_secs() / 60
+    )
+}
 
 /// The failure text for a transport error. HTTP statuses never land here
 /// (`http_status_as_error(false)` returns them as responses, handled by
-/// [`status_detail`]); a deadline hit before the headers arrived reads
-/// better as the ceiling than as ureq's "timeout: global".
+/// [`status_detail`]). Only the GLOBAL timeout is the turn ceiling; the 5
+/// second connect timeout also arrives as `Error::Timeout` and must keep
+/// its own name ("timeout: connect") instead of claiming ten minutes
+/// passed after five seconds.
 fn error_detail(e: &ureq3::Error) -> String {
     match e {
-        ureq3::Error::Timeout(_) => String::from("turn exceeded the 10 minute ceiling"),
+        ureq3::Error::Timeout(ureq3::Timeout::Global | ureq3::Timeout::PerCall) => ceiling_msg(),
         other => other.to_string(),
     }
 }
@@ -330,7 +343,9 @@ fn status_detail(status: u16, body: &str) -> String {
 }
 
 /// Whether a body-read error is the transport enforcing the turn deadline
-/// (the global timeout travels inside `io::Error::other`).
+/// (the global timeout travels inside `io::Error::other`). Only the global
+/// and per-call reasons count: no other timeout is configured for the body
+/// phase, and a raw socket-timeout kind can only mean the same budget.
 fn is_timeout(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -338,7 +353,12 @@ fn is_timeout(e: &std::io::Error) -> bool {
     ) || e
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<ureq3::Error>())
-        .is_some_and(|u| matches!(u, ureq3::Error::Timeout(_)))
+        .is_some_and(|u| {
+            matches!(
+                u,
+                ureq3::Error::Timeout(ureq3::Timeout::Global | ureq3::Timeout::PerCall)
+            )
+        })
 }
 
 /// The local twin of the claude reader's `result` handling: reset the
@@ -356,4 +376,30 @@ fn end_turn(state: &Mutex<PairState>, turn_tx: &Sender<TurnEnd>, is_error: bool,
         cancelled,
         text,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the GLOBAL timeout is the turn ceiling. The 5 second connect
+    /// timeout also surfaces as `Error::Timeout`; reporting it as "exceeded
+    /// the 10 minute ceiling" after 5 seconds misnames the failure.
+    #[test]
+    fn a_connect_timeout_is_not_reported_as_the_turn_ceiling() {
+        let connect = error_detail(&ureq3::Error::Timeout(ureq3::Timeout::Connect));
+        assert!(
+            !connect.contains("ceiling"),
+            "a connect timeout is not the turn ceiling: {connect}"
+        );
+        let global = error_detail(&ureq3::Error::Timeout(ureq3::Timeout::Global));
+        assert!(
+            global.contains("ceiling"),
+            "the global timeout IS the ceiling: {global}"
+        );
+        assert!(
+            global.contains("10 minute"),
+            "the ceiling text names the enforced duration: {global}"
+        );
+    }
 }
