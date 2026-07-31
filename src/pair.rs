@@ -2632,6 +2632,52 @@ mod tests {
         pump.join().unwrap();
     }
 
+    /// The deadline used to be polled only BETWEEN reads: a peer that sent
+    /// headers and then held the body open without a single byte parked the
+    /// loop inside the blocking `read` (up to the 300s socket timeout) past
+    /// the ceiling. Each wait is bounded by the remaining turn time instead.
+    #[test]
+    fn a_silent_stream_body_is_cut_at_the_deadline() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        // The thread ends on its own after the silence window; dropping the
+        // handle detaches it.
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req);
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
+            // Not one body byte: hold the connection open in silence, long
+            // enough that only the deadline can explain a prompt return.
+            std::thread::sleep(Duration::from_secs(4));
+        });
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        let started = Instant::now();
+        local::stream_turn_until(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+            Instant::now() + Duration::from_millis(300),
+        );
+        let elapsed = started.elapsed();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error, "a deadline cut is a failure: {}", end.text);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the ceiling must interrupt a silent body promptly, took {elapsed:?}"
+        );
+        assert!(messages.is_empty(), "the conversation stays balanced");
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
     /// Malformed SSE data mid-stream silently dropped a chunk of the reply
     /// and still reported success; a broken endpoint must fail the turn.
     #[test]

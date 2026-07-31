@@ -168,11 +168,36 @@ pub(crate) fn stream_turn_until(
     // server trickling bytes could otherwise hold the seat busy forever.
     // The deadline is enforced per CHUNK, not per line - `lines()` blocks
     // until a newline arrives, so a stream of non-newline bytes would have
-    // dodged a per-line check indefinitely.
+    // dodged a per-line check indefinitely. And because the blocking `read`
+    // itself cannot be interrupted, a helper thread owns the socket and
+    // forwards chunks over a channel: the loop waits at most the REMAINING
+    // turn time for each one, so a peer that holds the body open in silence
+    // cannot park the turn inside `read` past the ceiling. After a cut the
+    // helper lingers until its read returns (at worst the socket timeout),
+    // notices the receiver is gone, and exits.
     let mut reader = resp.into_reader();
     let mut pending: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<std::io::Result<Vec<u8>>>();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match std::io::Read::read(&mut reader, &mut chunk) {
+                Ok(0) => break, // hung up; the dropped sender says so
+                Ok(n) => {
+                    if chunk_tx.send(Ok(chunk[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = chunk_tx.send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
     'stream: loop {
+        // Checked even when chunks are queued: a peer flooding bytes faster
+        // than they drain must not starve the deadline.
         if std::time::Instant::now() > deadline {
             stream_error = Some(String::from("turn exceeded the 10 minute ceiling"));
             break;
@@ -183,11 +208,17 @@ pub(crate) fn stream_turn_until(
             stream_error = Some(String::from("endpoint sent an over-long SSE line"));
             break;
         }
-        let n = match std::io::Read::read(&mut reader, &mut chunk) {
-            Ok(0) | Err(_) => break, // hung up; finish() reverts open fences
-            Ok(n) => n,
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let bytes = match chunk_rx.recv_timeout(remaining) {
+            Ok(Ok(b)) => b,
+            // Hung up (EOF or read error); finish() reverts open fences.
+            Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                stream_error = Some(String::from("turn exceeded the 10 minute ceiling"));
+                break;
+            }
         };
-        pending.extend_from_slice(&chunk[..n]);
+        pending.extend_from_slice(&bytes);
         while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
             let raw: Vec<u8> = pending.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&raw[..raw.len() - 1]);

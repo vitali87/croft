@@ -19783,7 +19783,10 @@ fn toggling_the_navigator_preserves_its_provider() {
     app.toggle_navigator(); // off
     let mid = crate::session::read_pair_record(&app.pair_record_path).unwrap();
     assert!(!mid.enabled, "the first toggle really deactivates");
+    assert_eq!(mid.name, "navigator");
     assert_eq!(mid.provider.as_deref(), Some("ollama"));
+    assert_eq!(mid.base_url.as_deref(), Some("http://localhost:11434"));
+    assert_eq!(mid.model.as_deref(), Some("qwen3-coder:30b"));
     app.toggle_navigator(); // back on
     let r = crate::session::read_pair_record(&app.pair_record_path).unwrap();
     assert!(r.enabled);
