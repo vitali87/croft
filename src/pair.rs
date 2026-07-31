@@ -2308,7 +2308,7 @@ mod tests {
         open_region(&mut st, "demo.txt", (4, 0), (2, usize::MAX));
         assert!(st.discarding, "the inverted edit's body must be discarded");
         assert_eq!(
-            st.session.doc_text("demo.txt").as_deref(),
+            st.session.doc_text("demo.txt"),
             Some("l0\nl1\nl2\nl3\nl4\nl5"),
             "nothing may be applied"
         );

@@ -148,10 +148,8 @@ pub(crate) fn stream_turn(
                     }
                 }
             }
-            "message_delta" => {
-                if v["delta"]["stop_reason"] == "max_tokens" {
-                    truncated = true;
-                }
+            "message_delta" if v["delta"]["stop_reason"] == "max_tokens" => {
+                truncated = true;
             }
             "message_stop" => {
                 clean_end = true;
