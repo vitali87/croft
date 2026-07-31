@@ -232,7 +232,20 @@ impl FenceMachine {
         match self.state {
             FenceState::Outside => {
                 if !self.buf.is_empty() {
-                    events.push(FenceEvent::Commentary(std::mem::take(&mut self.buf)));
+                    let mut tail = std::mem::take(&mut self.buf);
+                    // Only the unterminated LAST line can be a fence header.
+                    // A VALID one is protocol residue (a fence the turn cut
+                    // off before its newline) and is dropped like an
+                    // unterminated body; malformed ones stay commentary,
+                    // the malformed-header rule.
+                    let last_start = tail.rfind('\n').map_or(0, |i| i + 1);
+                    let line = tail[last_start..].trim_end_matches('\r');
+                    if parse_header(line).is_some() || parse_note_header(line).is_some() {
+                        tail.truncate(last_start);
+                    }
+                    if !tail.is_empty() {
+                        events.push(FenceEvent::Commentary(tail));
+                    }
                 }
             }
             FenceState::Body {
@@ -499,6 +512,17 @@ struct StreamRegion {
     displaced: Vec<(u64, usize)>,
 }
 
+/// What [`PairState::stage_turn`] overwrote, so a send that never leaves
+/// the process can be undone ([`PairState::unstage_turn`]).
+pub(crate) struct StagedTurn {
+    file: String,
+    /// The previous look at `file`; also the yield-diff baseline the
+    /// caller reads before sending.
+    pub(crate) prior_seen: Option<String>,
+    prior_comment_only: bool,
+    prior_target: Option<String>,
+}
+
 /// One anchored navigator note: a byte offset into `file`'s replica text
 /// (kept fresh against concurrent edits exactly like the stream region)
 /// plus the accumulated body.
@@ -645,6 +669,42 @@ impl PairState {
         self.last_seen.insert(file.to_string(), content.to_string())
     }
 
+    /// [`Self::begin_turn`] plus everything needed to undo it: the caller
+    /// stages the look BEFORE the send, and a failed send must not keep it
+    /// (`last_seen` is the yield-diff baseline — a retry would diff the
+    /// file against itself — and a latched `comment_only` would silently
+    /// edit-suppress the next successful turn).
+    pub(crate) fn stage_turn(
+        &mut self,
+        file: &str,
+        content: &str,
+        comment_only: bool,
+    ) -> StagedTurn {
+        let prior_comment_only = self.comment_only;
+        let prior_target = self.target_file.clone();
+        let prior_seen = self.begin_turn(file, content, comment_only);
+        StagedTurn {
+            file: file.to_string(),
+            prior_seen,
+            prior_comment_only,
+            prior_target,
+        }
+    }
+
+    /// Put back what [`Self::stage_turn`] overwrote (the send never left).
+    pub(crate) fn unstage_turn(&mut self, staged: StagedTurn) {
+        self.comment_only = staged.prior_comment_only;
+        self.target_file = staged.prior_target;
+        match staged.prior_seen {
+            Some(old) => {
+                self.last_seen.insert(staged.file, old);
+            }
+            None => {
+                self.last_seen.remove(&staged.file);
+            }
+        }
+    }
+
     /// Park the navigator's visible caret at `row` (0-based, column 0):
     /// broadcast now when the file is live, else once its bootstrap lands
     /// (the pump resolves it). A newer park supersedes an unresolved one.
@@ -692,6 +752,46 @@ impl PairState {
         if self.send_parked_caret(&file, row) || !self.session.is_bootstrapping(&file) {
             self.pending_caret = None;
         }
+    }
+}
+
+/// Bounded lock for anything that DECIDES or ACTS on the pilot's state
+/// from the App's threads (is a turn running? send this ask; land this
+/// note): transient contention is normal — the pilot's pump holds the
+/// mutex for microseconds every 25ms poll — so an instant try_lock
+/// spuriously refuses keypresses and misreports a quiet seat as busy. But
+/// an unbounded lock joins the deadlock cycle when a pilot thread is
+/// wedged in a blocking relay write. Retry briefly, then give up.
+/// Per-frame render reads never wait at all (see `PairHost::caret_sites`):
+/// they have a next frame, a decision does not.
+pub(crate) fn lock_briefly(
+    state: &Mutex<PairState>,
+) -> Option<std::sync::MutexGuard<'_, PairState>> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(100);
+    loop {
+        if let Ok(guard) = state.try_lock() {
+            return Some(guard);
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Host and child DIAGNOSTICS, never the model's voice. Seated in croft
+/// they go to the OUTPUT channel: [`say`]'s Commentary events are reserved
+/// for the model's own prose, which the App anchors as a navigator comment
+/// box — a diagnostic riding that channel was rendered as the navigator's
+/// remark in the user's file and counted as one of its comments. The REPL
+/// driver prints to stdout, its only voice.
+fn diag(state: &Mutex<PairState>, level: crate::output::OutputLevel, text: &str) {
+    let seated = state.lock().unwrap().events.is_some();
+    if seated {
+        crate::output::push("Navigator", level, text);
+    } else {
+        println!("{text}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 }
 
@@ -1056,12 +1156,17 @@ pub(crate) fn seat_pilot(
                 line.clear();
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
+                    // Seated, claude's stderr chatter (MCP startup and the
+                    // like) is a diagnostic for the OUTPUT channel — as a
+                    // Commentary event it was anchored into the user's file
+                    // as one of the navigator's own comment boxes.
                     Ok(_) => match &events {
-                        Some(tx) => {
-                            let _ = tx.send(crate::pair_host::PairEvent::Commentary(format!(
-                                "[claude] {}",
-                                line.trim_end()
-                            )));
+                        Some(_) => {
+                            crate::output::push(
+                                "Navigator",
+                                crate::output::OutputLevel::Info,
+                                &format!("[claude] {}", line.trim_end()),
+                            );
                         }
                         None => eprint!("[claude] {line}"),
                     },
@@ -1278,10 +1383,10 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
                     // may never touch a buffer, whatever the model says.
                     st.discarding = true;
                     drop(st);
-                    say(
+                    diag(
                         state,
-                        "[pair] edit suppressed: this is a yielded, \
-                         comment-only turn\n",
+                        crate::output::OutputLevel::Warn,
+                        "[pair] edit suppressed: this is a yielded, comment-only turn",
                     );
                     return;
                 }
@@ -1293,11 +1398,12 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
                 open_region(&mut st, &file, start, end);
             } else {
                 state.lock().unwrap().discarding = true;
-                say(
+                diag(
                     state,
+                    crate::output::OutputLevel::Warn,
                     &format!(
                         "[pair] no live croft session serves {file}; edit dropped \
-                         (start croft in this workspace first)\n"
+                         (start croft in this workspace first)"
                     ),
                 );
             }
@@ -1746,7 +1852,10 @@ pub(crate) fn inject_note_now(
     row: usize,
     body: &str,
 ) -> Option<u64> {
-    let mut st = state.lock().unwrap();
+    // Bounded lock (see lock_briefly): the App's tick thread must never
+    // wait indefinitely on the pilot mutex (held across blocking relay
+    // writes). None sends the caller to its OUTPUT fallback.
+    let mut st = lock_briefly(state)?;
     if !st.session.is_live(file) {
         return None;
     }
@@ -1795,10 +1904,11 @@ pub(crate) fn send_turn(state: &Mutex<PairState>, sink: &TurnSink, line: &str) -
         (file, buffer)
     };
     if file.is_some() && buffer.is_none() {
-        say(
+        diag(
             state,
+            crate::output::OutputLevel::Warn,
             "[pair] target file is not live (no owner answered); \
-             sending the task with the file name only\n",
+             sending the task with the file name only",
         );
     }
     let body = compose_turn_text(&task, file.as_deref(), buffer.as_deref());
@@ -1813,13 +1923,25 @@ pub(crate) fn write_user_turn(
     sink: &TurnSink,
     body: String,
 ) -> Result<()> {
-    let content = {
+    let (content, note) = {
         let mut st = state.lock().unwrap();
         let note = st.pending_note.take();
         st.turn_active = true;
-        with_pending_note(note, body)
+        (with_pending_note(note.clone(), body), note)
     };
-    sink.send_user(&content)
+    let sent = sink.send_user(&content);
+    if sent.is_err() {
+        // The turn never left: unlatch it (a wedged turn_active refused
+        // every later ask/yield/reply for the seat's life) and put the
+        // cancel note back — it is still owed to the model on the next
+        // turn that actually sends.
+        let mut st = state.lock().unwrap();
+        st.turn_active = false;
+        if st.pending_note.is_none() {
+            st.pending_note = note;
+        }
+    }
+    sent
 }
 
 /// The pending cancel note rides in front of the next turn's body.
@@ -1844,6 +1966,11 @@ import json, sys
 
 log = open(sys.argv[1], "a")
 mode = sys.argv[2]
+
+# The real claude CLI is chatty on stderr while its MCP servers start; the
+# tee must route this to OUTPUT, never into the model's comment boxes.
+print("mcp server starting", file=sys.stderr)
+sys.stderr.flush()
 
 def emit(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
@@ -2203,6 +2330,173 @@ mod tests {
         (state, stop, pump)
     }
 
+    /// The UI thread must NEVER wait on the pilot's state mutex: pilot
+    /// threads hold it across blocking relay writes (write_frame_blocking
+    /// spins on WouldBlock with no deadline), and the App draining the
+    /// relay is what completes those writes — so a blocking read from the
+    /// render/tick path closes a circular wait and hangs the editor. Every
+    /// UI-facing host method answers from a fallback when the mutex is
+    /// contended.
+    #[test]
+    fn ui_reads_answer_instantly_while_the_pilot_mutex_is_held() {
+        let harness = OwnerHarness::start("hello world");
+        let host = crate::pair_host::PairHost::spawn(PairConfig {
+            socket: harness.socket.clone(),
+            workspace: harness._dir.path().to_path_buf(),
+            name: String::from("nav"),
+            model: Some(String::from("m")),
+            task: None,
+            provider: Provider::Local {
+                base_url: String::from("http://127.0.0.1:9"),
+            },
+        })
+        .unwrap();
+        let state = host.state_for_tests().expect("pilot state");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let busy = host.is_busy();
+            let _ = host.caret_sites();
+            let _ = host.notes_snapshot("demo.txt");
+            let seen = host.last_seen("demo.txt");
+            let rejected = host.send_yield_turn("demo.txt", "x").is_err();
+            done_tx.send((busy, seen, rejected)).unwrap();
+            drop(host);
+        });
+        let (busy, seen, rejected) = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("UI reads must answer instantly while the pilot mutex is held");
+        assert!(busy, "contended = the pilot is mid-work = busy");
+        assert_eq!(seen, None, "no baseline is better than a blocked frame");
+        assert!(rejected, "a send under contention reports mid-turn");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        reader.join().unwrap();
+    }
+
+    /// is_busy() must stay true from the send until the App CONSUMES the
+    /// turn's end: the reader clears turn_active before it queues TurnEnd,
+    /// so a tick landing in that window saw an idle seat and started a new
+    /// turn that stole the finished turn's origin and counters.
+    #[test]
+    fn the_seat_stays_busy_until_turn_done_is_consumed() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script).arg(&log).arg("stream");
+        let mut host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "nav", None, cmd).unwrap();
+        host.send_yield_turn("demo.txt", "hello world").unwrap();
+        let state = host.state_for_tests().expect("pilot state");
+        // Wait until the PILOT finished the turn (its reader cleared the
+        // latch); the App has not polled yet.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.lock().unwrap().turn_active() {
+            assert!(Instant::now() < deadline, "the fake turn never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            host.is_busy(),
+            "the turn's end has not been consumed yet: the seat is still busy"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if host
+                .poll()
+                .iter()
+                .any(|e| matches!(e, crate::pair_host::PairEvent::TurnDone { .. }))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "TurnDone never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!host.is_busy(), "consumed: the seat is idle again");
+        drop(host);
+    }
+
+    /// A yield whose send failed must not keep the look: last_seen is the
+    /// diff baseline (a retry would diff the file against itself and show
+    /// the model nothing), and the latched comment_only would silently
+    /// edit-suppress the next successful turn.
+    #[test]
+    fn a_failed_yield_leaves_no_look_behind() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world");
+        // A child that exits immediately: the first send hits a dead stdin.
+        let mut cmd = Command::new("python3");
+        cmd.arg("-c").arg("pass");
+        let mut host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "nav", None, cmd).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if host
+                .poll()
+                .iter()
+                .any(|e| matches!(e, crate::pair_host::PairEvent::Died(_)))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the child never died");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let sent = host.send_yield_turn("demo.txt", "hello world");
+        assert!(sent.is_err(), "a dead stdin must fail the send");
+        assert_eq!(
+            host.last_seen("demo.txt"),
+            None,
+            "a failed yield keeps no baseline"
+        );
+        assert!(!host.is_busy(), "a failed yield keeps no busy latch");
+        drop(host);
+    }
+
+    /// A send that never reached the endpoint must not wedge the seat: the
+    /// busy latch and the pending cancel note were committed BEFORE the
+    /// write, so a dead stdin left is_busy() true for the rest of the
+    /// seat's life and silently ate the "your edit was cancelled" preamble
+    /// owed to the model.
+    #[test]
+    fn a_failed_send_unlatches_the_turn_and_keeps_the_cancel_note() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        state.lock().unwrap().pending_note = Some(String::from("cancelled: f.rs"));
+        let dead = TurnSink::Claude(Arc::new(Mutex::new(None)));
+        let err = write_user_turn(&state, &dead, String::from("hi"))
+            .expect_err("a dead stdin must fail the send");
+        assert!(err.to_string().contains("stdin"), "{err}");
+        {
+            let st = state.lock().unwrap();
+            assert!(
+                !st.turn_active,
+                "a turn that never left must not stay active"
+            );
+            assert_eq!(
+                st.pending_note.as_deref(),
+                Some("cancelled: f.rs"),
+                "the cancel note is still owed to the model"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
     /// An unseat moments before exit must still reap the pilot's child:
     /// Drop detaches its grace-kill onto a thread, and a thread that dies
     /// with the process leaves the child running (orphaned, still holding
@@ -2235,6 +2529,36 @@ mod tests {
         assert!(
             !alive(&marker),
             "after join_teardowns the dropped host's child must be reaped"
+        );
+    }
+
+    /// A valid fence header arriving as the turn's LAST bytes (no trailing
+    /// newline) is protocol residue, not prose: flushing it as commentary
+    /// rendered the raw <<<NOTE ...>>> marker inside a comment box. A
+    /// malformed <<<-prefixed tail keeps the existing commentary behavior
+    /// (the malformed-header rule).
+    #[test]
+    fn an_unterminated_fence_header_never_leaks_into_commentary() {
+        let mut m = FenceMachine::new();
+        let mut events = m.push("thinking\n<<<NOTE src/f.rs:12>>>");
+        events.extend(m.finish());
+        let commentary = commentary_of(&events);
+        assert!(commentary.contains("thinking"));
+        assert!(
+            !commentary.contains("<<<NOTE"),
+            "protocol residue leaked: {commentary:?}"
+        );
+        let mut events = m.push("<<<EDIT src/f.rs:0:0-0:5>>>");
+        events.extend(m.finish());
+        assert!(
+            !commentary_of(&events).contains("<<<EDIT"),
+            "an EDIT header tail is the same class"
+        );
+        let mut events = m.push("<<<EDIT garbage");
+        events.extend(m.finish());
+        assert!(
+            commentary_of(&events).contains("<<<EDIT garbage"),
+            "a malformed tail stays commentary"
         );
     }
 
@@ -3944,6 +4268,9 @@ mod tests {
         std::fs::write(&script, FAKE_CLAUDE).unwrap();
         let log = harness._dir.path().join("stdin.log");
 
+        let baseline = crate::output::snapshot("Navigator")
+            .unwrap_or_default()
+            .len();
         let mut cmd = Command::new("python3");
         cmd.arg(&script).arg(&log).arg("stream"); // streams an EDIT fence
         let mut host =
@@ -3962,13 +4289,35 @@ mod tests {
         }
         // The owner never saw an edit land.
         assert_eq!(harness.remote_edit_count(), 0, "edit must be suppressed");
+        // Diagnostics NEVER ride Commentary: the App anchors that channel
+        // as the navigator's own comment boxes, so the suppression notice
+        // (and claude's stderr chatter) would be rendered as the model's
+        // remark in the user's file and counted as a comment.
         assert!(
-            events.iter().any(|e| matches!(
+            !events.iter().any(|e| matches!(
                 e,
-                crate::pair_host::PairEvent::Commentary(c) if c.contains("suppressed")
+                crate::pair_host::PairEvent::Commentary(c)
+                    if c.contains("suppressed") || c.contains("[claude]")
             )),
-            "suppression must be spoken; saw {events:?}"
+            "diagnostics must not become comment boxes; saw {events:?}"
         );
+        let wait_output = |needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let lines = crate::output::snapshot("Navigator").unwrap_or_default();
+                if lines.iter().skip(baseline).any(|l| l.text.contains(needle)) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "OUTPUT never carried {needle:?}: {:?}",
+                    lines.iter().skip(baseline).collect::<Vec<_>>()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait_output("suppressed");
+        wait_output("[claude] mcp server starting");
         drop(host);
     }
 
