@@ -520,9 +520,12 @@ interaction into turn-based driver/navigator pairing:
   — the old turn-supersession rule is gone, only the driver closes a box.
 - **Turn commentary.** The model's non-fence prose accumulates over the
   turn and lands as ONE comment box at the turn's origin (the asked line,
-  the yield caret, or the replied note) when the turn ends. There is no
-  Navigator OUTPUT channel any more; only when the origin file is no
-  longer live does the prose fall back to OUTPUT rather than being lost.
+  the yield caret, or the replied note) when the turn ends. Commentary no
+  longer streams to a Navigator OUTPUT channel; OUTPUT ("Navigator") now
+  carries only diagnostics — prose whose origin file is no longer live
+  (rather than losing it) and warnings like a dropped inverted fence range
+  (which must never hit stderr: the seat runs in-process and stderr would
+  corrupt the alternate screen).
   The NOTE fence is model-protocol only — nothing new rides the relay, so
   0.1.633/634 peers interop untouched.
 - **The navigator's caret (0.1.639).** The seat has a persistent, visible
@@ -601,8 +604,13 @@ croft pair --base-url http://box:8080 --model qwen3-coder:30b   # implies ollama
   the seat stays; the next ask retries. The idle badge names the model:
   `◆ claude (qwen3-coder:30b) seated`.
 - **Auth.** Keyed Anthropic-compatible gateways read `ANTHROPIC_AUTH_TOKEN`
-  from croft's environment; `pair.json` records only provider, base_url, and
-  model — never a token.
+  from croft's environment, sent as `Authorization: Bearer` (Anthropic's own
+  convention for that variable) and mirrored into `x-api-key` for gateways
+  of the other style, alongside `anthropic-version`. The credential only
+  ever travels over https or to a loopback host — a cleartext remote
+  `--base-url http://box:8080` gets a harmless placeholder instead, so the
+  token cannot be sniffed off the wire. `pair.json` records only provider,
+  base_url, and model — never a token.
 
 ### Slice 3 design: op transport and the process model
 

@@ -62,18 +62,18 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Navigator comment boxes taller than the window are fully readable: non-wrap scrolling steps into and past a box, the scrollbar is live and accurate with boxes on screen, and a long reply windows around the caret instead of going blind.",
+        summary: "A failed local-model turn no longer poisons the conversation: the unanswered ask is dropped so the next one starts clean, and every failure mode (mid-stream drop, timeout, token-limit truncation, stream errors) is reported honestly instead of as a finished turn.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "F4 reaches every comment, including the navigator's answer anchored on the same line as the note you replied to.",
+        summary: "Toggling the navigator off and on keeps its backend: a local ollama seat no longer silently becomes a cloud claude seat, and croft pair --provider ollama --off simply deactivates.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Proactive navigator looks stop over-firing: list bullets, block quotes, paragraph splits, and single struct fields or enum variants no longer summon an unsolicited comment turn.",
+        summary: "Local endpoint problems name their cause: HTTP error bodies (like ollama's 'model not found, try pulling it') reach the status line, and a malformed --base-url is refused at activation instead of failing hours later.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A failed reply no longer duplicates your text in the box, commentary anchors only in its own file, and changing the workspace root drops the old workspace's collaborator carets.",
+        summary: "The gateway token travels as a proper Bearer header and only over https or to loopback hosts, a stalled endpoint can no longer hold the seat busy past ten minutes (the deadline now cuts at the socket itself, so failed turns leak no threads or connections), and an inverted edit fence reports to OUTPUT instead of corrupting the screen.",
     },
 ];

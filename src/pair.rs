@@ -1428,7 +1428,16 @@ fn open_region(st: &mut PairState, file: &str, start: (usize, usize), end: (usiz
     let (s, e) = (s.min(doc.len()), e.min(doc.len()));
     if s > e {
         st.discarding = true;
-        eprintln!("[pair] fence range is inverted; edit dropped");
+        // The OUTPUT channel, never stderr: the resident navigator runs
+        // in-process, so an eprintln! lands on the alternate screen and
+        // corrupts the render (the pdftoppm/DAP capture class). The
+        // whole-line header form makes an inverted range a one-token slip
+        // for a weak local model.
+        crate::output::push(
+            "Navigator",
+            crate::output::OutputLevel::Warn,
+            "fence range is inverted; edit dropped",
+        );
         return;
     }
     let original = doc[s..e].to_string();
@@ -2074,6 +2083,25 @@ mod tests {
     /// request, and streams `deltas` as `content_block_delta`/`text_delta`
     /// events followed by `message_stop`, closing to end the stream.
     fn serve_sse_once(deltas: Vec<&'static str>) -> (String, std::thread::JoinHandle<()>) {
+        let mut body = String::new();
+        for d in deltas {
+            let ev = json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": d },
+            });
+            body.push_str(&format!("event: content_block_delta\ndata: {ev}\n\n"));
+        }
+        body.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        serve_http_once(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             connection: close\r\n\r\n{body}"
+        ))
+    }
+
+    /// One-shot HTTP stub answering `resp` verbatim after draining the whole
+    /// request (headers + Content-Length body), per the SSE-stub trap.
+    fn serve_http_once(resp: String) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -2101,20 +2129,6 @@ mod tests {
                     }
                 }
             }
-            let mut body = String::new();
-            for d in deltas {
-                let ev = json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": { "type": "text_delta", "text": d },
-                });
-                body.push_str(&format!("event: content_block_delta\ndata: {ev}\n\n"));
-            }
-            body.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
-                 connection: close\r\n\r\n{body}"
-            );
             let _ = sock.write_all(resp.as_bytes());
         });
         (base_url, server)
@@ -2262,6 +2276,52 @@ mod tests {
         );
     }
 
+    /// A PARSEABLE whole-line header with an inverted range (`5-3`) drops
+    /// the edit through the OUTPUT channel, never stderr: the resident
+    /// navigator runs in-process, so an eprintln! would land on the
+    /// alternate screen and corrupt the render. The inverted header is a
+    /// one-token slip for the weak local models the whole-line form serves.
+    #[test]
+    fn an_inverted_fence_range_drops_the_edit_via_output_not_stderr() {
+        let harness = OwnerHarness::start("l0\nl1\nl2\nl3\nl4\nl5");
+        let session = connect_session(&harness.socket, "pilot").unwrap();
+        let state = Mutex::new(PairState::new(session, None));
+        state
+            .lock()
+            .unwrap()
+            .begin_turn("demo.txt", "l0\nl1\nl2\nl3\nl4\nl5", false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut st = state.lock().unwrap();
+            let _ = st.session.poll(|_| None);
+            if st.session.is_live("demo.txt") {
+                break;
+            }
+            drop(st);
+            assert!(Instant::now() < deadline, "demo.txt never went live");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let baseline = crate::output::snapshot("Navigator")
+            .unwrap_or_default()
+            .len();
+        let mut st = state.lock().unwrap();
+        open_region(&mut st, "demo.txt", (4, 0), (2, usize::MAX));
+        assert!(st.discarding, "the inverted edit's body must be discarded");
+        assert_eq!(
+            st.session.doc_text("demo.txt"),
+            Some("l0\nl1\nl2\nl3\nl4\nl5"),
+            "nothing may be applied"
+        );
+        let lines = crate::output::snapshot("Navigator").unwrap_or_default();
+        assert!(
+            lines
+                .iter()
+                .skip(baseline)
+                .any(|l| l.text.contains("inverted")),
+            "the drop is reported on the OUTPUT channel"
+        );
+    }
+
     /// Offline slice of the local backend: one canned /v1/messages SSE turn
     /// streams a fenced edit through the REAL fence machine and apply path
     /// into the owner's replica, appends the assistant message, and ends
@@ -2345,7 +2405,392 @@ mod tests {
             end.text
         );
         assert!(!state.lock().unwrap().turn_active());
-        assert_eq!(messages.len(), 1, "no assistant message on a failed turn");
+        assert!(
+            messages.is_empty(),
+            "the unanswered user message is popped so the next ask starts clean"
+        );
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// A stream that dies before `message_stop` is a FAILED turn: the old
+    /// code reported success ("claude finished its turn") while the partial
+    /// edit had been reverted and nothing happened - and it appended the
+    /// partial text as an assistant message, corrupting the conversation.
+    #[test]
+    fn a_mid_stream_drop_reports_failure_and_balances_the_conversation() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let ev = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": "half a rep" },
+        });
+        let (base_url, server) = serve_http_once(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             connection: close\r\n\r\nevent: content_block_delta\ndata: {ev}\n\n"
+        ));
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(
+            end.is_error,
+            "an unclean stream end is a failure: {}",
+            end.text
+        );
+        assert!(
+            messages.is_empty(),
+            "the conversation stays balanced for the next ask"
+        );
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// The HTTP error body carries the fix ("model 'x' not found, try
+    /// pulling it first"); throwing it away left an opaque status code.
+    #[test]
+    fn an_http_error_body_reaches_the_surfaced_failure() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let (base_url, server) = serve_http_once(String::from(
+            "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\n\
+             connection: close\r\n\r\n{\"error\":\"model 'qwn3' not found, try pulling it\"}",
+        ));
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn(
+            &base_url,
+            "qwn3",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error);
+        assert!(
+            end.text.contains("not found, try pulling it"),
+            "the body's own words must survive: {}",
+            end.text
+        );
+        assert!(messages.is_empty());
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// `stop_reason: max_tokens` means the reply (and any fence in it) was
+    /// cut off; reporting success would pretend the half-edit was the turn.
+    #[test]
+    fn a_token_limit_truncation_is_a_failed_turn() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let delta = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": "prose" },
+        });
+        let md = json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "max_tokens" },
+        });
+        let (base_url, server) = serve_http_once(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             connection: close\r\n\r\n\
+             event: content_block_delta\ndata: {delta}\n\n\
+             event: message_delta\ndata: {md}\n\n\
+             event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        ));
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error, "truncation must not read as success");
+        assert!(end.text.contains("truncated"), "{}", end.text);
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// The environment credential only ever travels to https or loopback
+    /// destinations; a cleartext remote hop gets the harmless placeholder.
+    #[test]
+    fn the_credential_never_rides_cleartext_to_a_remote_host() {
+        use local::auth_for;
+        assert_eq!(
+            auth_for("http://box:8080", Some("secret")),
+            (String::from("croft"), None),
+        );
+        assert_eq!(
+            auth_for("http://localhost.evil.com:80", Some("secret")),
+            (String::from("croft"), None),
+        );
+        let bearer = Some(String::from("Bearer t"));
+        assert_eq!(
+            auth_for("http://localhost:11434", Some("t")),
+            (String::from("t"), bearer.clone()),
+        );
+        assert_eq!(
+            auth_for("http://127.0.0.1:11434", Some("t")),
+            (String::from("t"), bearer.clone()),
+        );
+        assert_eq!(
+            auth_for("http://[::1]:11434", Some("t")),
+            (String::from("t"), bearer.clone()),
+        );
+        assert_eq!(
+            auth_for("https://gw.example.com", Some("t")),
+            (String::from("t"), bearer),
+        );
+        assert_eq!(
+            auth_for("http://localhost:11434", None),
+            (String::from("croft"), None)
+        );
+        // Userinfo must not fool the gate: the destination here is the
+        // remote host, not localhost.
+        assert_eq!(
+            auth_for("http://localhost:pass@evil.example", Some("secret")),
+            (String::from("croft"), None),
+        );
+        assert_eq!(
+            auth_for("http://127.0.0.2:11434", Some("t")),
+            (String::from("t"), Some(String::from("Bearer t"))),
+            "any 127.x address is loopback"
+        );
+    }
+
+    /// The wall-clock ceiling is enforced per CHUNK: a stream of non-newline
+    /// bytes never completes a line, so a per-line check would have let a
+    /// trickling endpoint hold the seat busy indefinitely.
+    #[test]
+    fn a_trickling_stream_is_cut_at_the_deadline() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let stop_trickle = Arc::new(AtomicBool::new(false));
+        let server = {
+            let stop_trickle = Arc::clone(&stop_trickle);
+            std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut req = [0u8; 4096];
+                let _ = sock.read(&mut req);
+                let _ =
+                    sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
+                // Non-newline bytes, forever (until the test releases us).
+                while !stop_trickle.load(Ordering::Relaxed) {
+                    if sock.write_all(b".").is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        let started = Instant::now();
+        local::stream_turn_until(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+            Instant::now() + Duration::from_millis(300),
+        );
+        let elapsed = started.elapsed();
+        stop_trickle.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error, "a deadline cut is a failure: {}", end.text);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the ceiling must interrupt the trickle promptly, took {elapsed:?}"
+        );
+        assert!(messages.is_empty(), "the conversation stays balanced");
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// The deadline used to be polled only BETWEEN reads: a peer that sent
+    /// headers and then held the body open without a single byte parked the
+    /// loop inside the blocking `read` (up to the 300s socket timeout) past
+    /// the ceiling. Each wait is bounded by the remaining turn time instead.
+    #[test]
+    fn a_silent_stream_body_is_cut_at_the_deadline() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        // The thread ends on its own after the silence window; dropping the
+        // handle detaches it.
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req);
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
+            // Not one body byte: hold the connection open in silence, long
+            // enough that only the deadline can explain a prompt return.
+            std::thread::sleep(Duration::from_secs(4));
+        });
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        let started = Instant::now();
+        local::stream_turn_until(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+            Instant::now() + Duration::from_millis(300),
+        );
+        let elapsed = started.elapsed();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error, "a deadline cut is a failure: {}", end.text);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the ceiling must interrupt a silent body promptly, took {elapsed:?}"
+        );
+        assert!(messages.is_empty(), "the conversation stays balanced");
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// A deadline cut must also RELEASE the connection. Returning on time
+    /// while a detached reader stayed blocked in `read` kept the socket and
+    /// a thread alive for up to the 300s socket timeout per failed turn, so
+    /// repeated failures accumulated both. The server observing EOF right
+    /// after the cut is the proof the transport let go.
+    #[test]
+    fn a_deadline_cut_releases_the_connection() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (eof_tx, eof_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req);
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
+            // Silent body: block until the CLIENT hangs up. EOF or a reset
+            // is the release; draining any leftover request bytes first.
+            let mut probe = [0u8; 64];
+            loop {
+                match sock.read(&mut probe) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = eof_tx.send(());
+        });
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn_until(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+            Instant::now() + Duration::from_millis(300),
+        );
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error, "a deadline cut is a failure: {}", end.text);
+        eof_rx.recv_timeout(Duration::from_secs(2)).expect(
+            "the deadline cut must close the connection, not park it until the socket timeout",
+        );
+        assert!(messages.is_empty(), "the conversation stays balanced");
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// Malformed SSE data mid-stream silently dropped a chunk of the reply
+    /// and still reported success; a broken endpoint must fail the turn.
+    #[test]
+    fn malformed_sse_data_fails_the_turn() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let (base_url, server) = serve_http_once(String::from(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             connection: close\r\n\r\ndata: {not json\n\n\
+             event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ));
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error);
+        assert!(end.text.contains("malformed"), "{}", end.text);
+        assert!(messages.is_empty());
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// A 3xx from the endpoint must NOT be followed: ureq replays the
+    /// x-api-key header to the redirect target, so a loopback endpoint
+    /// answering 302 could bounce the credential to an arbitrary host. The
+    /// redirect surfaces as a failed turn naming the status.
+    #[test]
+    fn a_redirect_is_refused_not_followed() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let (base_url, server) = serve_http_once(String::from(
+            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:1/v1/messages\r\n\
+             connection: close\r\n\r\n",
+        ));
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error);
+        assert!(
+            end.text.contains("302"),
+            "the redirect is refused with its status, not followed: {}",
+            end.text
+        );
+        assert!(messages.is_empty());
         stop.store(true, Ordering::Relaxed);
         pump.join().unwrap();
     }
