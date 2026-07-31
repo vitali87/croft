@@ -332,6 +332,23 @@ pub fn join_teardowns() {
     }
 }
 
+/// Pull the FINISHED handles out of the registry, leaving the running ones:
+/// each unseat sweeps its predecessors so repeated unseat/reseat cycles do
+/// not grow the registry without bound. Joining the returned handles is
+/// instant (the threads have exited) but happens outside the lock anyway.
+fn sweep_finished(reg: &mut Vec<std::thread::JoinHandle<()>>) -> Vec<std::thread::JoinHandle<()>> {
+    let mut done = Vec::new();
+    let mut i = 0;
+    while i < reg.len() {
+        if reg[i].is_finished() {
+            done.push(reg.swap_remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    done
+}
+
 impl Drop for PairHost {
     fn drop(&mut self) {
         // Detach the teardown: the grace-kill blocks up to 2s (claude lingers
@@ -343,7 +360,45 @@ impl Drop for PairHost {
         // that happened shortly before exit.
         if let Some(p) = self.pilot.take() {
             let handle = std::thread::spawn(move || p.shutdown());
-            TEARDOWNS.lock().unwrap().push(handle);
+            let done = {
+                let mut reg = TEARDOWNS.lock().unwrap();
+                let done = sweep_finished(&mut reg);
+                reg.push(handle);
+                done
+            };
+            for h in done {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sweep_finished;
+
+    /// The registry sweep keeps only RUNNING teardowns: finished ones are
+    /// pulled out (and joined by the caller), so repeated unseat/reseat
+    /// cycles cannot grow the registry without bound.
+    #[test]
+    fn sweep_finished_pulls_only_the_finished_handles() {
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        let finished = std::thread::spawn(|| {});
+        // A finished thread may take a beat to be observably finished.
+        while !finished.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let running = std::thread::spawn(move || {
+            let _ = block_rx.recv();
+        });
+        let mut reg = vec![finished, running];
+        let done = sweep_finished(&mut reg);
+        assert_eq!(done.len(), 1, "exactly the finished handle is pulled");
+        assert_eq!(reg.len(), 1, "the running teardown stays registered");
+        assert!(!reg[0].is_finished(), "and it is the running one");
+        block_tx.send(()).unwrap();
+        for h in done.into_iter().chain(reg) {
+            h.join().unwrap();
         }
     }
 }

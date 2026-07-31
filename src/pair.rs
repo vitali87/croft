@@ -491,6 +491,12 @@ struct StreamRegion {
     start: usize,
     anchor: usize,
     original: String,
+    /// Notes whose anchors sat at or inside the fence's range when it
+    /// opened, as `(note id, offset - start)`: the delete collapses them
+    /// and the streamed inserts drag them along, so the revert can only
+    /// restore them from these recorded deltas (`start` keeps tracking
+    /// remote edits, so `start + delta` stays exact in the restored text).
+    displaced: Vec<(u64, usize)>,
 }
 
 /// One anchored navigator note: a byte offset into `file`'s replica text
@@ -1448,6 +1454,15 @@ fn open_region(st: &mut PairState, file: &str, start: (usize, usize), end: (usiz
     let original = doc[s..e].to_string();
     let new = format!("{}{}", &doc[..s], &doc[e..]);
     st.session.local_change(file, &new);
+    // Anchors at or inside the range are about to be collapsed by the
+    // delete (and then dragged along by the streamed inserts): record
+    // their pre-edit deltas so a revert can put them back exactly.
+    let displaced: Vec<(u64, usize)> = st
+        .notes
+        .iter()
+        .filter(|n| n.file == file && (s..e).contains(&n.offset))
+        .map(|n| (n.id, n.offset - s))
+        .collect();
     // Our own delete moves any note anchored below the cut in this file.
     let span = ResolvedSpan {
         at: s,
@@ -1460,6 +1475,7 @@ fn open_region(st: &mut PairState, file: &str, start: (usize, usize), end: (usiz
         start: s,
         anchor: s,
         original,
+        displaced,
     });
     st.discarding = false;
     st.session.send_stream_state(file, true);
@@ -1488,6 +1504,19 @@ fn revert_region(st: &mut PairState) {
             inserted: r.original.clone(),
         };
         shift_notes(&mut st.notes, &r.file, std::slice::from_ref(&span));
+        // Anchors that sat inside the range cannot be un-shifted (the
+        // delete collapsed them); restore them from the deltas recorded at
+        // open. `start` tracked remote edits all along, so `start + delta`
+        // lands exactly where the anchor sat in the restored slice.
+        for (id, delta) in &r.displaced {
+            if let Some(n) = st
+                .notes
+                .iter_mut()
+                .find(|n| n.id == *id && n.file == r.file)
+            {
+                n.offset = start + delta;
+            }
+        }
     }
     st.session.send_stream_state(&r.file, false);
 }
@@ -3992,13 +4021,19 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.begin_turn("demo.txt", "hello world", false);
-            let id = st.take_note_id();
-            st.notes.push(Note {
-                id,
-                file: String::from("demo.txt"),
-                offset: 8, // inside "world", below the edited span
-                body: String::from("remark"),
-            });
+            // Anchors below, AT, and INSIDE the edited span [0, 5): the
+            // below one is shifted and must shift back; the at/inside ones
+            // are collapsed by the delete and ride the streamed inserts,
+            // so only their recorded pre-edit offsets can restore them.
+            for offset in [8usize, 0, 2] {
+                let id = st.take_note_id();
+                st.notes.push(Note {
+                    id,
+                    file: String::from("demo.txt"),
+                    offset,
+                    body: String::from("remark"),
+                });
+            }
         }
         apply_fence_event(
             &state,
@@ -4013,10 +4048,17 @@ mod tests {
             FenceEvent::EditBody(String::from("hi there friend")),
         );
         apply_fence_event(&state, FenceEvent::EditAbort);
-        let offset = state.lock().unwrap().notes[0].offset;
+        let offsets: Vec<usize> = state
+            .lock()
+            .unwrap()
+            .notes
+            .iter()
+            .map(|n| n.offset)
+            .collect();
         assert_eq!(
-            offset, 8,
-            "the revert must restore the note anchor the edit had shifted"
+            offsets,
+            vec![8, 0, 2],
+            "the revert must restore every note anchor the edit had moved"
         );
         stop.store(true, Ordering::Relaxed);
         pump.join().unwrap();

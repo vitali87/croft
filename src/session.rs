@@ -147,6 +147,14 @@ pub(crate) fn write_pair_record(path: &Path, record: &PairRecord) -> Result<()> 
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0),
     );
+    // The clock alone cannot guarantee distinct bytes (SystemTime can
+    // repeat for rapid writes under coarse granularity): pid + a
+    // process-local counter differs on every call, in every process.
+    static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    v["write_nonce"] = serde_json::Value::from(
+        (u64::from(std::process::id()) << 32)
+            | (WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xffff_ffff),
+    );
     std::fs::write(path, v.to_string()).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -442,6 +450,43 @@ pub fn bind_socket_0600(socket: &Path) -> std::io::Result<std::os::unix::net::Un
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An enabled→enabled rewrite must NEVER serialize byte-identically:
+    /// the App re-arms a downed navigator on record-content change, and the
+    /// clock alone cannot carry that guarantee (SystemTime can repeat for
+    /// rapid writes under coarse clock granularity). A per-write nonce
+    /// (pid + process-local counter) differs even when the clock stands
+    /// still.
+    #[test]
+    fn every_pair_record_write_serializes_differently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pair.json");
+        let record = PairRecord {
+            model: None,
+            name: String::from("nav"),
+            enabled: true,
+            task: None,
+            provider: None,
+            base_url: None,
+        };
+        write_pair_record(&path, &record).unwrap();
+        let a = std::fs::read(&path).unwrap();
+        write_pair_record(&path, &record).unwrap();
+        let b = std::fs::read(&path).unwrap();
+        assert_ne!(a, b, "identical records must still write distinct bytes");
+        let va: serde_json::Value = serde_json::from_slice(&a).unwrap();
+        let vb: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(
+            va["write_nonce"].is_u64(),
+            "the nonce is part of the record"
+        );
+        assert_ne!(
+            va["write_nonce"], vb["write_nonce"],
+            "the nonce differs even when the clock stands still"
+        );
+        // The stamp fields stay invisible to the typed read path.
+        assert_eq!(read_pair_record(&path).as_ref(), Some(&record));
+    }
 
     /// Two attach-or-create racers for the SAME target must never both
     /// publish: before creation was serialized, the later publisher replaced
