@@ -2113,6 +2113,10 @@ pub struct App {
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
     cell_pixel: Option<(u32, u32)>,
+    /// Last wheel step applied to a PDF preview (when, and in which
+    /// direction), so a momentum flick's same-direction burst coalesces
+    /// instead of queueing one blocking rasteriser run per event.
+    last_pdf_wheel: Option<(std::time::Instant, i32)>,
     /// Pre-encoded inline-image for the source-control change-count badge (an
     /// accent pill + count, VS Code's `activityBarBadge`), emitted at z=1 over
     /// the SCM activity icon's bottom-right. `None` when there are no changes,
@@ -3409,6 +3413,7 @@ impl App {
             search_query_tx,
             search_results_rx,
             cell_pixel: None,
+            last_pdf_wheel: None,
             scm_change_badge: None,
             scm_change_badge_count: 0,
             explorer_unsaved_badge: None,
@@ -26240,7 +26245,7 @@ impl App {
                     if let Some(diff) = self.editor.diff.as_mut() {
                         diff.scroll_down_by(3);
                     } else if self.editor.pdf_page().is_some() {
-                        self.step_pdf_page(1);
+                        self.wheel_pdf_page(1);
                     } else {
                         self.editor.scroll_down(3);
                     }
@@ -26301,7 +26306,7 @@ impl App {
                     if let Some(diff) = self.editor.diff.as_mut() {
                         diff.scroll_up_by(3);
                     } else if self.editor.pdf_page().is_some() {
-                        self.step_pdf_page(-1);
+                        self.wheel_pdf_page(-1);
                     } else {
                         self.editor.scroll_up(3);
                     }
@@ -27495,11 +27500,40 @@ impl App {
         }
     }
 
-    /// Step the focused PDF preview by `delta` pages. The overlay re-bakes on
-    /// its own (the page is part of its re-emit key), so this is the single
-    /// entry point every gesture - arrows, wheel, menu - can call.
+    /// Step the focused PDF preview by `delta` pages, wrapping at the
+    /// document ends. The overlay re-bakes on its own (the page is part of
+    /// its re-emit key). Deliberate gestures only - arrows, menu; the wheel
+    /// goes through [`Self::wheel_pdf_page`].
     fn step_pdf_page(&mut self, delta: i32) {
         self.editor.change_pdf_page(delta);
+    }
+
+    /// Wheel paging for the PDF preview. Differs from the key path twice
+    /// over: it clamps at the document ends (no scroll wheel wraps a PDF),
+    /// and a same-direction repeat inside the cooldown is dropped - every
+    /// page step is a synchronous rasteriser run on the UI thread, so a
+    /// momentum flick's burst of wheel events must coalesce instead of
+    /// freezing the TUI for one render per event. A reversal is deliberate
+    /// and always passes.
+    fn wheel_pdf_page(&mut self, delta: i32) {
+        const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(150);
+        let now = std::time::Instant::now();
+        if let Some((at, dir)) = self.last_pdf_wheel
+            && dir == delta.signum()
+            && now.duration_since(at) < COOLDOWN
+        {
+            return;
+        }
+        self.last_pdf_wheel = Some((now, delta.signum()));
+        let Some(cur) = self.editor.pdf_page() else {
+            return;
+        };
+        let target = if delta >= 0 {
+            cur.saturating_add(delta as u32)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs()).max(1)
+        };
+        self.editor.set_pdf_page(target);
     }
 
     fn jump_pdf_page(&mut self, page: u32) {

@@ -20803,6 +20803,53 @@ fn the_wheel_pages_a_pdf_under_the_pointer() {
     assert_eq!(current_pdf_page(&app), 1, "wheel up pages back");
 }
 
+/// A momentum flick delivers a burst of same-direction wheel events, and
+/// every PDF page step is a synchronous rasteriser run on the UI thread: the
+/// burst must coalesce (rate-limited per direction) instead of queueing
+/// dozens of blocking renders. A reversal is deliberate and passes through
+/// immediately (the paging test above depends on that).
+#[test]
+fn a_wheel_flick_over_a_pdf_coalesces_to_one_page_step() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(
+        current_pdf_page(&app),
+        2,
+        "a same-direction burst steps one page, not one per event"
+    );
+}
+
+/// The wheel never wraps the document: page 1 stays put on wheel up and the
+/// last page stays put on wheel down. (The arrow keys wrap deliberately;
+/// no PDF viewer wraps on scroll.)
+#[test]
+fn the_wheel_does_not_wrap_a_pdf_at_its_ends() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+    wheel(&mut app, MouseEventKind::ScrollUp, col, row);
+    assert_eq!(current_pdf_page(&app), 1, "wheel up on page 1 must not wrap");
+    app.jump_pdf_page(3);
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(
+        current_pdf_page(&app),
+        3,
+        "wheel down on the last page must not wrap"
+    );
+}
+
 #[test]
 fn a_spreadsheet_opened_from_the_explorer_scrolls_with_the_arrow_keys() {
     let tmp = tempfile::tempdir().unwrap();
