@@ -17,7 +17,7 @@
 //! `crate::mcp::transport`.
 
 use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -244,25 +244,19 @@ pub(crate) fn serve_with_token(
     if crate::session::is_alive(socket) {
         anyhow::bail!("a session host is already running on {}", socket.display());
     }
-    // A crashed server leaves a stale socket file behind (unix sockets are
-    // not auto-unlinked); the liveness probe above proved nobody owns it.
-    let _ = std::fs::remove_file(socket);
     // Possession of the account is the trust boundary (same as dtach); never
-    // let another user attach. `bind` starts accepting connections the instant
-    // it returns, so a chmod on the next line leaves a TOCTOU window in which
-    // the socket carries umask-derived perms (0644 under umask 022). Bind under
-    // a 0077 umask so the socket is 0600 from creation; restore afterward.
-    let prev_umask = unsafe { libc::umask(0o077) };
-    let listener =
-        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()));
-    unsafe { libc::umask(prev_umask) };
-    let listener = listener?;
-    {
-        // Belt-and-braces: assert 0600 even where umask was ignored.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
-            .context("restricting socket permissions")?;
-    }
+    // let another user attach. Stale-file removal and creation serialization
+    // live inside the binder: a racer that loses the per-target lock is told
+    // the winner is alive instead of silently replacing its socket.
+    let listener = match crate::session::bind_socket_0600(socket) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            anyhow::bail!("a session host is already running on {}", socket.display());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("binding {}", socket.display())));
+        }
+    };
     if let Some(ws) = workspace {
         crate::session::write_meta_preserving_created(socket, ws)?;
     }

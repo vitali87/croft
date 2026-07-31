@@ -59,21 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "In a grid of three or more editor groups the focused group's PDF preview really shows now: the overlay's gate, key and pixels all resolve to the focused group instead of the first one, so pages turn and links click.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "A tcsh or csh user's PATH survives a Dock launch: the probe marks itself a login shell the way login(1) does, so ~/.login is finally read.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "A collab guest keeps re-asking for the owner's snapshot through the whole bootstrap window (the backoff now caps at 1s), so an owner that connects a moment late is still caught instead of the file silently going local-only.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "PDF link slicing survives malformed text runs: a bare ampersand or a zero-extent run can no longer push a link over neighbouring text or make it unclickable.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Fix,
+    summary: "Session and collab sockets are now bound owner-only without touching the process umask: the old save/restore dance raced concurrent binds, could leave a relay socket readable by other users, and could corrupt the process umask for good.",
+}];

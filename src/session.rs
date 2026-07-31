@@ -365,9 +365,186 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
+/// Bind a unix listener at `socket`, owner-only (0600) with no window in
+/// which anyone else could connect. Possession of the account is the trust
+/// boundary for every croft socket (the session mux, the collab relay):
+/// another user must never be able to connect. Shared by both binders so the
+/// permission discipline lives in exactly one place.
+pub fn bind_socket_0600(socket: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+    // Creation is serialized per target through an owner-only lock file held
+    // across the liveness probe, the stale-file removal, the bind and the
+    // publication. Without it, two attach-or-create racers could both probe
+    // "nobody alive", both publish, and the later publisher replaced the
+    // earlier one's directory entry - a live but pathless listener, i.e. a
+    // stranded session host invisible to every future client. The loser now
+    // finds the winner alive under the lock and is told to attach instead
+    // (`AddrInUse`). The flock releases on drop (or on crash, by the OS).
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(socket.with_extension("bind.lock"))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if is_alive(socket) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!("a listener is already serving {}", socket.display()),
+        ));
+    }
+    // Proven dead under the lock: a crashed owner's stale file (unix sockets
+    // are not auto-unlinked) must not block the next creator.
+    let _ = std::fs::remove_file(socket);
+    // `bind` starts accepting connections the instant it returns, and the
+    // socket file's mode comes from the process umask. A save/restore umask
+    // dance around the bind is process-global state: two concurrent binds
+    // interleaving their restores corrupted the mask for the rest of the
+    // process's life, and one of the sockets got created under the loose
+    // caller mask. Instead, bind inside a fresh 0700 staging dir next to
+    // the target (same filesystem; the short `.s` name keeps the AF_UNIX
+    // path-length budget), fix the socket's own mode to 0600 while nobody
+    // can traverse to it, then rename(2) it into place atomically. No
+    // process-global state anywhere.
+    static STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = STAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let parent = socket.parent().unwrap_or(Path::new("."));
+    let stage = parent.join(format!(".s{}-{n}", std::process::id()));
+    // A crash can strand a same-named staging dir (the counter restarts
+    // with the process and pids recycle); it is ours by construction.
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::DirBuilder::new().mode(0o700).create(&stage)?;
+    let result = (|| {
+        let tmp = stage.join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&tmp)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&tmp, socket)?;
+        Ok(listener)
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two attach-or-create racers for the SAME target must never both
+    /// publish: before creation was serialized, the later publisher replaced
+    /// the earlier one's directory entry, leaving a live but pathless
+    /// listener (a stranded session host, invisible to every future client).
+    /// Exactly one racer may win; the loser is told the address is in use so
+    /// it attaches to the winner instead.
+    #[test]
+    fn racing_binds_on_one_target_produce_exactly_one_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("same.sock");
+        let outcomes: Vec<std::io::Result<std::os::unix::net::UnixListener>> =
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..2)
+                    .map(|_| {
+                        let sock = sock.clone();
+                        s.spawn(move || bind_socket_0600(&sock))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+        let winners = outcomes.iter().filter(|o| o.is_ok()).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one racer may publish a listener on one target"
+        );
+        for o in &outcomes {
+            if let Err(e) = o {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::AddrInUse,
+                    "the loser must be told to attach, got {e:?}"
+                );
+            }
+        }
+        // And the published listener is the live one: a client reaches it.
+        let l = outcomes.into_iter().find_map(|o| o.ok()).unwrap();
+        let _c = std::os::unix::net::UnixStream::connect(&sock)
+            .expect("the surviving pathname must reach the winning listener");
+        drop(l);
+    }
+
+    /// A stale socket file (its owner crashed; nobody accepts) must not block
+    /// the next creator: the binder proves it dead and replaces it.
+    #[test]
+    fn a_dead_stale_socket_file_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("stale.sock");
+        drop(bind_socket_0600(&sock).expect("first bind"));
+        assert!(sock.exists(), "a dropped listener leaves its file behind");
+        let _l = bind_socket_0600(&sock).expect("a dead socket file must be replaced");
+        std::os::unix::net::UnixStream::connect(&sock).expect("the new listener answers");
+    }
+
+    /// Every croft socket is owner-only from its first observable instant.
+    #[test]
+    fn a_bound_socket_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("a.sock");
+        let _l = bind_socket_0600(&sock).expect("bind");
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket must be 0600, got {mode:o}");
+    }
+
+    /// Binding must not go through process-global state: the parallel test
+    /// suite (and any future in-process threading) binds relay and mux
+    /// sockets from many threads at once. The old save/restore umask dance
+    /// raced - two interleaved binds could restore each other's masks
+    /// (permanently corrupting the process umask) and one socket could be
+    /// created under the caller's loose umask for its whole life.
+    #[test]
+    fn concurrent_binds_never_corrupt_the_process_umask_or_a_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        let read_umask = || unsafe {
+            // Read is a write on this API; probe with the tightest value so
+            // the blink can only ever make a concurrent file MORE private.
+            let cur = libc::umask(0o077);
+            libc::umask(cur);
+            cur
+        };
+        let before = read_umask();
+        let dir = tempfile::tempdir().unwrap();
+        let worst = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        std::thread::scope(|s| {
+            for t in 0..2 {
+                let dir = dir.path().to_path_buf();
+                let worst = std::sync::Arc::clone(&worst);
+                s.spawn(move || {
+                    for i in 0..300 {
+                        let sock = dir.join(format!("{t}-{i}.sock"));
+                        let l = bind_socket_0600(&sock).expect("bind");
+                        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+                        let mut w = worst.lock().unwrap();
+                        if mode > *w {
+                            *w = mode;
+                        }
+                        drop(l);
+                        let _ = std::fs::remove_file(&sock);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            *worst.lock().unwrap(),
+            0o600,
+            "a racing bind produced a socket looser than 0600"
+        );
+        assert_eq!(
+            read_umask(),
+            before,
+            "racing binds corrupted the process umask"
+        );
+    }
 
     /// The single-host lock is exclusive: a second acquirer is refused while
     /// the first holds it, and the lock frees when the holder drops (the OS
