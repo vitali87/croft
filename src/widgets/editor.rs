@@ -5646,12 +5646,15 @@ impl Editor {
             self.wrap_set_top(scrollbar::scroll_for_y(metrics, y));
             return true;
         }
-        let Some(metrics) = scrollbar::vertical_metrics(
-            self.last_scrollbar,
-            self.lines.len(),
-            viewport,
-            self.scroll,
-        ) else {
+        // Same content length the render sized the bar with: lines plus
+        // comment-box rows. Mapping through bare `lines.len()` made the bar
+        // of a short file with a tall navigator comment dead (metrics said
+        // "no overflow") and a long file's thumb run away from the pointer.
+        let bw = self.visible_text_width();
+        let content = self.lines.len() + self.box_rows_between(0, self.lines.len(), bw);
+        let Some(metrics) =
+            scrollbar::vertical_metrics(self.last_scrollbar, content, viewport, self.scroll)
+        else {
             return false;
         };
         self.scroll_view_to(scrollbar::scroll_for_y(metrics, y));
@@ -11882,6 +11885,38 @@ mod tests {
         assert_ne!(
             first, second,
             "a reload must stamp fresh content, or the baked overlay stays stale"
+        );
+    }
+
+    /// The scrollbar is drawn against `lines + comment-box rows`, so the
+    /// drag must map through the same content length. Mapping through bare
+    /// `lines.len()` made the bar of a short file with a tall navigator
+    /// comment completely dead (metrics said "no overflow"), and made a
+    /// long file's thumb run away from the pointer.
+    #[test]
+    fn dragging_the_scrollbar_of_a_file_with_a_comment_box_scrolls() {
+        let mut e = editor_with("a\nb\nc\nd\ne");
+        e.comment_boxes.push(CommentBox {
+            id: 1,
+            line: 1,
+            author: String::from("navigator"),
+            body: (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+        });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        assert!(
+            e.last_scrollbar.width > 0,
+            "the box overflows the viewport, so a bar must be drawn"
+        );
+        assert!(
+            e.scroll_to_bar_y(e.last_scrollbar.y + e.last_scrollbar.height / 2),
+            "a drag on the drawn bar must scroll, not be refused as no-overflow"
         );
     }
 
