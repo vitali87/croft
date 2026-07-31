@@ -9780,6 +9780,14 @@ impl App {
         if p != Pane::Terminal && self.terminal_copy_mode.is_some() {
             self.close_terminal_copy_mode();
         }
+        // A maximized terminal gives the editor zero rows; focusing the
+        // editor is always an intent to use it, so restore it (VS Code's
+        // convention when a file is revealed over a maximized panel).
+        // `terminal_pane_maximized` (width, among terminal panes) is
+        // unrelated and stays.
+        if p == Pane::Editor && self.terminal_maximized {
+            self.terminal_maximized = false;
+        }
         self.focus = p;
         self.sync_focus_flags();
         if self.editor.focused {

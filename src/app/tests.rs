@@ -20850,6 +20850,25 @@ fn the_wheel_does_not_wrap_a_pdf_at_its_ends() {
     );
 }
 
+/// Opening a file while the terminal is maximized (Ctrl+Shift+J) must
+/// restore the editor - the same convention VS Code follows when a file is
+/// revealed over a maximized panel. Before this, focus silently moved into
+/// an editor the layout gave zero rows: arrows did nothing visible and
+/// typing dirtied a hidden buffer.
+#[test]
+fn opening_a_file_over_a_maximized_terminal_restores_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_maximized = true;
+    open_from_explorer(&mut app, "a.txt");
+    assert!(matches!(app.focus, Pane::Editor));
+    assert!(
+        !app.terminal_maximized,
+        "focusing the editor must restore it from under a maximized terminal"
+    );
+}
+
 #[test]
 fn a_spreadsheet_opened_from_the_explorer_scrolls_with_the_arrow_keys() {
     let tmp = tempfile::tempdir().unwrap();
