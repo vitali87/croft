@@ -2149,7 +2149,12 @@ impl Editor {
         (0..self.comment_boxes.len())
             .filter(|&i| {
                 let l = self.comment_boxes[i].line;
-                l >= from && l < to
+                // A box on a line hidden inside a collapsed fold is never
+                // painted (the layout skips hidden lines wholesale), so it
+                // must not count toward any scroll geometry either - it
+                // kept a scrollbar alive for invisible content and let the
+                // wheel walk the viewport into blank space.
+                l >= from && l < to && !self.is_line_hidden(l)
             })
             .map(|i| self.comment_box_height(i, tw))
             .sum()
@@ -10149,6 +10154,46 @@ mod tests {
         assert_eq!(e.cursor_row, 1, "the caret skips the box");
         e.move_up();
         assert_eq!(e.cursor_row, 0);
+    }
+
+    /// A comment box on a line hidden inside a collapsed fold is never
+    /// painted, so it must not count toward the scroll extent either: it
+    /// used to inflate the content length, keeping a scrollbar alive for
+    /// invisible content and letting the wheel scroll into blank space.
+    #[test]
+    fn a_box_hidden_by_a_fold_does_not_extend_the_scroll_geometry() {
+        let mut e = editor_with("fn a() {\n    body();\n}\nlast");
+        e.comment_boxes = vec![CommentBox {
+            id: 1,
+            line: 1,
+            author: "navigator".into(),
+            body: (0..20)
+                .map(|i| format!("p{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1), "the box's line folds away");
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        assert_eq!(
+            e.last_scrollbar.width, 0,
+            "4 lines minus a fold fit the viewport; nothing left to scroll"
+        );
+        e.scroll_down(3);
+        assert_eq!(
+            (e.scroll, e.scroll_sub),
+            (0, 0),
+            "scrolling must not walk into folded-away box rows"
+        );
     }
 
     /// A comment box taller than the viewport must be reachable in non-wrap
