@@ -16260,9 +16260,9 @@ impl App {
             .editor
             .comment_focus
             .as_ref()
-            .and_then(|f| notes.iter().find(|(id, ..)| *id == f.id))
-            .map(|(_, row, _)| *row)
-            .unwrap_or(self.editor.cursor_row);
+            .and_then(|f| notes.iter().position(|(id, ..)| *id == f.id))
+            .map(|i| (notes[i].1, i))
+            .unwrap_or((self.editor.cursor_row, usize::MAX));
         let idx = next_note_by_row(notes, here);
         Some((notes[idx].0, notes[idx].1))
     }
@@ -29744,17 +29744,25 @@ fn is_extensions_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'x')
 }
 
-/// Index of the next navigator note to visit from caret row `here`: the note
-/// with the smallest row strictly greater than `here`, wrapping to the
-/// smallest row overall. `notes` are in landing (stream) order, not row
-/// order, so a naive `position(row > here)` would skip notes and could stick.
-fn next_note_by_row(notes: &[(u64, usize, String)], here: usize) -> usize {
+/// Index of the next navigator note to visit from `here` = (row, index of
+/// the currently focused note, or `usize::MAX` when the walk starts from a
+/// bare caret row): the note with the smallest (row, index) strictly greater
+/// than `here`, wrapping to the smallest overall. The index tie-break makes
+/// every note on a shared row reachable - the reply flow anchors the
+/// navigator's answer on the answered note's own row, and a row-only walk
+/// could never step from the first co-anchored note to the second.
+fn next_note_by_row(notes: &[(u64, usize, String)], here: (usize, usize)) -> usize {
     notes
         .iter()
         .enumerate()
-        .filter(|(_, (_, row, _))| *row > here)
-        .min_by_key(|(_, (_, row, _))| *row)
-        .or_else(|| notes.iter().enumerate().min_by_key(|(_, (_, row, _))| *row))
+        .filter(|(i, (_, row, _))| (*row, *i) > here)
+        .min_by_key(|(i, (_, row, _))| (*row, *i))
+        .or_else(|| {
+            notes
+                .iter()
+                .enumerate()
+                .min_by_key(|(i, (_, row, _))| (*row, *i))
+        })
         .map(|(i, _)| i)
         .unwrap_or(0)
 }

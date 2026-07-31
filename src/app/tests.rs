@@ -19742,12 +19742,30 @@ fn next_note_by_row_walks_rows_in_order_and_wraps() {
         (3u64, 6usize, String::from("mid")),
     ];
     // From the top: nearest row strictly greater.
-    assert_eq!(notes[super::next_note_by_row(&notes, 0)].1, 2);
-    assert_eq!(notes[super::next_note_by_row(&notes, 2)].1, 6);
-    assert_eq!(notes[super::next_note_by_row(&notes, 6)].1, 10);
+    assert_eq!(notes[super::next_note_by_row(&notes, (0, usize::MAX))].1, 2);
+    assert_eq!(notes[super::next_note_by_row(&notes, (2, usize::MAX))].1, 6);
+    assert_eq!(notes[super::next_note_by_row(&notes, (6, usize::MAX))].1, 10);
     // Past the last note: wrap to the smallest row (not stick on row 10).
-    assert_eq!(notes[super::next_note_by_row(&notes, 10)].1, 2);
-    assert_eq!(notes[super::next_note_by_row(&notes, 99)].1, 2);
+    assert_eq!(notes[super::next_note_by_row(&notes, (10, usize::MAX))].1, 2);
+    assert_eq!(notes[super::next_note_by_row(&notes, (99, usize::MAX))].1, 2);
+}
+
+/// Replying anchors the navigator's answer on the answered note's own row,
+/// so two notes on one row is the NORMAL state after one reply. The index
+/// tie-break must step through both and wrap - a row-only walk went
+/// first-note → first-note forever and the answer was unreachable by F4.
+#[test]
+fn next_note_by_row_steps_through_co_anchored_notes() {
+    let notes = vec![
+        (1u64, 5usize, String::from("original")),
+        (2u64, 5usize, String::from("answer")),
+    ];
+    // Focused on the first note at row 5: F4 reaches its co-anchored answer.
+    assert_eq!(super::next_note_by_row(&notes, (5, 0)), 1);
+    // Focused on the answer: F4 wraps back to the first.
+    assert_eq!(super::next_note_by_row(&notes, (5, 1)), 0);
+    // From a bare caret on that row, neither is "past" it: wrap to first.
+    assert_eq!(super::next_note_by_row(&notes, (5, usize::MAX)), 0);
 }
 
 /// Only one croft self-appoints the navigator owner per workspace: a second
