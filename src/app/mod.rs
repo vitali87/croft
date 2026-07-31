@@ -2113,6 +2113,12 @@ pub struct App {
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
     cell_pixel: Option<(u32, u32)>,
+    /// Last wheel step applied to a PDF preview (when, in which direction,
+    /// and on which document), so a momentum flick's same-direction burst
+    /// coalesces instead of queueing one blocking rasteriser run per event.
+    /// Keyed by document: switching to another PDF starts fresh - a reader's
+    /// first gesture there is not a repeat.
+    last_pdf_wheel: Option<(std::time::Instant, i32, Option<PathBuf>)>,
     /// Pre-encoded inline-image for the source-control change-count badge (an
     /// accent pill + count, VS Code's `activityBarBadge`), emitted at z=1 over
     /// the SCM activity icon's bottom-right. `None` when there are no changes,
@@ -2798,6 +2804,11 @@ pub struct EditorImageLayout {
     /// path and rect are unchanged on a page turn and the stale picture stays
     /// on screen unless every call site remembers to invalidate the layout.
     pub page: u32,
+    /// Content stamp of the baked bytes ([`crate::widgets::editor::ImageView::generation`]).
+    /// Part of the re-emit key so a file rebuilt on disk re-bakes even when
+    /// the path, rect and page are all unchanged (a pdflatex rebuild lands
+    /// on the same page the reader was on).
+    pub generation: u64,
 }
 
 /// Re-emit key for the terminal pane's inline-image overlay: the cell rect
@@ -3409,6 +3420,7 @@ impl App {
             search_query_tx,
             search_results_rx,
             cell_pixel: None,
+            last_pdf_wheel: None,
             scm_change_badge: None,
             scm_change_badge_count: 0,
             explorer_unsaved_badge: None,
@@ -8420,17 +8432,21 @@ impl App {
 
     fn cycle_focus(&mut self) {
         // Skip hidden panes when cycling.
+        let mut next = self.focus;
         for _ in 0..3 {
-            self.focus = match self.focus {
+            next = match next {
                 Pane::Tree => Pane::Editor,
                 Pane::Editor => Pane::Terminal,
                 Pane::Terminal => Pane::Tree,
             };
-            if self.pane_visible(self.focus) {
+            if self.pane_visible(next) {
                 break;
             }
         }
-        self.sync_focus_flags();
+        // Through `focus_pane`, never a bare assignment: every route into a
+        // pane shares its guarantees (terminal find/copy-mode teardown, and
+        // restoring the editor from under a maximized terminal).
+        self.focus_pane(next);
     }
 
     /// Returns true exactly once after the welcome OSC-1337 image has been
@@ -9774,6 +9790,14 @@ impl App {
         }
         if p != Pane::Terminal && self.terminal_copy_mode.is_some() {
             self.close_terminal_copy_mode();
+        }
+        // A maximized terminal gives the editor zero rows; focusing the
+        // editor is always an intent to use it, so restore it (VS Code's
+        // convention when a file is revealed over a maximized panel).
+        // `terminal_pane_maximized` (width, among terminal panes) is
+        // unrelated and stays.
+        if p == Pane::Editor && self.terminal_maximized {
+            self.terminal_maximized = false;
         }
         self.focus = p;
         self.sync_focus_flags();
@@ -26240,7 +26264,7 @@ impl App {
                     if let Some(diff) = self.editor.diff.as_mut() {
                         diff.scroll_down_by(3);
                     } else if self.editor.pdf_page().is_some() {
-                        self.step_pdf_page(1);
+                        self.wheel_pdf_page(1);
                     } else {
                         self.editor.scroll_down(3);
                     }
@@ -26301,7 +26325,7 @@ impl App {
                     if let Some(diff) = self.editor.diff.as_mut() {
                         diff.scroll_up_by(3);
                     } else if self.editor.pdf_page().is_some() {
-                        self.step_pdf_page(-1);
+                        self.wheel_pdf_page(-1);
                     } else {
                         self.editor.scroll_up(3);
                     }
@@ -26617,6 +26641,22 @@ impl App {
             }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
+    }
+
+    /// Whether an open context menu (or its submenu panel) overlaps `rect`
+    /// on a protocol with no image z-layer (iTerm2 OSC-1337, Sixel), where
+    /// the image blit would overpaint the menu. Kitty layers images below
+    /// text, so it never needs this.
+    fn context_menu_covers_rect(&self, rect: Rect) -> bool {
+        match self.inline_protocol {
+            crate::iterm2_inline::InlineImageProtocol::ITerm2
+            | crate::iterm2_inline::InlineImageProtocol::Sixel => {}
+            _ => return false,
+        }
+        self.menu_rect()
+            .into_iter()
+            .chain(self.submenu_rect())
+            .any(|m| rects_intersect(m, rect))
     }
 
     /// Compute the menu's bounding rect from current state.
@@ -27495,11 +27535,42 @@ impl App {
         }
     }
 
-    /// Step the focused PDF preview by `delta` pages. The overlay re-bakes on
-    /// its own (the page is part of its re-emit key), so this is the single
-    /// entry point every gesture - arrows, wheel, menu - can call.
+    /// Step the focused PDF preview by `delta` pages, wrapping at the
+    /// document ends. The overlay re-bakes on its own (the page is part of
+    /// its re-emit key). Deliberate gestures only - arrows, menu; the wheel
+    /// goes through [`Self::wheel_pdf_page`].
     fn step_pdf_page(&mut self, delta: i32) {
         self.editor.change_pdf_page(delta);
+    }
+
+    /// Wheel paging for the PDF preview. Differs from the key path twice
+    /// over: it clamps at the document ends (no scroll wheel wraps a PDF),
+    /// and a same-direction repeat inside the cooldown is dropped - every
+    /// page step is a synchronous rasteriser run on the UI thread, so a
+    /// momentum flick's burst of wheel events must coalesce instead of
+    /// freezing the TUI for one render per event. A reversal is deliberate
+    /// and always passes.
+    fn wheel_pdf_page(&mut self, delta: i32) {
+        const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(150);
+        let now = std::time::Instant::now();
+        let doc = self.editor.path.clone();
+        if let Some((at, dir, last_doc)) = &self.last_pdf_wheel
+            && *dir == delta.signum()
+            && *last_doc == doc
+            && now.duration_since(*at) < COOLDOWN
+        {
+            return;
+        }
+        self.last_pdf_wheel = Some((now, delta.signum(), doc));
+        let Some(cur) = self.editor.pdf_page() else {
+            return;
+        };
+        let target = if delta >= 0 {
+            cur.saturating_add(delta as u32)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs()).max(1)
+        };
+        self.editor.set_pdf_page(target);
     }
 
     fn jump_pdf_page(&mut self, page: u32) {
@@ -27621,7 +27692,27 @@ impl App {
                 .and_then(|g| g.image.as_ref())
                 .and_then(|i| i.pdf.as_ref())
                 .map_or(1, |p| p.current_page),
+            generation: self
+                .group_on_side(side)
+                .and_then(|g| g.image.as_ref())
+                .map_or(0, |i| i.generation),
         };
+        // The cell-buffer protocols (iTerm2 OSC-1337, Sixel) have no
+        // z-layer, so the post-frame image blit would overpaint an open
+        // context menu (Kitty puts the image at deep-negative z instead).
+        // Hold the overlay cleared while a menu overlaps it; the layout
+        // was invalidated, so the first frame after the menu closes or
+        // moves off re-bakes the picture.
+        if self.context_menu_covers_rect(Rect {
+            x: cell_x,
+            y: cell_y,
+            width: cell_w,
+            height: cell_h,
+        }) {
+            self.overlays.editor[side].request_clear_if_displayed();
+            self.overlays.editor[side].invalidate_layout();
+            return;
+        }
         // Skip the bake when nothing about the layout changed - this is
         // the hot path on every frame an image is on screen.
         if self.overlays.editor[side].layout_matches(&desired) {

@@ -59,7 +59,21 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Session and collab sockets are now bound owner-only without touching the process umask: the old save/restore dance raced concurrent binds, could leave a relay socket readable by other users, and could corrupt the process umask for good.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "The wheel over a PDF no longer freezes croft on a momentum flick (same-direction bursts coalesce) and stops at the first and last page instead of wrapping around.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "A PDF rebuilt on disk shows its fresh render immediately: the preview re-bakes on content change, not just on a page or layout change.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Croft.app opens every file you selected in Finder, and paths with apostrophes, quotes or spaces survive the launcher's two shell layers.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Opening a file while the terminal is maximized restores the editor instead of typing into an invisible buffer, a right-click menu over an image survives on iTerm2 and Sixel, and End on a PDF with an unknown page count says so instead of failing on page 4294967295.",
+    },
+];

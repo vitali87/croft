@@ -11977,6 +11977,7 @@ fn closing_image_tab_requests_overlay_clear_on_next_render() {
             cell_h: 10,
             path: tmp.path().join("doomed.png"),
             page: 1,
+            generation: 0,
         }),
         true,
     );
@@ -15184,6 +15185,7 @@ fn editor_image_overlay_is_dual_slot_and_clear_ors_both_columns() {
         cell_h: 10,
         path: tmp.path().join(name),
         page: 1,
+        generation: 0,
     };
     // Both physical columns can hold an inline image at once.
     app.overlays.editor[0].set_test_state(Some("left-osc".into()), Some(layout("l.png")), true);
@@ -20801,6 +20803,163 @@ fn the_wheel_pages_a_pdf_under_the_pointer() {
     assert_eq!(current_pdf_page(&app), 2, "wheel down pages forward");
     wheel(&mut app, MouseEventKind::ScrollUp, col, row);
     assert_eq!(current_pdf_page(&app), 1, "wheel up pages back");
+}
+
+/// A momentum flick delivers a burst of same-direction wheel events, and
+/// every PDF page step is a synchronous rasteriser run on the UI thread: the
+/// burst must coalesce (rate-limited per direction) instead of queueing
+/// dozens of blocking renders. A reversal is deliberate and passes through
+/// immediately (the paging test above depends on that).
+#[test]
+fn a_wheel_flick_over_a_pdf_coalesces_to_one_page_step() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(
+        current_pdf_page(&app),
+        2,
+        "a same-direction burst steps one page, not one per event"
+    );
+}
+
+/// The wheel never wraps the document: page 1 stays put on wheel up and the
+/// last page stays put on wheel down. (The arrow keys wrap deliberately;
+/// no PDF viewer wraps on scroll.)
+#[test]
+fn the_wheel_does_not_wrap_a_pdf_at_its_ends() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+    wheel(&mut app, MouseEventKind::ScrollUp, col, row);
+    assert_eq!(
+        current_pdf_page(&app),
+        1,
+        "wheel up on page 1 must not wrap"
+    );
+    app.jump_pdf_page(3);
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(
+        current_pdf_page(&app),
+        3,
+        "wheel down on the last page must not wrap"
+    );
+}
+
+/// Opening a file while the terminal is maximized (Ctrl+Shift+J) must
+/// restore the editor - the same convention VS Code follows when a file is
+/// revealed over a maximized panel. Before this, focus silently moved into
+/// an editor the layout gave zero rows: arrows did nothing visible and
+/// typing dirtied a hidden buffer.
+#[test]
+fn opening_a_file_over_a_maximized_terminal_restores_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_maximized = true;
+    open_from_explorer(&mut app, "a.txt");
+    assert!(matches!(app.focus, Pane::Editor));
+    assert!(
+        !app.terminal_maximized,
+        "focusing the editor must restore it from under a maximized terminal"
+    );
+}
+
+/// iTerm2 OSC-1337 and Sixel have no image z-layer: the post-frame image
+/// blit overwrites whatever text sits in those cells, so an open context
+/// menu overlapping the editor preview must suppress the overlay (Kitty
+/// instead layers images below text and needs nothing).
+#[test]
+fn a_context_menu_over_the_editor_image_suppresses_the_blit_on_no_z_protocols() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let img = ratatui::layout::Rect::new(2, 2, 30, 15);
+    assert!(
+        !app.context_menu_covers_rect(img),
+        "no menu open: nothing to suppress"
+    );
+    app.context_menu = Some(ContextMenu::flat(
+        (4, 4),
+        vec![(
+            String::from("Rename"),
+            MenuAction::Rename(tmp.path().into()),
+        )],
+        tmp.path().into(),
+    ));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::ITerm2;
+    assert!(
+        app.context_menu_covers_rect(img),
+        "an overlapping menu must suppress the image on iTerm2"
+    );
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    assert!(
+        !app.context_menu_covers_rect(img),
+        "Kitty layers images below text; the menu already wins"
+    );
+}
+
+/// F6 must give the same guarantee as every other route into the editor:
+/// it used to assign focus directly, bypassing `focus_pane`, so cycling
+/// into the editor under a maximized terminal focused a zero-height pane.
+#[test]
+fn cycling_focus_into_the_editor_also_restores_a_maximized_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_maximized = true;
+    for _ in 0..3 {
+        app.cycle_focus();
+        if matches!(app.focus, Pane::Editor) {
+            break;
+        }
+    }
+    assert!(
+        matches!(app.focus, Pane::Editor),
+        "F6 must reach the editor"
+    );
+    assert!(
+        !app.terminal_maximized,
+        "cycling into the editor must restore it, same as any other route"
+    );
+}
+
+/// The wheel cooldown is per document: scrolling one PDF and immediately
+/// wheeling in a second, freshly focused PDF is that document's FIRST
+/// gesture, not a repeat - an app-global cooldown swallowed it.
+#[test]
+fn the_wheel_cooldown_does_not_leak_across_pdf_documents() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.pdf");
+    let b = tmp.path().join("b.pdf");
+    write_three_page_pdf(&a);
+    write_three_page_pdf(&b);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(current_pdf_page(&app), 2);
+    app.editor.open(&b).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+    // Pin the cooldown stamp to "just now, same direction, other document"
+    // so the window is deterministically open regardless of how long the
+    // rasteriser took: only the document identity may let this tick through.
+    app.last_pdf_wheel = Some((std::time::Instant::now(), 1, Some(a.clone())));
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(
+        current_pdf_page(&app),
+        2,
+        "the second document's first wheel tick must not be dropped"
+    );
 }
 
 #[test]
