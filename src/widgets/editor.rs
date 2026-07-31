@@ -2216,8 +2216,15 @@ impl Editor {
             // Footer: `╰ ❯ <reply>            ✕ Ignore ╯`
             let focus = self.comment_focus.as_ref().filter(|f| f.id == b.id);
             let field_w = w.saturating_sub(4 + IGNORE_TAIL_COLS);
+            // Window the draft around the caret: a reply longer than the
+            // field otherwise froze at its first field_w chars and the
+            // user typed blind, with no caret drawn anywhere.
+            let win = focus.map_or(0, |f| f.cursor.saturating_sub(field_w.saturating_sub(1)));
             let (draft, style) = match focus {
-                Some(f) => (pad(&f.reply, field_w), body_st),
+                Some(f) => {
+                    let visible: String = f.reply.chars().skip(win).take(field_w).collect();
+                    (pad(&visible, field_w), body_st)
+                }
                 None => (pad("Reply", field_w), dim),
             };
             let mut spans = vec![
@@ -2225,12 +2232,13 @@ impl Editor {
                 Span::styled("\u{276f} ", accent),
             ];
             match focus {
-                Some(f) if f.cursor < field_w => {
+                Some(f) if field_w > 0 && f.cursor - win < field_w => {
                     // Split the draft around the caret cell so it shows.
+                    let cursor = f.cursor - win;
                     let chars: Vec<char> = draft.chars().collect();
-                    let before: String = chars[..f.cursor].iter().collect();
-                    let at: String = chars[f.cursor..=f.cursor].iter().collect();
-                    let after: String = chars[f.cursor + 1..].iter().collect();
+                    let before: String = chars[..cursor].iter().collect();
+                    let at: String = chars[cursor..=cursor].iter().collect();
+                    let after: String = chars[cursor + 1..].iter().collect();
                     spans.push(Span::styled(before, style));
                     spans.push(Span::styled(
                         at,
@@ -10066,6 +10074,50 @@ mod tests {
         assert_eq!(e.cursor_row, 0);
     }
 
+    /// A reply longer than the footer field must window around the caret:
+    /// the frozen first-N-chars rendering meant typing past the field width
+    /// went blind - no caret anywhere and the new text never appearing.
+    #[test]
+    fn a_long_reply_windows_so_the_caret_and_tail_stay_visible() {
+        let mut e = editor_with("first\nsecond\nthird");
+        e.comment_boxes = vec![CommentBox {
+            id: 7,
+            line: 0,
+            author: "navigator".into(),
+            body: "tighten this".into(),
+        }];
+        let reply = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_TAIL";
+        e.comment_focus = Some(CommentFocus {
+            id: 7,
+            reply: reply.into(),
+            cursor: reply.chars().count(),
+        });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let footer: String = (0..area.width)
+            .map(|x| buf[(x, 4)].symbol().to_string())
+            .collect();
+        assert!(
+            footer.contains("_TAIL"),
+            "the field must window to keep the tail under the caret visible: {footer:?}"
+        );
+        let caret_cells = (0..area.width)
+            .filter(|&x| {
+                buf[(x, 4)]
+                    .style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            })
+            .count();
+        assert_eq!(caret_cells, 1, "exactly one caret cell renders: {footer:?}");
+    }
+
     /// The focused box renders the typed reply in its footer field.
     #[test]
     fn focused_comment_box_renders_the_reply_draft() {
@@ -11900,7 +11952,10 @@ mod tests {
             id: 1,
             line: 1,
             author: String::from("navigator"),
-            body: (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+            body: (0..20)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
         });
         let area = Rect {
             x: 0,

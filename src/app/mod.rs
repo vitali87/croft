@@ -16022,8 +16022,27 @@ impl App {
                         // where it last commented). A file that is not live
                         // any more falls back to the OUTPUT channel rather
                         // than losing the navigator's words.
-                        let anchor =
-                            origin.or_else(|| file.clone().map(|f| (f, self.editor.cursor_row)));
+                        let anchor = origin.or_else(|| {
+                            file.clone().map(|f| {
+                                // The caret row only means something in the
+                                // file it is in: pairing the last-noted
+                                // file with the ACTIVE tab's cursor row
+                                // anchored the box at an unrelated line.
+                                // Any other file clamps to its end.
+                                let same = self
+                                    .editor
+                                    .path
+                                    .as_ref()
+                                    .and_then(|p| collab_file_key(&self.tree.root, p))
+                                    .is_some_and(|active| active == f);
+                                let row = if same {
+                                    self.editor.cursor_row
+                                } else {
+                                    usize::MAX
+                                };
+                                (f, row)
+                            })
+                        });
                         let landed = anchor.as_ref().and_then(|(f, row)| {
                             self.pair_host
                                 .as_ref()
@@ -16200,9 +16219,12 @@ impl App {
             return;
         };
         let content = self.editor.lines.join("\n");
-        host.append_to_note(focus.id, &format!("you: {reply}"));
         match host.send_reply_turn(&file, row, &note_body, &reply, &content) {
             Ok(()) => {
+                // Only after the send: a failed send keeps the draft for a
+                // retry, and appending first would duplicate the reply in
+                // the box on every attempt.
+                host.append_to_note(focus.id, &format!("you: {reply}"));
                 self.pair_turn_origin = Some((file, row));
                 self.status = format!("Replied to {}", host.name());
                 self.editor.comment_focus = None;
@@ -26941,6 +26963,10 @@ impl App {
         self.pair_host_lock_path = crate::session::pair_host_lock_path(&new_root);
         self.navigator_down = false; // the death latch belonged to the old root
         self.last_pair_check = None; // read the new record this tick, not in 1s
+        // Old-workspace carets are keyed by root-relative file, so a
+        // same-named file under the new root would wear a departed peer's
+        // caret. The live session repopulates its own on the next poll.
+        self.collab_carets.clear();
         self.status = if shell_synced {
             format!("Workspace root: {display}")
         } else {
