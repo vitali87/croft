@@ -104,6 +104,15 @@ color_quant = "1.1"
 # codicons are pure `<path>` glyphs, so this trims fontdb/rustybuzz entirely.
 resvg = { version = "0.47", default-features = false }
 ureq = { version = "2", default-features = false, features = ["tls"] }
+# The local-model navigator transport only (src/pair/local.rs). Version 3's
+# phased timeouts check the remaining budget before EVERY socket read, so one
+# per-request global timeout enforces the turn deadline at the socket layer
+# and a deadline cut drops the response and closes the socket. Version 2's
+# only knob is a fixed per-read timeout, which parked a blocked read (plus a
+# helper thread and the socket) long past the deadline on a silent peer.
+# The rest of the tree stays on ureq 2 until those call sites migrate.
+# 3.3.0 verified current on crates.io 2026-07-31.
+ureq3 = { package = "ureq", version = "3", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Text CRDT for multiplayer Phase D (independent viewports): tracks concurrent

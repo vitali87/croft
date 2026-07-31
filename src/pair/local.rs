@@ -100,33 +100,50 @@ pub(crate) fn stream_turn_until(
         "system": system,
         "messages": messages,
     });
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        // Per-read, not per-request: a cold model may take minutes to load
-        // before its first token, but the whole stream may run far longer.
-        .timeout_read(Duration::from_secs(300))
-        // Never follow redirects: ureq replays the x-api-key header to the
-        // redirect target, so a loopback endpoint answering 302 could bounce
-        // the credential to an arbitrary host (and a 301 would downgrade
-        // the POST to GET anyway). A redirect surfaces as a status error.
-        .redirects(0)
-        .build();
+    // ureq 3 here, not the tree-wide ureq 2: version 3's phased timeouts
+    // check the remaining budget before EVERY socket operation, so the
+    // per-request global timeout below enforces the turn deadline at the
+    // socket layer. A read can neither outlive the deadline nor keep the
+    // socket alive after it: the cut drops the response, which closes the
+    // connection. Version 2's only knob was a fixed per-read timeout, which
+    // parked a blocked read (plus a helper thread and the socket) for up to
+    // that timeout past the deadline on a peer that just went silent.
+    let agent = ureq3::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(5)))
+        // Never follow redirects: the x-api-key header would be replayed to
+        // the redirect target, so a loopback endpoint answering 302 could
+        // bounce the credential to an arbitrary host (and a 301 would
+        // downgrade the POST to GET anyway). With 0 the 3xx comes back as a
+        // plain response and is refused below.
+        .max_redirects(0)
+        // Non-2xx arrives as a response, not an error: the error BODY
+        // carries the fix ("model 'x' not found, try pulling it first").
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
     let token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
     let (api_key, bearer) = auth_for(base_url, token.as_deref());
     let mut post = agent
-        .post(&format!("{base_url}/v1/messages"))
-        .set("content-type", "application/json")
-        .set("anthropic-version", "2023-06-01")
-        .set("x-api-key", &api_key);
+        .post(format!("{base_url}/v1/messages"))
+        .config()
+        // The whole exchange (headers, cold-model wait, every body read)
+        // shares the turn's remaining wall-clock budget.
+        .timeout_global(Some(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        ))
+        .build()
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-api-key", &api_key);
     if let Some(bearer) = &bearer {
-        post = post.set("authorization", bearer);
+        post = post.header("authorization", bearer);
     }
-    let resp = match post.send_string(&req.to_string()) {
+    let resp = match post.send(req.to_string()) {
         Ok(r) => r,
         Err(e) => {
             // The endpoint never answered the turn: pop the user message so
             // the conversation stays balanced. Leaving it made the NEXT turn
-            // send [user, user] - a hard 400 on strict gateways for the rest
+            // send [user, user], a hard 400 on strict gateways for the rest
             // of the seat's life, or a silent re-submit of the unanswered
             // ask on permissive local servers.
             messages.pop();
@@ -134,23 +151,37 @@ pub(crate) fn stream_turn_until(
                 state,
                 turn_tx,
                 true,
-                format!("local endpoint {base_url}: {}", error_detail(e)),
+                format!("local endpoint {base_url}: {}", error_detail(&e)),
             );
             return;
         }
     };
 
+    let status = resp.status().as_u16();
     // With redirects disabled a 3xx arrives as a plain response; name it
     // instead of reading an empty stream (following it would have replayed
     // the credential header to wherever Location pointed).
-    if resp.status() >= 300 {
-        let status = resp.status();
+    if (300..400).contains(&status) {
         messages.pop();
         end_turn(
             state,
             turn_tx,
             true,
             format!("local endpoint {base_url}: redirect refused (status {status})"),
+        );
+        return;
+    }
+    if status >= 400 {
+        let body = resp.into_body().read_to_string().unwrap_or_default();
+        messages.pop();
+        end_turn(
+            state,
+            turn_tx,
+            true,
+            format!(
+                "local endpoint {base_url}: {}",
+                status_detail(status, &body)
+            ),
         );
         return;
     }
@@ -164,40 +195,18 @@ pub(crate) fn stream_turn_until(
     let mut clean_end = false;
     let mut truncated = false;
     let mut stream_error: Option<String> = None;
-    // Total wall-clock ceiling: the 300s socket timeout is per READ, so a
-    // server trickling bytes could otherwise hold the seat busy forever.
-    // The deadline is enforced per CHUNK, not per line - `lines()` blocks
-    // until a newline arrives, so a stream of non-newline bytes would have
-    // dodged a per-line check indefinitely. And because the blocking `read`
-    // itself cannot be interrupted, a helper thread owns the socket and
-    // forwards chunks over a channel: the loop waits at most the REMAINING
-    // turn time for each one, so a peer that holds the body open in silence
-    // cannot park the turn inside `read` past the ceiling. After a cut the
-    // helper lingers until its read returns (at worst the socket timeout),
-    // notices the receiver is gone, and exits.
-    let mut reader = resp.into_reader();
+    // Total wall-clock ceiling: the transport's global timeout above bounds
+    // every socket read by the remaining budget, so a silent or trickling
+    // peer is cut mid-read at the deadline (and dropping the reader then
+    // closes the socket). The deadline is enforced per CHUNK, not per line;
+    // `lines()` blocks until a newline arrives, so a stream of non-newline
+    // bytes would have dodged a per-line check indefinitely.
+    let mut reader = resp.into_body().into_reader();
     let mut pending: Vec<u8> = Vec::new();
-    let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<std::io::Result<Vec<u8>>>();
-    std::thread::spawn(move || {
-        let mut chunk = [0u8; 4096];
-        loop {
-            match std::io::Read::read(&mut reader, &mut chunk) {
-                Ok(0) => break, // hung up; the dropped sender says so
-                Ok(n) => {
-                    if chunk_tx.send(Ok(chunk[..n].to_vec())).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let _ = chunk_tx.send(Err(e));
-                    break;
-                }
-            }
-        }
-    });
+    let mut chunk = [0u8; 4096];
     'stream: loop {
-        // Checked even when chunks are queued: a peer flooding bytes faster
-        // than they drain must not starve the deadline.
+        // Checked even while data flows: a peer flooding bytes faster than
+        // they drain must not starve the deadline.
         if std::time::Instant::now() > deadline {
             stream_error = Some(String::from("turn exceeded the 10 minute ceiling"));
             break;
@@ -208,17 +217,16 @@ pub(crate) fn stream_turn_until(
             stream_error = Some(String::from("endpoint sent an over-long SSE line"));
             break;
         }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let bytes = match chunk_rx.recv_timeout(remaining) {
-            Ok(Ok(b)) => b,
-            // Hung up (EOF or read error); finish() reverts open fences.
-            Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        let n = match std::io::Read::read(&mut reader, &mut chunk) {
+            Ok(0) => break, // hung up; finish() reverts open fences
+            Ok(n) => n,
+            Err(e) if is_timeout(&e) => {
                 stream_error = Some(String::from("turn exceeded the 10 minute ceiling"));
                 break;
             }
+            Err(_) => break, // hung up; finish() reverts open fences
         };
-        pending.extend_from_slice(&bytes);
+        pending.extend_from_slice(&chunk[..n]);
         while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
             let raw: Vec<u8> = pending.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&raw[..raw.len() - 1]);
@@ -298,23 +306,39 @@ pub(crate) fn stream_turn_until(
 /// Total wall-clock ceiling for one turn (the socket timeout is per read).
 const TURN_DEADLINE: Duration = Duration::from_secs(600);
 
-/// The failure text for a request error, with any HTTP error body included:
-/// the body carries the fix ("model 'x' not found, try pulling it first"),
-/// and ureq's Display is just the status code.
-fn error_detail(e: ureq::Error) -> String {
+/// The failure text for a transport error. HTTP statuses never land here
+/// (`http_status_as_error(false)` returns them as responses, handled by
+/// [`status_detail`]); a deadline hit before the headers arrived reads
+/// better as the ceiling than as ureq's "timeout: global".
+fn error_detail(e: &ureq3::Error) -> String {
     match e {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            let body = body.trim();
-            if body.is_empty() {
-                format!("status {code}")
-            } else {
-                let short: String = body.chars().take(200).collect();
-                format!("status {code}: {short}")
-            }
-        }
+        ureq3::Error::Timeout(_) => String::from("turn exceeded the 10 minute ceiling"),
         other => other.to_string(),
     }
+}
+
+/// The failure text for an HTTP error status, with the error body included:
+/// the body carries the fix ("model 'x' not found, try pulling it first").
+fn status_detail(status: u16, body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        format!("status {status}")
+    } else {
+        let short: String = body.chars().take(200).collect();
+        format!("status {status}: {short}")
+    }
+}
+
+/// Whether a body-read error is the transport enforcing the turn deadline
+/// (the global timeout travels inside `io::Error::other`).
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) || e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq3::Error>())
+        .is_some_and(|u| matches!(u, ureq3::Error::Timeout(_)))
 }
 
 /// The local twin of the claude reader's `result` handling: reset the

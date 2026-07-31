@@ -2678,6 +2678,56 @@ mod tests {
         pump.join().unwrap();
     }
 
+    /// A deadline cut must also RELEASE the connection. Returning on time
+    /// while a detached reader stayed blocked in `read` kept the socket and
+    /// a thread alive for up to the 300s socket timeout per failed turn, so
+    /// repeated failures accumulated both. The server observing EOF right
+    /// after the cut is the proof the transport let go.
+    #[test]
+    fn a_deadline_cut_releases_the_connection() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (eof_tx, eof_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req);
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
+            // Silent body: block until the CLIENT hangs up. EOF or a reset
+            // is the release; draining any leftover request bytes first.
+            let mut probe = [0u8; 64];
+            loop {
+                match sock.read(&mut probe) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = eof_tx.send(());
+        });
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn_until(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+            Instant::now() + Duration::from_millis(300),
+        );
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error, "a deadline cut is a failure: {}", end.text);
+        eof_rx.recv_timeout(Duration::from_secs(2)).expect(
+            "the deadline cut must close the connection, not park it until the socket timeout",
+        );
+        assert!(messages.is_empty(), "the conversation stays balanced");
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
     /// Malformed SSE data mid-stream silently dropped a chunk of the reply
     /// and still reported success; a broken endpoint must fail the turn.
     #[test]
