@@ -19742,12 +19742,66 @@ fn next_note_by_row_walks_rows_in_order_and_wraps() {
         (3u64, 6usize, String::from("mid")),
     ];
     // From the top: nearest row strictly greater.
-    assert_eq!(notes[super::next_note_by_row(&notes, 0)].1, 2);
-    assert_eq!(notes[super::next_note_by_row(&notes, 2)].1, 6);
-    assert_eq!(notes[super::next_note_by_row(&notes, 6)].1, 10);
+    assert_eq!(notes[super::next_note_by_row(&notes, (0, usize::MAX))].1, 2);
+    assert_eq!(notes[super::next_note_by_row(&notes, (2, usize::MAX))].1, 6);
+    assert_eq!(
+        notes[super::next_note_by_row(&notes, (6, usize::MAX))].1,
+        10
+    );
     // Past the last note: wrap to the smallest row (not stick on row 10).
-    assert_eq!(notes[super::next_note_by_row(&notes, 10)].1, 2);
-    assert_eq!(notes[super::next_note_by_row(&notes, 99)].1, 2);
+    assert_eq!(
+        notes[super::next_note_by_row(&notes, (10, usize::MAX))].1,
+        2
+    );
+    assert_eq!(
+        notes[super::next_note_by_row(&notes, (99, usize::MAX))].1,
+        2
+    );
+}
+
+/// Collab carets are keyed by root-relative file paths: after a re-root, a
+/// same-named file under the new root would wear a departed peer's caret
+/// from the old workspace. Re-rooting clears them; a live session
+/// repopulates its own on the next poll.
+#[test]
+fn changing_the_workspace_root_drops_stale_collab_carets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = tmp.path().join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.collab_carets.insert(
+        7,
+        CollabCaret {
+            file: String::from("src/main.rs"),
+            row: 3,
+            col: 1,
+            name: String::from("guest"),
+            last_moved: std::time::Instant::now(),
+        },
+    );
+    app.change_workspace_root(inner);
+    assert!(
+        app.collab_carets.is_empty(),
+        "old-workspace carets must not survive a re-root"
+    );
+}
+
+/// Replying anchors the navigator's answer on the answered note's own row,
+/// so two notes on one row is the NORMAL state after one reply. The index
+/// tie-break must step through both and wrap - a row-only walk went
+/// first-note → first-note forever and the answer was unreachable by F4.
+#[test]
+fn next_note_by_row_steps_through_co_anchored_notes() {
+    let notes = vec![
+        (1u64, 5usize, String::from("original")),
+        (2u64, 5usize, String::from("answer")),
+    ];
+    // Focused on the first note at row 5: F4 reaches its co-anchored answer.
+    assert_eq!(super::next_note_by_row(&notes, (5, 0)), 1);
+    // Focused on the answer: F4 wraps back to the first.
+    assert_eq!(super::next_note_by_row(&notes, (5, 1)), 0);
+    // From a bare caret on that row, neither is "past" it: wrap to first.
+    assert_eq!(super::next_note_by_row(&notes, (5, usize::MAX)), 0);
 }
 
 /// Only one croft self-appoints the navigator owner per workspace: a second
@@ -19963,11 +20017,21 @@ fn cmd_k_y_yields_the_active_file_and_commentary_reaches_output() {
         std::thread::sleep(Duration::from_millis(10));
     }
     // The fake's "Reviewing." commentary flows to the Navigator channel.
+    // OUTPUT is process-global, so only lines past this test's own baseline
+    // count: a sibling test's residue on the same channel must not be able
+    // to satisfy the wait.
+    let baseline = crate::output::snapshot("Navigator")
+        .unwrap_or_default()
+        .len();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         app.poll_pair();
         let lines = crate::output::snapshot("Navigator").unwrap_or_default();
-        if lines.iter().any(|l| l.text.contains("Reviewing.")) {
+        if lines
+            .iter()
+            .skip(baseline)
+            .any(|l| l.text.contains("Reviewing."))
+        {
             break;
         }
         assert!(

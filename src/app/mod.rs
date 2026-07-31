@@ -16022,8 +16022,27 @@ impl App {
                         // where it last commented). A file that is not live
                         // any more falls back to the OUTPUT channel rather
                         // than losing the navigator's words.
-                        let anchor =
-                            origin.or_else(|| file.clone().map(|f| (f, self.editor.cursor_row)));
+                        let anchor = origin.or_else(|| {
+                            file.clone().map(|f| {
+                                // The caret row only means something in the
+                                // file it is in: pairing the last-noted
+                                // file with the ACTIVE tab's cursor row
+                                // anchored the box at an unrelated line.
+                                // Any other file clamps to its end.
+                                let same = self
+                                    .editor
+                                    .path
+                                    .as_ref()
+                                    .and_then(|p| collab_file_key(&self.tree.root, p))
+                                    .is_some_and(|active| active == f);
+                                let row = if same {
+                                    self.editor.cursor_row
+                                } else {
+                                    usize::MAX
+                                };
+                                (f, row)
+                            })
+                        });
                         let landed = anchor.as_ref().and_then(|(f, row)| {
                             self.pair_host
                                 .as_ref()
@@ -16200,9 +16219,12 @@ impl App {
             return;
         };
         let content = self.editor.lines.join("\n");
-        host.append_to_note(focus.id, &format!("you: {reply}"));
         match host.send_reply_turn(&file, row, &note_body, &reply, &content) {
             Ok(()) => {
+                // Only after the send: a failed send keeps the draft for a
+                // retry, and appending first would duplicate the reply in
+                // the box on every attempt.
+                host.append_to_note(focus.id, &format!("you: {reply}"));
                 self.pair_turn_origin = Some((file, row));
                 self.status = format!("Replied to {}", host.name());
                 self.editor.comment_focus = None;
@@ -16260,9 +16282,9 @@ impl App {
             .editor
             .comment_focus
             .as_ref()
-            .and_then(|f| notes.iter().find(|(id, ..)| *id == f.id))
-            .map(|(_, row, _)| *row)
-            .unwrap_or(self.editor.cursor_row);
+            .and_then(|f| notes.iter().position(|(id, ..)| *id == f.id))
+            .map(|i| (notes[i].1, i))
+            .unwrap_or((self.editor.cursor_row, usize::MAX));
         let idx = next_note_by_row(notes, here);
         Some((notes[idx].0, notes[idx].1))
     }
@@ -26941,6 +26963,10 @@ impl App {
         self.pair_host_lock_path = crate::session::pair_host_lock_path(&new_root);
         self.navigator_down = false; // the death latch belonged to the old root
         self.last_pair_check = None; // read the new record this tick, not in 1s
+        // Old-workspace carets are keyed by root-relative file, so a
+        // same-named file under the new root would wear a departed peer's
+        // caret. The live session repopulates its own on the next poll.
+        self.collab_carets.clear();
         self.status = if shell_synced {
             format!("Workspace root: {display}")
         } else {
@@ -29744,17 +29770,25 @@ fn is_extensions_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'x')
 }
 
-/// Index of the next navigator note to visit from caret row `here`: the note
-/// with the smallest row strictly greater than `here`, wrapping to the
-/// smallest row overall. `notes` are in landing (stream) order, not row
-/// order, so a naive `position(row > here)` would skip notes and could stick.
-fn next_note_by_row(notes: &[(u64, usize, String)], here: usize) -> usize {
+/// Index of the next navigator note to visit from `here` = (row, index of
+/// the currently focused note, or `usize::MAX` when the walk starts from a
+/// bare caret row): the note with the smallest (row, index) strictly greater
+/// than `here`, wrapping to the smallest overall. The index tie-break makes
+/// every note on a shared row reachable - the reply flow anchors the
+/// navigator's answer on the answered note's own row, and a row-only walk
+/// could never step from the first co-anchored note to the second.
+fn next_note_by_row(notes: &[(u64, usize, String)], here: (usize, usize)) -> usize {
     notes
         .iter()
         .enumerate()
-        .filter(|(_, (_, row, _))| *row > here)
-        .min_by_key(|(_, (_, row, _))| *row)
-        .or_else(|| notes.iter().enumerate().min_by_key(|(_, (_, row, _))| *row))
+        .filter(|(i, (_, row, _))| (*row, *i) > here)
+        .min_by_key(|(i, (_, row, _))| (*row, *i))
+        .or_else(|| {
+            notes
+                .iter()
+                .enumerate()
+                .min_by_key(|(i, (_, row, _))| (*row, *i))
+        })
         .map(|(i, _)| i)
         .unwrap_or(0)
 }

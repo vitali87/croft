@@ -62,18 +62,18 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The wheel over a PDF no longer freezes croft on a momentum flick (same-direction bursts coalesce) and stops at the first and last page instead of wrapping around.",
+        summary: "Navigator comment boxes taller than the window are fully readable: non-wrap scrolling steps into and past a box, the scrollbar is live and accurate with boxes on screen, and a long reply windows around the caret instead of going blind.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A PDF rebuilt on disk shows its fresh render immediately: the preview re-bakes on content change, not just on a page or layout change.",
+        summary: "F4 reaches every comment, including the navigator's answer anchored on the same line as the note you replied to.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Croft.app opens every file you selected in Finder, and paths with apostrophes, quotes or spaces survive the launcher's two shell layers.",
+        summary: "Proactive navigator looks stop over-firing: list bullets, block quotes, paragraph splits, and single struct fields or enum variants no longer summon an unsolicited comment turn.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Opening a file while the terminal is maximized restores the editor instead of typing into an invisible buffer, a right-click menu over an image survives on iTerm2 and Sixel, and End on a PDF with an unknown page count says so instead of failing on page 4294967295.",
+        summary: "A failed reply no longer duplicates your text in the box, commentary anchors only in its own file, and changing the workspace root drops the old workspace's collaborator carets.",
     },
 ];
