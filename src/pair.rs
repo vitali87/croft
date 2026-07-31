@@ -2074,6 +2074,25 @@ mod tests {
     /// request, and streams `deltas` as `content_block_delta`/`text_delta`
     /// events followed by `message_stop`, closing to end the stream.
     fn serve_sse_once(deltas: Vec<&'static str>) -> (String, std::thread::JoinHandle<()>) {
+        let mut body = String::new();
+        for d in deltas {
+            let ev = json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": d },
+            });
+            body.push_str(&format!("event: content_block_delta\ndata: {ev}\n\n"));
+        }
+        body.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        serve_http_once(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             connection: close\r\n\r\n{body}"
+        ))
+    }
+
+    /// One-shot HTTP stub answering `resp` verbatim after draining the whole
+    /// request (headers + Content-Length body), per the SSE-stub trap.
+    fn serve_http_once(resp: String) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -2101,20 +2120,6 @@ mod tests {
                     }
                 }
             }
-            let mut body = String::new();
-            for d in deltas {
-                let ev = json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": { "type": "text_delta", "text": d },
-                });
-                body.push_str(&format!("event: content_block_delta\ndata: {ev}\n\n"));
-            }
-            body.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
-                 connection: close\r\n\r\n{body}"
-            );
             let _ = sock.write_all(resp.as_bytes());
         });
         (base_url, server)
@@ -2345,9 +2350,166 @@ mod tests {
             end.text
         );
         assert!(!state.lock().unwrap().turn_active());
-        assert_eq!(messages.len(), 1, "no assistant message on a failed turn");
+        assert!(
+            messages.is_empty(),
+            "the unanswered user message is popped so the next ask starts clean"
+        );
         stop.store(true, Ordering::Relaxed);
         pump.join().unwrap();
+    }
+
+    /// A stream that dies before `message_stop` is a FAILED turn: the old
+    /// code reported success ("claude finished its turn") while the partial
+    /// edit had been reverted and nothing happened - and it appended the
+    /// partial text as an assistant message, corrupting the conversation.
+    #[test]
+    fn a_mid_stream_drop_reports_failure_and_balances_the_conversation() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let ev = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": "half a rep" },
+        });
+        let (base_url, server) = serve_http_once(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             connection: close\r\n\r\nevent: content_block_delta\ndata: {ev}\n\n"
+        ));
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(
+            end.is_error,
+            "an unclean stream end is a failure: {}",
+            end.text
+        );
+        assert!(
+            messages.is_empty(),
+            "the conversation stays balanced for the next ask"
+        );
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// The HTTP error body carries the fix ("model 'x' not found, try
+    /// pulling it first"); throwing it away left an opaque status code.
+    #[test]
+    fn an_http_error_body_reaches_the_surfaced_failure() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let (base_url, server) = serve_http_once(String::from(
+            "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\n\
+             connection: close\r\n\r\n{\"error\":\"model 'qwn3' not found, try pulling it\"}",
+        ));
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn(
+            &base_url,
+            "qwn3",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error);
+        assert!(
+            end.text.contains("not found, try pulling it"),
+            "the body's own words must survive: {}",
+            end.text
+        );
+        assert!(messages.is_empty());
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// `stop_reason: max_tokens` means the reply (and any fence in it) was
+    /// cut off; reporting success would pretend the half-edit was the turn.
+    #[test]
+    fn a_token_limit_truncation_is_a_failed_turn() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let delta = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": "prose" },
+        });
+        let md = json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "max_tokens" },
+        });
+        let (base_url, server) = serve_http_once(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             connection: close\r\n\r\n\
+             event: content_block_delta\ndata: {delta}\n\n\
+             event: message_delta\ndata: {md}\n\n\
+             event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        ));
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error, "truncation must not read as success");
+        assert!(end.text.contains("truncated"), "{}", end.text);
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// The environment credential only ever travels to https or loopback
+    /// destinations; a cleartext remote hop gets the harmless placeholder.
+    #[test]
+    fn the_credential_never_rides_cleartext_to_a_remote_host() {
+        use local::auth_for;
+        assert_eq!(
+            auth_for("http://box:8080", Some("secret")),
+            (String::from("croft"), None),
+        );
+        assert_eq!(
+            auth_for("http://localhost.evil.com:80", Some("secret")),
+            (String::from("croft"), None),
+        );
+        let bearer = Some(String::from("Bearer t"));
+        assert_eq!(
+            auth_for("http://localhost:11434", Some("t")),
+            (String::from("t"), bearer.clone()),
+        );
+        assert_eq!(
+            auth_for("http://127.0.0.1:11434", Some("t")),
+            (String::from("t"), bearer.clone()),
+        );
+        assert_eq!(
+            auth_for("http://[::1]:11434", Some("t")),
+            (String::from("t"), bearer.clone()),
+        );
+        assert_eq!(
+            auth_for("https://gw.example.com", Some("t")),
+            (String::from("t"), bearer),
+        );
+        assert_eq!(
+            auth_for("http://localhost:11434", None),
+            (String::from("croft"), None)
+        );
     }
 
     /// The childless local seat end to end: seat_local connects the guest
