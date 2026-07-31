@@ -105,6 +105,11 @@ pub(crate) fn stream_turn_until(
         // Per-read, not per-request: a cold model may take minutes to load
         // before its first token, but the whole stream may run far longer.
         .timeout_read(Duration::from_secs(300))
+        // Never follow redirects: ureq replays the x-api-key header to the
+        // redirect target, so a loopback endpoint answering 302 could bounce
+        // the credential to an arbitrary host (and a 301 would downgrade
+        // the POST to GET anyway). A redirect surfaces as a status error.
+        .redirects(0)
         .build();
     let token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
     let (api_key, bearer) = auth_for(base_url, token.as_deref());
@@ -134,6 +139,21 @@ pub(crate) fn stream_turn_until(
             return;
         }
     };
+
+    // With redirects disabled a 3xx arrives as a plain response; name it
+    // instead of reading an empty stream (following it would have replayed
+    // the credential header to wherever Location pointed).
+    if resp.status() >= 300 {
+        let status = resp.status();
+        messages.pop();
+        end_turn(
+            state,
+            turn_tx,
+            true,
+            format!("local endpoint {base_url}: redirect refused (status {status})"),
+        );
+        return;
+    }
 
     let mut fence = FenceMachine::new();
     let mut assistant = String::new();

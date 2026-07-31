@@ -133,6 +133,16 @@ fn pair_off_and_reactivation_keep_the_recorded_backend() {
     assert!(r.contains("\"provider\":\"ollama\""), "{r}");
     assert!(r.contains("http://localhost:9999"), "{r}");
     assert!(r.contains("qwen3-coder:30b"), "{r}");
+    // An explicit provider SWITCH starts fresh: the other backend's
+    // endpoint and model must not ride along into the claude record.
+    run(&["pair", "--provider", "claude"]);
+    let r = read();
+    assert!(r.contains("\"provider\":\"claude\""), "{r}");
+    assert!(
+        !r.contains("http://localhost:9999"),
+        "the ollama endpoint must not survive a provider switch: {r}"
+    );
+    assert!(!r.contains("qwen3-coder:30b"), "{r}");
     // Activation detached a relay for the workspace; reap it so test runs
     // do not accumulate idle processes.
     let sessions = home.path().join(".cache/croft/sessions");

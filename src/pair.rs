@@ -2663,6 +2663,42 @@ mod tests {
         pump.join().unwrap();
     }
 
+    /// A 3xx from the endpoint must NOT be followed: ureq replays the
+    /// x-api-key header to the redirect target, so a loopback endpoint
+    /// answering 302 could bounce the credential to an arbitrary host. The
+    /// redirect surfaces as a failed turn naming the status.
+    #[test]
+    fn a_redirect_is_refused_not_followed() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let (base_url, server) = serve_http_once(String::from(
+            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:1/v1/messages\r\n\
+             connection: close\r\n\r\n",
+        ));
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error);
+        assert!(
+            end.text.contains("302"),
+            "the redirect is refused with its status, not followed: {}",
+            end.text
+        );
+        assert!(messages.is_empty());
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
     /// The childless local seat end to end: seat_local connects the guest
     /// seat, the queued turn streams the stub endpoint's fenced edit into
     /// the owner's replica, the turn ends cleanly, and shutdown returns

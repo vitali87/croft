@@ -19790,6 +19790,7 @@ fn toggling_the_navigator_preserves_its_provider() {
     assert_eq!(r.provider.as_deref(), Some("ollama"));
     assert_eq!(r.base_url.as_deref(), Some("http://localhost:11434"));
     assert_eq!(r.model.as_deref(), Some("qwen3-coder:30b"));
+    assert_eq!(r.name, "navigator", "the seat keeps its name too");
 }
 
 /// Collab carets are keyed by root-relative file paths: after a re-root, a

@@ -349,11 +349,28 @@ impl Cli {
                 // silently converted a disabled ollama record into a cloud
                 // claude seat.
                 let current = crate::session::read_pair_record(&record_path);
-                let model = model.or_else(|| current.as_ref().and_then(|r| r.model.clone()));
-                let base_url =
-                    base_url.or_else(|| current.as_ref().and_then(|r| r.base_url.clone()));
-                let provider =
-                    provider.or_else(|| current.as_ref().and_then(|r| r.provider.clone()));
+                let recorded = current.as_ref().and_then(|r| r.provider.clone());
+                // An explicit provider SWITCH starts that backend fresh:
+                // inheriting the other backend's endpoint or model would
+                // mis-configure the new seat (a claude record persists
+                // provider None, so compare normalised names).
+                let normal = |p: &Option<String>| {
+                    p.as_deref()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| String::from("claude"))
+                };
+                let inherit = provider.is_none() || normal(&provider) == normal(&recorded);
+                let model = model.or_else(|| {
+                    inherit
+                        .then(|| current.as_ref().and_then(|r| r.model.clone()))
+                        .flatten()
+                });
+                let base_url = base_url.or_else(|| {
+                    inherit
+                        .then(|| current.as_ref().and_then(|r| r.base_url.clone()))
+                        .flatten()
+                });
+                let provider = provider.or(recorded);
                 let (provider, base_url) = resolve_pair_provider(provider, base_url)?;
                 if off {
                     crate::session::write_pair_record(
