@@ -20842,7 +20842,11 @@ fn the_wheel_does_not_wrap_a_pdf_at_its_ends() {
     app.editor.open(&path).unwrap();
     let (col, row) = place_editor_pane(&mut app);
     wheel(&mut app, MouseEventKind::ScrollUp, col, row);
-    assert_eq!(current_pdf_page(&app), 1, "wheel up on page 1 must not wrap");
+    assert_eq!(
+        current_pdf_page(&app),
+        1,
+        "wheel up on page 1 must not wrap"
+    );
     app.jump_pdf_page(3);
     wheel(&mut app, MouseEventKind::ScrollDown, col, row);
     assert_eq!(
@@ -20868,6 +20872,39 @@ fn opening_a_file_over_a_maximized_terminal_restores_the_editor() {
     assert!(
         !app.terminal_maximized,
         "focusing the editor must restore it from under a maximized terminal"
+    );
+}
+
+/// iTerm2 OSC-1337 and Sixel have no image z-layer: the post-frame image
+/// blit overwrites whatever text sits in those cells, so an open context
+/// menu overlapping the editor preview must suppress the overlay (Kitty
+/// instead layers images below text and needs nothing).
+#[test]
+fn a_context_menu_over_the_editor_image_suppresses_the_blit_on_no_z_protocols() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let img = ratatui::layout::Rect::new(2, 2, 30, 15);
+    assert!(
+        !app.context_menu_covers_rect(img),
+        "no menu open: nothing to suppress"
+    );
+    app.context_menu = Some(ContextMenu::flat(
+        (4, 4),
+        vec![(
+            String::from("Rename"),
+            MenuAction::Rename(tmp.path().into()),
+        )],
+        tmp.path().into(),
+    ));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::ITerm2;
+    assert!(
+        app.context_menu_covers_rect(img),
+        "an overlapping menu must suppress the image on iTerm2"
+    );
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    assert!(
+        !app.context_menu_covers_rect(img),
+        "Kitty layers images below text; the menu already wins"
     );
 }
 

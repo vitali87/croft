@@ -26637,6 +26637,22 @@ impl App {
         }
     }
 
+    /// Whether an open context menu (or its submenu panel) overlaps `rect`
+    /// on a protocol with no image z-layer (iTerm2 OSC-1337, Sixel), where
+    /// the image blit would overpaint the menu. Kitty layers images below
+    /// text, so it never needs this.
+    fn context_menu_covers_rect(&self, rect: Rect) -> bool {
+        match self.inline_protocol {
+            crate::iterm2_inline::InlineImageProtocol::ITerm2
+            | crate::iterm2_inline::InlineImageProtocol::Sixel => {}
+            _ => return false,
+        }
+        self.menu_rect()
+            .into_iter()
+            .chain(self.submenu_rect())
+            .any(|m| rects_intersect(m, rect))
+    }
+
     /// Compute the menu's bounding rect from current state.
     fn menu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
@@ -27673,6 +27689,22 @@ impl App {
                 .and_then(|g| g.image.as_ref())
                 .map_or(0, |i| i.generation),
         };
+        // The cell-buffer protocols (iTerm2 OSC-1337, Sixel) have no
+        // z-layer, so the post-frame image blit would overpaint an open
+        // context menu (Kitty puts the image at deep-negative z instead).
+        // Hold the overlay cleared while a menu overlaps it; the layout
+        // was invalidated, so the first frame after the menu closes or
+        // moves off re-bakes the picture.
+        if self.context_menu_covers_rect(Rect {
+            x: cell_x,
+            y: cell_y,
+            width: cell_w,
+            height: cell_h,
+        }) {
+            self.overlays.editor[side].request_clear_if_displayed();
+            self.overlays.editor[side].invalidate_layout();
+            return;
+        }
         // Skip the bake when nothing about the layout changed - this is
         // the hot path on every frame an image is on screen.
         if self.overlays.editor[side].layout_matches(&desired) {
