@@ -74,6 +74,6 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The gateway token travels as a proper Bearer header and only over https or to localhost, a stalled endpoint can no longer hold the seat busy past ten minutes, and an inverted edit fence reports to OUTPUT instead of corrupting the screen.",
+        summary: "The gateway token travels as a proper Bearer header and only over https or to loopback hosts, a stalled endpoint can no longer hold the seat busy past ten minutes, and an inverted edit fence reports to OUTPUT instead of corrupting the screen.",
     },
 ];

@@ -2565,6 +2565,102 @@ mod tests {
             auth_for("http://localhost:11434", None),
             (String::from("croft"), None)
         );
+        // Userinfo must not fool the gate: the destination here is the
+        // remote host, not localhost.
+        assert_eq!(
+            auth_for("http://localhost:pass@evil.example", Some("secret")),
+            (String::from("croft"), None),
+        );
+        assert_eq!(
+            auth_for("http://127.0.0.2:11434", Some("t")),
+            (String::from("t"), Some(String::from("Bearer t"))),
+            "any 127.x address is loopback"
+        );
+    }
+
+    /// The wall-clock ceiling is enforced per CHUNK: a stream of non-newline
+    /// bytes never completes a line, so a per-line check would have let a
+    /// trickling endpoint hold the seat busy indefinitely.
+    #[test]
+    fn a_trickling_stream_is_cut_at_the_deadline() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let stop_trickle = Arc::new(AtomicBool::new(false));
+        let server = {
+            let stop_trickle = Arc::clone(&stop_trickle);
+            std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut req = [0u8; 4096];
+                let _ = sock.read(&mut req);
+                let _ =
+                    sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
+                // Non-newline bytes, forever (until the test releases us).
+                while !stop_trickle.load(Ordering::Relaxed) {
+                    if sock.write_all(b".").is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        let started = Instant::now();
+        local::stream_turn_until(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+            Instant::now() + Duration::from_millis(300),
+        );
+        let elapsed = started.elapsed();
+        stop_trickle.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error, "a deadline cut is a failure: {}", end.text);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the ceiling must interrupt the trickle promptly, took {elapsed:?}"
+        );
+        assert!(messages.is_empty(), "the conversation stays balanced");
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// Malformed SSE data mid-stream silently dropped a chunk of the reply
+    /// and still reported success; a broken endpoint must fail the turn.
+    #[test]
+    fn malformed_sse_data_fails_the_turn() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let (base_url, server) = serve_http_once(String::from(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             connection: close\r\n\r\ndata: {not json\n\n\
+             event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ));
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        state.lock().unwrap().turn_active = true;
+        local::stream_turn(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+        let end = turn_rx.try_recv().expect("turn ended");
+        assert!(end.is_error);
+        assert!(end.text.contains("malformed"), "{}", end.text);
+        assert!(messages.is_empty());
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
     }
 
     /// The childless local seat end to end: seat_local connects the guest

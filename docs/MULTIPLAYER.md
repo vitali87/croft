@@ -520,9 +520,12 @@ interaction into turn-based driver/navigator pairing:
   — the old turn-supersession rule is gone, only the driver closes a box.
 - **Turn commentary.** The model's non-fence prose accumulates over the
   turn and lands as ONE comment box at the turn's origin (the asked line,
-  the yield caret, or the replied note) when the turn ends. There is no
-  Navigator OUTPUT channel any more; only when the origin file is no
-  longer live does the prose fall back to OUTPUT rather than being lost.
+  the yield caret, or the replied note) when the turn ends. Commentary no
+  longer streams to a Navigator OUTPUT channel; OUTPUT ("Navigator") now
+  carries only diagnostics — prose whose origin file is no longer live
+  (rather than losing it) and warnings like a dropped inverted fence range
+  (which must never hit stderr: the seat runs in-process and stderr would
+  corrupt the alternate screen).
   The NOTE fence is model-protocol only — nothing new rides the relay, so
   0.1.633/634 peers interop untouched.
 - **The navigator's caret (0.1.639).** The seat has a persistent, visible

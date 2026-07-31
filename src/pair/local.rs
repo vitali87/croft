@@ -7,7 +7,6 @@
 //! shared pair machinery; only the transport differs. The endpoint is
 //! stateless, so the caller owns the conversation as a message list.
 
-use std::io::BufRead;
 use std::sync::Mutex;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
@@ -29,25 +28,31 @@ const MAX_TOKENS: u64 = 8192;
 /// instead, so the token cannot be sniffed off the wire. Environment-only
 /// on purpose: a token must never land in `pair.json`.
 pub(crate) fn auth_for(base_url: &str, token: Option<&str>) -> (String, Option<String>) {
-    let allowed = base_url.starts_with("https://")
-        || base_url
-            .strip_prefix("http://")
-            .is_some_and(|rest| loopback_host(rest.split('/').next().unwrap_or("")));
     match token {
-        Some(t) if allowed => (t.to_string(), Some(format!("Bearer {t}"))),
+        Some(t) if credential_allowed(base_url) => (t.to_string(), Some(format!("Bearer {t}"))),
         _ => (String::from("croft"), None),
     }
 }
 
-/// Whether `host_port` (authority without scheme or path) is loopback.
-fn loopback_host(host_port: &str) -> bool {
-    if let Some(rest) = host_port.strip_prefix('[') {
-        return rest.split(']').next() == Some("::1");
+/// Whether the credential may travel to `base_url`: https anywhere, http
+/// only to a loopback host. A real URL parse, not a string scan - the
+/// authority's userinfo made `http://localhost:pass@evil.example` read as
+/// loopback under a colon-split check while the actual destination was the
+/// remote host.
+fn credential_allowed(base_url: &str) -> bool {
+    let Ok(u) = url::Url::parse(base_url) else {
+        return false;
+    };
+    match u.scheme() {
+        "https" => true,
+        "http" => match u.host() {
+            Some(url::Host::Domain(d)) => d == "localhost",
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
     }
-    matches!(
-        host_port.split(':').next().unwrap_or(""),
-        "localhost" | "127.0.0.1"
-    )
 }
 
 /// POST one streaming `/v1/messages` turn and drive its text deltas through
@@ -64,6 +69,29 @@ pub(crate) fn stream_turn(
     messages: &mut Vec<Value>,
     state: &Mutex<PairState>,
     turn_tx: &Sender<TurnEnd>,
+) {
+    stream_turn_until(
+        base_url,
+        model,
+        system,
+        messages,
+        state,
+        turn_tx,
+        std::time::Instant::now() + TURN_DEADLINE,
+    );
+}
+
+/// [`stream_turn`] with an explicit wall-clock deadline, so tests can prove
+/// the ceiling interrupts a trickling stream without waiting ten minutes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_turn_until(
+    base_url: &str,
+    model: &str,
+    system: &str,
+    messages: &mut Vec<Value>,
+    state: &Mutex<PairState>,
+    turn_tx: &Sender<TurnEnd>,
+    deadline: std::time::Instant,
 ) {
     let req = json!({
         "model": model,
@@ -118,49 +146,70 @@ pub(crate) fn stream_turn(
     let mut stream_error: Option<String> = None;
     // Total wall-clock ceiling: the 300s socket timeout is per READ, so a
     // server trickling bytes could otherwise hold the seat busy forever.
-    let deadline = std::time::Instant::now() + TURN_DEADLINE;
-    for line in std::io::BufReader::new(resp.into_reader()).lines() {
+    // The deadline is enforced per CHUNK, not per line - `lines()` blocks
+    // until a newline arrives, so a stream of non-newline bytes would have
+    // dodged a per-line check indefinitely.
+    let mut reader = resp.into_reader();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    'stream: loop {
         if std::time::Instant::now() > deadline {
             stream_error = Some(String::from("turn exceeded the 10 minute ceiling"));
             break;
         }
-        let Ok(line) = line else {
-            break; // endpoint hung up mid-stream; finish() reverts open fences
-        };
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        if data.trim() == "[DONE]" {
-            clean_end = true;
+        // A single SSE line has no business being megabytes long; a cap
+        // keeps a hostile or broken endpoint from ballooning memory.
+        if pending.len() > 1 << 20 {
+            stream_error = Some(String::from("endpoint sent an over-long SSE line"));
             break;
         }
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            continue;
+        let n = match std::io::Read::read(&mut reader, &mut chunk) {
+            Ok(0) | Err(_) => break, // hung up; finish() reverts open fences
+            Ok(n) => n,
         };
-        match v["type"].as_str().unwrap_or("") {
-            "content_block_delta" => {
-                if v["delta"]["type"] == "text_delta"
-                    && let Some(text) = v["delta"]["text"].as_str()
-                {
-                    assistant.push_str(text);
-                    for event in fence.push(text) {
-                        apply_fence_event(state, event);
+        pending.extend_from_slice(&chunk[..n]);
+        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = pending.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw[..raw.len() - 1]);
+            let line = line.trim_end_matches('\r');
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data.trim() == "[DONE]" {
+                clean_end = true;
+                break 'stream;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(data) else {
+                // Skipping silently would drop a chunk of the reply and
+                // still report success; the endpoint is broken, say so.
+                stream_error = Some(String::from("endpoint sent malformed SSE data"));
+                break 'stream;
+            };
+            match v["type"].as_str().unwrap_or("") {
+                "content_block_delta" => {
+                    if v["delta"]["type"] == "text_delta"
+                        && let Some(text) = v["delta"]["text"].as_str()
+                    {
+                        assistant.push_str(text);
+                        for event in fence.push(text) {
+                            apply_fence_event(state, event);
+                        }
                     }
                 }
+                "message_delta" if v["delta"]["stop_reason"] == "max_tokens" => {
+                    truncated = true;
+                }
+                "message_stop" => {
+                    clean_end = true;
+                    break 'stream;
+                }
+                "error" => {
+                    let msg = v["error"]["message"].as_str().unwrap_or("stream error");
+                    stream_error = Some(msg.to_string());
+                    break 'stream;
+                }
+                _ => {}
             }
-            "message_delta" if v["delta"]["stop_reason"] == "max_tokens" => {
-                truncated = true;
-            }
-            "message_stop" => {
-                clean_end = true;
-                break;
-            }
-            "error" => {
-                let msg = v["error"]["message"].as_str().unwrap_or("stream error");
-                stream_error = Some(msg.to_string());
-                break;
-            }
-            _ => {}
         }
     }
     for event in fence.finish() {

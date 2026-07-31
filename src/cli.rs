@@ -338,29 +338,33 @@ impl Cli {
                     .canonicalize()
                     .context("resolving workspace path")?;
                 let name = name.unwrap_or_else(|| "claude".into());
-                let (provider, base_url) = resolve_pair_provider(provider, base_url)?;
                 let record_path = crate::session::pair_record_path(&workspace);
                 if let Some(dir) = record_path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
+                // The persisted record is the baseline; explicit flags
+                // override it. Resolving bare flags in isolation made
+                // `--provider ollama --off` clobber a custom endpoint with
+                // the default one, and a plain `croft pair` re-activation
+                // silently converted a disabled ollama record into a cloud
+                // claude seat.
+                let current = crate::session::read_pair_record(&record_path);
+                let model = model.or_else(|| current.as_ref().and_then(|r| r.model.clone()));
+                let base_url =
+                    base_url.or_else(|| current.as_ref().and_then(|r| r.base_url.clone()));
+                let provider =
+                    provider.or_else(|| current.as_ref().and_then(|r| r.provider.clone()));
+                let (provider, base_url) = resolve_pair_provider(provider, base_url)?;
                 if off {
-                    // Deactivation preserves the recorded backend (and takes
-                    // no flag validation: `--provider ollama --off` must
-                    // simply turn the seat off). Erasing provider/base_url
-                    // here made the documented off/on recovery silently
-                    // convert a local seat into a cloud claude seat.
-                    let current = crate::session::read_pair_record(&record_path);
                     crate::session::write_pair_record(
                         &record_path,
                         &crate::session::PairRecord {
-                            model: model.or_else(|| current.as_ref().and_then(|r| r.model.clone())),
+                            model,
                             name,
                             enabled: false,
                             task: None,
-                            provider: provider
-                                .or_else(|| current.as_ref().and_then(|r| r.provider.clone())),
-                            base_url: base_url
-                                .or_else(|| current.as_ref().and_then(|r| r.base_url.clone())),
+                            provider,
+                            base_url,
                         },
                     )?;
                     println!("navigator deactivated for {}", workspace.display());
@@ -445,13 +449,21 @@ fn resolve_pair_provider(
     // Validate at activation time, when the user is watching: a malformed
     // endpoint otherwise surfaces hours later as an opaque failure on the
     // first turn. A trailing slash would build `...//v1/messages`, which
-    // routers 301 and ureq follows by downgrading POST to GET.
+    // routers 301 and ureq follows by downgrading POST to GET; a prefix
+    // check alone admitted empty hosts (`https:///path`), whitespace, and
+    // malformed ports, so the URL is properly parsed.
     let base_url = base_url
         .map(|u| {
-            let u = u.trim_end_matches('/').to_string();
+            let u = u.trim().trim_end_matches('/').to_string();
+            let parsed = url::Url::parse(&u)
+                .map_err(|e| anyhow::anyhow!("--base-url is not a valid URL ({e}): {u}"))?;
             anyhow::ensure!(
-                u.starts_with("http://") || u.starts_with("https://"),
-                "--base-url must start with http:// or https:// (got {u})"
+                matches!(parsed.scheme(), "http" | "https"),
+                "--base-url must use http or https (got {u})"
+            );
+            anyhow::ensure!(
+                parsed.host_str().is_some_and(|h| !h.is_empty()),
+                "--base-url needs a host (got {u})"
             );
             Ok(u)
         })
@@ -1303,6 +1315,21 @@ mod tests {
         assert!(
             resolve_pair_provider(None, Some(String::from("localhost:11434"))).is_err(),
             "a schemeless endpoint must be refused up front"
+        );
+        assert!(
+            resolve_pair_provider(None, Some(String::from("https://"))).is_err(),
+            "an empty host must be refused"
+        );
+        // Per the WHATWG parser, extra authority slashes are skipped:
+        // `https:///v1` is host `v1`, odd but well-formed, and accepted.
+        assert!(resolve_pair_provider(None, Some(String::from("https:///v1"))).is_ok());
+        assert!(
+            resolve_pair_provider(None, Some(String::from("http://local host:1"))).is_err(),
+            "whitespace must be refused"
+        );
+        assert!(
+            resolve_pair_provider(None, Some(String::from("http://x:99999999"))).is_err(),
+            "a malformed port must be refused"
         );
     }
 

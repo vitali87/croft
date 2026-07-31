@@ -538,6 +538,7 @@ dependencies = [
  "tree-sitter-yaml",
  "tui-input",
  "ureq",
+ "url",
  "zip",
 ]
 
