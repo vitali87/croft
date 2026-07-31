@@ -20908,6 +20908,60 @@ fn a_context_menu_over_the_editor_image_suppresses_the_blit_on_no_z_protocols() 
     );
 }
 
+/// F6 must give the same guarantee as every other route into the editor:
+/// it used to assign focus directly, bypassing `focus_pane`, so cycling
+/// into the editor under a maximized terminal focused a zero-height pane.
+#[test]
+fn cycling_focus_into_the_editor_also_restores_a_maximized_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_maximized = true;
+    for _ in 0..3 {
+        app.cycle_focus();
+        if matches!(app.focus, Pane::Editor) {
+            break;
+        }
+    }
+    assert!(
+        matches!(app.focus, Pane::Editor),
+        "F6 must reach the editor"
+    );
+    assert!(
+        !app.terminal_maximized,
+        "cycling into the editor must restore it, same as any other route"
+    );
+}
+
+/// The wheel cooldown is per document: scrolling one PDF and immediately
+/// wheeling in a second, freshly focused PDF is that document's FIRST
+/// gesture, not a repeat - an app-global cooldown swallowed it.
+#[test]
+fn the_wheel_cooldown_does_not_leak_across_pdf_documents() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.pdf");
+    let b = tmp.path().join("b.pdf");
+    write_three_page_pdf(&a);
+    write_three_page_pdf(&b);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(current_pdf_page(&app), 2);
+    app.editor.open(&b).unwrap();
+    let (col, row) = place_editor_pane(&mut app);
+    // Pin the cooldown stamp to "just now, same direction, other document"
+    // so the window is deterministically open regardless of how long the
+    // rasteriser took: only the document identity may let this tick through.
+    app.last_pdf_wheel = Some((std::time::Instant::now(), 1, Some(a.clone())));
+    wheel(&mut app, MouseEventKind::ScrollDown, col, row);
+    assert_eq!(
+        current_pdf_page(&app),
+        2,
+        "the second document's first wheel tick must not be dropped"
+    );
+}
+
 #[test]
 fn a_spreadsheet_opened_from_the_explorer_scrolls_with_the_arrow_keys() {
     let tmp = tempfile::tempdir().unwrap();

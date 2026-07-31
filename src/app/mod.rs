@@ -2113,10 +2113,12 @@ pub struct App {
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
     cell_pixel: Option<(u32, u32)>,
-    /// Last wheel step applied to a PDF preview (when, and in which
-    /// direction), so a momentum flick's same-direction burst coalesces
-    /// instead of queueing one blocking rasteriser run per event.
-    last_pdf_wheel: Option<(std::time::Instant, i32)>,
+    /// Last wheel step applied to a PDF preview (when, in which direction,
+    /// and on which document), so a momentum flick's same-direction burst
+    /// coalesces instead of queueing one blocking rasteriser run per event.
+    /// Keyed by document: switching to another PDF starts fresh - a reader's
+    /// first gesture there is not a repeat.
+    last_pdf_wheel: Option<(std::time::Instant, i32, Option<PathBuf>)>,
     /// Pre-encoded inline-image for the source-control change-count badge (an
     /// accent pill + count, VS Code's `activityBarBadge`), emitted at z=1 over
     /// the SCM activity icon's bottom-right. `None` when there are no changes,
@@ -8430,17 +8432,21 @@ impl App {
 
     fn cycle_focus(&mut self) {
         // Skip hidden panes when cycling.
+        let mut next = self.focus;
         for _ in 0..3 {
-            self.focus = match self.focus {
+            next = match next {
                 Pane::Tree => Pane::Editor,
                 Pane::Editor => Pane::Terminal,
                 Pane::Terminal => Pane::Tree,
             };
-            if self.pane_visible(self.focus) {
+            if self.pane_visible(next) {
                 break;
             }
         }
-        self.sync_focus_flags();
+        // Through `focus_pane`, never a bare assignment: every route into a
+        // pane shares its guarantees (terminal find/copy-mode teardown, and
+        // restoring the editor from under a maximized terminal).
+        self.focus_pane(next);
     }
 
     /// Returns true exactly once after the welcome OSC-1337 image has been
@@ -27547,13 +27553,15 @@ impl App {
     fn wheel_pdf_page(&mut self, delta: i32) {
         const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(150);
         let now = std::time::Instant::now();
-        if let Some((at, dir)) = self.last_pdf_wheel
-            && dir == delta.signum()
-            && now.duration_since(at) < COOLDOWN
+        let doc = self.editor.path.clone();
+        if let Some((at, dir, last_doc)) = &self.last_pdf_wheel
+            && *dir == delta.signum()
+            && *last_doc == doc
+            && now.duration_since(*at) < COOLDOWN
         {
             return;
         }
-        self.last_pdf_wheel = Some((now, delta.signum()));
+        self.last_pdf_wheel = Some((now, delta.signum(), doc));
         let Some(cur) = self.editor.pdf_page() else {
             return;
         };
