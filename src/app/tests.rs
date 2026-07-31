@@ -19877,15 +19877,17 @@ fn only_one_croft_self_appoints_the_navigator_owner() {
         a.last_pair_check = None;
     };
 
-    // Croft A grabs the single-host lock and self-appoints (the spawn bails,
-    // but the lock is taken first and held).
+    // Croft A grabs the single-host lock, self-appoints, and HOSTS (a
+    // local-provider seat spawns no child): the lock is only kept by a
+    // window that actually holds the seat.
     let mut a = App::new(tmp.path().to_path_buf()).unwrap();
     a.pair_record_path = tmp.path().join("a.pair.json");
     a.pair_socket = socket.clone();
     a.pair_host_lock_path = lock_path.clone();
-    a.pair_spawn_override = Some(Box::new(|_| anyhow::bail!("no real child in test")));
+    a.pair_spawn_override = Some(Box::new(local_test_spawn));
     enable(&mut a);
     a.maybe_seat_navigator();
+    assert!(a.pair_host.is_some(), "A must host: {}", a.status);
     assert!(
         a.pair_host_lock.is_some(),
         "A must hold the single-host lock"
@@ -19906,6 +19908,233 @@ fn only_one_croft_self_appoints_the_navigator_owner() {
         b.status.to_lowercase().contains("another croft"),
         "B must say another croft hosts it, got: {}",
         b.status
+    );
+
+    // The refusal is announced ONCE. B keeps silently polling for takeover,
+    // but re-announcing every second clobbered its status line forever and
+    // dirtied a frame at 1 Hz.
+    b.status = String::from("Saved src/foo.rs");
+    b.last_pair_check = None;
+    let redraw = b.maybe_seat_navigator();
+    assert!(!redraw, "an unchanged refusal must not dirty the frame");
+    assert_eq!(
+        b.status, "Saved src/foo.rs",
+        "the refusal must not clobber the status line again"
+    );
+}
+
+/// A local-provider seat for tests: connects to the workspace relay but
+/// spawns no child process (the endpoint is never contacted until a turn).
+fn local_test_spawn(cfg: &crate::pair::PairConfig) -> anyhow::Result<crate::pair_host::PairHost> {
+    crate::pair_host::PairHost::spawn(crate::pair::PairConfig {
+        socket: cfg.socket.clone(),
+        workspace: cfg.workspace.clone(),
+        name: cfg.name.clone(),
+        model: Some(String::from("test-model")),
+        task: None,
+        provider: crate::pair::Provider::Local {
+            base_url: String::from("http://127.0.0.1:9"),
+        },
+    })
+}
+
+/// A window whose spawn FAILED must not keep the workspace's single-host
+/// lock: it cannot host, so holding the flock only blocks the window that
+/// can. The failed spawner un-appoints itself and releases; the next window
+/// acquires and seats.
+#[test]
+fn a_failed_spawner_releases_the_lock_so_another_window_can_host() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    let lock_path = tmp.path().join("host.lock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let record = crate::session::PairRecord {
+        model: None,
+        name: "nav".into(),
+        enabled: true,
+        task: None,
+        provider: None,
+        base_url: None,
+    };
+
+    let mut a = App::new(tmp.path().to_path_buf()).unwrap();
+    a.pair_record_path = tmp.path().join("a.pair.json");
+    a.pair_socket = socket.clone();
+    a.pair_host_lock_path = lock_path.clone();
+    a.pair_spawn_override = Some(Box::new(|_| anyhow::bail!("claude is broken")));
+    crate::session::write_pair_record(&a.pair_record_path, &record).unwrap();
+    a.last_pair_check = None;
+    a.maybe_seat_navigator();
+    assert!(a.pair_host.is_none());
+    assert!(a.navigator_down, "the failure latches, no 1s retry storm");
+    assert!(
+        a.pair_host_lock.is_none(),
+        "a window that cannot host must release the lock"
+    );
+    assert!(
+        a.collab_config.is_none(),
+        "the same-tick self-appointment is undone with it"
+    );
+
+    let mut b = App::new(tmp.path().to_path_buf()).unwrap();
+    b.pair_record_path = tmp.path().join("b.pair.json");
+    b.pair_socket = socket.clone();
+    b.pair_host_lock_path = lock_path.clone();
+    b.pair_spawn_override = Some(Box::new(local_test_spawn));
+    crate::session::write_pair_record(&b.pair_record_path, &record).unwrap();
+    b.last_pair_check = None;
+    b.maybe_seat_navigator();
+    assert!(
+        b.pair_host.is_some(),
+        "the working window must be able to host: {}",
+        b.status
+    );
+}
+
+/// Unseating the navigator mid-turn must reset the turn's note counters:
+/// they survived into the NEXT seat's first TurnDone, which then reported
+/// a dead seat's notes (inflated count, wrong file).
+#[test]
+fn unseating_the_navigator_resets_the_turn_note_counters() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut record = crate::session::PairRecord {
+        model: None,
+        name: "nav".into(),
+        enabled: true,
+        task: None,
+        provider: None,
+        base_url: None,
+    };
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pair_record_path = tmp.path().join("x.pair.json");
+    app.pair_socket = socket.clone();
+    app.pair_host_lock_path = tmp.path().join("x.host.lock");
+    app.pair_spawn_override = Some(Box::new(local_test_spawn));
+    crate::session::write_pair_record(&app.pair_record_path, &record).unwrap();
+    app.last_pair_check = None;
+    app.maybe_seat_navigator();
+    assert!(app.pair_host.is_some(), "seated: {}", app.status);
+
+    // Mid-turn state: the navigator commented three times in a.rs.
+    app.pair_notes_this_turn = 3;
+    app.pair_last_noted_file = Some(String::from("a.rs"));
+    app.pair_noted_files.insert(String::from("a.rs"));
+
+    record.enabled = false;
+    crate::session::write_pair_record(&app.pair_record_path, &record).unwrap();
+    app.last_pair_check = None;
+    app.maybe_seat_navigator();
+    assert!(app.pair_host.is_none(), "unseated");
+    assert_eq!(
+        app.pair_notes_this_turn, 0,
+        "a dead seat's note count must not leak into the next seat's TurnDone"
+    );
+    assert!(
+        app.pair_last_noted_file.is_none(),
+        "a dead seat's noted file must not leak either"
+    );
+    assert!(app.pair_noted_files.is_empty());
+}
+
+/// The TurnDone hint names a file only when every note landed in the SAME
+/// file: "3 comments in b.rs" was a lie when two of them sat in a.rs.
+#[test]
+fn turn_note_summary_only_names_a_single_file() {
+    use std::collections::BTreeSet;
+    let one: BTreeSet<String> = [String::from("a.rs")].into();
+    assert_eq!(super::turn_note_summary(1, &one), "1 comment in a.rs");
+    assert_eq!(super::turn_note_summary(3, &one), "3 comments in a.rs");
+    let two: BTreeSet<String> = [String::from("a.rs"), String::from("b.rs")].into();
+    assert_eq!(
+        super::turn_note_summary(3, &two),
+        "3 comments across 2 files"
+    );
+    assert_eq!(super::turn_note_summary(2, &BTreeSet::new()), "2 comments");
+}
+
+/// Re-running `croft pair` after a failed seat must retry: the CLI promises
+/// "a running croft seats it within a second", but an enabled→enabled
+/// rewrite has no transition for the death latch to observe. The record's
+/// mtime is the signal.
+#[test]
+fn a_record_rewrite_re_arms_a_downed_navigator() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let record = crate::session::PairRecord {
+        model: None,
+        name: "nav".into(),
+        enabled: true,
+        task: None,
+        provider: None,
+        base_url: None,
+    };
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pair_record_path = tmp.path().join("x.pair.json");
+    app.pair_socket = socket.clone();
+    app.pair_host_lock_path = tmp.path().join("x.host.lock");
+    app.pair_spawn_override = Some(Box::new(|_| anyhow::bail!("claude is broken")));
+    crate::session::write_pair_record(&app.pair_record_path, &record).unwrap();
+    app.last_pair_check = None;
+    app.maybe_seat_navigator();
+    assert!(app.navigator_down, "the first seat fails and latches");
+
+    // Latched: an unchanged record must NOT retry every second.
+    app.last_pair_check = None;
+    app.maybe_seat_navigator();
+    assert!(app.pair_host.is_none());
+
+    // The user fixes the backend and re-runs `croft pair`: the rewritten
+    // record (bumped mtime; contents may be identical) re-arms seating.
+    crate::session::write_pair_record(&app.pair_record_path, &record).unwrap();
+    let f = std::fs::File::options()
+        .write(true)
+        .open(&app.pair_record_path)
+        .unwrap();
+    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(2))
+        .unwrap();
+    app.pair_spawn_override = Some(Box::new(local_test_spawn));
+    app.last_pair_check = None;
+    app.maybe_seat_navigator();
+    assert!(
+        app.pair_host.is_some(),
+        "a rewritten record must re-arm the downed navigator: {}",
+        app.status
     );
 }
 
@@ -20476,9 +20705,21 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
         "the pref must gate the look"
     );
 
-    // Pref back on: the completed construct fires a comment-only look
-    // anchored at the new function's row.
+    // Pref back on but the user is mid-typing in a prompt (the ask box):
+    // stealing the seat now would make their Enter fail against a busy
+    // host and lose the typed draft. An open prompt suppresses the look
+    // without consuming the scan.
     app.proactive_navigator_enabled = true;
+    app.open_ask_navigator((0, 0), String::new());
+    assert!(app.input_prompt.is_some(), "the ask box must open");
+    assert!(
+        !app.tick_proactive_navigator(),
+        "an open prompt must suppress the proactive look"
+    );
+    app.close_input_prompt();
+
+    // Prompt closed: the completed construct fires a comment-only look
+    // anchored at the new function's row.
     assert!(app.tick_proactive_navigator(), "new fn + pause must fire");
     assert_eq!(
         app.pair_turn_origin,
@@ -20492,6 +20733,41 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
 
     // The same buffer state never fires twice (latch + busy host).
     assert!(!app.tick_proactive_navigator());
+}
+
+/// A failed ask submit must not eat the typed draft: the navigator can go
+/// away (or busy) between opening the box and Enter, and the instruction
+/// the user typed is unrecoverable once the prompt closes. The failure
+/// keeps the box open for a retry, like a failed comment reply keeps its
+/// draft.
+#[test]
+fn a_failed_ask_submit_keeps_the_typed_draft() {
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.input_prompt = Some(
+        InputPrompt::new(
+            InputPurpose::AskNavigator {
+                file: String::from("f.rs"),
+                range: (0, 0),
+                selection: String::new(),
+            },
+            "Ask nav",
+            "",
+        )
+        .with_value("check the loop bounds"),
+    );
+    app.submit_input_prompt();
+    let p = app
+        .input_prompt
+        .as_ref()
+        .expect("the failed submit must keep the prompt open");
+    assert_eq!(p.value, "check the loop bounds", "the draft survives");
+    assert!(
+        app.status.to_lowercase().contains("not active"),
+        "the failure is announced: {}",
+        app.status
+    );
 }
 
 /// Enter in a focused comment box sends the reply turn: the composed

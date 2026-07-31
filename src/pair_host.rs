@@ -315,6 +315,23 @@ impl PairHost {
     }
 }
 
+/// Teardown threads detached by [`Drop`]: an unseat's grace-kill runs on
+/// its own thread, and a thread that dies with the process leaves the
+/// claude child running (orphaned, still holding its MCP subprocesses).
+/// The exit path joins these so every detached teardown finishes first.
+static TEARDOWNS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Join every teardown thread [`Drop`] detached. Called on the exit path
+/// after the live host's own `shutdown_blocking`; bounded by the pilots'
+/// grace-kill (about two seconds each, and stacked teardowns are rare).
+pub fn join_teardowns() {
+    let handles: Vec<_> = std::mem::take(&mut *TEARDOWNS.lock().unwrap());
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
 impl Drop for PairHost {
     fn drop(&mut self) {
         // Detach the teardown: the grace-kill blocks up to 2s (claude lingers
@@ -322,9 +339,11 @@ impl Drop for PairHost {
         // navigator is unseated (toggle off / disabled record). The detached
         // thread owns the pilot and reverts, hangs up, and grace-kills on its
         // own. Exit paths that must reap the child first use
-        // `shutdown_blocking` instead.
+        // `shutdown_blocking` instead, plus [`join_teardowns`] for drops
+        // that happened shortly before exit.
         if let Some(p) = self.pilot.take() {
-            std::thread::spawn(move || p.shutdown());
+            let handle = std::thread::spawn(move || p.shutdown());
+            TEARDOWNS.lock().unwrap().push(handle);
         }
     }
 }

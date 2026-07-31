@@ -62,18 +62,18 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A failed local-model turn no longer poisons the conversation: the unanswered ask is dropped so the next one starts clean, and every failure mode (mid-stream drop, timeout, token-limit truncation, stream errors) is reported honestly instead of as a finished turn.",
+        summary: "Cancelling or aborting a navigator edit no longer drifts its comment anchors: the revert now un-shifts every note the streamed edit had moved, so the gutter marks and F4 land where the navigator actually commented.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Toggling the navigator off and on keeps its backend: a local ollama seat no longer silently becomes a cloud claude seat, and croft pair --provider ollama --off simply deactivates.",
+        summary: "A croft window whose navigator failed to seat releases the workspace's single-host lock, so another window can host instead of nobody; re-running croft pair after fixing the backend now retries the seat, and the 'hosted by another window' notice is announced once instead of overwriting the status line every second.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Local endpoint problems name their cause: HTTP error bodies (like ollama's 'model not found, try pulling it') reach the status line, and a malformed --base-url is refused at activation instead of failing hours later.",
+        summary: "The ask box no longer eats a typed instruction: a proactive look cannot steal the seat while a prompt is open, and a failed ask keeps the box open with the draft intact for a retry.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The gateway token travels as a proper Bearer header and only over https or to loopback hosts, a stalled endpoint can no longer hold the seat busy past ten minutes (the deadline now cuts at the socket itself, so failed turns leak no threads or connections), and an inverted edit fence reports to OUTPUT instead of corrupting the screen.",
+        summary: "Quitting right after unseating the navigator no longer orphans its claude child (exit now joins the detached teardown), and a re-seated navigator's first turn summary no longer inherits a dead seat's comment count or claims every comment sits in one file when they span several.",
     },
 ];
