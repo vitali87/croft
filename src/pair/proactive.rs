@@ -133,9 +133,18 @@ fn markdown_new_row(old: &str, new: &str) -> Option<usize> {
     {
         return None;
     }
+    // Anchor at the ADDED occurrence, not merely a hash whose global count
+    // grew: for a paragraph duplicating earlier prose the global check is
+    // true at the first copy too, and anchoring there scoped the look to
+    // unrelated earlier text. The running count singles out the new copy.
+    let mut running: HashMap<u64, usize> = HashMap::new();
     new_paras
         .iter()
-        .find(|(h, _)| new_counts[h] > old_counts.get(h).copied().unwrap_or(0))
+        .find(|(h, _)| {
+            let seen = running.entry(*h).or_default();
+            *seen += 1;
+            *seen > old_counts.get(h).copied().unwrap_or(0)
+        })
         .or(new_paras.last())
         .map(|(_, r)| *r)
 }
@@ -296,6 +305,17 @@ mod tests {
         // A genuinely new paragraph with the old ones intact still fires.
         let added = "alpha beta gamma delta.\n\nfresh thought.\n";
         assert_eq!(new_construct_row(LangKind::Markdown, old, added), Some(2));
+    }
+
+    /// Appending a paragraph whose text duplicates earlier prose must
+    /// anchor at the NEW copy: a global-count check is true at the first
+    /// occurrence too, and anchoring there scoped the navigator's look to
+    /// unrelated earlier text.
+    #[test]
+    fn a_duplicated_paragraph_anchors_at_the_new_copy() {
+        let old = "repeat paragraph.\n\nother paragraph.\n";
+        let dup = "repeat paragraph.\n\nother paragraph.\n\nrepeat paragraph.\n";
+        assert_eq!(new_construct_row(LangKind::Markdown, old, dup), Some(4));
     }
 
     #[test]
