@@ -17,7 +17,7 @@
 //! `crate::mcp::transport`.
 
 use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -248,21 +248,9 @@ pub(crate) fn serve_with_token(
     // not auto-unlinked); the liveness probe above proved nobody owns it.
     let _ = std::fs::remove_file(socket);
     // Possession of the account is the trust boundary (same as dtach); never
-    // let another user attach. `bind` starts accepting connections the instant
-    // it returns, so a chmod on the next line leaves a TOCTOU window in which
-    // the socket carries umask-derived perms (0644 under umask 022). Bind under
-    // a 0077 umask so the socket is 0600 from creation; restore afterward.
-    let prev_umask = unsafe { libc::umask(0o077) };
-    let listener =
-        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()));
-    unsafe { libc::umask(prev_umask) };
-    let listener = listener?;
-    {
-        // Belt-and-braces: assert 0600 even where umask was ignored.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
-            .context("restricting socket permissions")?;
-    }
+    // let another user attach.
+    let listener = crate::session::bind_socket_0600(socket)
+        .with_context(|| format!("binding {}", socket.display()))?;
     if let Some(ws) = workspace {
         crate::session::write_meta_preserving_created(socket, ws)?;
     }

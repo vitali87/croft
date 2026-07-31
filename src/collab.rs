@@ -431,7 +431,6 @@ impl CollabMsg {
 /// closes; one thread per client. Distinct socket from the PTY mux
 /// (`<hash>.collab.sock`), so it never carries terminal bytes.
 pub fn relay_serve(socket: &std::path::Path) -> anyhow::Result<()> {
-    use std::os::unix::net::UnixListener;
     // Attach-or-create: a live relay already owns the socket; binding over
     // it would strand that relay's connected clients mid-session. (Two
     // creators racing past this check is the same benign window
@@ -444,10 +443,7 @@ pub fn relay_serve(socket: &std::path::Path) -> anyhow::Result<()> {
     }
     let _ = std::fs::remove_file(socket);
     // Bind 0600 with no TOCTOU window (same fix as the mux socket).
-    let prev_umask = unsafe { libc::umask(0o077) };
-    let listener = UnixListener::bind(socket);
-    unsafe { libc::umask(prev_umask) };
-    let listener = listener?;
+    let listener = crate::session::bind_socket_0600(socket)?;
 
     let clients: std::sync::Arc<std::sync::Mutex<Vec<Peer>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

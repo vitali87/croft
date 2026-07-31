@@ -365,9 +365,106 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
+/// Bind a unix listener at `socket`, owner-only (0600) with no window in
+/// which anyone else could connect. Possession of the account is the trust
+/// boundary for every croft socket (the session mux, the collab relay):
+/// another user must never be able to connect. Shared by both binders so the
+/// permission discipline lives in exactly one place.
+pub fn bind_socket_0600(socket: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    // `bind` starts accepting connections the instant it returns, and the
+    // socket file's mode comes from the process umask. A save/restore umask
+    // dance around the bind is process-global state: two concurrent binds
+    // interleaving their restores corrupted the mask for the rest of the
+    // process's life, and one of the sockets got created under the loose
+    // caller mask. Instead, bind inside a fresh 0700 staging dir next to
+    // the target (same filesystem; the short `.s` name keeps the AF_UNIX
+    // path-length budget), fix the socket's own mode to 0600 while nobody
+    // can traverse to it, then rename(2) it into place atomically. No
+    // process-global state anywhere.
+    static STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = STAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let parent = socket.parent().unwrap_or(Path::new("."));
+    let stage = parent.join(format!(".s{}-{n}", std::process::id()));
+    // A crash can strand a same-named staging dir (the counter restarts
+    // with the process and pids recycle); it is ours by construction.
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::DirBuilder::new().mode(0o700).create(&stage)?;
+    let result = (|| {
+        let tmp = stage.join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&tmp)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&tmp, socket)?;
+        Ok(listener)
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every croft socket is owner-only from its first observable instant.
+    #[test]
+    fn a_bound_socket_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("a.sock");
+        let _l = bind_socket_0600(&sock).expect("bind");
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket must be 0600, got {mode:o}");
+    }
+
+    /// Binding must not go through process-global state: the parallel test
+    /// suite (and any future in-process threading) binds relay and mux
+    /// sockets from many threads at once. The old save/restore umask dance
+    /// raced - two interleaved binds could restore each other's masks
+    /// (permanently corrupting the process umask) and one socket could be
+    /// created under the caller's loose umask for its whole life.
+    #[test]
+    fn concurrent_binds_never_corrupt_the_process_umask_or_a_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        let read_umask = || unsafe {
+            // Read is a write on this API; probe with the tightest value so
+            // the blink can only ever make a concurrent file MORE private.
+            let cur = libc::umask(0o077);
+            libc::umask(cur);
+            cur
+        };
+        let before = read_umask();
+        let dir = tempfile::tempdir().unwrap();
+        let worst = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        std::thread::scope(|s| {
+            for t in 0..2 {
+                let dir = dir.path().to_path_buf();
+                let worst = std::sync::Arc::clone(&worst);
+                s.spawn(move || {
+                    for i in 0..300 {
+                        let sock = dir.join(format!("{t}-{i}.sock"));
+                        let l = bind_socket_0600(&sock).expect("bind");
+                        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+                        let mut w = worst.lock().unwrap();
+                        if mode > *w {
+                            *w = mode;
+                        }
+                        drop(l);
+                        let _ = std::fs::remove_file(&sock);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            *worst.lock().unwrap(),
+            0o600,
+            "a racing bind produced a socket looser than 0600"
+        );
+        assert_eq!(
+            read_umask(),
+            before,
+            "racing binds corrupted the process umask"
+        );
+    }
 
     /// The single-host lock is exclusive: a second acquirer is refused while
     /// the first holds it, and the lock frees when the holder drops (the OS
