@@ -5618,8 +5618,10 @@ impl Editor {
         if self.wrap_enabled() {
             let top = self.top_visual_row(self.visible_text_width());
             self.wrap_set_top(top.saturating_sub(n));
-        } else {
+        } else if self.comment_boxes.is_empty() {
             self.scroll_view_to(self.scroll.saturating_sub(n));
+        } else {
+            self.nonwrap_set_top(self.nonwrap_top_content_row().saturating_sub(n));
         }
     }
 
@@ -5633,8 +5635,10 @@ impl Editor {
         if self.wrap_enabled() {
             let top = self.top_visual_row(self.visible_text_width());
             self.wrap_set_top(top.saturating_add(n));
-        } else {
+        } else if self.comment_boxes.is_empty() {
             self.scroll_view_to(self.scroll.saturating_add(n));
+        } else {
+            self.nonwrap_set_top(self.nonwrap_top_content_row().saturating_add(n));
         }
     }
 
@@ -5660,12 +5664,15 @@ impl Editor {
         // "no overflow") and a long file's thumb run away from the pointer.
         let bw = self.visible_text_width();
         let content = self.lines.len() + self.box_rows_between(0, self.lines.len(), bw);
-        let Some(metrics) =
-            scrollbar::vertical_metrics(self.last_scrollbar, content, viewport, self.scroll)
-        else {
+        let Some(metrics) = scrollbar::vertical_metrics(
+            self.last_scrollbar,
+            content,
+            viewport,
+            self.nonwrap_top_content_row(),
+        ) else {
             return false;
         };
-        self.scroll_view_to(scrollbar::scroll_for_y(metrics, y));
+        self.nonwrap_set_top(scrollbar::scroll_for_y(metrics, y));
         true
     }
 
@@ -5796,6 +5803,56 @@ impl Editor {
             }
         }
         buf
+    }
+
+    /// The non-wrap viewport top in CONTENT rows: buffer lines plus the
+    /// comment-box rows above (and inside, via `scroll_sub`) the top line.
+    fn nonwrap_top_content_row(&self) -> usize {
+        let bw = self.visible_text_width();
+        self.scroll + self.box_rows_between(0, self.scroll, bw) + self.scroll_sub
+    }
+
+    /// Set the non-wrap viewport top to content row `row`, landing mid-box
+    /// when it falls inside a comment box (`scroll_sub` counts rows past
+    /// the top line's own text row). Mirrors `wrap_set_top` for the
+    /// box-extended non-wrap layout; a tall box is unreadable and its
+    /// Reply/Ignore footer unreachable with a line-granular top. Pulls the
+    /// cursor along like `scroll_view_to`.
+    fn nonwrap_set_top(&mut self, row: usize) {
+        let viewport = self.text_rows();
+        if viewport == 0 || self.lines.is_empty() {
+            self.scroll = 0;
+            self.scroll_sub = 0;
+            return;
+        }
+        if self.comment_boxes.is_empty() {
+            self.scroll_sub = 0;
+            self.scroll_view_to(row);
+            return;
+        }
+        let bw = self.visible_text_width();
+        let total = self.lines.len() + self.box_rows_between(0, self.lines.len(), bw);
+        let row = row.min(total.saturating_sub(viewport));
+        let mut acc = 0usize;
+        let mut line = 0usize;
+        while line < self.lines.len() {
+            let group = 1 + self.box_rows_between(line, line + 1, bw);
+            if acc + group > row {
+                break;
+            }
+            acc += group;
+            line += 1;
+        }
+        self.scroll = line.min(self.lines.len().saturating_sub(1));
+        self.scroll_sub = row.saturating_sub(acc);
+        let last_visible = (self.scroll + viewport - 1).min(self.lines.len().saturating_sub(1));
+        if self.cursor_row < self.scroll {
+            self.cursor_row = self.scroll;
+        } else if self.cursor_row > last_visible {
+            self.cursor_row = last_visible;
+        }
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.last_edit_kind = None;
     }
 
     fn scroll_view_to(&mut self, top: usize) {
@@ -6700,7 +6757,17 @@ impl Widget for &mut Editor {
             );
             (tw as u16, metrics)
         } else {
-            self.scroll_sub = 0;
+            // `scroll_sub` counts rows INTO the top line's comment box (set
+            // by the content-row scroller); clamp it to the group and drop
+            // it entirely when a cursor clamp below moves the top line.
+            if self.comment_boxes.is_empty() {
+                self.scroll_sub = 0;
+            } else {
+                let bw = inner.width.saturating_sub(gutter_width + 3) as usize;
+                let group = 1 + self.box_rows_between(self.scroll, self.scroll + 1, bw);
+                self.scroll_sub = self.scroll_sub.min(group - 1);
+            }
+            let scroll_before = self.scroll;
             if text_height > 0 {
                 if self.cursor_row < self.scroll {
                     self.scroll = self.cursor_row;
@@ -6721,15 +6788,18 @@ impl Widget for &mut Editor {
                     }
                 }
             }
-            let box_rows = {
-                let bw = inner.width.saturating_sub(gutter_width + 3) as usize;
-                self.box_rows_between(0, self.lines.len(), bw)
-            };
+            if self.scroll != scroll_before {
+                self.scroll_sub = 0;
+            }
+            let bw = inner.width.saturating_sub(gutter_width + 3) as usize;
+            let box_rows = self.box_rows_between(0, self.lines.len(), bw);
             let metrics = scrollbar::vertical_metrics(
                 scrollbar_area,
                 self.lines.len() + box_rows,
                 text_height,
-                self.scroll,
+                // Content-row top: lines above plus box rows above plus the
+                // rows scrolled into the top line's own box.
+                self.scroll + self.box_rows_between(0, self.scroll, bw) + self.scroll_sub,
             );
             let sw = u16::from(metrics.is_some());
             let tw = inner.width.saturating_sub(gutter_width + 2 + sw);
@@ -6823,14 +6893,21 @@ impl Widget for &mut Editor {
             // skipping any hidden inside a collapsed fold.
             let tw = text_width as usize;
             let mut line = self.scroll;
+            // Group-position skip on the top line: 0 = its text row, 1..
+            // = rows into its comment box, so the viewport can start
+            // mid-box exactly like the wrap path.
+            let mut skip = self.scroll_sub;
             while line < self.lines.len() && visual_rows.len() < text_height {
                 if !self.is_line_hidden(line) {
-                    visual_rows.push(VisRow::Text {
-                        line,
-                        start: self.scroll_col,
-                        end: self.scroll_col + text_width as usize,
-                    });
-                    push_box_rows(&mut visual_rows, self, line, 0, 1, tw);
+                    if skip == 0 && visual_rows.len() < text_height {
+                        visual_rows.push(VisRow::Text {
+                            line,
+                            start: self.scroll_col,
+                            end: self.scroll_col + text_width as usize,
+                        });
+                    }
+                    push_box_rows(&mut visual_rows, self, line, skip, 1, tw);
+                    skip = 0;
                 }
                 line += 1;
             }
@@ -10072,6 +10149,57 @@ mod tests {
         assert_eq!(e.cursor_row, 1, "the caret skips the box");
         e.move_up();
         assert_eq!(e.cursor_row, 0);
+    }
+
+    /// A comment box taller than the viewport must be reachable in non-wrap
+    /// mode: scrolling used to be line-granular (a 3-line file cannot
+    /// scroll at all), so a tall box was truncated at the viewport edge and
+    /// its footer - the Reply field and ✕ Ignore - could never be seen.
+    #[test]
+    fn nonwrap_scrolling_reaches_a_tall_comment_boxes_footer() {
+        let mut e = editor_with("first\nsecond\nthird");
+        e.comment_boxes = vec![CommentBox {
+            id: 1,
+            line: 0,
+            author: "navigator".into(),
+            body: (0..30)
+                .map(|i| format!("point {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let screen = |buf: &ratatui::buffer::Buffer| -> String {
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            !screen(&buf).contains("Ignore"),
+            "the tall box overflows: its footer starts off-screen"
+        );
+        // Scroll far enough that the footer row must be inside the viewport.
+        for _ in 0..12 {
+            e.scroll_down(3);
+        }
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        assert!(
+            screen(&buf).contains("Ignore"),
+            "scrolling must reach the box footer; got:\n{}",
+            screen(&buf)
+        );
     }
 
     /// A reply longer than the footer field must window around the caret:

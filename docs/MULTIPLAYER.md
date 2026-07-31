@@ -542,8 +542,12 @@ interaction into turn-based driver/navigator pairing:
 - **Proactive looks (0.1.640).** The navigator re-engages on its own as
   the driver works: when tree-sitter sees a NEW completed construct in the
   active file (an outline symbol for code — a half-typed `fn foo(` parses
-  as an error and never fires — or a new heading / added paragraph in
-  markdown, `src/pair/proactive.rs`) and typing pauses for 2s, the App
+  as an error and never fires, and member-level symbols like a struct
+  field or enum variant count as edits inside their construct, not
+  constructs — or a new heading / purely added top-level paragraph in
+  markdown: list bullets and block quotes are not paragraphs, and a
+  paragraph split in two is a reshape, `src/pair/proactive.rs`) and
+  typing pauses for 2s, the App
   hands it the same comment-only yield turn `Cmd+K Y` would, anchored at
   the new construct. Only files the navigator has already looked at
   re-engage it (re-engagement, not ambush); one buffer state is scanned at
