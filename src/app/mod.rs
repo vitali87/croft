@@ -27767,16 +27767,14 @@ impl App {
     /// and always passes.
     fn wheel_pdf_page(&mut self, delta: i32) {
         const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(150);
-        let now = std::time::Instant::now();
         let doc = self.editor.path.clone();
         if let Some((at, dir, last_doc)) = &self.last_pdf_wheel
             && *dir == delta.signum()
             && *last_doc == doc
-            && now.duration_since(*at) < COOLDOWN
+            && at.elapsed() < COOLDOWN
         {
             return;
         }
-        self.last_pdf_wheel = Some((now, delta.signum(), doc));
         let Some(cur) = self.editor.pdf_page() else {
             return;
         };
@@ -27786,6 +27784,12 @@ impl App {
             cur.saturating_sub(delta.unsigned_abs()).max(1)
         };
         self.editor.set_pdf_page(target);
+        // Stamped AFTER the rasterise: the flick's remaining events queued
+        // while the render ran, so a stamp taken at entry had already aged
+        // by the render's duration when they were processed — a render
+        // slower than the cooldown let every queued event through, one
+        // blocking render each.
+        self.last_pdf_wheel = Some((std::time::Instant::now(), delta.signum(), doc));
     }
 
     fn jump_pdf_page(&mut self, page: u32) {
