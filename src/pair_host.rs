@@ -409,7 +409,9 @@ impl PairHost {
             // Bounded (see lock_briefly): the keypress thread must not wait
             // on a wedged pilot, but the unstage must not be LOST either (a
             // stale look breaks the yield diff and latches comment_only) —
-            // hand it to a thread that may wait.
+            // hand it to a thread that may wait. Generation-checked: if a
+            // newer turn stages before that thread runs, the late rollback
+            // drops itself instead of stomping the live turn's books.
             Err(_) => match lock_briefly(state) {
                 Some(mut st) => st.unstage_turn(staged),
                 None => {

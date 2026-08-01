@@ -521,6 +521,11 @@ pub(crate) struct StagedTurn {
     pub(crate) prior_seen: Option<String>,
     prior_comment_only: bool,
     prior_target: Option<String>,
+    /// Which staging this undo belongs to: a rollback that lands after a
+    /// NEWER turn has staged (its send failed while the pilot mutex was
+    /// wedged, so the unstage waited on a thread) is stale and must not
+    /// stomp the live turn's books.
+    stage_gen: u64,
 }
 
 /// One anchored navigator note: a byte offset into `file`'s replica text
@@ -556,6 +561,10 @@ pub(crate) struct PairState {
     target_file: Option<String>,
     /// Prepended to the next user turn (set by cancel).
     pending_note: Option<String>,
+    /// Bumped by every [`Self::stage_turn`]; pairs with
+    /// [`StagedTurn::stage_gen`] so a deferred rollback can recognise that
+    /// a newer turn has staged and drop itself.
+    stage_gen: u64,
     /// Anchored navigator notes; offsets kept fresh by the pump.
     notes: Vec<Note>,
     /// Next note id (monotonic; ids are never reused within a seat).
@@ -596,6 +605,7 @@ impl PairState {
             turn_active: false,
             target_file: None,
             pending_note: None,
+            stage_gen: 0,
             notes: Vec::new(),
             next_note_id: 1,
             note_in_flight: None,
@@ -683,16 +693,23 @@ impl PairState {
         let prior_comment_only = self.comment_only;
         let prior_target = self.target_file.clone();
         let prior_seen = self.begin_turn(file, content, comment_only);
+        self.stage_gen += 1;
         StagedTurn {
             file: file.to_string(),
             prior_seen,
             prior_comment_only,
             prior_target,
+            stage_gen: self.stage_gen,
         }
     }
 
     /// Put back what [`Self::stage_turn`] overwrote (the send never left).
+    /// A no-op when a NEWER turn has staged since: this rollback ran late
+    /// (see [`StagedTurn::stage_gen`]) and its books are stale.
     pub(crate) fn unstage_turn(&mut self, staged: StagedTurn) {
+        if self.stage_gen != staged.stage_gen {
+            return;
+        }
         self.comment_only = staged.prior_comment_only;
         self.target_file = staged.prior_target;
         match staged.prior_seen {
@@ -2662,6 +2679,32 @@ mod tests {
         harness.wait_until("the reply turn's caret", |h| {
             h.carets().iter().any(|(n, r, _)| n == "replier" && *r == 2)
         });
+    }
+
+    /// A rollback deferred past its moment (the failed send could not get
+    /// the pilot mutex, so the unstage was handed to a waiting thread) must
+    /// land as a no-op once a NEWER turn has staged: unconditionally
+    /// restoring the old turn's books would flip the live turn
+    /// comment-only, retarget it, and rot its yield-diff baseline.
+    #[test]
+    fn a_stale_rollback_never_stomps_a_newer_turn() {
+        let harness = OwnerHarness::start("hello");
+        let session = connect_session(&harness.socket, "pilot").unwrap();
+        let state = Mutex::new(PairState::new(session, None));
+        let mut st = state.lock().unwrap();
+        let staged_a = st.stage_turn("demo.txt", "one", false);
+        // Turn B stages before A's deferred rollback lands.
+        let _staged_b = st.stage_turn("demo.txt", "two", true);
+        st.unstage_turn(staged_a); // the deferred rollback finally runs
+        assert_eq!(
+            st.last_seen_of("demo.txt").as_deref(),
+            Some("two"),
+            "a stale rollback must not replace the live turn's baseline"
+        );
+        assert!(
+            st.comment_only,
+            "a stale rollback must not unlatch the live turn's comment-only"
+        );
     }
 
     /// An edit taking over the caret supersedes an unresolved pending park:
