@@ -523,9 +523,12 @@ interaction into turn-based driver/navigator pairing:
   the yield caret, or the replied note) when the turn ends. Commentary no
   longer streams to a Navigator OUTPUT channel; OUTPUT ("Navigator") now
   carries only diagnostics — prose whose origin file is no longer live
-  (rather than losing it) and warnings like a dropped inverted fence range
-  (which must never hit stderr: the seat runs in-process and stderr would
-  corrupt the alternate screen).
+  (rather than losing it), warnings like a dropped inverted fence range,
+  host notices (a suppressed edit on a comment-only turn, a file with no
+  live owner), and the claude child's stderr chatter — none of which are the
+  model's voice, so none of them may land in a comment box (and stderr
+  must never be written directly: the seat runs in-process and stderr
+  would corrupt the alternate screen).
   The NOTE fence is model-protocol only — nothing new rides the relay, so
   0.1.633/634 peers interop untouched.
 - **The navigator's caret (0.1.639).** The seat has a persistent, visible

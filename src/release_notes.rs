@@ -62,18 +62,26 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Cancelling or aborting a navigator edit no longer drifts its comment anchors: the revert now un-shifts every note the streamed edit had moved, so the gutter marks and F4 land where the navigator actually commented.",
+        summary: "Croft.app starts again: the Dock-launch PATH repair asked your login shell for its PATH on croft's own terminal, and an interactive zsh steals the terminal's foreground for job control, so croft came up as a background process and died with an I/O error before drawing anything. The probe now runs in its own session, where it cannot touch croft's terminal.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A croft window whose navigator failed to seat releases the workspace's single-host lock, so another window can host instead of nobody; re-running croft pair after fixing the backend now retries the seat, and the 'hosted by another window' notice is announced once instead of overwriting the status line every second.",
+        summary: "Navigator comment boxes carry only the model's own words: claude's startup chatter and host notices (a suppressed edit, a file nobody serves) now go to the OUTPUT panel instead of being anchored in your file as the navigator's remarks and counted as its comments.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The ask box no longer eats a typed instruction: a proactive look cannot steal the seat while a prompt is open, and a failed ask keeps the box open with the draft intact for a retry.",
+        summary: "The editor can no longer hang on a wedged navigator: nothing on the render or tick path waits on the pilot's internals anymore (a stalled seat reads as busy and the last known carets and comments keep painting), closing a same-process deadlock introduced when the navigator moved in-process.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Quitting right after unseating the navigator no longer orphans its claude child (exit now joins the detached teardown), and a re-seated navigator's first turn summary no longer inherits a dead seat's comment count or claims every comment sits in one file when they span several.",
+        summary: "A send that never reaches the model leaves the seat exactly as it was: no permanently busy navigator, the cancel note it still owes the model is kept, and a failed yield no longer destroys the diff baseline or latches the next turn into comment-only mode.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "The seat stays busy until croft has actually consumed the turn's end (a turn started in the finish window stole the previous turn's anchor and comment count), and a fence header cut off by the end of a turn is dropped instead of leaking raw protocol markers into a comment box.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "A duplicated or spontaneous turn result from claude ends nothing: only a turn croft actually dispatched can release the seat's busy gate, so a protocol hiccup can no longer let two turns overlap and overwrite each other's staging.",
     },
 ];

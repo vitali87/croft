@@ -14,8 +14,8 @@ use anyhow::{Context, Result};
 
 use crate::collab::position;
 use crate::pair::{
-    PairConfig, Pilot, Provider, claude_command, compose_ask_turn, compose_yield_turn, seat_local,
-    seat_pilot, send_turn, write_user_turn,
+    PairConfig, Pilot, Provider, claude_command, compose_ask_turn, compose_yield_turn,
+    lock_briefly, seat_local, seat_pilot, send_turn, write_user_turn,
 };
 
 /// What the pilot surfaces to the App, drained by `poll` once per tick.
@@ -54,7 +54,27 @@ pub struct PairHost {
     /// child owns model selection); shown in the idle badge via [`Self::title`].
     model_label: Option<String>,
     died: bool,
+    /// True from a successful send until [`Self::poll`] delivers the
+    /// turn's `TurnDone`: the pilot's reader clears `turn_active` BEFORE
+    /// it queues `TurnEnd`, so without this gate a tick landing in that
+    /// window saw an idle seat and started a new turn that stole the
+    /// finished turn's origin and note counters.
+    turn_pending: std::sync::atomic::AtomicBool,
+    /// Last successful [`Self::caret_sites`] answer, served when the pilot
+    /// mutex is contended (the UI thread never waits on it).
+    sites_cache: std::sync::Mutex<Vec<u64>>,
+    /// Last successful [`Self::notes_snapshot`] per file, same reason.
+    notes_cache: std::sync::Mutex<NotesByFile>,
+    /// A failed send's undo that could not get the pilot mutex in time.
+    /// Parked here (never handed to an untracked thread) and applied
+    /// before the next send is admitted — or by the next [`Self::poll`]
+    /// tick, whichever gets the lock first — so a newer turn can never
+    /// stage over a pending rollback's books.
+    pending_rollback: std::sync::Mutex<Option<crate::pair::StagedTurn>>,
 }
+
+/// Per-file note snapshots: `(id, 0-based row, body)` per note.
+type NotesByFile = std::collections::HashMap<String, Vec<(u64, usize, String)>>;
 
 impl PairHost {
     /// Seat the navigator for a workspace on its configured provider: the
@@ -101,6 +121,10 @@ impl PairHost {
             name: name.to_string(),
             model_label: None,
             died: false,
+            turn_pending: std::sync::atomic::AtomicBool::new(false),
+            sites_cache: std::sync::Mutex::new(Vec::new()),
+            notes_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_rollback: std::sync::Mutex::new(None),
         };
         if let Some(task) = task {
             host.send_task(task)?;
@@ -113,25 +137,48 @@ impl PairHost {
         &self.name
     }
 
+    /// Test seam: the pilot's state mutex, for pinning that UI-facing
+    /// reads never block on it.
+    #[cfg(test)]
+    pub(crate) fn state_for_tests(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::pair::PairState>>> {
+        self.pilot.as_ref().map(|p| std::sync::Arc::clone(&p.state))
+    }
+
     /// This seat's site id in every live file: the navigator's wire
     /// identity. The App paints these carets in the navigator accent and
     /// clears exactly them on unseat — display names are neither unique (a
     /// human may pick the same one) nor length-stable (carets truncate
     /// their name to 24 chars at ingest).
     pub fn caret_sites(&self) -> Vec<u64> {
-        self.pilot
-            .as_ref()
-            .map(|p| p.state.lock().unwrap().my_site_ids())
-            .unwrap_or_default()
+        let Some(p) = self.pilot.as_ref() else {
+            return Vec::new();
+        };
+        // try_lock: this runs on every render, and the pilot's threads hold
+        // the state mutex across BLOCKING relay writes that only complete
+        // once the App drains the relay — waiting here closes a circular
+        // wait and hangs the editor. Contended, serve the last answer.
+        match p.state.try_lock() {
+            Ok(st) => {
+                let sites = st.my_site_ids();
+                *self.sites_cache.lock().unwrap() = sites.clone();
+                sites
+            }
+            Err(_) => self.sites_cache.lock().unwrap().clone(),
+        }
     }
 
     /// What the navigator last saw of `file` (None = it never looked
     /// there). The proactive trigger compares the live buffer against this
     /// to decide whether a NEW construct completed.
     pub fn last_seen(&self, file: &str) -> Option<String> {
+        // Bounded lock (see lock_briefly): the proactive trigger DECIDES on
+        // this value, so a spurious None under microsecond pump contention
+        // would silently swallow a look. A wedged pilot still answers None.
         self.pilot
             .as_ref()
-            .and_then(|p| p.state.lock().unwrap().last_seen_of(file))
+            .and_then(|p| lock_briefly(&p.state).and_then(|st| st.last_seen_of(file)))
     }
 
     /// The badge label: the caret name, plus the local model when this seat
@@ -143,12 +190,23 @@ impl PairHost {
         }
     }
 
-    /// True while a turn is streaming: a new ask/yield must wait for it to
-    /// finish, else the shared comment-only flag gets clobbered mid-stream.
+    /// True while a turn is streaming OR finished but not yet consumed via
+    /// [`Self::poll`]: a new ask/yield must wait for it, else the shared
+    /// comment-only flag gets clobbered mid-stream (and a turn started in
+    /// the finish window would steal the previous turn's origin).
     pub fn is_busy(&self) -> bool {
-        self.pilot
-            .as_ref()
-            .is_some_and(|p| p.state.lock().unwrap().turn_active())
+        if self.turn_pending.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        // Bounded lock (see lock_briefly): this gates asks, yields and the
+        // proactive trigger, so an instant try_lock misreported a quiet
+        // seat as busy whenever the pump's microsecond hold collided with
+        // the check. Only a genuinely wedged pilot answers busy here.
+        self.pilot.as_ref().is_some_and(|p| {
+            lock_briefly(&p.state)
+                .map(|st| st.turn_active())
+                .unwrap_or(true)
+        })
     }
 
     /// Everything the pilot produced since the last tick: commentary and
@@ -157,7 +215,15 @@ impl PairHost {
     pub fn poll(&mut self) -> Vec<PairEvent> {
         let mut out: Vec<PairEvent> = self.events.try_iter().collect();
         if let Some(p) = &self.pilot {
+            // Opportunistic (instant try_lock, never waits on the tick
+            // thread): a parked rollback lands on the next quiet tick
+            // instead of waiting for the user's next send.
+            let _ = self.drain_rollback(|| p.state.try_lock().ok());
             while let Ok(end) = p.turn_rx.try_recv() {
+                // The App has now SEEN the turn end: only here does the
+                // busy gate release (see `turn_pending`).
+                self.turn_pending
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 out.push(PairEvent::TurnDone {
                     cancelled: end.cancelled,
                     failed: (end.is_error && !end.cancelled).then(|| end.text.clone()),
@@ -178,7 +244,18 @@ impl PairHost {
     /// as a [`PairEvent::TurnDone`].
     pub fn send_task(&self, line: &str) -> Result<()> {
         let p = self.pilot.as_ref().context("navigator pilot is gone")?;
-        send_turn(&p.state, &p.sink, line)
+        if self.turn_pending.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+        }
+        if !self.drain_rollback(|| lock_briefly(&p.state)) {
+            anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+        }
+        let sent = send_turn(&p.state, &p.sink, line);
+        if sent.is_ok() {
+            self.turn_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        sent
     }
 
     /// Ask turn: the navigator may edit. `range` is the invoked 0-based
@@ -193,40 +270,79 @@ impl PairHost {
         content: &str,
     ) -> Result<()> {
         let p = self.pilot.as_ref().context("navigator pilot is gone")?;
-        if p.state.lock().unwrap().turn_active() {
+        // A parked rollback is applied before a new turn may stage (see
+        // `pending_rollback`); refusing beats staging over stale books.
+        if !self.drain_rollback(|| lock_briefly(&p.state)) {
             anyhow::bail!("the navigator is mid-turn; wait for it to finish");
         }
-        {
-            let mut st = p.state.lock().unwrap();
-            st.begin_turn(file, content, false);
+        let staged = {
+            // Bounded lock (see lock_briefly): a wedged pilot cannot hang
+            // the keypress, transient pump contention succeeds on retry.
+            let Some(mut st) = lock_briefly(&p.state) else {
+                anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+            };
+            if st.turn_active() || self.turn_pending.load(std::sync::atomic::Ordering::Relaxed) {
+                // turn_pending too: between the pilot finishing and poll()
+                // consuming its TurnDone, turn_active is already false, and
+                // a send admitted here would overwrite the unconsumed
+                // turn's staging (origin, counters, target).
+                anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+            }
+            let staged = st.stage_turn(file, content, false);
             st.park_caret(file, range.0); // visible presence at the ask site
-        }
+            staged
+        };
         let body = compose_ask_turn(file, range, selection, instruction, content);
-        write_user_turn(&p.state, &p.sink, body)
+        self.commit_or_unstage(write_user_turn(&p.state, &p.sink, body), &p.state, staged)
     }
 
     /// Yield turn: the driver hands the navigator the floor. Comment-only,
     /// host-enforced; the turn carries the diff since its last look.
     pub fn send_yield_turn(&self, file: &str, content: &str) -> Result<()> {
         let p = self.pilot.as_ref().context("navigator pilot is gone")?;
-        if p.state.lock().unwrap().turn_active() {
+        // A parked rollback is applied before a new turn may stage (see
+        // `pending_rollback`); refusing beats staging over stale books.
+        if !self.drain_rollback(|| lock_briefly(&p.state)) {
             anyhow::bail!("the navigator is mid-turn; wait for it to finish");
         }
-        let old = p.state.lock().unwrap().begin_turn(file, content, true);
-        let diff = old.filter(|o| o != content).map(|o| {
-            similar::TextDiff::from_lines(o.as_str(), content)
-                .unified_diff()
-                .context_radius(2)
-                .to_string()
-        });
+        let staged = {
+            // Bounded lock (see lock_briefly): a wedged pilot cannot hang
+            // the keypress, transient pump contention succeeds on retry.
+            let Some(mut st) = lock_briefly(&p.state) else {
+                anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+            };
+            if st.turn_active() || self.turn_pending.load(std::sync::atomic::Ordering::Relaxed) {
+                // turn_pending too: between the pilot finishing and poll()
+                // consuming its TurnDone, turn_active is already false, and
+                // a send admitted here would overwrite the unconsumed
+                // turn's staging (origin, counters, target).
+                anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+            }
+            st.stage_turn(file, content, true)
+        };
+        let diff = staged
+            .prior_seen
+            .as_ref()
+            .filter(|o| o.as_str() != content)
+            .map(|o| {
+                similar::TextDiff::from_lines(o.as_str(), content)
+                    .unified_diff()
+                    .context_radius(2)
+                    .to_string()
+            });
         let body = compose_yield_turn(file, content, diff.as_deref());
-        write_user_turn(&p.state, &p.sink, body)
+        self.commit_or_unstage(write_user_turn(&p.state, &p.sink, body), &p.state, staged)
     }
 
     /// Drop every anchored note (the palette's "Navigator: Clear Notes").
     pub fn clear_notes(&self) {
-        if let Some(p) = &self.pilot {
-            p.state.lock().unwrap().clear_all_notes();
+        // Bounded lock (see lock_briefly): a clear that still cannot get
+        // the mutex is skipped; the notes are there and the next press
+        // works, and a wedged pilot costs at most the 100ms budget.
+        if let Some(p) = &self.pilot
+            && let Some(mut st) = lock_briefly(&p.state)
+        {
+            st.clear_all_notes();
         }
     }
 
@@ -249,15 +365,24 @@ impl PairHost {
 
     /// Drop exactly one note (the box's Ignore button).
     pub fn remove_note(&self, id: u64) {
-        if let Some(p) = &self.pilot {
-            p.state.lock().unwrap().remove_note(id);
+        // Bounded lock (see lock_briefly): an Ignore that still cannot
+        // get the mutex is skipped; the box stays and the next press works.
+        if let Some(p) = &self.pilot
+            && let Some(mut st) = lock_briefly(&p.state)
+        {
+            st.remove_note(id);
         }
     }
 
     /// Append one line to a note's body (the driver replied in its box).
     pub fn append_to_note(&self, id: u64, line: &str) {
-        if let Some(p) = &self.pilot {
-            p.state.lock().unwrap().append_to_note(id, line);
+        // Bounded lock (see lock_briefly): losing the echo line in the box
+        // when the mutex stays held is cosmetic; the reply itself already
+        // went.
+        if let Some(p) = &self.pilot
+            && let Some(mut st) = lock_briefly(&p.state)
+        {
+            st.append_to_note(id, line);
         }
     }
 
@@ -272,16 +397,65 @@ impl PairHost {
         content: &str,
     ) -> Result<()> {
         let p = self.pilot.as_ref().context("navigator pilot is gone")?;
-        if p.state.lock().unwrap().turn_active() {
+        // A parked rollback is applied before a new turn may stage (see
+        // `pending_rollback`); refusing beats staging over stale books.
+        if !self.drain_rollback(|| lock_briefly(&p.state)) {
             anyhow::bail!("the navigator is mid-turn; wait for it to finish");
         }
-        {
-            let mut st = p.state.lock().unwrap();
-            st.begin_turn(file, content, true);
+        let staged = {
+            // Bounded lock (see lock_briefly): a wedged pilot cannot hang
+            // the keypress, transient pump contention succeeds on retry.
+            let Some(mut st) = lock_briefly(&p.state) else {
+                anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+            };
+            if st.turn_active() || self.turn_pending.load(std::sync::atomic::Ordering::Relaxed) {
+                // turn_pending too: between the pilot finishing and poll()
+                // consuming its TurnDone, turn_active is already false, and
+                // a send admitted here would overwrite the unconsumed
+                // turn's staging (origin, counters, target).
+                anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+            }
+            let staged = st.stage_turn(file, content, true);
             st.park_caret(file, row); // visible presence at the answered note
-        }
+            staged
+        };
         let body = crate::pair::compose_reply_turn(file, row, note_body, reply, content);
-        write_user_turn(&p.state, &p.sink, body)
+        self.commit_or_unstage(write_user_turn(&p.state, &p.sink, body), &p.state, staged)
+    }
+
+    /// A sent turn arms the busy gate; a failed one undoes its staged look
+    /// so the seat is exactly as it was before the attempt.
+    fn commit_or_unstage(
+        &self,
+        sent: Result<()>,
+        state: &std::sync::Arc<std::sync::Mutex<crate::pair::PairState>>,
+        staged: crate::pair::StagedTurn,
+    ) -> Result<()> {
+        match &sent {
+            Ok(()) => self
+                .turn_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed),
+            // Bounded (see lock_briefly): the keypress thread must not wait
+            // on a wedged pilot, but the unstage must not be LOST either (a
+            // stale look breaks the yield diff and latches comment_only) —
+            // park it. The next send applies it before staging (or refuses),
+            // so a newer turn can never stage over the pending undo's books.
+            Err(_) => match lock_briefly(state) {
+                Some(mut st) => st.unstage_turn(staged),
+                None => *self.pending_rollback.lock().unwrap() = Some(staged),
+            },
+        }
+        sent
+    }
+
+    /// Apply a parked rollback if there is one. False = it is still parked
+    /// (the pilot mutex stayed contended for the whole `lock` budget), and
+    /// the caller must not stage a new turn over its books.
+    fn drain_rollback<'a>(
+        &self,
+        lock: impl FnOnce() -> Option<std::sync::MutexGuard<'a, crate::pair::PairState>>,
+    ) -> bool {
+        drain_parked(&self.pending_rollback, lock)
     }
 
     /// Tear the seat down synchronously (revert, hang up, grace-kill, join).
@@ -300,18 +474,58 @@ impl PairHost {
         let Some(p) = &self.pilot else {
             return Vec::new();
         };
-        let st = p.state.lock().unwrap();
+        // try_lock (UI tick path, see caret_sites): contended, serve the
+        // last computed snapshot for this file.
+        let Ok(st) = p.state.try_lock() else {
+            return self
+                .notes_cache
+                .lock()
+                .unwrap()
+                .get(file)
+                .cloned()
+                .unwrap_or_default();
+        };
         // Skip splitting the whole document (this runs every tick for the
         // active file) when it has no notes to place.
-        if st.notes_in(file).next().is_none() {
-            return Vec::new();
-        }
-        let Some(lines) = st.doc_lines(file) else {
-            return Vec::new();
+        let snap = if st.notes_in(file).next().is_none() {
+            Vec::new()
+        } else if let Some(lines) = st.doc_lines(file) {
+            st.notes_in(file)
+                .map(|n| (n.id, position(&lines, n.offset).0, n.body.clone()))
+                .collect()
+        } else {
+            Vec::new()
         };
-        st.notes_in(file)
-            .map(|n| (n.id, position(&lines, n.offset).0, n.body.clone()))
-            .collect()
+        self.notes_cache
+            .lock()
+            .unwrap()
+            .insert(file.to_string(), snap.clone());
+        snap
+    }
+}
+
+/// The core of [`PairHost::drain_rollback`], split out so the undo-record
+/// semantics are testable without a seated pilot: a parked undo either
+/// applies (guard obtained) and clears the park, or stays parked and the
+/// caller refuses to stage. Under contention nothing is lost or applied
+/// out of order.
+pub(crate) fn drain_parked<'a>(
+    parked: &std::sync::Mutex<Option<crate::pair::StagedTurn>>,
+    lock: impl FnOnce() -> Option<std::sync::MutexGuard<'a, crate::pair::PairState>>,
+) -> bool {
+    let mut parked = parked.lock().unwrap();
+    let Some(staged) = parked.take() else {
+        return true;
+    };
+    match lock() {
+        Some(mut st) => {
+            st.unstage_turn(staged);
+            true
+        }
+        None => {
+            *parked = Some(staged);
+            false
+        }
     }
 }
 
