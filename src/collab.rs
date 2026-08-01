@@ -59,6 +59,12 @@ pub struct ResolvedSpan {
 pub struct CollabDoc {
     replica: Replica,
     text: String,
+    /// Bumped on every text mutation (local or integrated remote). The
+    /// editor wiring pins each buffer of a live file to the generation it
+    /// last synced at, so a buffer created after the file went live (a
+    /// split duplicate loaded from stale disk text) is detectable and gets
+    /// seeded from the replica instead of poisoning the session.
+    text_gen: u64,
     /// Literal text of insertions cola backlogged (its backlog keeps only
     /// position metadata), keyed by the run's identity so the drain can
     /// splice the right characters back in. An entry for a duplicate
@@ -82,6 +88,7 @@ impl CollabDoc {
         Self {
             replica: Replica::new(id, initial.len()),
             text: initial.to_string(),
+            text_gen: 1,
             pending_insert_texts: std::collections::HashMap::new(),
         }
     }
@@ -95,6 +102,7 @@ impl CollabDoc {
         Self {
             replica: self.replica.fork(id),
             text: self.text.clone(),
+            text_gen: 1,
             pending_insert_texts: self.pending_insert_texts.clone(),
         }
     }
@@ -114,12 +122,18 @@ impl CollabDoc {
         Ok(Self {
             replica,
             text: text.to_string(),
+            text_gen: 1,
             pending_insert_texts: std::collections::HashMap::new(),
         })
     }
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The current text generation (see the field doc).
+    pub fn text_gen(&self) -> u64 {
+        self.text_gen
     }
 
     /// This replica's site id (unique per participant per document).
@@ -130,6 +144,7 @@ impl CollabDoc {
     /// Apply a local insertion at byte offset `at` and return the op to
     /// broadcast to the other replicas.
     pub fn local_insert(&mut self, at: usize, s: &str) -> Op {
+        self.text_gen += 1;
         self.text.insert_str(at, s);
         let insertion = self.replica.inserted(at, s.len());
         Op::Insert {
@@ -140,6 +155,7 @@ impl CollabDoc {
 
     /// Apply a local deletion of byte range `at..at+len` and return the op.
     pub fn local_delete(&mut self, at: usize, len: usize) -> Op {
+        self.text_gen += 1;
         let deletion = self.replica.deleted(at..at + len);
         self.text.replace_range(at..at + len, "");
         Op::Delete { deletion }
@@ -178,6 +194,9 @@ impl CollabDoc {
             }
         }
         self.drain_backlog(&mut spans);
+        if !spans.is_empty() {
+            self.text_gen += 1;
+        }
         spans
     }
 
@@ -800,6 +819,15 @@ impl CollabSession {
     pub fn doc_text(&self, file: &str) -> Option<&str> {
         match self.docs.get(file) {
             Some(DocState::Live(doc)) => Some(doc.text()),
+            _ => None,
+        }
+    }
+
+    /// The live doc's text generation for `file` (see
+    /// [`CollabDoc::text_gen`]): the editor wiring's staleness check.
+    pub fn doc_gen(&self, file: &str) -> Option<u64> {
+        match self.docs.get(file) {
+            Some(DocState::Live(doc)) => Some(doc.text_gen()),
             _ => None,
         }
     }

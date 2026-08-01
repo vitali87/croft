@@ -1359,6 +1359,12 @@ pub struct Editor {
     /// after a remote edit is applied so the diff never rebroadcasts one
     /// (same lazy-recompute pattern as `git_marks_seq`).
     pub collab_synced_seq: u64,
+    /// The [`CollabDoc::text_gen`](crate::collab::CollabDoc::text_gen) this
+    /// buffer last synced at, 0 = never attached to the live doc. A buffer
+    /// created after its file went live (a split duplicate, a reopen) holds
+    /// stale disk text: it must never extract (its diff would revert every
+    /// peer) and is instead seeded from the replica when this lags.
+    pub collab_doc_gen: u64,
     /// HEAD baseline for the git gutter: the committed version's lines. Set by
     /// the app (read off the workspace git root once per file / HEAD change).
     /// `None` when the file is untracked, outside a repo, or not yet fetched.
@@ -1664,6 +1670,7 @@ impl Editor {
             breakpoint_logs: std::collections::HashMap::new(),
             edit_seq: 0,
             collab_synced_seq: 0,
+            collab_doc_gen: 0,
             git_head_lines: None,
             git_baseline_for: None,
             git_marks: std::collections::HashMap::new(),

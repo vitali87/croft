@@ -19357,6 +19357,92 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
     );
 }
 
+/// Splitting (or reopening) a live shared file loads the DISK copy, which
+/// is stale by construction: a guest never writes shared files, so an
+/// unsaved session's work exists only in buffers and replicas. The stale
+/// duplicate used to become the active buffer, catch incoming spans at
+/// nonsense offsets, and — on the first keystroke — broadcast a diff of
+/// the live doc against the old disk text, reverting every peer to the
+/// pre-session file. A fresh buffer of a live file must be seeded from the
+/// replicated text, and every pane of the file must mirror the session.
+#[test]
+fn splitting_a_live_file_does_not_revert_the_session() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello world").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    let pump_until =
+        |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(owner, guest) {
+                assert!(Instant::now() < deadline, "never settled: {what}");
+                owner.poll_collab();
+                guest.poll_collab();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+    pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+
+    // An hour of unsaved session work, in miniature.
+    guest.editor.insert_str("SESSION ");
+    pump_until(&mut owner, &mut guest, "session edit converges", &|o, g| {
+        o.editor.lines == g.editor.lines && o.editor.lines[0].contains("SESSION")
+    });
+    let session_text = owner.editor.lines.clone();
+
+    // The guest splits: the duplicate is read from the stale disk copy.
+    guest.split_editor_dir(crate::app::editor_layout::SplitDir::Horizontal, true);
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "the split pane seeds from the live doc, not the disk",
+        &|_, g| g.editor.lines == session_text,
+    );
+
+    // Typing in the split must extend the session, never revert it.
+    guest.editor.insert_str("MORE ");
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "the split edit reaches the owner",
+        &|o, _| o.editor.lines[0].contains("MORE"),
+    );
+    assert!(
+        owner.editor.lines[0].contains("SESSION"),
+        "the pre-split session work survived, got: {:?}",
+        owner.editor.lines
+    );
+
+    // Both guest panes mirror the live document.
+    pump_until(&mut owner, &mut guest, "both panes mirror", &|o, g| {
+        g.editor.lines == o.editor.lines
+            && g.editor_layout
+                .inactive_groups()
+                .iter()
+                .all(|grp| grp.editors.iter().all(|ed| ed.lines == o.editor.lines))
+    });
+}
+
 /// Losing the relay link must not be silent: the app detects the dead
 /// channel, drops the session, and reconnects through the normal backoff
 /// path. Before detection existed, `is_live` stayed true forever and the
@@ -19378,7 +19464,10 @@ fn losing_the_relay_reconnects_instead_of_typing_into_the_void() {
     // Detection: the dead session is dropped.
     let deadline = Instant::now() + Duration::from_secs(3);
     while guest.collab.is_some() {
-        assert!(Instant::now() < deadline, "the dead session was never dropped");
+        assert!(
+            Instant::now() < deadline,
+            "the dead session was never dropped"
+        );
         guest.poll_collab();
         std::thread::sleep(Duration::from_millis(10));
     }
