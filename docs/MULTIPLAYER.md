@@ -366,7 +366,20 @@ The rest of the shipped shape:
   generation falls behind mirror the doc text. Remote spans land on every
   attached pane. "Only the first-found tab stays synced" was unstable —
   focusing another group reorders which pane is found first — and a behind
-  pane accepting a keystroke silently deleted the other pane's work.
+  pane accepting a keystroke silently deleted the other pane's work. A
+  keystroke into a pane that has not attached yet (the one-tick window
+  after a split or reopen) is refused by the same input gate that guards
+  bootstrap — absorbed, it would be silently wiped by the seeding. The
+  collab passes touch TEXT tabs only, every matching one: diff/image/sheet
+  tabs carry the file's path too (close-by-path needs it), and a diff tab
+  earlier in the strip used to swallow the snapshot and spans meant for
+  the real buffer. `Editor::open` drops the attachment when the path
+  CHANGES (a reused preview tab kept the old doc's generation and could
+  broadcast the new file's disk text into it) but keeps it on a same-path
+  reload, which is how an owner's reload-diff converges as ops. While the
+  link is down entirely, the active pane mirrors onto its siblings each
+  tick, so panes cannot diverge independently and the reconnect replays
+  exactly one offline text per file.
 - **Link loss is detected.** EOF or a hard error on the relay channel (and
   any failed send) latches the channel dead; the app drops the session with
   a status hint and reconnects through the normal 2s-backoff path, and
@@ -375,7 +388,9 @@ The rest of the shipped shape:
   never left the machine), so the re-bootstrap keeps its text and replays
   the divergence against the owner's snapshot as fresh local edits instead
   of wiping it — the offline work reaches every peer once the link is
-  back. EOF used to be indistinguishable from an idle
+  back. While no session exists, the guest save gate stands down (there is
+  nobody to defer to; blocking stranded offline work in RAM for the whole
+  outage). EOF used to be indistinguishable from an idle
   socket, so a killed relay left `is_live` true forever while every op
   vanished — with saves still gated, a guest's work existed only in RAM.
   The relay's forwarding writes are bounded too

@@ -66,11 +66,11 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Splitting or reopening a live-shared file can no longer wipe the session: the duplicate pane used to load the stale disk copy and, on your first keystroke, broadcast a diff that reverted every participant to the pre-session file. Fresh panes now seed from the shared document, and all panes of a shared file stay in step.",
+        summary: "Splitting or reopening a live-shared file can no longer wipe the session: the duplicate pane used to load the stale disk copy and, on your first keystroke, broadcast a diff that reverted every participant to the pre-session file. Fresh panes now seed from the shared document (a keystroke arriving before the seed is refused instead of silently wiped), all panes of a shared file stay in step, diff/image/sheet tabs are never mistaken for the document, and a reused preview tab detaches from the old file's doc when it navigates.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Losing the collab relay is now detected: the session reconnects (files re-join automatically) instead of silently swallowing every edit while the share looked alive, and edits made while the link was down are replayed into the restored session instead of being wiped by the owner's older snapshot.",
+        summary: "Losing the collab relay is now detected: the session reconnects (files re-join automatically) instead of silently swallowing every edit while the share looked alive, and edits made while the link was down are replayed into the restored session instead of being wiped by the owner's older snapshot — including edits spread across split panes, which mirror each other offline. A disconnected guest can also save its shared files, so a permanent outage no longer strands work in RAM.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
