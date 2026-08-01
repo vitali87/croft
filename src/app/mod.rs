@@ -1133,7 +1133,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
         MenuAction::CloseAllTabs => Some("⌘K W"),
         MenuAction::CloseSavedTabs => Some("⌘K U"),
-        MenuAction::KeepTabOpen(_) => Some("⌘K ⏎"),
+        MenuAction::KeepTabOpen(_) => Some("⌘K ⇧P"),
         MenuAction::ToggleTabPin(_) => Some("⌘K P"),
         MenuAction::SplitEditor => Some("⌘\\"),
         MenuAction::SplitEditorUp => Some("⌘K ⌘\\"),
@@ -1886,6 +1886,16 @@ pub struct ClosedTerminal {
     pub closed_at: std::time::Instant,
 }
 
+/// A `cargo test --no-run` running on a background thread: the receiver for
+/// its result, the test's name, and the workspace root it builds for (so a
+/// re-root mid-build discards the binary instead of debugging it in the
+/// wrong workspace).
+type PendingTestDebug = (
+    std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+    String,
+    PathBuf,
+);
+
 pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
@@ -2625,6 +2635,11 @@ pub struct App {
     /// Polled each frame by [`App::poll_dap`], which mirrors the paused location
     /// into `editor.stop_line`.
     pub dap_session: Option<crate::dap::session::DapSession>,
+    /// In-flight background `cargo test --no-run` for debug-a-test: the
+    /// receiver yields the picked binary (or the build error) and the test
+    /// name rides along for the launch. Drained per tick; a second request
+    /// while one is pending is refused with a status line.
+    pending_test_debug: Option<PendingTestDebug>,
     /// Variable `variablesReference`s the user has expanded in the Variables
     /// panel. Persisted across polls so re-fetched variables stay open.
     pub debug_expanded: std::collections::HashSet<i64>,
@@ -3605,6 +3620,7 @@ impl App {
             mcp_busy_label: None,
             process_picker: None,
             dap_session: None,
+            pending_test_debug: None,
             debug_expanded: std::collections::HashSet::new(),
             debug_console: Vec::new(),
             debug_ever_stopped: false,
@@ -7011,14 +7027,27 @@ impl App {
                 )
             })
             .collect();
+        self.present_call_hierarchy_menu(items, noun);
+        true
+    }
+
+    /// Show a call-hierarchy reply as a picker at the caret — unless another
+    /// menu is already open: rust-analyzer can answer seconds later, and a
+    /// late reply must not replace what the user is looking at (or yank
+    /// focus to the editor under them).
+    fn present_call_hierarchy_menu(&mut self, items: Vec<(String, MenuAction)>, noun: &str) {
+        if self.context_menu.is_some() {
+            self.status = String::from("Call hierarchy ready, but another menu is open");
+            return;
+        }
         self.status = format!("{} {noun}", items.len());
         let origin = self.editor.cursor_screen_pos().unwrap_or((
             self.editor.last_full_area.x + 1,
             self.editor.last_full_area.y + 1,
         ));
         self.focus_pane(Pane::Editor);
+        let root = self.tree.root.clone();
         self.context_menu = Some(ContextMenu::flat(origin, items, root));
-        true
     }
 
     /// Request the callers (`incoming`) or callees of the symbol at the
@@ -7139,6 +7168,13 @@ impl App {
     /// Implementations and Go to References; `noun` is the status-line plural
     /// ("implementations" / "references").
     fn open_location_picker(&mut self, targets: Vec<(PathBuf, u32, u32)>, noun: &str) {
+        // Same guard as present_call_hierarchy_menu: the LSP can answer
+        // seconds later, and the reply must not replace a menu the user
+        // opened while waiting (or yank focus to the editor).
+        if self.context_menu.is_some() {
+            self.status = String::from("Locations ready, but another menu is open");
+            return;
+        }
         let root = self.tree.root.clone();
         let items: Vec<(String, MenuAction)> = targets
             .into_iter()
@@ -9929,9 +9965,18 @@ impl App {
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
             t.set_palette(self.theme.ansi());
-            // Host accents: the shell's OSC 7 host against the prefs rules
-            // (first match wins). Cleared the moment the host stops matching
-            // (an in-pane SSH session ends).
+        }
+        self.dress_host_accents();
+    }
+
+    /// Host accents: each pane's shell-reported OSC 7 host against the prefs
+    /// rules (first match wins). Cleared the moment the host stops matching
+    /// (an in-pane SSH session ends). Runs from `sync_focus_flags` AND at the
+    /// top of `render`: the OSC 7 host arrives on a PTY reader thread with no
+    /// input event behind it, so the PTY-dirty redraw is the only wakeup —
+    /// dressing must not wait for the next key or click.
+    fn dress_host_accents(&mut self) {
+        for t in self.terminals.iter_mut() {
             let dress = t.shell_host().and_then(|h| {
                 self.host_accents
                     .iter()
@@ -10343,6 +10388,7 @@ impl App {
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let size = frame.area();
         self.last_frame_area = size;
+        self.dress_host_accents();
         // Theme background, whole frame. croft's chrome (the sidebar panels,
         // explorer sections, activity bar, gaps) mostly paints `Color::Reset`
         // and leans on the iTerm2 `SetColors` session bg to color it. Ghostty /
@@ -12643,8 +12689,17 @@ impl App {
             // Cmd+K P: pin / unpin the active tab. This chord was Cmd+K
             // Shift+Enter (and Keep Open bare Cmd+K Enter) — both silently
             // SHADOWED the later, documented Cmd+K Enter run-test-at-cursor
-            // arms below, so the Enter family now belongs to Testing alone;
-            // Keep Open stays on the tab context menu.
+            // arms below, so the Enter family now belongs to Testing alone.
+            // Cmd+K ⇧P: keep the active preview tab open (sibling of the pin
+            // chord below). Must precede the case-insensitive 'p' arm, which
+            // would swallow the shifted press.
+            KeyCode::Char('P') if shifted && plain => {
+                if self.editor.keep_open(self.editor.active_index()) {
+                    self.status = String::from("Kept tab open");
+                    self.poke_cursor();
+                }
+                true
+            }
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'p') => {
                 let idx = self.editor.active_index();
                 let pinned = self.editor.toggle_pin(idx);
@@ -13819,40 +13874,14 @@ impl App {
                 }
             }
             Some(crate::testing::worker::Runner::Cargo) => {
-                let Some(adapter) = lldb_dap_path() else {
+                if lldb_dap_path().is_none() {
                     self.debug_error(lldb_dap_missing_message());
                     return;
-                };
-                self.status = format!("Building test binary for {name}");
-                let binary = match crate::testing::worker::build_test_binary(&root) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        self.debug_error(format!("Test build failed: {e}"));
-                        return;
-                    }
-                };
-                // The bare name is libtest's substring filter (run-at-cursor
-                // has no full module path); --nocapture keeps output visible.
-                let args = vec![name.clone(), String::from("--nocapture")];
-                let request = crate::dap::session::lldb_test_launch_request(&binary, &args);
-                match crate::dap::session::DapSession::launch_with(
-                    &adapter,
-                    &[],
-                    &root,
-                    request,
-                    breakpoints,
-                ) {
-                    Ok(session) => {
-                        self.dap_session = Some(session);
-                        self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
-                        self.run_debug.feedback_is_error = false;
-                        self.status = format!(
-                            "Debugging test {name} via lldb-dap — F5 continue · Shift+F5 stop"
-                        );
-                        self.reveal_debug_view();
-                    }
-                    Err(e) => self.debug_error(format!("Failed to start lldb-dap: {e}")),
                 }
+                // The file the gesture happened in narrows the harness: a
+                // lib test and an integration test can share a bare fn name.
+                let source = self.editor.path.clone();
+                self.start_test_binary_build(root, name, source);
             }
             Some(crate::testing::worker::Runner::Vitest | crate::testing::worker::Runner::Jest) => {
                 self.status =
@@ -13861,6 +13890,103 @@ impl App {
             None => {
                 self.status = String::from("No test runner detected in this workspace");
             }
+        }
+    }
+
+    /// Kick off `cargo test --no-run` on a background thread and remember the
+    /// receiver: a cold build takes minutes, and running it on the UI thread
+    /// froze every pane — no keys, no redraw, no PTY pumping — while the
+    /// "Building…" status could never even paint before the launch overwrote
+    /// it. The drain launches the debugger when the binary arrives.
+    fn start_test_binary_build(&mut self, root: PathBuf, name: String, source: Option<PathBuf>) {
+        if self.pending_test_debug.is_some() {
+            self.status = String::from("A test binary is already building");
+            return;
+        }
+        self.status = format!("Building test binary for {name}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let name = name.clone();
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    crate::testing::worker::build_test_binary(&root, &name, source.as_deref())
+                        .map_err(|e| e.to_string()),
+                );
+            });
+        }
+        self.pending_test_debug = Some((rx, name, root));
+    }
+
+    /// Drain the background test-binary build: on success launch lldb-dap
+    /// (with the editor's breakpoints as they are NOW — the user may have set
+    /// more while the build ran), on failure surface the error. Returns true
+    /// when anything landed, for the redraw aggregate.
+    fn drain_pending_test_debug(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let Some((rx, _, _)) = self.pending_test_debug.as_ref() else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err(String::from("the build thread died")),
+        };
+        let (_, name, build_root) = self.pending_test_debug.take().expect("checked above");
+        // Re-rooting the Explorer mid-build would otherwise launch the old
+        // workspace's binary with the new workspace's cwd and breakpoints.
+        if build_root != self.tree.root {
+            self.status = format!(
+                "Test binary for {name} finished, but the workspace changed — debug it again from its workspace"
+            );
+            return true;
+        }
+        match result {
+            Ok(binary) => self.launch_lldb_test_debug(&binary, &name),
+            Err(e) => self.debug_error(format!("Test build failed: {e}")),
+        }
+        true
+    }
+
+    /// The launch tail of debug-a-cargo-test, run from the drain once the
+    /// background build hands over the binary.
+    fn launch_lldb_test_debug(&mut self, binary: &Path, name: &str) {
+        use std::collections::BTreeMap;
+        if self.dap_session.is_some() {
+            self.status = String::from("A debug session is already running (Shift+F5 stops it)");
+            return;
+        }
+        let Some(adapter) = lldb_dap_path() else {
+            self.debug_error(lldb_dap_missing_message());
+            return;
+        };
+        let root = self.tree.root.clone();
+        let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
+            .editor
+            .breakpoints
+            .iter()
+            .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
+            .collect();
+        // The bare name is libtest's substring filter (run-at-cursor has no
+        // full module path); --nocapture keeps output visible.
+        let args = vec![name.to_string(), String::from("--nocapture")];
+        let request = crate::dap::session::lldb_test_launch_request(binary, &args);
+        match crate::dap::session::DapSession::launch_with(
+            &adapter,
+            &[],
+            &root,
+            request,
+            breakpoints,
+        ) {
+            Ok(session) => {
+                self.dap_session = Some(session);
+                self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
+                self.run_debug.feedback_is_error = false;
+                self.status =
+                    format!("Debugging test {name} via lldb-dap — F5 continue · Shift+F5 stop");
+                self.reveal_debug_view();
+            }
+            Err(e) => self.debug_error(format!("Failed to start lldb-dap: {e}")),
         }
     }
 
@@ -25269,9 +25395,18 @@ impl App {
                     // not start a resize (the rest of the column still drags).
                     // The COMMITS graph draws no right border either, so its
                     // scrollbar shares the same column (Codeberg #41).
+                    // Both scrollbar rects refresh only while their widget
+                    // renders (outline under Explorer, the graph under
+                    // Source Control), so each exemption is gated on its
+                    // view — a stale rect from the last visit must not keep
+                    // deadening the seam after a view switch.
+                    let outline_bar = self.sidebar_view == SidebarView::Explorer
+                        && rect_contains(self.outline.last_scrollbar, m.column, m.row);
+                    let graph_bar = self.sidebar_view == SidebarView::SourceControl
+                        && rect_contains(self.commit_graph.last_scrollbar, m.column, m.row);
                     if (m.column == x || m.column == x.saturating_sub(1))
-                        && !rect_contains(self.outline.last_scrollbar, m.column, m.row)
-                        && !rect_contains(self.commit_graph.last_scrollbar, m.column, m.row)
+                        && !outline_bar
+                        && !graph_bar
                         && self.decoration_dot_at(m.column, m.row).is_none()
                     {
                         self.splitter_drag = Some(SplitterDrag::Sidebar);
@@ -27248,6 +27383,10 @@ impl App {
         // now-empty panel discovers on its next open.
         self.test_worker.set_root(new_root.clone());
         self.testing.reset();
+        // Drop any in-flight `cargo test --no-run`: the drain would refuse
+        // its root-mismatched binary anyway, but the occupied slot kept
+        // refusing NEW debug builds until the stale compile finished.
+        self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
         }
@@ -32888,7 +33027,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
-        let tests_changed = app.test_worker.drain(&mut app.testing);
+        let tests_changed =
+            app.test_worker.drain(&mut app.testing) | app.drain_pending_test_debug();
         let mcp_changed = app.poll_mcp();
         let pair_changed =
             app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();

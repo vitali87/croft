@@ -62,22 +62,30 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The editor tab strip now follows the selected theme: on the ten editor-inspired themes it used to stay the built-ins' navy chrome regardless of the palette. Tab colors are theme data (strip, tab bodies, hover lift, close pill), derived from each theme's palette when not declared, with Croft Black and Croft Dark rendering byte-for-byte as before.",
+        summary: "Debugging a cargo test no longer freezes croft: the test-binary build runs on a background thread with a visible progress status instead of blocking every pane for the whole compile, and a workspace switched mid-build discards the finished binary instead of debugging the old project inside the new one. The debugger also picks the harness that actually contains the test — a failed workspace build surfaces the compile error instead of launching a partial binary, and the file the gesture happened in disambiguates a lib test from an integration test sharing the same name, including a renamed [[test]] target whose name the file stem cannot predict.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Reconnecting a shared session can no longer erase the owner's work: while a guest was offline, edits the owner kept making were read back as deletions when the guest's diverged buffer replayed wholesale. The reconnect now three-way merges the guest's offline delta with the owner's snapshot (against the last text both sides agreed on), so both sides' outage-era edits survive on every replica.",
+        summary: "The gutter play bead is honest now: #[cfg(test)], #[cfg_attr(test, ...)], and attributes that merely end in test (#[contest], #[mytest]) no longer count as test attributes (every cfg-gated helper in a codebase wore a bead that ran nothing and wiped the Testing tree), a def test_* only gets a bead in a pytest-collectable file, and clicking a breakpoint dot, the paused stop arrow, or the AI-stream square on a test line no longer silently starts a test run — the click hit-test honors the same sign-cell precedence the render does.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Seeding the Search sidebar from the last terminal grep/rg now describes that command faithfully: leftover include/exclude filters from an earlier manual search are replaced instead of silently narrowing the seeded results, rg's -s (case-sensitive) flag is honored without hijacking grep's unrelated -s, !-negated globs land in files-to-exclude instead of matching nothing, every -g/--glob (and spaced --exclude value) accumulates instead of only the first, and -- ends option parsing so a dash-leading pattern seeds as the pattern.",
+        summary: "A per-host pane accent now appears the moment the shell reports its host: the OSC 7 hostname arrives with no key or click behind it, and the accent used to wait for the next input event before dressing the pane border — SSHing into a prod-* host and just watching the pane left it undressed.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Seeding a search can no longer crash croft: a text selection left in the files-to-include field survived the seed as a stale byte range into the shorter seeded text, and the next keystroke panicked out of bounds. The seed now resets field selections and hands focus to the query it just filled.",
+        summary: "Removing a breakpoint now removes the whole breakpoint: its logpoint message and condition used to survive removal and silently re-attach to the next plain breakpoint on that line — resurrecting a logpoint that printed instead of ever pausing.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "croft ls no longer reports a workspace's collab relay as a phantom persistent session: the relay socket shares the sessions directory and hash keying, so it used to print an (unknown) row whose id collided with the real session's.",
+        summary: "Running one vitest test with parentheses or brackets in its title works: vitest's -t is a regex like jest's, and croft passed the title unescaped, so 'adds (1 + 1)' matched nothing and an unbalanced bracket errored. Titles are now escaped on every vitest path, matching the jest paths.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Find highlights stay readable when the caret rests on a match: the LSP occurrence tint used to paint its dark background over the find layer's black-on-gold cells, turning every highlighted match (including the orange active-match cue) into unreadable black-on-grey. Occurrences now paint beneath the find layer.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Keep Open works from the keyboard again on Cmd+K Shift+P — the tab menu had kept advertising the old Cmd+K Enter chord, which now runs the test at the caret. A stale COMMITS-graph scrollbar no longer deadens a band of the sidebar splitter after leaving Source Control, and a slow call-hierarchy, references, or implementations reply no longer replaces a menu the user opened while waiting.",
     },
 ];

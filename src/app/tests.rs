@@ -402,6 +402,108 @@ fn cmd_k_h_chords_fire_call_hierarchy_requests() {
 }
 
 #[test]
+fn a_late_call_hierarchy_reply_does_not_clobber_an_open_menu() {
+    // rust-analyzer can answer seconds later; if the user opened another
+    // menu while waiting, the reply must be dropped, not replace what they
+    // are looking at (and yank focus to the editor).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let items = vec![(
+        String::from("caller — a.rs:1"),
+        MenuAction::GoToLocation {
+            path: tmp.path().join("a.rs"),
+            line: 0,
+            col: 0,
+        },
+    )];
+    let other = ContextMenu::flat((1, 1), items.clone(), tmp.path().to_path_buf());
+    app.context_menu = Some(other);
+    let menu_before = app.context_menu.as_ref().map(|m| m.items.len());
+    app.present_call_hierarchy_menu(items, "incoming calls");
+    assert_eq!(
+        app.context_menu.as_ref().map(|m| m.items.len()),
+        menu_before,
+        "an open menu survives a late reply"
+    );
+    assert_eq!(app.status, "Call hierarchy ready, but another menu is open");
+    // With no menu open, the reply presents normally.
+    app.context_menu = None;
+    app.present_call_hierarchy_menu(
+        vec![(
+            String::from("caller — a.rs:1"),
+            MenuAction::GoToLocation {
+                path: tmp.path().join("a.rs"),
+                line: 0,
+                col: 0,
+            },
+        )],
+        "incoming calls",
+    );
+    assert!(
+        app.context_menu.is_some(),
+        "a free slot presents the picker"
+    );
+    assert_eq!(app.status, "1 incoming calls");
+}
+
+#[test]
+fn a_late_location_picker_reply_does_not_clobber_an_open_menu() {
+    // Go to Implementations / References share the async-reply shape with
+    // call hierarchy: the LSP can answer seconds later, and the picker must
+    // not replace a menu the user opened while waiting.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let items = vec![(
+        String::from("a.rs:1"),
+        MenuAction::GoToLocation {
+            path: tmp.path().join("a.rs"),
+            line: 0,
+            col: 0,
+        },
+    )];
+    app.context_menu = Some(ContextMenu::flat(
+        (1, 1),
+        items.clone(),
+        tmp.path().to_path_buf(),
+    ));
+    let menu_before = app.context_menu.as_ref().map(|m| m.items.len());
+    app.open_location_picker(vec![(tmp.path().join("a.rs"), 0, 0)], "references");
+    assert_eq!(
+        app.context_menu.as_ref().map(|m| m.items.len()),
+        menu_before,
+        "an open menu survives a late reply"
+    );
+    assert_eq!(app.status, "Locations ready, but another menu is open");
+    // With no menu open, the reply presents normally.
+    app.context_menu = None;
+    app.open_location_picker(vec![(tmp.path().join("a.rs"), 0, 0)], "references");
+    assert!(
+        app.context_menu.is_some(),
+        "a free slot presents the picker"
+    );
+    assert_eq!(app.status, "1 references");
+}
+
+#[test]
+fn a_workspace_change_cancels_the_pending_test_debug_build() {
+    // The drain already refuses to launch a binary whose build root no
+    // longer matches, but the occupied slot also kept refusing NEW builds
+    // ("A test binary is already building") until the stale compile
+    // finished. Re-rooting must free the slot immediately.
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = tmp.path().join("inner");
+    std::fs::create_dir(&inner).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.pending_test_debug = Some((rx, String::from("my_case"), tmp.path().to_path_buf()));
+    app.change_workspace_root(inner);
+    assert!(
+        app.pending_test_debug.is_none(),
+        "re-rooting drops the in-flight build so a new one can start"
+    );
+}
+
+#[test]
 fn popup_gradient_tracks_black_theme() {
     // Popups/menus/tooltips wear the gradient + muted selection only under the
     // Black theme; Croft Dark keeps the legacy bright-blue accent so it stays
@@ -12053,6 +12155,57 @@ fn sidebar_drag_grabs_one_column_left_of_seam() {
 }
 
 #[test]
+fn a_stale_commit_graph_scrollbar_rect_cannot_deaden_the_splitter() {
+    // The COMMITS graph refreshes `last_scrollbar` only while it renders,
+    // i.e. only under the Source Control view. After switching to Explorer
+    // the stale rect used to keep punching a hole in the splitter grab
+    // zone: dragging the sidebar seam inside that band silently did
+    // nothing. The exemption must apply only while the graph is visible.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_splitter_x = Some(36);
+    app.last_content_width = 60;
+    app.last_content_height = 20;
+    app.sidebar_width = 32;
+    app.commit_graph.last_scrollbar = Rect {
+        x: 35,
+        y: 4,
+        width: 1,
+        height: 10,
+    };
+    app.sidebar_view = SidebarView::Explorer;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 35,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(
+        app.splitter_drag,
+        Some(SplitterDrag::Sidebar),
+        "a stale graph scrollbar rect must not deaden the seam outside Source Control"
+    );
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column: 35,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    });
+    // While the graph IS visible, its scrollbar still wins the cell.
+    app.sidebar_view = SidebarView::SourceControl;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 35,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        app.splitter_drag.is_none(),
+        "the live graph scrollbar keeps its exemption from the grab zone"
+    );
+}
+
+#[test]
 fn welcome_paints_a_full_bordered_box_around_the_editor_area() {
     // Without a visible envelope, users on the welcome page can't
     // perceive that the explorer is resizable and can't see where the
@@ -13628,6 +13781,115 @@ fn cmd_k_enter_reaches_run_test_at_cursor_not_keep_open() {
     assert!(
         app.editor.is_preview(app.editor.active_index()),
         "Keep Open no longer owns the chord, so the preview stays a preview"
+    );
+}
+
+#[test]
+fn cmd_k_shift_p_keeps_the_preview_tab_open_and_the_menu_says_so() {
+    // Keep Open lost its Cmd+K Enter chord to run-test-at-cursor, but the
+    // tab menu kept advertising "⌘K ⏎" — a hint that now starts a test run.
+    // The action lives on Cmd+K ⇧P (sibling of Cmd+K P pin), and the menu
+    // label must say exactly that.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "x").unwrap();
+    app.editor.open_preview(&f).unwrap();
+    let idx = app.editor.active_index();
+    assert!(app.editor.is_preview(idx), "opened as a preview tab");
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('P'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(
+        !app.editor.is_preview(app.editor.active_index()),
+        "Cmd+K Shift+P promotes the preview to a kept-open tab"
+    );
+    assert_eq!(app.status, "Kept tab open");
+    assert_eq!(
+        shortcut_for(&MenuAction::KeepTabOpen(0)),
+        Some("⌘K ⇧P"),
+        "the tab menu must advertise the chord that actually works"
+    );
+}
+
+#[test]
+fn debug_a_cargo_test_builds_off_the_ui_thread() {
+    // A cold `cargo test --no-run` takes minutes; running it on the UI
+    // thread froze the whole TUI (no keys, no redraw, no PTY pumping, no
+    // cancel) and the "Building…" status could never even paint before the
+    // launch overwrote it. The request must return immediately and the
+    // result arrive through the tick drain.
+    let tmp = tempfile::tempdir().unwrap();
+    // A Cargo project cargo rejects instantly (no src/), so the background
+    // build fails fast and deterministically.
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.start_test_binary_build(tmp.path().to_path_buf(), String::from("my_case"), None);
+    assert_eq!(
+        app.status, "Building test binary for my_case",
+        "the request returns with the progress status showing"
+    );
+    // A second request while one is pending is refused, not stacked.
+    app.start_test_binary_build(tmp.path().to_path_buf(), String::from("other"), None);
+    assert_eq!(app.status, "A test binary is already building");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !app.drain_pending_test_debug() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the build result never arrived through the drain"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.status.starts_with("Test build failed"),
+        "a broken crate surfaces the build error, got: {}",
+        app.status
+    );
+    assert!(
+        app.pending_test_debug.is_none(),
+        "the pending slot frees for the next request"
+    );
+}
+
+#[test]
+fn a_test_binary_that_finishes_after_a_workspace_change_is_discarded() {
+    // Re-rooting the Explorer while `cargo test --no-run` runs used to make
+    // the drain launch the OLD workspace's binary with the NEW workspace's
+    // cwd and breakpoint context. A finished build whose originating root no
+    // longer matches the current workspace must be dropped, not launched.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pending_test_debug = Some((
+        rx,
+        String::from("my_case"),
+        std::path::PathBuf::from("/somewhere/else"),
+    ));
+    tx.send(Ok(std::path::PathBuf::from(
+        "/somewhere/else/target/debug/deps/x-abc123",
+    )))
+    .unwrap();
+    assert!(
+        app.drain_pending_test_debug(),
+        "the drain consumed the result"
+    );
+    assert!(
+        app.dap_session.is_none(),
+        "no debugger may launch for a foreign workspace's binary"
+    );
+    assert!(
+        app.status.contains("workspace changed"),
+        "status explains the discarded build, got: {}",
+        app.status
+    );
+    assert!(
+        app.pending_test_debug.is_none(),
+        "the pending slot frees for the next request"
     );
 }
 
