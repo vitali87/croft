@@ -98,10 +98,21 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
         }
     }
 
+    // A standalone `--` ends option parsing: everything after it is
+    // positional, so a dash-leading pattern (`rg -- -TODO`) stays a pattern.
+    let mut flags_done = false;
     while idx < tokens.len() {
         let tok = tokens[idx].clone();
         idx += 1;
-        if let Some(long) = tok.strip_prefix("--") {
+        if flags_done {
+            if pattern.is_none() {
+                pattern = Some(tok);
+            }
+            continue;
+        }
+        if tok == "--" {
+            flags_done = true;
+        } else if let Some(long) = tok.strip_prefix("--") {
             let (name, inline_val) = match long.split_once('=') {
                 Some((n, v)) => (n, Some(v.to_string())),
                 None => (long, None),
@@ -346,6 +357,17 @@ mod tests {
         let c = parse("grep -rn --exclude=*.min.js --exclude-dir=dist TODO .").unwrap();
         assert_eq!(c.pattern, "TODO");
         assert_eq!(c.exclude.as_deref(), Some("*.min.js,dist"));
+    }
+
+    #[test]
+    fn end_of_options_marker_lets_a_dash_leading_pattern_through() {
+        // `rg -- -TODO src` searches for the literal `-TODO`; without
+        // honoring `--`, the parser ate `-TODO` as flags and seeded the
+        // search with `src` — running replace against unintended text.
+        let c = parse("rg -g '*.rs' -- -TODO src").unwrap();
+        assert_eq!(c.pattern, "-TODO");
+        assert_eq!(c.include.as_deref(), Some("*.rs"));
+        assert_eq!(parse("grep -rn -- --help .").unwrap().pattern, "--help");
     }
 
     #[test]
