@@ -1133,7 +1133,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
         MenuAction::CloseAllTabs => Some("⌘K W"),
         MenuAction::CloseSavedTabs => Some("⌘K U"),
-        MenuAction::KeepTabOpen(_) => Some("⌘K ⏎"),
+        MenuAction::KeepTabOpen(_) => Some("⌘K ⇧P"),
         MenuAction::ToggleTabPin(_) => Some("⌘K P"),
         MenuAction::SplitEditor => Some("⌘\\"),
         MenuAction::SplitEditorUp => Some("⌘K ⌘\\"),
@@ -7011,14 +7011,27 @@ impl App {
                 )
             })
             .collect();
+        self.present_call_hierarchy_menu(items, noun);
+        true
+    }
+
+    /// Show a call-hierarchy reply as a picker at the caret — unless another
+    /// menu is already open: rust-analyzer can answer seconds later, and a
+    /// late reply must not replace what the user is looking at (or yank
+    /// focus to the editor under them).
+    fn present_call_hierarchy_menu(&mut self, items: Vec<(String, MenuAction)>, noun: &str) {
+        if self.context_menu.is_some() {
+            self.status = String::from("Call hierarchy ready, but another menu is open");
+            return;
+        }
         self.status = format!("{} {noun}", items.len());
         let origin = self.editor.cursor_screen_pos().unwrap_or((
             self.editor.last_full_area.x + 1,
             self.editor.last_full_area.y + 1,
         ));
         self.focus_pane(Pane::Editor);
+        let root = self.tree.root.clone();
         self.context_menu = Some(ContextMenu::flat(origin, items, root));
-        true
     }
 
     /// Request the callers (`incoming`) or callees of the symbol at the
@@ -12643,8 +12656,17 @@ impl App {
             // Cmd+K P: pin / unpin the active tab. This chord was Cmd+K
             // Shift+Enter (and Keep Open bare Cmd+K Enter) — both silently
             // SHADOWED the later, documented Cmd+K Enter run-test-at-cursor
-            // arms below, so the Enter family now belongs to Testing alone;
-            // Keep Open stays on the tab context menu.
+            // arms below, so the Enter family now belongs to Testing alone.
+            // Cmd+K ⇧P: keep the active preview tab open (sibling of the pin
+            // chord below). Must precede the case-insensitive 'p' arm, which
+            // would swallow the shifted press.
+            KeyCode::Char('P') if shifted && plain => {
+                if self.editor.keep_open(self.editor.active_index()) {
+                    self.status = String::from("Kept tab open");
+                    self.poke_cursor();
+                }
+                true
+            }
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'p') => {
                 let idx = self.editor.active_index();
                 let pinned = self.editor.toggle_pin(idx);
@@ -25269,9 +25291,18 @@ impl App {
                     // not start a resize (the rest of the column still drags).
                     // The COMMITS graph draws no right border either, so its
                     // scrollbar shares the same column (Codeberg #41).
+                    // Both scrollbar rects refresh only while their widget
+                    // renders (outline under Explorer, the graph under
+                    // Source Control), so each exemption is gated on its
+                    // view — a stale rect from the last visit must not keep
+                    // deadening the seam after a view switch.
+                    let outline_bar = self.sidebar_view == SidebarView::Explorer
+                        && rect_contains(self.outline.last_scrollbar, m.column, m.row);
+                    let graph_bar = self.sidebar_view == SidebarView::SourceControl
+                        && rect_contains(self.commit_graph.last_scrollbar, m.column, m.row);
                     if (m.column == x || m.column == x.saturating_sub(1))
-                        && !rect_contains(self.outline.last_scrollbar, m.column, m.row)
-                        && !rect_contains(self.commit_graph.last_scrollbar, m.column, m.row)
+                        && !outline_bar
+                        && !graph_bar
                         && self.decoration_dot_at(m.column, m.row).is_none()
                     {
                         self.splitter_drag = Some(SplitterDrag::Sidebar);

@@ -1775,6 +1775,22 @@ impl Editor {
         let path = self.path.clone()?;
         let set = self.breakpoints.entry(path.clone()).or_default();
         let now_set = if set.remove(&line) {
+            // Removing a breakpoint removes the whole breakpoint: an
+            // orphaned condition or log message would silently re-attach to
+            // the next plain breakpoint set on this line (a resurrected
+            // logpoint never pauses at all).
+            if let Some(conds) = self.breakpoint_conditions.get_mut(&path) {
+                conds.remove(&line);
+                if conds.is_empty() {
+                    self.breakpoint_conditions.remove(&path);
+                }
+            }
+            if let Some(logs) = self.breakpoint_logs.get_mut(&path) {
+                logs.remove(&line);
+                if logs.is_empty() {
+                    self.breakpoint_logs.remove(&path);
+                }
+            }
             false
         } else {
             set.insert(line);
@@ -1851,7 +1867,34 @@ impl Editor {
         if self.wrap_enabled() && start != 0 {
             return None;
         }
-        crate::testing::locate::test_fn_on_line(&self.lines, line)
+        // Render precedence: the stop arrow, breakpoint glyphs, and the
+        // AI-stream square all outrank the play bead in the shared sign
+        // cell — a click on one of those glyphs must not start a test run.
+        if self.sign_cell_taken(line) {
+            return None;
+        }
+        crate::testing::locate::test_fn_on_line(self.path.as_deref(), &self.lines, line)
+    }
+
+    /// Whether the sign cell of 0-based `line` is claimed by a glyph that
+    /// outranks the test play bead: the debugger's stop arrow, any
+    /// breakpoint glyph (dot, diamond, hollow ring), or the AI-stream stop
+    /// square — the same precedence the render pass applies.
+    fn sign_cell_taken(&self, line: usize) -> bool {
+        if self.stream_stop_line == Some(line) {
+            return true;
+        }
+        let Some(path) = self.path.as_deref() else {
+            return false;
+        };
+        let here = line + 1; // gutter is 1-based
+        self.stop_line
+            .as_ref()
+            .is_some_and(|(p, l)| p == path && *l == here)
+            || self
+                .breakpoints
+                .get(path)
+                .is_some_and(|s| s.contains(&here))
     }
 
     /// Whether `(col, row)` lands on the AI-stream stop button in the sign
@@ -7067,7 +7110,12 @@ impl Widget for &mut Editor {
             // breakpoint dot both outrank it.
             if (!wrap || row_start == 0)
                 && !sign_taken
-                && crate::testing::locate::test_fn_on_line(&self.lines, line_idx).is_some()
+                && crate::testing::locate::test_fn_on_line(
+                    self.path.as_deref(),
+                    &self.lines,
+                    line_idx,
+                )
+                .is_some()
             {
                 buf.set_string(
                     sign_x,
@@ -9378,6 +9426,40 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_breakpoint_discards_its_logpoint_and_condition() {
+        // F9 twice on a logpoint line reads as "remove, then set a plain
+        // breakpoint" — but the orphaned message survived in
+        // `breakpoint_logs` and re-attached on the next set, resurrecting a
+        // logpoint that never pauses. Same leak for conditions.
+        let path = PathBuf::from("/x/a.py");
+        let mut e = Editor::new();
+        e.path = Some(path.clone());
+        e.lines = vec!["a".into(), "b".into(), "c".into()];
+        e.toggle_breakpoint_line(2);
+        e.breakpoint_logs
+            .entry(path.clone())
+            .or_default()
+            .insert(2, String::from("x is {x}"));
+        e.breakpoint_conditions
+            .entry(path.clone())
+            .or_default()
+            .insert(2, String::from("x > 1"));
+        e.toggle_breakpoint_line(2); // remove
+        e.toggle_breakpoint_line(2); // re-add: a PLAIN breakpoint
+        let lines = e.breakpoints.get(&path).cloned().unwrap();
+        let specs = e.source_breakpoints(&path, &lines);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].log_message, None,
+            "a re-added breakpoint must pause, not print"
+        );
+        assert_eq!(
+            specs[0].condition, None,
+            "a re-added breakpoint must be unconditional"
+        );
+    }
+
+    #[test]
     fn toggle_breakpoint_line_targets_an_explicit_line_not_the_cursor() {
         let mut e = Editor::new();
         e.path = Some(PathBuf::from("/x/a.py"));
@@ -9954,6 +10036,9 @@ mod tests {
     #[test]
     fn gutter_play_glyph_marks_test_fns_and_maps_clicks_to_the_name() {
         let mut e = editor_with("#[test]\nfn my_case() {}\nfn helper() {}");
+        // Beads need a saved .rs file: an unsaved buffer has nothing a
+        // runner could target.
+        e.path = Some(PathBuf::from("/x/a.rs"));
         let area = Rect {
             x: 0,
             y: 0,
@@ -10357,6 +10442,51 @@ mod tests {
         assert!(
             footer.contains("why here?"),
             "the reply draft renders in the footer: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn a_claimed_sign_cell_does_not_hit_test_as_the_play_bead() {
+        // Render gives the sign cell to the stop arrow / breakpoint glyph /
+        // AI-stream square before the play bead; the CLICK hit-test must
+        // agree, or the natural gesture of clicking a red ● (VS Code toggles
+        // a breakpoint there) silently starts a test run instead.
+        let mut e = editor_with("#[test]\nfn my_case() {}");
+        e.path = Some(PathBuf::from("/x/a.rs"));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let sign_x = e.last_inner.x;
+        assert_eq!(e.test_glyph_at(sign_x, 2).as_deref(), Some("my_case"));
+        e.toggle_breakpoint_line(2);
+        assert_eq!(
+            e.test_glyph_at(sign_x, 2),
+            None,
+            "the breakpoint dot's cell must not run tests on click"
+        );
+        e.toggle_breakpoint_line(2);
+        assert_eq!(
+            e.test_glyph_at(sign_x, 2).as_deref(),
+            Some("my_case"),
+            "removing the dot hands the cell back to the bead"
+        );
+        e.stop_line = Some((e.path.clone().unwrap(), 2));
+        assert_eq!(
+            e.test_glyph_at(sign_x, 2),
+            None,
+            "the paused stop arrow owns its cell"
+        );
+        e.stop_line = None;
+        e.stream_stop_line = Some(1);
+        assert_eq!(
+            e.test_glyph_at(sign_x, 2),
+            None,
+            "the AI-stream stop square owns its cell"
         );
     }
 

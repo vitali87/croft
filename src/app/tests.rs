@@ -402,6 +402,51 @@ fn cmd_k_h_chords_fire_call_hierarchy_requests() {
 }
 
 #[test]
+fn a_late_call_hierarchy_reply_does_not_clobber_an_open_menu() {
+    // rust-analyzer can answer seconds later; if the user opened another
+    // menu while waiting, the reply must be dropped, not replace what they
+    // are looking at (and yank focus to the editor).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let items = vec![(
+        String::from("caller — a.rs:1"),
+        MenuAction::GoToLocation {
+            path: tmp.path().join("a.rs"),
+            line: 0,
+            col: 0,
+        },
+    )];
+    let other = ContextMenu::flat((1, 1), items.clone(), tmp.path().to_path_buf());
+    app.context_menu = Some(other);
+    let menu_before = app.context_menu.as_ref().map(|m| m.items.len());
+    app.present_call_hierarchy_menu(items, "incoming calls");
+    assert_eq!(
+        app.context_menu.as_ref().map(|m| m.items.len()),
+        menu_before,
+        "an open menu survives a late reply"
+    );
+    assert_eq!(app.status, "Call hierarchy ready, but another menu is open");
+    // With no menu open, the reply presents normally.
+    app.context_menu = None;
+    app.present_call_hierarchy_menu(
+        vec![(
+            String::from("caller — a.rs:1"),
+            MenuAction::GoToLocation {
+                path: tmp.path().join("a.rs"),
+                line: 0,
+                col: 0,
+            },
+        )],
+        "incoming calls",
+    );
+    assert!(
+        app.context_menu.is_some(),
+        "a free slot presents the picker"
+    );
+    assert_eq!(app.status, "1 incoming calls");
+}
+
+#[test]
 fn popup_gradient_tracks_black_theme() {
     // Popups/menus/tooltips wear the gradient + muted selection only under the
     // Black theme; Croft Dark keeps the legacy bright-blue accent so it stays
@@ -12053,6 +12098,57 @@ fn sidebar_drag_grabs_one_column_left_of_seam() {
 }
 
 #[test]
+fn a_stale_commit_graph_scrollbar_rect_cannot_deaden_the_splitter() {
+    // The COMMITS graph refreshes `last_scrollbar` only while it renders,
+    // i.e. only under the Source Control view. After switching to Explorer
+    // the stale rect used to keep punching a hole in the splitter grab
+    // zone: dragging the sidebar seam inside that band silently did
+    // nothing. The exemption must apply only while the graph is visible.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_splitter_x = Some(36);
+    app.last_content_width = 60;
+    app.last_content_height = 20;
+    app.sidebar_width = 32;
+    app.commit_graph.last_scrollbar = Rect {
+        x: 35,
+        y: 4,
+        width: 1,
+        height: 10,
+    };
+    app.sidebar_view = SidebarView::Explorer;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 35,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(
+        app.splitter_drag,
+        Some(SplitterDrag::Sidebar),
+        "a stale graph scrollbar rect must not deaden the seam outside Source Control"
+    );
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column: 35,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    });
+    // While the graph IS visible, its scrollbar still wins the cell.
+    app.sidebar_view = SidebarView::SourceControl;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 35,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        app.splitter_drag.is_none(),
+        "the live graph scrollbar keeps its exemption from the grab zone"
+    );
+}
+
+#[test]
 fn welcome_paints_a_full_bordered_box_around_the_editor_area() {
     // Without a visible envelope, users on the welcome page can't
     // perceive that the explorer is resizable and can't see where the
@@ -13628,6 +13724,35 @@ fn cmd_k_enter_reaches_run_test_at_cursor_not_keep_open() {
     assert!(
         app.editor.is_preview(app.editor.active_index()),
         "Keep Open no longer owns the chord, so the preview stays a preview"
+    );
+}
+
+#[test]
+fn cmd_k_shift_p_keeps_the_preview_tab_open_and_the_menu_says_so() {
+    // Keep Open lost its Cmd+K Enter chord to run-test-at-cursor, but the
+    // tab menu kept advertising "⌘K ⏎" — a hint that now starts a test run.
+    // The action lives on Cmd+K ⇧P (sibling of Cmd+K P pin), and the menu
+    // label must say exactly that.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "x").unwrap();
+    app.editor.open_preview(&f).unwrap();
+    let idx = app.editor.active_index();
+    assert!(app.editor.is_preview(idx), "opened as a preview tab");
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('P'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(
+        !app.editor.is_preview(app.editor.active_index()),
+        "Cmd+K Shift+P promotes the preview to a kept-open tab"
+    );
+    assert_eq!(app.status, "Kept tab open");
+    assert_eq!(
+        shortcut_for(&MenuAction::KeepTabOpen(0)),
+        Some("⌘K ⇧P"),
+        "the tab menu must advertise the chord that actually works"
     );
 }
 
