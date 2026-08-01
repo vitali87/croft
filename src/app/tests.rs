@@ -14350,6 +14350,49 @@ fn switching_sidebar_view_closes_the_open_commit_dropdown() {
 // --- Split editor (side-by-side panes) -----------------------------------
 
 /// Open a file into the focused editor group of a fresh App.
+/// Seeding the Search panel from a terminal command must describe THAT
+/// command: filter globs left over from an earlier manual search would
+/// silently narrow the seeded results (the terminal scanned everything), and
+/// the status line would still claim a faithful seed — feeding Replace All a
+/// wrong subset.
+#[test]
+fn seeding_search_replaces_stale_include_and_exclude_filters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.search.include = String::from("*.md");
+    app.search.exclude = String::from("vendor");
+    assert!(app.seed_search_from_command("rg TODO"));
+    assert_eq!(
+        app.search.include, "",
+        "a bare rg scanned everything; a stale include must not filter the seeded search"
+    );
+    assert_eq!(app.search.exclude, "");
+    assert!(app.seed_search_from_command("rg -g '*.rs' -g '!target' TODO"));
+    assert_eq!(app.search.include, "*.rs");
+    assert_eq!(app.search.exclude, "target");
+}
+
+/// A byte-range selection made in the Include field before the seed must not
+/// survive into the (shorter) seeded text: the next keystroke used to
+/// replace_range the stale span and panic out of bounds.
+#[test]
+fn seeding_search_cannot_leave_a_stale_field_selection() {
+    use crate::widgets::search::SearchField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.search.include = String::from("**/*.rs,**/*.toml");
+    app.search.focus_field(SearchField::Include);
+    app.search.select_all_active();
+    assert!(app.seed_search_from_command("rg -g '*.md' TODO"));
+    assert_eq!(
+        app.search.field,
+        SearchField::Query,
+        "seeding hands focus to the query field it just filled"
+    );
+    app.search.type_char('x');
+    assert_eq!(app.search.include, "*.md", "the seeded include is intact");
+}
+
 fn app_with_open_file(tmp: &std::path::Path, name: &str, body: &str) -> App {
     let f = tmp.join(name);
     std::fs::write(&f, body).unwrap();

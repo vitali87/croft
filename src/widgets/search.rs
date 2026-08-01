@@ -895,6 +895,19 @@ impl SearchPanel {
             .map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
     }
 
+    /// Replace the query and both filter lists wholesale (the terminal-seed
+    /// path). Text replacement invalidates any byte-range selection into the
+    /// old text — a stale range into shorter text panics on the next edit —
+    /// and focus moves to the query the caller just filled.
+    pub fn seed(&mut self, query: String, include: String, exclude: String) {
+        self.query = query;
+        self.include = include;
+        self.exclude = exclude;
+        self.field = SearchField::Query;
+        self.selection = None;
+        self.field_selection = None;
+    }
+
     pub fn select_all_query(&mut self) {
         if self.query.is_empty() {
             self.selection = None;

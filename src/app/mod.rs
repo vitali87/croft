@@ -21325,21 +21325,30 @@ impl App {
                 }
             }
         };
-        let Some(sc) = crate::quickfix::parse_search_command(input.trim()) else {
+        if !self.seed_search_from_command(input.trim()) {
             self.status =
                 String::from("Last terminal command wasn't a grep/rg search — nothing to seed");
-            return;
+        }
+    }
+
+    /// Populate and run the Search panel from a parsed terminal search
+    /// command line. Returns false when `input` isn't a recognisable search.
+    fn seed_search_from_command(&mut self, input: &str) -> bool {
+        let Some(sc) = crate::quickfix::parse_search_command(input) else {
+            return false;
         };
-        self.search.query = sc.pattern.clone();
+        self.search.seed(
+            sc.pattern.clone(),
+            sc.include.unwrap_or_default(),
+            sc.exclude.unwrap_or_default(),
+        );
         self.search.opts.case_sensitive = sc.case_sensitive;
         self.search.opts.whole_word = sc.whole_word;
         self.search.opts.use_regex = sc.use_regex;
-        if let Some(inc) = sc.include {
-            self.search.include = inc;
-        }
         self.set_sidebar_view(SidebarView::Search);
         self.submit_search_query();
         self.status = format!("Search seeded from terminal: {}", sc.pattern);
+        true
     }
 
     fn terminal_file_click(&mut self, col: u16, row: u16) -> bool {
