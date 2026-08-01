@@ -447,6 +447,63 @@ fn a_late_call_hierarchy_reply_does_not_clobber_an_open_menu() {
 }
 
 #[test]
+fn a_late_location_picker_reply_does_not_clobber_an_open_menu() {
+    // Go to Implementations / References share the async-reply shape with
+    // call hierarchy: the LSP can answer seconds later, and the picker must
+    // not replace a menu the user opened while waiting.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let items = vec![(
+        String::from("a.rs:1"),
+        MenuAction::GoToLocation {
+            path: tmp.path().join("a.rs"),
+            line: 0,
+            col: 0,
+        },
+    )];
+    app.context_menu = Some(ContextMenu::flat(
+        (1, 1),
+        items.clone(),
+        tmp.path().to_path_buf(),
+    ));
+    let menu_before = app.context_menu.as_ref().map(|m| m.items.len());
+    app.open_location_picker(vec![(tmp.path().join("a.rs"), 0, 0)], "references");
+    assert_eq!(
+        app.context_menu.as_ref().map(|m| m.items.len()),
+        menu_before,
+        "an open menu survives a late reply"
+    );
+    assert_eq!(app.status, "Locations ready, but another menu is open");
+    // With no menu open, the reply presents normally.
+    app.context_menu = None;
+    app.open_location_picker(vec![(tmp.path().join("a.rs"), 0, 0)], "references");
+    assert!(
+        app.context_menu.is_some(),
+        "a free slot presents the picker"
+    );
+    assert_eq!(app.status, "1 references");
+}
+
+#[test]
+fn a_workspace_change_cancels_the_pending_test_debug_build() {
+    // The drain already refuses to launch a binary whose build root no
+    // longer matches, but the occupied slot also kept refusing NEW builds
+    // ("A test binary is already building") until the stale compile
+    // finished. Re-rooting must free the slot immediately.
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = tmp.path().join("inner");
+    std::fs::create_dir(&inner).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.pending_test_debug = Some((rx, String::from("my_case"), tmp.path().to_path_buf()));
+    app.change_workspace_root(inner);
+    assert!(
+        app.pending_test_debug.is_none(),
+        "re-rooting drops the in-flight build so a new one can start"
+    );
+}
+
+#[test]
 fn popup_gradient_tracks_black_theme() {
     // Popups/menus/tooltips wear the gradient + muted selection only under the
     // Black theme; Croft Dark keeps the legacy bright-blue accent so it stays
@@ -13772,13 +13829,13 @@ fn debug_a_cargo_test_builds_off_the_ui_thread() {
     )
     .unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.start_test_binary_build(tmp.path().to_path_buf(), String::from("my_case"));
+    app.start_test_binary_build(tmp.path().to_path_buf(), String::from("my_case"), None);
     assert_eq!(
         app.status, "Building test binary for my_case",
         "the request returns with the progress status showing"
     );
     // A second request while one is pending is refused, not stacked.
-    app.start_test_binary_build(tmp.path().to_path_buf(), String::from("other"));
+    app.start_test_binary_build(tmp.path().to_path_buf(), String::from("other"), None);
     assert_eq!(app.status, "A test binary is already building");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !app.drain_pending_test_debug() {

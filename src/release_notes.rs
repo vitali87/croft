@@ -62,7 +62,7 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Debugging a cargo test no longer freezes croft: the test-binary build runs on a background thread with a visible progress status instead of blocking every pane for the whole compile, and a workspace switched mid-build discards the finished binary instead of debugging the old project inside the new one. The debugger also now picks the harness that actually contains the test (probing each candidate with --list), so a lib test in a lib+bin crate or a workspace no longer launches the wrong binary, runs zero tests, and exits before a breakpoint can bind.",
+        summary: "Debugging a cargo test no longer freezes croft: the test-binary build runs on a background thread with a visible progress status instead of blocking every pane for the whole compile, and a workspace switched mid-build discards the finished binary instead of debugging the old project inside the new one. The debugger also picks the harness that actually contains the test — a failed workspace build surfaces the compile error instead of launching a partial binary, and the file the gesture happened in disambiguates a lib test from an integration test sharing the same name.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
@@ -82,6 +82,6 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Keep Open works from the keyboard again on Cmd+K Shift+P — the tab menu had kept advertising the old Cmd+K Enter chord, which now runs the test at the caret. A stale COMMITS-graph scrollbar no longer deadens a band of the sidebar splitter after leaving Source Control, and a slow call-hierarchy reply no longer replaces a menu the user opened while waiting.",
+        summary: "Keep Open works from the keyboard again on Cmd+K Shift+P — the tab menu had kept advertising the old Cmd+K Enter chord, which now runs the test at the caret. A stale COMMITS-graph scrollbar no longer deadens a band of the sidebar splitter after leaving Source Control, and a slow call-hierarchy, references, or implementations reply no longer replaces a menu the user opened while waiting.",
     },
 ];

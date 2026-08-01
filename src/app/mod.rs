@@ -7168,6 +7168,13 @@ impl App {
     /// Implementations and Go to References; `noun` is the status-line plural
     /// ("implementations" / "references").
     fn open_location_picker(&mut self, targets: Vec<(PathBuf, u32, u32)>, noun: &str) {
+        // Same guard as present_call_hierarchy_menu: the LSP can answer
+        // seconds later, and the reply must not replace a menu the user
+        // opened while waiting (or yank focus to the editor).
+        if self.context_menu.is_some() {
+            self.status = String::from("Locations ready, but another menu is open");
+            return;
+        }
         let root = self.tree.root.clone();
         let items: Vec<(String, MenuAction)> = targets
             .into_iter()
@@ -13861,7 +13868,10 @@ impl App {
                     self.debug_error(lldb_dap_missing_message());
                     return;
                 }
-                self.start_test_binary_build(root, name);
+                // The file the gesture happened in narrows the harness: a
+                // lib test and an integration test can share a bare fn name.
+                let source = self.editor.path.clone();
+                self.start_test_binary_build(root, name, source);
             }
             Some(crate::testing::worker::Runner::Vitest | crate::testing::worker::Runner::Jest) => {
                 self.status =
@@ -13878,7 +13888,7 @@ impl App {
     /// froze every pane — no keys, no redraw, no PTY pumping — while the
     /// "Building…" status could never even paint before the launch overwrote
     /// it. The drain launches the debugger when the binary arrives.
-    fn start_test_binary_build(&mut self, root: PathBuf, name: String) {
+    fn start_test_binary_build(&mut self, root: PathBuf, name: String, source: Option<PathBuf>) {
         if self.pending_test_debug.is_some() {
             self.status = String::from("A test binary is already building");
             return;
@@ -13890,7 +13900,7 @@ impl App {
             let root = root.clone();
             std::thread::spawn(move || {
                 let _ = tx.send(
-                    crate::testing::worker::build_test_binary(&root, &name)
+                    crate::testing::worker::build_test_binary(&root, &name, source.as_deref())
                         .map_err(|e| e.to_string()),
                 );
             });
@@ -27363,6 +27373,10 @@ impl App {
         // now-empty panel discovers on its next open.
         self.test_worker.set_root(new_root.clone());
         self.testing.reset();
+        // Drop any in-flight `cargo test --no-run`: the drain would refuse
+        // its root-mismatched binary anyway, but the occupied slot kept
+        // refusing NEW debug builds until the stale compile finished.
+        self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
         }
