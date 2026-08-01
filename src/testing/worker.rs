@@ -345,15 +345,16 @@ fn is_js_file(pattern: &str) -> bool {
     super::parse::is_js_test_file(js_id_parts(pattern).0)
 }
 
-/// The test binary from a `cargo test --no-run --message-format=json` output:
-/// the compiler-artifact lines whose profile is `test` and whose `executable`
-/// is set. A bin/lib target (unit tests, the common case) outranks an
-/// integration `test` target.
-/// ponytail: with several integration-test binaries this picks the last one;
-/// mapping a test NAME to its binary would need running each with `--list`.
-pub fn test_binary_from_cargo_json(output: &str) -> Option<PathBuf> {
-    let mut unit: Option<PathBuf> = None;
-    let mut any: Option<PathBuf> = None;
+/// The test-profile executables from `cargo test --no-run
+/// --message-format=json` output: compiler-artifact lines whose profile is
+/// `test` and whose `executable` is set. Ranked lib first (unit tests
+/// overwhelmingly live in the lib), then bin, then integration `test`
+/// targets, preserving cargo's order within a rank. A src/lib.rs +
+/// src/main.rs crate emits both a lib and a bin harness; the old last-wins
+/// pick handed a lib test to the bin harness, which filters everything out
+/// and exits before a breakpoint can bind.
+pub fn test_binary_candidates(output: &str) -> Vec<PathBuf> {
+    let mut ranked: Vec<(u8, PathBuf)> = Vec::new();
     for line in output.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -369,42 +370,107 @@ pub fn test_binary_from_cargo_json(output: &str) -> Option<PathBuf> {
         let Some(exe) = v.get("executable").and_then(|e| e.as_str()) else {
             continue;
         };
-        let is_unit = v
+        let kind_rank = v
             .get("target")
             .and_then(|t| t.get("kind"))
             .and_then(|k| k.as_array())
-            .is_some_and(|kinds| {
-                kinds
-                    .iter()
-                    .filter_map(|k| k.as_str())
-                    .any(|k| k == "bin" || k == "lib")
-            });
-        if is_unit {
-            unit = Some(PathBuf::from(exe));
-        } else {
-            any = Some(PathBuf::from(exe));
-        }
+            .map(|kinds| {
+                let has = |want: &str| kinds.iter().filter_map(|k| k.as_str()).any(|k| k == want);
+                if has("lib") {
+                    0
+                } else if has("bin") {
+                    1
+                } else {
+                    2
+                }
+            })
+            .unwrap_or(2);
+        ranked.push((kind_rank, PathBuf::from(exe)));
     }
-    unit.or(any)
+    ranked.sort_by_key(|(r, _)| *r); // stable: cargo order kept within a rank
+    ranked.into_iter().map(|(_, p)| p).collect()
 }
 
-/// Build (or reuse) the workspace's test binary for debugging:
-/// `cargo test --no-run --message-format=json`, synchronously.
-/// ponytail: blocks the caller for the build — warm targets answer in
-/// under a second, a cold crate takes as long as it takes; move to a
-/// background thread if that ever hurts in practice.
-pub fn build_test_binary(root: &Path) -> std::io::Result<PathBuf> {
+/// Which candidate harness actually contains `name`: each is asked to
+/// `--list` with the name as libtest's filter (fast — nothing runs), and the
+/// first whose listing carries a `…: test` line wins. cargo's JSON does not
+/// say which target defines a test.
+pub fn binary_containing_test(candidates: &[PathBuf], name: &str) -> Option<PathBuf> {
+    for exe in candidates {
+        let Ok(out) = Command::new(exe)
+            .args([name, "--list"])
+            .stdin(Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.lines().any(|l| l.trim_end().ends_with(": test")) {
+            return Some(exe.clone());
+        }
+    }
+    None
+}
+
+/// Build (or reuse) the workspace's test binaries and pick the harness that
+/// contains `name`: `cargo test --no-run --message-format=json`, then a
+/// `--list` probe per candidate when more than one harness came out. Blocking
+/// — the app runs this on a background thread and launches from the drain.
+pub fn build_test_binary(root: &Path, name: &str) -> std::io::Result<PathBuf> {
     let out = cargo_cmd(root, &["test", "--no-run", "--message-format=json"]).output()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    test_binary_from_cargo_json(&stdout).ok_or_else(|| {
-        std::io::Error::other(format!(
-            "no test binary in cargo's build output: {}",
-            String::from_utf8_lossy(&out.stderr)
-                .lines()
-                .last()
-                .unwrap_or("")
-        ))
-    })
+    let candidates = test_binary_candidates(&stdout);
+    let probed = if candidates.len() > 1 {
+        binary_containing_test(&candidates, name)
+    } else {
+        None
+    };
+    probed
+        .or_else(|| candidates.into_iter().next())
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "no test binary in cargo's build output: {}",
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("")
+            ))
+        })
+}
+
+/// vitest argv for one exact test: the file scopes the run and `-t` narrows
+/// to the title. vitest's `-t/--testNamePattern` is jest-compatible — a
+/// REGEX over the full name — so the title is escaped like jest's.
+fn vitest_one_args(name: &str) -> Vec<String> {
+    let (file, title) = js_id_parts(name);
+    let mut args = vec![String::from("run"), file.to_string()];
+    if let Some(t) = title {
+        args.push(String::from("-t"));
+        args.push(regex_escape(t));
+    }
+    args.push(String::from("--reporter=tap-flat"));
+    args
+}
+
+/// vitest argv for a filter run: a suite click passes a node-ID prefix
+/// (`file` or `file::describe`), run-at-cursor a bare title. The file scopes
+/// the run when present; a describe segment (or the bare title) narrows via
+/// `-t`.
+fn vitest_filter_args(pattern: &str) -> Vec<String> {
+    let mut args = vec![String::from("run")];
+    let (file, title) = js_id_parts(pattern);
+    if is_js_file(pattern) {
+        args.push(file.to_string());
+        if let Some(t) = title {
+            args.push(String::from("-t"));
+            args.push(regex_escape(t));
+        }
+    } else {
+        args.push(String::from("-t"));
+        args.push(regex_escape(pattern));
+    }
+    args.push(String::from("--reporter=tap-flat"));
+    args
 }
 
 /// Adapt a one-line-one-case parser to [`run_streaming`]'s many-cases shape
@@ -516,15 +582,7 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
         Some(Runner::Vitest) => {
-            // The file scopes the run; `-t` narrows to the title (a substring
-            // match on the full name, like pytest's `-k`).
-            let (file, title) = js_id_parts(name);
-            let mut args = vec!["run", file];
-            if let Some(t) = title {
-                args.extend(["-t", t]);
-            }
-            args.push("--reporter=tap-flat");
-            let cmd = js_cmd(root, "vitest", &args);
+            let cmd = js_cmd(root, "vitest", &vitest_one_args(name));
             run_streaming(tx, cmd, one(parse_vitest_tap_line))
         }
         Some(Runner::Jest) => {
@@ -564,22 +622,8 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
             };
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        // A suite click passes a node-ID prefix (`file` or `file::describe`),
-        // run-at-cursor a bare title. The file scopes the run when present;
-        // a describe segment (or the bare title) narrows via `-t`.
         Some(Runner::Vitest) => {
-            let mut args = vec!["run"];
-            let (file, title) = js_id_parts(pattern);
-            if is_js_file(pattern) {
-                args.push(file);
-                if let Some(t) = title {
-                    args.extend(["-t", t]);
-                }
-            } else {
-                args.extend(["-t", pattern]);
-            }
-            args.push("--reporter=tap-flat");
-            let cmd = js_cmd(root, "vitest", &args);
+            let cmd = js_cmd(root, "vitest", &vitest_filter_args(pattern));
             run_streaming(tx, cmd, one(parse_vitest_tap_line))
         }
         Some(Runner::Jest) => {
@@ -665,6 +709,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vitest_titles_are_regex_escaped_like_jests() {
+        // vitest's `-t/--testNamePattern` is jest-compatible: a REGEX over
+        // the full name. Passing a title raw turns `adds (1 + 1)` into a
+        // capture group (0 tests match) and an unbalanced `[` into an
+        // invalid-pattern error. The jest paths already escape; vitest must
+        // treat the same flag the same way.
+        let args = vitest_one_args("tests/math.test.js::math::adds (1 + 1)");
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "tests/math.test.js",
+                "-t",
+                r"adds \(1 \+ 1\)",
+                "--reporter=tap-flat"
+            ]
+        );
+        let args = vitest_filter_args("parses [ tokens");
+        assert_eq!(
+            args,
+            vec!["run", "-t", r"parses \[ tokens", "--reporter=tap-flat"]
+        );
+        let args = vitest_filter_args("tests/a.test.js::group (x)");
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "tests/a.test.js",
+                "-t",
+                r"group \(x\)",
+                "--reporter=tap-flat"
+            ]
+        );
+    }
+
+    #[test]
     fn drain_drops_responses_from_before_the_last_set_root() {
         let (mut w, tx) = TestWorker::for_test();
         let mut panel = TestingPanel::new();
@@ -703,27 +783,60 @@ mod tests {
     fn cargo_json_artifact_lines_yield_the_unit_test_binary() {
         // Shapes captured from a real `cargo test --no-run --message-format=json`
         // run: one compiler-artifact line per target, `executable` set only on
-        // test binaries. The bin/lib target (unit tests) outranks integration
-        // test targets when both exist.
+        // test binaries. A src/lib.rs + src/main.rs crate emits BOTH a lib and
+        // a bin harness; last-wins used to hand a lib test to the bin harness,
+        // which filters everything out and exits before a breakpoint binds.
+        // Candidates rank lib first (unit tests overwhelmingly live there),
+        // then bin, then integration, preserving cargo order within a rank.
         let lines = [
             r#"{"reason":"compiler-artifact","target":{"kind":["test"],"name":"cli"},"profile":{"test":true},"executable":"/p/target/debug/deps/cli-2a2d806b06669aa7"}"#,
-            r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"croft"},"profile":{"test":true},"executable":"/p/target/debug/deps/croft-ff001122"}"#,
+            r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"croft"},"profile":{"test":true},"executable":"/p/target/debug/deps/croft-lib00"}"#,
+            r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"croft"},"profile":{"test":true},"executable":"/p/target/debug/deps/croft-bin00"}"#,
             r#"{"reason":"build-finished","success":true}"#,
         ];
         let joined = lines.join("\n");
         assert_eq!(
-            test_binary_from_cargo_json(&joined).as_deref(),
-            Some(std::path::Path::new("/p/target/debug/deps/croft-ff001122")),
-            "the bin target's test binary wins over the integration test's"
+            test_binary_candidates(&joined),
+            vec![
+                PathBuf::from("/p/target/debug/deps/croft-lib00"),
+                PathBuf::from("/p/target/debug/deps/croft-bin00"),
+                PathBuf::from("/p/target/debug/deps/cli-2a2d806b06669aa7"),
+            ],
+            "lib outranks bin outranks integration; nothing is dropped"
         );
         // Only an integration target: it is still returned.
         assert_eq!(
-            test_binary_from_cargo_json(lines[0]).as_deref(),
-            Some(std::path::Path::new(
-                "/p/target/debug/deps/cli-2a2d806b06669aa7"
-            ))
+            test_binary_candidates(lines[0]),
+            vec![PathBuf::from("/p/target/debug/deps/cli-2a2d806b06669aa7")]
         );
-        assert_eq!(test_binary_from_cargo_json(lines[2]), None);
-        assert_eq!(test_binary_from_cargo_json(""), None);
+        assert!(test_binary_candidates(lines[3]).is_empty());
+        assert!(test_binary_candidates("").is_empty());
+    }
+
+    /// cargo's JSON does not say which target defines a test; with several
+    /// harnesses each is asked to `--list` the name (fast, runs nothing) and
+    /// the first that knows it wins.
+    #[test]
+    fn probe_picks_the_harness_that_actually_lists_the_test() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let empty = script("bin_harness", r#"echo "0 tests, 0 benchmarks""#);
+        let has = script("lib_harness", r#"echo "module::lib_side_test: test""#);
+        assert_eq!(
+            binary_containing_test(&[empty.clone(), has.clone()], "lib_side_test"),
+            Some(has),
+            "the harness listing the test wins even when probed second"
+        );
+        assert_eq!(
+            binary_containing_test(&[empty], "lib_side_test"),
+            None,
+            "no harness knows the test -> no pick (caller falls back)"
+        );
     }
 }
