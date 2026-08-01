@@ -62,26 +62,18 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A momentum flick over a PDF preview coalesces reliably: the wheel cooldown now starts when the page render finishes, so a render slower than the cooldown no longer lets every queued wheel event through as its own blocking page step.",
+        summary: "The editor tab strip now follows the selected theme: on the ten editor-inspired themes it used to stay the built-ins' navy chrome regardless of the palette. Tab colors are theme data (strip, tab bodies, hover lift, close pill), derived from each theme's palette when not declared, with Croft Black and Croft Dark rendering byte-for-byte as before.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Splitting or reopening a live-shared file can no longer wipe the session: the duplicate pane used to load the stale disk copy and, on your first keystroke, broadcast a diff that reverted every participant to the pre-session file. Fresh panes now seed from the shared document (a keystroke arriving before the seed is refused instead of silently wiped), all panes of a shared file stay in step, diff/image/sheet tabs are never mistaken for the document, and a reused preview tab detaches from the old file's doc when it navigates.",
+        summary: "Seeding the Search sidebar from the last terminal grep/rg now describes that command faithfully: leftover include/exclude filters from an earlier manual search are replaced instead of silently narrowing the seeded results, rg's -s (case-sensitive) flag is honored, !-negated globs land in files-to-exclude instead of matching nothing, and every -g/--glob accumulates instead of only the first.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Losing the collab relay is now detected: the session reconnects (files re-join automatically) instead of silently swallowing every edit while the share looked alive, and edits made while the link was down are replayed into the restored session instead of being wiped by the owner's older snapshot — including edits spread across split panes, which mirror each other offline. A disconnected guest can also save its shared files, so a permanent outage no longer strands work in RAM.",
+        summary: "Seeding a search can no longer crash croft: a text selection left in the files-to-include field survived the seed as a stale byte range into the shorter seeded text, and the next keystroke panicked out of bounds. The seed now resets field selections and hands focus to the query it just filled.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A shared file whose session owner never answers now truly degrades to local editing: the input gate used to re-arm every three seconds forever and the guest could neither type nor save; the guest now edits freely and its save writes to disk.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "One stuck participant can no longer freeze everyone: the collab relay's forwarding writes are bounded, a peer that stops draining is dropped, and a full socket can no longer wedge croft's own UI thread mid-send.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "A collab peer (including an AI seat over the MCP agent) can no longer reach outside the workspace: shared-file keys arriving over the wire are contained to the workspace root, so neither a traversing path nor a symlink pointing beyond the root can read or edit files outside it.",
+        summary: "croft ls no longer reports a workspace's collab relay as a phantom persistent session: the relay socket shares the sessions directory and hash keying, so it used to print an (unknown) row whose id collided with the real session's.",
     },
 ];
