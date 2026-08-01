@@ -2625,6 +2625,11 @@ pub struct App {
     /// Polled each frame by [`App::poll_dap`], which mirrors the paused location
     /// into `editor.stop_line`.
     pub dap_session: Option<crate::dap::session::DapSession>,
+    /// In-flight background `cargo test --no-run` for debug-a-test: the
+    /// receiver yields the picked binary (or the build error) and the test
+    /// name rides along for the launch. Drained per tick; a second request
+    /// while one is pending is refused with a status line.
+    pending_test_debug: Option<(std::sync::mpsc::Receiver<Result<PathBuf, String>>, String)>,
     /// Variable `variablesReference`s the user has expanded in the Variables
     /// panel. Persisted across polls so re-fetched variables stay open.
     pub debug_expanded: std::collections::HashSet<i64>,
@@ -3605,6 +3610,7 @@ impl App {
             mcp_busy_label: None,
             process_picker: None,
             dap_session: None,
+            pending_test_debug: None,
             debug_expanded: std::collections::HashSet::new(),
             debug_console: Vec::new(),
             debug_ever_stopped: false,
@@ -13841,40 +13847,11 @@ impl App {
                 }
             }
             Some(crate::testing::worker::Runner::Cargo) => {
-                let Some(adapter) = lldb_dap_path() else {
+                if lldb_dap_path().is_none() {
                     self.debug_error(lldb_dap_missing_message());
                     return;
-                };
-                self.status = format!("Building test binary for {name}");
-                let binary = match crate::testing::worker::build_test_binary(&root) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        self.debug_error(format!("Test build failed: {e}"));
-                        return;
-                    }
-                };
-                // The bare name is libtest's substring filter (run-at-cursor
-                // has no full module path); --nocapture keeps output visible.
-                let args = vec![name.clone(), String::from("--nocapture")];
-                let request = crate::dap::session::lldb_test_launch_request(&binary, &args);
-                match crate::dap::session::DapSession::launch_with(
-                    &adapter,
-                    &[],
-                    &root,
-                    request,
-                    breakpoints,
-                ) {
-                    Ok(session) => {
-                        self.dap_session = Some(session);
-                        self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
-                        self.run_debug.feedback_is_error = false;
-                        self.status = format!(
-                            "Debugging test {name} via lldb-dap — F5 continue · Shift+F5 stop"
-                        );
-                        self.reveal_debug_view();
-                    }
-                    Err(e) => self.debug_error(format!("Failed to start lldb-dap: {e}")),
                 }
+                self.start_test_binary_build(root, name);
             }
             Some(crate::testing::worker::Runner::Vitest | crate::testing::worker::Runner::Jest) => {
                 self.status =
@@ -13883,6 +13860,94 @@ impl App {
             None => {
                 self.status = String::from("No test runner detected in this workspace");
             }
+        }
+    }
+
+    /// Kick off `cargo test --no-run` on a background thread and remember the
+    /// receiver: a cold build takes minutes, and running it on the UI thread
+    /// froze every pane — no keys, no redraw, no PTY pumping — while the
+    /// "Building…" status could never even paint before the launch overwrote
+    /// it. The drain launches the debugger when the binary arrives.
+    fn start_test_binary_build(&mut self, root: PathBuf, name: String) {
+        if self.pending_test_debug.is_some() {
+            self.status = String::from("A test binary is already building");
+            return;
+        }
+        self.status = format!("Building test binary for {name}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let name = name.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    crate::testing::worker::build_test_binary(&root, &name)
+                        .map_err(|e| e.to_string()),
+                );
+            });
+        }
+        self.pending_test_debug = Some((rx, name));
+    }
+
+    /// Drain the background test-binary build: on success launch lldb-dap
+    /// (with the editor's breakpoints as they are NOW — the user may have set
+    /// more while the build ran), on failure surface the error. Returns true
+    /// when anything landed, for the redraw aggregate.
+    fn drain_pending_test_debug(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let Some((rx, _)) = self.pending_test_debug.as_ref() else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err(String::from("the build thread died")),
+        };
+        let (_, name) = self.pending_test_debug.take().expect("checked above");
+        match result {
+            Ok(binary) => self.launch_lldb_test_debug(&binary, &name),
+            Err(e) => self.debug_error(format!("Test build failed: {e}")),
+        }
+        true
+    }
+
+    /// The launch tail of debug-a-cargo-test, run from the drain once the
+    /// background build hands over the binary.
+    fn launch_lldb_test_debug(&mut self, binary: &Path, name: &str) {
+        use std::collections::BTreeMap;
+        if self.dap_session.is_some() {
+            self.status = String::from("A debug session is already running (Shift+F5 stops it)");
+            return;
+        }
+        let Some(adapter) = lldb_dap_path() else {
+            self.debug_error(lldb_dap_missing_message());
+            return;
+        };
+        let root = self.tree.root.clone();
+        let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
+            .editor
+            .breakpoints
+            .iter()
+            .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
+            .collect();
+        // The bare name is libtest's substring filter (run-at-cursor has no
+        // full module path); --nocapture keeps output visible.
+        let args = vec![name.to_string(), String::from("--nocapture")];
+        let request = crate::dap::session::lldb_test_launch_request(binary, &args);
+        match crate::dap::session::DapSession::launch_with(
+            &adapter,
+            &[],
+            &root,
+            request,
+            breakpoints,
+        ) {
+            Ok(session) => {
+                self.dap_session = Some(session);
+                self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
+                self.run_debug.feedback_is_error = false;
+                self.status =
+                    format!("Debugging test {name} via lldb-dap — F5 continue · Shift+F5 stop");
+                self.reveal_debug_view();
+            }
+            Err(e) => self.debug_error(format!("Failed to start lldb-dap: {e}")),
         }
     }
 
@@ -32919,7 +32984,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
-        let tests_changed = app.test_worker.drain(&mut app.testing);
+        let tests_changed =
+            app.test_worker.drain(&mut app.testing) | app.drain_pending_test_debug();
         let mcp_changed = app.poll_mcp();
         let pair_changed =
             app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();

@@ -13757,6 +13757,49 @@ fn cmd_k_shift_p_keeps_the_preview_tab_open_and_the_menu_says_so() {
 }
 
 #[test]
+fn debug_a_cargo_test_builds_off_the_ui_thread() {
+    // A cold `cargo test --no-run` takes minutes; running it on the UI
+    // thread froze the whole TUI (no keys, no redraw, no PTY pumping, no
+    // cancel) and the "Building…" status could never even paint before the
+    // launch overwrote it. The request must return immediately and the
+    // result arrive through the tick drain.
+    let tmp = tempfile::tempdir().unwrap();
+    // A Cargo project cargo rejects instantly (no src/), so the background
+    // build fails fast and deterministically.
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.start_test_binary_build(tmp.path().to_path_buf(), String::from("my_case"));
+    assert_eq!(
+        app.status, "Building test binary for my_case",
+        "the request returns with the progress status showing"
+    );
+    // A second request while one is pending is refused, not stacked.
+    app.start_test_binary_build(tmp.path().to_path_buf(), String::from("other"));
+    assert_eq!(app.status, "A test binary is already building");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !app.drain_pending_test_debug() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the build result never arrived through the drain"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.status.starts_with("Test build failed"),
+        "a broken crate surfaces the build error, got: {}",
+        app.status
+    );
+    assert!(
+        app.pending_test_debug.is_none(),
+        "the pending slot frees for the next request"
+    );
+}
+
+#[test]
 fn cmd_k_p_pins_then_unpins_the_active_tab() {
     // Pin moved to Cmd+K P: its old Shift+Enter chord now debugs the test
     // at the caret.
