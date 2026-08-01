@@ -2679,6 +2679,11 @@ pub struct App {
     /// Throttle for the lazy relay connect (the owner starts before any
     /// guest has spawned the relay, so the first attempts fail by design).
     last_collab_connect: Option<std::time::Instant>,
+    /// Per-file merge base harvested when the relay link died: the last
+    /// replicated text every participant agreed on. A reconnect bootstrap
+    /// replays only this side's offline delta against it (three-way with the
+    /// owner's snapshot), so owner edits made during the outage survive.
+    collab_offline_base: std::collections::HashMap<String, String>,
     /// Peers' last-known carets by site id. Painted as ghost carets in the
     /// peer's color when their file is active, with a name tag while the
     /// caret is inside its fade window.
@@ -3618,6 +3623,7 @@ impl App {
             collab: None,
             collab_config: crate::collab::CollabChannel::env_config(),
             last_collab_connect: None,
+            collab_offline_base: std::collections::HashMap::new(),
             collab_carets: std::collections::HashMap::new(),
             collab_caret_sent: None,
             collab_stream: None,
@@ -16699,12 +16705,24 @@ impl App {
                 }
                 CollabEvent::Bootstrapped { file, text } => {
                     let doc_gen = session.doc_gen(&file).unwrap_or(0);
+                    let owner_text = text.clone();
+                    let base = self.collab_offline_base.remove(&file);
                     if let Some(kept) = self.finish_collab_bootstrap(&root, &file, text, doc_gen) {
                         // A buffer diverged while the link was down: replay
                         // the divergence as local edits so the offline work
-                        // reaches every peer; the attach pass below re-marks
-                        // the kept panes (doc text now equals theirs).
-                        session.local_change(&file, &kept);
+                        // reaches every peer; the attach pass below re-seeds
+                        // the kept panes from the doc once it holds the
+                        // replayed text. With a harvested base, only this
+                        // side's offline delta replays (three-way against
+                        // the owner's snapshot), so owner edits made during
+                        // the outage survive.
+                        let replay = match base {
+                            Some(base) => {
+                                crate::collab::merge_offline_texts(&base, &kept, &owner_text)
+                            }
+                            None => kept,
+                        };
+                        session.local_change(&file, &replay);
                     }
                 }
                 CollabEvent::BootstrapTimedOut { file } => {
@@ -16817,15 +16835,26 @@ impl App {
         }
 
         if session.disconnected() {
-            // The relay hung up (EOF or a failed write): keeping the dead
-            // session made `is_live` lie forever while every op vanished.
-            // Drop it; the connect path above re-attaches (2s backoff) and
-            // guest files re-bootstrap through the normal request path.
-            self.status = String::from("Shared session link lost; reconnecting");
+            self.drop_lost_collab_session(session);
             return true;
         }
         self.collab = Some(session);
         changed | self.collab_labels_dirty()
+    }
+
+    /// The relay hung up (EOF or a failed write): keeping the dead session
+    /// made `is_live` lie forever while every op vanished. Drop it; the
+    /// connect path re-attaches (2s backoff) and guest files re-bootstrap
+    /// through the normal request path.
+    fn drop_lost_collab_session(&mut self, session: crate::collab::CollabSession) {
+        // Harvest each live doc's replicated text first: it is the merge
+        // base for offline edits at the next bootstrap. Without it, the
+        // whole diverged buffer replays and reads the owner's concurrent
+        // (unseen) edits as deletions.
+        for (file, text) in session.live_texts() {
+            self.collab_offline_base.insert(file, text);
+        }
+        self.status = String::from("Shared session link lost; reconnecting");
     }
 
     /// One redraw when the set of visible caret name tags changes with no
@@ -27262,6 +27291,9 @@ impl App {
             self.collab = None;
             self.collab_config = None;
         }
+        // Old-root merge bases are keyed by root-relative file, like the
+        // carets below: never let them merge into a same-named file here.
+        self.collab_offline_base.clear();
         self.pair_record_path = crate::session::pair_record_path(&new_root);
         self.pair_socket = crate::session::collab_socket_path(&new_root);
         self.pair_host_lock_path = crate::session::pair_host_lock_path(&new_root);

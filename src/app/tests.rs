@@ -19697,10 +19697,11 @@ fn reconnecting_replays_offline_guest_edits_instead_of_deleting_them() {
         o.editor.lines == g.editor.lines && o.editor.lines[0].contains("SESSION")
     });
 
-    // The link dies: this is the state poll_collab leaves after detecting a
-    // dead channel (session dropped, config kept). Hold the reconnect
-    // backoff while the guest keeps typing offline.
-    guest.collab = None;
+    // The link dies: drive the same teardown poll_collab runs after
+    // detecting a dead channel (session dropped, config kept). Hold the
+    // reconnect backoff while the guest keeps typing offline.
+    let dead = guest.collab.take().unwrap();
+    guest.drop_lost_collab_session(dead);
     guest.last_collab_connect = Some(Instant::now());
     guest.editor.insert_str("OFFLINE ");
     let offline_text = guest.editor.lines.clone();
@@ -19725,6 +19726,85 @@ fn reconnecting_replays_offline_guest_edits_instead_of_deleting_them() {
         &mut guest,
         "the offline edit reaches the owner",
         &|o, g| o.editor.lines == g.editor.lines && o.editor.lines[0].contains("OFFLINE"),
+    );
+}
+
+/// The converse of the replay test above: while the guest was offline, the
+/// OWNER also edited the file. The guest's whole diverged buffer replayed
+/// over the reconnect bootstrap used to read the owner's unseen edit as a
+/// deletion and strip it from every replica. The reconnect must merge the
+/// guest's offline delta with the owner's snapshot (three-way, against the
+/// last shared text harvested when the link died).
+#[test]
+fn reconnect_replay_preserves_owner_edits_made_during_the_outage() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "alpha\nbeta\ngamma").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    let pump_until =
+        |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(owner, guest) {
+                assert!(Instant::now() < deadline, "never settled: {what}");
+                owner.poll_collab();
+                guest.poll_collab();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+    pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+
+    // The guest's link dies through the real teardown (which harvests the
+    // merge base); it edits line 1 offline while the owner edits line 3.
+    let dead = guest.collab.take().unwrap();
+    guest.drop_lost_collab_session(dead);
+    guest.last_collab_connect = Some(Instant::now());
+    guest.editor.insert_str("OFFLINE ");
+    let owner_pump = |owner: &mut App| {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            owner.poll_collab();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    owner.editor.cursor_row = 2;
+    owner.editor.cursor_col = 0;
+    owner.editor.insert_str("OWNER ");
+    owner_pump(&mut owner);
+
+    // Reconnect: both offline-era edits must survive, everywhere.
+    guest.last_collab_connect = None;
+    pump_until(&mut owner, &mut guest, "reconnect goes live", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "both offline-era edits converge on every replica",
+        &|o, g| {
+            o.editor.lines == g.editor.lines
+                && o.editor.lines[0].contains("OFFLINE")
+                && o.editor.lines[2].contains("OWNER")
+        },
     );
 }
 

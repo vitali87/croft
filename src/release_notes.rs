@@ -66,7 +66,11 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Seeding the Search sidebar from the last terminal grep/rg now describes that command faithfully: leftover include/exclude filters from an earlier manual search are replaced instead of silently narrowing the seeded results, rg's -s (case-sensitive) flag is honored, !-negated globs land in files-to-exclude instead of matching nothing, and every -g/--glob accumulates instead of only the first.",
+        summary: "Reconnecting a shared session can no longer erase the owner's work: while a guest was offline, edits the owner kept making were read back as deletions when the guest's diverged buffer replayed wholesale. The reconnect now three-way merges the guest's offline delta with the owner's snapshot (against the last text both sides agreed on), so both sides' outage-era edits survive on every replica.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Seeding the Search sidebar from the last terminal grep/rg now describes that command faithfully: leftover include/exclude filters from an earlier manual search are replaced instead of silently narrowing the seeded results, rg's -s (case-sensitive) flag is honored without hijacking grep's unrelated -s, !-negated globs land in files-to-exclude instead of matching nothing, every -g/--glob (and spaced --exclude value) accumulates instead of only the first, and -- ends option parsing so a dash-leading pattern seeds as the pattern.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,

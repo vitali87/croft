@@ -311,6 +311,98 @@ pub fn text_delta_ops(doc: &mut CollabDoc, new: &str) -> Vec<Op> {
     ops
 }
 
+/// Three-way merge of a shared file after an offline gap: `base` is the last
+/// text every participant agreed on (harvested when the link died), `ours`
+/// the local buffer that diverged offline, `theirs` the owner's bootstrap
+/// snapshot (which may carry edits made during the outage). Line-level
+/// hunks against `base` from both sides are combined; where they touch the
+/// same lines, ours wins — the offline buffer is the only home of that work,
+/// while the owner's side of a genuine conflict still lives in its replicas'
+/// history. Replaying `ours` wholesale instead read every owner edit made
+/// during the outage as a deletion.
+pub fn merge_offline_texts(base: &str, ours: &str, theirs: &str) -> String {
+    use similar::{ChangeTag, TextDiff};
+    /// A run of changed base lines: half-open line range + replacement
+    /// lines; a pure insertion has start == end.
+    type Hunk = (usize, usize, Vec<String>);
+    if base == theirs {
+        return ours.to_string(); // nothing happened on their side
+    }
+    if base == ours {
+        return theirs.to_string(); // nothing happened here
+    }
+
+    // Line hunks against base.
+    fn hunks(base_lines: &[&str], derived_lines: &[&str]) -> Vec<Hunk> {
+        let diff = TextDiff::from_slices(base_lines, derived_lines);
+        let mut out: Vec<Hunk> = Vec::new();
+        let mut cur: Option<Hunk> = None;
+        let mut old_pos = 0usize;
+        for change in diff.iter_all_changes() {
+            match change.tag() {
+                ChangeTag::Equal => {
+                    if let Some(h) = cur.take() {
+                        out.push(h);
+                    }
+                    old_pos += 1;
+                }
+                ChangeTag::Delete => {
+                    match &mut cur {
+                        Some(h) => h.1 = old_pos + 1,
+                        None => cur = Some((old_pos, old_pos + 1, Vec::new())),
+                    }
+                    old_pos += 1;
+                }
+                ChangeTag::Insert => {
+                    let line = change.value().to_string();
+                    match &mut cur {
+                        Some(h) => h.2.push(line),
+                        None => cur = Some((old_pos, old_pos, vec![line])),
+                    }
+                }
+            }
+        }
+        if let Some(h) = cur.take() {
+            out.push(h);
+        }
+        out
+    }
+
+    let base_lines: Vec<&str> = base.split('\n').collect();
+    let ours_hunks = hunks(&base_lines, &ours.split('\n').collect::<Vec<_>>());
+    let theirs_hunks = hunks(&base_lines, &theirs.split('\n').collect::<Vec<_>>());
+
+    // Two hunks conflict when their base ranges intersect, or when both are
+    // insertions at the same point.
+    let conflicts =
+        |a: &Hunk, b: &Hunk| (a.0 < b.1 && b.0 < a.1) || (a.0 == b.0 && (a.0 == a.1 || b.0 == b.1));
+    let mut chosen: Vec<(&Hunk, bool)> = ours_hunks.iter().map(|h| (h, true)).collect();
+    for th in &theirs_hunks {
+        if !ours_hunks.iter().any(|oh| conflicts(oh, th)) {
+            chosen.push((th, false));
+        }
+    }
+    // Ours-first at equal starts, so an offline insertion lands before a
+    // same-point owner replacement; either order is textually valid.
+    chosen.sort_by_key(|(h, is_ours)| (h.0, !*is_ours));
+
+    let mut out: Vec<String> = Vec::new();
+    let mut pos = 0usize;
+    for (h, _) in chosen {
+        while pos < h.0 {
+            out.push(base_lines[pos].to_string());
+            pos += 1;
+        }
+        out.extend(h.2.iter().cloned());
+        pos = pos.max(h.1);
+    }
+    while pos < base_lines.len() {
+        out.push(base_lines[pos].to_string());
+        pos += 1;
+    }
+    out.join("\n")
+}
+
 /// Byte offset of the char-indexed position `(row, col)` within the text
 /// formed by joining `lines` with `'\n'` — the linear coordinate CollabDoc and
 /// cola operate in. croft's editor addresses the buffer as `(row, char-column)`
@@ -839,6 +931,20 @@ impl CollabSession {
             Some(DocState::Live(doc)) => Some(doc.text()),
             _ => None,
         }
+    }
+
+    /// Every live file's current replicated text. Harvested as the offline
+    /// merge base when the relay link is lost: it is the last text every
+    /// participant agreed on, so a reconnect can replay only this side's
+    /// delta instead of its whole (possibly stale) buffer.
+    pub fn live_texts(&self) -> Vec<(String, String)> {
+        self.docs
+            .iter()
+            .filter_map(|(f, d)| match d {
+                DocState::Live(doc) => Some((f.clone(), doc.text().to_string())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The live doc's text generation for `file` (see
@@ -1464,6 +1570,51 @@ mod tests {
         b.apply_remote(&decoded);
         assert_eq!(b.text(), a.text());
         assert_eq!(b.text(), "aZZbc");
+    }
+
+    /// Disjoint offline-era edits from both sides of a dead link must both
+    /// survive the reconnect merge.
+    #[test]
+    fn merge_offline_texts_keeps_disjoint_edits_from_both_sides() {
+        assert_eq!(
+            merge_offline_texts(
+                "alpha\nbeta\ngamma",
+                "OFFLINE alpha\nbeta\ngamma",
+                "alpha\nbeta\nOWNER gamma",
+            ),
+            "OFFLINE alpha\nbeta\nOWNER gamma"
+        );
+        // Insertions at different points both land.
+        assert_eq!(
+            merge_offline_texts("a\nb\nc", "x\na\nb\nc", "a\nb\nc\ny"),
+            "x\na\nb\nc\ny"
+        );
+        // Their deletion coexists with our disjoint edit.
+        assert_eq!(
+            merge_offline_texts("a\nb\nc", "a EDIT\nb\nc", "a\nc"),
+            "a EDIT\nc"
+        );
+    }
+
+    /// A genuine conflict (both sides touched the same line) keeps ours: the
+    /// offline buffer is the only home of that work, while their side still
+    /// lives in the replicas' history.
+    #[test]
+    fn merge_offline_texts_prefers_ours_on_a_conflicting_line() {
+        assert_eq!(
+            merge_offline_texts("alpha\nbeta", "OURS\nbeta", "THEIRS\nbeta"),
+            "OURS\nbeta"
+        );
+        // Same-point insertions collide: ours wins, theirs is dropped.
+        assert_eq!(merge_offline_texts("a\nb", "a\nX\nb", "a\nY\nb"), "a\nX\nb");
+    }
+
+    /// One quiet side means no merge at all: the other side's text is the
+    /// result verbatim.
+    #[test]
+    fn merge_offline_texts_with_one_quiet_side_is_the_other_text() {
+        assert_eq!(merge_offline_texts("base", "base", "theirs"), "theirs");
+        assert_eq!(merge_offline_texts("base", "ours", "base"), "ours");
     }
 
     /// The slice-4 extraction path: an arbitrary text-state transition on one
