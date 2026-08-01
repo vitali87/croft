@@ -651,7 +651,25 @@ pub fn contained_path(root: &std::path::Path, file: &str) -> Option<std::path::P
         && rel
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)));
-    plain.then(|| root.join(rel))
+    if !plain {
+        return None;
+    }
+    let joined = root.join(rel);
+    // Plain components are not enough: a normal-looking key can name a
+    // symlink inside the workspace whose target lies outside it, and the
+    // later open follows the link. Resolve the deepest existing ancestor
+    // (the file itself may not exist) and require it to stay under the
+    // resolved root; a link resolving inside the workspace remains fine.
+    let canon_root = root.canonicalize().ok()?;
+    let mut probe = joined.as_path();
+    loop {
+        match probe.canonicalize() {
+            Ok(real) => return real.starts_with(&canon_root).then_some(joined),
+            // Nothing exists at this depth yet; check the parent instead.
+            // The walk ends at `root` itself, which trivially resolves.
+            Err(_) => probe = probe.parent()?,
+        }
+    }
 }
 
 /// The owner's fixed site id; joiners are allocated ids from 2 up.
