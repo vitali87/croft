@@ -80,4 +80,8 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
         kind: NoteKind::Fix,
         summary: "The seat stays busy until croft has actually consumed the turn's end (a turn started in the finish window stole the previous turn's anchor and comment count), and a fence header cut off by the end of a turn is dropped instead of leaking raw protocol markers into a comment box.",
     },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "A duplicated or spontaneous turn result from claude ends nothing: only a turn croft actually dispatched can release the seat's busy gate, so a protocol hiccup can no longer let two turns overlap and overwrite each other's staging.",
+    },
 ];

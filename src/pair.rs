@@ -1363,6 +1363,16 @@ fn handle_claude_event(
             }
         }
         Some("result") => {
+            // claude's stdout is an external input: a result with no
+            // dispatched turn behind it (every dispatch sets turn_active,
+            // and the arm below clears it exactly once) is a duplicate or
+            // spontaneous emission. Ending a turn it does not own would
+            // queue a phantom TurnEnd — releasing the host's busy gate
+            // under a newer turn — and the finish()/flag resets would
+            // revert that turn's open fence and staging.
+            if !state.lock().unwrap().turn_active {
+                return;
+            }
             for event in fence.finish() {
                 apply_fence_event(state, event);
             }
@@ -2760,6 +2770,41 @@ mod tests {
         );
         assert!(!st.comment_only, "the original comment-only state is back");
         assert_eq!(st.target_file, None, "the original target is back");
+    }
+
+    /// claude's stdout is an external input: a `result` line with no
+    /// dispatched turn behind it (a duplicate emission, or a spontaneous
+    /// one) must end nothing. Queuing a phantom TurnEnd would release the
+    /// host's busy gate under a newer turn, and the handler's flag resets
+    /// would clear that turn's comment-only staging.
+    #[test]
+    fn an_unsolicited_result_ends_no_turn() {
+        let harness = OwnerHarness::start("hello");
+        let session = connect_session(&harness.socket, "pilot").unwrap();
+        let state = Mutex::new(PairState::new(session, None));
+        let mut fence = FenceMachine::new();
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+        let result = json!({ "type": "result", "is_error": false, "result": "done" });
+
+        // A dispatched turn ends exactly once.
+        state.lock().unwrap().turn_active = true;
+        handle_claude_event(&state, &mut fence, &result, &turn_tx);
+        assert!(
+            turn_rx.try_recv().is_ok(),
+            "the genuine result ends the turn"
+        );
+
+        // A newer comment-only turn stages, then the duplicate arrives.
+        state.lock().unwrap().stage_turn("demo.txt", "one", true);
+        handle_claude_event(&state, &mut fence, &result, &turn_tx);
+        assert!(
+            turn_rx.try_recv().is_err(),
+            "a duplicate result must not queue a phantom TurnEnd"
+        );
+        assert!(
+            state.lock().unwrap().comment_only,
+            "a duplicate result must not clear the newer turn's comment-only staging"
+        );
     }
 
     /// An edit taking over the caret supersedes an unresolved pending park:
