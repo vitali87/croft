@@ -26639,12 +26639,18 @@ impl App {
         // Guests in a collab session never write shared files: the owner is
         // the single writer, so the FS watcher and history snapshots see one
         // author. The guest's edits already flowed to the owner as ops.
+        // Except a file whose bootstrap gave up (no owner answered): the
+        // guest is its only author, and refusing meant the work could never
+        // persist anywhere.
         if self.is_collab_guest()
             && self
                 .editor
                 .path
                 .as_ref()
-                .is_some_and(|p| collab_file_key(&self.tree.root, p).is_some())
+                .and_then(|p| collab_file_key(&self.tree.root, p))
+                .is_some_and(|file| {
+                    !self.collab.as_ref().is_some_and(|s| s.is_local_only(&file))
+                })
         {
             self.status =
                 String::from("Shared file: the session owner saves (your edits are already live)");

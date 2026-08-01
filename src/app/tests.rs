@@ -19357,6 +19357,64 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
     );
 }
 
+/// A guest whose bootstrap nobody answered degrades to plain local editing,
+/// as the timeout promises: the input gate lifts, the file stays local-only
+/// (no re-request re-arming the gate every 3 seconds), and the guest's save
+/// writes to disk — with no owner there is no other author to defer to, so
+/// a refused save meant the work could never persist anywhere.
+#[test]
+fn a_guest_without_an_owner_degrades_to_local_editing_and_saves() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // A guest alone on the relay: nobody answers its snapshot request.
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.open_file_at_launch(&file);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        guest.poll_collab();
+        if let Some(s) = guest.collab.as_ref()
+            && s.is_local_only("f.txt")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "bootstrap never gave up");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Later ticks must not re-arm the bootstrap gate.
+    for _ in 0..5 {
+        guest.poll_collab();
+    }
+    assert!(
+        !guest.collab.as_ref().unwrap().is_bootstrapping("f.txt"),
+        "the tick re-armed the input gate after the give-up"
+    );
+    // The guest is the only author: its save persists.
+    guest.editor.insert_str("LOCAL ");
+    guest.save();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        guest.editor.lines.join("\n"),
+        "the degraded file's save must reach disk, got status: {}",
+        guest.status
+    );
+}
+
 /// The `file` key in a snapshot request comes straight off the wire: a
 /// traversing or absolute key must never resolve outside the workspace, or
 /// any guest (the MCP collab agent included) could make the owner read,

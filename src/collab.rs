@@ -640,6 +640,11 @@ enum DocState {
     // Boxed: CollabDoc is an order of magnitude larger than the bootstrap
     // variant, and per-file states live in a map for the session's life.
     Live(Box<CollabDoc>),
+    /// The bootstrap gave up (nobody answered, or the snapshot was
+    /// corrupt): the file is edited locally, by this guest alone. A latch,
+    /// not an absence — forgetting the file instead made the app tick
+    /// re-request it and re-arm the 3s input gate forever.
+    LocalOnly,
 }
 
 /// What [`CollabSession::poll`] resolved this tick, for the app to apply to
@@ -716,6 +721,23 @@ impl CollabSession {
     /// True when `file` is replicating (bootstrap finished).
     pub fn is_live(&self, file: &str) -> bool {
         matches!(self.docs.get(file), Some(DocState::Live(_)))
+    }
+
+    /// True when `file` gave up bootstrapping (no owner answered): the
+    /// guest edits it locally and is its only author.
+    pub fn is_local_only(&self, file: &str) -> bool {
+        matches!(self.docs.get(file), Some(DocState::LocalOnly))
+    }
+
+    /// Explicitly retry sharing a file that gave up bootstrapping (the
+    /// collab agent's `collab_open`). The app tick never rejoins — it calls
+    /// [`Self::request_file`], which respects the local-only latch, or a
+    /// guest whose owner is gone would re-enter the input gate every 3s.
+    pub fn rejoin_file(&mut self, file: &str) {
+        if matches!(self.docs.get(file), Some(DocState::LocalOnly)) {
+            self.docs.remove(file);
+        }
+        self.request_file(file);
     }
 
     /// True while `file` waits for its snapshot (the app gates edit input).
@@ -865,9 +887,10 @@ impl CollabSession {
                         }
                     }
                     Some(DocState::Bootstrapping { buffered, .. }) => buffered.push(env),
-                    // Not open on this peer: ignored until opened, then the
-                    // bootstrap snapshot carries this edit anyway.
-                    None => {}
+                    // Not open on this peer (or degraded to local-only):
+                    // ignored until opened or rejoined, then the bootstrap
+                    // snapshot carries this edit anyway.
+                    None | Some(DocState::LocalOnly) => {}
                 },
                 CollabMsg::SnapshotRequest { file, nonce } => {
                     // Only the owner answers, so a request never draws
@@ -923,7 +946,7 @@ impl CollabSession {
                     let Ok(mut doc) = CollabDoc::from_snapshot(assigned_site, &text, &replica)
                     else {
                         // Corrupt snapshot: give up as if nobody answered.
-                        self.docs.remove(&file);
+                        self.docs.insert(file.clone(), DocState::LocalOnly);
                         events.push(CollabEvent::BootstrapTimedOut { file });
                         continue;
                     };
@@ -979,7 +1002,10 @@ impl CollabSession {
             })
             .collect();
         for file in timed_out {
-            self.docs.remove(&file);
+            // A latch, not a removal: the app tick re-requests any open file
+            // that is neither live nor bootstrapping, so a forgotten file
+            // re-entered the input gate 16ms after every give-up.
+            self.docs.insert(file.clone(), DocState::LocalOnly);
             events.push(CollabEvent::BootstrapTimedOut { file });
         }
         // Re-send unanswered requests: the relay has no replay, so the
@@ -1661,6 +1687,44 @@ mod tests {
         }
         assert!(!guest.is_bootstrapping("src/f.rs"));
         assert!(!guest.is_live("src/f.rs"));
+    }
+
+    /// A timed-out bootstrap is a latch, not a moment: the app's tick
+    /// re-requests any open file that is neither live nor bootstrapping, so
+    /// a timeout that merely forgot the file sent the guest straight back
+    /// into the 3s input gate, forever — unable to ever type or save. After
+    /// the give-up, request_file must be a no-op; only an explicit rejoin
+    /// (the collab agent's collab_open retry) re-arms the bootstrap.
+    #[test]
+    fn a_timed_out_file_stays_local_only_through_re_requests() {
+        let (_dir, _owner, mut guest) = session_pair();
+        guest.request_file("src/f.rs");
+        let deadline =
+            std::time::Instant::now() + BOOTSTRAP_TIMEOUT + std::time::Duration::from_secs(3);
+        loop {
+            let events = guest.poll(|_| None);
+            if events
+                .iter()
+                .any(|e| matches!(e, CollabEvent::BootstrapTimedOut { .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bootstrap never timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // The app tick re-requests unshared open files: a no-op now.
+        guest.request_file("src/f.rs");
+        assert!(
+            !guest.is_bootstrapping("src/f.rs"),
+            "a re-request after the give-up must not re-arm the input gate"
+        );
+        assert!(guest.is_local_only("src/f.rs"));
+        // An explicit rejoin starts a fresh bootstrap.
+        guest.rejoin_file("src/f.rs");
+        assert!(guest.is_bootstrapping("src/f.rs"));
     }
 
     /// An unanswered resend backs off (a guest cannot tell a lost request
