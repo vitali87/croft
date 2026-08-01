@@ -70,6 +70,9 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
         }
         _ => return None,
     };
+    // `-s` means case-sensitive only in rg/ag; GNU grep and ack use it to
+    // suppress error messages, and git grep has no such flag at all.
+    let dash_s_is_case_sensitive = matches!(prog, "rg" | "ripgrep" | "ag");
     let mut case_sensitive = false; // rg smart-case & our default: case-insensitive
     let mut whole_word = false;
     let mut include: Option<String> = None;
@@ -149,7 +152,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
             while ci < chars.len() {
                 match chars[ci] {
                     'i' | 'S' => case_sensitive = false,
-                    's' => case_sensitive = true,
+                    's' if dash_s_is_case_sensitive => case_sensitive = true,
                     'w' => whole_word = true,
                     'F' => use_regex = false,
                     'E' | 'P' => use_regex = true,
@@ -307,6 +310,18 @@ mod tests {
         assert!(parse("rg -s Error src/").unwrap().case_sensitive);
         assert!(parse("rg -sw Error").unwrap().case_sensitive);
         assert!(parse("rg --case-sensitive Error").unwrap().case_sensitive);
+        // ag spells case-sensitive the same way.
+        assert!(parse("ag -s Error").unwrap().case_sensitive);
+    }
+
+    #[test]
+    fn grep_dash_s_is_not_case_sensitivity() {
+        // In GNU grep (and ack) `-s` suppresses error messages; reading it as
+        // rg's case-sensitive flag would seed a search that skips
+        // differently-cased matches the terminal command actually found.
+        assert!(!parse("grep -s Error .").unwrap().case_sensitive);
+        assert!(!parse("grep -rs Error .").unwrap().case_sensitive);
+        assert!(!parse("git grep -s Error").unwrap().case_sensitive);
     }
 
     #[test]
