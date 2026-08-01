@@ -2471,8 +2471,14 @@ mod tests {
             assert!(Instant::now() < deadline, "the child never died");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let sent = host.send_yield_turn("demo.txt", "hello world");
-        assert!(sent.is_err(), "a dead stdin must fail the send");
+        let err = host.send_yield_turn("demo.txt", "hello world").unwrap_err();
+        // Pin the failure to the sink write AFTER staging: a pre-staging
+        // rejection ("mid-turn", "pilot is gone") would pass the rollback
+        // assertions below vacuously, without ever staging a look.
+        assert!(
+            format!("{err:#}").contains("claude"),
+            "the send must fail at the claude sink, not before staging: {err:#}"
+        );
         assert_eq!(
             host.last_seen("demo.txt"),
             None,
