@@ -19801,9 +19801,14 @@ fn reconnect_replay_preserves_owner_edits_made_during_the_outage() {
         &mut guest,
         "both offline-era edits converge on every replica",
         &|o, g| {
+            // `get`, not indexing: if the merge dropped a line, the test must
+            // fail at the deadline with "never settled", not panic here.
             o.editor.lines == g.editor.lines
-                && o.editor.lines[0].contains("OFFLINE")
-                && o.editor.lines[2].contains("OWNER")
+                && o.editor
+                    .lines
+                    .first()
+                    .is_some_and(|l| l.contains("OFFLINE"))
+                && o.editor.lines.get(2).is_some_and(|l| l.contains("OWNER"))
         },
     );
 }

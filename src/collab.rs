@@ -372,10 +372,12 @@ pub fn merge_offline_texts(base: &str, ours: &str, theirs: &str) -> String {
     let ours_hunks = hunks(&base_lines, &ours.split('\n').collect::<Vec<_>>());
     let theirs_hunks = hunks(&base_lines, &theirs.split('\n').collect::<Vec<_>>());
 
-    // Two hunks conflict when their base ranges intersect, or when both are
-    // insertions at the same point.
+    // Two hunks conflict when their base ranges genuinely intersect, or when
+    // both are insertions at the same point (no order between them exists).
+    // An insertion merely TOUCHING the other side's replacement at its start
+    // offset is not a conflict: both survive, ours-first at the boundary.
     let conflicts =
-        |a: &Hunk, b: &Hunk| (a.0 < b.1 && b.0 < a.1) || (a.0 == b.0 && (a.0 == a.1 || b.0 == b.1));
+        |a: &Hunk, b: &Hunk| (a.0 < b.1 && b.0 < a.1) || (a.0 == b.0 && a.0 == a.1 && b.0 == b.1);
     let mut chosen: Vec<(&Hunk, bool)> = ours_hunks.iter().map(|h| (h, true)).collect();
     for th in &theirs_hunks {
         if !ours_hunks.iter().any(|oh| conflicts(oh, th)) {
@@ -1607,6 +1609,18 @@ mod tests {
         );
         // Same-point insertions collide: ours wins, theirs is dropped.
         assert_eq!(merge_offline_texts("a\nb", "a\nX\nb", "a\nY\nb"), "a\nX\nb");
+    }
+
+    /// Touching is not conflicting: an insertion that merely shares its
+    /// start offset with the other side's replacement coexists with it —
+    /// dropping either side would silently lose retainable work.
+    #[test]
+    fn merge_offline_texts_keeps_touching_insertion_and_replacement() {
+        // Our insertion sits right before the line they replaced.
+        assert_eq!(merge_offline_texts("a\nb", "X\na\nb", "A\nb"), "X\nA\nb");
+        // The mirror image: our replacement, their adjacent insertion.
+        // (Order at the shared boundary is ours-first; nothing is lost.)
+        assert_eq!(merge_offline_texts("a\nb", "A\nb", "X\na\nb"), "A\nX\nb");
     }
 
     /// One quiet side means no merge at all: the other side's text is the
