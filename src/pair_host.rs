@@ -233,6 +233,9 @@ impl PairHost {
     /// as a [`PairEvent::TurnDone`].
     pub fn send_task(&self, line: &str) -> Result<()> {
         let p = self.pilot.as_ref().context("navigator pilot is gone")?;
+        if self.turn_pending.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("the navigator is mid-turn; wait for it to finish");
+        }
         let sent = send_turn(&p.state, &p.sink, line);
         if sent.is_ok() {
             self.turn_pending
@@ -259,7 +262,11 @@ impl PairHost {
             let Some(mut st) = lock_briefly(&p.state) else {
                 anyhow::bail!("the navigator is mid-turn; wait for it to finish");
             };
-            if st.turn_active() {
+            if st.turn_active() || self.turn_pending.load(std::sync::atomic::Ordering::Relaxed) {
+                // turn_pending too: between the pilot finishing and poll()
+                // consuming its TurnDone, turn_active is already false, and
+                // a send admitted here would overwrite the unconsumed
+                // turn's staging (origin, counters, target).
                 anyhow::bail!("the navigator is mid-turn; wait for it to finish");
             }
             let staged = st.stage_turn(file, content, false);
@@ -280,7 +287,11 @@ impl PairHost {
             let Some(mut st) = lock_briefly(&p.state) else {
                 anyhow::bail!("the navigator is mid-turn; wait for it to finish");
             };
-            if st.turn_active() {
+            if st.turn_active() || self.turn_pending.load(std::sync::atomic::Ordering::Relaxed) {
+                // turn_pending too: between the pilot finishing and poll()
+                // consuming its TurnDone, turn_active is already false, and
+                // a send admitted here would overwrite the unconsumed
+                // turn's staging (origin, counters, target).
                 anyhow::bail!("the navigator is mid-turn; wait for it to finish");
             }
             st.stage_turn(file, content, true)
@@ -301,8 +312,9 @@ impl PairHost {
 
     /// Drop every anchored note (the palette's "Navigator: Clear Notes").
     pub fn clear_notes(&self) {
-        // try_lock (UI path, see caret_sites): a contended clear is simply
-        // skipped; the notes are still there and the next press works.
+        // Bounded lock (see lock_briefly): a clear that still cannot get
+        // the mutex is skipped; the notes are there and the next press
+        // works, and a wedged pilot costs at most the 100ms budget.
         if let Some(p) = &self.pilot
             && let Some(mut st) = lock_briefly(&p.state)
         {
@@ -329,8 +341,8 @@ impl PairHost {
 
     /// Drop exactly one note (the box's Ignore button).
     pub fn remove_note(&self, id: u64) {
-        // try_lock (UI path, see caret_sites): a contended Ignore is
-        // skipped; the box stays and the next press works.
+        // Bounded lock (see lock_briefly): an Ignore that still cannot
+        // get the mutex is skipped; the box stays and the next press works.
         if let Some(p) = &self.pilot
             && let Some(mut st) = lock_briefly(&p.state)
         {
@@ -340,8 +352,9 @@ impl PairHost {
 
     /// Append one line to a note's body (the driver replied in its box).
     pub fn append_to_note(&self, id: u64, line: &str) {
-        // try_lock (UI path, see caret_sites): losing the echo line in the
-        // box under contention is cosmetic; the reply itself already went.
+        // Bounded lock (see lock_briefly): losing the echo line in the box
+        // when the mutex stays held is cosmetic; the reply itself already
+        // went.
         if let Some(p) = &self.pilot
             && let Some(mut st) = lock_briefly(&p.state)
         {
@@ -366,7 +379,11 @@ impl PairHost {
             let Some(mut st) = lock_briefly(&p.state) else {
                 anyhow::bail!("the navigator is mid-turn; wait for it to finish");
             };
-            if st.turn_active() {
+            if st.turn_active() || self.turn_pending.load(std::sync::atomic::Ordering::Relaxed) {
+                // turn_pending too: between the pilot finishing and poll()
+                // consuming its TurnDone, turn_active is already false, and
+                // a send admitted here would overwrite the unconsumed
+                // turn's staging (origin, counters, target).
                 anyhow::bail!("the navigator is mid-turn; wait for it to finish");
             }
             let staged = st.stage_turn(file, content, true);
@@ -389,7 +406,19 @@ impl PairHost {
             Ok(()) => self
                 .turn_pending
                 .store(true, std::sync::atomic::Ordering::Relaxed),
-            Err(_) => state.lock().unwrap().unstage_turn(staged),
+            // Bounded (see lock_briefly): the keypress thread must not wait
+            // on a wedged pilot, but the unstage must not be LOST either (a
+            // stale look breaks the yield diff and latches comment_only) —
+            // hand it to a thread that may wait.
+            Err(_) => match lock_briefly(state) {
+                Some(mut st) => st.unstage_turn(staged),
+                None => {
+                    let state = std::sync::Arc::clone(state);
+                    std::thread::spawn(move || {
+                        state.lock().unwrap().unstage_turn(staged);
+                    });
+                }
+            },
         }
         sent
     }

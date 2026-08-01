@@ -786,7 +786,12 @@ pub(crate) fn lock_briefly(
 /// remark in the user's file and counted as one of its comments. The REPL
 /// driver prints to stdout, its only voice.
 fn diag(state: &Mutex<PairState>, level: crate::output::OutputLevel, text: &str) {
-    let seated = state.lock().unwrap().events.is_some();
+    // Bounded (see lock_briefly): diagnostics also fire from paths a
+    // wedged pilot would block. Unknown seating falls back to OUTPUT — the
+    // right sink when seated, and for the REPL a diagnostic in OUTPUT is
+    // the lesser loss (stdout is unreachable without the lock, and stderr
+    // would corrupt a seated alternate screen).
+    let seated = lock_briefly(state).is_none_or(|st| st.events.is_some());
     if seated {
         crate::output::push("Navigator", level, text);
     } else {
@@ -2411,6 +2416,16 @@ mod tests {
         assert!(
             host.is_busy(),
             "the turn's end has not been consumed yet: the seat is still busy"
+        );
+        // The gate must hold at the SEND paths too, not just is_busy():
+        // direct callers would otherwise overwrite the unconsumed turn's
+        // staging in this window.
+        let refused = host
+            .send_yield_turn("demo.txt", "hello world")
+            .expect_err("a send in the finish window must be refused");
+        assert!(
+            refused.to_string().contains("mid-turn"),
+            "the refusal names the reason: {refused}"
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -4268,9 +4283,6 @@ mod tests {
         std::fs::write(&script, FAKE_CLAUDE).unwrap();
         let log = harness._dir.path().join("stdin.log");
 
-        let baseline = crate::output::snapshot("Navigator")
-            .unwrap_or_default()
-            .len();
         let mut cmd = Command::new("python3");
         cmd.arg(&script).arg(&log).arg("stream"); // streams an EDIT fence
         let mut host =
@@ -4301,17 +4313,19 @@ mod tests {
             )),
             "diagnostics must not become comment boxes; saw {events:?}"
         );
+        // Whole-snapshot search, no baseline index: OUTPUT is a shared
+        // evicting ring, so a length captured earlier can drift under
+        // concurrent tests and a skip() would step over the lines.
         let wait_output = |needle: &str| {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let lines = crate::output::snapshot("Navigator").unwrap_or_default();
-                if lines.iter().skip(baseline).any(|l| l.text.contains(needle)) {
+                if lines.iter().any(|l| l.text.contains(needle)) {
                     return;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "OUTPUT never carried {needle:?}: {:?}",
-                    lines.iter().skip(baseline).collect::<Vec<_>>()
+                    "OUTPUT never carried {needle:?}: {lines:?}"
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
