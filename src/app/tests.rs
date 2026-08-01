@@ -13800,6 +13800,43 @@ fn debug_a_cargo_test_builds_off_the_ui_thread() {
 }
 
 #[test]
+fn a_test_binary_that_finishes_after_a_workspace_change_is_discarded() {
+    // Re-rooting the Explorer while `cargo test --no-run` runs used to make
+    // the drain launch the OLD workspace's binary with the NEW workspace's
+    // cwd and breakpoint context. A finished build whose originating root no
+    // longer matches the current workspace must be dropped, not launched.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pending_test_debug = Some((
+        rx,
+        String::from("my_case"),
+        std::path::PathBuf::from("/somewhere/else"),
+    ));
+    tx.send(Ok(std::path::PathBuf::from(
+        "/somewhere/else/target/debug/deps/x-abc123",
+    )))
+    .unwrap();
+    assert!(
+        app.drain_pending_test_debug(),
+        "the drain consumed the result"
+    );
+    assert!(
+        app.dap_session.is_none(),
+        "no debugger may launch for a foreign workspace's binary"
+    );
+    assert!(
+        app.status.contains("workspace changed"),
+        "status explains the discarded build, got: {}",
+        app.status
+    );
+    assert!(
+        app.pending_test_debug.is_none(),
+        "the pending slot frees for the next request"
+    );
+}
+
+#[test]
 fn cmd_k_p_pins_then_unpins_the_active_tab() {
     // Pin moved to Cmd+K P: its old Shift+Enter chord now debugs the test
     // at the caret.

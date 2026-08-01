@@ -1886,6 +1886,16 @@ pub struct ClosedTerminal {
     pub closed_at: std::time::Instant,
 }
 
+/// A `cargo test --no-run` running on a background thread: the receiver for
+/// its result, the test's name, and the workspace root it builds for (so a
+/// re-root mid-build discards the binary instead of debugging it in the
+/// wrong workspace).
+type PendingTestDebug = (
+    std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+    String,
+    PathBuf,
+);
+
 pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
@@ -2629,7 +2639,7 @@ pub struct App {
     /// receiver yields the picked binary (or the build error) and the test
     /// name rides along for the launch. Drained per tick; a second request
     /// while one is pending is refused with a status line.
-    pending_test_debug: Option<(std::sync::mpsc::Receiver<Result<PathBuf, String>>, String)>,
+    pending_test_debug: Option<PendingTestDebug>,
     /// Variable `variablesReference`s the user has expanded in the Variables
     /// panel. Persisted across polls so re-fetched variables stay open.
     pub debug_expanded: std::collections::HashSet<i64>,
@@ -13877,6 +13887,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         {
             let name = name.clone();
+            let root = root.clone();
             std::thread::spawn(move || {
                 let _ = tx.send(
                     crate::testing::worker::build_test_binary(&root, &name)
@@ -13884,7 +13895,7 @@ impl App {
                 );
             });
         }
-        self.pending_test_debug = Some((rx, name));
+        self.pending_test_debug = Some((rx, name, root));
     }
 
     /// Drain the background test-binary build: on success launch lldb-dap
@@ -13893,7 +13904,7 @@ impl App {
     /// when anything landed, for the redraw aggregate.
     fn drain_pending_test_debug(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
-        let Some((rx, _)) = self.pending_test_debug.as_ref() else {
+        let Some((rx, _, _)) = self.pending_test_debug.as_ref() else {
             return false;
         };
         let result = match rx.try_recv() {
@@ -13901,7 +13912,15 @@ impl App {
             Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => Err(String::from("the build thread died")),
         };
-        let (_, name) = self.pending_test_debug.take().expect("checked above");
+        let (_, name, build_root) = self.pending_test_debug.take().expect("checked above");
+        // Re-rooting the Explorer mid-build would otherwise launch the old
+        // workspace's binary with the new workspace's cwd and breakpoints.
+        if build_root != self.tree.root {
+            self.status = format!(
+                "Test binary for {name} finished, but the workspace changed — debug it again from its workspace"
+            );
+            return true;
+        }
         match result {
             Ok(binary) => self.launch_lldb_test_debug(&binary, &name),
             Err(e) => self.debug_error(format!("Test build failed: {e}")),
