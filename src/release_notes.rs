@@ -62,6 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
+        summary: "A momentum flick over a PDF preview coalesces reliably: the wheel cooldown now starts when the page render finishes, so a render slower than the cooldown no longer lets every queued wheel event through as its own blocking page step.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
         summary: "Splitting or reopening a live-shared file can no longer wipe the session: the duplicate pane used to load the stale disk copy and, on your first keystroke, broadcast a diff that reverted every participant to the pre-session file. Fresh panes now seed from the shared document, and all panes of a shared file stay in step.",
     },
     ReleaseNote {
