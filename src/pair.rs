@@ -710,6 +710,11 @@ impl PairState {
         if self.stage_gen != staged.stage_gen {
             return;
         }
+        // An applied undo re-opens the generation beneath it, so undo
+        // records unwind LIFO all the way back to the original state
+        // (turn A fails parked, turn B stages over the residue and fails:
+        // B's undo restores A's books AND re-admits A's undo).
+        self.stage_gen = staged.stage_gen - 1;
         self.comment_only = staged.prior_comment_only;
         self.target_file = staged.prior_target;
         match staged.prior_seen {
@@ -2705,6 +2710,56 @@ mod tests {
             st.comment_only,
             "a stale rollback must not unlatch the live turn's comment-only"
         );
+    }
+
+    /// A failed send's undo that could not get the pilot mutex is parked,
+    /// not handed to an untracked thread: while parked (contended lock) a
+    /// new send is refused, and once the lock is free the undo applies and
+    /// the park clears — the books are never a mix of two turns.
+    #[test]
+    fn a_parked_rollback_blocks_sends_until_it_applies() {
+        let harness = OwnerHarness::start("hello");
+        let session = connect_session(&harness.socket, "pilot").unwrap();
+        let state = Mutex::new(PairState::new(session, None));
+        let staged = state.lock().unwrap().stage_turn("demo.txt", "one", false);
+        let parked = Mutex::new(Some(staged));
+        // Contended: still parked, the caller must refuse to stage.
+        assert!(!crate::pair_host::drain_parked(&parked, || None));
+        assert!(parked.lock().unwrap().is_some(), "the undo is not lost");
+        // Free: the undo applies and the park clears.
+        assert!(crate::pair_host::drain_parked(&parked, || Some(
+            state.lock().unwrap()
+        )));
+        assert!(parked.lock().unwrap().is_none());
+        assert_eq!(
+            state.lock().unwrap().last_seen_of("demo.txt"),
+            None,
+            "the parked undo restored the pre-turn baseline"
+        );
+    }
+
+    /// Rollbacks are undo records: applied newest-first they must unwind
+    /// all the way back to the original state. Turn A fails (rollback
+    /// parked), turn B stages over A's residue and fails too; B's undo
+    /// puts A's books back and must also re-admit A's undo, or the seat
+    /// stays latched to A's staged look, comment-only flag, and target.
+    #[test]
+    fn nested_rollbacks_unwind_to_the_original_state() {
+        let harness = OwnerHarness::start("hello");
+        let session = connect_session(&harness.socket, "pilot").unwrap();
+        let state = Mutex::new(PairState::new(session, None));
+        let mut st = state.lock().unwrap();
+        let staged_a = st.stage_turn("demo.txt", "one", false);
+        let staged_b = st.stage_turn("demo.txt", "two", true);
+        st.unstage_turn(staged_b); // B's send failed: newest undo first
+        st.unstage_turn(staged_a); // then A's parked undo lands
+        assert_eq!(
+            st.last_seen_of("demo.txt"),
+            None,
+            "both failed turns unwound: no baseline remains"
+        );
+        assert!(!st.comment_only, "the original comment-only state is back");
+        assert_eq!(st.target_file, None, "the original target is back");
     }
 
     /// An edit taking over the caret supersedes an unresolved pending park:

@@ -423,13 +423,20 @@ mod tests {
     /// makes the theft impossible.
     #[test]
     fn the_probe_cannot_touch_crofts_terminal_session() {
+        // macOS ps has no session-id keyword (`sess` prints 0), so the
+        // stub reports its sid via python (resolved through PATH — the
+        // absolute /usr/bin/python3 only exists with the Xcode CLT).
+        if Command::new("python3").arg("--version").output().is_err() {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("stub-shell");
         std::fs::write(
             &stub,
             format!(
                 "#!/bin/sh\n\
-                 exec /usr/bin/python3 -c 'import os; \
+                 exec python3 -c 'import os; \
                  print(\"{BEGIN}%d{END}\" % os.getsid(0))'\n"
             ),
         )
