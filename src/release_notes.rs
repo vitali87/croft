@@ -62,11 +62,15 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Debugging a cargo test no longer freezes croft: the test-binary build runs on a background thread with a visible progress status instead of blocking every pane for the whole compile, and a workspace switched mid-build discards the finished binary instead of debugging the old project inside the new one. The debugger also picks the harness that actually contains the test — a failed workspace build surfaces the compile error instead of launching a partial binary, and the file the gesture happened in disambiguates a lib test from an integration test sharing the same name.",
+        summary: "Debugging a cargo test no longer freezes croft: the test-binary build runs on a background thread with a visible progress status instead of blocking every pane for the whole compile, and a workspace switched mid-build discards the finished binary instead of debugging the old project inside the new one. The debugger also picks the harness that actually contains the test — a failed workspace build surfaces the compile error instead of launching a partial binary, and the file the gesture happened in disambiguates a lib test from an integration test sharing the same name, including a renamed [[test]] target whose name the file stem cannot predict.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The gutter play bead is honest now: #[cfg(test)] and #[cfg_attr(test, ...)] no longer count as test attributes (every cfg-gated helper in a codebase wore a bead that ran nothing and wiped the Testing tree), a def test_* only gets a bead in a pytest-collectable file, and clicking a breakpoint dot, the paused stop arrow, or the AI-stream square on a test line no longer silently starts a test run — the click hit-test honors the same sign-cell precedence the render does.",
+        summary: "The gutter play bead is honest now: #[cfg(test)], #[cfg_attr(test, ...)], and attributes that merely end in test (#[contest], #[mytest]) no longer count as test attributes (every cfg-gated helper in a codebase wore a bead that ran nothing and wiped the Testing tree), a def test_* only gets a bead in a pytest-collectable file, and clicking a breakpoint dot, the paused stop arrow, or the AI-stream square on a test line no longer silently starts a test run — the click hit-test honors the same sign-cell precedence the render does.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "A per-host pane accent now appears the moment the shell reports its host: the OSC 7 hostname arrives with no key or click behind it, and the accent used to wait for the next input event before dressing the pane border — SSHing into a prod-* host and just watching the pane left it undressed.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,

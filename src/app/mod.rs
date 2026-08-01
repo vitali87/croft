@@ -9965,9 +9965,18 @@ impl App {
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
             t.set_palette(self.theme.ansi());
-            // Host accents: the shell's OSC 7 host against the prefs rules
-            // (first match wins). Cleared the moment the host stops matching
-            // (an in-pane SSH session ends).
+        }
+        self.dress_host_accents();
+    }
+
+    /// Host accents: each pane's shell-reported OSC 7 host against the prefs
+    /// rules (first match wins). Cleared the moment the host stops matching
+    /// (an in-pane SSH session ends). Runs from `sync_focus_flags` AND at the
+    /// top of `render`: the OSC 7 host arrives on a PTY reader thread with no
+    /// input event behind it, so the PTY-dirty redraw is the only wakeup —
+    /// dressing must not wait for the next key or click.
+    fn dress_host_accents(&mut self) {
+        for t in self.terminals.iter_mut() {
             let dress = t.shell_host().and_then(|h| {
                 self.host_accents
                     .iter()
@@ -10379,6 +10388,7 @@ impl App {
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let size = frame.area();
         self.last_frame_area = size;
+        self.dress_host_accents();
         // Theme background, whole frame. croft's chrome (the sidebar panels,
         // explorer sections, activity bar, gaps) mostly paints `Color::Reset`
         // and leans on the iTerm2 `SetColors` session bg to color it. Ghostty /

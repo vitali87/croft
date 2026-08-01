@@ -134,11 +134,12 @@ pub fn test_fn_on_line(path: Option<&Path>, lines: &[String], idx: usize) -> Opt
 }
 
 /// Whether an attribute line marks a test fn: the attribute path's LAST
-/// segment ends in `test` (`#[test]`, `#[tokio::test]`, `#[rstest]`,
-/// `#[googletest::test]`) — not a mere mention of the word. `#[cfg(test)]`
-/// and `#[cfg_attr(test, ...)]` are configuration (path segment `cfg`/
-/// `cfg_attr`), and treating them as test markers put a play bead on every
-/// `#[cfg(test)] fn helper()` in a codebase.
+/// segment IS `test` (`#[test]`, `#[tokio::test]`, `#[googletest::test]`)
+/// or `rstest` — never a mere suffix. `#[contest]`/`#[mytest]` are ordinary
+/// attributes cargo does not collect, and a bead on them runs zero tests.
+/// `#[cfg(test)]` and `#[cfg_attr(test, ...)]` are configuration (path
+/// segment `cfg`/`cfg_attr`), and treating them as test markers put a play
+/// bead on every `#[cfg(test)] fn helper()` in a codebase.
 fn attr_marks_test(attr_line: &str) -> bool {
     let inner = attr_line.trim_start_matches("#[");
     let name_end = inner
@@ -147,7 +148,7 @@ fn attr_marks_test(attr_line: &str) -> bool {
     inner[..name_end]
         .rsplit("::")
         .next()
-        .is_some_and(|seg| seg.ends_with("test"))
+        .is_some_and(|seg| seg == "test" || seg == "rstest")
 }
 
 /// Extract the identifier after a function keyword (`fn ` for Rust, `def ` for
@@ -364,6 +365,41 @@ mod tests {
             test_fn_on_line(rs, &lines, 5),
             None,
             "cfg_attr is configuration"
+        );
+    }
+
+    #[test]
+    fn suffix_named_attributes_are_not_test_markers() {
+        // `#[contest]` / `#[mytest]` are ordinary proc-macro attributes
+        // cargo never collects; a play bead on them runs zero tests. Only
+        // the exact `test` segment (bare or path-qualified) and `rstest`
+        // mark a test.
+        let lines: Vec<String> = [
+            "#[contest]",
+            "fn fake_case() {}",
+            "#[mytest]",
+            "fn other_fake_case() {}",
+            "#[googletest::test]",
+            "fn qualified_case() {}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let rs = Some(Path::new("a.rs"));
+        assert_eq!(
+            test_fn_on_line(rs, &lines, 1),
+            None,
+            "#[contest] merely ends in `test`"
+        );
+        assert_eq!(
+            test_fn_on_line(rs, &lines, 3),
+            None,
+            "#[mytest] merely ends in `test`"
+        );
+        assert_eq!(
+            test_fn_on_line(rs, &lines, 5).as_deref(),
+            Some("qualified_case"),
+            "a path-qualified exact `test` segment still counts"
         );
     }
 

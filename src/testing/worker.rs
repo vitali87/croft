@@ -346,12 +346,16 @@ fn is_js_file(pattern: &str) -> bool {
 }
 
 /// One test-harness executable out of `cargo test --no-run`'s JSON: its
-/// path, the target that built it, and whether that target is an integration
-/// test (kind `test`, one harness per `tests/*.rs`).
+/// path, the target that built it, the target's root source file, and
+/// whether that target is an integration test (kind `test`, one harness per
+/// `tests/*.rs` — or per explicit `[[test]]` entry, which can rename the
+/// target and point it anywhere; `src_path` is the only reliable link back
+/// to the file).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TestBinary {
     pub path: PathBuf,
     pub target: String,
+    pub src_path: PathBuf,
     pub integration: bool,
 }
 
@@ -403,6 +407,12 @@ pub fn test_binary_candidates(output: &str) -> Vec<TestBinary> {
                     .and_then(|n| n.as_str())
                     .unwrap_or("")
                     .to_string(),
+                src_path: PathBuf::from(
+                    target
+                        .and_then(|t| t.get("src_path"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or(""),
+                ),
                 integration: has_kind("test"),
             },
         ));
@@ -440,32 +450,20 @@ pub fn binary_containing_test(candidates: &[PathBuf], name: &str) -> Option<Path
     None
 }
 
-/// The integration-test target a source file compiles into: `tests/foo.rs`
-/// and `tests/foo/main.rs` both build target `foo`. `None` for any other
-/// location (unit tests in lib/bin targets).
-fn integration_target_of(root: &Path, source: &Path) -> Option<String> {
-    let rel = source.strip_prefix(root).ok()?;
-    let mut parts = rel.components();
-    if parts.next()?.as_os_str() != "tests" {
-        return None;
-    }
-    Path::new(parts.next()?.as_os_str())
-        .file_stem()?
-        .to_str()
-        .map(str::to_string)
-}
-
 /// Build (or reuse) the workspace's test binaries and pick the harness that
 /// contains `name`: `cargo test --no-run --message-format=json`, then a
 /// `--list` probe when more than one harness could own the test. A nonzero
 /// cargo exit is a build failure even if some targets' executables were
 /// already emitted — launching a partial build would debug stale code
 /// instead of surfacing the compile error. `source` (the file the debug
-/// gesture happened in) narrows the harnesses first: a file under `tests/`
-/// belongs to exactly one integration target, any other file to the lib/bin
-/// targets — so a lib test and an integration test sharing a bare fn name
-/// cannot select each other's harness. Blocking — the app runs this on a
-/// background thread and launches from the drain.
+/// gesture happened in) narrows the harnesses first: a file that IS a
+/// target's `src_path` owns that target outright (exact even for a renamed
+/// `[[test]] path = ...` target the file stem cannot predict); a module
+/// file narrows to its side of the build (`tests/` → integration harnesses,
+/// anything else → lib/bin) and never widens further — a lib-first probe
+/// over every harness is how a unit test used to steal an integration
+/// test's bare name. Blocking — the app runs this on a background thread
+/// and launches from the drain.
 pub fn build_test_binary(
     root: &Path,
     name: &str,
@@ -487,27 +485,50 @@ pub fn build_test_binary(
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let all = test_binary_candidates(&stdout);
-    let narrowed: Vec<&TestBinary> = match source.map(|s| integration_target_of(root, s)) {
-        Some(Some(target)) => all
-            .iter()
-            .filter(|c| c.integration && c.target == target)
-            .collect(),
-        Some(None) => all.iter().filter(|c| !c.integration).collect(),
-        None => all.iter().collect(),
-    };
-    // An empty narrowing (say, a tests/ layout cargo maps to a target name
-    // the file stem does not predict) falls back to every harness rather
-    // than refusing outright — the probe still has to confirm the pick.
-    let pool: Vec<&TestBinary> = if narrowed.is_empty() {
-        all.iter().collect()
-    } else {
-        narrowed
-    };
-    match pool.as_slice() {
-        [] => Err(std::io::Error::other(format!(
+    if all.is_empty() {
+        return Err(std::io::Error::other(format!(
             "no test binary in cargo's build output: {}",
             stderr.lines().last().unwrap_or("")
-        ))),
+        )));
+    }
+    let pool: Vec<&TestBinary> = match source {
+        Some(src) => {
+            // Canonicalize both sides: cargo reports resolved paths
+            // (/private/var/... on macOS) while the editor may hold the
+            // symlinked spelling of the same file.
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let src = canon(src);
+            let exact: Vec<&TestBinary> =
+                all.iter().filter(|c| canon(&c.src_path) == src).collect();
+            if exact.is_empty() {
+                let is_integration_src = src.strip_prefix(canon(root)).is_ok_and(|rel| {
+                    rel.components()
+                        .next()
+                        .is_some_and(|c| c.as_os_str() == "tests")
+                });
+                let side: Vec<&TestBinary> = all
+                    .iter()
+                    .filter(|c| c.integration == is_integration_src)
+                    .collect();
+                if side.is_empty() {
+                    return Err(std::io::Error::other(format!(
+                        "no {} harness in the build owns {}",
+                        if is_integration_src {
+                            "integration-test"
+                        } else {
+                            "unit-test"
+                        },
+                        src.display()
+                    )));
+                }
+                side
+            } else {
+                exact
+            }
+        }
+        None => all.iter().collect(),
+    };
+    match pool.as_slice() {
         [only] => Ok(only.path.clone()),
         _ => {
             let paths: Vec<PathBuf> = pool.iter().map(|c| c.path.clone()).collect();
@@ -886,7 +907,7 @@ mod tests {
         // Candidates rank lib first (unit tests overwhelmingly live there),
         // then bin, then integration, preserving cargo order within a rank.
         let lines = [
-            r#"{"reason":"compiler-artifact","target":{"kind":["test"],"name":"cli"},"profile":{"test":true},"executable":"/p/target/debug/deps/cli-2a2d806b06669aa7"}"#,
+            r#"{"reason":"compiler-artifact","target":{"kind":["test"],"name":"cli","src_path":"/p/tests/cli.rs"},"profile":{"test":true},"executable":"/p/target/debug/deps/cli-2a2d806b06669aa7"}"#,
             r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"croft"},"profile":{"test":true},"executable":"/p/target/debug/deps/croft-lib00"}"#,
             r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"croft"},"profile":{"test":true},"executable":"/p/target/debug/deps/croft-bin00"}"#,
             r#"{"reason":"build-finished","success":true}"#,
@@ -905,6 +926,7 @@ mod tests {
         // Target identity survives the ranking: the integration harness knows
         // its target name so a source file under tests/ can select it.
         assert_eq!(got[2].target, "cli");
+        assert_eq!(got[2].src_path, PathBuf::from("/p/tests/cli.rs"));
         assert!(got[2].integration);
         assert!(!got[0].integration && !got[1].integration);
         // Only an integration target: it is still returned.
@@ -1034,6 +1056,52 @@ mod tests {
         assert!(
             stem_of(&from_lib).starts_with("dup"),
             "a src/ file selects the lib harness, got {from_lib:?}"
+        );
+    }
+
+    #[test]
+    fn a_renamed_integration_target_still_owns_its_source_file() {
+        // Explicit `[[test]]` entries can point a target at any path:
+        // tests/custom_source.rs building target renamed_harness. Guessing
+        // the target from the file stem found nothing, fell back to every
+        // harness, and the lib-first probe handed the gesture to the unit
+        // harness — whose exact filter then ran zero tests. cargo's JSON
+        // knows each target's src_path; the gesture's file matches it
+        // exactly, whatever the target is called.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("tests")).unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            concat!(
+                "[package]\nname = \"renamed\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                "[[test]]\nname = \"renamed_harness\"\npath = \"tests/custom_source.rs\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src").join("lib.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn same_name() {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("tests").join("custom_source.rs"),
+            "#[test]\nfn same_name() {}\n",
+        )
+        .unwrap();
+        let picked = build_test_binary(
+            tmp.path(),
+            "same_name",
+            Some(&tmp.path().join("tests").join("custom_source.rs")),
+        )
+        .unwrap();
+        assert!(
+            picked
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("renamed_harness"),
+            "the [[test]] target owning the source wins, got {picked:?}"
         );
     }
 
