@@ -834,7 +834,7 @@ impl InnerChannel {
 /// retry loop here — often on the UI thread — froze croft with no escape.
 /// A peer whose buffers stay full this long is gone for practical purposes;
 /// reporting failure lets the caller treat the connection as dead.
-const WRITE_FRAME_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const WRITE_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Write a whole frame to a socket that may be in non-blocking mode. `write_all`
 /// aborts on the first `WouldBlock` even after a partial write, which would leave
@@ -843,13 +843,31 @@ const WRITE_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 /// the deadline passes ([`WRITE_FRAME_DEADLINE`]): false either way means the
 /// connection is unusable.
 pub(crate) fn write_frame_blocking(stream: &mut UnixStream, frame: &[u8]) -> bool {
-    let deadline = std::time::Instant::now() + WRITE_FRAME_DEADLINE;
+    write_frame_blocking_with_deadline(
+        stream,
+        frame,
+        std::time::Instant::now() + WRITE_FRAME_DEADLINE,
+    )
+}
+
+fn write_frame_blocking_with_deadline(
+    stream: &mut impl Write,
+    frame: &[u8],
+    deadline: std::time::Instant,
+) -> bool {
     let mut written = 0;
     while written < frame.len() {
         match stream.write(&frame[written..]) {
             Ok(0) => return false,
             Ok(n) => written += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // Interrupted retries immediately but still against the
+            // deadline: a signal storm must not spin past the bound this
+            // function exists to guarantee.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if std::time::Instant::now() > deadline {
                     return false;
@@ -932,6 +950,38 @@ mod tests {
             Err(_) => panic!("write_frame_blocking hung past its deadline on a wedged peer"),
         }
         drop(b);
+    }
+
+    /// Every retry path in the bounded write checks the deadline, not just
+    /// WouldBlock: a stream stuck returning Interrupted (a signal storm)
+    /// must also give up instead of spinning forever.
+    #[test]
+    fn write_frame_blocking_bounds_an_interrupt_storm() {
+        struct InterruptForever;
+        impl std::io::Write for InterruptForever {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ok = write_frame_blocking_with_deadline(
+                &mut InterruptForever,
+                &[0u8; 16],
+                std::time::Instant::now() + Duration::from_millis(100),
+            );
+            let _ = tx.send(ok);
+        });
+        match rx.recv_timeout(Duration::from_secs(4)) {
+            Ok(ok) => assert!(
+                !ok,
+                "an interrupt storm must report failure at the deadline"
+            ),
+            Err(_) => panic!("write_frame_blocking spun past its deadline on Interrupted"),
+        }
     }
 
     #[test]

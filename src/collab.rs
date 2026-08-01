@@ -1136,6 +1136,12 @@ impl CollabSession {
 /// healthy peers) before any client gives its connection up for dead.
 const RELAY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+// The ordering above is a recovery guarantee, not a coincidence: hold it
+// against future edits to either constant.
+const _: () = assert!(
+    RELAY_WRITE_TIMEOUT.as_millis() < crate::session_host::WRITE_FRAME_DEADLINE.as_millis()
+);
+
 type Peer = std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>;
 
 /// One connection: reassemble whole frames from this peer and forward each,
