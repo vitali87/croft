@@ -128,10 +128,10 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                         push_glob(&mut include, v);
                     }
                 }
-                // grep's exclusion flags take `=GLOB` inline only; a bare
-                // `--exclude` is a grep usage error, so don't eat a token.
+                // grep's exclusion flags: getopt_long takes the glob inline
+                // (`--exclude=GLOB`) or spaced (`--exclude GLOB`).
                 "exclude" | "exclude-dir" => {
-                    if let Some(v) = inline_val {
+                    if let Some(v) = take_value(inline_val, &tokens, &mut idx) {
                         push_glob(&mut exclude, v);
                     }
                 }
@@ -346,5 +346,17 @@ mod tests {
         let c = parse("grep -rn --exclude=*.min.js --exclude-dir=dist TODO .").unwrap();
         assert_eq!(c.pattern, "TODO");
         assert_eq!(c.exclude.as_deref(), Some("*.min.js,dist"));
+    }
+
+    #[test]
+    fn spaced_grep_exclusion_values_are_not_the_pattern() {
+        // getopt_long takes required arguments spaced too: `--exclude GLOB`.
+        // Not consuming the value made the glob the seeded search pattern.
+        let c = parse("grep -r --exclude *.min.js needle .").unwrap();
+        assert_eq!(c.pattern, "needle");
+        assert_eq!(c.exclude.as_deref(), Some("*.min.js"));
+        let c = parse("grep -r --exclude-dir dist TODO .").unwrap();
+        assert_eq!(c.pattern, "TODO");
+        assert_eq!(c.exclude.as_deref(), Some("dist"));
     }
 }
