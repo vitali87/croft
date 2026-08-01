@@ -13210,10 +13210,19 @@ impl App {
                         .path
                         .as_ref()
                         .and_then(|p| collab_file_key(&self.tree.root, p))
-                    && session.is_bootstrapping(&file)
                 {
-                    self.status = format!("{file}: joining the shared session, one moment");
-                    return Ok(());
+                    if session.is_bootstrapping(&file) {
+                        self.status = format!("{file}: joining the shared session, one moment");
+                        return Ok(());
+                    }
+                    // Same gate for a not-yet-attached pane of a LIVE file
+                    // (a fresh split or reopen holding stale disk text): a
+                    // keystroke absorbed now would be silently wiped when
+                    // the attach pass seeds the pane one tick later.
+                    if session.is_live(&file) && self.editor.collab_doc_gen == 0 {
+                        self.status = format!("{file}: syncing this pane, one moment");
+                        return Ok(());
+                    }
                 }
                 self.handle_editor_key(key);
                 self.poke_cursor();
@@ -16595,16 +16604,23 @@ impl App {
             let Some((socket, role)) = self.collab_config.clone() else {
                 return false;
             };
+            // While the link is down there is no doc to converge panes of a
+            // shared file through, yet input still reaches the active pane:
+            // mirror it onto its siblings so panes cannot diverge
+            // independently — the reconnect bootstrap keeps and replays
+            // exactly ONE divergent text per file, and a second divergent
+            // pane would be silently replaced by the attach pass.
+            let mirrored = self.mirror_offline_siblings();
             let due = self
                 .last_collab_connect
                 .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2));
             if !due {
-                return false;
+                return mirrored;
             }
             self.last_collab_connect = Some(std::time::Instant::now());
             match CollabChannel::connect(&socket, role) {
                 Some(ch) => self.collab = Some(CollabSession::new(ch, collab_display_name())),
-                None => return false,
+                None => return mirrored,
             }
         }
         let mut session = self.collab.take().expect("connected above");
@@ -16639,16 +16655,29 @@ impl App {
 
         // Invariant 1a: extract-before-apply. Applying remote ops first
         // would re-diff them below as local edits and rebroadcast (echo).
+        // Only ATTACHED buffers extract (collab_doc_gen != 0): a buffer
+        // created after its file went live — a split duplicate, a reopen —
+        // was loaded from the disk copy, which is stale by construction
+        // (guests never write shared files). Diffing it against the doc
+        // would broadcast a delete-everything/reinsert-the-old-file op set
+        // and revert every peer; the attach pass below seeds it instead.
         let mut extract = |editors: &mut [crate::widgets::editor::Editor]| {
             for ed in editors.iter_mut() {
+                if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+                    continue;
+                }
                 let Some(file) = ed.path.as_ref().and_then(|p| collab_file_key(&root, p)) else {
                     continue;
                 };
-                if ed.edit_seq == ed.collab_synced_seq || !session.is_live(&file) {
+                if ed.collab_doc_gen == 0
+                    || ed.edit_seq == ed.collab_synced_seq
+                    || !session.is_live(&file)
+                {
                     continue;
                 }
                 session.local_change(&file, &ed.lines.join("\n"));
                 ed.collab_synced_seq = ed.edit_seq;
+                ed.collab_doc_gen = session.doc_gen(&file).unwrap_or(0);
             }
         };
         extract(&mut self.editor.editors);
@@ -16665,10 +16694,18 @@ impl App {
             changed = true;
             match event {
                 CollabEvent::RemoteEdit { file, spans } => {
-                    self.apply_collab_spans(&root, &file, &spans);
+                    let doc_gen = session.doc_gen(&file).unwrap_or(0);
+                    self.apply_collab_spans(&root, &file, &spans, doc_gen);
                 }
                 CollabEvent::Bootstrapped { file, text } => {
-                    self.finish_collab_bootstrap(&root, &file, text);
+                    let doc_gen = session.doc_gen(&file).unwrap_or(0);
+                    if let Some(kept) = self.finish_collab_bootstrap(&root, &file, text, doc_gen) {
+                        // A buffer diverged while the link was down: replay
+                        // the divergence as local edits so the offline work
+                        // reaches every peer; the attach pass below re-marks
+                        // the kept panes (doc text now equals theirs).
+                        session.local_change(&file, &kept);
+                    }
                 }
                 CollabEvent::BootstrapTimedOut { file } => {
                     self.status = format!("{file}: no session owner answered; editing locally");
@@ -16718,6 +16755,52 @@ impl App {
             }
         }
 
+        // Attach-and-mirror: a buffer of a live file that has never synced
+        // (gen 0: a fresh split duplicate or reopen holding stale disk
+        // text) is seeded from the replicated text, and a clean buffer
+        // whose generation fell behind (a sibling pane extracted a local
+        // edit) mirrors the doc. Every pane of a live file converges every
+        // tick — "the first found stays synced" was unstable, because
+        // focusing another group reorders which pane is found first, and a
+        // behind pane accepting a keystroke would diff its older text
+        // against the doc and silently delete the other pane's work.
+        let mut attach = |editors: &mut [crate::widgets::editor::Editor]| {
+            for ed in editors.iter_mut() {
+                // Diff/image/sheet tabs can carry a shared file's path, but
+                // their `lines` are not documents: never seed or mark them.
+                if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+                    continue;
+                }
+                let Some(file) = ed.path.as_ref().and_then(|p| collab_file_key(&root, p)) else {
+                    continue;
+                };
+                let Some(doc_gen) = session.doc_gen(&file) else {
+                    continue;
+                };
+                if ed.collab_doc_gen == doc_gen
+                    || (ed.collab_doc_gen != 0 && ed.edit_seq != ed.collab_synced_seq)
+                {
+                    continue;
+                }
+                let text = session
+                    .doc_text(&file)
+                    .expect("doc_gen implies a live doc")
+                    .to_string();
+                // The owner's buffer at snapshot creation already IS the
+                // doc text: attach without a cursor-jolting replace.
+                if ed.lines.join("\n") != text {
+                    ed.replace_all_lines(text.split('\n').map(str::to_string).collect());
+                    changed = true;
+                }
+                ed.collab_synced_seq = ed.edit_seq;
+                ed.collab_doc_gen = doc_gen;
+            }
+        };
+        attach(&mut self.editor.editors);
+        for group in self.editor_layout.inactive_groups_mut() {
+            attach(&mut group.editors);
+        }
+
         // Broadcast this participant's caret when it moved in a live file.
         if let Some(file) = self
             .editor
@@ -16733,6 +16816,14 @@ impl App {
             }
         }
 
+        if session.disconnected() {
+            // The relay hung up (EOF or a failed write): keeping the dead
+            // session made `is_live` lie forever while every op vanished.
+            // Drop it; the connect path above re-attaches (2s backoff) and
+            // guest files re-bootstrap through the normal request path.
+            self.status = String::from("Shared session link lost; reconnecting");
+            return true;
+        }
         self.collab = Some(session);
         changed | self.collab_labels_dirty()
     }
@@ -16791,22 +16882,75 @@ impl App {
         )
     }
 
+    /// While the collab link is down, mirror the active pane onto its
+    /// sibling panes of the same file (nothing else converges them without
+    /// a live doc). Input only reaches the active pane, so running this
+    /// every tick keeps all panes equal and the reconnect bootstrap sees
+    /// exactly one divergent text per file. Only a previously-attached pane
+    /// (generation != 0) mirrors out: a fresh reopen's disk text is stale
+    /// by construction and would revert siblings still holding session
+    /// text.
+    fn mirror_offline_siblings(&mut self) -> bool {
+        if self.editor.collab_doc_gen == 0
+            || self.editor.diff.is_some()
+            || self.editor.image.is_some()
+            || self.editor.sheet.is_some()
+        {
+            return false;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            return false;
+        };
+        if collab_file_key(&self.tree.root, &path).is_none() {
+            return false;
+        }
+        let lines = self.editor.lines.clone();
+        let mut changed = false;
+        let mut mirror = |ed: &mut crate::widgets::editor::Editor| {
+            if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+                return;
+            }
+            if ed.path.as_deref() != Some(path.as_path()) || ed.lines == lines {
+                return;
+            }
+            ed.replace_all_lines(lines.clone());
+            changed = true;
+        };
+        let active = self.editor.active_index();
+        for (i, ed) in self.editor.editors.iter_mut().enumerate() {
+            if i != active {
+                mirror(ed);
+            }
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                mirror(ed);
+            }
+        }
+        changed
+    }
+
     /// The owner's current text for a file a guest asked to share: the open
     /// buffer if any, else open it as a background tab (keeping the owner's
     /// focus where it was) and read that. None declines the request
     /// (missing, unreadable, or not a text buffer).
     fn owner_buffer_text(&mut self, root: &Path, file: &str) -> Option<String> {
-        let path = root.join(file);
-        let text_of = |ed: &crate::widgets::editor::Editor| {
-            (ed.diff.is_none() && ed.image.is_none() && ed.sheet.is_none())
-                .then(|| ed.lines.join("\n"))
+        let path = crate::collab::contained_path(root, file)?;
+        // First TEXT tab with the path: a diff tab of the same file found
+        // first must not make the owner decline a share its real buffer
+        // could serve.
+        let is_text = |ed: &&crate::widgets::editor::Editor| {
+            ed.path.as_deref() == Some(path.as_path())
+                && ed.diff.is_none()
+                && ed.image.is_none()
+                && ed.sheet.is_none()
         };
-        if let Some(i) = self.editor.find_tab_with_path(&path) {
-            return text_of(&self.editor.editors[i]);
+        if let Some(ed) = self.editor.editors.iter().find(is_text) {
+            return Some(ed.lines.join("\n"));
         }
-        for group in self.editor_layout.inactive_groups_mut() {
-            if let Some(i) = group.find_tab_with_path(&path) {
-                return text_of(&group.editors[i]);
+        for group in self.editor_layout.inactive_groups() {
+            if let Some(ed) = group.editors.iter().find(is_text) {
+                return Some(ed.lines.join("\n"));
             }
         }
         if !path.is_file() {
@@ -16816,23 +16960,40 @@ impl App {
         self.editor.open_in_new_tab(&path).ok()?;
         let opened = self.editor.active_index();
         self.editor.select(keep);
-        text_of(&self.editor.editors[opened])
+        let ed = &self.editor.editors[opened];
+        (ed.diff.is_none() && ed.image.is_none() && ed.sheet.is_none()).then(|| ed.lines.join("\n"))
     }
 
-    /// Replay resolved remote spans onto the open buffer for `file`,
+    /// Replay resolved remote spans onto every open buffer for `file`,
     /// converting each byte span to the editor's char coordinates. Spans are
     /// sequential (each relative to the text with earlier ones applied), so
-    /// they go through `apply_span_edits` one at a time. When the same file
-    /// is open in several groups only the first found stays synced, matching
-    /// the existing split-view-as-independent-copies behavior.
+    /// they go through `apply_span_edits` one at a time. Every ATTACHED pane
+    /// gets them (attached panes hold identical text, so the byte offsets
+    /// are valid in each); a never-attached pane still holds stale disk
+    /// text where the offsets would splice garbage — the attach pass seeds
+    /// it from the doc instead.
     fn apply_collab_spans(
         &mut self,
         root: &Path,
         file: &str,
         spans: &[crate::collab::ResolvedSpan],
+        doc_gen: u64,
     ) {
-        let path = root.join(file);
+        let Some(path) = crate::collab::contained_path(root, file) else {
+            return;
+        };
+        // Every matching TEXT tab, not the first tab found by path: a
+        // diff/image/sheet tab carries the path too (close-by-path), and a
+        // first-found lookup let one shadow the real text tab out of its
+        // updates while the spans spliced into a buffer that is not a
+        // document.
         let apply = |ed: &mut crate::widgets::editor::Editor| {
+            if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+                return;
+            }
+            if ed.collab_doc_gen == 0 {
+                return;
+            }
             for s in spans {
                 let (sr, sc) = crate::collab::position(&ed.lines, s.at);
                 let (er, ec) = crate::collab::position(&ed.lines, s.at + s.deleted);
@@ -16845,42 +17006,78 @@ impl App {
             // Echo suppression: apply_span_edits bumped edit_seq, which would
             // re-arm the tick diff and rebroadcast what was just applied.
             ed.collab_synced_seq = ed.edit_seq;
+            ed.collab_doc_gen = doc_gen;
         };
-        if let Some(i) = self.editor.find_tab_with_path(&path) {
-            apply(&mut self.editor.editors[i]);
-            return;
+        for ed in self.editor.editors.iter_mut() {
+            if ed.path.as_deref() == Some(path.as_path()) {
+                apply(ed);
+            }
         }
         for group in self.editor_layout.inactive_groups_mut() {
-            if let Some(i) = group.find_tab_with_path(&path) {
-                apply(&mut group.editors[i]);
-                return;
+            for ed in group.editors.iter_mut() {
+                if ed.path.as_deref() == Some(path.as_path()) {
+                    apply(ed);
+                }
             }
         }
     }
 
-    /// A guest's bootstrap snapshot landed: swap the buffer to the owner's
-    /// canonical text (usually identical to what was read from disk) and
-    /// mark the file synced, which also lifts the input gate.
-    fn finish_collab_bootstrap(&mut self, root: &Path, file: &str, text: String) {
-        let path = root.join(file);
+    /// A guest's bootstrap snapshot landed: swap every open buffer for the
+    /// file to the owner's canonical text (usually identical to what was
+    /// read from disk) and mark them synced, which also lifts the input
+    /// gate. A buffer that was already attached to an earlier session
+    /// incarnation and diverges from the snapshot holds work made while the
+    /// link was down — work that exists nowhere else, so replacing it would
+    /// silently delete it. Such a buffer keeps its text and is returned for
+    /// the caller to re-inject as local edits (panes converged every tick
+    /// before the link died, so any divergent pane carries the same text).
+    fn finish_collab_bootstrap(
+        &mut self,
+        root: &Path,
+        file: &str,
+        text: String,
+        doc_gen: u64,
+    ) -> Option<String> {
+        let path = crate::collab::contained_path(root, file)?;
         let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-        let finish = |ed: &mut crate::widgets::editor::Editor| {
+        let mut kept = None;
+        let mut finish = |ed: &mut crate::widgets::editor::Editor| {
+            if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+                return;
+            }
+            if ed.collab_doc_gen != 0 && ed.lines != lines {
+                // Offline divergence: keep the buffer; gen 0 lets the
+                // attach pass re-mark it once the doc holds the merged
+                // text (the caller's local_change makes them equal).
+                if kept.is_none() {
+                    kept = Some(ed.lines.join("\n"));
+                }
+                ed.collab_doc_gen = 0;
+                return;
+            }
             if ed.lines != lines {
                 ed.replace_all_lines(lines.clone());
             }
             ed.collab_synced_seq = ed.edit_seq;
+            ed.collab_doc_gen = doc_gen;
         };
-        if let Some(i) = self.editor.find_tab_with_path(&path) {
-            finish(&mut self.editor.editors[i]);
-        } else {
-            for group in self.editor_layout.inactive_groups_mut() {
-                if let Some(i) = group.find_tab_with_path(&path) {
-                    finish(&mut group.editors[i]);
-                    break;
+        // Every matching TEXT tab (see apply_collab_spans): first-found let
+        // a diff tab of the file swallow the snapshot while the text tab
+        // went unmarked.
+        for ed in self.editor.editors.iter_mut() {
+            if ed.path.as_deref() == Some(path.as_path()) {
+                finish(ed);
+            }
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                if ed.path.as_deref() == Some(path.as_path()) {
+                    finish(ed);
                 }
             }
         }
         self.status = format!("{file} is now live-shared");
+        kept
     }
 
     /// True when this croft is a solo-viewport guest: the session owner is
@@ -26635,12 +26832,22 @@ impl App {
         // Guests in a collab session never write shared files: the owner is
         // the single writer, so the FS watcher and history snapshots see one
         // author. The guest's edits already flowed to the owner as ops.
+        // Except a file whose bootstrap gave up (no owner answered): the
+        // guest is its only author, and refusing meant the work could never
+        // persist anywhere. Same when there is NO session at all (relay
+        // link down, reconnect pending): with nobody to defer to, blocking
+        // strands the offline work in RAM for the whole outage.
         if self.is_collab_guest()
             && self
                 .editor
                 .path
                 .as_ref()
-                .is_some_and(|p| collab_file_key(&self.tree.root, p).is_some())
+                .and_then(|p| collab_file_key(&self.tree.root, p))
+                .is_some_and(|file| {
+                    self.collab
+                        .as_ref()
+                        .is_some_and(|s| !s.is_local_only(&file))
+                })
         {
             self.status =
                 String::from("Shared file: the session owner saves (your edits are already live)");
@@ -27666,16 +27873,14 @@ impl App {
     /// and always passes.
     fn wheel_pdf_page(&mut self, delta: i32) {
         const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(150);
-        let now = std::time::Instant::now();
         let doc = self.editor.path.clone();
         if let Some((at, dir, last_doc)) = &self.last_pdf_wheel
             && *dir == delta.signum()
             && *last_doc == doc
-            && now.duration_since(*at) < COOLDOWN
+            && at.elapsed() < COOLDOWN
         {
             return;
         }
-        self.last_pdf_wheel = Some((now, delta.signum(), doc));
         let Some(cur) = self.editor.pdf_page() else {
             return;
         };
@@ -27685,6 +27890,12 @@ impl App {
             cur.saturating_sub(delta.unsigned_abs()).max(1)
         };
         self.editor.set_pdf_page(target);
+        // Stamped AFTER the rasterise: the flick's remaining events queued
+        // while the render ran, so a stamp taken at entry had already aged
+        // by the render's duration when they were processed — a render
+        // slower than the cooldown let every queued event through, one
+        // blocking render each.
+        self.last_pdf_wheel = Some((std::time::Instant::now(), delta.signum(), doc));
     }
 
     fn jump_pdf_page(&mut self, page: u32) {

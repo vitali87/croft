@@ -62,26 +62,26 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Croft.app starts again: the Dock-launch PATH repair asked your login shell for its PATH on croft's own terminal, and an interactive zsh steals the terminal's foreground for job control, so croft came up as a background process and died with an I/O error before drawing anything. The probe now runs in its own session, where it cannot touch croft's terminal.",
+        summary: "A momentum flick over a PDF preview coalesces reliably: the wheel cooldown now starts when the page render finishes, so a render slower than the cooldown no longer lets every queued wheel event through as its own blocking page step.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Navigator comment boxes carry only the model's own words: claude's startup chatter and host notices (a suppressed edit, a file nobody serves) now go to the OUTPUT panel instead of being anchored in your file as the navigator's remarks and counted as its comments.",
+        summary: "Splitting or reopening a live-shared file can no longer wipe the session: the duplicate pane used to load the stale disk copy and, on your first keystroke, broadcast a diff that reverted every participant to the pre-session file. Fresh panes now seed from the shared document (a keystroke arriving before the seed is refused instead of silently wiped), all panes of a shared file stay in step, diff/image/sheet tabs are never mistaken for the document, and a reused preview tab detaches from the old file's doc when it navigates.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The editor can no longer hang on a wedged navigator: nothing on the render or tick path waits on the pilot's internals anymore (a stalled seat reads as busy and the last known carets and comments keep painting), closing a same-process deadlock introduced when the navigator moved in-process.",
+        summary: "Losing the collab relay is now detected: the session reconnects (files re-join automatically) instead of silently swallowing every edit while the share looked alive, and edits made while the link was down are replayed into the restored session instead of being wiped by the owner's older snapshot — including edits spread across split panes, which mirror each other offline. A disconnected guest can also save its shared files, so a permanent outage no longer strands work in RAM.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A send that never reaches the model leaves the seat exactly as it was: no permanently busy navigator, the cancel note it still owes the model is kept, and a failed yield no longer destroys the diff baseline or latches the next turn into comment-only mode.",
+        summary: "A shared file whose session owner never answers now truly degrades to local editing: the input gate used to re-arm every three seconds forever and the guest could neither type nor save; the guest now edits freely and its save writes to disk.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The seat stays busy until croft has actually consumed the turn's end (a turn started in the finish window stole the previous turn's anchor and comment count), and a fence header cut off by the end of a turn is dropped instead of leaking raw protocol markers into a comment box.",
+        summary: "One stuck participant can no longer freeze everyone: the collab relay's forwarding writes are bounded, a peer that stops draining is dropped, and a full socket can no longer wedge croft's own UI thread mid-send.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A duplicated or spontaneous turn result from claude ends nothing: only a turn croft actually dispatched can release the seat's busy gate, so a protocol hiccup can no longer let two turns overlap and overwrite each other's staging.",
+        summary: "A collab peer (including an AI seat over the MCP agent) can no longer reach outside the workspace: shared-file keys arriving over the wire are contained to the workspace root, so neither a traversing path nor a symlink pointing beyond the root can read or edit files outside it.",
     },
 ];

@@ -162,7 +162,10 @@ fn call_tool(state: &Mutex<AgentState>, tool: &str, args: &Value) -> Option<Valu
     let not_live = || error_result(format!("{file} is not live; call collab_open first"));
     Some(match tool {
         "collab_open" => {
-            state.lock().unwrap().session.request_file(&file);
+            // rejoin, not request: an earlier open that timed out latched
+            // the file local-only, and a plain request respects the latch —
+            // the caller retrying after starting croft would never join.
+            state.lock().unwrap().session.rejoin_file(&file);
             let deadline = Instant::now() + OPEN_TIMEOUT;
             loop {
                 {

@@ -59,6 +59,12 @@ pub struct ResolvedSpan {
 pub struct CollabDoc {
     replica: Replica,
     text: String,
+    /// Bumped on every text mutation (local or integrated remote). The
+    /// editor wiring pins each buffer of a live file to the generation it
+    /// last synced at, so a buffer created after the file went live (a
+    /// split duplicate loaded from stale disk text) is detectable and gets
+    /// seeded from the replica instead of poisoning the session.
+    text_gen: u64,
     /// Literal text of insertions cola backlogged (its backlog keeps only
     /// position metadata), keyed by the run's identity so the drain can
     /// splice the right characters back in. An entry for a duplicate
@@ -82,6 +88,7 @@ impl CollabDoc {
         Self {
             replica: Replica::new(id, initial.len()),
             text: initial.to_string(),
+            text_gen: 1,
             pending_insert_texts: std::collections::HashMap::new(),
         }
     }
@@ -95,6 +102,7 @@ impl CollabDoc {
         Self {
             replica: self.replica.fork(id),
             text: self.text.clone(),
+            text_gen: 1,
             pending_insert_texts: self.pending_insert_texts.clone(),
         }
     }
@@ -114,12 +122,18 @@ impl CollabDoc {
         Ok(Self {
             replica,
             text: text.to_string(),
+            text_gen: 1,
             pending_insert_texts: std::collections::HashMap::new(),
         })
     }
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The current text generation (see the field doc).
+    pub fn text_gen(&self) -> u64 {
+        self.text_gen
     }
 
     /// This replica's site id (unique per participant per document).
@@ -130,6 +144,7 @@ impl CollabDoc {
     /// Apply a local insertion at byte offset `at` and return the op to
     /// broadcast to the other replicas.
     pub fn local_insert(&mut self, at: usize, s: &str) -> Op {
+        self.text_gen += 1;
         self.text.insert_str(at, s);
         let insertion = self.replica.inserted(at, s.len());
         Op::Insert {
@@ -140,6 +155,7 @@ impl CollabDoc {
 
     /// Apply a local deletion of byte range `at..at+len` and return the op.
     pub fn local_delete(&mut self, at: usize, len: usize) -> Op {
+        self.text_gen += 1;
         let deletion = self.replica.deleted(at..at + len);
         self.text.replace_range(at..at + len, "");
         Op::Delete { deletion }
@@ -178,6 +194,9 @@ impl CollabDoc {
             }
         }
         self.drain_backlog(&mut spans);
+        if !spans.is_empty() {
+            self.text_gen += 1;
+        }
         spans
     }
 
@@ -452,6 +471,17 @@ pub fn relay_serve(socket: &std::path::Path) -> anyhow::Result<()> {
     let clients: std::sync::Arc<std::sync::Mutex<Vec<Peer>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     for stream in listener.incoming().flatten() {
+        // Bounded writes: forwarding holds the global client mutex, so one
+        // peer that stops draining (SIGSTOPped, wedged mid-write) used to
+        // block its writer forever — starving every other peer AND their
+        // reader threads queued on the same mutex, a cross-process
+        // deadlock. A write that cannot complete inside the timeout fails,
+        // and the failed peer is dropped (see relay_client). Setting the
+        // timeout itself fails with EINVAL on macOS when the peer already
+        // hung up (the liveness probe connects and drops instantly) — such
+        // a socket cannot block a write, so serve it rather than let one
+        // dead accept kill the loop for every later peer.
+        let _ = stream.set_write_timeout(Some(RELAY_WRITE_TIMEOUT));
         let tx = std::sync::Arc::new(std::sync::Mutex::new(stream.try_clone()?));
         clients.lock().unwrap().push(std::sync::Arc::clone(&tx));
         let clients = std::sync::Arc::clone(&clients);
@@ -521,6 +551,12 @@ pub struct CollabChannel {
     stream: std::os::unix::net::UnixStream,
     reader: crate::session_host::FrameReader,
     pub role: CollabRole,
+    /// Latched on EOF or a hard error: the relay hung up. Nothing clears
+    /// it — the owner of the channel drops it and reconnects. Without the
+    /// latch a dead relay read exactly like an idle one, and a guest kept
+    /// typing into a buffer whose ops reached nobody, with saves still
+    /// gated, so the work existed only in RAM.
+    dead: bool,
 }
 
 impl CollabChannel {
@@ -548,13 +584,25 @@ impl CollabChannel {
             stream,
             reader: crate::session_host::FrameReader::new(),
             role,
+            dead: false,
         })
     }
 
+    /// True once the relay hung up (EOF or a failed write): the channel is
+    /// unusable and its owner should drop it and reconnect.
+    pub fn is_dead(&self) -> bool {
+        self.dead
+    }
+
     /// Broadcast one message to the other participants. Returns false when
-    /// the relay is gone (the caller drops the channel and reconnects).
+    /// the relay is gone (which also latches [`Self::is_dead`], so the
+    /// session surfaces the loss even though callers fire-and-forget).
     pub fn send(&mut self, msg: &CollabMsg) -> bool {
-        crate::session_host::write_frame_blocking(&mut self.stream, &msg.encode())
+        let sent = crate::session_host::write_frame_blocking(&mut self.stream, &msg.encode());
+        if !sent {
+            self.dead = true;
+        }
+        sent
     }
 
     /// Drain every message waiting on the channel, in arrival order.
@@ -565,7 +613,18 @@ impl CollabChannel {
         let mut buf = [0u8; 16384];
         loop {
             match self.stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                // EOF and hard errors are the relay hanging up — distinct
+                // from WouldBlock (idle), which they used to be lumped with.
+                Ok(0) => {
+                    self.dead = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.dead = true;
+                    break;
+                }
                 Ok(n) => {
                     for frame in self.reader.push(&buf[..n]) {
                         if let crate::session_host::Frame::Bytes(payload) = frame
@@ -578,6 +637,38 @@ impl CollabChannel {
             }
         }
         msgs
+    }
+}
+
+/// Resolve a wire-supplied file key against the workspace root. Keys arrive
+/// from peers (snapshot requests, ops, carets) and the MCP collab agent
+/// forwards caller input verbatim, so containment is enforced here, not by
+/// the sender: every component must be a plain name — a traversing or
+/// absolute key must never let a guest read or edit outside the workspace.
+pub fn contained_path(root: &std::path::Path, file: &str) -> Option<std::path::PathBuf> {
+    let rel = std::path::Path::new(file);
+    let plain = !file.is_empty()
+        && rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !plain {
+        return None;
+    }
+    let joined = root.join(rel);
+    // Plain components are not enough: a normal-looking key can name a
+    // symlink inside the workspace whose target lies outside it, and the
+    // later open follows the link. Resolve the deepest existing ancestor
+    // (the file itself may not exist) and require it to stay under the
+    // resolved root; a link resolving inside the workspace remains fine.
+    let canon_root = root.canonicalize().ok()?;
+    let mut probe = joined.as_path();
+    loop {
+        match probe.canonicalize() {
+            Ok(real) => return real.starts_with(&canon_root).then_some(joined),
+            // Nothing exists at this depth yet; check the parent instead.
+            // The walk ends at `root` itself, which trivially resolves.
+            Err(_) => probe = probe.parent()?,
+        }
     }
 }
 
@@ -626,6 +717,11 @@ enum DocState {
     // Boxed: CollabDoc is an order of magnitude larger than the bootstrap
     // variant, and per-file states live in a map for the session's life.
     Live(Box<CollabDoc>),
+    /// The bootstrap gave up (nobody answered, or the snapshot was
+    /// corrupt): the file is edited locally, by this guest alone. A latch,
+    /// not an absence — forgetting the file instead made the app tick
+    /// re-request it and re-arm the 3s input gate forever.
+    LocalOnly,
 }
 
 /// What [`CollabSession::poll`] resolved this tick, for the app to apply to
@@ -693,7 +789,11 @@ impl CollabSession {
             role: channel.role,
             channel,
             docs: std::collections::HashMap::new(),
-            next_site: OWNER_SITE + 1,
+            // pid-seeded: a restarted owner allocating "2, 3, ..." again
+            // would re-issue ids that guests surviving from the previous
+            // owner already hold, permanently breaking convergence. Each
+            // incarnation allocates from its own disjoint range instead.
+            next_site: ((std::process::id() as u64) << 32) | (OWNER_SITE + 1),
             next_nonce: (std::process::id() as u64) << 32,
             name,
         }
@@ -702,6 +802,29 @@ impl CollabSession {
     /// True when `file` is replicating (bootstrap finished).
     pub fn is_live(&self, file: &str) -> bool {
         matches!(self.docs.get(file), Some(DocState::Live(_)))
+    }
+
+    /// True once the relay hung up: every later send is lost, so the app
+    /// drops the session and reconnects (files re-bootstrap on request).
+    pub fn disconnected(&self) -> bool {
+        self.channel.is_dead()
+    }
+
+    /// True when `file` gave up bootstrapping (no owner answered): the
+    /// guest edits it locally and is its only author.
+    pub fn is_local_only(&self, file: &str) -> bool {
+        matches!(self.docs.get(file), Some(DocState::LocalOnly))
+    }
+
+    /// Explicitly retry sharing a file that gave up bootstrapping (the
+    /// collab agent's `collab_open`). The app tick never rejoins — it calls
+    /// [`Self::request_file`], which respects the local-only latch, or a
+    /// guest whose owner is gone would re-enter the input gate every 3s.
+    pub fn rejoin_file(&mut self, file: &str) {
+        if matches!(self.docs.get(file), Some(DocState::LocalOnly)) {
+            self.docs.remove(file);
+        }
+        self.request_file(file);
     }
 
     /// True while `file` waits for its snapshot (the app gates edit input).
@@ -714,6 +837,15 @@ impl CollabSession {
     pub fn doc_text(&self, file: &str) -> Option<&str> {
         match self.docs.get(file) {
             Some(DocState::Live(doc)) => Some(doc.text()),
+            _ => None,
+        }
+    }
+
+    /// The live doc's text generation for `file` (see
+    /// [`CollabDoc::text_gen`]): the editor wiring's staleness check.
+    pub fn doc_gen(&self, file: &str) -> Option<u64> {
+        match self.docs.get(file) {
+            Some(DocState::Live(doc)) => Some(doc.text_gen()),
             _ => None,
         }
     }
@@ -851,9 +983,10 @@ impl CollabSession {
                         }
                     }
                     Some(DocState::Bootstrapping { buffered, .. }) => buffered.push(env),
-                    // Not open on this peer: ignored until opened, then the
-                    // bootstrap snapshot carries this edit anyway.
-                    None => {}
+                    // Not open on this peer (or degraded to local-only):
+                    // ignored until opened or rejoined, then the bootstrap
+                    // snapshot carries this edit anyway.
+                    None | Some(DocState::LocalOnly) => {}
                 },
                 CollabMsg::SnapshotRequest { file, nonce } => {
                     // Only the owner answers, so a request never draws
@@ -909,7 +1042,7 @@ impl CollabSession {
                     let Ok(mut doc) = CollabDoc::from_snapshot(assigned_site, &text, &replica)
                     else {
                         // Corrupt snapshot: give up as if nobody answered.
-                        self.docs.remove(&file);
+                        self.docs.insert(file.clone(), DocState::LocalOnly);
                         events.push(CollabEvent::BootstrapTimedOut { file });
                         continue;
                     };
@@ -965,7 +1098,10 @@ impl CollabSession {
             })
             .collect();
         for file in timed_out {
-            self.docs.remove(&file);
+            // A latch, not a removal: the app tick re-requests any open file
+            // that is neither live nor bootstrapping, so a forgotten file
+            // re-entered the input gate 16ms after every give-up.
+            self.docs.insert(file.clone(), DocState::LocalOnly);
             events.push(CollabEvent::BootstrapTimedOut { file });
         }
         // Re-send unanswered requests: the relay has no replay, so the
@@ -994,6 +1130,18 @@ impl CollabSession {
     }
 }
 
+/// How long the relay lets one forwarding write block before treating the
+/// peer as wedged and dropping it. Shorter than the clients' own
+/// frame-write deadline, so the relay recovers (and traffic resumes for
+/// healthy peers) before any client gives its connection up for dead.
+const RELAY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+// The ordering above is a recovery guarantee, not a coincidence: hold it
+// against future edits to either constant.
+const _: () = assert!(
+    RELAY_WRITE_TIMEOUT.as_millis() < crate::session_host::WRITE_FRAME_DEADLINE.as_millis()
+);
+
 type Peer = std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>;
 
 /// One connection: reassemble whole frames from this peer and forward each,
@@ -1019,7 +1167,18 @@ fn relay_client(
             let out = encode_bytes_frame(&payload);
             let mut peers = clients.lock().unwrap();
             peers.retain(|c| {
-                std::sync::Arc::ptr_eq(c, me) || c.lock().unwrap().write_all(&out).is_ok()
+                if std::sync::Arc::ptr_eq(c, me) {
+                    return true;
+                }
+                let mut s = c.lock().unwrap();
+                if s.write_all(&out).is_ok() {
+                    return true;
+                }
+                // Timed out (wedged peer) or gone: shut the socket down so
+                // the peer's reader thread sees EOF and cleans up — merely
+                // forgetting the write clone left the connection half-alive.
+                let _ = s.shutdown(std::net::Shutdown::Both);
+                false
             });
         }
     }
@@ -1277,6 +1436,7 @@ mod tests {
             stream: rx,
             reader: crate::session_host::FrameReader::new(),
             role: CollabRole::Guest,
+            dead: false,
         };
         let bogus = crate::session_host::encode_bytes_frame(br#"{"FutureVariant":{"whatever":1}}"#);
         tx.write_all(&bogus).unwrap();
@@ -1647,6 +1807,171 @@ mod tests {
         }
         assert!(!guest.is_bootstrapping("src/f.rs"));
         assert!(!guest.is_live("src/f.rs"));
+    }
+
+    /// One peer that stops reading (SIGSTOPped, or wedged mid-write) must
+    /// not take the whole session down: the relay used to blocking-write to
+    /// every peer while holding the global client list mutex, so a full
+    /// send buffer wedged the forwarding thread, which starved every other
+    /// peer's writes AND blocked their reader threads on the same mutex —
+    /// a three-process deadlock. A bounded write drops the wedged peer and
+    /// traffic keeps flowing to the rest.
+    #[test]
+    fn a_wedged_peer_cannot_deadlock_the_relay() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("w.collab.sock");
+        {
+            let s = socket.clone();
+            std::thread::spawn(move || {
+                let _ = relay_serve(&s);
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::session::is_alive(&socket) {
+            assert!(Instant::now() < deadline, "relay never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A connects and never reads a byte.
+        let _a = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        // C drains everything, watching for the marker frame.
+        let mut c = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let (found_tx, found_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use crate::session_host::{Frame, FrameReader};
+            let mut reader = FrameReader::new();
+            let mut buf = [0u8; 16384];
+            loop {
+                let n = match c.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                for frame in reader.push(&buf[..n]) {
+                    if matches!(&frame, Frame::Bytes(p) if p.as_slice() == b"MARKER") {
+                        let _ = found_tx.send(());
+                        return;
+                    }
+                }
+            }
+        });
+        // B floods well past every kernel buffer (wedging the relay's
+        // writes to A), then sends the marker.
+        let mut b = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        b.set_nonblocking(true).unwrap();
+        let mut push = |bytes: &[u8]| {
+            let mut written = 0;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while written < bytes.len() {
+                assert!(
+                    Instant::now() < deadline,
+                    "sender starved: the relay is wedged on the peer that never reads"
+                );
+                match b.write(&bytes[written..]) {
+                    Ok(n) => written += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(e) => panic!("sender failed: {e}"),
+                }
+            }
+        };
+        let frame = crate::session_host::encode_bytes_frame(&[0u8; 4096]);
+        for _ in 0..256 {
+            push(&frame);
+        }
+        push(&crate::session_host::encode_bytes_frame(b"MARKER"));
+        assert!(
+            found_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the marker never reached the healthy peer: the relay is wedged"
+        );
+    }
+
+    /// A relay that hangs up must be visible: EOF on the drain marks the
+    /// channel dead and the session disconnected, so the app can drop it
+    /// and reconnect. EOF used to read exactly like an idle socket, so a
+    /// guest kept typing into a buffer whose ops reached nobody — with
+    /// saves still gated, the work existed only in RAM.
+    #[test]
+    fn a_dead_relay_marks_the_session_disconnected() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dead.collab.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut session = CollabSession::new(
+            CollabChannel::connect(&socket, CollabRole::Guest).expect("connects"),
+            String::from("guest"),
+        );
+        let (peer, _) = listener.accept().unwrap();
+        let _ = session.poll(|_| None);
+        assert!(
+            !session.disconnected(),
+            "a healthy idle channel must not read as dead"
+        );
+        drop(peer); // the relay dies
+        let _ = session.poll(|_| None);
+        assert!(
+            session.disconnected(),
+            "EOF from the relay must mark the session disconnected"
+        );
+    }
+
+    /// Site ids are identity: a restarted owner re-allocating from the same
+    /// fixed counter re-issues ids that surviving guests already hold,
+    /// which permanently breaks convergence. Seeding the counter from the
+    /// owner's process id keeps every owner incarnation's allocations
+    /// disjoint.
+    #[test]
+    fn an_owner_seeds_site_ids_from_its_process_id() {
+        let (_dir, mut owner, mut guest) = session_pair();
+        guest.request_file("src/f.rs");
+        pump(&mut owner, &mut guest, "abc", |_, ge| {
+            ge.iter()
+                .any(|e| matches!(e, CollabEvent::Bootstrapped { .. }))
+        });
+        let expected = ((std::process::id() as u64) << 32) | (OWNER_SITE + 1);
+        assert_eq!(
+            guest.my_site_ids(),
+            vec![expected],
+            "the first allocated site id must come from the pid-seeded range"
+        );
+    }
+
+    /// A timed-out bootstrap is a latch, not a moment: the app's tick
+    /// re-requests any open file that is neither live nor bootstrapping, so
+    /// a timeout that merely forgot the file sent the guest straight back
+    /// into the 3s input gate, forever — unable to ever type or save. After
+    /// the give-up, request_file must be a no-op; only an explicit rejoin
+    /// (the collab agent's collab_open retry) re-arms the bootstrap.
+    #[test]
+    fn a_timed_out_file_stays_local_only_through_re_requests() {
+        let (_dir, _owner, mut guest) = session_pair();
+        guest.request_file("src/f.rs");
+        let deadline =
+            std::time::Instant::now() + BOOTSTRAP_TIMEOUT + std::time::Duration::from_secs(3);
+        loop {
+            let events = guest.poll(|_| None);
+            if events
+                .iter()
+                .any(|e| matches!(e, CollabEvent::BootstrapTimedOut { .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bootstrap never timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // The app tick re-requests unshared open files: a no-op now.
+        guest.request_file("src/f.rs");
+        assert!(
+            !guest.is_bootstrapping("src/f.rs"),
+            "a re-request after the give-up must not re-arm the input gate"
+        );
+        assert!(guest.is_local_only("src/f.rs"));
+        // An explicit rejoin starts a fresh bootstrap.
+        guest.rejoin_file("src/f.rs");
+        assert!(guest.is_bootstrapping("src/f.rs"));
     }
 
     /// An unanswered resend backs off (a guest cannot tell a lost request

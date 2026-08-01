@@ -1359,6 +1359,12 @@ pub struct Editor {
     /// after a remote edit is applied so the diff never rebroadcasts one
     /// (same lazy-recompute pattern as `git_marks_seq`).
     pub collab_synced_seq: u64,
+    /// The [`CollabDoc::text_gen`](crate::collab::CollabDoc::text_gen) this
+    /// buffer last synced at, 0 = never attached to the live doc. A buffer
+    /// created after its file went live (a split duplicate, a reopen) holds
+    /// stale disk text: it must never extract (its diff would revert every
+    /// peer) and is instead seeded from the replica when this lags.
+    pub collab_doc_gen: u64,
     /// HEAD baseline for the git gutter: the committed version's lines. Set by
     /// the app (read off the workspace git root once per file / HEAD change).
     /// `None` when the file is untracked, outside a repo, or not yet fetched.
@@ -1664,6 +1670,7 @@ impl Editor {
             breakpoint_logs: std::collections::HashMap::new(),
             edit_seq: 0,
             collab_synced_seq: 0,
+            collab_doc_gen: 0,
             git_head_lines: None,
             git_baseline_for: None,
             git_marks: std::collections::HashMap::new(),
@@ -2535,6 +2542,7 @@ impl Editor {
         }
         // Decode with the file's BOM-declared encoding if it has one, else
         // UTF-8. A later "Reopen with Encoding" overrides this.
+        let changed_file = self.path.as_deref() != Some(path);
         let enc = encoding_rs::Encoding::for_bom(&bytes)
             .map(|(e, _)| e)
             .unwrap_or(encoding_rs::UTF_8);
@@ -2580,6 +2588,17 @@ impl Editor {
         // the bump the server keeps analysing the old text and never sends
         // fresh semantic tokens — codeberg issue #39).
         self.edit_seq = self.edit_seq.wrapping_add(1);
+        // A path CHANGE detaches the buffer from any collab doc it was
+        // synced to: the old generation belongs to another file, and a
+        // reused tab (the preview tab) keeping it would let the next collab
+        // tick broadcast this file's disk text as edits to that doc. A
+        // same-path reload keeps its attachment deliberately — that is how
+        // an owner's reload-diff (external change, Replace All) converges
+        // into the session as ops.
+        if changed_file {
+            self.collab_doc_gen = 0;
+            self.collab_synced_seq = self.edit_seq;
+        }
         // Drop any semantic-token batch measured against the previous content:
         // decoding it over the new lines paints the old file's colors at the
         // wrong offsets. Tree-sitter colors cover the gap until the fresh
@@ -9214,6 +9233,40 @@ mod tests {
         );
         // The last stop ends the session.
         assert!(!e.snippet_active());
+    }
+
+    /// A reused tab (the preview tab navigating file to file) must drop its
+    /// collab attachment when it loads a DIFFERENT path: the old generation
+    /// belongs to another file's doc, and keeping it lets the next collab
+    /// tick broadcast this file's disk text as edits to that doc. A
+    /// same-path reload keeps the attachment on purpose — that is how an
+    /// owner's reload-diff (external change, Replace All) converges as ops.
+    #[test]
+    fn open_resets_collab_attachment_only_on_a_path_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, "aaa").unwrap();
+        std::fs::write(&b, "bbb").unwrap();
+        let mut e = Editor::new();
+        e.open(&a).unwrap();
+        e.collab_doc_gen = 7;
+        e.collab_synced_seq = 3;
+        e.open(&b).unwrap();
+        assert_eq!(
+            e.collab_doc_gen, 0,
+            "opening another path must detach the buffer from the old doc"
+        );
+        assert_eq!(
+            e.collab_synced_seq, e.edit_seq,
+            "a fresh open has nothing pending to extract"
+        );
+        e.collab_doc_gen = 7;
+        e.open(&b).unwrap();
+        assert_eq!(
+            e.collab_doc_gen, 7,
+            "a same-path reload must keep its attachment so the reload broadcasts as edits"
+        );
     }
 
     #[test]

@@ -19357,6 +19357,598 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
     );
 }
 
+/// Splitting (or reopening) a live shared file loads the DISK copy, which
+/// is stale by construction: a guest never writes shared files, so an
+/// unsaved session's work exists only in buffers and replicas. The stale
+/// duplicate used to become the active buffer, catch incoming spans at
+/// nonsense offsets, and — on the first keystroke — broadcast a diff of
+/// the live doc against the old disk text, reverting every peer to the
+/// pre-session file. A fresh buffer of a live file must be seeded from the
+/// replicated text, and every pane of the file must mirror the session.
+#[test]
+fn splitting_a_live_file_does_not_revert_the_session() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello world").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    let pump_until =
+        |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(owner, guest) {
+                assert!(Instant::now() < deadline, "never settled: {what}");
+                owner.poll_collab();
+                guest.poll_collab();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+    pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+
+    // An hour of unsaved session work, in miniature.
+    guest.editor.insert_str("SESSION ");
+    pump_until(&mut owner, &mut guest, "session edit converges", &|o, g| {
+        o.editor.lines == g.editor.lines && o.editor.lines[0].contains("SESSION")
+    });
+    let session_text = owner.editor.lines.clone();
+
+    // The guest splits: the duplicate is read from the stale disk copy.
+    guest.split_editor_dir(crate::app::editor_layout::SplitDir::Horizontal, true);
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "the split pane seeds from the live doc, not the disk",
+        &|_, g| g.editor.lines == session_text,
+    );
+
+    // Typing in the split must extend the session, never revert it.
+    guest.editor.insert_str("MORE ");
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "the split edit reaches the owner",
+        &|o, _| o.editor.lines[0].contains("MORE"),
+    );
+    assert!(
+        owner.editor.lines[0].contains("SESSION"),
+        "the pre-split session work survived, got: {:?}",
+        owner.editor.lines
+    );
+
+    // Both guest panes mirror the live document.
+    pump_until(&mut owner, &mut guest, "both panes mirror", &|o, g| {
+        g.editor.lines == o.editor.lines
+            && g.editor_layout
+                .inactive_groups()
+                .iter()
+                .all(|grp| grp.editors.iter().all(|ed| ed.lines == o.editor.lines))
+    });
+}
+
+/// Losing the relay link must not be silent: the app detects the dead
+/// channel, drops the session, and reconnects through the normal backoff
+/// path. Before detection existed, `is_live` stayed true forever and the
+/// guest typed into a buffer whose ops reached nobody.
+#[test]
+fn losing_the_relay_reconnects_instead_of_typing_into_the_void() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    // A hand-rolled "relay": accepts, then hangs up on command.
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.poll_collab();
+    assert!(guest.collab.is_some(), "first connect");
+    let (peer, _) = listener.accept().unwrap();
+    drop(peer); // the relay dies
+
+    // Detection: the dead session is dropped.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while guest.collab.is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "the dead session was never dropped"
+        );
+        guest.poll_collab();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Recovery: a fresh session connects (the listener's backlog accepts).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while guest.collab.is_none() {
+        assert!(Instant::now() < deadline, "never reconnected");
+        guest.poll_collab();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A guest whose bootstrap nobody answered degrades to plain local editing,
+/// as the timeout promises: the input gate lifts, the file stays local-only
+/// (no re-request re-arming the gate every 3 seconds), and the guest's save
+/// writes to disk — with no owner there is no other author to defer to, so
+/// a refused save meant the work could never persist anywhere.
+#[test]
+fn a_guest_without_an_owner_degrades_to_local_editing_and_saves() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // A guest alone on the relay: nobody answers its snapshot request.
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.open_file_at_launch(&file);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        guest.poll_collab();
+        if let Some(s) = guest.collab.as_ref()
+            && s.is_local_only("f.txt")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "bootstrap never gave up");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Later ticks must not re-arm the bootstrap gate.
+    for _ in 0..5 {
+        guest.poll_collab();
+    }
+    assert!(
+        !guest.collab.as_ref().unwrap().is_bootstrapping("f.txt"),
+        "the tick re-armed the input gate after the give-up"
+    );
+    // The guest is the only author: its save persists.
+    guest.editor.insert_str("LOCAL ");
+    guest.save();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        guest.editor.lines.join("\n"),
+        "the degraded file's save must reach disk, got status: {}",
+        guest.status
+    );
+}
+
+/// The `file` key in a snapshot request comes straight off the wire: a
+/// traversing or absolute key must never resolve outside the workspace, or
+/// any guest (the MCP collab agent included) could make the owner read,
+/// broadcast, and even edit arbitrary files it can reach.
+#[test]
+fn a_traversing_wire_file_key_is_declined() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(tmp.path().join("secret.txt"), "SECRET").unwrap();
+    std::fs::write(root.join("inner.txt"), "inner").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    assert_eq!(
+        app.owner_buffer_text(&root, "../secret.txt"),
+        None,
+        "a traversing wire key must not escape the workspace root"
+    );
+    assert_eq!(
+        app.owner_buffer_text(&root, "sub/../../secret.txt"),
+        None,
+        "a mid-path traversal must not escape the workspace root"
+    );
+    assert_eq!(
+        app.owner_buffer_text(&root, "/etc/hosts"),
+        None,
+        "an absolute wire key must not leave the workspace root"
+    );
+    assert_eq!(
+        app.owner_buffer_text(&root, "inner.txt").as_deref(),
+        Some("inner"),
+        "a plain relative key still resolves"
+    );
+}
+
+/// Lexical containment is not enough: a normal-looking wire key can name a
+/// symlink inside the workspace whose target lies outside it, and the
+/// owner-side open would follow the link — disclosing (and editing) files
+/// beyond the share. Symlinked keys must resolve inside the workspace or be
+/// declined; intra-workspace symlinks keep working.
+#[test]
+fn a_symlinked_wire_file_key_cannot_escape_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(tmp.path().join("secret.txt"), "SECRET").unwrap();
+    std::fs::write(root.join("inner.txt"), "inner").unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("secret.txt"), root.join("leak.txt")).unwrap();
+    std::fs::create_dir(tmp.path().join("outside")).unwrap();
+    std::fs::write(tmp.path().join("outside").join("deep.txt"), "DEEP").unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("outside"), root.join("sub")).unwrap();
+    std::os::unix::fs::symlink(root.join("inner.txt"), root.join("alias.txt")).unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    assert_eq!(
+        app.owner_buffer_text(&root, "leak.txt"),
+        None,
+        "a symlink to a file outside the workspace must be declined"
+    );
+    assert_eq!(
+        app.owner_buffer_text(&root, "sub/deep.txt"),
+        None,
+        "a path through a symlinked directory must not escape the workspace"
+    );
+    assert_eq!(
+        app.owner_buffer_text(&root, "alias.txt").as_deref(),
+        Some("inner"),
+        "a symlink resolving inside the workspace still works"
+    );
+}
+
+/// An edit the guest made while the relay link was down exists nowhere but
+/// its buffer: the op never reached the owner. Reconnection bootstraps from
+/// the owner's older snapshot, and replacing the buffer with it silently
+/// deleted the offline work. The divergence must instead be re-injected as
+/// local edits, so the guest keeps its work and the owner receives it.
+#[test]
+fn reconnecting_replays_offline_guest_edits_instead_of_deleting_them() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello world").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    let pump_until =
+        |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(owner, guest) {
+                assert!(Instant::now() < deadline, "never settled: {what}");
+                owner.poll_collab();
+                guest.poll_collab();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+    pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+    guest.editor.insert_str("SESSION ");
+    pump_until(&mut owner, &mut guest, "session edit converges", &|o, g| {
+        o.editor.lines == g.editor.lines && o.editor.lines[0].contains("SESSION")
+    });
+
+    // The link dies: this is the state poll_collab leaves after detecting a
+    // dead channel (session dropped, config kept). Hold the reconnect
+    // backoff while the guest keeps typing offline.
+    guest.collab = None;
+    guest.last_collab_connect = Some(Instant::now());
+    guest.editor.insert_str("OFFLINE ");
+    let offline_text = guest.editor.lines.clone();
+
+    // Reconnect: the file re-bootstraps from the owner's older snapshot.
+    guest.last_collab_connect = None;
+    pump_until(&mut owner, &mut guest, "reconnect goes live", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+    assert!(
+        guest.editor.lines[0].contains("OFFLINE"),
+        "the bootstrap deleted the guest's offline edit, got: {:?}",
+        guest.editor.lines
+    );
+    assert_eq!(
+        guest.editor.lines, offline_text,
+        "the guest's buffer must survive the reconnect intact"
+    );
+    // The offline edit reaches the owner: nothing was lost.
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "the offline edit reaches the owner",
+        &|o, g| o.editor.lines == g.editor.lines && o.editor.lines[0].contains("OFFLINE"),
+    );
+}
+
+/// Diff, image, and sheet tabs can carry a shared file's path (a diff tab
+/// stores it so close-by-path works), but their `lines` are not documents:
+/// the collab passes must never seed, span-splice, or mark them — and a
+/// diff tab sitting earlier in the tab strip must not shadow the real text
+/// tab out of receiving the session's updates.
+#[test]
+fn collab_never_touches_diff_image_or_sheet_tabs() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello world").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    // The guest's diff tab lands at index 0, AHEAD of the text tab: a
+    // first-found-by-path lookup would hand it the session's updates.
+    guest.editor.open_diff(&file, &file).unwrap();
+    guest.open_file_at_launch(&file);
+    let pump_until =
+        |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(owner, guest) {
+                assert!(Instant::now() < deadline, "never settled: {what}");
+                owner.poll_collab();
+                guest.poll_collab();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+    pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+    owner.editor.insert_str("OWNER ");
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "the owner edit reaches the guest text tab",
+        &|o, g| g.editor.lines == o.editor.lines && g.editor.lines[0].contains("OWNER"),
+    );
+    let diff_tab = &guest.editor.editors[0];
+    assert!(diff_tab.diff.is_some(), "the diff tab survived");
+    assert_eq!(
+        diff_tab.collab_doc_gen, 0,
+        "a diff tab must never be marked as an attached collab buffer"
+    );
+    assert!(
+        !diff_tab.lines.join("\n").contains("hello"),
+        "the collab passes seeded document text into a diff tab"
+    );
+}
+
+/// A keystroke into a fresh, not-yet-attached pane of a live file (a split
+/// or reopen holding stale disk text) used to land in the stale buffer and
+/// be silently wiped when the attach pass seeded the pane one tick later.
+/// The bootstrap input gate must cover this window too: refuse the key
+/// with a hint instead of losing it.
+#[test]
+fn typing_into_an_unattached_pane_of_a_live_file_is_gated_not_wiped() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello world").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    let pump_until =
+        |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(owner, guest) {
+                assert!(Instant::now() < deadline, "never settled: {what}");
+                owner.poll_collab();
+                guest.poll_collab();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+    pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+    guest.editor.insert_str("SESSION ");
+    pump_until(&mut owner, &mut guest, "session edit converges", &|o, g| {
+        o.editor.lines == g.editor.lines && o.editor.lines[0].contains("SESSION")
+    });
+
+    // The split duplicate holds stale disk text and has not attached yet;
+    // a keystroke arriving before the next tick must be refused, not
+    // absorbed into text the attach pass is about to replace.
+    guest.split_editor_dir(crate::app::editor_layout::SplitDir::Horizontal, true);
+    guest
+        .handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !guest.editor.lines.join("\n").contains('x'),
+        "the keystroke went into a stale unattached pane and will be wiped"
+    );
+    pump_until(&mut owner, &mut guest, "the split pane seeds", &|o, g| {
+        g.editor.lines == o.editor.lines && g.editor.lines[0].contains("SESSION")
+    });
+    assert!(
+        !owner.editor.lines.join("\n").contains('x'),
+        "the gated keystroke must not reach the session"
+    );
+}
+
+/// While the relay link is down there is no session to defer to: the guest
+/// editing offline must be able to save its shared file, or a permanent
+/// relay outage strands the work in RAM forever (the save gate used to
+/// treat a missing session as "shared, owner saves").
+#[test]
+fn a_disconnected_guest_can_still_save_its_shared_file() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello world").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    let pump_until =
+        |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(owner, guest) {
+                assert!(Instant::now() < deadline, "never settled: {what}");
+                owner.poll_collab();
+                guest.poll_collab();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+    pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+
+    // The link dies; the guest keeps editing offline and saves.
+    guest.collab = None;
+    guest.last_collab_connect = Some(Instant::now());
+    guest.editor.insert_str("OFF ");
+    guest.save();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        guest.editor.lines.join("\n"),
+        "a disconnected guest's save must reach disk, got status: {}",
+        guest.status
+    );
+}
+
+/// Two split panes of a shared file edited while the link is down must both
+/// keep their work through the reconnect. Panes cannot converge through the
+/// doc while there is no session, so the active pane (the only one input
+/// reaches) mirrors onto its siblings — the reconnect then replays exactly
+/// one offline text per file, holding every edit.
+#[test]
+fn offline_edits_in_split_panes_all_survive_a_reconnect() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello world").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    let pump_until =
+        |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(owner, guest) {
+                assert!(Instant::now() < deadline, "never settled: {what}");
+                owner.poll_collab();
+                guest.poll_collab();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+    pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+    guest.editor.insert_str("SESSION ");
+    pump_until(&mut owner, &mut guest, "session edit converges", &|o, g| {
+        o.editor.lines == g.editor.lines && o.editor.lines[0].contains("SESSION")
+    });
+    guest.split_editor_dir(crate::app::editor_layout::SplitDir::Horizontal, true);
+    let session_text = owner.editor.lines.clone();
+    pump_until(&mut owner, &mut guest, "both panes attach", &|_, g| {
+        g.editor.lines == session_text
+            && g.editor_layout
+                .inactive_groups()
+                .iter()
+                .all(|grp| grp.editors.iter().all(|ed| ed.lines == session_text))
+    });
+
+    // The link dies. Both panes are edited while offline.
+    guest.collab = None;
+    guest.last_collab_connect = Some(Instant::now());
+    guest.editor.insert_str("RIGHT ");
+    guest.poll_collab();
+    guest.focus_editor_group(true);
+    guest.editor.insert_str("LEFT ");
+    guest.poll_collab();
+
+    // Reconnect: every offline edit must reach the owner.
+    guest.last_collab_connect = None;
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "both offline edits reach the owner",
+        &|o, _| {
+            let text = o.editor.lines.join("\n");
+            text.contains("RIGHT") && text.contains("LEFT")
+        },
+    );
+}
+
 /// The cancel affordances around the AI stream: Cmd+K X and the palette
 /// entry both route through `collab_cancel_stream` (hint when idle), and
 /// the gutter stop button's row follows the pilot's caret in the streamed

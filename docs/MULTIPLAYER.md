@@ -302,8 +302,18 @@ The rest of the shipped shape:
 - **Bootstrap.** A guest opening a workspace file broadcasts
   `SnapshotRequest{file, nonce}`; only the owner answers, with the canonical
   text plus the cola-encoded replica and an owner-allocated site id (owner is
-  site 1 and the single allocator, so ids never collide; nonces are seeded
-  from the process id so two guests never adopt each other's reply). Ops
+  site 1 and the single allocator, so ids never collide; the allocation
+  counter is seeded from the owner's pid, so a restarted owner cannot
+  re-issue an id a surviving guest still holds; nonces are seeded
+  from the process id so two guests never adopt each other's reply). The
+  wire-supplied file key is contained on the owner side
+  (`collab::contained_path`: every component a plain name, and the deepest
+  existing ancestor must canonicalize inside the resolved root, so a
+  normal-looking key naming a symlink whose target lies beyond the
+  workspace is declined while intra-workspace symlinks keep working), so
+  neither a traversing/absolute key nor a symlinked one from any guest —
+  the MCP collab agent forwards caller input verbatim — can read or edit
+  outside the workspace. Ops
   arriving mid-bootstrap are buffered and replayed (duplicates integrate as
   no-ops). The relay has no replay, so an unanswered request is **re-sent
   while bootstrapping, starting at 500ms and doubling on every further
@@ -322,7 +332,13 @@ The rest of the shipped shape:
   until the snapshot lands; with **no owner on the relay the bootstrap times
   out after 3s** and the file degrades to plain local editing — a deviation
   from "read-only until ready", chosen so a lone solo guest is not read-only
-  forever.
+  forever. The give-up is a **latch** (`DocState::LocalOnly`), not a
+  removal: the app tick re-requests any open file that is neither live nor
+  bootstrapping, so a forgotten file re-entered the input gate 16ms after
+  every timeout, forever. A local-only file is exempt from the guest save
+  gate (the guest is its only author; with no owner, a refused save meant
+  the work could never persist), and only the collab agent's `collab_open`
+  explicitly rejoins past the latch.
 - **Backlog correctness.** `CollabDoc::apply_remote` drains cola's causal
   backlog (out-of-order delivery), stashing insertion text by run identity;
   silently dropping unmergeable ops (the slice-3 gap) permanently diverged
@@ -340,14 +356,54 @@ The rest of the shipped shape:
 - **Carets.** `CollabMsg::Caret` broadcasts each participant's cursor
   (throttled to actual moves); peers paint them through the existing
   `ghost_carets` machinery in the participant's color.
+- **Split panes of a live file mirror the session.** Every buffer of a live
+  file carries the `CollabDoc::text_gen` it last synced at (0 = never
+  attached). A buffer created after the file went live — a split duplicate,
+  a close-and-reopen — holds disk text that is stale by construction, so it
+  never extracts (its diff against the doc would broadcast a
+  delete-everything/reinsert-the-old-file op set and revert every peer) and
+  is seeded from the replica on the next tick; attached panes whose
+  generation falls behind mirror the doc text. Remote spans land on every
+  attached pane. "Only the first-found tab stays synced" was unstable —
+  focusing another group reorders which pane is found first — and a behind
+  pane accepting a keystroke silently deleted the other pane's work. A
+  keystroke into a pane that has not attached yet (the one-tick window
+  after a split or reopen) is refused by the same input gate that guards
+  bootstrap — absorbed, it would be silently wiped by the seeding. The
+  collab passes touch TEXT tabs only, every matching one: diff/image/sheet
+  tabs carry the file's path too (close-by-path needs it), and a diff tab
+  earlier in the strip used to swallow the snapshot and spans meant for
+  the real buffer. `Editor::open` drops the attachment when the path
+  CHANGES (a reused preview tab kept the old doc's generation and could
+  broadcast the new file's disk text into it) but keeps it on a same-path
+  reload, which is how an owner's reload-diff converges as ops. While the
+  link is down entirely, the active pane mirrors onto its siblings each
+  tick, so panes cannot diverge independently and the reconnect replays
+  exactly one offline text per file.
+- **Link loss is detected.** EOF or a hard error on the relay channel (and
+  any failed send) latches the channel dead; the app drops the session with
+  a status hint and reconnects through the normal 2s-backoff path, and
+  guest files re-bootstrap. A previously-attached buffer that diverged
+  while the link was down holds work that exists nowhere else (its ops
+  never left the machine), so the re-bootstrap keeps its text and replays
+  the divergence against the owner's snapshot as fresh local edits instead
+  of wiping it — the offline work reaches every peer once the link is
+  back. While no session exists, the guest save gate stands down (there is
+  nobody to defer to; blocking stranded offline work in RAM for the whole
+  outage). EOF used to be indistinguishable from an idle
+  socket, so a killed relay left `is_live` true forever while every op
+  vanished — with saves still gated, a guest's work existed only in RAM.
+  The relay's forwarding writes are bounded too
+  (`SO_SNDTIMEO`, 2s, wedged peer dropped with a shutdown so its reader
+  sees EOF), and `write_frame_blocking` gives up after 5s: forwarding holds
+  the global client mutex, so one SIGSTOPped peer used to deadlock the
+  relay and freeze every participant's UI thread mid-send.
 - **Not shipped, deliberately.** The participants-menu "open solo viewport"
   action: a viewport is a *process on the guest's machine*, which the host
   croft cannot conjure over the mux — the affordance is the `--solo` flag on
-  the guest's own launch command. Split views of a shared file: only the
-  first-found tab stays synced, matching the existing
-  split-views-are-independent-copies behavior. Same-file collab docs are
+  the guest's own launch command. Same-file collab docs are
   keyed per workspace-relative path; files outside the workspace are never
-  shared.
+  shared (enforced by `contained_path`, above).
 
 Still deferred (documented, not blockers): shared undo timeline (undo stays
 per-process; undoing a peer's edit is just an edit and converges), shared
