@@ -19357,6 +19357,40 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
     );
 }
 
+/// Losing the relay link must not be silent: the app detects the dead
+/// channel, drops the session, and reconnects through the normal backoff
+/// path. Before detection existed, `is_live` stayed true forever and the
+/// guest typed into a buffer whose ops reached nobody.
+#[test]
+fn losing_the_relay_reconnects_instead_of_typing_into_the_void() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    // A hand-rolled "relay": accepts, then hangs up on command.
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.poll_collab();
+    assert!(guest.collab.is_some(), "first connect");
+    let (peer, _) = listener.accept().unwrap();
+    drop(peer); // the relay dies
+
+    // Detection: the dead session is dropped.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while guest.collab.is_some() {
+        assert!(Instant::now() < deadline, "the dead session was never dropped");
+        guest.poll_collab();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Recovery: a fresh session connects (the listener's backlog accepts).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while guest.collab.is_none() {
+        assert!(Instant::now() < deadline, "never reconnected");
+        guest.poll_collab();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// A guest whose bootstrap nobody answered degrades to plain local editing,
 /// as the timeout promises: the input gate lifts, the file stays local-only
 /// (no re-request re-arming the gate every 3 seconds), and the guest's save

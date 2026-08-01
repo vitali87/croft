@@ -16733,6 +16733,14 @@ impl App {
             }
         }
 
+        if session.disconnected() {
+            // The relay hung up (EOF or a failed write): keeping the dead
+            // session made `is_live` lie forever while every op vanished.
+            // Drop it; the connect path above re-attaches (2s backoff) and
+            // guest files re-bootstrap through the normal request path.
+            self.status = String::from("Shared session link lost; reconnecting");
+            return true;
+        }
         self.collab = Some(session);
         changed | self.collab_labels_dirty()
     }

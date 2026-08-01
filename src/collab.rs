@@ -521,6 +521,12 @@ pub struct CollabChannel {
     stream: std::os::unix::net::UnixStream,
     reader: crate::session_host::FrameReader,
     pub role: CollabRole,
+    /// Latched on EOF or a hard error: the relay hung up. Nothing clears
+    /// it — the owner of the channel drops it and reconnects. Without the
+    /// latch a dead relay read exactly like an idle one, and a guest kept
+    /// typing into a buffer whose ops reached nobody, with saves still
+    /// gated, so the work existed only in RAM.
+    dead: bool,
 }
 
 impl CollabChannel {
@@ -548,13 +554,25 @@ impl CollabChannel {
             stream,
             reader: crate::session_host::FrameReader::new(),
             role,
+            dead: false,
         })
     }
 
+    /// True once the relay hung up (EOF or a failed write): the channel is
+    /// unusable and its owner should drop it and reconnect.
+    pub fn is_dead(&self) -> bool {
+        self.dead
+    }
+
     /// Broadcast one message to the other participants. Returns false when
-    /// the relay is gone (the caller drops the channel and reconnects).
+    /// the relay is gone (which also latches [`Self::is_dead`], so the
+    /// session surfaces the loss even though callers fire-and-forget).
     pub fn send(&mut self, msg: &CollabMsg) -> bool {
-        crate::session_host::write_frame_blocking(&mut self.stream, &msg.encode())
+        let sent = crate::session_host::write_frame_blocking(&mut self.stream, &msg.encode());
+        if !sent {
+            self.dead = true;
+        }
+        sent
     }
 
     /// Drain every message waiting on the channel, in arrival order.
@@ -565,7 +583,18 @@ impl CollabChannel {
         let mut buf = [0u8; 16384];
         loop {
             match self.stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                // EOF and hard errors are the relay hanging up — distinct
+                // from WouldBlock (idle), which they used to be lumped with.
+                Ok(0) => {
+                    self.dead = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.dead = true;
+                    break;
+                }
                 Ok(n) => {
                     for frame in self.reader.push(&buf[..n]) {
                         if let crate::session_host::Frame::Bytes(payload) = frame
@@ -712,7 +741,11 @@ impl CollabSession {
             role: channel.role,
             channel,
             docs: std::collections::HashMap::new(),
-            next_site: OWNER_SITE + 1,
+            // pid-seeded: a restarted owner allocating "2, 3, ..." again
+            // would re-issue ids that guests surviving from the previous
+            // owner already hold, permanently breaking convergence. Each
+            // incarnation allocates from its own disjoint range instead.
+            next_site: ((std::process::id() as u64) << 32) | (OWNER_SITE + 1),
             next_nonce: (std::process::id() as u64) << 32,
             name,
         }
@@ -721,6 +754,12 @@ impl CollabSession {
     /// True when `file` is replicating (bootstrap finished).
     pub fn is_live(&self, file: &str) -> bool {
         matches!(self.docs.get(file), Some(DocState::Live(_)))
+    }
+
+    /// True once the relay hung up: every later send is lost, so the app
+    /// drops the session and reconnects (files re-bootstrap on request).
+    pub fn disconnected(&self) -> bool {
+        self.channel.is_dead()
     }
 
     /// True when `file` gave up bootstrapping (no owner answered): the
@@ -1317,6 +1356,7 @@ mod tests {
             stream: rx,
             reader: crate::session_host::FrameReader::new(),
             role: CollabRole::Guest,
+            dead: false,
         };
         let bogus = crate::session_host::encode_bytes_frame(br#"{"FutureVariant":{"whatever":1}}"#);
         tx.write_all(&bogus).unwrap();
@@ -1687,6 +1727,55 @@ mod tests {
         }
         assert!(!guest.is_bootstrapping("src/f.rs"));
         assert!(!guest.is_live("src/f.rs"));
+    }
+
+    /// A relay that hangs up must be visible: EOF on the drain marks the
+    /// channel dead and the session disconnected, so the app can drop it
+    /// and reconnect. EOF used to read exactly like an idle socket, so a
+    /// guest kept typing into a buffer whose ops reached nobody — with
+    /// saves still gated, the work existed only in RAM.
+    #[test]
+    fn a_dead_relay_marks_the_session_disconnected() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dead.collab.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut session = CollabSession::new(
+            CollabChannel::connect(&socket, CollabRole::Guest).expect("connects"),
+            String::from("guest"),
+        );
+        let (peer, _) = listener.accept().unwrap();
+        let _ = session.poll(|_| None);
+        assert!(
+            !session.disconnected(),
+            "a healthy idle channel must not read as dead"
+        );
+        drop(peer); // the relay dies
+        let _ = session.poll(|_| None);
+        assert!(
+            session.disconnected(),
+            "EOF from the relay must mark the session disconnected"
+        );
+    }
+
+    /// Site ids are identity: a restarted owner re-allocating from the same
+    /// fixed counter re-issues ids that surviving guests already hold,
+    /// which permanently breaks convergence. Seeding the counter from the
+    /// owner's process id keeps every owner incarnation's allocations
+    /// disjoint.
+    #[test]
+    fn an_owner_seeds_site_ids_from_its_process_id() {
+        let (_dir, mut owner, mut guest) = session_pair();
+        guest.request_file("src/f.rs");
+        pump(&mut owner, &mut guest, "abc", |_, ge| {
+            ge.iter()
+                .any(|e| matches!(e, CollabEvent::Bootstrapped { .. }))
+        });
+        let expected = ((std::process::id() as u64) << 32) | (OWNER_SITE + 1);
+        assert_eq!(
+            guest.my_site_ids(),
+            vec![expected],
+            "the first allocated site id must come from the pid-seeded range"
+        );
     }
 
     /// A timed-out bootstrap is a latch, not a moment: the app's tick
