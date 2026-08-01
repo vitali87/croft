@@ -19572,6 +19572,119 @@ fn a_traversing_wire_file_key_is_declined() {
     );
 }
 
+/// Lexical containment is not enough: a normal-looking wire key can name a
+/// symlink inside the workspace whose target lies outside it, and the
+/// owner-side open would follow the link — disclosing (and editing) files
+/// beyond the share. Symlinked keys must resolve inside the workspace or be
+/// declined; intra-workspace symlinks keep working.
+#[test]
+fn a_symlinked_wire_file_key_cannot_escape_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(tmp.path().join("secret.txt"), "SECRET").unwrap();
+    std::fs::write(root.join("inner.txt"), "inner").unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("secret.txt"), root.join("leak.txt")).unwrap();
+    std::fs::create_dir(tmp.path().join("outside")).unwrap();
+    std::fs::write(tmp.path().join("outside").join("deep.txt"), "DEEP").unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("outside"), root.join("sub")).unwrap();
+    std::os::unix::fs::symlink(root.join("inner.txt"), root.join("alias.txt")).unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    assert_eq!(
+        app.owner_buffer_text(&root, "leak.txt"),
+        None,
+        "a symlink to a file outside the workspace must be declined"
+    );
+    assert_eq!(
+        app.owner_buffer_text(&root, "sub/deep.txt"),
+        None,
+        "a path through a symlinked directory must not escape the workspace"
+    );
+    assert_eq!(
+        app.owner_buffer_text(&root, "alias.txt").as_deref(),
+        Some("inner"),
+        "a symlink resolving inside the workspace still works"
+    );
+}
+
+/// An edit the guest made while the relay link was down exists nowhere but
+/// its buffer: the op never reached the owner. Reconnection bootstraps from
+/// the owner's older snapshot, and replacing the buffer with it silently
+/// deleted the offline work. The divergence must instead be re-injected as
+/// local edits, so the guest keeps its work and the owner receives it.
+#[test]
+fn reconnecting_replays_offline_guest_edits_instead_of_deleting_them() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "hello world").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    let pump_until =
+        |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(owner, guest) {
+                assert!(Instant::now() < deadline, "never settled: {what}");
+                owner.poll_collab();
+                guest.poll_collab();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+    pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+    guest.editor.insert_str("SESSION ");
+    pump_until(&mut owner, &mut guest, "session edit converges", &|o, g| {
+        o.editor.lines == g.editor.lines && o.editor.lines[0].contains("SESSION")
+    });
+
+    // The link dies: this is the state poll_collab leaves after detecting a
+    // dead channel (session dropped, config kept). Hold the reconnect
+    // backoff while the guest keeps typing offline.
+    guest.collab = None;
+    guest.last_collab_connect = Some(Instant::now());
+    guest.editor.insert_str("OFFLINE ");
+    let offline_text = guest.editor.lines.clone();
+
+    // Reconnect: the file re-bootstraps from the owner's older snapshot.
+    guest.last_collab_connect = None;
+    pump_until(&mut owner, &mut guest, "reconnect goes live", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+    assert!(
+        guest.editor.lines[0].contains("OFFLINE"),
+        "the bootstrap deleted the guest's offline edit, got: {:?}",
+        guest.editor.lines
+    );
+    assert_eq!(
+        guest.editor.lines, offline_text,
+        "the guest's buffer must survive the reconnect intact"
+    );
+    // The offline edit reaches the owner: nothing was lost.
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "the offline edit reaches the owner",
+        &|o, g| o.editor.lines == g.editor.lines && o.editor.lines[0].contains("OFFLINE"),
+    );
+}
+
 /// The cancel affordances around the AI stream: Cmd+K X and the palette
 /// entry both route through `collab_cancel_stream` (hint when idle), and
 /// the gutter stop button's row follows the pilot's caret in the streamed

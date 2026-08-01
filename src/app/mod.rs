@@ -16680,7 +16680,13 @@ impl App {
                 }
                 CollabEvent::Bootstrapped { file, text } => {
                     let doc_gen = session.doc_gen(&file).unwrap_or(0);
-                    self.finish_collab_bootstrap(&root, &file, text, doc_gen);
+                    if let Some(kept) = self.finish_collab_bootstrap(&root, &file, text, doc_gen) {
+                        // A buffer diverged while the link was down: replay
+                        // the divergence as local edits so the offline work
+                        // reaches every peer; the attach pass below re-marks
+                        // the kept panes (doc text now equals theirs).
+                        session.local_change(&file, &kept);
+                    }
                 }
                 CollabEvent::BootstrapTimedOut { file } => {
                     self.status = format!("{file}: no session owner answered; editing locally");
@@ -16929,13 +16935,33 @@ impl App {
     /// A guest's bootstrap snapshot landed: swap every open buffer for the
     /// file to the owner's canonical text (usually identical to what was
     /// read from disk) and mark them synced, which also lifts the input
-    /// gate.
-    fn finish_collab_bootstrap(&mut self, root: &Path, file: &str, text: String, doc_gen: u64) {
-        let Some(path) = crate::collab::contained_path(root, file) else {
-            return;
-        };
+    /// gate. A buffer that was already attached to an earlier session
+    /// incarnation and diverges from the snapshot holds work made while the
+    /// link was down — work that exists nowhere else, so replacing it would
+    /// silently delete it. Such a buffer keeps its text and is returned for
+    /// the caller to re-inject as local edits (panes converged every tick
+    /// before the link died, so any divergent pane carries the same text).
+    fn finish_collab_bootstrap(
+        &mut self,
+        root: &Path,
+        file: &str,
+        text: String,
+        doc_gen: u64,
+    ) -> Option<String> {
+        let path = crate::collab::contained_path(root, file)?;
         let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-        let finish = |ed: &mut crate::widgets::editor::Editor| {
+        let mut kept = None;
+        let mut finish = |ed: &mut crate::widgets::editor::Editor| {
+            if ed.collab_doc_gen != 0 && ed.lines != lines {
+                // Offline divergence: keep the buffer; gen 0 lets the
+                // attach pass re-mark it once the doc holds the merged
+                // text (the caller's local_change makes them equal).
+                if kept.is_none() {
+                    kept = Some(ed.lines.join("\n"));
+                }
+                ed.collab_doc_gen = 0;
+                return;
+            }
             if ed.lines != lines {
                 ed.replace_all_lines(lines.clone());
             }
@@ -16951,6 +16977,7 @@ impl App {
             }
         }
         self.status = format!("{file} is now live-shared");
+        kept
     }
 
     /// True when this croft is a solo-viewport guest: the session owner is
