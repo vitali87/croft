@@ -7262,6 +7262,34 @@ impl Widget for &mut Editor {
                 }
             }
 
+            // LSP occurrences of the symbol under the caret (word highlight):
+            // painted before the find layer, the selection band, and the
+            // bracket match so all three stay visible on top. The find layer
+            // in particular paints black-on-gold; an occurrence bg over it
+            // left black text on a dark grey (the caret parked on a find
+            // match makes the two layers cover the same cells).
+            for &(occ_row, occ_start, occ_end, occ_write) in &self.occurrences {
+                if occ_row != line_idx {
+                    continue;
+                }
+                let bg = if occ_write {
+                    self.theme.occurrence_write_bg()
+                } else {
+                    self.theme.occurrence_bg()
+                };
+                for c in occ_start..occ_end {
+                    if c < row_start {
+                        continue;
+                    }
+                    let col = (c + inlay_cells_before(&hint_cells, c) - row_start) as u16;
+                    if col >= row_width {
+                        break;
+                    }
+                    let cell = &mut buf[(text_x + col, y)];
+                    cell.set_style(cell.style().bg(bg));
+                }
+            }
+
             if let Some(term) = self.search_highlight.as_deref() {
                 let active_on_line = self
                     .active_search_match
@@ -7292,31 +7320,6 @@ impl Widget for &mut Editor {
                     row_start,
                     &hint_cells,
                 );
-            }
-
-            // LSP occurrences of the symbol under the caret (word highlight):
-            // painted before the selection band and bracket match so both
-            // stay visible on top.
-            for &(occ_row, occ_start, occ_end, occ_write) in &self.occurrences {
-                if occ_row != line_idx {
-                    continue;
-                }
-                let bg = if occ_write {
-                    self.theme.occurrence_write_bg()
-                } else {
-                    self.theme.occurrence_bg()
-                };
-                for c in occ_start..occ_end {
-                    if c < row_start {
-                        continue;
-                    }
-                    let col = (c + inlay_cells_before(&hint_cells, c) - row_start) as u16;
-                    if col >= row_width {
-                        break;
-                    }
-                    let cell = &mut buf[(text_x + col, y)];
-                    cell.set_style(cell.style().bg(bg));
-                }
             }
 
             if let Some(((sr, sc), (er, ec))) = sel_norm
@@ -10082,6 +10085,7 @@ mod tests {
     #[test]
     fn gutter_stream_stop_glyph_renders_maps_clicks_and_outranks_the_play_glyph() {
         let mut e = editor_with("#[test]\nfn my_case() {}\nfn helper() {}");
+        e.path = Some(PathBuf::from("/x/a.rs")); // beads need a saved .rs file
         e.stream_stop_line = Some(1); // 0-based: the test fn's line
         let area = Rect {
             x: 0,
@@ -10442,6 +10446,48 @@ mod tests {
         assert!(
             footer.contains("why here?"),
             "the reply draft renders in the footer: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn find_highlights_stay_readable_over_occurrence_tints() {
+        // Cmd+F then Enter parks the caret ON a match; the idle-caret
+        // documentHighlight then returns every occurrence of that word —
+        // exactly the cells the find layer just painted black-on-gold. The
+        // find layer must stay on top: an occurrence bg painted over it
+        // keeps the BLACK foreground on a dark grey, which is unreadable,
+        // and kills the orange active-match cue.
+        let mut e = editor_with("config here");
+        e.path = Some(PathBuf::from("/x/a.rs"));
+        e.set_search_highlight(Some(String::from("config")));
+        e.occurrences = vec![(0, 0, 6, false)];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 5,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let gold = Color::Rgb(0xff, 0xd7, 0x4a);
+        let occ = crate::theme::Theme::BLACK.occurrence_bg();
+        let mut gold_cells = 0;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = &buf[(x, y)];
+                if cell.bg == gold {
+                    gold_cells += 1;
+                }
+                assert!(
+                    !(cell.fg == Color::Black && cell.bg == occ),
+                    "cell ({x},{y}) '{}' wears the find layer's black fg on the occurrence bg — unreadable",
+                    cell.symbol()
+                );
+            }
+        }
+        assert!(
+            gold_cells >= 6,
+            "the find highlight must survive the occurrence pass (got {gold_cells} gold cells)"
         );
     }
 
