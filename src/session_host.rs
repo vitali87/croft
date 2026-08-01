@@ -829,11 +829,21 @@ impl InnerChannel {
     }
 }
 
+/// Total wall-clock ceiling for one frame write. The peer is another
+/// process: stopped or wedged mid-write it drains nothing, and an unbounded
+/// retry loop here — often on the UI thread — froze croft with no escape.
+/// A peer whose buffers stay full this long is gone for practical purposes;
+/// reporting failure lets the caller treat the connection as dead.
+const WRITE_FRAME_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Write a whole frame to a socket that may be in non-blocking mode. `write_all`
 /// aborts on the first `WouldBlock` even after a partial write, which would leave
 /// a torn `[type][len][payload]` on the wire and desync the peer's FrameReader
-/// for every later control frame. Loop until the frame is fully committed.
+/// for every later control frame. Loop until the frame is fully committed or
+/// the deadline passes ([`WRITE_FRAME_DEADLINE`]): false either way means the
+/// connection is unusable.
 pub(crate) fn write_frame_blocking(stream: &mut UnixStream, frame: &[u8]) -> bool {
+    let deadline = std::time::Instant::now() + WRITE_FRAME_DEADLINE;
     let mut written = 0;
     while written < frame.len() {
         match stream.write(&frame[written..]) {
@@ -841,6 +851,9 @@ pub(crate) fn write_frame_blocking(stream: &mut UnixStream, frame: &[u8]) -> boo
             Ok(n) => written += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
                 std::thread::sleep(Duration::from_millis(1));
             }
             Err(_) => return false,
@@ -895,6 +908,30 @@ mod tests {
             collab_socket_for_mux(Path::new("/x/sessions/abc123.sock")),
             PathBuf::from("/x/sessions/abc123.sock.collab.sock")
         );
+    }
+
+    /// A peer that stops draining its socket (stopped with SIGSTOP, or
+    /// itself blocked mid-write) used to wedge the writer forever: the
+    /// WouldBlock loop had no deadline, and on the UI thread that froze
+    /// croft with no escape. The write must give up and report failure.
+    #[test]
+    fn write_frame_blocking_gives_up_when_the_peer_never_drains() {
+        use std::io::Write;
+        let (mut a, b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        // Fill the send buffer: the peer never reads.
+        let chunk = [0u8; 8192];
+        while a.write(&chunk).is_ok() {}
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ok = write_frame_blocking(&mut a, &[0u8; 65536]);
+            let _ = tx.send(ok);
+        });
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(ok) => assert!(!ok, "a wedged write must report failure, not success"),
+            Err(_) => panic!("write_frame_blocking hung past its deadline on a wedged peer"),
+        }
+        drop(b);
     }
 
     #[test]

@@ -452,6 +452,17 @@ pub fn relay_serve(socket: &std::path::Path) -> anyhow::Result<()> {
     let clients: std::sync::Arc<std::sync::Mutex<Vec<Peer>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     for stream in listener.incoming().flatten() {
+        // Bounded writes: forwarding holds the global client mutex, so one
+        // peer that stops draining (SIGSTOPped, wedged mid-write) used to
+        // block its writer forever — starving every other peer AND their
+        // reader threads queued on the same mutex, a cross-process
+        // deadlock. A write that cannot complete inside the timeout fails,
+        // and the failed peer is dropped (see relay_client). Setting the
+        // timeout itself fails with EINVAL on macOS when the peer already
+        // hung up (the liveness probe connects and drops instantly) — such
+        // a socket cannot block a write, so serve it rather than let one
+        // dead accept kill the loop for every later peer.
+        let _ = stream.set_write_timeout(Some(RELAY_WRITE_TIMEOUT));
         let tx = std::sync::Arc::new(std::sync::Mutex::new(stream.try_clone()?));
         clients.lock().unwrap().push(std::sync::Arc::clone(&tx));
         let clients = std::sync::Arc::clone(&clients);
@@ -1073,6 +1084,12 @@ impl CollabSession {
     }
 }
 
+/// How long the relay lets one forwarding write block before treating the
+/// peer as wedged and dropping it. Shorter than the clients' own
+/// frame-write deadline, so the relay recovers (and traffic resumes for
+/// healthy peers) before any client gives its connection up for dead.
+const RELAY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 type Peer = std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>;
 
 /// One connection: reassemble whole frames from this peer and forward each,
@@ -1098,7 +1115,18 @@ fn relay_client(
             let out = encode_bytes_frame(&payload);
             let mut peers = clients.lock().unwrap();
             peers.retain(|c| {
-                std::sync::Arc::ptr_eq(c, me) || c.lock().unwrap().write_all(&out).is_ok()
+                if std::sync::Arc::ptr_eq(c, me) {
+                    return true;
+                }
+                let mut s = c.lock().unwrap();
+                if s.write_all(&out).is_ok() {
+                    return true;
+                }
+                // Timed out (wedged peer) or gone: shut the socket down so
+                // the peer's reader thread sees EOF and cleans up — merely
+                // forgetting the write clone left the connection half-alive.
+                let _ = s.shutdown(std::net::Shutdown::Both);
+                false
             });
         }
     }
@@ -1727,6 +1755,84 @@ mod tests {
         }
         assert!(!guest.is_bootstrapping("src/f.rs"));
         assert!(!guest.is_live("src/f.rs"));
+    }
+
+    /// One peer that stops reading (SIGSTOPped, or wedged mid-write) must
+    /// not take the whole session down: the relay used to blocking-write to
+    /// every peer while holding the global client list mutex, so a full
+    /// send buffer wedged the forwarding thread, which starved every other
+    /// peer's writes AND blocked their reader threads on the same mutex —
+    /// a three-process deadlock. A bounded write drops the wedged peer and
+    /// traffic keeps flowing to the rest.
+    #[test]
+    fn a_wedged_peer_cannot_deadlock_the_relay() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("w.collab.sock");
+        {
+            let s = socket.clone();
+            std::thread::spawn(move || {
+                let _ = relay_serve(&s);
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::session::is_alive(&socket) {
+            assert!(Instant::now() < deadline, "relay never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A connects and never reads a byte.
+        let _a = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        // C drains everything, watching for the marker frame.
+        let mut c = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let (found_tx, found_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use crate::session_host::{Frame, FrameReader};
+            let mut reader = FrameReader::new();
+            let mut buf = [0u8; 16384];
+            loop {
+                let n = match c.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                for frame in reader.push(&buf[..n]) {
+                    if matches!(&frame, Frame::Bytes(p) if p.as_slice() == b"MARKER") {
+                        let _ = found_tx.send(());
+                        return;
+                    }
+                }
+            }
+        });
+        // B floods well past every kernel buffer (wedging the relay's
+        // writes to A), then sends the marker.
+        let mut b = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        b.set_nonblocking(true).unwrap();
+        let mut push = |bytes: &[u8]| {
+            let mut written = 0;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while written < bytes.len() {
+                assert!(
+                    Instant::now() < deadline,
+                    "sender starved: the relay is wedged on the peer that never reads"
+                );
+                match b.write(&bytes[written..]) {
+                    Ok(n) => written += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(e) => panic!("sender failed: {e}"),
+                }
+            }
+        };
+        let frame = crate::session_host::encode_bytes_frame(&[0u8; 4096]);
+        for _ in 0..256 {
+            push(&frame);
+        }
+        push(&crate::session_host::encode_bytes_frame(b"MARKER"));
+        assert!(
+            found_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the marker never reached the healthy peer: the relay is wedged"
+        );
     }
 
     /// A relay that hangs up must be visible: EOF on the drain marks the
