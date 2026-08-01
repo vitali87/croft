@@ -100,6 +100,14 @@ pub struct Theme {
     ansi: [(u8, u8, u8); 16],
     /// The code-highlight palette (defaults to [`SyntaxPalette::BASE16`]).
     syntax: SyntaxPalette,
+    /// Tab-strip chrome (the editor tab bar). Explicit for the two built-ins
+    /// (byte-for-byte the historical constants); derived from the palette in
+    /// [`Theme::from_decl`] for themes that don't declare them.
+    tab_strip: (u8, u8, u8),
+    tab_inactive: (u8, u8, u8),
+    tab_active: (u8, u8, u8),
+    tab_hover: (u8, u8, u8),
+    tab_pill: (u8, u8, u8),
 }
 
 impl Theme {
@@ -120,6 +128,14 @@ impl Theme {
         osk_armed: (0x0e, 0x7e, 0x76),
         ansi: VSCODE_ANSI,
         syntax: SyntaxPalette::BASE16,
+        tab_strip: (0x1f, 0x24, 0x36),
+        tab_inactive: (0x2a, 0x2f, 0x3e),
+        // The teal selection fill (gradient::POPUP_SEL_BG) as the active chip,
+        // with the brighter teal hover pill; both inlined from the old
+        // brand-branch constants in src/widgets/editor.rs.
+        tab_active: (0x26, 0x4f, 0x4a),
+        tab_hover: (0x2f, 0x35, 0x50),
+        tab_pill: (0x3c, 0x8a, 0x7e),
     };
 
     /// Croft Dark (Blue) — the historical look. Const mirror of the manifest,
@@ -138,6 +154,12 @@ impl Theme {
         osk_armed: (0x00, 0x7a, 0xcc),
         ansi: VSCODE_ANSI,
         syntax: SyntaxPalette::BASE16,
+        // The historical navy chip look.
+        tab_strip: (0x1f, 0x24, 0x36),
+        tab_inactive: (0x2a, 0x2f, 0x3e),
+        tab_active: (0x1e, 0x3a, 0x6e),
+        tab_hover: (0x34, 0x50, 0x7f),
+        tab_pill: (0x4e, 0x9a, 0xff),
     };
 
     /// Every available theme in pick-list order, loaded once from the bundled +
@@ -185,14 +207,28 @@ impl Theme {
     /// Build a theme from a parsed manifest entry, interning its strings and
     /// parsing its `#rrggbb` colors (a bad color degrades to black, not a crash).
     fn from_decl(d: &crate::lsp::manifest::ThemeDecl) -> Theme {
+        let accent = parse_hex(&d.accent);
+        let selection = parse_hex(&d.selection);
+        let search = parse_hex(&d.search);
+        // Tab-strip chrome defaults, for themes that declare no explicit tab
+        // colors: the strip wears the theme's secondary panel fill, an
+        // inactive tab lifts a hair off it, the active tab wears the
+        // selection fill, hover tints the strip toward the accent, and the
+        // close pill is the accent itself.
+        let tab_strip = hex_or(&d.tab_strip, search);
         Theme {
             id: intern(&d.id),
             label: intern(&d.label),
             bg: parse_hex(&d.background),
-            accent: parse_hex(&d.accent),
-            selection: parse_hex(&d.selection),
-            search: parse_hex(&d.search),
+            accent,
+            selection,
+            search,
             button: parse_hex(&d.button),
+            tab_strip,
+            tab_inactive: hex_or(&d.tab_inactive, blend((0xff, 0xff, 0xff), 0.06, tab_strip)),
+            tab_active: hex_or(&d.tab_active, selection),
+            tab_hover: hex_or(&d.tab_hover, blend(accent, 0.25, tab_strip)),
+            tab_pill: hex_or(&d.tab_close_pill, accent),
             gradient: d.gradient,
             osk_key: parse_hex(&d.osk_key),
             osk_special: parse_hex(&d.osk_special),
@@ -428,6 +464,37 @@ impl Theme {
     pub fn scrollbar_thumb_focused(self) -> Color {
         self.blend_over_bg((0x64, 0x64, 0x64), 0.70)
     }
+
+    /// The editor tab bar's background (VS Code
+    /// `editorGroupHeader.tabsBackground`), including the gap right of the
+    /// last tab.
+    pub fn tab_strip_bg(self) -> Color {
+        rgb(self.tab_strip)
+    }
+
+    /// An inactive tab's body fill.
+    pub fn tab_inactive_bg(self) -> Color {
+        rgb(self.tab_inactive)
+    }
+
+    /// The active tab's body fill.
+    pub fn tab_active_bg(self) -> Color {
+        rgb(self.tab_active)
+    }
+
+    /// An inactive tab's body while the pointer rests on it (VS Code
+    /// `tab.hoverBackground`); the active tab is already prominent and never
+    /// lifts.
+    pub fn tab_hover_bg(self) -> Color {
+        rgb(self.tab_hover)
+    }
+
+    /// The pill behind the close cross / pin glyph while the pointer is on
+    /// that cell (VS Code `toolbar.hoverBackground`). Must stay distinct from
+    /// [`Theme::tab_active_bg`] or the hover is invisible on the active tab.
+    pub fn tab_close_pill_bg(self) -> Color {
+        rgb(self.tab_pill)
+    }
 }
 
 impl Default for Theme {
@@ -438,6 +505,13 @@ impl Default for Theme {
 
 fn rgb(c: (u8, u8, u8)) -> Color {
     Color::Rgb(c.0, c.1, c.2)
+}
+
+/// Alpha-composite `fg` over `bg` at `alpha`, as raw bytes. The tuple-level
+/// sibling of [`Theme::blend_over_bg`], for derivations at parse time.
+fn blend(fg: (u8, u8, u8), alpha: f32, bg: (u8, u8, u8)) -> (u8, u8, u8) {
+    let mix = |f: u8, b: u8| (f as f32 * alpha + b as f32 * (1.0 - alpha)).round() as u8;
+    (mix(fg.0, bg.0), mix(fg.1, bg.1), mix(fg.2, bg.2))
 }
 
 /// Parse `#rrggbb` (case-insensitive); anything malformed degrades to black so
@@ -503,6 +577,43 @@ mod tests {
             Theme::from_id("dark-blue"),
             Theme::DARK_BLUE,
             "manifest == const DARK_BLUE"
+        );
+    }
+
+    #[test]
+    fn built_in_tab_chrome_is_byte_identical_to_the_legacy_constants() {
+        // The tab strip's colors were hardcoded constants in
+        // src/widgets/editor.rs before they became theme data; the two
+        // built-ins must keep rendering exactly as before the move.
+        let b = Theme::BLACK;
+        assert_eq!(b.tab_strip_bg(), Color::Rgb(0x1f, 0x24, 0x36));
+        assert_eq!(b.tab_inactive_bg(), Color::Rgb(0x2a, 0x2f, 0x3e));
+        assert_eq!(b.tab_active_bg(), Color::Rgb(0x26, 0x4f, 0x4a));
+        assert_eq!(b.tab_hover_bg(), Color::Rgb(0x2f, 0x35, 0x50));
+        assert_eq!(b.tab_close_pill_bg(), Color::Rgb(0x3c, 0x8a, 0x7e));
+        let d = Theme::DARK_BLUE;
+        assert_eq!(d.tab_strip_bg(), Color::Rgb(0x1f, 0x24, 0x36));
+        assert_eq!(d.tab_inactive_bg(), Color::Rgb(0x2a, 0x2f, 0x3e));
+        assert_eq!(d.tab_active_bg(), Color::Rgb(0x1e, 0x3a, 0x6e));
+        assert_eq!(d.tab_hover_bg(), Color::Rgb(0x34, 0x50, 0x7f));
+        assert_eq!(d.tab_close_pill_bg(), Color::Rgb(0x4e, 0x9a, 0xff));
+    }
+
+    #[test]
+    fn manifest_themes_without_tab_colors_derive_them_from_the_palette() {
+        // A theme that declares no tab_* fields still gets full tab chrome:
+        // strip from its secondary panel fill, active tab from its selection,
+        // close pill from its accent. No theme can fall back to another
+        // theme's (navy) chrome.
+        let s = Theme::from_id("solarized-dark");
+        assert_eq!(s.id(), "solarized-dark");
+        assert_eq!(s.tab_strip_bg(), s.search_bg());
+        assert_eq!(s.tab_active_bg(), s.selection());
+        assert_eq!(s.tab_close_pill_bg(), s.accent());
+        assert_ne!(
+            s.tab_strip_bg(),
+            Theme::DARK_BLUE.tab_strip_bg(),
+            "solarized must not wear the built-ins' navy strip"
         );
     }
 

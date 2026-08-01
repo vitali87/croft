@@ -267,6 +267,22 @@ pub struct ThemeDecl {
     /// VS Code's dark terminal defaults.
     #[serde(default)]
     pub ansi: Vec<String>,
+    /// Optional editor tab-bar chrome (`#rrggbb`): strip background, inactive
+    /// tab, active tab, hovered inactive tab, and the close-cross hover pill.
+    /// Each omitted color is derived from the palette above (strip from
+    /// `search`, active from `selection`, hover/pill from `accent`), so most
+    /// themes need none of these; the two built-ins pin their historical
+    /// values.
+    #[serde(default)]
+    pub tab_strip: String,
+    #[serde(default)]
+    pub tab_inactive: String,
+    #[serde(default)]
+    pub tab_active: String,
+    #[serde(default)]
+    pub tab_hover: String,
+    #[serde(default)]
+    pub tab_close_pill: String,
     /// Optional code-highlight colors (`#rrggbb`). Each omitted field keeps the
     /// Base16-Ocean-Dark default, so a theme can recolor just a few token roles.
     /// comment / keyword / string / constant (numbers, consts, params) /
