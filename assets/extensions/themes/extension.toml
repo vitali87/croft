@@ -24,6 +24,13 @@ gradient = true
 osk_key = "#20242b"
 osk_special = "#14161b"
 osk_armed = "#0e7e76"
+# Historical tab chrome, byte-for-byte (the teal selection chip + brighter
+# teal hover pill that used to live as brand constants in src/widgets/editor.rs).
+tab_strip = "#1f2436"
+tab_inactive = "#2a2f3e"
+tab_active = "#264f4a"
+tab_hover = "#2f3550"
+tab_close_pill = "#3c8a7e"
 
 [[themes]]
 id = "dark-blue"
@@ -37,6 +44,12 @@ gradient = false
 osk_key = "#3a4052"
 osk_special = "#2c3140"
 osk_armed = "#007acc"
+# Historical navy tab chrome, byte-for-byte.
+tab_strip = "#1f2436"
+tab_inactive = "#2a2f3e"
+tab_active = "#1e3a6e"
+tab_hover = "#34507f"
+tab_close_pill = "#4e9aff"
 
 # --- Ten dark themes inspired by popular editors (VS Code, Zed, Neovim,
 # PyCharm). Each carries its editor's real code palette via the `syn_*` fields

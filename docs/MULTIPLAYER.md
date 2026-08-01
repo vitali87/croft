@@ -386,9 +386,14 @@ The rest of the shipped shape:
   guest files re-bootstrap. A previously-attached buffer that diverged
   while the link was down holds work that exists nowhere else (its ops
   never left the machine), so the re-bootstrap keeps its text and replays
-  the divergence against the owner's snapshot as fresh local edits instead
-  of wiping it — the offline work reaches every peer once the link is
-  back. While no session exists, the guest save gate stands down (there is
+  the divergence as fresh local edits instead of wiping it — the offline
+  work reaches every peer once the link is back. The replay is a three-way
+  merge, not a whole-buffer overwrite: dropping the dead session harvests
+  each live doc's last replicated text as the merge base
+  (`CollabSession::live_texts`), and the bootstrap merges the offline delta
+  with the owner's snapshot (`merge_offline_texts`, line-level, ours wins a
+  same-line conflict), so edits the owner made during the outage survive
+  instead of being read back as deletions. While no session exists, the guest save gate stands down (there is
   nobody to defer to; blocking stranded offline work in RAM for the whole
   outage). EOF used to be indistinguishable from an idle
   socket, so a killed relay left `is_live` true forever while every op

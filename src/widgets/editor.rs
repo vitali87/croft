@@ -8913,27 +8913,13 @@ impl DerefMut for EditorTabs {
     }
 }
 
-const TAB_STRIP_BG: Color = Color::Rgb(0x1f, 0x24, 0x36);
-const TAB_INACTIVE_BG: Color = Color::Rgb(0x2a, 0x2f, 0x3e);
-const TAB_ACTIVE_BG: Color = Color::Rgb(0x1e, 0x3a, 0x6e);
+// Tab-strip chrome (strip, tab bodies, hover lift, close pill) is per-theme
+// data: `Theme::tab_*` carries the two built-ins' historical constants and
+// derives colors for every manifest theme, so the strip follows the selected
+// theme instead of staying VS-Code navy. Only the label foregrounds stay
+// fixed: this muted grey and white are legible on all dark themes.
 const TAB_INACTIVE_FG: Color = Color::Rgb(0x9d, 0xa5, 0xb4);
 const TAB_ACTIVE_FG: Color = Color::White;
-/// Lift applied to an inactive tab's body while the pointer rests anywhere
-/// over it (VS Code `tab.hoverBackground`). Croft Dark lifts the slate chip
-/// toward navy; the active tab is already prominent so it never lifts.
-const TAB_HOVER_BG: Color = Color::Rgb(0x34, 0x50, 0x7f);
-/// Black theme counterpart of `TAB_HOVER_BG`.
-const TAB_HOVER_BG_BRAND: Color = Color::Rgb(0x2f, 0x35, 0x50);
-/// Pill painted behind the close `\u{2715}` cell when the pointer is on it
-/// (VS Code `toolbar.hoverBackground`). Croft Dark uses the bright focus-accent
-/// blue so the pill reads clearly even on the already-navy active tab; an
-/// earlier dim navy was invisible against `TAB_ACTIVE_BG`.
-const TAB_CLOSE_PILL_BG: Color = Color::Rgb(0x4e, 0x9a, 0xff);
-/// Black-theme counterpart. The active tab there is already `POPUP_SEL_BG`
-/// teal, so the pill must be a *brighter* teal to be visible; reusing
-/// `POPUP_SEL_BG` (as the code once did) painted the pill the same colour as
-/// the tab and showed nothing.
-const TAB_CLOSE_PILL_BG_BRAND: Color = Color::Rgb(0x3c, 0x8a, 0x7e);
 
 impl Widget for &mut EditorTabs {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -8977,9 +8963,19 @@ impl Widget for &mut EditorTabs {
             height: area.height - strip_h,
         };
 
+        // The tab chrome follows the theme. Like the brand flag below, the
+        // theme propagates from a synced sibling: a tab opened since the last
+        // sync still carries the default theme and must not flash the wrong
+        // chrome for a frame.
+        let theme = self
+            .editors
+            .iter()
+            .map(|e| e.theme)
+            .find(|t| *t != crate::theme::Theme::default())
+            .unwrap_or_default();
         // Paint strip background first so the gap to the right of the last
         // tab still reads as the tab-strip colour rather than terminal default.
-        let strip_bg_style = Style::default().bg(TAB_STRIP_BG);
+        let strip_bg_style = Style::default().bg(theme.tab_strip_bg());
         for x in strip.x..strip.x + strip.width {
             buf[(x, strip.y)].set_style(strip_bg_style);
             buf[(x, strip.y)].set_symbol(" ");
@@ -9002,11 +8998,7 @@ impl Widget for &mut EditorTabs {
                 ed.focus_gradient = true;
             }
         }
-        let active_tab_bg = if brand {
-            crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
-        } else {
-            TAB_ACTIVE_BG
-        };
+        let active_tab_bg = theme.tab_active_bg();
         let pointer = self.hover_pointer;
         for (i, ed) in self.editors.iter().enumerate() {
             let label_text = tab_label(ed);
@@ -9032,15 +9024,11 @@ impl Widget for &mut EditorTabs {
             let on_close = pointer == Some((close_x, strip.y));
             let hover_lift = tab_hovered && !is_active;
             let bg = if hover_lift {
-                if brand {
-                    TAB_HOVER_BG_BRAND
-                } else {
-                    TAB_HOVER_BG
-                }
+                theme.tab_hover_bg()
             } else if is_active {
                 active_tab_bg
             } else {
-                TAB_INACTIVE_BG
+                theme.tab_inactive_bg()
             };
             let fg = if is_active || hover_lift {
                 TAB_ACTIVE_FG
@@ -9064,11 +9052,7 @@ impl Widget for &mut EditorTabs {
             // Overpaint the close/pin cell with its hover pill so the user sees
             // exactly which glyph their click will land on.
             if on_close {
-                let pill_bg = if brand {
-                    TAB_CLOSE_PILL_BG_BRAND
-                } else {
-                    TAB_CLOSE_PILL_BG
-                };
+                let pill_bg = theme.tab_close_pill_bg();
                 buf.set_string(
                     close_x,
                     strip.y,
@@ -14322,9 +14306,10 @@ mod tests {
         t.hover_pointer = Some((cx, area.y));
         let mut buf = Buffer::empty(area);
         (&mut t).render(area, &mut buf);
+        let pill = crate::theme::Theme::default().tab_close_pill_bg();
         assert_eq!(
             buf[(cx, area.y)].bg,
-            TAB_CLOSE_PILL_BG,
+            pill,
             "the hovered cross cell wears the pill"
         );
         assert_eq!(buf[(cx, area.y)].fg, Color::White);
@@ -14335,7 +14320,7 @@ mod tests {
         );
         assert_ne!(
             buf[(other, area.y)].bg,
-            TAB_CLOSE_PILL_BG,
+            pill,
             "an un-hovered cross gets no pill"
         );
     }
@@ -14362,15 +14347,20 @@ mod tests {
         t.hover_pointer = Some((cx, area.y));
         let mut buf = Buffer::empty(area);
         (&mut t).render(area, &mut buf);
-        let active_bg = crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG);
+        let black = crate::theme::Theme::from_id("black");
+        assert_eq!(
+            black.tab_active_bg(),
+            crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG),
+            "the Black theme's active chip is still the brand selection teal"
+        );
         assert_eq!(
             buf[(cx, area.y)].bg,
-            TAB_CLOSE_PILL_BG_BRAND,
+            black.tab_close_pill_bg(),
             "the Black-theme close pill uses the brighter teal"
         );
         assert_ne!(
             buf[(cx, area.y)].bg,
-            active_bg,
+            black.tab_active_bg(),
             "the pill must not equal the active tab bg, or the cross shows no hover at all"
         );
     }
@@ -14396,15 +14386,49 @@ mod tests {
         t.hover_pointer = Some((x0 + 1, area.y));
         let mut buf = Buffer::empty(area);
         (&mut t).render(area, &mut buf);
+        let hover = crate::theme::Theme::default().tab_hover_bg();
         assert_eq!(
             buf[(x0 + 1, area.y)].bg,
-            TAB_HOVER_BG,
+            hover,
             "an inactive tab body lifts under the pointer"
         );
         assert_ne!(
             buf[(x1 + 1, area.y)].bg,
-            TAB_HOVER_BG,
+            hover,
             "the active tab keeps its own bg when a sibling is hovered"
+        );
+    }
+
+    /// The ten manifest themes recolor the editor body; the tab strip must
+    /// follow, not stay the hardcoded VS-Code navy of the two built-ins. A
+    /// theme without explicit tab colors derives them: the strip wears the
+    /// theme's secondary panel fill and the active tab its selection fill.
+    #[test]
+    fn tab_strip_follows_the_selected_theme() {
+        use ratatui::buffer::Buffer;
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+        let solarized = crate::theme::Theme::from_id("solarized-dark");
+        assert_eq!(solarized.id(), "solarized-dark", "bundled theme resolves");
+        t.editors[0].theme = solarized;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        assert_eq!(
+            buf[(area.width - 1, 0)].bg,
+            solarized.search_bg(),
+            "the gap right of the last tab wears the theme's strip color"
+        );
+        let (x0, _) = t.tab_screen_x(0).unwrap();
+        assert_eq!(
+            buf[(x0 + 1, 0)].bg,
+            solarized.selection(),
+            "the active tab wears the theme's selection fill, not the navy chip"
         );
     }
 

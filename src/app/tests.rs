@@ -14350,6 +14350,49 @@ fn switching_sidebar_view_closes_the_open_commit_dropdown() {
 // --- Split editor (side-by-side panes) -----------------------------------
 
 /// Open a file into the focused editor group of a fresh App.
+/// Seeding the Search panel from a terminal command must describe THAT
+/// command: filter globs left over from an earlier manual search would
+/// silently narrow the seeded results (the terminal scanned everything), and
+/// the status line would still claim a faithful seed — feeding Replace All a
+/// wrong subset.
+#[test]
+fn seeding_search_replaces_stale_include_and_exclude_filters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.search.include = String::from("*.md");
+    app.search.exclude = String::from("vendor");
+    assert!(app.seed_search_from_command("rg TODO"));
+    assert_eq!(
+        app.search.include, "",
+        "a bare rg scanned everything; a stale include must not filter the seeded search"
+    );
+    assert_eq!(app.search.exclude, "");
+    assert!(app.seed_search_from_command("rg -g '*.rs' -g '!target' TODO"));
+    assert_eq!(app.search.include, "*.rs");
+    assert_eq!(app.search.exclude, "target");
+}
+
+/// A byte-range selection made in the Include field before the seed must not
+/// survive into the (shorter) seeded text: the next keystroke used to
+/// replace_range the stale span and panic out of bounds.
+#[test]
+fn seeding_search_cannot_leave_a_stale_field_selection() {
+    use crate::widgets::search::SearchField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.search.include = String::from("**/*.rs,**/*.toml");
+    app.search.focus_field(SearchField::Include);
+    app.search.select_all_active();
+    assert!(app.seed_search_from_command("rg -g '*.md' TODO"));
+    assert_eq!(
+        app.search.field,
+        SearchField::Query,
+        "seeding hands focus to the query field it just filled"
+    );
+    app.search.type_char('x');
+    assert_eq!(app.search.include, "*.md", "the seeded include is intact");
+}
+
 fn app_with_open_file(tmp: &std::path::Path, name: &str, body: &str) -> App {
     let f = tmp.join(name);
     std::fs::write(&f, body).unwrap();
@@ -19654,10 +19697,11 @@ fn reconnecting_replays_offline_guest_edits_instead_of_deleting_them() {
         o.editor.lines == g.editor.lines && o.editor.lines[0].contains("SESSION")
     });
 
-    // The link dies: this is the state poll_collab leaves after detecting a
-    // dead channel (session dropped, config kept). Hold the reconnect
-    // backoff while the guest keeps typing offline.
-    guest.collab = None;
+    // The link dies: drive the same teardown poll_collab runs after
+    // detecting a dead channel (session dropped, config kept). Hold the
+    // reconnect backoff while the guest keeps typing offline.
+    let dead = guest.collab.take().unwrap();
+    guest.drop_lost_collab_session(dead);
     guest.last_collab_connect = Some(Instant::now());
     guest.editor.insert_str("OFFLINE ");
     let offline_text = guest.editor.lines.clone();
@@ -19682,6 +19726,90 @@ fn reconnecting_replays_offline_guest_edits_instead_of_deleting_them() {
         &mut guest,
         "the offline edit reaches the owner",
         &|o, g| o.editor.lines == g.editor.lines && o.editor.lines[0].contains("OFFLINE"),
+    );
+}
+
+/// The converse of the replay test above: while the guest was offline, the
+/// OWNER also edited the file. The guest's whole diverged buffer replayed
+/// over the reconnect bootstrap used to read the owner's unseen edit as a
+/// deletion and strip it from every replica. The reconnect must merge the
+/// guest's offline delta with the owner's snapshot (three-way, against the
+/// last shared text harvested when the link died).
+#[test]
+fn reconnect_replay_preserves_owner_edits_made_during_the_outage() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "alpha\nbeta\ngamma").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    let pump_until =
+        |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(owner, guest) {
+                assert!(Instant::now() < deadline, "never settled: {what}");
+                owner.poll_collab();
+                guest.poll_collab();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+    pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+
+    // The guest's link dies through the real teardown (which harvests the
+    // merge base); it edits line 1 offline while the owner edits line 3.
+    let dead = guest.collab.take().unwrap();
+    guest.drop_lost_collab_session(dead);
+    guest.last_collab_connect = Some(Instant::now());
+    guest.editor.insert_str("OFFLINE ");
+    let owner_pump = |owner: &mut App| {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            owner.poll_collab();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    owner.editor.cursor_row = 2;
+    owner.editor.cursor_col = 0;
+    owner.editor.insert_str("OWNER ");
+    owner_pump(&mut owner);
+
+    // Reconnect: both offline-era edits must survive, everywhere.
+    guest.last_collab_connect = None;
+    pump_until(&mut owner, &mut guest, "reconnect goes live", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+    });
+    pump_until(
+        &mut owner,
+        &mut guest,
+        "both offline-era edits converge on every replica",
+        &|o, g| {
+            // `get`, not indexing: if the merge dropped a line, the test must
+            // fail at the deadline with "never settled", not panic here.
+            o.editor.lines == g.editor.lines
+                && o.editor
+                    .lines
+                    .first()
+                    .is_some_and(|l| l.contains("OFFLINE"))
+                && o.editor.lines.get(2).is_some_and(|l| l.contains("OWNER"))
+        },
     );
 }
 

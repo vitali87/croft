@@ -24,6 +24,7 @@ pub struct SearchCommand {
     pub whole_word: bool,
     pub use_regex: bool,
     pub include: Option<String>,
+    pub exclude: Option<String>,
 }
 
 /// Consume `idx`'s token as a flag value (or take the inline `--flag=value`
@@ -69,15 +70,49 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
         }
         _ => return None,
     };
+    // `-s` means case-sensitive only in rg/ag; GNU grep and ack use it to
+    // suppress error messages, and git grep has no such flag at all.
+    let dash_s_is_case_sensitive = matches!(prog, "rg" | "ripgrep" | "ag");
     let mut case_sensitive = false; // rg smart-case & our default: case-insensitive
     let mut whole_word = false;
     let mut include: Option<String> = None;
+    let mut exclude: Option<String> = None;
     let mut pattern: Option<String> = None;
 
+    // Append a glob to one of the panel's comma-separated filter lists.
+    fn push_glob(list: &mut Option<String>, glob: String) {
+        match list {
+            Some(s) => {
+                s.push(',');
+                s.push_str(&glob);
+            }
+            None => *list = Some(glob),
+        }
+    }
+    // rg spells exclusion as a `!`-negated glob; the panel spells it as the
+    // separate files-to-exclude list, which has no negation syntax.
+    fn route_glob(inc: &mut Option<String>, exc: &mut Option<String>, glob: String) {
+        match glob.strip_prefix('!') {
+            Some(neg) => push_glob(exc, neg.to_string()),
+            None => push_glob(inc, glob),
+        }
+    }
+
+    // A standalone `--` ends option parsing: everything after it is
+    // positional, so a dash-leading pattern (`rg -- -TODO`) stays a pattern.
+    let mut flags_done = false;
     while idx < tokens.len() {
         let tok = tokens[idx].clone();
         idx += 1;
-        if let Some(long) = tok.strip_prefix("--") {
+        if flags_done {
+            if pattern.is_none() {
+                pattern = Some(tok);
+            }
+            continue;
+        }
+        if tok == "--" {
+            flags_done = true;
+        } else if let Some(long) = tok.strip_prefix("--") {
             let (name, inline_val) = match long.split_once('=') {
                 Some((n, v)) => (n, Some(v.to_string())),
                 None => (long, None),
@@ -94,10 +129,21 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                         pattern = v;
                     }
                 }
-                "glob" | "iglob" | "include" => {
-                    let v = take_value(inline_val, &tokens, &mut idx);
-                    if include.is_none() {
-                        include = v;
+                "glob" | "iglob" => {
+                    if let Some(v) = take_value(inline_val, &tokens, &mut idx) {
+                        route_glob(&mut include, &mut exclude, v);
+                    }
+                }
+                "include" => {
+                    if let Some(v) = take_value(inline_val, &tokens, &mut idx) {
+                        push_glob(&mut include, v);
+                    }
+                }
+                // grep's exclusion flags: getopt_long takes the glob inline
+                // (`--exclude=GLOB`) or spaced (`--exclude GLOB`).
+                "exclude" | "exclude-dir" => {
+                    if let Some(v) = take_value(inline_val, &tokens, &mut idx) {
+                        push_glob(&mut exclude, v);
                     }
                 }
                 // Long flags that take a value we don't use; drop the value so
@@ -117,6 +163,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
             while ci < chars.len() {
                 match chars[ci] {
                     'i' | 'S' => case_sensitive = false,
+                    's' if dash_s_is_case_sensitive => case_sensitive = true,
                     'w' => whole_word = true,
                     'F' => use_regex = false,
                     'E' | 'P' => use_regex = true,
@@ -131,8 +178,8 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                             if pattern.is_none() {
                                 pattern = v;
                             }
-                        } else if include.is_none() {
-                            include = v;
+                        } else if let Some(v) = v {
+                            route_glob(&mut include, &mut exclude, v);
                         }
                         break; // consumed the rest of this token
                     }
@@ -164,6 +211,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
         whole_word,
         use_regex,
         include,
+        exclude,
     })
 }
 
@@ -263,5 +311,74 @@ mod tests {
     #[test]
     fn path_prefixed_program_is_recognised() {
         assert_eq!(parse("/usr/bin/rg needle").unwrap().pattern, "needle");
+    }
+
+    #[test]
+    fn rg_dash_s_forces_case_sensitivity() {
+        // `-s` is rg's explicit case-sensitive flag; dropping it would seed a
+        // case-insensitive search whose Replace All rewrites identifiers the
+        // terminal command never matched.
+        assert!(parse("rg -s Error src/").unwrap().case_sensitive);
+        assert!(parse("rg -sw Error").unwrap().case_sensitive);
+        assert!(parse("rg --case-sensitive Error").unwrap().case_sensitive);
+        // ag spells case-sensitive the same way.
+        assert!(parse("ag -s Error").unwrap().case_sensitive);
+    }
+
+    #[test]
+    fn grep_dash_s_is_not_case_sensitivity() {
+        // In GNU grep (and ack) `-s` suppresses error messages; reading it as
+        // rg's case-sensitive flag would seed a search that skips
+        // differently-cased matches the terminal command actually found.
+        assert!(!parse("grep -s Error .").unwrap().case_sensitive);
+        assert!(!parse("grep -rs Error .").unwrap().case_sensitive);
+        assert!(!parse("git grep -s Error").unwrap().case_sensitive);
+    }
+
+    #[test]
+    fn negated_globs_become_the_exclude_filter() {
+        // `rg -g '!node_modules'` is rg's exclude idiom. Copied verbatim into
+        // the include filter it matches nothing (the panel's globs have no
+        // negation), silently emptying the seeded search.
+        let c = parse("rg -g '!node_modules' TODO").unwrap();
+        assert_eq!(c.include, None);
+        assert_eq!(c.exclude.as_deref(), Some("node_modules"));
+    }
+
+    #[test]
+    fn multiple_globs_accumulate_into_the_comma_lists() {
+        let c = parse("rg -g '*.rs' -g '*.md' -g '!target' TODO").unwrap();
+        assert_eq!(c.include.as_deref(), Some("*.rs,*.md"));
+        assert_eq!(c.exclude.as_deref(), Some("target"));
+    }
+
+    #[test]
+    fn grep_exclude_flags_seed_the_exclude_filter() {
+        let c = parse("grep -rn --exclude=*.min.js --exclude-dir=dist TODO .").unwrap();
+        assert_eq!(c.pattern, "TODO");
+        assert_eq!(c.exclude.as_deref(), Some("*.min.js,dist"));
+    }
+
+    #[test]
+    fn end_of_options_marker_lets_a_dash_leading_pattern_through() {
+        // `rg -- -TODO src` searches for the literal `-TODO`; without
+        // honoring `--`, the parser ate `-TODO` as flags and seeded the
+        // search with `src` — running replace against unintended text.
+        let c = parse("rg -g '*.rs' -- -TODO src").unwrap();
+        assert_eq!(c.pattern, "-TODO");
+        assert_eq!(c.include.as_deref(), Some("*.rs"));
+        assert_eq!(parse("grep -rn -- --help .").unwrap().pattern, "--help");
+    }
+
+    #[test]
+    fn spaced_grep_exclusion_values_are_not_the_pattern() {
+        // getopt_long takes required arguments spaced too: `--exclude GLOB`.
+        // Not consuming the value made the glob the seeded search pattern.
+        let c = parse("grep -r --exclude *.min.js needle .").unwrap();
+        assert_eq!(c.pattern, "needle");
+        assert_eq!(c.exclude.as_deref(), Some("*.min.js"));
+        let c = parse("grep -r --exclude-dir dist TODO .").unwrap();
+        assert_eq!(c.pattern, "TODO");
+        assert_eq!(c.exclude.as_deref(), Some("dist"));
     }
 }

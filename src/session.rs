@@ -340,14 +340,27 @@ pub fn attach(path: Option<PathBuf>, solo: bool) -> Result<()> {
     Ok(())
 }
 
-/// `croft ls`: print the live persistent sessions, pruning any dead sockets.
-pub fn list() -> Result<()> {
-    let dir = sessions_dir();
+/// The live persistent sessions under `dir`, pruning any dead session
+/// sockets. One row per session: (id, workspace, uptime).
+fn session_rows(dir: &Path) -> Vec<(String, String, String)> {
     let mut rows: Vec<(String, String, String)> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let socket = entry.path();
             if socket.extension().and_then(|e| e.to_str()) != Some("sock") {
+                continue;
+            }
+            // The workspace's collab relay lives in the same directory with
+            // the same hash keying (`<hash>.collab.sock`). It is not a
+            // session: listing it printed a phantom `(unknown)` row whose id
+            // collided with the real session's, and probing it cost the relay
+            // a connect-and-drop. Its lifecycle belongs to the relay's own
+            // bind path, not to `ls` pruning.
+            if socket
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".collab.sock"))
+            {
                 continue;
             }
             if !is_alive(&socket) {
@@ -373,6 +386,12 @@ pub fn list() -> Result<()> {
             rows.push((id, workspace, uptime));
         }
     }
+    rows
+}
+
+/// `croft ls`: print the live persistent sessions, pruning any dead sockets.
+pub fn list() -> Result<()> {
+    let rows = session_rows(&sessions_dir());
     if rows.is_empty() {
         println!("No persistent croft sessions. Start one with `croft attach`.");
         return Ok(());
@@ -486,6 +505,43 @@ mod tests {
         );
         // The stamp fields stay invisible to the typed read path.
         assert_eq!(read_pair_record(&path).as_ref(), Some(&record));
+    }
+
+    /// A workspace's collab relay socket (`<hash>.collab.sock`) shares the
+    /// sessions directory and hash keying with the real session socket, and
+    /// is a live listener whenever `croft pair` seated a navigator. It is not
+    /// a session: `croft ls` used to print it as a phantom `(unknown)` row
+    /// whose 8-char id collided with the real session's.
+    #[test]
+    fn ls_does_not_report_the_collab_relay_as_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = "deadbeefcafef00d";
+        // A live mux session with its workspace sidecar.
+        let mux = dir.path().join(format!("{hash}.mux.sock"));
+        let _mux_listener = bind_socket_0600(&mux).unwrap();
+        write_meta(
+            &mux,
+            &SessionMeta {
+                workspace: PathBuf::from("/tmp/ws"),
+                created_unix: now_unix(),
+            },
+        )
+        .unwrap();
+        // The same workspace's live collab relay.
+        let collab = dir.path().join(format!("{hash}.collab.sock"));
+        let _collab_listener = bind_socket_0600(&collab).unwrap();
+
+        let rows = session_rows(dir.path());
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the session is a session; the relay must not be listed: {rows:?}"
+        );
+        assert_eq!(rows[0].1, "/tmp/ws");
+        assert!(
+            collab.exists(),
+            "ls must not prune the relay socket either — its lifecycle belongs to the relay"
+        );
     }
 
     /// Two attach-or-create racers for the SAME target must never both
