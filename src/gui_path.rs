@@ -107,6 +107,18 @@ fn probe_cmd(shell: &str) -> Command {
 /// Run a prepared probe command and return the PATH it printed, giving up
 /// after `timeout`.
 fn run_probe(mut cmd: Command, timeout: Duration) -> Option<String> {
+    // Its own session, so the probe has no controlling terminal. `-l -i`
+    // makes the shell interactive, and an interactive zsh takes the
+    // terminal's foreground process group for job control; left in croft's
+    // session it steals the TTY, and once it exits croft is a background
+    // process on its own terminal — enabling raw mode then fails with EIO
+    // and a Dock launch dies on arrival.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+            libc::setsid();
+            Ok(())
+        });
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -399,6 +411,39 @@ mod tests {
         assert!(
             path.split(':').any(|e| e == "/from/login"),
             "~/.login was not sourced; the csh user's PATH is lost: {path:?}"
+        );
+    }
+
+    /// The probe must run in its own session, with no controlling terminal.
+    /// `-l -i` makes the user's shell interactive, and an interactive zsh
+    /// takes the terminal's foreground process group for job control. Left
+    /// in croft's session it steals the TTY; when it exits, croft is a
+    /// background process on its own terminal and enabling raw mode fails
+    /// with EIO — a Dock launch "crashes" on arrival. A session of its own
+    /// makes the theft impossible.
+    #[test]
+    fn the_probe_cannot_touch_crofts_terminal_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub-shell");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 exec /usr/bin/python3 -c 'import os; \
+                 print(\"{BEGIN}%d{END}\" % os.getsid(0))'\n"
+            ),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&stub, perm).unwrap();
+        let sid = run_probe(probe_cmd(&stub.display().to_string()), PROBE_TIMEOUT)
+            .expect("the stub must report its session id");
+        let own = unsafe { libc::getsid(0) };
+        assert_ne!(
+            sid.trim().parse::<i64>().expect("a numeric session id"),
+            i64::from(own),
+            "the probe shell shares croft's terminal session"
         );
     }
 

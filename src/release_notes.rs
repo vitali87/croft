@@ -62,6 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
+        summary: "Croft.app starts again: the Dock-launch PATH repair asked your login shell for its PATH on croft's own terminal, and an interactive zsh steals the terminal's foreground for job control, so croft came up as a background process and died with an I/O error before drawing anything. The probe now runs in its own session, where it cannot touch croft's terminal.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
         summary: "Navigator comment boxes carry only the model's own words: claude's startup chatter and host notices (a suppressed edit, a file nobody serves) now go to the OUTPUT panel instead of being anchored in your file as the navigator's remarks and counted as its comments.",
     },
     ReleaseNote {
