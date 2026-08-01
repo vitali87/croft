@@ -7166,6 +7166,40 @@ fn mouse_wheel_over_the_commits_graph_scrolls_it() {
 }
 
 #[test]
+fn a_graph_refresh_swallowed_by_an_inflight_fetch_refires_when_the_reply_drains() {
+    // Make Root during an in-flight COMMITS fetch: set_root clears the
+    // panel and triggers a refresh, but the inflight latch swallows it,
+    // and the old root's reply is then dropped by the drain's root tag.
+    // Without a queued re-fire nothing refetches until HEAD next moves,
+    // so the panel sits on "Loading" indefinitely.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Settle any startup fetch so the latch state is ours alone.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.graph_fetch_inflight {
+        app.sync_explorer_panels();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup graph fetch must settle"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // A fetch is mid-flight for the old root when a trigger arrives.
+    app.graph_fetch_inflight = true;
+    app.refresh_commit_graph();
+    // The stale reply lands: dropped by the root tag.
+    app.graph_tx
+        .send((std::path::PathBuf::from("/since-left/root"), Vec::new()))
+        .unwrap();
+    app.sync_explorer_panels();
+    assert!(
+        app.graph_fetch_inflight,
+        "the trigger swallowed during flight must re-fire once the stale reply drains"
+    );
+}
+
+#[test]
 fn commits_graph_scrollbar_thumb_drag_follows_the_pointer() {
     // Codeberg #41 companion: every other sidebar section's scrollbar
     // supports a thumb drag (outline, timeline, testing, …); the COMMITS

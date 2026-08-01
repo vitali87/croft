@@ -62,30 +62,18 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Debugging a cargo test no longer freezes croft: the test-binary build runs on a background thread with a visible progress status instead of blocking every pane for the whole compile, and a workspace switched mid-build discards the finished binary instead of debugging the old project inside the new one. The debugger also picks the harness that actually contains the test — a failed workspace build surfaces the compile error instead of launching a partial binary, and the file the gesture happened in disambiguates a lib test from an integration test sharing the same name, including a renamed [[test]] target whose name the file stem cannot predict.",
+        summary: "Multi-cursor blocks and collaborators' ghost carets sit on the correct side of an inlay hint: a caret exactly at a hint's anchor — where Change All Occurrences puts every caret on a `let` binding with a type hint — used to paint its block a hint-width to the right of the primary caret, outside its own selection band and on top of an unrelated character.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The gutter play bead is honest now: #[cfg(test)], #[cfg_attr(test, ...)], and attributes that merely end in test (#[contest], #[mytest]) no longer count as test attributes (every cfg-gated helper in a codebase wore a bead that ran nothing and wiped the Testing tree), a def test_* only gets a bead in a pytest-collectable file, and clicking a breakpoint dot, the paused stop arrow, or the AI-stream square on a test line no longer silently starts a test run — the click hit-test honors the same sign-cell precedence the render does.",
+        summary: "Clicking the Testing panel's border can no longer run tests: the play-glyph hit zone had no left edge, so a click on the pane's border column beside a suite header quietly kicked off the whole suite.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A per-host pane accent now appears the moment the shell reports its host: the OSC 7 hostname arrives with no key or click behind it, and the accent used to wait for the next input event before dressing the pane border — SSHing into a prod-* host and just watching the pane left it undressed.",
+        summary: "Make Root during an in-flight COMMITS fetch no longer strands the graph on Loading: a refresh arriving while a fetch was running was silently dropped, and the old root's reply was then discarded, leaving nothing to repaint the panel until HEAD next moved. The swallowed refresh is now queued and re-fires the moment the stale reply drains.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Removing a breakpoint now removes the whole breakpoint: its logpoint message and condition used to survive removal and silently re-attach to the next plain breakpoint on that line — resurrecting a logpoint that printed instead of ever pausing.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Running one vitest test with parentheses or brackets in its title works: vitest's -t is a regex like jest's, and croft passed the title unescaped, so 'adds (1 + 1)' matched nothing and an unbalanced bracket errored. Titles are now escaped on every vitest path, matching the jest paths.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Find highlights stay readable when the caret rests on a match: the LSP occurrence tint used to paint its dark background over the find layer's black-on-gold cells, turning every highlighted match (including the orange active-match cue) into unreadable black-on-grey. Occurrences now paint beneath the find layer.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Keep Open works from the keyboard again on Cmd+K Shift+P — the tab menu had kept advertising the old Cmd+K Enter chord, which now runs the test at the caret. A stale COMMITS-graph scrollbar no longer deadens a band of the sidebar splitter after leaving Source Control, and a slow call-hierarchy, references, or implementations reply no longer replaces a menu the user opened while waiting.",
+        summary: "A one-row terminal selection on a repeated row (a divider rule, a continuation marker) re-anchors to its own copy after the app repaints: the highlight used to jump to whichever identical row landed nearest, while copy kept returning the original text. The rows captured around the selection now break the tie.",
     },
 ];

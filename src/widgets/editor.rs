@@ -7196,6 +7196,11 @@ impl Widget for &mut Editor {
                 .map(|(hc, l)| (*hc, l.chars().count()))
                 .collect();
             let ex = |c: usize| inlay_cells_before(&hint_cells, c);
+            // Caret placement uses the strictly-before rule instead: a
+            // caret AT a hint's anchor sits left of the hint (the
+            // `cursor_screen_pos` / VS Code convention), while a CHARACTER
+            // at the anchor paints right of it (`ex` above).
+            let ex_caret = |c: usize| inlay_cells_strictly_before(&hint_cells, c);
             if hint_cells.is_empty() {
                 // Shift highlight spans to the row origin and clip them to the
                 // segment so build_line_spans never slices past `visible_raw`.
@@ -7377,7 +7382,11 @@ impl Widget for &mut Editor {
                     && c >= row_start
                     && (c < row_end || (c == row_end && row_end == line_len));
                 if on_row {
-                    paint_block_cursor(buf, text_x, y, row_width, c + ex(c), row_start);
+                    // Strictly-before, not `ex`: a caret AT a hint's anchor
+                    // sits left of the hint like the primary caret
+                    // (`cursor_screen_pos`), marking the cell its typed
+                    // character will land on, inside its own band.
+                    paint_block_cursor(buf, text_x, y, row_width, c + ex_caret(c), row_start);
                 }
             }
 
@@ -7390,7 +7399,15 @@ impl Widget for &mut Editor {
                     && gc >= row_start
                     && (gc < row_end || (gc == row_end && row_end == line_len));
                 if on_row {
-                    paint_ghost_caret(buf, text_x, y, row_width, gc + ex(gc), row_start, color);
+                    paint_ghost_caret(
+                        buf,
+                        text_x,
+                        y,
+                        row_width,
+                        gc + ex_caret(gc),
+                        row_start,
+                        color,
+                    );
                 }
             }
 
@@ -7764,6 +7781,13 @@ fn inlay_cells_before(hints: &[(usize, usize)], c: usize) -> usize {
         .filter(|(hc, _)| *hc <= c)
         .map(|(_, n)| n)
         .sum()
+}
+
+/// Hint cells strictly before buffer column `c`: the shift for a CARET at
+/// `c`, which sits left of a hint anchored exactly there (a character at
+/// `c` sits right of it — that is [`inlay_cells_before`]).
+fn inlay_cells_strictly_before(hints: &[(usize, usize)], c: usize) -> usize {
+    hints.iter().filter(|(hc, _)| *hc < c).map(|(_, n)| n).sum()
 }
 
 /// The syntax-highlighted spans of `raw`'s character range `[from, to)`,
@@ -10680,6 +10704,52 @@ mod tests {
             e.cursor_screen_pos(),
             Some((text_x + 5, e.last_inner.y)),
             "the caret at the anchor must sit before the hint"
+        );
+    }
+
+    #[test]
+    fn secondary_and_ghost_carets_sit_left_of_an_inlay_hint_like_the_primary() {
+        // Change All Occurrences puts every extra caret at a word end —
+        // exactly where rust-analyzer anchors a binding's type hint. The
+        // primary caret deliberately sits LEFT of such a hint (see
+        // cursor_screen_pos_shifts_past_inlay_hints); the block painted for
+        // a secondary caret, and a collaborator's ghost caret, must agree
+        // instead of landing a hint-width to the right, outside their own
+        // selection band.
+        let mut e = editor_with("let x = f(y);");
+        let p = std::path::PathBuf::from("/tmp/hints.rs");
+        e.path = Some(p.clone());
+        e.apply_inlay_hints(p, vec![inlay(0, 5, ": i32")]);
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 5,
+        };
+
+        // Secondary caret at the hint's anchor (buffer col 5).
+        e.carets = vec![EditorSelection::new(0, 5)];
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let block_x = (0..area.width).find(|&x| buf[(x, 1)].bg == Color::Rgb(0xae, 0xc6, 0xff));
+        assert_eq!(
+            block_x,
+            Some(text_x + 5),
+            "the secondary caret's block must sit where the primary would"
+        );
+
+        // Ghost caret at the same anchor, painted in the participant color.
+        e.carets.clear();
+        e.ghost_carets = vec![(0, 5, Color::Red)];
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let ghost_x = (0..area.width).find(|&x| buf[(x, 1)].bg == Color::Red);
+        assert_eq!(
+            ghost_x,
+            Some(text_x + 5),
+            "a collaborator's ghost caret must sit where the primary would"
         );
     }
 

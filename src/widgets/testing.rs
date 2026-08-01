@@ -256,6 +256,13 @@ impl TestingPanel {
         if y < self.first_row_y || y >= self.first_row_y + self.viewport_rows {
             return None;
         }
+        // `last_area` is the full bordered rect and the caller gates on it,
+        // so both border columns reach here; they are pane chrome, not tree
+        // — without this bound a left-border click satisfied the glyph
+        // thresholds below and ran a whole suite.
+        if x <= self.last_area.x || x + 1 >= self.last_area.x + self.last_area.width {
+            return None;
+        }
         let inner_x = self.last_area.x + 1;
         let shown = (y - self.first_row_y) as usize;
         match self.rows.get(self.scroll + shown)? {
@@ -554,6 +561,12 @@ mod tests {
         // name itself is inert so a stray click never kicks a whole suite.
         assert_eq!(p.hit_at(2, 3), Some(RowHit::RunSuite("m".into())));
         assert_eq!(p.hit_at(10, 3), None);
+        // The pane's border columns are chrome, not tree: a click on the
+        // left border must never run a suite or a case, and one on the
+        // right border must never jump to a case's source.
+        assert_eq!(p.hit_at(0, 3), None, "left border on a suite header");
+        assert_eq!(p.hit_at(0, 4), None, "left border on a case row");
+        assert_eq!(p.hit_at(29, 4), None, "right border on a case row");
         // Outside the tree: nothing.
         assert_eq!(p.hit_at(3, 2), None);
         assert_eq!(p.hit_at(3, 9), None);
