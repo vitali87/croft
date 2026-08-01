@@ -307,9 +307,13 @@ The rest of the shipped shape:
   re-issue an id a surviving guest still holds; nonces are seeded
   from the process id so two guests never adopt each other's reply). The
   wire-supplied file key is contained on the owner side
-  (`collab::contained_path`: every component a plain name), so a traversing
-  or absolute key from any guest — the MCP collab agent forwards caller
-  input verbatim — can never read or edit outside the workspace. Ops
+  (`collab::contained_path`: every component a plain name, and the deepest
+  existing ancestor must canonicalize inside the resolved root, so a
+  normal-looking key naming a symlink whose target lies beyond the
+  workspace is declined while intra-workspace symlinks keep working), so
+  neither a traversing/absolute key nor a symlinked one from any guest —
+  the MCP collab agent forwards caller input verbatim — can read or edit
+  outside the workspace. Ops
   arriving mid-bootstrap are buffered and replayed (duplicates integrate as
   no-ops). The relay has no replay, so an unanswered request is **re-sent
   while bootstrapping, starting at 500ms and doubling on every further
@@ -366,7 +370,12 @@ The rest of the shipped shape:
 - **Link loss is detected.** EOF or a hard error on the relay channel (and
   any failed send) latches the channel dead; the app drops the session with
   a status hint and reconnects through the normal 2s-backoff path, and
-  guest files re-bootstrap. EOF used to be indistinguishable from an idle
+  guest files re-bootstrap. A previously-attached buffer that diverged
+  while the link was down holds work that exists nowhere else (its ops
+  never left the machine), so the re-bootstrap keeps its text and replays
+  the divergence against the owner's snapshot as fresh local edits instead
+  of wiping it — the offline work reaches every peer once the link is
+  back. EOF used to be indistinguishable from an idle
   socket, so a killed relay left `is_live` true forever while every op
   vanished — with saves still gated, a guest's work existed only in RAM.
   The relay's forwarding writes are bounded too

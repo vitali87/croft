@@ -66,7 +66,7 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Losing the collab relay is now detected: the session reconnects (files re-join automatically) instead of silently swallowing every edit while the share looked alive — work no longer exists only in RAM after a relay dies.",
+        summary: "Losing the collab relay is now detected: the session reconnects (files re-join automatically) instead of silently swallowing every edit while the share looked alive, and edits made while the link was down are replayed into the restored session instead of being wiped by the owner's older snapshot.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
@@ -78,6 +78,6 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A collab peer (including an AI seat over the MCP agent) can no longer reach outside the workspace: shared-file keys arriving over the wire are contained to the workspace root, so a traversing path can neither read nor edit files beyond it.",
+        summary: "A collab peer (including an AI seat over the MCP agent) can no longer reach outside the workspace: shared-file keys arriving over the wire are contained to the workspace root, so neither a traversing path nor a symlink pointing beyond the root can read or edit files outside it.",
     },
 ];
