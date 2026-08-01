@@ -19357,6 +19357,40 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
     );
 }
 
+/// The `file` key in a snapshot request comes straight off the wire: a
+/// traversing or absolute key must never resolve outside the workspace, or
+/// any guest (the MCP collab agent included) could make the owner read,
+/// broadcast, and even edit arbitrary files it can reach.
+#[test]
+fn a_traversing_wire_file_key_is_declined() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(tmp.path().join("secret.txt"), "SECRET").unwrap();
+    std::fs::write(root.join("inner.txt"), "inner").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    assert_eq!(
+        app.owner_buffer_text(&root, "../secret.txt"),
+        None,
+        "a traversing wire key must not escape the workspace root"
+    );
+    assert_eq!(
+        app.owner_buffer_text(&root, "sub/../../secret.txt"),
+        None,
+        "a mid-path traversal must not escape the workspace root"
+    );
+    assert_eq!(
+        app.owner_buffer_text(&root, "/etc/hosts"),
+        None,
+        "an absolute wire key must not leave the workspace root"
+    );
+    assert_eq!(
+        app.owner_buffer_text(&root, "inner.txt").as_deref(),
+        Some("inner"),
+        "a plain relative key still resolves"
+    );
+}
+
 /// The cancel affordances around the AI stream: Cmd+K X and the palette
 /// entry both route through `collab_cancel_stream` (hint when idle), and
 /// the gutter stop button's row follows the pilot's caret in the streamed

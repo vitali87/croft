@@ -16796,7 +16796,7 @@ impl App {
     /// focus where it was) and read that. None declines the request
     /// (missing, unreadable, or not a text buffer).
     fn owner_buffer_text(&mut self, root: &Path, file: &str) -> Option<String> {
-        let path = root.join(file);
+        let path = crate::collab::contained_path(root, file)?;
         let text_of = |ed: &crate::widgets::editor::Editor| {
             (ed.diff.is_none() && ed.image.is_none() && ed.sheet.is_none())
                 .then(|| ed.lines.join("\n"))
@@ -16831,7 +16831,9 @@ impl App {
         file: &str,
         spans: &[crate::collab::ResolvedSpan],
     ) {
-        let path = root.join(file);
+        let Some(path) = crate::collab::contained_path(root, file) else {
+            return;
+        };
         let apply = |ed: &mut crate::widgets::editor::Editor| {
             for s in spans {
                 let (sr, sc) = crate::collab::position(&ed.lines, s.at);
@@ -16862,7 +16864,9 @@ impl App {
     /// canonical text (usually identical to what was read from disk) and
     /// mark the file synced, which also lifts the input gate.
     fn finish_collab_bootstrap(&mut self, root: &Path, file: &str, text: String) {
-        let path = root.join(file);
+        let Some(path) = crate::collab::contained_path(root, file) else {
+            return;
+        };
         let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
         let finish = |ed: &mut crate::widgets::editor::Editor| {
             if ed.lines != lines {

@@ -581,6 +581,20 @@ impl CollabChannel {
     }
 }
 
+/// Resolve a wire-supplied file key against the workspace root. Keys arrive
+/// from peers (snapshot requests, ops, carets) and the MCP collab agent
+/// forwards caller input verbatim, so containment is enforced here, not by
+/// the sender: every component must be a plain name — a traversing or
+/// absolute key must never let a guest read or edit outside the workspace.
+pub fn contained_path(root: &std::path::Path, file: &str) -> Option<std::path::PathBuf> {
+    let rel = std::path::Path::new(file);
+    let plain = !file.is_empty()
+        && rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    plain.then(|| root.join(rel))
+}
+
 /// The owner's fixed site id; joiners are allocated ids from 2 up.
 const OWNER_SITE: u64 = 1;
 
