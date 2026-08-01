@@ -508,10 +508,17 @@ pub(crate) mod test_clip {
         /// Cross-process exclusion: a process-per-test runner
         /// (cargo-nextest) gives every test its own process, so
         /// `CLIP_LOCK` alone cannot keep two tests off the ONE system
-        /// pasteboard. An exclusive advisory lock on a well-known temp
-        /// file extends the exclusion across processes; the kernel
-        /// releases it when the file closes on drop — including when a
-        /// test process dies, so a killed test can never wedge the rest.
+        /// pasteboard. An exclusive advisory lock on a well-known file
+        /// extends the exclusion across processes; the kernel releases
+        /// it when the file closes on drop — including when a test
+        /// process dies, so a killed test can never wedge the rest.
+        ///
+        /// The lock file lives under the checkout's own `target/`, not
+        /// the shared temp dir: every test process of a run compiles
+        /// from the same checkout (so they agree on the path), and a
+        /// user-owned directory means no other local user can pre-plant
+        /// a symlink at the predictable name and have `open` clobber
+        /// its target.
         _file_lock: std::fs::File,
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         snapshot: Option<String>,
@@ -522,11 +529,15 @@ pub(crate) mod test_clip {
             let mutex = CLIP_LOCK
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
+            let lock_dir =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+            std::fs::create_dir_all(&lock_dir)
+                .expect("clipboard test lock dir must exist");
             let file_lock = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(std::env::temp_dir().join("croft-clipboard-test.lock"))
+                .open(lock_dir.join("croft-clipboard-test.lock"))
                 .expect("clipboard test lock file must open");
             loop {
                 match file_lock.lock() {
