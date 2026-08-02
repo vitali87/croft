@@ -887,6 +887,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Cmd+F (also Ctrl+F off macOS)",
+                description: "Find in terminal scrollback (Enter next, Shift+Enter prev, Esc close); on macOS Ctrl+F reaches the program, as in VS Code / iTerm2",
+                handler: "is_terminal_find_key",
+            },
+            ShortcutEntry {
                 keys: "Ctrl+Shift+H",
                 description: "Command history: search every command this machine ran (cwd, exit, duration kept); ^R cycles all / this directory / failed, Enter types it",
                 handler: "is_command_history_key",

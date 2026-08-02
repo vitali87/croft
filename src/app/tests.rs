@@ -1664,6 +1664,29 @@ fn cmd_f_opens_terminal_find_and_captures_typing() {
     assert!(app.terminal_find.is_none(), "Esc must close the find bar");
 }
 
+/// VS Code and iTerm2 on macOS reserve Cmd+F for terminal find and let
+/// Ctrl+F through to the child — it is a control byte programs bind
+/// (vim's page-forward, the shell's emacs forward-char). Stealing both
+/// chords left no way to send 0x06 to a pane at all. Linux keeps Ctrl+F
+/// opening find, the VS Code default there.
+#[cfg(target_os = "macos")]
+#[test]
+fn ctrl_f_reaches_the_terminal_child_on_macos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.handle_terminal_key(key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert!(
+        app.terminal_find.is_none(),
+        "Ctrl+F must not open find on macOS"
+    );
+    let written = app.terminals[0].written_bytes_for_test();
+    assert!(
+        written.ends_with(&[0x06]),
+        "Ctrl+F must be encoded to the child, wrote {written:?}"
+    );
+}
+
 #[test]
 fn cmd_opt_up_parks_the_previous_prompt_mark_at_the_viewport_top() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4172,6 +4195,64 @@ fn cmd_click_on_a_file_line_reference_in_the_terminal_opens_the_file_there() {
     assert!(
         matches!(app.focus, Pane::Editor),
         "the jump must focus the editor"
+    );
+}
+
+/// An OSC 8 hyperlink's URI is invisible: the pane shows "CLICK-ME" while
+/// the cell carries whatever the printing program chose — including a
+/// file:// or custom-scheme URI that `open`/`xdg-open` would hand to an
+/// arbitrary application. Only web links may open; anything else is
+/// refused with the REAL destination surfaced in the status line.
+#[test]
+fn cmd_clicking_a_non_web_hyperlink_refuses_instead_of_opening() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.terminal_mut().focused = true;
+    term.draw(|f| app.render(f)).unwrap();
+
+    let script = "printf 'ref \\033]8;;file:///nonexistent-croft-probe\\033\\\\CLICK-ME\\033]8;;\\033\\\\\\n'";
+    app.terminal_mut()
+        .write_input(format!("{script}\r").as_bytes());
+    // Locate the linked cell in the click's own coordinate space
+    // (`hyperlink_at` viewport rows), not via `visible_text`, whose
+    // logical-line joining shifts row indices past any soft wrap.
+    let linked_cell = |app: &App| -> Option<(usize, usize)> {
+        (0..40usize).find_map(|r| {
+            (0..120usize)
+                .find(|&c| {
+                    app.terminal().hyperlink_at(r, c).as_deref()
+                        == Some("file:///nonexistent-croft-probe")
+                })
+                .map(|c| (r, c))
+        })
+    };
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(5000) && linked_cell(&app).is_none()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    term.draw(|f| app.render(f)).unwrap();
+    let (row_idx, col) = linked_cell(&app).expect("shell must print the linked text within 5s");
+
+    let inner = app.terminal().last_inner;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: inner.x + col as u16,
+        row: inner.y + row_idx as u16,
+        modifiers: KeyModifiers::SUPER,
+    });
+
+    assert!(
+        !app.status.starts_with("Opened"),
+        "a file:// hyperlink must never reach the system opener (status: {})",
+        app.status
+    );
+    assert!(
+        app.status.contains("file:///nonexistent-croft-probe"),
+        "the refusal must surface the real destination (status: {})",
+        app.status
     );
 }
 
@@ -23157,6 +23238,87 @@ fn quick_select_closes_instead_of_hijacking_another_pane() {
     assert!(
         !app.terminals[1].has_hints_for_test(),
         "the sibling pane must not inherit the old pane's hint labels"
+    );
+}
+
+/// The find anchor rides the scroll clock like every other line-anchored
+/// overlay: output streaming while the bar is open used to leave the
+/// stored match line pointing N rows below its text, so the next
+/// Enter/Shift+Enter walked from a phantom position — re-finding the same
+/// occurrence or skipping others — and the bright active highlight
+/// detached from its row.
+#[test]
+fn terminal_find_navigation_survives_streaming_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    // Fill the screen first so later output rotates rows into scrollback
+    // (line indices only drift once the grid is full).
+    let mut feed = Vec::new();
+    for i in 0..40 {
+        feed.extend_from_slice(format!("pad-{i}\r\n").as_bytes());
+    }
+    feed.extend_from_slice(b"match-one\r\nmatch-two\r\nmatch-three\r\n");
+    app.terminals[0].feed_bytes_for_test(&feed);
+    app.handle_terminal_key(key(KeyCode::Char('f'), KeyModifiers::SUPER));
+    for c in "match".chars() {
+        app.handle_terminal_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    let anchored_line = |app: &App| -> String {
+        let (lines, top, now) = app.terminals[0].grid_lines_and_clock();
+        let (clock, abs, _c, _l) = app.terminal_find_match.expect("an anchored match");
+        let abs = abs - (now - clock) as i32;
+        let row = (abs - top).clamp(0, lines.len() as i32 - 1) as usize;
+        lines[row].clone()
+    };
+    assert!(
+        anchored_line(&app).contains("match-three"),
+        "staging: the first anchor is the bottom-most occurrence"
+    );
+    // Output streams while the bar is open: every stored line drifts.
+    app.terminals[0].feed_bytes_for_test(b"filler\r\nfiller\r\nfiller\r\nfiller\r\nfiller\r\n");
+    app.handle_terminal_key(key(KeyCode::Enter, KeyModifiers::SHIFT));
+    assert!(
+        anchored_line(&app).contains("match-two"),
+        "prev from the drifted anchor must land on the occurrence above it, got {:?}",
+        anchored_line(&app)
+    );
+}
+
+/// Terminal find is bound to the pane it opened on: a gesture that
+/// activates a sibling pane must close it AND clear the highlight on the
+/// pane that owned it. Closing against the newly active pane instead left
+/// the owning pane's needle painted for the rest of the session and
+/// applied the stored jump anchor to the wrong pane's grid.
+#[test]
+fn terminal_find_closes_instead_of_straying_to_another_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.terminals[0].feed_bytes_for_test(b"\r\nerror one\r\nerror two\r\n");
+    app.handle_terminal_key(key(KeyCode::Char('f'), KeyModifiers::SUPER));
+    app.handle_terminal_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
+    assert!(
+        app.terminals[0].has_search_for_test(),
+        "staging: the owning pane is highlighted"
+    );
+    app.terminals.push(
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sleep",
+            &[String::from("30")],
+            tmp.path(),
+        )
+        .unwrap(),
+    );
+    app.active_terminal = 1;
+    app.sync_focus_flags();
+    assert!(
+        app.terminal_find.is_none(),
+        "a pane switch closes find instead of retargeting the new pane"
+    );
+    assert!(
+        !app.terminals[0].has_search_for_test(),
+        "the owning pane's highlight must be cleared on close"
     );
 }
 

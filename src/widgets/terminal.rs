@@ -527,10 +527,13 @@ pub struct PtyTerminal {
     /// occurrence on each visible row.
     search_needle: Option<String>,
     search_opts: crate::widgets::search::SearchOpts,
-    /// The active match `(abs_line, col, len)` painted in the brighter accent,
-    /// versus the muted highlight on every other occurrence (VS Code's
-    /// current-vs-other match colours).
-    current_match: Option<(i32, usize, usize)>,
+    /// The active match painted in the brighter accent, versus the muted
+    /// highlight on every other occurrence (VS Code's current-vs-other match
+    /// colours). Stored as `(clock_rec, line_rec, col, len)` — the line is
+    /// anchored on the scroll clock like annotations and hints, so streaming
+    /// output moves the bright cell with its text instead of leaving it
+    /// parked on a viewport row.
+    current_match: Option<(i64, i32, usize, usize)>,
     /// Latched by the event listener when the child rings BEL; drained by
     /// [`Self::take_bell`].
     bell: Arc<AtomicBool>,
@@ -1140,6 +1143,27 @@ impl PtyTerminal {
         (lines, top)
     }
 
+    /// [`Self::grid_lines`] plus the scroll-clock reading, captured under
+    /// ONE term lock. Terminal find stamps its match anchor with the clock;
+    /// separate reads would let output land between them and mis-pair a
+    /// line with a reading it wasn't captured at.
+    pub fn grid_lines_and_clock(&self) -> (Vec<String>, i32, i64) {
+        let term = self.term.lock();
+        if term.columns() == 0 {
+            return (Vec::new(), 0, self.clock_now(&term));
+        }
+        let top = term.grid().topmost_line().0;
+        let bottom = term.screen_lines() as i32 - 1;
+        let mut lines = Vec::new();
+        let mut l = top;
+        while l <= bottom {
+            let (s, _cols) = row_text_and_cols(&term, l);
+            lines.push(s.trim_end().to_string());
+            l += 1;
+        }
+        (lines, top, self.clock_now(&term))
+    }
+
     /// The OSC 8 hyperlink URI stored under viewport cell `(row, col)`, if
     /// any. Hyperlinked cells carry the URI invisibly; the app's
     /// Cmd/Ctrl+click handler checks this before the plain-text URL regex.
@@ -1166,9 +1190,12 @@ impl PtyTerminal {
     }
 
     /// Mark which occurrence is the active match `(abs_line, col, len)` so the
-    /// render loop paints it in the brighter accent.
-    pub fn set_current_match(&mut self, m: Option<(i32, usize, usize)>) {
-        self.current_match = m;
+    /// render loop paints it in the brighter accent. `clock` is the
+    /// scroll-clock reading the line was captured against (the
+    /// [`Self::grid_lines_and_clock`] snapshot); the render re-bases per
+    /// frame so the highlight follows its text through streaming output.
+    pub fn set_current_match(&mut self, m: Option<(i32, usize, usize)>, clock: i64) {
+        self.current_match = m.map(|(line, col, len)| (clock, line, col, len));
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -2501,6 +2528,12 @@ impl PtyTerminal {
         self.hints.is_some()
     }
 
+    /// Test-only: whether a find highlight needle is currently set.
+    #[cfg(test)]
+    pub fn has_search_for_test(&self) -> bool {
+        self.search_needle.is_some()
+    }
+
     /// Test-only: the raw state behind the corrected selection accessors —
     /// (stored selection, sel_scrolled, clock_base, alt anchor top, alt
     /// mode) — for diagnosing drift math from app-level tests.
@@ -3527,6 +3560,13 @@ impl Widget for &mut PtyTerminal {
             .as_ref()
             .map_or(0, |(c0, _)| (self.clock_now(&term) - c0) as i32);
 
+        // The active find match, re-based to the current clock the same way
+        // (its stored line drifts by exactly the rows scrolled since it was
+        // anchored, so the bright cell stays glued to its text).
+        let active_match: Option<(i32, usize, usize)> = self
+            .current_match
+            .map(|(c0, l, c, n)| (l - (self.clock_now(&term) - c0) as i32, c, n));
+
         for y in 0..rows {
             // Find matches on this row once, then paint them per cell below.
             // Match positions are char indices in the spacer-skipped row text
@@ -3539,7 +3579,7 @@ impl Widget for &mut PtyTerminal {
                 for (mc, ml) in
                     crate::widgets::editor_find::line_matches(&text, self.search_opts, needle)
                 {
-                    let active = self.current_match == Some((row_line_idx, mc, ml));
+                    let active = active_match == Some((row_line_idx, mc, ml));
                     for k in mc..mc + ml {
                         if let Some(&col) = colmap.get(k) {
                             paint[col] = if active { 2 } else { 1 };

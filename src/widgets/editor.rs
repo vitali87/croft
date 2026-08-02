@@ -3320,6 +3320,11 @@ impl Editor {
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
+        // A whole-buffer swap invalidates both history stacks: a redo/undo
+        // popped afterwards would reinstate the buffer as decoded under the
+        // OLD encoding, silently discarding the re-decode.
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
         self.scroll = 0;
@@ -11455,6 +11460,33 @@ mod tests {
         let after_undo = e.edit_seq;
         assert!(e.redo());
         assert!(e.edit_seq > after_undo, "redo must bump edit_seq");
+    }
+
+    /// "Reopen with Encoding" swaps the whole buffer for a re-decode of the
+    /// file on disk, like every other whole-buffer replacement — and like
+    /// them it must clear BOTH history stacks: a redo popped after the swap
+    /// used to reinstate the entire buffer as decoded under the OLD
+    /// encoding (plus its dirty flag), silently discarding the re-decode.
+    #[test]
+    fn reopening_with_an_encoding_clears_both_history_stacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("enc.txt");
+        std::fs::write(&path, "plain\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        e.insert_char('x');
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["plain".to_string()], "staging: edit undone");
+        e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
+        assert!(
+            !e.redo(),
+            "redo must not resurrect the buffer decoded under the old encoding"
+        );
+        assert!(
+            !e.undo(),
+            "undo history from before the re-decode is equally stale"
+        );
+        assert_eq!(e.lines, vec!["plain".to_string()]);
     }
 
     #[test]
