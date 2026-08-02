@@ -353,10 +353,18 @@ fn panel_band_rect(band: Rect, alignment: PanelAlignment) -> Rect {
 }
 
 /// Centered popup geometry for frames of any size. Min bounds cap at the
-/// frame because Ord::clamp panics on min > max.
+/// frame because Ord::clamp panics on min > max, and a frame with no
+/// cells on an axis gets no popup at all.
 fn fallback_popup_rect(full: Rect, max_w_cap: u16) -> Rect {
-    let max_w = max_w_cap.min(full.width).max(1);
-    let max_h = full.height.max(1);
+    if full.width == 0 || full.height == 0 {
+        return Rect {
+            width: 0,
+            height: 0,
+            ..full
+        };
+    }
+    let max_w = max_w_cap.min(full.width);
+    let max_h = full.height;
     let width = (full.width.saturating_mul(7) / 10).clamp(40.min(max_w), max_w);
     let height = (full.height.saturating_mul(6) / 10).clamp(10.min(max_h), max_h);
     Rect {

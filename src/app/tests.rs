@@ -22880,6 +22880,22 @@ fn the_history_popup_survives_a_tiny_frame() {
     term.draw(|f| app.render(f)).unwrap();
 }
 
+/// A zero-sized frame (a host window mid-collapse) has no cells at all:
+/// the fallback geometry used to floor each axis to one cell, handing
+/// back a 1×1 popup that sits outside the frame it was asked to fit.
+#[test]
+fn a_zero_sized_frame_gets_no_fallback_popup() {
+    let r = fallback_popup_rect(Rect::new(0, 0, 0, 0), 100);
+    assert_eq!(r.area(), 0, "no cells exist to draw into: {r:?}");
+    let r = fallback_popup_rect(Rect::new(0, 0, 80, 0), 110);
+    assert_eq!(r.area(), 0, "a zero-height frame cannot host rows: {r:?}");
+    let r = fallback_popup_rect(Rect::new(2, 3, 30, 8), 110);
+    assert!(
+        r.x >= 2 && r.y >= 3 && r.right() <= 32 && r.bottom() <= 11,
+        "a real frame keeps the popup inside it: {r:?}"
+    );
+}
+
 /// vim's `e` at the last word of a row hops to the next row's first word
 /// end, exactly like `w` and `b` already wrap; it used to be a dead key
 /// there because the scan ran into the row's trailing padding.
