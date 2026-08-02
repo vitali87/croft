@@ -62,18 +62,26 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Command decoration dots stay honest: clearing the pane used to invert every mark's position math so stale dots later resurfaced on unrelated rows, where their menu copied or re-ran the wrong text; marks now ride the scroll clock (stable past a full scrollback too) and clears drop them.",
+        summary: "Cmd-clicking a terminal hyperlink only opens web links now: an OSC 8 cell can carry any URI behind unrelated visible text, and a file:// or custom-scheme target would have launched an arbitrary application off one disguised click. Non-web links are refused with the real destination shown in the status bar.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "In bash with an array PROMPT_COMMAND (ble.sh, prompt frameworks), pressing Enter at an empty prompt no longer fabricates a phantom finished command that hijacked Cmd+K Shift+R/C/S.",
+        summary: "Ctrl+F reaches the program in the terminal again on macOS (vim's page-forward, the shell's forward-char); find-in-terminal lives on Cmd+F there, matching VS Code and iTerm2. Linux keeps Ctrl+F opening find.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A pane SSH'd into a remote host no longer leaks the remote directory into local actions: splits and session restore only trust the shell-reported cwd when this machine reported it and the kernel confirms the shell really is in that directory.",
+        summary: "Find-in-terminal is bound to the pane it opened on: switching panes closes it and clears its highlight, instead of leaving the old pane lit forever and aiming Enter/Shift+Enter at the wrong pane's scrollback.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Directories with percent escapes in their names (a literal %41) survive the shell integration round trip: zsh and bash now escape the % like fish always did.",
+        summary: "The active find match rides the scroll clock: output streaming under an open find bar no longer detaches the bright highlight from its text or makes next/previous walk from a phantom row.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Reopen with Encoding clears the undo/redo history: a redo after re-decoding could silently reinstate the whole buffer as decoded under the previous encoding.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Clearing a terminal truly empties its scrollback now: the erase order used to slide the cleared screen contents into scrollback, still reachable by scrolling up.",
     },
 ];

@@ -2614,9 +2614,18 @@ pub struct App {
     /// scrollback (like iTerm2 / Ghostty scrollback search). Reuses the
     /// editor find widget; the replace row is never shown. None when closed.
     pub terminal_find: Option<crate::widgets::editor_find::EditorFind>,
-    /// The active terminal-find match as `(abs_grid_line, col, len)`, the
-    /// anchor next/prev navigation walks from. None until the first match.
-    terminal_find_match: Option<(i32, usize, usize)>,
+    /// The pane index `terminal_find` opened on. Find is bound to that pane
+    /// like quick-select and copy mode: a gesture that activates a sibling
+    /// closes it (per-frame invariant in `sync_focus_flags`), so its
+    /// highlight and jump anchor never stray onto another pane's grid.
+    terminal_find_pane: usize,
+    /// The active terminal-find match as `(clock, abs_grid_line, col, len)`,
+    /// the anchor next/prev navigation walks from — the line is stamped with
+    /// the scroll-clock reading of the snapshot it was found in, and every
+    /// use re-bases it first, so output streaming under an open find bar
+    /// cannot leave navigation walking from a phantom row. None until the
+    /// first match.
+    terminal_find_match: Option<(i64, i32, usize, usize)>,
     /// Ctrl+Shift+Space quick-select hint mode on the active terminal pane
     /// (WezTerm's quick-select): every labelled match on the viewport plus
     /// the label prefix typed so far. None when the mode is off.
@@ -3632,6 +3641,7 @@ impl App {
             },
             editor_find: None,
             terminal_find: None,
+            terminal_find_pane: 0,
             terminal_find_match: None,
             terminal_quick_select: None,
             // Under test, both durable stores point at per-process scratch
@@ -9521,6 +9531,23 @@ impl App {
     fn clear_terminal_at(&mut self, idx: usize) {
         if let Some(t) = self.terminals.get_mut(idx) {
             t.clear_screen_and_scrollback();
+            // The cleared grid invalidates find's state on this pane: the
+            // anchored match names content that no longer exists (and the
+            // clear can kill the scroll clock's tracer), so navigation
+            // restarts from scratch and the count reflects the empty grid.
+            if self.terminal_find.is_some() && self.terminal_find_pane == idx {
+                self.terminal_find_match = None;
+                self.terminals[idx].set_current_match(None, 0);
+                let (lines, _top) = self.terminals[idx].grid_lines();
+                if let Some(state) = self.terminal_find.as_mut() {
+                    state.match_count = crate::widgets::editor_find::count_matches(
+                        &lines,
+                        &state.query,
+                        state.opts,
+                    );
+                    state.match_index = None;
+                }
+            }
             self.status = String::from("Cleared terminal");
         }
     }
@@ -9955,6 +9982,10 @@ impl App {
             .is_some_and(|st| st.pane != self.active_terminal)
         {
             self.close_terminal_quick_select();
+        }
+        // Terminal find is pane-bound the same way.
+        if self.terminal_find.is_some() && self.terminal_find_pane != self.active_terminal {
+            self.close_terminal_find();
         }
         self.tree.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
         self.search.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Search;
@@ -20276,11 +20307,12 @@ impl App {
             self.open_command_history();
             return;
         }
-        // Cmd+F / Ctrl+F: open find-in-terminal (scrollback search), like
-        // iTerm2 / Ghostty. The chord is intercepted here rather than
-        // forwarded to the inner program, matching how real terminals reserve
-        // it for their own find.
-        if is_editor_find_key(key) {
+        // Open find-in-terminal (scrollback search). Cmd+F everywhere;
+        // Ctrl+F only off macOS, matching VS Code's terminal find defaults:
+        // on macOS Ctrl+F is a control byte the child owns (vim page-forward,
+        // emacs forward-char) and iTerm2/VS Code pass it through, while on
+        // Linux/Windows Ctrl+F opening find IS the VS Code default.
+        if is_terminal_find_key(key) {
             self.open_terminal_find();
             return;
         }
@@ -21671,7 +21703,21 @@ impl App {
     /// dev-server URL is forwarded home and opened; any other link opens on the
     /// local Mac through the drop relay (with the usual confirm gate). On a
     /// local session everything opens directly.
+    ///
+    /// Web links only: an OSC 8 cell carries whatever URI the printing
+    /// program chose while showing unrelated text, so a file:// or
+    /// custom-scheme URI would hand `open`/`xdg-open` an arbitrary target
+    /// (app launch, protocol handler) off one disguised click. The refusal
+    /// surfaces the real destination in the status line.
     fn open_detected_url(&mut self, url: &str) {
+        let scheme_ok = {
+            let l = url.trim_start().to_ascii_lowercase();
+            l.starts_with("http://") || l.starts_with("https://")
+        };
+        if !scheme_ok {
+            self.status = format!("Refused to open non-web link: {url}");
+            return;
+        }
         let loopback = crate::port_detect::loopback_url_port(url);
         if self.drop_relay_active() {
             if let Some(port) = loopback {
@@ -23592,6 +23638,7 @@ impl App {
         };
         state.match_count = crate::widgets::editor_find::count_matches(&lines, &initial, opts);
         self.terminal_find = Some(state);
+        self.terminal_find_pane = self.active_terminal;
         self.terminal_find_match = None;
         self.terminal_mut()
             .set_search((!initial.is_empty()).then(|| initial.clone()), opts);
@@ -23608,8 +23655,13 @@ impl App {
         if self.terminal_find.take().is_some() {
             self.terminal_find_match = None;
             let opts = self.search.opts;
-            self.terminal_mut().set_search(None, opts);
-            self.terminal_mut().set_current_match(None);
+            // Clear every pane, not just the active one: the close may be
+            // the pane-binding invariant firing after `active_terminal`
+            // already moved off the pane that owns the highlight.
+            for t in &mut self.terminals {
+                t.set_search(None, opts);
+                t.set_current_match(None, 0);
+            }
         }
     }
 
@@ -23627,7 +23679,7 @@ impl App {
         self.terminal_find_match = None;
         self.terminal_mut()
             .set_search((!new_query.is_empty()).then(|| new_query.clone()), opts);
-        self.terminal_mut().set_current_match(None);
+        self.terminal_mut().set_current_match(None, 0);
         if !new_query.is_empty() {
             self.terminal_find_jump(false);
         }
@@ -23646,13 +23698,17 @@ impl App {
         if needle.is_empty() {
             return;
         }
-        let (lines, top) = self.terminal().grid_lines();
+        let (lines, top, now) = self.terminal().grid_lines_and_clock();
         if lines.is_empty() {
             return;
         }
         let anchor = self.terminal_find_match;
         let (from_row, from_col) = match anchor {
-            Some((abs, col, _len)) => {
+            Some((clock, abs, col, _len)) => {
+                // Re-base the stored line by the rows scrolled since it was
+                // anchored, so navigation walks from the match's TEXT, not
+                // from the viewport row it occupied at anchor time.
+                let abs = abs - (now - clock) as i32;
                 let row = (abs - top).clamp(0, lines.len() as i32 - 1) as usize;
                 (row, col)
             }
@@ -23684,9 +23740,9 @@ impl App {
             return;
         };
         let abs_line = top + m.row as i32;
-        self.terminal_find_match = Some((abs_line, m.col_chars, m.len_chars));
+        self.terminal_find_match = Some((now, abs_line, m.col_chars, m.len_chars));
         self.terminal_mut()
-            .set_current_match(Some((abs_line, m.col_chars, m.len_chars)));
+            .set_current_match(Some((abs_line, m.col_chars, m.len_chars)), now);
         self.terminal_mut().scroll_to_line(abs_line);
         let idx =
             crate::widgets::editor_find::match_index_at(&lines, &needle, opts, m.row, m.col_chars);
@@ -26539,6 +26595,10 @@ impl App {
                             .is_some_and(|st| st.pane != idx)
                         {
                             self.close_terminal_quick_select();
+                        }
+                        // As is the find bar and its highlight.
+                        if self.terminal_find.is_some() && self.terminal_find_pane != idx {
+                            self.close_terminal_find();
                         }
                         self.active_terminal = idx;
                     }
@@ -30178,6 +30238,17 @@ fn is_editor_find_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// The terminal pane's find chord: Cmd+F everywhere, plus Ctrl+F off macOS
+/// only (VS Code's terminal find defaults). On macOS Ctrl+F must reach the
+/// child as 0x06 — it is a control byte programs bind — so the editor's
+/// looser Ctrl-or-Cmd predicate must not gate the terminal pane there.
+fn is_terminal_find_key(key: KeyEvent) -> bool {
+    if !is_editor_find_key(key) {
+        return false;
+    }
+    cfg!(not(target_os = "macos")) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// VS Code-style `Cmd+Opt+F` / `Ctrl+Alt+F` inside the editor: open the
