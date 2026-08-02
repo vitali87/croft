@@ -303,6 +303,46 @@ impl ScrollClock {
 /// scrollback with the exit time) and which saturates once the ring fills,
 /// freezing ids to screen positions. Alternate-screen output stamps
 /// nothing: it isn't scrollback rows, and the gutter is normal-screen only.
+/// Destructive-clear detector over the raw PTY byte stream: ED 2
+/// (`\x1b[2J`, erases the live screen), ED 3 (`\x1b[3J`, erases the
+/// scrollback) and RIS (`\x1bc`, both). Keyed on the bytes rather than on
+/// `history_size` movement, which is 0 → 0 when nothing has scrolled into
+/// history yet. A three-byte carry catches a sequence split across reads.
+/// Ceiling (ponytail): the verdict is per-chunk, so a wipe followed by an
+/// alt-screen entry in the SAME read is attributed to the alt screen and
+/// skipped; interleaving with the advance would need per-segment scans.
+#[derive(Default)]
+struct WipeSniffer {
+    carry: Vec<u8>,
+}
+
+impl WipeSniffer {
+    /// Returns (screen wiped, history wiped) for this chunk.
+    fn scan(&mut self, chunk: &[u8]) -> (bool, bool) {
+        let mut screen = false;
+        let mut hist = false;
+        let mut probe = std::mem::take(&mut self.carry);
+        probe.extend_from_slice(chunk);
+        for w in probe.windows(2) {
+            if w == b"\x1bc" {
+                screen = true;
+                hist = true;
+            }
+        }
+        for w in probe.windows(4) {
+            if w == b"\x1b[2J" {
+                screen = true;
+            } else if w == b"\x1b[3J" {
+                hist = true;
+            }
+        }
+        let keep = probe.len().min(3);
+        probe.drain(..probe.len() - keep);
+        self.carry = probe;
+        (screen, hist)
+    }
+}
+
 fn stamp_chunk(
     term: &mut Term<VoidListener>,
     clock: &mut ScrollClock,
@@ -1196,6 +1236,7 @@ impl PtyTerminal {
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut port_sniffer = crate::port_detect::PortSniffer::new();
             let mut osc_sniffer = crate::shell_integration::OscSniffer::default();
+            let mut wipe_sniffer = WipeSniffer::default();
             let mut trigger_scanner = crate::triggers::TriggerScanner::new();
             let mut trigger_hits = Vec::new();
             // Per-pane monotonic id for captured inline images; the overlay
@@ -1221,8 +1262,8 @@ impl PtyTerminal {
                         // the mark landed (alacritty drops the sequences
                         // themselves as unknown OSC).
                         let osc_events = osc_sniffer.scan(&buf[..n]);
+                        let (screen_wiped, hist_wiped) = wipe_sniffer.scan(&buf[..n]);
                         let mut t = term_for_thread.lock();
-                        let hist_before = t.grid().history_size();
                         let mut done = 0usize;
                         for (end, ev) in osc_events {
                             processor.advance(&mut *t, &buf[done..end]);
@@ -1319,12 +1360,22 @@ impl PtyTerminal {
                             }
                         }
                         processor.advance(&mut *t, &buf[done..n]);
-                        // Scrollback shrank mid-chunk: only ED 3 (`clear`
-                        // via modern terminfo) or a full reset does that,
-                        // and both erase the content the pane's captured
-                        // images anchored to.
-                        if t.grid().history_size() < hist_before {
-                            images_for_thread.lock().unwrap().clear();
+                        // A destructive clear erases the content the pane's
+                        // captured images anchored to: ED 2 the live screen
+                        // rows, ED 3 the scrollback ones, RIS both. Inside
+                        // the alt screen the sequences touch the alternate
+                        // grid, so primary-screen images are untouched.
+                        if (screen_wiped || hist_wiped) && !t.mode().contains(TermMode::ALT_SCREEN)
+                        {
+                            let mut imgs = images_for_thread.lock().unwrap();
+                            if !imgs.is_empty() {
+                                let now = clock_for_thread.lock().unwrap().tick(&mut t);
+                                imgs.retain(|m| {
+                                    let line = m.line_rec - (now - m.clock_rec) as i32;
+                                    let wiped = if line >= 0 { screen_wiped } else { hist_wiped };
+                                    !wiped
+                                });
+                            }
                         }
                         // Stamp newly-arrived rows for the timestamps gutter:
                         // every row the cursor moved past in this chunk gets
@@ -5984,6 +6035,40 @@ mod tests {
         assert!(
             term.pane_images().is_empty(),
             "an ED 3 scrollback wipe from the program must drop the pane's images"
+        );
+    }
+
+    /// A wipe with EMPTY scrollback (picture captured on the first screen,
+    /// nothing scrolled into history yet) must drop the image too: the
+    /// history-shrink heuristic saw 0 → 0 and kept the stale overlay.
+    #[test]
+    fn a_zero_history_screen_wipe_drops_captured_images() {
+        use base64::Engine;
+        let mut png_buf = Vec::new();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_buf),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+        let tmp = tempfile::tempdir().unwrap();
+        let script = format!(
+            "printf '\\033]1337;File=inline=1:{b64}\\007\\n'; read x; printf '\\033[2J\\033[3J\\033[H'; printf 'wiped\\n'; sleep 30"
+        );
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script], tmp.path()).unwrap();
+        let mut waited = 0u32;
+        while term.pane_images().is_empty() {
+            assert!(waited < 8000, "inline image never captured");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        term.write_input(b"\n");
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.starts_with("wiped")));
+        assert!(
+            term.pane_images().is_empty(),
+            "a screen wipe with empty history must still drop the pane's images"
         );
     }
 
