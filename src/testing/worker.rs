@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 
 use super::model::{Activity, TestCase, TestStatus};
+use super::regex_escape;
 use super::parse::{
     parse_jest_json, parse_list_line, parse_pytest_collect_line, parse_pytest_line,
     parse_test_line, parse_vitest_list_line, parse_vitest_tap_line,
@@ -39,9 +40,13 @@ pub enum TestRequest {
     RunAll,
     /// Run a single test by its exact name (click-to-run from the tree).
     RunOne(String),
-    /// Run every test whose name contains the string (a suite, or run-at-cursor
-    /// by function name). cargo's name filter is a substring match.
+    /// Run every test whose name contains the string (run-at-cursor by
+    /// function name). cargo's name filter is a substring match.
     RunFilter(String),
+    /// Run a whole suite by its unanchored name (a header click). The cargo
+    /// arm anchors it with [`super::suite_pattern`] so `parse` cannot sweep
+    /// `parse_utils::b`; pytest gets it positionally as a node-ID prefix.
+    RunSuite(String),
     Discover,
     /// Rebind the worker's working directory (Explorer re-root). Without it the
     /// worker keeps shelling cargo in the launch dir captured at spawn, so after
@@ -131,6 +136,10 @@ impl TestWorker {
         let _ = self.request_tx.send(TestRequest::RunFilter(pattern));
     }
 
+    pub fn run_suite(&self, suite: String) {
+        let _ = self.request_tx.send(TestRequest::RunSuite(suite));
+    }
+
     pub fn discover(&self) {
         let _ = self.request_tx.send(TestRequest::Discover);
     }
@@ -200,7 +209,8 @@ fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, Te
         match req {
             TestRequest::RunAll => run_all(&root, &etx),
             TestRequest::RunOne(name) => run_one(&root, &etx, &name),
-            TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern),
+            TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern, false),
+            TestRequest::RunSuite(suite) => run_filter(&root, &etx, &suite, true),
             TestRequest::Discover => discover(&root, &etx),
             TestRequest::SetRoot(p) => {
                 root = p;
@@ -321,19 +331,6 @@ fn js_cmd<S: AsRef<std::ffi::OsStr>>(root: &Path, runner: &str, args: &[S]) -> C
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
-}
-
-/// Escape a test title for jest's `-t`, which is a REGEX matched against the
-/// full name; titles routinely contain `(`, `?`, `$`.
-fn regex_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if "\\^$.|?*+()[]{}".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// Split a croft JS node ID (`file::describe...::test`) into its file and an
@@ -760,14 +757,15 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
     tx.send(TestResponse::Finished { ok: Some(ok) });
 }
 
-/// Run every test matching a name filter. cargo's positional filter is a
-/// substring match, so the suite prefix or a bare fn name both work. pytest
+/// Run every test matching a name filter. `suite` marks a header click: the
+/// cargo arm then anchors the pattern with [`super::suite_pattern`], since a
+/// bare substring like `parse` would also sweep `parse_utils::b`. pytest
 /// splits the two shapes: a suite is a node-ID prefix (`tests/test_x.py`,
 /// `tests/test_x.py::TestGroup`) passed positionally, a bare function name
 /// (run-at-cursor) goes through `-k`, pytest's substring matcher. Like
 /// [`run_one`], the app has already marked the affected cases and shown the
 /// busy state, so no `Started` is sent.
-fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
+fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
     // See run_all: `None` refuses instead of falling through to cargo, and
     // `Refused` (not a bare Finished) rolls back the filtered Running marks.
     let Some(runner) = runner_for(root) else {
@@ -792,6 +790,13 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
         Runner::Cargo => {
+            let anchored;
+            let pattern = if suite {
+                anchored = super::suite_pattern(pattern);
+                &anchored
+            } else {
+                pattern
+            };
             let cmd = cargo_cmd(root, &["test", pattern, "--no-fail-fast", "--color=never"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
@@ -873,7 +878,8 @@ mod tests {
         let etx = EpochTx { tx: &tx, epoch: 0 };
         run_all(tmp.path(), &etx);
         run_one(tmp.path(), &etx, "a::b");
-        run_filter(tmp.path(), &etx, "a");
+        run_filter(tmp.path(), &etx, "a", false);
+        run_filter(tmp.path(), &etx, "a", true);
         discover(tmp.path(), &etx);
         let msgs: Vec<TestResponse> = rx.try_iter().map(|(_, r)| r).collect();
         assert!(
@@ -884,7 +890,7 @@ mod tests {
             msgs.iter()
                 .filter(|m| matches!(m, TestResponse::Refused))
                 .count(),
-            4,
+            5,
             "each refused request must answer with Refused, not a bare Finished"
         );
         assert!(

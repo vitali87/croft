@@ -55,8 +55,9 @@ pub struct TestingPanel {
     /// result lines stream in.
     cases: Vec<TestCase>,
     activity: Activity,
-    /// `Some(ok)` after a run completes (`ok` = the runner exited 0). Drives the
-    /// summary line; `None` before the first run.
+    /// `Some(ok)` after a run completes (`ok` = the runner exited 0); `None`
+    /// before the first run. Surfaces a failed run that reported no Failed
+    /// case (compile error, zero matching tests) in the summary line.
     last_run_ok: Option<bool>,
     /// Latest cargo build-status line while busy (e.g. "Compiling ratatui"), so
     /// a long compile shows movement instead of a static "Discovering tests".
@@ -183,11 +184,27 @@ impl TestingPanel {
     }
 
     /// A run or discovery finished. `ok` is the runner's exit success for a run,
-    /// or `None` for discovery (which reports no pass/fail).
+    /// or `None` for discovery (which reports no pass/fail). A marked case the
+    /// run never reported (compile error, a test renamed since discovery) is
+    /// rolled back like a refusal — its old result returns, a start-inserted
+    /// case disappears — instead of spinning its Running dot forever.
     pub fn on_finished(&mut self, ok: Option<bool>) {
         self.activity = Activity::Idle;
         self.progress = None;
-        self.prerun.clear();
+        for (name, old) in std::mem::take(&mut self.prerun) {
+            let Some(i) = self.cases.iter().position(|c| c.name == name) else {
+                continue;
+            };
+            if self.cases[i].status != TestStatus::Running {
+                continue; // it reported: keep the fresh result
+            }
+            match old {
+                Some(status) => self.cases[i].status = status,
+                None => {
+                    self.cases.remove(i);
+                }
+            }
+        }
         if ok.is_some() {
             self.last_run_ok = ok;
         }
@@ -333,6 +350,22 @@ impl TestingPanel {
         }
     }
 
+    /// A named case's current status, for tests that assert run marking.
+    #[cfg(test)]
+    pub fn status_of(&self, name: &str) -> Option<TestStatus> {
+        self.cases.iter().find(|c| c.name == name).map(|c| c.status)
+    }
+
+    /// The full name of the ONLY discovered case whose leaf matches, or
+    /// `None` when the tree is empty, stale, or the leaf ambiguous — the
+    /// caller then falls back to a substring run. Lets run-at-cursor target
+    /// `parse::run` exactly instead of every test containing `run`.
+    pub fn sole_case_with_leaf(&self, leaf: &str) -> Option<String> {
+        let mut it = self.cases.iter().filter(|c| c.suite_and_leaf().1 == leaf);
+        let first = it.next()?;
+        it.next().is_none().then(|| first.name.clone())
+    }
+
     /// Build the flat render-row list: a header per suite followed by its cases,
     /// in the cases' sorted order.
     fn build_rows(&mut self) {
@@ -405,10 +438,10 @@ impl Widget for &mut TestingPanel {
         // bleeds past the panel into the neighbouring pane.
         let right = inner.x + inner.width;
         let text_right = right.saturating_sub(1);
-        let clip = |s: &str, start_x: u16| -> String {
-            let avail = text_right.saturating_sub(start_x) as usize;
-            s.chars().take(avail).collect()
-        };
+        // Column budget up to the scrollbar lane. `set_stringn` clips by
+        // DISPLAY width, so a double-width (CJK) name stops at the budget
+        // instead of painting twice it and bleeding through the border.
+        let avail = |start_x: u16| text_right.saturating_sub(start_x) as usize;
 
         // Summary line: busy state, the pass/fail/skip tally, or a kickoff hint.
         let (passed, failed, skipped) = self.counts();
@@ -418,30 +451,49 @@ impl Widget for &mut TestingPanel {
                 Activity::Discovering => "Discovering tests",
                 _ => "Running tests",
             };
-            buf.set_string(
+            buf.set_stringn(
                 inner.x + 1,
                 summary_y,
-                clip(label, inner.x + 1),
+                label,
+                avail(inner.x + 1),
                 Style::default().fg(self.theme.accent()),
             );
         } else if self.cases.is_empty() {
-            buf.set_string(
+            // A run that wiped the tree and then failed (compile error on a
+            // full run) must not hide behind the kickoff hint.
+            let (text, color) = if self.last_run_ok == Some(false) {
+                ("Run failed", self.theme.git_deleted())
+            } else {
+                ("Run All Tests (Enter)", COLOR_DIM)
+            };
+            buf.set_stringn(
                 inner.x + 1,
                 summary_y,
-                clip("Run All Tests (Enter)", inner.x + 1),
-                Style::default().fg(COLOR_DIM),
+                text,
+                avail(inner.x + 1),
+                Style::default().fg(color),
             );
         } else {
-            let summary = format!("{passed} passed · {failed} failed · {skipped} skipped");
-            let color = if failed > 0 {
+            // A nonzero runner exit with no Failed case in the tree (compile
+            // error, a filter matching nothing) would otherwise keep the old
+            // green tally: say so.
+            let run_failed = self.last_run_ok == Some(false) && failed == 0;
+            // The marker leads so a narrow panel cannot clip it away.
+            let summary = if run_failed {
+                format!("run failed · {passed} passed · {skipped} skipped")
+            } else {
+                format!("{passed} passed · {failed} failed · {skipped} skipped")
+            };
+            let color = if failed > 0 || run_failed {
                 self.theme.git_deleted()
             } else {
                 self.theme.git_added()
             };
-            buf.set_string(
+            buf.set_stringn(
                 inner.x + 1,
                 summary_y,
-                clip(&summary, inner.x + 1),
+                &summary,
+                avail(inner.x + 1),
                 Style::default().fg(color),
             );
         }
@@ -458,10 +510,11 @@ impl Widget for &mut TestingPanel {
             && let Some(p) = &self.progress
             && body_h > 0
         {
-            buf.set_string(
+            buf.set_stringn(
                 inner.x + 1,
                 body_y0,
-                clip(p, inner.x + 1),
+                p,
+                avail(inner.x + 1),
                 Style::default().fg(COLOR_DIM),
             );
         }
@@ -491,10 +544,11 @@ impl Widget for &mut TestingPanel {
                         GLYPH_PLAY.to_string(),
                         Style::default().fg(COLOR_DIM),
                     );
-                    buf.set_string(
+                    buf.set_stringn(
                         inner.x + 3,
                         y,
-                        clip(suite, inner.x + 3),
+                        suite,
+                        avail(inner.x + 3),
                         Style::default()
                             .fg(COLOR_HEADER)
                             .add_modifier(Modifier::BOLD),
@@ -510,10 +564,11 @@ impl Widget for &mut TestingPanel {
                         glyph.to_string(),
                         Style::default().fg(color),
                     );
-                    buf.set_string(
+                    buf.set_stringn(
                         inner.x + 4,
                         y,
-                        clip(leaf, inner.x + 4),
+                        leaf,
+                        avail(inner.x + 4),
                         Style::default().fg(COLOR_CASE),
                     );
                 }
@@ -654,6 +709,109 @@ mod tests {
             t.status,
             TestStatus::Passed,
             "reset drops the old snapshot, so a later refusal restores nothing"
+        );
+    }
+
+    /// A run can complete without ever reporting a case it marked Running: a
+    /// compile error (diagnostics only, no `test ...` lines), a test renamed
+    /// since discovery (`--exact` matches nothing), a suite whose module no
+    /// longer builds. The finish must roll those marks back like a refusal
+    /// does, or the accent dot spins forever on a run that already died.
+    #[test]
+    fn a_finished_run_rolls_back_cases_that_never_reported() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "m::a".into(),
+            status: TestStatus::Passed,
+        });
+        p.on_finished(Some(true));
+
+        // Compile error: the run reports nothing for the marked case.
+        p.start_single("m::a");
+        p.on_finished(Some(false));
+        let a = p.cases.iter().find(|c| c.name == "m::a").unwrap();
+        assert_eq!(
+            a.status,
+            TestStatus::Passed,
+            "a case the run never reported gets its old result back"
+        );
+
+        // A start-inserted case disappears again instead of lingering.
+        p.start_single("m::renamed");
+        p.on_finished(Some(false));
+        assert!(
+            !p.cases.iter().any(|c| c.name == "m::renamed"),
+            "a case the start inserted is removed when the run never reports it"
+        );
+
+        // A case that DID report keeps its fresh result, not the snapshot.
+        p.start_single("m::a");
+        p.apply_case(TestCase {
+            name: "m::a".into(),
+            status: TestStatus::Failed,
+        });
+        p.on_finished(Some(false));
+        let a = p.cases.iter().find(|c| c.name == "m::a").unwrap();
+        assert_eq!(a.status, TestStatus::Failed);
+    }
+
+    /// A failed run whose failure never reached the tree (compile error, zero
+    /// matching tests) must still be visible: the summary carries a "run
+    /// failed" marker whenever the runner exited nonzero but no case shows
+    /// Failed. Without it the panel silently keeps the old green tally.
+    #[test]
+    fn a_failed_run_with_no_reported_failure_is_visible_in_the_summary() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "m::a".into(),
+            status: TestStatus::Passed,
+        });
+        p.on_finished(Some(true));
+        p.start_single("m::a");
+        p.on_finished(Some(false)); // compile error: nothing reported
+
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let summary: String = (0..40).map(|x| buf[(x, 2)].symbol()).collect();
+        assert!(
+            summary.contains("run failed"),
+            "a nonzero exit with no Failed case must say so, got {summary:?}"
+        );
+    }
+
+    /// Double-width characters in a test name must clip to display columns,
+    /// not chars: counting chars lets a CJK name paint twice its budget and
+    /// overwrite the scrollbar lane and the panel's right border.
+    #[test]
+    fn wide_characters_never_bleed_past_the_scrollbar_lane() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "套件::测试用例的名字很长很长很长很长很长".into(),
+            status: TestStatus::Passed,
+        });
+        p.on_finished(Some(true));
+
+        // The buffer is the whole frame, wider than the panel: ratatui only
+        // clips at the frame edge, so the panel must clip itself.
+        let area = Rect::new(0, 0, 20, 10);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 10));
+        (&mut p).render(area, &mut buf);
+        for y in 1..9 {
+            assert_eq!(
+                buf[(19, y)].symbol(),
+                "│",
+                "the right border at row {y} must survive a wide-char name"
+            );
+        }
+        let bled: String = (20..40).map(|x| buf[(x, 4)].symbol()).collect();
+        assert_eq!(
+            bled.trim(),
+            "",
+            "nothing may paint past the panel into the neighbouring pane"
         );
     }
 

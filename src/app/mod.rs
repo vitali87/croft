@@ -2048,6 +2048,13 @@ pub struct App {
     /// TIMELINE once the snapshot actually exists on disk.
     history_done_rx: std::sync::mpsc::Receiver<PathBuf>,
     history_done_tx: std::sync::mpsc::Sender<PathBuf>,
+    /// Replies from the background test-source locator (the workspace grep is
+    /// too slow for the render thread): the root the search ran under, the
+    /// test name, and the hit. A reply from before a re-root is dropped.
+    #[allow(clippy::type_complexity)]
+    test_jump_rx: std::sync::mpsc::Receiver<(PathBuf, String, Option<(PathBuf, u32)>)>,
+    #[allow(clippy::type_complexity)]
+    test_jump_tx: std::sync::mpsc::Sender<(PathBuf, String, Option<(PathBuf, u32)>)>,
     /// Background per-ecosystem dependency-resolution result for DEPENDENCIES.
     deps_rx: std::sync::mpsc::Receiver<Vec<Dependency>>,
     deps_tx: std::sync::mpsc::Sender<Vec<Dependency>>,
@@ -3360,6 +3367,7 @@ impl App {
         let disabled_extensions = loaded_prefs.disabled_extensions.clone();
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
+        let (test_jump_tx, test_jump_rx) = std::sync::mpsc::channel();
         let (graph_tx, graph_rx) = std::sync::mpsc::channel();
         let (blame_tx, blame_rx) = std::sync::mpsc::channel();
         let (deps_tx, deps_rx) = std::sync::mpsc::channel();
@@ -3443,6 +3451,8 @@ impl App {
             timeline_tx,
             history_done_rx,
             history_done_tx,
+            test_jump_rx,
+            test_jump_tx,
             timeline_fetched: None,
             blame_rx,
             blame_tx,
@@ -6681,6 +6691,18 @@ impl App {
                     }
                 }
             }
+        }
+        // A background test-source lookup landed: jump or say it missed. A
+        // reply from before an Explorer re-root names the old root; drop it.
+        while let Ok((root, name, hit)) = self.test_jump_rx.try_recv() {
+            if root != self.workspace_root {
+                continue;
+            }
+            match hit {
+                Some((path, line)) => self.go_to_definition(path, line, 0),
+                None => self.status = format!("No source found for test {name}"),
+            }
+            changed = true;
         }
         // A history snapshot finished writing: refetch the TIMELINE so the
         // new version shows (resetting the marker before the write landed
@@ -13936,28 +13958,34 @@ impl App {
     }
 
     /// Jump the editor to a test's `fn` definition (Cmd/Opt+click in the tree).
-    /// `--list` carries no location, so we grep the source for the function.
+    /// `--list` carries no location, so we grep the source for the function —
+    /// a whole-workspace walk, so it runs on a background thread and the jump
+    /// lands via the drain in [`Self::sync_explorer_panels`].
     fn jump_to_test_source(&mut self, name: String) {
-        match crate::testing::locate::find_test_source(&self.workspace_root, &name) {
-            Some((path, line)) => self.go_to_definition(path, line, 0),
-            None => self.status = format!("No source found for test {name}"),
-        }
+        let root = self.workspace_root.clone();
+        let tx = self.test_jump_tx.clone();
+        self.status = format!("Locating test {name}");
+        std::thread::spawn(move || {
+            let hit = crate::testing::locate::find_test_source(&root, &name);
+            let _ = tx.send((root, name, hit));
+        });
     }
 
-    /// Run every test in a suite (click on its header in the tree). The suite
-    /// name is a prefix of its tests' names, so cargo's substring filter runs
-    /// exactly that module.
+    /// Run every test in a suite (click on its header in the tree). cargo's
+    /// filter and the panel's marking are substring matches, so the pattern is
+    /// anchored (`parse::`) to keep `parse` from sweeping `parse_utils::b`.
     fn run_suite(&mut self, suite: String) {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.testing.start_filter(&suite);
-        self.test_worker.run_filter(suite);
+        self.testing
+            .start_filter(&crate::testing::suite_pattern(&suite));
+        self.test_worker.run_suite(suite);
         self.set_sidebar_view(SidebarView::Testing);
     }
 
     /// Run the test the editor caret sits in (Cmd+K Enter / palette). Finds the
-    /// enclosing `fn` and runs it by name substring; results stream into the
+    /// enclosing `fn` and runs it by name; results stream into the
     /// Testing view like any other run.
     fn run_test_at_cursor(&mut self) {
         let Some(name) =
@@ -13971,14 +13999,25 @@ impl App {
 
     /// Start the test `name` through the worker and reveal the Testing view —
     /// the shared tail of run-at-cursor and the editor's gutter play glyph.
+    /// A leaf unique in the discovered tree resolves to its full name for an
+    /// exact run; otherwise cargo's substring filter is the best available.
     fn run_named_test(&mut self, name: String) {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.testing.start_filter(&name);
-        self.test_worker.run_filter(name.clone());
+        let (run, exact) = match self.testing.sole_case_with_leaf(&name) {
+            Some(full) => (full, true),
+            None => (name, false),
+        };
+        if exact {
+            self.testing.start_single(&run);
+            self.test_worker.run_one(run.clone());
+        } else {
+            self.testing.start_filter(&run);
+            self.test_worker.run_filter(run.clone());
+        }
         self.set_sidebar_view(SidebarView::Testing);
-        self.status = format!("Running test {name}");
+        self.status = format!("Running test {run}");
     }
 
     /// Debug the test the editor caret sits in (Cmd+K Shift+Enter, palette).
