@@ -186,7 +186,13 @@ impl CommandHistory {
     /// occurrence wins, like atuin), case-insensitive substring `query`,
     /// narrowed by `scope` (`cwd` is the pane's current directory for
     /// [`HistoryScope::Dir`]).
-    pub fn search(&self, query: &str, scope: HistoryScope, cwd: &str, host: &str) -> Vec<HistoryEntry> {
+    pub fn search(
+        &self,
+        query: &str,
+        scope: HistoryScope,
+        cwd: &str,
+        host: &str,
+    ) -> Vec<HistoryEntry> {
         let q = query.to_lowercase();
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();

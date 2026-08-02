@@ -1791,7 +1791,13 @@ def f() -> Config:\n\
         let mut reg = LangRegistry::new();
         let src = "let x = 1;\n";
         let ls = compute_line_starts(src.as_bytes());
-        let h = highlight_text_with_palette(&mut reg, LangKind::Rust, src.as_bytes(), &ls, &gruvbox_ish);
+        let h = highlight_text_with_palette(
+            &mut reg,
+            LangKind::Rust,
+            src.as_bytes(),
+            &ls,
+            &gruvbox_ish,
+        );
         let slate = Some(rgb(0xc0, 0xc5, 0xce));
         let cream = Some(rgb(0xeb, 0xdb, 0xb2));
         assert!(

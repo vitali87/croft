@@ -877,9 +877,7 @@ mod tests {
         discover(tmp.path(), &etx);
         let msgs: Vec<TestResponse> = rx.try_iter().map(|(_, r)| r).collect();
         assert!(
-            !msgs
-                .iter()
-                .any(|m| matches!(m, TestResponse::Started(_))),
+            !msgs.iter().any(|m| matches!(m, TestResponse::Started(_))),
             "a refused run must not send Started: it wipes the discovered tree"
         );
         assert_eq!(

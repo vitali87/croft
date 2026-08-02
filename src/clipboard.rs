@@ -529,10 +529,8 @@ pub(crate) mod test_clip {
             let mutex = CLIP_LOCK
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            let lock_dir =
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-            std::fs::create_dir_all(&lock_dir)
-                .expect("clipboard test lock dir must exist");
+            let lock_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+            std::fs::create_dir_all(&lock_dir).expect("clipboard test lock dir must exist");
             let file_lock = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)

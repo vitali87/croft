@@ -3158,13 +3158,7 @@ impl Widget for &mut PtyTerminal {
             let ann_now = self.clock_now(&term);
             self.annotations
                 .iter()
-                .map(|a| {
-                    (
-                        a.line_rec - (ann_now - a.clock_rec) as i32,
-                        a.start,
-                        a.len,
-                    )
-                })
+                .map(|a| (a.line_rec - (ann_now - a.clock_rec) as i32, a.start, a.len))
                 .collect()
         };
         let display_offset = term.grid().display_offset();

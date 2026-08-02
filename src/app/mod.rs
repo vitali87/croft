@@ -352,6 +352,21 @@ fn panel_band_rect(band: Rect, alignment: PanelAlignment) -> Rect {
     }
 }
 
+/// Centered popup geometry for frames of any size. Min bounds cap at the
+/// frame because Ord::clamp panics on min > max.
+fn fallback_popup_rect(full: Rect, max_w_cap: u16) -> Rect {
+    let max_w = max_w_cap.min(full.width).max(1);
+    let max_h = full.height.max(1);
+    let width = (full.width.saturating_mul(7) / 10).clamp(40.min(max_w), max_w);
+    let height = (full.height.saturating_mul(6) / 10).clamp(10.min(max_h), max_h);
+    Rect {
+        x: full.x + (full.width.saturating_sub(width)) / 2,
+        y: full.y + (full.height.saturating_sub(height)) / 4,
+        width,
+        height,
+    }
+}
+
 fn activity_icon_glyph_x(bar: Rect) -> u16 {
     bar.x + bar.width / 2
 }
@@ -20080,8 +20095,12 @@ impl App {
         let Some(pop) = self.command_history_popup.as_ref() else {
             return;
         };
-        let (query, scope, cwd, host) =
-            (pop.query.clone(), pop.scope, pop.cwd.clone(), pop.host.clone());
+        let (query, scope, cwd, host) = (
+            pop.query.clone(),
+            pop.scope,
+            pop.cwd.clone(),
+            pop.host.clone(),
+        );
         let results = self.command_history.search(&query, scope, &cwd, &host);
         if let Some(pop) = self.command_history_popup.as_mut() {
             pop.set_results(results);
@@ -23148,21 +23167,7 @@ impl App {
                     height: side.height,
                 }
             }
-            _ => {
-                // Min bounds cap at the frame: Ord::clamp panics on min > max.
-                let max_w = 100.min(full.width).max(1);
-                let max_h = full.height.max(1);
-                let width =
-                    (full.width.saturating_mul(7) / 10).clamp(40.min(max_w), max_w);
-                let height =
-                    (full.height.saturating_mul(6) / 10).clamp(10.min(max_h), max_h);
-                Rect {
-                    x: full.x + (full.width.saturating_sub(width)) / 2,
-                    y: full.y + (full.height.saturating_sub(height)) / 4,
-                    width,
-                    height,
-                }
-            }
+            _ => fallback_popup_rect(full, 100),
         };
         crate::widgets::zoxide_jump::render_zoxide_jump(jump, rect, frame.buffer_mut(), gradient);
     }
@@ -23174,19 +23179,8 @@ impl App {
             return;
         };
         // Centered box, the zoxide-jump fallback geometry: wide enough for
-        // command lines, anchored in the upper half like Quick Open. The
-        // minimum bounds cap at the frame so a tiny host window can never
-        // invert the clamp (Ord::clamp panics on min > max).
-        let max_w = 110.min(full.width).max(1);
-        let max_h = full.height.max(1);
-        let width = (full.width.saturating_mul(7) / 10).clamp(40.min(max_w), max_w);
-        let height = (full.height.saturating_mul(6) / 10).clamp(10.min(max_h), max_h);
-        let rect = Rect {
-            x: full.x + (full.width.saturating_sub(width)) / 2,
-            y: full.y + (full.height.saturating_sub(height)) / 4,
-            width,
-            height,
-        };
+        // command lines, anchored in the upper half like Quick Open.
+        let rect = fallback_popup_rect(full, 110);
         crate::widgets::history_popup::render_history_popup(
             pop,
             rect,
@@ -23350,21 +23344,7 @@ impl App {
                     height: side.height,
                 }
             }
-            _ => {
-                // Min bounds cap at the frame: Ord::clamp panics on min > max.
-                let max_w = 100.min(full.width).max(1);
-                let max_h = full.height.max(1);
-                let width =
-                    (full.width.saturating_mul(7) / 10).clamp(40.min(max_w), max_w);
-                let height =
-                    (full.height.saturating_mul(6) / 10).clamp(10.min(max_h), max_h);
-                Rect {
-                    x: full.x + (full.width.saturating_sub(width)) / 2,
-                    y: full.y + (full.height.saturating_sub(height)) / 4,
-                    width,
-                    height,
-                }
-            }
+            _ => fallback_popup_rect(full, 100),
         };
         crate::widgets::branch_picker::render_branch_picker(
             picker,
