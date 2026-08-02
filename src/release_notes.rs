@@ -62,26 +62,18 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "An imgcat picture rides the scrollback in long-lived panes: once the 5000-line history saturated, the anchor froze onto a viewport row and the picture sat on top of every later command's output.",
+        summary: "Output triggers respect the alt-screen boundary exactly: a banner printed just before a full-screen app used to be silently dropped, content inside vim/htop could fire false notifications, and output around an alt round trip could splice into a line that was never printed.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Clearing a pane clears its pictures too: the pane's Clear (and a program-emitted scrollback wipe, e.g. typing clear) used to leave the captured image floating over the fresh prompt.",
+        summary: "Quick-select is bound to the pane it opened on: switching panes closes the labels instead of painting them over the new pane's unrelated text, or pasting the old pane's content into the new pane's shell.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Scrolling under an inline image is smooth: every scrolled row used to re-decode and re-resize the full photo on the render thread, stalling the UI during fast output.",
+        summary: "Quick-select labels follow their matches while output streams: the gold labels used to squat on fixed rows while the content scrolled away, so the typed label copied something no longer on screen.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "On Ghostty/Kitty the terminal picture and the source-control badge no longer evict each other: both overlays shared one Kitty image id, so the badge's 2-second keepalive and the picture's re-emit kept replacing one another.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "The pane's right-click menu stays readable over a picture: the image now sits below text on Kitty and yields to the open menu on iTerm2/Sixel, matching the editor preview.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Shift+End reaches full-screen programs again: in the alternate screen it was swallowed by the scrollback reset while Shift+Home, Shift+PageUp and Shift+PageDown correctly fell through.",
+        summary: "With more matches than labels, the bottom of the screen keeps its labels: the overflow used to drop the prompt-adjacent matches, the exact ones quick-select exists for, and the status line now counts anything left unlabelled.",
     },
 ];

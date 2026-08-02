@@ -23073,6 +23073,93 @@ fn shift_end_reaches_an_alt_screen_program() {
     );
 }
 
+/// Quick-select labels ride the scroll clock like every other overlay:
+/// output streaming under an open label set used to leave the gold labels
+/// at fixed viewport rows while their matches scrolled away, so the user
+/// typed the label next to one thing and copied another.
+#[test]
+fn quick_select_labels_follow_content_that_streams_below_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // Park the cursor at the pane bottom so every further row SCROLLS.
+    let h = app.terminals[0].last_inner.height as usize;
+    app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
+    app.terminals[0].feed_bytes_for_test(b"http://drift.io");
+    app.open_terminal_quick_select();
+    assert!(app.terminal_quick_select.is_some(), "staging: one hint");
+    app.terminals[0].feed_bytes_for_test(b"\r\nx1\r\nx2\r\nx3");
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let rows: Vec<String> = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        })
+        .collect();
+    assert!(
+        rows.iter().any(|r| r.contains("attp://drift.io")),
+        "the label 'a' must still overlay its own URL's first cell after the\n\
+         content scrolled; rows: {rows:?}"
+    );
+}
+
+/// Quick-select is bound to the pane it opened on, exactly like copy mode:
+/// after a pane switch its labels must close, never be pushed onto (or
+/// pasted into) the newly active pane at the old pane's coordinates.
+#[test]
+fn quick_select_closes_instead_of_hijacking_another_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    // Three URLs per row across ten rows: >26 matches forces two-char
+    // labels, so the first typed char takes the PUSH path (a live re-push
+    // of the hint set) rather than committing and closing.
+    let mut feed = Vec::new();
+    for i in 0..10 {
+        feed.extend_from_slice(
+            format!("\r\nhttp://a{i}.io http://b{i}.io http://c{i}.io").as_bytes(),
+        );
+    }
+    feed.extend_from_slice(b"\r\n");
+    app.terminals[0].feed_bytes_for_test(&feed);
+    app.open_terminal_quick_select();
+    let st = app.terminal_quick_select.as_ref().expect("staging: hints");
+    assert!(st.hints.len() > 26, "staging: two-char labels required");
+    // A label PREFIX char (the first char of some two-char label).
+    let prefix = st
+        .hints
+        .iter()
+        .find(|h| h.label.len() == 2)
+        .expect("staging: a two-char label")
+        .label
+        .chars()
+        .next()
+        .unwrap();
+    app.terminals.push(
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sleep",
+            &[String::from("30")],
+            tmp.path(),
+        )
+        .unwrap(),
+    );
+    app.active_terminal = 1;
+    app.handle_terminal_quick_select_key(key(KeyCode::Char(prefix), KeyModifiers::NONE));
+    assert!(
+        app.terminal_quick_select.is_none(),
+        "a pane switch closes quick select instead of hijacking the new pane"
+    );
+    assert!(
+        !app.terminals[1].has_hints_for_test(),
+        "the sibling pane must not inherit the old pane's hint labels"
+    );
+}
+
 /// Copy mode is bound to the pane it opened on: a gesture that activates a
 /// sibling pane closes the mode (tmux-style) instead of folding the other
 /// pane's independent scroll clock into the stored coordinates and

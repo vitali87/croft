@@ -116,6 +116,24 @@ pub fn find_matches(lines: &[String]) -> Vec<QuickMatch> {
     out
 }
 
+/// Pair matches with labels, bottom-priority: when there are more matches
+/// than labels, the TOP overflow is dropped (the least useful rows) and the
+/// bottom-most match — nearest the prompt, the likeliest target — always
+/// keeps the cheapest label. Returns (match, label) in match order.
+pub fn label_matches(matches: Vec<QuickMatch>, labels: &[String]) -> Vec<(QuickMatch, String)> {
+    let n = labels.len();
+    let skip = matches.len().saturating_sub(n);
+    matches
+        .into_iter()
+        .skip(skip)
+        .enumerate()
+        .map(|(i, m)| {
+            let label = labels[n - 1 - i].clone();
+            (m, label)
+        })
+        .collect()
+}
+
 /// Labels for `count` matches from `alphabet`, WezTerm's overflow scheme:
 /// single-char labels while they fit; otherwise the smallest tail of the
 /// alphabet is reserved as two-char prefixes (`abcd` for 6 matches gives
@@ -152,6 +170,39 @@ mod tests {
 
     fn lines(rows: &[&str]) -> Vec<String> {
         rows.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// More matches than labels: the BOTTOM of the screen keeps its labels
+    /// (nearest the prompt, the likeliest target) and the top overflow is
+    /// dropped — `take(n)` used to keep the top and leave everything near
+    /// the prompt unlabelled and unreachable.
+    #[test]
+    fn label_overflow_drops_the_top_and_keeps_the_cheapest_label_at_the_bottom() {
+        let matches: Vec<QuickMatch> = (0..20)
+            .map(|r| QuickMatch {
+                row: r,
+                start: 0,
+                len: 3,
+                text: format!("m{r}"),
+            })
+            .collect();
+        let labels = assign_labels(matches.len(), "abc");
+        assert_eq!(labels.len(), 9, "3-char alphabet caps at 9 pair labels");
+        let paired = label_matches(matches, &labels);
+        assert_eq!(paired.len(), 9);
+        assert_eq!(
+            paired.first().unwrap().0.row,
+            11,
+            "the TOP overflow is dropped, not the bottom"
+        );
+        assert_eq!(
+            (
+                paired.last().unwrap().0.row,
+                paired.last().unwrap().1.as_str()
+            ),
+            (19, labels[0].as_str()),
+            "the bottom-most match keeps the cheapest label"
+        );
     }
 
     #[test]
