@@ -1837,14 +1837,19 @@ impl PtyTerminal {
         self.osc7_host.lock().unwrap().clone()
     }
 
-    /// [`Self::shell_cwd`], trusted only when the REPORTING host is this
-    /// machine (empty, "localhost", or the local hostname — RFC 8089
-    /// semantics via the command history's canonicalizer): an in-pane ssh
-    /// session reports the remote's path, which is meaningless — and
-    /// silently wrong when it happens to exist — on the local filesystem.
+    /// [`Self::shell_cwd`], trusted only when the report provably came from
+    /// the LOCAL shell: the reporting host must be this machine (empty,
+    /// "localhost", or the local hostname — RFC 8089 semantics via the
+    /// command history's canonicalizer) AND the shell must own the tty
+    /// (`foreground_is_shell`). The hostname alone is a self-report — a
+    /// remote session's output can claim any name — but while an ssh
+    /// client (or any app) holds the foreground group, whatever printed
+    /// the claim is not the local shell at its prompt; conversely a shell
+    /// at its prompt has just re-asserted its own OSC 7. The cost is that
+    /// a local tmux/pager forces the caller's `cwd_of_pid` fallback.
     pub fn local_shell_cwd(&self) -> Option<std::path::PathBuf> {
         let host = self.shell_host().unwrap_or_default();
-        if !crate::command_history::is_local_host(&host) {
+        if !crate::command_history::is_local_host(&host) || !self.foreground_is_shell() {
             return None;
         }
         self.shell_cwd()
@@ -4354,6 +4359,48 @@ mod tests {
         assert!(
             !term.foreground_is_shell(),
             "while a foreground command owns the tty, the foreground group is the command not the shell, so a cd must not be injected"
+        );
+    }
+
+    /// A foreground process that owns the tty (an ssh client, exactly)
+    /// controls everything the pane prints — including an OSC 7 report
+    /// impersonating this machine's own hostname. The self-reported host
+    /// is no proof of locality then: `local_shell_cwd` must refuse while
+    /// the shell is not the foreground group, whatever the claim says.
+    #[test]
+    fn a_foreground_process_cannot_impersonate_a_local_cwd_report() {
+        let out = std::process::Command::new("hostname").output().unwrap();
+        let local = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if local.is_empty() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        let mut waited = 0u32;
+        while waited < 4000 && !term.foreground_is_shell() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        // A foreground job (the ssh stand-in) prints an OSC 7 claiming
+        // this machine's own hostname.
+        term.write_input(
+            format!("printf '\\033]7;file://{local}/tmp\\007'; sleep 10\n").as_bytes(),
+        );
+        let mut waited = 0u32;
+        while waited < 4000 && (term.foreground_is_shell() || term.shell_cwd().is_none()) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert_eq!(
+            term.shell_cwd(),
+            Some(std::path::PathBuf::from("/tmp")),
+            "staging: the claim was captured"
+        );
+        assert!(!term.foreground_is_shell(), "staging: a job owns the tty");
+        assert_eq!(
+            term.local_shell_cwd(),
+            None,
+            "a tty-owning foreground process must not place local splits by claim"
         );
     }
 
