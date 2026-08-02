@@ -559,9 +559,11 @@ pub struct PtyTerminal {
     /// the app's drain for long-command notifications.
     finished_rx: std::sync::mpsc::Receiver<FinishedCommand>,
     /// Quick-select hint spans pushed down by the app while hint mode is
-    /// active; the render loop paints the match spans and overlays each
-    /// label. `None` when quick-select is off.
-    hints: Option<Vec<HintSpan>>,
+    /// active, paired with the scroll-clock reading their lines were
+    /// captured at: the render loop re-bases each span every frame so the
+    /// labels follow their matches through streaming output instead of
+    /// squatting on fixed viewport rows. `None` when quick-select is off.
+    hints: Option<(i64, Vec<HintSpan>)>,
     /// The user's trigger set, shared with the reader thread (which scans
     /// completed lines for notify/bell firings) and read by the render loop
     /// (which paints highlight-trigger matches). The inner Arc is swapped by
@@ -1047,9 +1049,12 @@ impl PtyTerminal {
     }
 
     /// Set (or clear) the quick-select hint overlay. The app owns hint-mode
-    /// state and re-pushes the filtered set as the user types label chars.
-    pub fn set_hints(&mut self, hints: Option<Vec<HintSpan>>) {
-        self.hints = hints;
+    /// state and re-pushes the filtered set as the user types label chars;
+    /// `clock` is the scroll-clock reading the span lines were captured at
+    /// (from [`Self::visible_lines_and_clock`]), reused verbatim on every
+    /// re-push so the render-time translation stays anchored to the open.
+    pub fn set_hints(&mut self, hints: Option<Vec<HintSpan>>, clock: i64) {
+        self.hints = hints.map(|h| (clock, h));
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -1070,6 +1075,26 @@ impl PtyTerminal {
             lines.push(s.trim_end().to_string());
         }
         (lines, -off)
+    }
+
+    /// [`Self::visible_lines`] plus the scroll clock, all from ONE term
+    /// lock: coordinates and clock captured together so output landing
+    /// between two separate reads can never mis-pair them (quick-select
+    /// anchors its labels on this snapshot).
+    pub fn visible_lines_and_clock(&mut self) -> (Vec<String>, i32, i64) {
+        let mut term = self.term.lock();
+        let clock = self.clock.lock().unwrap().tick(&mut term);
+        if term.columns() == 0 {
+            return (Vec::new(), 0, clock);
+        }
+        let off = term.grid().display_offset() as i32;
+        let rows = term.screen_lines() as i32;
+        let mut lines = Vec::new();
+        for l in -off..rows - off {
+            let (s, _cols) = row_text_and_cols(&term, l);
+            lines.push(s.trim_end().to_string());
+        }
+        (lines, -off, clock)
     }
 
     /// Swap in a new trigger set. The app calls this for every pane on every
@@ -1432,14 +1457,16 @@ impl PtyTerminal {
                         }
                         // Notify/bell triggers match completed output lines,
                         // never inside a full-screen app (the alt screen owns
-                        // the bytes; iTerm2 skips those too). Skipped
-                        // entirely when no event trigger is configured.
+                        // the bytes; iTerm2 skips those too). The scanner
+                        // tracks the alt boundary POSITIONALLY from the
+                        // stream — the chunk's final mode says nothing about
+                        // where a line fell — so it must see EVERY chunk, or
+                        // its alt tracking and string state machine desync
+                        // and skipped-gap output splices into phantom lines.
                         let trig = triggers_for_thread.lock().unwrap().clone();
-                        if trig.has_events() && !t.mode().contains(TermMode::ALT_SCREEN) {
-                            trigger_scanner.scan(&buf[..n], &trig, &mut trigger_hits);
-                            for h in trigger_hits.drain(..) {
-                                let _ = trigger_tx.send(h);
-                            }
+                        trigger_scanner.scan(&buf[..n], &trig, &mut trigger_hits);
+                        for h in trigger_hits.drain(..) {
+                            let _ = trigger_tx.send(h);
                         }
                         drop(t);
                         pty_pending_bytes_for_thread.fetch_add(n, Ordering::Relaxed);
@@ -2307,6 +2334,12 @@ impl PtyTerminal {
             line_rec,
             clock_rec,
         });
+    }
+
+    /// Test-only: whether a quick-select hint overlay is currently set.
+    #[cfg(test)]
+    pub fn has_hints_for_test(&self) -> bool {
+        self.hints.is_some()
     }
 
     /// Test-only: the raw state behind the corrected selection accessors —
@@ -3321,6 +3354,15 @@ impl Widget for &mut PtyTerminal {
         };
         let cursor_col_in_viewport = cursor_point.column.0 as i32;
 
+        // Quick-select hint drift: lines were captured at the set's clock
+        // reading; re-base them to now so labels follow their matches
+        // through streaming output (the annotation translation, one read
+        // per frame).
+        let hint_drift: i32 = self
+            .hints
+            .as_ref()
+            .map_or(0, |(c0, _)| (self.clock_now(&term) - c0) as i32);
+
         for y in 0..rows {
             // Find matches on this row once, then paint them per cell below.
             // Match positions are char indices in the spacer-skipped row text
@@ -3345,30 +3387,33 @@ impl Widget for &mut PtyTerminal {
             // Quick-select hints on this row: 1 = match span, 2 = label cell
             // (the char to draw rides in the parallel vec). Char indices go
             // through the same colmap as the find highlight.
-            let hint_paint: Option<(Vec<u8>, Vec<char>)> = self.hints.as_ref().and_then(|hints| {
-                let row_hints: Vec<&HintSpan> =
-                    hints.iter().filter(|h| h.line == row_line_idx).collect();
-                if row_hints.is_empty() {
-                    return None;
-                }
-                let (_text, colmap) = row_text_and_cols(&term, row_line_idx);
-                let mut span = vec![0u8; cols as usize];
-                let mut label = vec!['\0'; cols as usize];
-                for h in row_hints {
-                    for k in h.start..h.start + h.len {
-                        if let Some(&col) = colmap.get(k) {
-                            span[col] = 1;
+            let hint_paint: Option<(Vec<u8>, Vec<char>)> =
+                self.hints.as_ref().and_then(|(_, hints)| {
+                    let row_hints: Vec<&HintSpan> = hints
+                        .iter()
+                        .filter(|h| h.line - hint_drift == row_line_idx)
+                        .collect();
+                    if row_hints.is_empty() {
+                        return None;
+                    }
+                    let (_text, colmap) = row_text_and_cols(&term, row_line_idx);
+                    let mut span = vec![0u8; cols as usize];
+                    let mut label = vec!['\0'; cols as usize];
+                    for h in row_hints {
+                        for k in h.start..h.start + h.len {
+                            if let Some(&col) = colmap.get(k) {
+                                span[col] = 1;
+                            }
+                        }
+                        for (j, c) in h.label.chars().skip(h.typed).enumerate() {
+                            if let Some(&col) = colmap.get(h.start + j) {
+                                span[col] = 2;
+                                label[col] = c;
+                            }
                         }
                     }
-                    for (j, c) in h.label.chars().skip(h.typed).enumerate() {
-                        if let Some(&col) = colmap.get(h.start + j) {
-                            span[col] = 2;
-                            label[col] = c;
-                        }
-                    }
-                }
-                Some((span, label))
-            });
+                    Some((span, label))
+                });
             // Trigger highlights on this row: per-cell fg/bg from the first
             // matching highlight trigger. Painted under the find highlight
             // and quick-select labels, which both win.
@@ -4697,6 +4742,42 @@ mod tests {
         };
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].action, crate::triggers::TriggerAction::Notify);
+        assert_eq!(hits[0].message, "deploy went failed");
+    }
+
+    /// A banner printed just before handing off to a full-screen app lands
+    /// in the same PTY chunk as the alt-screen entry: gating the trigger
+    /// scan on the chunk's FINAL mode dropped that whole chunk (and let a
+    /// chunk that merely ENDED on the primary screen fire on alt content).
+    /// The scanner tracks the boundary positionally, so the reader must
+    /// feed it every chunk unconditionally.
+    #[test]
+    fn a_trigger_fires_for_primary_text_that_shares_a_chunk_with_alt_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "read x; printf 'deploy failed\\n\\033[?1049h'; sleep 1; printf '\\033[?1049lok\\n'; sleep 30";
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let set = crate::triggers::TriggerSet::from_json(
+            r#"[ { "regex": "deploy (\\w+)", "action": "notify", "message": "deploy went \\1" } ]"#,
+        );
+        assert!(set.has_events());
+        term.set_triggers(std::sync::Arc::new(set));
+        term.write_input(b"\n");
+        let mut waited = 0u32;
+        let hits = loop {
+            let hits = term.drain_trigger_hits();
+            if !hits.is_empty() {
+                break hits;
+            }
+            assert!(
+                waited < 8000,
+                "the primary-screen line before the alt entry never fired"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        };
+        assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].message, "deploy went failed");
     }
 

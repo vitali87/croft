@@ -244,7 +244,21 @@ pub struct TriggerScanner {
     /// anything else it is an in-place rewrite (reset without matching).
     /// Kept across chunks — a CR can be the last byte of a read.
     cr_pending: bool,
+    /// Whether the byte position currently being scanned sits inside the
+    /// alternate screen. Tracked POSITIONALLY from DECSET/DECRST 47/1047/
+    /// 1049 (and RIS) in the stream itself, so alt-screen content never
+    /// fires and primary text sharing a chunk with a transition still does
+    /// — the chunk's final terminal mode says nothing about where a line
+    /// fell. Requires the scanner to see EVERY chunk, never a gated subset,
+    /// or the tracking (and the string state machine) desyncs.
+    in_alt: bool,
+    /// Parameter bytes of the CSI currently being consumed (bounded; only
+    /// needed to recognize the alt-screen DECSET/DECRST lists).
+    csi: Vec<u8>,
 }
+
+/// Longest CSI parameter list retained; a real DECSET list is far shorter.
+const CSI_CAP: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ScanState {
@@ -287,8 +301,9 @@ impl TriggerScanner {
                     0x00..=0x1f | 0x7f => {}
                     _ => {
                         // Past the cap the byte is dropped; the capped prefix
-                        // still matches on completion.
-                        if self.line.len() < LINE_CAP {
+                        // still matches on completion. Alt-screen bytes are
+                        // consumed but never accumulated.
+                        if !self.in_alt && self.line.len() < LINE_CAP {
                             self.line.push(b);
                         }
                     }
@@ -297,12 +312,28 @@ impl TriggerScanner {
                     self.state = match b {
                         b'[' => ScanState::Csi,
                         b']' | b'P' | b'X' | b'^' | b'_' => ScanState::InString,
+                        // RIS: full reset, back on the primary screen.
+                        b'c' => {
+                            self.set_alt(false);
+                            ScanState::Ground
+                        }
                         _ => ScanState::Ground,
                     };
                 }
                 ScanState::Csi => {
                     if (0x40..=0x7e).contains(&b) {
+                        if (b == b'h' || b == b'l') && self.csi.first() == Some(&b'?') {
+                            let alt = self.csi[1..]
+                                .split(|&c| c == b';')
+                                .any(|p| p == b"47" || p == b"1047" || p == b"1049");
+                            if alt {
+                                self.set_alt(b == b'h');
+                            }
+                        }
+                        self.csi.clear();
                         self.state = ScanState::Ground;
+                    } else if self.csi.len() < CSI_CAP {
+                        self.csi.push(b);
                     }
                 }
                 ScanState::InString => match b {
@@ -323,11 +354,26 @@ impl TriggerScanner {
         }
     }
 
+    /// Cross an alt-screen boundary: whatever partial primary line was
+    /// pending is stale on both edges (the shell repaints its prompt after
+    /// a full-screen app exits), so it must never splice with later text.
+    fn set_alt(&mut self, alt: bool) {
+        if self.in_alt != alt {
+            self.in_alt = alt;
+            self.reset_line();
+            self.cr_pending = false;
+        }
+    }
+
     fn reset_line(&mut self) {
         self.line.clear();
     }
 
     fn complete_line(&mut self, set: &TriggerSet, out: &mut Vec<TriggerHit>) {
+        if self.in_alt {
+            self.reset_line();
+            return;
+        }
         if !self.line.is_empty() {
             let line = String::from_utf8_lossy(&self.line);
             for t in &set.triggers {
@@ -436,6 +482,43 @@ mod tests {
         sc.scan(b"beep two\r", &s, &mut out);
         sc.scan(b"\n", &s, &mut out);
         assert_eq!(out.len(), 1, "chunk-split CRLF must complete: {out:?}");
+    }
+
+    /// The scanner tracks alt-screen entry/exit POSITIONALLY through the
+    /// byte stream: alt-screen content never fires, primary text sharing a
+    /// chunk with an alt transition still does, and a partial primary line
+    /// interrupted by an alt round trip never splices with post-exit text.
+    #[test]
+    fn scanner_tracks_the_alt_screen_positionally() {
+        let s = set(r##"[
+  { "regex": "SECRET", "action": "notify" },
+  { "regex": "BUILD FAILED", "action": "notify" },
+  { "regex": "ERROR: failed", "action": "notify" }
+]"##);
+        let mut sc = TriggerScanner::new();
+        let mut out = Vec::new();
+        // (a) Content that only ever existed on the alt screen must not
+        // fire, even though the chunk ENDS back on the primary screen.
+        sc.scan(b"\x1b[?1049hSECRET\n\x1b[?1049l", &s, &mut out);
+        assert!(out.is_empty(), "alt-screen content fired: {out:?}");
+        // (b) Primary text in the same chunk as the alt ENTRY still fires.
+        sc.scan(b"BUILD FAILED\n\x1b[?1049h", &s, &mut out);
+        assert_eq!(out.len(), 1, "primary text before alt entry: {out:?}");
+        assert_eq!(out[0].line, "BUILD FAILED");
+        out.clear();
+        sc.scan(b"\x1b[?1049l", &s, &mut out);
+        // (c) A partial primary line interrupted by an alt round trip must
+        // not splice with post-exit output into a line never printed.
+        sc.scan(b"ERR", &s, &mut out);
+        sc.scan(b"\x1b[?1049halt stuff\x1b[?1049l", &s, &mut out);
+        sc.scan(b"OR: failed\n", &s, &mut out);
+        assert!(out.is_empty(), "spliced a line never printed: {out:?}");
+        // Multi-parameter DECSET lists count too (\x1b[?1002;1049h).
+        sc.scan(b"\x1b[?1002;1049hSECRET\n\x1b[?1049;1002l", &s, &mut out);
+        assert!(out.is_empty(), "combined DECSET alt entry missed: {out:?}");
+        // And RIS resets to the primary screen.
+        sc.scan(b"\x1b[?1049h\x1bcBUILD FAILED\n", &s, &mut out);
+        assert_eq!(out.len(), 1, "RIS must exit the alt screen: {out:?}");
     }
 
     #[test]

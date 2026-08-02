@@ -1861,6 +1861,14 @@ struct TerminalSelectAutoScroll {
 /// whether any typed char was UPPERCASE (commit then pastes the match into
 /// the shell as well as copying it, WezTerm's convention).
 pub struct QuickSelectState {
+    /// Index into `App::terminals` of the pane the labels were scraped
+    /// from: hints, pastes and re-pushes are bound to it, and any gesture
+    /// that activates a sibling pane closes the mode (the copy-mode rule).
+    pane: usize,
+    /// Scroll-clock reading the hint lines were captured at (one snapshot
+    /// with the lines themselves); every re-push reuses it so the pane's
+    /// render-time translation keeps labels on their scrolled matches.
+    clock: i64,
     hints: Vec<QuickHint>,
     typed: String,
     shifted: bool,
@@ -9932,6 +9940,17 @@ impl App {
     }
 
     fn sync_focus_flags(&mut self) {
+        // Quick-select is bound to the pane it opened on; this per-frame
+        // invariant covers every gesture that can move `active_terminal`
+        // (clicks, chords, pane closes shifting indices) in one place, so
+        // stale labels never survive a pane switch to hijack the new pane.
+        if self
+            .terminal_quick_select
+            .as_ref()
+            .is_some_and(|st| st.pane != self.active_terminal)
+        {
+            self.close_terminal_quick_select();
+        }
         self.tree.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
         self.search.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Search;
         self.source_control.focused =
@@ -23723,7 +23742,7 @@ impl App {
     /// match getting the cheapest one (WezTerm / tmux-thumbs), and overlays
     /// them for the render loop.
     fn open_terminal_quick_select(&mut self) {
-        let (lines, top) = self.terminal().visible_lines();
+        let (lines, top, clock) = self.terminal_mut().visible_lines_and_clock();
         let matches = crate::quick_select::find_matches(&lines);
         if matches.is_empty() {
             self.status = String::from("Quick select: nothing to match on screen");
@@ -23731,32 +23750,37 @@ impl App {
         }
         let labels =
             crate::quick_select::assign_labels(matches.len(), crate::quick_select::ALPHABET);
-        let n = labels.len();
-        let hints: Vec<QuickHint> = matches
+        let dropped = matches.len().saturating_sub(labels.len());
+        let hints: Vec<QuickHint> = crate::quick_select::label_matches(matches, &labels)
             .into_iter()
-            .take(n)
-            .enumerate()
-            .map(|(i, m)| QuickHint {
+            .map(|(m, label)| QuickHint {
                 line: top + m.row as i32,
                 start: m.start,
                 len: m.len,
                 text: m.text,
-                label: labels[n - 1 - i].clone(),
+                label,
             })
             .collect();
-        self.push_quick_select_hints(&hints, "");
+        self.push_quick_select_hints(&hints, "", clock);
         self.terminal_quick_select = Some(QuickSelectState {
+            pane: self.active_terminal,
+            clock,
             hints,
             typed: String::new(),
             shifted: false,
         });
-        self.status =
-            String::from("Quick select: type a label to copy, UPPERCASE pastes, Esc cancels");
+        self.status = if dropped > 0 {
+            format!(
+                "Quick select: type a label to copy, UPPERCASE pastes, Esc cancels ({dropped} top matches unlabelled)"
+            )
+        } else {
+            String::from("Quick select: type a label to copy, UPPERCASE pastes, Esc cancels")
+        };
     }
 
     /// Push the hint spans matching the typed label prefix down to the pane
     /// for painting. Called on open and after every typed / erased char.
-    fn push_quick_select_hints(&mut self, hints: &[QuickHint], typed: &str) {
+    fn push_quick_select_hints(&mut self, hints: &[QuickHint], typed: &str, clock: i64) {
         let spans: Vec<crate::widgets::terminal::HintSpan> = hints
             .iter()
             .filter(|h| h.label.starts_with(typed))
@@ -23768,7 +23792,7 @@ impl App {
                 typed: typed.len(),
             })
             .collect();
-        self.terminal_mut().set_hints(Some(spans));
+        self.terminal_mut().set_hints(Some(spans), clock);
     }
 
     fn close_terminal_quick_select(&mut self) {
@@ -23776,7 +23800,7 @@ impl App {
             // Clear every pane, not just the active one: a mouse click can
             // move `active_terminal` while the labels are still up.
             for t in &mut self.terminals {
-                t.set_hints(None);
+                t.set_hints(None, 0);
             }
         }
     }
@@ -24073,6 +24097,17 @@ impl App {
     }
 
     fn handle_terminal_quick_select_key(&mut self, key: KeyEvent) {
+        // Bound to its origin pane: if anything moved the active pane while
+        // the labels were up, close instead of pushing (or pasting) the old
+        // pane's coordinates and text into the new one.
+        if self
+            .terminal_quick_select
+            .as_ref()
+            .is_some_and(|st| st.pane != self.active_terminal)
+        {
+            self.close_terminal_quick_select();
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.close_terminal_quick_select();
@@ -24085,8 +24120,8 @@ impl App {
                 state.typed.pop();
                 // Case history is not kept; retyping decides paste-vs-copy.
                 state.shifted = false;
-                let (hints, typed) = (state.hints.clone(), state.typed.clone());
-                self.push_quick_select_hints(&hints, &typed);
+                let (hints, typed, clock) = (state.hints.clone(), state.typed.clone(), state.clock);
+                self.push_quick_select_hints(&hints, &typed, clock);
             }
             KeyCode::Char(c) if c.is_ascii_alphabetic() => {
                 let Some(state) = self.terminal_quick_select.as_ref() else {
@@ -24113,8 +24148,8 @@ impl App {
                     };
                     state.typed = candidate.clone();
                     state.shifted = shifted;
-                    let hints = state.hints.clone();
-                    self.push_quick_select_hints(&hints, &candidate);
+                    let (hints, clock) = (state.hints.clone(), state.clock);
+                    self.push_quick_select_hints(&hints, &candidate, clock);
                 }
                 // A char no label starts with is ignored, like WezTerm.
             }
@@ -26491,6 +26526,14 @@ impl App {
                             .is_some_and(|st| st.pane != idx)
                         {
                             self.close_terminal_copy_mode();
+                        }
+                        // Quick-select labels are pane-bound the same way.
+                        if self
+                            .terminal_quick_select
+                            .as_ref()
+                            .is_some_and(|st| st.pane != idx)
+                        {
+                            self.close_terminal_quick_select();
                         }
                         self.active_terminal = idx;
                     }
