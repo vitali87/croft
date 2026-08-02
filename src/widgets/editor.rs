@@ -3493,18 +3493,21 @@ impl Editor {
     /// Move the caret to a resolved tab stop, selecting its placeholder text so
     /// the next keystroke replaces it.
     fn place_at_snippet_stop(&mut self, stop: (usize, usize, usize)) {
+        // A stop can outlive its row (a backspace join mid-session shrinks
+        // the buffer): clamp to the live grid before planting anything —
+        // clamping only the cursor left a selection whose row indexed past
+        // the buffer end on the next edit.
         let (row, col, len) = stop;
+        let row = row.min(self.lines.len().saturating_sub(1));
+        let line_len = self.line_char_len(row);
+        let col = col.min(line_len);
+        let end = (col + len).min(line_len);
         self.cursor_row = row;
-        self.cursor_col = col + len;
-        self.selection = if len > 0 {
-            Some(EditorSelection {
-                anchor: (row, col),
-                head: (row, col + len),
-            })
-        } else {
-            None
-        };
-        self.clamp_cursor();
+        self.cursor_col = end;
+        self.selection = (end > col).then_some(EditorSelection {
+            anchor: (row, col),
+            head: (row, end),
+        });
     }
 
     fn insert_newline_raw(&mut self) {
@@ -4274,8 +4277,13 @@ impl Editor {
     /// Discard local edits and reload from disk unconditionally — the
     /// "Revert" half of a conflict resolution.
     pub fn revert_to_disk(&mut self) -> Result<()> {
+        // Reload FIRST: clearing `dirty` before a reload that then fails
+        // (file deleted between the conflict popup and the Enter) would
+        // launder unsaved edits as clean — the tab loses its marker and
+        // the next FS sweep silently auto-reverts them away.
+        self.reload_from_disk()?;
         self.dirty = false;
-        self.reload_from_disk()
+        Ok(())
     }
 
     /// FS-sync sweep entry point, applied to every open tab. Compares the
@@ -9331,6 +9339,55 @@ mod tests {
         );
         // The last stop ends the session.
         assert!(!e.snippet_active());
+    }
+
+    /// A failed revert must not launder the buffer clean: clearing `dirty`
+    /// before the fallible reload meant a file deleted between the conflict
+    /// popup and the Enter left unsaved edits flagged clean — the tab lost
+    /// its unsaved marker, auto-save ignored it, and the next FS sweep
+    /// silently auto-reverted the edits when the file reappeared.
+    #[test]
+    fn a_failed_revert_keeps_the_buffer_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("gone.txt");
+        std::fs::write(&path, "disk\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        e.insert_char('x');
+        assert!(e.dirty, "staging: unsaved edits");
+        std::fs::remove_file(&path).unwrap();
+        assert!(e.revert_to_disk().is_err(), "staging: the reload fails");
+        assert!(
+            e.dirty,
+            "a failed reload must keep the unsaved edits marked dirty"
+        );
+    }
+
+    /// A snippet stop can outlive its row: rows deleted mid-session (the
+    /// backspace join) leave later stops pointing past the end of the
+    /// buffer, and Tab then planted a selection on the vanished row — the
+    /// next edit indexed `lines[row]` out of bounds and panicked the TUI.
+    #[test]
+    fn a_snippet_stop_on_a_deleted_row_cannot_plant_a_selection_out_of_bounds() {
+        let mut e = editor_with("");
+        e.insert_str("try");
+        e.expand_snippet(
+            "try:\n    ${1:pass}\nexcept ${2:Exception}:\n    ${3:raise}",
+            3,
+        );
+        assert!(e.snippet_active());
+        assert_eq!(e.selection_text(), "pass");
+        // Delete the placeholder, its indent, and the row join — the buffer
+        // shrinks below stop $3's recorded row, and backspace keeps the
+        // session alive by design.
+        for _ in 0..6 {
+            e.backspace();
+        }
+        assert!(e.lines.len() < 4, "staging: a row was joined away");
+        e.snippet_next();
+        e.snippet_next();
+        // The next edit must not panic on a selection past the buffer end.
+        e.insert_char('x');
     }
 
     /// A reused tab (the preview tab navigating file to file) must drop its

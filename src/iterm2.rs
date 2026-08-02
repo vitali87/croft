@@ -763,6 +763,13 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         set_string(menu, label, format!("@~{}", i + 1));
     }
 
+    // Sweep the user-keybinding forwarders recorded by the PREVIOUS run
+    // before any inserts: a chord deleted from keybindings.json must
+    // release its Cmd chord in iTerm2 (a leftover entry keeps typing
+    // escape bytes into every iTerm2 session forever, with no croft UI to
+    // undo it), and sweeping first means a stale key that collides with a
+    // built-in simply gets re-inserted below.
+    remove_stale_user_forwarders(dict);
     let global = dict_entry_mut(dict, "GlobalKeyMap");
     global.insert(CMD_SHIFT_F_KEY.into(), send_hex_action(CMD_SHIFT_F_HEX, 0));
     // Explorer shortcuts: forward Cmd+F / Cmd+R / Cmd+/ to croft as
@@ -861,7 +868,7 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
     // built-ins are, so a rebind in keybindings.json actually reaches croft in
     // iTerm2. Added last so a user chord that collides with a built-in wins.
     insert_user_keymap_forwarders(
-        global,
+        dict,
         &crate::keymap::Keymap::load(&crate::keymap::keybindings_path()),
     );
 
@@ -923,14 +930,47 @@ fn dict_entry_mut<'a>(dict: &'a mut Dictionary, key: &str) -> &'a mut Dictionary
         .expect("dictionary value was just inserted")
 }
 
+/// Root-plist ledger of the user-keybinding forwarder keys installed by the
+/// previous `setup-iterm2` run, so the next run can remove entries whose
+/// chords have since left keybindings.json.
+const USER_FORWARDER_LEDGER_KEY: &str = "Croft User Keymap Forwarders";
+
+/// Remove every `GlobalKeyMap` forwarder the previous run recorded in the
+/// ledger. Runs before ANY forwarder inserts, so a stale user chord that
+/// collides with a built-in loses only its user entry, not the built-in.
+fn remove_stale_user_forwarders(dict: &mut Dictionary) {
+    let stale: Vec<String> = dict
+        .get(USER_FORWARDER_LEDGER_KEY)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_string().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if stale.is_empty() {
+        return;
+    }
+    let global = dict_entry_mut(dict, "GlobalKeyMap");
+    for key in &stale {
+        global.remove(key);
+    }
+}
+
 /// Install a `GlobalKeyMap` "Send Hex Code" forwarder for every user-bound
-/// chord that needs one (see [`crate::keymap::Chord::iterm2_forwarder`]).
-fn insert_user_keymap_forwarders(global: &mut Dictionary, keymap: &crate::keymap::Keymap) {
+/// chord that needs one (see [`crate::keymap::Chord::iterm2_forwarder`]),
+/// and record the installed keys in the root-plist ledger for the next
+/// run's stale sweep.
+fn insert_user_keymap_forwarders(dict: &mut Dictionary, keymap: &crate::keymap::Keymap) {
+    let mut installed = Vec::new();
+    let global = dict_entry_mut(dict, "GlobalKeyMap");
     for chord in keymap.chords() {
         if let Some((key, hex)) = chord.iterm2_forwarder() {
+            installed.push(Value::String(key.clone()));
             global.insert(key, send_hex_action(&hex, 0));
         }
     }
+    dict.insert(USER_FORWARDER_LEDGER_KEY.into(), Value::Array(installed));
 }
 
 fn send_hex_action(text: &str, apply_mode: i64) -> Value {
@@ -1000,15 +1040,42 @@ mod tests {
     fn user_keymap_chord_is_forwarded_into_the_global_key_map() {
         // A user rebind of an otherwise-unbound Cmd chord must install a CSI-u
         // forwarder, or the chord is eaten by macOS and never reaches croft.
-        let mut global = Dictionary::new();
+        let mut root = Dictionary::new();
         let km = crate::keymap::Keymap::from_json(
             r#"[{ "key": "cmd+j", "command": "toggle_terminal" }]"#,
         );
-        insert_user_keymap_forwarders(&mut global, &km);
+        insert_user_keymap_forwarders(&mut root, &km);
         // cmd+j: 'j' = 0x6a, Cmd mask 0x100000, kVK_ANSI_J = 0x26.
         assert!(
-            global.contains_key("0x6a-0x100000-0x26"),
+            dict_entry_mut(&mut root, "GlobalKeyMap").contains_key("0x6a-0x100000-0x26"),
             "the user's cmd+j binding must be forwarded so it reaches croft in iTerm2"
+        );
+    }
+
+    /// A chord deleted from keybindings.json must release its Cmd chord in
+    /// iTerm2 on the next setup run: the previous run's forwarder otherwise
+    /// keeps typing escape bytes into every iTerm2 session forever, with no
+    /// croft UI to undo it. The root-plist ledger records what was
+    /// installed so the sweep removes exactly that, never a built-in.
+    #[test]
+    fn a_deleted_user_keybinding_releases_its_iterm2_forwarder() {
+        let mut root = Dictionary::new();
+        let km1 = crate::keymap::Keymap::from_json(
+            r#"[{ "key": "cmd+j", "command": "toggle_terminal" }]"#,
+        );
+        remove_stale_user_forwarders(&mut root);
+        insert_user_keymap_forwarders(&mut root, &km1);
+        assert!(
+            dict_entry_mut(&mut root, "GlobalKeyMap").contains_key("0x6a-0x100000-0x26"),
+            "staging: run 1 installed the forwarder"
+        );
+        // Next run: the binding is gone from keybindings.json.
+        let km2 = crate::keymap::Keymap::from_json("[]");
+        remove_stale_user_forwarders(&mut root);
+        insert_user_keymap_forwarders(&mut root, &km2);
+        assert!(
+            !dict_entry_mut(&mut root, "GlobalKeyMap").contains_key("0x6a-0x100000-0x26"),
+            "the stale forwarder must be swept, not left hijacking Cmd+J in every session"
         );
     }
 

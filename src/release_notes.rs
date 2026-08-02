@@ -62,26 +62,22 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Cmd-clicking a terminal hyperlink only opens web links now: an OSC 8 cell can carry any URI behind unrelated visible text, and a file:// or custom-scheme target would have launched an arbitrary application off one disguised click. Non-web links are refused with the real destination shown in the status bar.",
+        summary: "A snippet session survives deleting rows without crashing: backspacing a placeholder's line away and Tabbing on used to plant the caret's selection past the end of the buffer, and the next keystroke brought the whole app down.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Ctrl+F reaches the program in the terminal again on macOS (vim's page-forward, the shell's forward-char); find-in-terminal lives on Cmd+F there, matching VS Code and iTerm2. Linux keeps Ctrl+F opening find.",
+        summary: "A failed Reload from disk (the file vanished after the conflict popup opened) keeps the buffer marked unsaved and says so in the status bar, instead of silently flagging unsaved edits clean where the next sync sweep could discard them.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Find-in-terminal is bound to the pane it opened on: switching panes closes it and clears its highlight, instead of leaving the old pane lit forever and aiming Enter/Shift+Enter at the wrong pane's scrollback.",
+        summary: "Deleting a user keybinding now releases its Cmd chord in iTerm2 on the next setup run: the installed forwarder used to stay behind forever, typing escape codes into every iTerm2 session.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The active find match rides the scroll clock: output streaming under an open find bar no longer detaches the bright highlight from its text or makes next/previous walk from a phantom row.",
+        summary: "The mouse wheel works on a terminal pane's border row while a full-screen app tracks the mouse: the notch used to vanish there instead of scrolling.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Reopen with Encoding clears the undo/redo history: a redo after re-decoding could silently reinstate the whole buffer as decoded under the previous encoding.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Clearing a terminal truly empties its scrollback now: the erase order used to slide the cleared screen contents into scrollback, still reachable by scrolling up.",
+        summary: "Problems file headers count only the diagnostics the active severity filter shows, not the file's full total.",
     },
 ];

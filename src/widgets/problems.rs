@@ -571,8 +571,15 @@ impl ProblemsPanel {
                 Style::default().fg(COLOR_DIM),
             ));
         }
+        // Count what the filter actually shows beneath this header, not the
+        // group's raw size — "Errors" over 1 error + 5 warnings reads 1.
+        let shown = group
+            .items
+            .iter()
+            .filter(|it| self.filter.keeps(it.severity))
+            .count();
         spans.push(Span::styled(
-            format!("  {}", group.items.len()),
+            format!("  {shown}"),
             Style::default().fg(COLOR_DIM),
         ));
         spans
@@ -648,6 +655,34 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// The file header's count badge must reflect the ACTIVE severity
+    /// filter: with "Errors" selected, a file with 1 error and 2 warnings
+    /// used to still show 3 over a single listed row.
+    #[test]
+    fn the_header_count_follows_the_severity_filter() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![
+                diag(0, DiagnosticSeverity::Error, "boom"),
+                diag(1, DiagnosticSeverity::Warning, "meh1"),
+                diag(2, DiagnosticSeverity::Warning, "meh2"),
+            ],
+        )]);
+        while p.filter != ProblemFilter::Errors {
+            p.cycle_filter();
+        }
+        let text: String = p
+            .header_spans(0)
+            .iter()
+            .map(|s| s.content.clone())
+            .collect();
+        assert!(
+            text.ends_with(" 1"),
+            "the badge must count only diagnostics passing the filter, got {text:?}"
+        );
     }
 
     #[test]
