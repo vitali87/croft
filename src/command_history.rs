@@ -28,6 +28,13 @@ fn canon_host(h: &str) -> &str {
     }
 }
 
+/// Whether an OSC 7 reporting host means "this machine" (empty, the RFC
+/// 8089 "localhost", or the machine's own hostname). Shared with every
+/// consumer that acts on a shell-reported path on the LOCAL filesystem.
+pub fn is_local_host(h: &str) -> bool {
+    canon_host(h).is_empty()
+}
+
 /// Whether `h` names this machine (case-insensitive, with or without the
 /// mDNS-style domain the shells sometimes include).
 fn is_local_hostname(h: &str) -> bool {
@@ -46,8 +53,20 @@ fn is_local_hostname(h: &str) -> bool {
     if local.is_empty() {
         return false;
     }
-    let short = |s: &str| s.split('.').next().unwrap_or(s).to_ascii_lowercase();
-    short(h) == short(local)
+    // Full-name comparison after lowercasing and stripping one mDNS
+    // `.local` suffix; a bare reported name may also match this machine's
+    // first label (shells report the short form). NEVER first-label vs
+    // first-label: `e2b.remote.example` is not the Mac named `e2b.local`.
+    let norm = |s: &str| {
+        let s = s.to_ascii_lowercase();
+        s.strip_suffix(".local").map(String::from).unwrap_or(s)
+    };
+    let h_n = norm(h);
+    let l_n = norm(local);
+    if h_n == l_n {
+        return true;
+    }
+    !h_n.contains('.') && Some(h_n.as_str()) == l_n.split('.').next()
 }
 
 /// One finished shell command.
@@ -240,6 +259,36 @@ mod tests {
             dur_ms: 42,
             ts,
         }
+    }
+
+    /// A remote FQDN that merely SHARES this machine's first DNS label is
+    /// a different machine: `e2b.remote.example` on a Mac named
+    /// `e2b.local` used to pass as local (first-label comparison), letting
+    /// a remote-reported cwd flow into local splits and session restore.
+    /// The legitimate spellings of THIS machine still pass: the exact
+    /// name, the mDNS `.local` variant, and the bare short name.
+    #[test]
+    fn a_remote_fqdn_sharing_the_short_name_is_not_local() {
+        let out = std::process::Command::new("hostname").output().unwrap();
+        let local = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if local.is_empty() {
+            return;
+        }
+        let first = local.split('.').next().unwrap().to_string();
+        assert!(
+            !is_local_host(&format!("{first}.remote.example")),
+            "an unrelated FQDN sharing the first label is another machine"
+        );
+        assert!(is_local_host(&local), "the machine's own name is local");
+        assert!(is_local_host(&first), "the bare short name is local");
+        assert!(
+            is_local_host(&format!("{first}.local")),
+            "the mDNS spelling is local"
+        );
+        assert!(
+            is_local_host(&first.to_uppercase()),
+            "hostname comparison is case-insensitive"
+        );
     }
 
     /// A command run at /x over an in-pane ssh session must not surface in

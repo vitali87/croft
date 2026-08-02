@@ -62,18 +62,18 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Output triggers respect the alt-screen boundary exactly: a banner printed just before a full-screen app used to be silently dropped, content inside vim/htop could fire false notifications, and output around an alt round trip could splice into a line that was never printed.",
+        summary: "Command decoration dots stay honest: clearing the pane used to invert every mark's position math so stale dots later resurfaced on unrelated rows, where their menu copied or re-ran the wrong text; marks now ride the scroll clock (stable past a full scrollback too) and clears drop them.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Quick-select is bound to the pane it opened on: switching panes closes the labels instead of painting them over the new pane's unrelated text, or pasting the old pane's content into the new pane's shell.",
+        summary: "In bash with an array PROMPT_COMMAND (ble.sh, prompt frameworks), pressing Enter at an empty prompt no longer fabricates a phantom finished command that hijacked Cmd+K Shift+R/C/S.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Quick-select labels follow their matches while output streams: the gold labels used to squat on fixed rows while the content scrolled away, so the typed label copied something no longer on screen.",
+        summary: "A pane SSH'd into a remote host no longer leaks the remote directory into local actions: splits and session restore only trust the shell-reported cwd when this machine reported it and the kernel confirms the shell really is in that directory.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "With more matches than labels, the bottom of the screen keeps its labels: the overflow used to drop the prompt-adjacent matches, the exact ones quick-select exists for, and the status line now counts anything left unlabelled.",
+        summary: "Directories with percent escapes in their names (a literal %41) survive the shell integration round trip: zsh and bash now escape the % like fish always did.",
     },
 ];
