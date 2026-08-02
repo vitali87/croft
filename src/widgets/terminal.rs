@@ -545,6 +545,11 @@ pub struct PtyTerminal {
     /// Latest OSC 7 reporting host (SSH inside the pane moves it to the
     /// remote's hostname); feeds the per-host accent rules.
     osc7_host: Arc<std::sync::Mutex<Option<String>>>,
+    /// Whether the newest OSC 7 report arrived while the SHELL owned the
+    /// tty (capture-time provenance): a report printed by a foreground job
+    /// (an ssh session) is never trusted for local filesystem use, even
+    /// after the job dies without a replacement report.
+    osc7_shell_owned: Arc<AtomicBool>,
     /// Host-accent dressing resolved by the app against the prefs rules:
     /// border / pill color and the watermark badge.
     pub accent: Option<(u8, u8, u8)>,
@@ -1295,6 +1300,13 @@ impl PtyTerminal {
         let clock_for_thread = clock.clone();
         let osc7_host = Arc::new(std::sync::Mutex::new(None::<String>));
         let osc7_host_for_thread = osc7_host.clone();
+        let osc7_shell_owned = Arc::new(AtomicBool::new(false));
+        let osc7_shell_owned_for_thread = osc7_shell_owned.clone();
+        // Capture-time provenance inputs for the reader thread: the pty fd
+        // for tcgetpgrp and the shell's pid. The reader thread is joined in
+        // Drop before the master closes, so the raw fd cannot dangle.
+        let master_fd_for_thread = pair.master.as_raw_fd();
+        let shell_pid_for_thread = shell_pid;
         // Trigger set shared with the reader thread; the inner Arc is swapped
         // by `set_triggers` on startup / config reload, picked up per chunk.
         let triggers = Arc::new(std::sync::Mutex::new(std::sync::Arc::new(
@@ -1343,8 +1355,23 @@ impl PtyTerminal {
                             use crate::shell_integration::OscEvent as E;
                             match ev {
                                 E::Cwd(p, host) => {
+                                    // Provenance AT CAPTURE: only a report
+                                    // that arrived while the shell owned
+                                    // the tty can have come from the local
+                                    // shell's own prompt hook; a foreground
+                                    // job's claim stays untrusted forever.
+                                    let shell_owned =
+                                        match (master_fd_for_thread, shell_pid_for_thread) {
+                                            (Some(fd), Some(pid)) => {
+                                                let fg = unsafe { libc::tcgetpgrp(fd) };
+                                                fg <= 0 || fg == pid
+                                            }
+                                            _ => true,
+                                        };
                                     *osc7_for_thread.lock().unwrap() = Some(p);
                                     *osc7_host_for_thread.lock().unwrap() = host;
+                                    osc7_shell_owned_for_thread
+                                        .store(shell_owned, Ordering::Release);
                                 }
                                 E::Notify(msg) => {
                                     notifications_for_thread.lock().unwrap().push(msg);
@@ -1537,6 +1564,7 @@ impl PtyTerminal {
             marks,
             osc7_cwd,
             osc7_host,
+            osc7_shell_owned,
             accent: None,
             accent_badge: None,
             notifications,
@@ -1849,7 +1877,10 @@ impl PtyTerminal {
     /// a local tmux/pager forces the caller's `cwd_of_pid` fallback.
     pub fn local_shell_cwd(&self) -> Option<std::path::PathBuf> {
         let host = self.shell_host().unwrap_or_default();
-        if !crate::command_history::is_local_host(&host) || !self.foreground_is_shell() {
+        if !crate::command_history::is_local_host(&host)
+            || !self.osc7_shell_owned.load(Ordering::Acquire)
+            || !self.foreground_is_shell()
+        {
             return None;
         }
         self.shell_cwd()
@@ -4401,6 +4432,61 @@ mod tests {
             term.local_shell_cwd(),
             None,
             "a tty-owning foreground process must not place local splits by claim"
+        );
+    }
+
+    /// The forged claim outliving its forger: a foreground job prints an
+    /// OSC 7 with a local-looking host and EXITS; the shell retakes the
+    /// tty without re-reporting (no integration), so a foreground check at
+    /// consultation time passes on the stale cache. Provenance must be
+    /// recorded at CAPTURE: a report that arrived while a job owned the
+    /// tty never becomes trusted, however long ago the job died.
+    #[test]
+    fn a_stale_claim_from_a_dead_foreground_job_stays_untrusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        // zsh -f: job control (the claim's job gets its own pgroup, like a
+        // real ssh client) but NO integration — the shell never overwrites
+        // the stale claim with a fresh trusted report of its own.
+        let mut term = PtyTerminal::new_running(
+            "/bin/zsh",
+            &[String::from("-f"), String::from("-i")],
+            tmp.path(),
+        )
+        .unwrap();
+        let mut waited = 0u32;
+        while waited < 4000 && !term.foreground_is_shell() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        // An EXTERNAL job (its own pgroup, like an ssh client — a bare
+        // printf would be a zsh builtin printing from the shell's own
+        // pgroup) settles as the tty owner, prints the local-looking
+        // claim, lingers so the capture happens while it owns the tty,
+        // and dies.
+        term.write_input(
+            b"/bin/sh -c 'sleep 1; printf \"\\033]7;file://localhost/tmp\\007\"; sleep 1'\n",
+        );
+        let mut waited = 0u32;
+        while waited < 8000
+            && !(term.foreground_is_shell()
+                && term.shell_cwd() == Some(std::path::PathBuf::from("/tmp")))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert_eq!(
+            term.shell_cwd(),
+            Some(std::path::PathBuf::from("/tmp")),
+            "staging: the claim was captured"
+        );
+        assert!(
+            term.foreground_is_shell(),
+            "staging: the job is gone and the shell owns the tty again"
+        );
+        assert_eq!(
+            term.local_shell_cwd(),
+            None,
+            "a claim captured while a job owned the tty must never become trusted"
         );
     }
 
