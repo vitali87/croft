@@ -66,11 +66,11 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Source a theme's queries don't capture (whitespace, gaps in sparse grammars) now takes the theme's own code foreground: under Gruvbox or Dracula those bytes rendered in cold Base16 slate beside cream-colored tokens. The same fix covers unhighlighted fenced code in the Markdown preview.",
+        summary: "Source bytes the highlighter's queries don't capture (whitespace, gaps in sparse grammars) now take the theme's own code foreground: under Gruvbox or Dracula those bytes rendered in cold Base16 slate beside cream-colored tokens. The same fix covers unhighlighted fenced code in the Markdown preview.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The Markdown preview recolors immediately on a theme switch: it bakes its colors at build time and only rebuilt on edits, so it kept the previous theme's headings, links, and code colors until the file was touched or the preview reopened.",
+        summary: "The Markdown preview recolors immediately on a theme switch: it bakes its colors at build time and was previously rebuilt only on edits, so it kept the old theme's headings, links, and code colors until the file was touched or the preview was reopened.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
