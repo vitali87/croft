@@ -219,8 +219,9 @@ const STALL_GAP_MS: u64 = 60_000;
 ///
 /// Shared (behind a mutex) between the render thread — selection,
 /// copy-mode, and annotation re-anchoring — and the PTY reader thread,
-/// which keys arrival timestamps on it. Both sides hold the term lock
-/// first, then this mutex.
+/// which keys arrival timestamps on it. Lock order everywhere:
+/// term → clock → line_times; the term lock is held across the whole
+/// sequence on both threads, and the inner two always nest in that order.
 struct ScrollClock {
     /// Monotonic reading, folded up to the last `tick`.
     base: i64,
@@ -3291,10 +3292,12 @@ impl Widget for &mut PtyTerminal {
         // when the row landed a long stall after its predecessor. Chrome
         // over content, painted only while the palette toggle is on.
         if self.show_timestamps && !alt_screen && inner.width > 14 {
-            let lt = self.line_times.lock().unwrap();
             // Row ids are `clock + grid line` — content-stable through
             // scrollback saturation, matching the reader thread's stamps.
+            // Clock before line_times: the shared lock order is
+            // term → clock → line_times (see [`ScrollClock`]).
             let clock_now = self.clock_now(&term);
+            let lt = self.line_times.lock().unwrap();
             for y in 0..rows {
                 let abs = clock_now + (y as i32 - display_offset as i32) as i64;
                 let Some(&ms) = lt.get(&abs) else { continue };
@@ -3383,8 +3386,12 @@ impl Widget for &mut PtyTerminal {
                 }
                 // A multi-row command (soft-wrapped or a quoted/heredoc
                 // newline) arrives with its rows joined by '\n'; a cell must
-                // never hold a control char, so the join becomes a space.
-                let label = format!("\u{25b6} {}", text.trim().replace('\n', " "));
+                // never hold ANY control char, so the whole class maps to
+                // spaces, not just the row join.
+                let label: String = format!("\u{25b6} {}", text.trim())
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
                 let mut xw = inner.x + 1;
                 for ch in label.chars() {
                     if xw + 1 >= inner.x + inner.width {
@@ -5868,7 +5875,15 @@ mod tests {
         // both left of the recorded prompt-end column 30.
         feed_pty(&t, b"\r\x1b[Kworking");
         let row = t.term.lock().grid().cursor.point.line.0 as u16;
-        let _ = t.prompt_click_arrows(5, row);
+        // Live bounds: the text ends at column 7 and the cursor sits at
+        // column 7, both left of the recorded 133;B column 30. The click at
+        // column 5 clamps into [30.min(7), 7] = 7, which equals the cursor,
+        // so the gesture degrades to no motion instead of panicking.
+        assert_eq!(
+            t.prompt_click_arrows(5, row),
+            None,
+            "a click on a shortened prompt row must degrade, not panic"
+        );
     }
 
     #[test]
