@@ -70,7 +70,7 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Deleting a user keybinding now releases its Cmd chord in iTerm2 on the next setup run: the installed forwarder used to stay behind forever, typing escape codes into every iTerm2 session.",
+        summary: "Deleting a user keybinding now releases its Cmd chord in iTerm2 on the next setup run: the installed forwarder used to stay behind forever, typing escape codes into every iTerm2 session. A forwarder you have since rewired in iTerm2 prefs is yours and is left alone.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
