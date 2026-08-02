@@ -23,6 +23,10 @@ preview*.svg
 # so a stray local override never gets committed.
 /.cargo/config.toml
 
+# Per-machine nextest thread cap; same rule as /.cargo/config.toml above
+# (nextest reads test-threads from here, not from RUST_TEST_THREADS).
+/.config/nextest.toml
+
 # Nix / direnv
 /.direnv/
 /result

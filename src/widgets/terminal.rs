@@ -99,6 +99,14 @@ struct AltSelAnchor {
     /// prefix/suffix highlighted. Painting clips to these; `None` while
     /// the whole block is visible.
     visible: Option<Vec<(i32, u16, u16)>>,
+    /// Row text just above / below the block at capture time (`None` at a
+    /// grid edge). Pure tie-breakers for re-anchoring: full-screen apps
+    /// repeat rows verbatim (divider rules, continuation markers), so a
+    /// selection whose own fingerprint matches several shifts equally —
+    /// inevitably a one-row selection on such a row — follows the copy
+    /// whose neighbours also match instead of the nearest lookalike.
+    ctx_above: Option<String>,
+    ctx_below: Option<String>,
 }
 
 impl Selection {
@@ -1817,11 +1825,14 @@ impl PtyTerminal {
         // least two (when the block has two) including a non-blank one,
         // so a lone repeated divider row can't latch the highlight onto an
         // unrelated copy of itself. More exact rows win; ties go to the
-        // smallest movement.
+        // shift whose captured neighbour rows also match (a ONE-row block
+        // has a one-row fingerprint, and full-screen apps repeat rows
+        // verbatim — the neighbours tell its copy from the lookalikes),
+        // then to the smallest movement.
         let k_rows = anchor.rows.len();
         let min_exact = k_rows.min(2);
-        // (top, exact-row count)
-        let mut best: Option<(i32, usize)> = None;
+        // (top, exact-row count, matched-neighbour count)
+        let mut best: Option<(i32, usize, usize)> = None;
         for top in 1 - k..rows_vis {
             let (mut exact, mut nonblank) = (0usize, false);
             for (i, want) in anchor.rows.iter().enumerate() {
@@ -1831,18 +1842,33 @@ impl PtyTerminal {
                     nonblank |= !want.trim().is_empty();
                 }
             }
+            let mut ctx = 0usize;
+            for (want, line) in [
+                (anchor.ctx_above.as_ref(), top - 1),
+                (anchor.ctx_below.as_ref(), top + k),
+            ] {
+                if let Some(want) = want
+                    && (0..rows_vis).contains(&line)
+                    && grid_rows[line as usize].0 == *want
+                {
+                    ctx += 1;
+                }
+            }
             if exact >= min_exact
                 && nonblank
-                && best.is_none_or(|(btop, bexact)| {
+                && best.is_none_or(|(btop, bexact, bctx)| {
                     exact > bexact
-                        || (exact == bexact && (top - old_top).abs() < (btop - old_top).abs())
+                        || (exact == bexact && ctx > bctx)
+                        || (exact == bexact
+                            && ctx == bctx
+                            && (top - old_top).abs() < (btop - old_top).abs())
                 })
             {
-                best = Some((top, exact));
+                best = Some((top, exact, ctx));
             }
         }
         match best {
-            Some((top, _)) => {
+            Some((top, _, _)) => {
                 let d = top - old_top;
                 anchor.top = top;
                 if d != 0
@@ -2549,6 +2575,8 @@ fn capture_alt_anchor(term: &Term<VoidListener>, sel: Selection) -> Option<AltSe
         return None;
     }
     let rows = (lo..=hi).map(|l| row_text_and_cols(term, l).0).collect();
+    let ctx_above = (lo > 0).then(|| row_text_and_cols(term, lo - 1).0);
+    let ctx_below = (hi + 1 < rows_vis).then(|| row_text_and_cols(term, hi + 1).0);
     let text = if sel.block {
         let (rl, cl, rh, ch) = sel.block_bounds();
         block_selection_text(term, rl, cl as usize, rh, ch as usize)
@@ -2562,6 +2590,8 @@ fn capture_alt_anchor(term: &Term<VoidListener>, sel: Selection) -> Option<AltSe
         text,
         dormant: false,
         visible: None,
+        ctx_above,
+        ctx_below,
     })
 }
 
@@ -5439,6 +5469,47 @@ mod tests {
         assert!(!anchor.dormant);
         assert_eq!(anchor.visible, None, "fully visible again: no clip");
         assert_eq!(t.selection_text(), "bravo two\ncharlie three\ndelta four");
+    }
+
+    #[test]
+    fn a_single_row_selection_on_a_repeated_row_reanchors_to_its_own_copy() {
+        // A one-row selection has a one-row fingerprint, and full-screen
+        // apps repeat rows verbatim (divider rules, continuation markers).
+        // After a repaint the nearest identical copy may be a DIFFERENT
+        // copy: the neighbours captured with the anchor must break the tie
+        // so the highlight follows its own row, not the closest lookalike.
+        let (_tmp, mut t) = quiet_pty();
+        feed_pty(
+            &t,
+            b"\x1b[?1049h\x1b[H\x1b[2Jalpha\r\n-----\r\nbravo\r\n-----\r\ncharlie",
+        );
+        // Select the SECOND divider (row 3), between bravo and charlie.
+        t.set_selection(Some(Selection {
+            anchor: (3, 0),
+            head: (3, 4),
+            block: false,
+        }));
+        assert_eq!(t.selection_text(), "-----");
+
+        // The app scrolls two rows: the selected divider moves to row 1
+        // (still between bravo and charlie), while a new divider appears
+        // at row 4 — NEARER to the old position than the real one.
+        feed_pty(
+            &t,
+            b"\x1b[H\x1b[2Jbravo\r\n-----\r\ncharlie\r\ndelta\r\n-----",
+        );
+        t.rebase_selection();
+        let anchor = t.alt_sel.as_ref().expect("anchor survives");
+        assert_eq!(
+            anchor.top, 1,
+            "the highlight must follow its own copy (neighbours bravo/charlie), not the nearest lookalike"
+        );
+        assert_eq!(
+            t.selection.map(|s| (s.anchor, s.head)),
+            Some(((1, 0), (1, 4))),
+            "the selection coordinates must move with the content"
+        );
+        assert_eq!(t.selection_text(), "-----");
     }
 
     /// Drive a PtyTerminal's grid directly: parse `bytes` into its term as

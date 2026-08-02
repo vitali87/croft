@@ -494,7 +494,8 @@ pub(crate) mod test_clip {
     /// Guard returned by `lock_clipboard_for_test`. While held, the
     /// current thread's `write_string` / `read_string` calls bypass the
     /// per-thread mock and exercise the real OS clipboard, and no
-    /// other thread can hold the lock concurrently.
+    /// other test — in this process or any other — drives the clipboard
+    /// concurrently.
     ///
     /// On macOS and Linux the guard also snapshots the system clipboard at
     /// acquire-time and restores it on drop, so a `cargo test` run never
@@ -504,6 +505,21 @@ pub(crate) mod test_clip {
     /// and restore is a harmless no-op.)
     pub(crate) struct ClipboardTestGuard {
         _mutex: MutexGuard<'static, ()>,
+        /// Cross-process exclusion: a process-per-test runner
+        /// (cargo-nextest) gives every test its own process, so
+        /// `CLIP_LOCK` alone cannot keep two tests off the ONE system
+        /// pasteboard. An exclusive advisory lock on a well-known file
+        /// extends the exclusion across processes; the kernel releases
+        /// it when the file closes on drop — including when a test
+        /// process dies, so a killed test can never wedge the rest.
+        ///
+        /// The lock file lives under the checkout's own `target/`, not
+        /// the shared temp dir: every test process of a run compiles
+        /// from the same checkout (so they agree on the path), and a
+        /// user-owned directory means no other local user can pre-plant
+        /// a symlink at the predictable name and have `open` clobber
+        /// its target.
+        _file_lock: std::fs::File,
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         snapshot: Option<String>,
     }
@@ -513,11 +529,32 @@ pub(crate) mod test_clip {
             let mutex = CLIP_LOCK
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
+            let lock_dir =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+            std::fs::create_dir_all(&lock_dir)
+                .expect("clipboard test lock dir must exist");
+            let file_lock = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(lock_dir.join("croft-clipboard-test.lock"))
+                .expect("clipboard test lock file must open");
+            loop {
+                match file_lock.lock() {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => panic!("clipboard test file lock failed: {e}"),
+                }
+            }
+            // Snapshot only once BOTH locks are held: until then the
+            // pasteboard may hold another test process's sentinel, and
+            // restoring that on drop would hand it to the next paste.
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             let snapshot = native_read();
             REAL_OPT_IN.with(|c| c.set(true));
             Self {
                 _mutex: mutex,
+                _file_lock: file_lock,
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 snapshot,
             }

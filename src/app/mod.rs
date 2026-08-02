@@ -1912,6 +1912,10 @@ pub struct App {
     /// A graph fetch is running; suppresses duplicate spawns when a burst of
     /// StatusAndChanges responses lands. Cleared when the reply drains.
     graph_fetch_inflight: bool,
+    /// A refresh was requested while a fetch was in flight (Make Root, a
+    /// newer HEAD): re-fire once the stale reply drains instead of dropping
+    /// the request (see [`Self::refresh_commit_graph`]).
+    graph_refetch_queued: bool,
     pub run_debug: RunDebugPanel,
     /// The Testing side panel: the suite tree with live pass/fail status.
     pub testing: crate::widgets::testing::TestingPanel,
@@ -3354,6 +3358,7 @@ impl App {
             graph_rx,
             graph_tx,
             graph_fetch_inflight: false,
+            graph_refetch_queued: false,
             run_debug,
             testing: crate::widgets::testing::TestingPanel::new(),
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
@@ -6618,6 +6623,12 @@ impl App {
             if root == self.tree.root {
                 self.commit_graph.set_rows(rows);
                 changed = true;
+            }
+            // A trigger arrived while this reply was in flight: what it
+            // asked for (new root, newer HEAD) is not what just landed.
+            if self.graph_refetch_queued {
+                self.graph_refetch_queued = false;
+                self.refresh_commit_graph();
             }
         }
 
@@ -13547,9 +13558,15 @@ impl App {
     /// Refetch the COMMITS graph off-thread: `git log --topo-order` plus the
     /// pure lane layout both run on the fetch thread, and the finished rows
     /// land in [`graph_rx`] tagged with the root they describe. The inflight
-    /// latch collapses a burst of triggers into one shell-out.
+    /// latch collapses a burst of triggers into one shell-out plus one
+    /// queued refetch: a trigger during flight is answering a question the
+    /// in-flight fetch predates (a Make Root, a newer HEAD), so it must
+    /// re-fire when the reply drains rather than be dropped — a root change
+    /// racing the fetch otherwise left the panel on "Loading" until HEAD
+    /// next moved.
     fn refresh_commit_graph(&mut self) {
         if self.graph_fetch_inflight {
+            self.graph_refetch_queued = true;
             return;
         }
         self.graph_fetch_inflight = true;
