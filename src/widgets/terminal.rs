@@ -467,6 +467,12 @@ pub struct PtyTerminal {
     /// pressure that broke timing-sensitive tests; production drops (closing
     /// a pane) leaked the same way.
     reader_thread: Option<std::thread::JoinHandle<()>>,
+    /// Write end of the reader thread's shutdown pipe; `Drop` closes it,
+    /// raising POLLHUP on the read end the reader polls alongside the pty.
+    /// Without it the join above can hang forever: on Linux a background job
+    /// keeps the pty slave open after the shell dies, so the reader's `read`
+    /// never returns EOF (macOS revokes the tty instead).
+    reader_shutdown: Option<std::io::PipeWriter>,
     /// The interactive shell's pid, captured at spawn. A shell at its
     /// prompt is its own foreground process-group leader, so this is the
     /// value `foreground_is_shell` compares `tcgetpgrp(master)` against.
@@ -1446,6 +1452,13 @@ impl PtyTerminal {
         let triggers_for_thread = triggers.clone();
         let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<crate::triggers::TriggerHit>();
 
+        // Shutdown pipe + master fd for the reader's poll gate: the reader
+        // must be wakeable without depending on the pty ever reaching EOF.
+        let (shutdown_r, shutdown_w) = std::io::pipe().context("shutdown pipe")?;
+        let pty_fd = pair
+            .master
+            .as_raw_fd()
+            .context("pty master has no raw fd")?;
         let reader_thread = std::thread::spawn(move || {
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut port_sniffer = crate::port_detect::PortSniffer::new();
@@ -1466,6 +1479,9 @@ impl PtyTerminal {
             let mut cmd_start: Option<std::time::Instant> = None;
             let mut buf = [0u8; 65536];
             loop {
+                if !wait_pty_readable(pty_fd, &shutdown_r) {
+                    break;
+                }
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -1656,6 +1672,7 @@ impl PtyTerminal {
             writer,
             _child: child,
             reader_thread: Some(reader_thread),
+            reader_shutdown: Some(shutdown_w),
             shell_pid,
             cols,
             rows,
@@ -3021,15 +3038,56 @@ impl PtyTerminal {
     }
 }
 
+/// Block until the pty has data (or EOF/error — the following `read` then
+/// observes it), or until the shutdown pipe signals (its write end closed in
+/// `Drop`). Returns false on shutdown. A bare blocking `read` is not enough
+/// to ever exit: on Linux a background job keeps the pty slave open after
+/// the shell dies, so the read never returns and joining the reader would
+/// freeze the UI for as long as the job runs.
+fn wait_pty_readable(pty_fd: std::os::fd::RawFd, shutdown: &std::io::PipeReader) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fds = [
+        libc::pollfd {
+            fd: pty_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: shutdown.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if fds[1].revents != 0 {
+            return false;
+        }
+        if fds[0].revents != 0 {
+            return true;
+        }
+    }
+}
+
 impl Drop for PtyTerminal {
     fn drop(&mut self) {
-        // Kill the shell so its slave fd closes; the reader thread's blocked
-        // `read` then returns EOF and the thread exits, which we join here.
-        // Without this a dropped terminal (a closed pane, or every terminal
-        // an App test creates) leaves a live shell process and a parked
-        // reader thread behind. The responder thread ends on its own once
+        // Kill the shell AND reap it: `kill()` reaps only when the shell dies
+        // inside its SIGHUP grace loop; the SIGKILL escalation (a shell that
+        // traps HUP) never waits, and `Child`'s own drop doesn't either, so
+        // without the `wait` every such closed pane left a zombie for the
+        // life of the process. The responder thread ends on its own once
         // `self.term` (holding its channel sender) drops with this struct.
         let _ = self._child.kill();
+        let _ = self._child.wait();
+        // Wake the reader (POLLHUP on its shutdown fd) and join it. EOF alone
+        // is not a reliable wake: see `wait_pty_readable`.
+        drop(self.reader_shutdown.take());
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
         }
@@ -4468,6 +4526,56 @@ mod tests {
         assert!(
             term.take_dirty(),
             "write_input must mark the terminal dirty"
+        );
+    }
+
+    /// Drop must REAP the shell on every path. portable-pty's `kill()` reaps
+    /// only when the shell dies inside its SIGHUP grace loop; a shell that
+    /// ignores HUP gets the SIGKILL escalation, which never waits — so every
+    /// such closed pane left a zombie for the life of the process.
+    #[test]
+    fn dropping_a_terminal_reaps_a_hup_ignoring_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        let pid = term.pid().expect("spawned shell has a pid") as i32;
+        // The needle only ever appears as command OUTPUT ($(..) is unexpanded
+        // in the input echo), so matching it proves the trap line executed.
+        term.write_input(b"trap '' HUP; echo TRAP_$(echo armed)\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !term.visible_text().contains("TRAP_armed") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "staging: the shell never confirmed the HUP trap"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(term);
+        let mut status = 0i32;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert!(
+            r < 0,
+            "the shell was left as an unreaped zombie (waitpid still found it: r={r})"
+        );
+    }
+
+    /// Drop must return promptly even when a background job keeps the pty
+    /// slave open: on Linux the reader's blocked `read` never returns then
+    /// (no tty revoke like macOS), so joining it would freeze the UI until
+    /// the job exits. The shutdown pipe is what wakes the reader.
+    #[test]
+    fn a_background_job_cannot_stall_a_dropped_pane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        term.write_input(b"sleep 30 &\n");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(term);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            "drop hung: the reader never woke while a background job held the pty slave"
         );
     }
 

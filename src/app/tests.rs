@@ -9172,6 +9172,22 @@ fn editor_app_with_lines(lines: &[&str]) -> App {
     app
 }
 
+/// History recording runs off-thread; poll until the store has entries (or a
+/// deadline passes and the caller's assert reports the miss).
+fn wait_for_snapshots(
+    root: &std::path::Path,
+    f: &std::path::Path,
+) -> Vec<crate::history::Snapshot> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let snaps = crate::history::entries_in(root, f);
+        if !snaps.is_empty() || std::time::Instant::now() > deadline {
+            return snaps;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn saving_records_a_local_history_snapshot_that_diffs_and_restores() {
     let tmp = tempfile::tempdir().unwrap();
@@ -9183,12 +9199,13 @@ fn saving_records_a_local_history_snapshot_that_diffs_and_restores() {
     app.editor.open(&f).unwrap();
     app.focus_pane(Pane::Editor);
 
-    // Type and save: the save hook records a snapshot of the on-disk bytes.
+    // Type and save: the save hook records a snapshot of the on-disk bytes
+    // (off-thread, so poll for it).
     app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
         .unwrap();
     app.save();
     let saved = std::fs::read_to_string(&f).unwrap();
-    let snaps = crate::history::entries_in(&app.history_root, &f);
+    let snaps = wait_for_snapshots(&app.history_root, &f);
     assert_eq!(snaps.len(), 1, "a save must record one snapshot");
     assert_eq!(
         std::fs::read_to_string(&snaps[0].file).unwrap(),
@@ -9213,6 +9230,107 @@ fn saving_records_a_local_history_snapshot_that_diffs_and_restores() {
         std::fs::read_to_string(&f).unwrap(),
         saved,
         "restore writes the snapshot contents back to disk"
+    );
+}
+
+/// A snapshot click that fails (pruned .snap, unreadable file) must disarm
+/// "Restore Snapshot": the palette entry otherwise writes whatever snapshot
+/// was viewed BEFORE over a file that is not even on screen.
+#[test]
+fn a_failed_snapshot_click_disarms_a_stale_restore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "a-disk\n").unwrap();
+    std::fs::write(&b, "b-disk\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    crate::history::record_in(&app.history_root, &a, b"a-old\n", 1000).unwrap();
+    app.editor.open(&a).unwrap();
+    app.open_timeline_diff(a.clone(), "local:1000".into());
+    assert!(app.history_restore.is_some(), "staging: a's snapshot armed");
+    // A pruned snapshot row of another file: the click fails...
+    app.open_timeline_diff(b.clone(), "local:999".into());
+    assert_eq!(app.status, "Snapshot no longer available");
+    assert!(
+        app.history_restore.is_none(),
+        "the failed click left the previous file's restore armed"
+    );
+    // ...and restore must refuse instead of clobbering a.txt.
+    app.restore_history_snapshot();
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "a-disk\n",
+        "restore wrote a stale snapshot over an unrelated file"
+    );
+}
+
+/// Local snapshots are path-keyed and repo-free, so a file outside the
+/// workspace root must still list (and restore) its versions; the panel used
+/// to sit on "Loading" forever while snapshots accumulated invisibly.
+#[test]
+fn a_file_outside_the_workspace_still_lists_its_local_snapshots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = outside.path().join("note.txt");
+    std::fs::write(&f, "v2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    crate::history::record_in(&app.history_root, &f, b"v1\n", 1000).unwrap();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let target = loop {
+        app.sync_explorer_panels();
+        if let Some(t) = app.timeline.diff_target(0) {
+            break Some(t);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(
+        target,
+        Some((f.clone(), "local:1000".to_string())),
+        "the out-of-root file's snapshot never reached the TIMELINE"
+    );
+}
+
+/// A Windows-1252 buffer (via Reopen with Encoding) saves non-UTF-8 bytes, so
+/// its history must be recorded byte-exact — the old text-only path silently
+/// skipped every save of such a file.
+#[test]
+fn saving_a_windows_1252_file_records_a_byte_exact_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("latin.txt");
+    // 0xE9 is 'é' in Windows-1252 and invalid UTF-8.
+    std::fs::write(&f, b"caf\xE9\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.save();
+    let snaps = wait_for_snapshots(&app.history_root, &f);
+    assert_eq!(
+        snaps.len(),
+        1,
+        "a non-UTF-8 file's save must record history"
+    );
+    let disk = std::fs::read(&f).unwrap();
+    assert!(disk.contains(&0xE9), "staging: the save re-encoded to 1252");
+    assert_eq!(
+        std::fs::read(&snaps[0].file).unwrap(),
+        disk,
+        "the snapshot must hold the exact on-disk bytes"
     );
 }
 

@@ -10,12 +10,15 @@
 //! file keeps at most [`MAX_SNAPSHOTS_PER_FILE`] snapshots so the directory
 //! can't grow without bound.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Cap per file so a hot save loop can't fill the disk; oldest pruned first.
 const MAX_SNAPSHOTS_PER_FILE: usize = 50;
+
+/// Saves this close to the newest snapshot replace it instead of appending
+/// (VS Code's `workbench.localHistory.mergeWindow`, default 10s). Without it
+/// the 1s auto save turns the capped store into a log of the last minute.
+const MERGE_WINDOW_MILLIS: u64 = 10_000;
 
 const SNAP_EXT: &str = "snap";
 
@@ -80,38 +83,73 @@ pub fn snapshot_millis(short_hash: &str) -> Option<u64> {
 
 /// The `.snap` file for `abs_path` at `millis` under `root_dir`, if it exists.
 pub fn snapshot_file_in(root_dir: &Path, abs_path: &Path, millis: u64) -> Option<PathBuf> {
-    let file = root_dir
-        .join(key_for(abs_path))
-        .join(format!("{millis}.{SNAP_EXT}"));
+    let file = dir_for(root_dir, abs_path).join(format!("{millis}.{SNAP_EXT}"));
     file.is_file().then_some(file)
 }
 
-/// Stable directory name for `abs_path`: a hex hash of its string form, so two
-/// files never collide and no path-to-key index is needed.
+/// Stable directory name for `abs_path`: FNV-1a 64 of its string form, so two
+/// files never collide and no path-to-key index is needed. Hand-rolled because
+/// the store outlives the binary: `DefaultHasher`'s algorithm is unspecified
+/// across Rust releases, and a key that moves orphans every stored snapshot.
 fn key_for(abs_path: &Path) -> String {
-    let mut h = DefaultHasher::new();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in abs_path.to_string_lossy().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// The key pre-FNV builds used (`DefaultHasher`); only consulted to migrate.
+fn legacy_key_for(abs_path: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
     abs_path.to_string_lossy().hash(&mut h);
     format!("{:016x}", h.finish())
 }
 
-/// Record `content` as a new snapshot of `abs_path` under `root_dir` (the
-/// history root; separated out so tests can point it at a tempdir). A no-op
-/// when `content` matches the newest snapshot, so idle saves don't pile up.
+/// The store directory for `abs_path`, renaming a legacy-keyed directory to
+/// the stable key on first touch so pre-FNV snapshots stay reachable.
+fn dir_for(root_dir: &Path, abs_path: &Path) -> PathBuf {
+    let dir = root_dir.join(key_for(abs_path));
+    if !dir.exists() {
+        let legacy = root_dir.join(legacy_key_for(abs_path));
+        if legacy.is_dir() {
+            let _ = std::fs::rename(&legacy, &dir);
+        }
+    }
+    dir
+}
+
+/// Record `content` (the file's raw on-disk bytes, so non-UTF-8 encodings
+/// round-trip) as a new snapshot of `abs_path` under `root_dir` (the history
+/// root; separated out so tests can point it at a tempdir). A no-op when
+/// `content` matches the newest snapshot; a save within
+/// [`MERGE_WINDOW_MILLIS`] of the newest replaces it instead of appending.
 /// Prunes to [`MAX_SNAPSHOTS_PER_FILE`]. Best-effort: any IO error is
 /// returned but a caller may ignore it (history is a convenience, not a
 /// guarantee).
 pub fn record_in(
     root_dir: &Path,
     abs_path: &Path,
-    content: &str,
+    content: &[u8],
     millis: u64,
 ) -> std::io::Result<()> {
-    let dir = root_dir.join(key_for(abs_path));
-    // Skip when the newest snapshot already holds this exact content.
-    if let Some(latest) = entries_in(root_dir, abs_path).first()
-        && std::fs::read_to_string(&latest.file).is_ok_and(|prev| prev == content)
-    {
-        return Ok(());
+    let dir = dir_for(root_dir, abs_path);
+    if let Some(latest) = entries_in(root_dir, abs_path).first() {
+        // Skip when the newest snapshot already holds this exact content.
+        if std::fs::read(&latest.file).is_ok_and(|prev| prev == content) {
+            return Ok(());
+        }
+        // Inside the merge window: this save supersedes the newest snapshot
+        // rather than appending, so a 1s auto save can't churn out history.
+        if millis.saturating_sub(latest.millis) < MERGE_WINDOW_MILLIS {
+            std::fs::write(dir.join(format!("{millis}.{SNAP_EXT}")), content)?;
+            if latest.millis != millis {
+                let _ = std::fs::remove_file(&latest.file);
+            }
+            return Ok(());
+        }
     }
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(format!("{millis}.{SNAP_EXT}")), content)?;
@@ -121,7 +159,7 @@ pub fn record_in(
 
 /// Snapshots of `abs_path` under `root_dir`, newest first.
 pub fn entries_in(root_dir: &Path, abs_path: &Path) -> Vec<Snapshot> {
-    let dir = root_dir.join(key_for(abs_path));
+    let dir = dir_for(root_dir, abs_path);
     let Ok(read) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -157,12 +195,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let f = Path::new("/work/a.rs");
-        record_in(root, f, "v1", 1000).unwrap();
-        record_in(root, f, "v2", 2000).unwrap();
-        record_in(root, f, "v3", 3000).unwrap();
+        record_in(root, f, b"v1", 1000).unwrap();
+        record_in(root, f, b"v2", 60_000).unwrap();
+        record_in(root, f, b"v3", 120_000).unwrap();
         let e = entries_in(root, f);
         assert_eq!(e.len(), 3);
-        assert_eq!(e[0].millis, 3000, "newest first");
+        assert_eq!(e[0].millis, 120_000, "newest first");
         assert_eq!(e[2].millis, 1000);
         assert_eq!(std::fs::read_to_string(&e[0].file).unwrap(), "v3");
     }
@@ -172,15 +210,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let f = Path::new("/work/a.rs");
-        record_in(root, f, "same", 1000).unwrap();
-        record_in(root, f, "same", 2000).unwrap();
+        record_in(root, f, b"same", 1000).unwrap();
+        record_in(root, f, b"same", 60_000).unwrap();
         assert_eq!(
             entries_in(root, f).len(),
             1,
             "an unchanged save must not add a snapshot"
         );
         // A real change still records.
-        record_in(root, f, "different", 3000).unwrap();
+        record_in(root, f, b"different", 120_000).unwrap();
         assert_eq!(entries_in(root, f).len(), 2);
     }
 
@@ -188,8 +226,8 @@ mod tests {
     fn distinct_files_never_share_a_key() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        record_in(root, Path::new("/work/a.rs"), "a", 1).unwrap();
-        record_in(root, Path::new("/work/b.rs"), "b", 1).unwrap();
+        record_in(root, Path::new("/work/a.rs"), b"a", 1).unwrap();
+        record_in(root, Path::new("/work/b.rs"), b"b", 1).unwrap();
         assert_eq!(entries_in(root, Path::new("/work/a.rs")).len(), 1);
         assert_eq!(entries_in(root, Path::new("/work/b.rs")).len(), 1);
         assert_eq!(
@@ -205,17 +243,17 @@ mod tests {
         let f = Path::new("/work/a.rs");
         for i in 0..(MAX_SNAPSHOTS_PER_FILE as u64 + 10) {
             // Vary content so nothing dedups.
-            record_in(root, f, &format!("v{i}"), i + 1).unwrap();
+            record_in(root, f, format!("v{i}").as_bytes(), (i + 1) * 60_000).unwrap();
         }
         let e = entries_in(root, f);
         assert_eq!(e.len(), MAX_SNAPSHOTS_PER_FILE, "capped");
         assert_eq!(
             e[0].millis,
-            MAX_SNAPSHOTS_PER_FILE as u64 + 10,
+            (MAX_SNAPSHOTS_PER_FILE as u64 + 10) * 60_000,
             "the newest survives"
         );
         assert!(
-            e.last().unwrap().millis > 10,
+            e.last().unwrap().millis > 10 * 60_000,
             "the oldest snapshots were pruned, not the newest"
         );
     }
@@ -224,6 +262,68 @@ mod tests {
     fn entries_for_an_unknown_file_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(entries_in(tmp.path(), Path::new("/nope.rs")).is_empty());
+    }
+
+    /// Auto save fires every second, so without a merge window the 50-snap cap
+    /// becomes a keystroke log and real history evaporates in minutes. VS Code
+    /// replaces the newest entry inside a 10s window instead of appending.
+    #[test]
+    fn saves_within_the_merge_window_replace_the_newest_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/a.rs");
+        record_in(root, f, b"v1", 1_000).unwrap();
+        record_in(root, f, b"v2", 60_000).unwrap();
+        // 5s after v2: inside the window, so v3 replaces v2 rather than piling on.
+        record_in(root, f, b"v3", 65_000).unwrap();
+        let e = entries_in(root, f);
+        assert_eq!(e.len(), 2, "the within-window save must merge, not append");
+        assert_eq!(e[0].millis, 65_000);
+        assert_eq!(std::fs::read(&e[0].file).unwrap(), b"v3");
+        assert_eq!(
+            std::fs::read(&e[1].file).unwrap(),
+            b"v1",
+            "history older than the window survives the churn"
+        );
+    }
+
+    /// The store must hold raw bytes: a UTF-16 file is first-class in the
+    /// editor, so its history must round-trip byte-exactly too.
+    #[test]
+    fn snapshots_hold_raw_bytes_so_non_utf8_files_have_history_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/u16.txt");
+        let utf16 = b"\xff\xfeh\x00i\x00";
+        record_in(root, f, utf16, 1_000).unwrap();
+        let e = entries_in(root, f);
+        assert_eq!(std::fs::read(&e[0].file).unwrap(), utf16);
+    }
+
+    /// The directory key is pinned to FNV-1a 64: `DefaultHasher`'s algorithm is
+    /// unspecified across Rust releases, so keying on it orphans every stored
+    /// snapshot at a toolchain bump.
+    #[test]
+    fn the_store_key_is_a_stable_hash_not_default_hasher() {
+        assert_eq!(key_for(Path::new("/work/a.rs")), "04a67ef4ed166070");
+    }
+
+    /// A store written by a pre-FNV build (keyed by `DefaultHasher`) is
+    /// migrated by renaming its directory the first time the file is touched.
+    #[test]
+    fn a_default_hasher_keyed_store_is_migrated_to_the_stable_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/a.rs");
+        let old_dir = root.join(legacy_key_for(f));
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("1000.snap"), b"old").unwrap();
+        let e = entries_in(root, f);
+        assert_eq!(e.len(), 1, "pre-FNV snapshots must be found via migration");
+        assert!(
+            root.join(key_for(f)).is_dir() && !old_dir.exists(),
+            "the legacy directory must be renamed to the stable key"
+        );
     }
 
     #[test]
