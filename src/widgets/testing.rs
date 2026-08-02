@@ -61,6 +61,15 @@ pub struct TestingPanel {
     /// Latest cargo build-status line while busy (e.g. "Compiling ratatui"), so
     /// a long compile shows movement instead of a static "Discovering tests".
     progress: Option<String>,
+    /// Latched by [`Self::on_refused`] and consumed by the app's drain, which
+    /// surfaces the no-runner status message.
+    refused: bool,
+    /// Pre-run statuses of the cases the last `start_single`/`start_filter`
+    /// marked Running (`None` = the start inserted the case). A worker
+    /// refusal restores the tree from this snapshot exactly — old
+    /// Passed/Failed/Skipped results come back instead of demoting to
+    /// NotRun. Cleared when the run actually starts answering.
+    prerun: Vec<(String, Option<TestStatus>)>,
     scroll: usize,
 
     pub focus_gradient: bool,
@@ -82,6 +91,8 @@ impl TestingPanel {
             activity: Activity::Idle,
             last_run_ok: None,
             progress: None,
+            refused: false,
+            prerun: Vec::new(),
             scroll: 0,
             focus_gradient: false,
             theme: Theme::default(),
@@ -100,6 +111,7 @@ impl TestingPanel {
     /// first case lands.
     pub fn on_busy_started(&mut self, activity: Activity) {
         self.cases.clear();
+        self.prerun.clear();
         self.activity = activity;
         self.last_run_ok = None;
         self.progress = None;
@@ -115,6 +127,11 @@ impl TestingPanel {
         self.activity = Activity::Idle;
         self.last_run_ok = None;
         self.progress = None;
+        // The refusal latch and rollback snapshot belong to the old
+        // workspace; carrying either across a re-root would surface a stale
+        // no-runner status or restore cases into the new project's tree.
+        self.refused = false;
+        self.prerun.clear();
         self.scroll = 0;
     }
 
@@ -129,6 +146,14 @@ impl TestingPanel {
     pub fn start_single(&mut self, name: &str) {
         self.activity = Activity::Running;
         self.progress = None;
+        // Snapshot the pre-run status (None = about to be inserted) so a
+        // worker refusal can put the tree back exactly.
+        let old = self
+            .cases
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.status);
+        self.prerun = vec![(name.to_string(), old)];
         self.apply_case(TestCase {
             name: name.to_string(),
             status: TestStatus::Running,
@@ -142,8 +167,11 @@ impl TestingPanel {
     pub fn start_filter(&mut self, pattern: &str) {
         self.activity = Activity::Running;
         self.progress = None;
+        // Snapshot each selected case's pre-run status for a refusal rollback.
+        self.prerun = Vec::new();
         for c in &mut self.cases {
             if c.name.contains(pattern) {
+                self.prerun.push((c.name.clone(), Some(c.status)));
                 c.status = TestStatus::Running;
             }
         }
@@ -163,9 +191,37 @@ impl TestingPanel {
     pub fn on_finished(&mut self, ok: Option<bool>) {
         self.activity = Activity::Idle;
         self.progress = None;
+        self.prerun.clear();
         if ok.is_some() {
             self.last_run_ok = ok;
         }
+    }
+
+    /// The worker refused a queued request because no enabled runner claims
+    /// the root anymore (disabled between the app's check and the queue
+    /// drain). Restore the tree exactly as it was before the `start_*` call
+    /// painted Running marks — old results come back, a start-inserted case
+    /// is removed — and latch the refusal for the app to surface as a status.
+    /// (A bare finish would have stranded the marks Running forever.)
+    pub fn on_refused(&mut self) {
+        self.activity = Activity::Idle;
+        self.progress = None;
+        for (name, old) in std::mem::take(&mut self.prerun) {
+            match old {
+                Some(status) => {
+                    if let Some(c) = self.cases.iter_mut().find(|c| c.name == name) {
+                        c.status = status;
+                    }
+                }
+                None => self.cases.retain(|c| c.name != name),
+            }
+        }
+        self.refused = true;
+    }
+
+    /// Consume the refusal latch (one status message per refusal).
+    pub fn take_refusal(&mut self) -> bool {
+        std::mem::take(&mut self.refused)
     }
 
     pub fn is_running(&self) -> bool {
@@ -533,6 +589,76 @@ mod tests {
         assert_eq!(p.cases.len(), 3, "the rest of the tree is preserved");
         let b = p.cases.iter().find(|c| c.name == "m::b").unwrap();
         assert_eq!(b.status, TestStatus::Running, "only the target is Running");
+    }
+
+    /// A worker refusal (runner disabled between the app's check and the
+    /// queue drain) must restore the tree EXACTLY as it was before the
+    /// `start_*` call painted Running marks: earlier Passed/Failed/Skipped
+    /// results come back (not a demotion to NotRun), a case the start
+    /// inserted disappears again, and one refusal is latched for the app's
+    /// status line.
+    #[test]
+    fn a_refused_run_restores_prerun_statuses_and_latches_once() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        for (n, st) in [
+            ("m::a", TestStatus::Passed),
+            ("m::b", TestStatus::Failed),
+            ("m::c", TestStatus::Skipped),
+        ] {
+            p.apply_case(TestCase {
+                name: n.into(),
+                status: st,
+            });
+        }
+        p.on_finished(Some(false));
+        p.start_filter("m::");
+
+        p.on_refused();
+
+        assert!(!p.is_busy(), "a refusal returns the panel to idle");
+        for (n, st) in [
+            ("m::a", TestStatus::Passed),
+            ("m::b", TestStatus::Failed),
+            ("m::c", TestStatus::Skipped),
+        ] {
+            let c = p.cases.iter().find(|c| c.name == n).unwrap();
+            assert_eq!(
+                c.status, st,
+                "{n} must get its pre-run result back, not NotRun"
+            );
+        }
+        assert!(p.take_refusal(), "the refusal is latched for the app");
+        assert!(!p.take_refusal(), "and consumed exactly once");
+
+        // A single-run of a test the tree didn't know inserts it Running;
+        // the refusal must remove it again, not leave a phantom NotRun row.
+        p.start_single("m::new");
+        p.on_refused();
+        assert!(
+            !p.cases.iter().any(|c| c.name == "m::new"),
+            "a start-inserted case disappears again on refusal"
+        );
+        assert!(p.take_refusal());
+
+        // A re-root (Explorer Make Root) drops both the latch and the
+        // snapshot: neither a stale no-runner status nor an old workspace's
+        // rollback may leak into the new project.
+        p.start_single("m::stale");
+        p.on_refused();
+        p.reset();
+        assert!(!p.take_refusal(), "reset clears the refusal latch");
+        p.apply_case(TestCase {
+            name: "other::t".into(),
+            status: TestStatus::Passed,
+        });
+        p.on_refused();
+        let t = p.cases.iter().find(|c| c.name == "other::t").unwrap();
+        assert_eq!(
+            t.status,
+            TestStatus::Passed,
+            "reset drops the old snapshot, so a later refusal restores nothing"
+        );
     }
 
     #[test]

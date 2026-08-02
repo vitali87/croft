@@ -61,6 +61,12 @@ pub enum TestResponse {
     Finished {
         ok: Option<bool>,
     },
+    /// The queued request found no enabled runner claiming the root (it was
+    /// disabled between the app's entry-point check and the worker draining
+    /// the queue). Distinct from `Finished` so the panel can roll back the
+    /// Running marks the `start_*` call painted instead of stranding them,
+    /// and the app can say why nothing ran.
+    Refused,
 }
 
 pub struct TestWorker {
@@ -161,6 +167,7 @@ impl TestWorker {
                 TestResponse::Case(case) => panel.apply_case(case),
                 TestResponse::Progress(line) => panel.set_progress(line),
                 TestResponse::Finished { ok } => panel.on_finished(ok),
+                TestResponse::Refused => panel.on_refused(),
             }
             changed = true;
         }
@@ -685,21 +692,32 @@ pub(crate) fn cargo_progress(line: &str) -> Option<String> {
 }
 
 fn run_all(root: &Path, tx: &EpochTx) {
+    // `None` (no enabled runner claims the root) must never fall through to
+    // cargo: the app's entry points refuse first, and this second gate keeps
+    // a disabled runner from shelling anything even if a new call site
+    // forgets the check. It must also run BEFORE `Started`, which clears the
+    // discovered tree — a refusal keeps the panel exactly as it was.
+    // Exhaustive matches below, no `_` arm, so a future Runner variant is a
+    // compile error here instead of silently cargo.
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Refused);
+        return;
+    };
     tx.send(TestResponse::Started(Activity::Running));
-    let ok = match runner_for(root) {
-        Some(Runner::Pytest) => {
+    let ok = match runner {
+        Runner::Pytest => {
             let cmd = pytest_cmd(root, &["-v", "--color=no"]);
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Some(Runner::Vitest) => {
+        Runner::Vitest => {
             let cmd = js_cmd(root, "vitest", &["run", "--reporter=tap-flat"]);
             run_streaming(tx, cmd, one(parse_vitest_tap_line))
         }
-        Some(Runner::Jest) => {
+        Runner::Jest => {
             let cmd = js_cmd(root, "jest", &["--json"]);
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
-        _ => {
+        Runner::Cargo => {
             let cmd = cargo_cmd(root, &["test", "--no-fail-fast", "--color=never"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
@@ -714,20 +732,26 @@ fn run_all(root: &Path, tx: &EpochTx) {
 /// app marks just this case Running and keeps the rest of the tree, so a
 /// single-test run doesn't wipe the discovered list.
 fn run_one(root: &Path, tx: &EpochTx, name: &str) {
-    let ok = match runner_for(root) {
-        Some(Runner::Pytest) => {
+    // See run_all: `None` refuses instead of falling through to cargo, and
+    // `Refused` (not a bare Finished) rolls back this case's Running mark.
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Refused);
+        return;
+    };
+    let ok = match runner {
+        Runner::Pytest => {
             let cmd = pytest_cmd(root, &["-v", "--color=no", name]);
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Some(Runner::Vitest) => {
+        Runner::Vitest => {
             let cmd = js_cmd(root, "vitest", &vitest_one_args(name));
             run_streaming(tx, cmd, one(parse_vitest_tap_line))
         }
-        Some(Runner::Jest) => {
+        Runner::Jest => {
             let cmd = js_cmd(root, "jest", &jest_one_args(name));
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
-        _ => {
+        Runner::Cargo => {
             let cmd = cargo_cmd(root, &["test", name, "--color=never", "--", "--exact"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
@@ -744,8 +768,14 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
 /// [`run_one`], the app has already marked the affected cases and shown the
 /// busy state, so no `Started` is sent.
 fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
-    let ok = match runner_for(root) {
-        Some(Runner::Pytest) => {
+    // See run_all: `None` refuses instead of falling through to cargo, and
+    // `Refused` (not a bare Finished) rolls back the filtered Running marks.
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Refused);
+        return;
+    };
+    let ok = match runner {
+        Runner::Pytest => {
             let cmd = if pattern.contains(".py") {
                 pytest_cmd(root, &["-v", "--color=no", pattern])
             } else {
@@ -753,15 +783,15 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
             };
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Some(Runner::Vitest) => {
+        Runner::Vitest => {
             let cmd = js_cmd(root, "vitest", &vitest_filter_args(pattern));
             run_streaming(tx, cmd, one(parse_vitest_tap_line))
         }
-        Some(Runner::Jest) => {
+        Runner::Jest => {
             let cmd = js_cmd(root, "jest", &jest_filter_args(pattern));
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
-        _ => {
+        Runner::Cargo => {
             let cmd = cargo_cmd(root, &["test", pattern, "--no-fail-fast", "--color=never"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
@@ -774,13 +804,18 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
 /// `--collect-only -q`), streaming each as a `NotRun` case. The cargo path
 /// still compiles the test binary, hence the Discovering state.
 fn discover(root: &Path, tx: &EpochTx) {
+    // See run_all: refuse before `Started` so the panel keeps its tree.
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Refused);
+        return;
+    };
     tx.send(TestResponse::Started(Activity::Discovering));
     let not_run = |name: String| TestCase {
         name,
         status: TestStatus::NotRun,
     };
-    match runner_for(root) {
-        Some(Runner::Pytest) => {
+    match runner {
+        Runner::Pytest => {
             let cmd = pytest_cmd(root, &["--collect-only", "-q", "--color=no"]);
             run_streaming(tx, cmd, |line| {
                 parse_pytest_collect_line(line)
@@ -789,7 +824,7 @@ fn discover(root: &Path, tx: &EpochTx) {
                     .collect()
             });
         }
-        Some(Runner::Vitest) => {
+        Runner::Vitest => {
             let cmd = js_cmd(root, "vitest", &["list"]);
             run_streaming(tx, cmd, |line| {
                 parse_vitest_list_line(line)
@@ -800,7 +835,7 @@ fn discover(root: &Path, tx: &EpochTx) {
         }
         // jest can only cheaply list FILES (`--listTests`, absolute paths);
         // per-test names come from the first run's `--json` document.
-        Some(Runner::Jest) => {
+        Runner::Jest => {
             let cmd = js_cmd(root, "jest", &["--listTests"]);
             run_streaming(tx, cmd, |line| {
                 let rel = Path::new(line.trim())
@@ -812,7 +847,7 @@ fn discover(root: &Path, tx: &EpochTx) {
                 }
             });
         }
-        _ => {
+        Runner::Cargo => {
             let cmd = cargo_cmd(root, &["test", "--color=never", "--", "--list"]);
             run_streaming(tx, cmd, |line| {
                 parse_list_line(line).map(not_run).into_iter().collect()
@@ -825,6 +860,42 @@ fn discover(root: &Path, tx: &EpochTx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runner disabled between the app's entry-point check and the worker
+    /// picking the queued request up must refuse WITHOUT wiping panel state:
+    /// `Started(Running)` clears the discovered tree, and a bare
+    /// `Finished{ok: None}` after `start_single`/`start_filter` leaves those
+    /// cases stranded as Running forever (T-Rex reproduced both).
+    #[test]
+    fn refusing_a_run_with_no_runner_never_wipes_or_strands_the_panel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx { tx: &tx, epoch: 0 };
+        run_all(tmp.path(), &etx);
+        run_one(tmp.path(), &etx, "a::b");
+        run_filter(tmp.path(), &etx, "a");
+        discover(tmp.path(), &etx);
+        let msgs: Vec<TestResponse> = rx.try_iter().map(|(_, r)| r).collect();
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, TestResponse::Started(_))),
+            "a refused run must not send Started: it wipes the discovered tree"
+        );
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, TestResponse::Refused))
+                .count(),
+            4,
+            "each refused request must answer with Refused, not a bare Finished"
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, TestResponse::Finished { .. })),
+            "a bare Finished after start_single/start_filter strands cases Running"
+        );
+    }
 
     #[test]
     fn vitest_titles_are_regex_escaped_like_jests() {

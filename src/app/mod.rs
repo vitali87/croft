@@ -7662,11 +7662,16 @@ impl App {
         // every open editor (across all split groups): cached spans carry baked
         // colors, so the syntax colors only follow the theme once recomputed.
         crate::highlight::set_syntax_palette(theme.syntax());
+        // Assign the theme before re-highlighting: the rebuilds below (the
+        // markdown preview in particular) read `ed.theme`, and the per-frame
+        // push in render would hand it over one frame too late.
         for ed in &mut self.editor.editors {
+            ed.theme = theme;
             ed.rehighlight_for_theme();
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in &mut group.editors {
+                ed.theme = theme;
                 ed.rehighlight_for_theme();
             }
         }
@@ -13763,10 +13768,24 @@ impl App {
         }
     }
 
+    /// Whether an enabled runner extension claims this workspace. When none
+    /// does — no recognised project, or its runner toggled off in the
+    /// Extensions panel — every run gesture must refuse here: the worker's
+    /// fallback used to shell `cargo test` regardless, so a disabled Rust
+    /// runner still ran (and rebuilt) the workspace, and a disabled Python
+    /// runner ran cargo in a directory with no Cargo.toml.
+    fn testing_runner_available(&mut self) -> bool {
+        if crate::testing::worker::runner_for(&self.tree.root).is_some() {
+            return true;
+        }
+        self.status = String::from(crate::testing::NO_RUNNER_STATUS);
+        false
+    }
+
     /// Kick off a full test run on the worker (no-op if a run/discovery is
     /// already in flight) and reveal the Testing view so results stream in.
     fn run_all_tests(&mut self) {
-        if self.testing.is_busy() {
+        if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_worker.run_all();
@@ -13776,7 +13795,7 @@ impl App {
     /// Run a single test by exact name (click-to-run from the tree). Marks just
     /// that case Running and keeps the rest of the discovered list intact.
     fn run_test(&mut self, name: String) {
-        if self.testing.is_busy() {
+        if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
         self.testing.start_single(&name);
@@ -13797,7 +13816,7 @@ impl App {
     /// name is a prefix of its tests' names, so cargo's substring filter runs
     /// exactly that module.
     fn run_suite(&mut self, suite: String) {
-        if self.testing.is_busy() {
+        if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
         self.testing.start_filter(&suite);
@@ -13821,7 +13840,7 @@ impl App {
     /// Start the test `name` through the worker and reveal the Testing view —
     /// the shared tail of run-at-cursor and the editor's gutter play glyph.
     fn run_named_test(&mut self, name: String) {
-        if self.testing.is_busy() {
+        if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
         self.testing.start_filter(&name);
@@ -33046,6 +33065,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let dap_changed = app.poll_dap();
         let tests_changed =
             app.test_worker.drain(&mut app.testing) | app.drain_pending_test_debug();
+        // A queued run the worker refused (runner disabled after the entry
+        // check) rolled its cases back in the drain; say why nothing ran.
+        if app.testing.take_refusal() {
+            app.status = String::from(crate::testing::NO_RUNNER_STATUS);
+        }
         let mcp_changed = app.poll_mcp();
         let pair_changed =
             app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();

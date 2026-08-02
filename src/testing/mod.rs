@@ -13,3 +13,9 @@ pub mod model;
 pub mod parse;
 pub mod registry;
 pub mod worker;
+
+/// Status-bar message for a run gesture refused because no enabled runner
+/// claims the workspace. One string for both refusal sites: the app's
+/// entry-point check and the worker's queued-request refusal.
+pub const NO_RUNNER_STATUS: &str =
+    "No test runner detected in this workspace (is its extension enabled?)";

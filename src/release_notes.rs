@@ -62,18 +62,18 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Multi-cursor blocks and collaborators' ghost carets sit on the correct side of an inlay hint: a caret exactly at a hint's anchor — where Change All Occurrences puts every caret on a `let` binding with a type hint — used to paint its block a hint-width to the right of the primary caret, outside its own selection band and on top of an unrelated character.",
+        summary: "Disabling a test-runner extension now actually stops croft running that runner: with the Rust runner toggled off, the gutter play glyph and every Testing gesture still shelled `cargo test` (and with only a Python project, ran cargo in a directory with no Cargo.toml). All four run gestures now refuse with a status when no enabled runner claims the workspace.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Clicking the Testing panel's border can no longer run tests: the play-glyph hit zone had no left edge, so a click on the pane's border column beside a suite header quietly kicked off the whole suite.",
+        summary: "Source bytes the highlighter's queries don't capture (whitespace, gaps in sparse grammars) now take the theme's own code foreground: under Gruvbox or Dracula those bytes rendered in cold Base16 slate beside cream-colored tokens. The same fix covers unhighlighted fenced code in the Markdown preview.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Make Root during an in-flight COMMITS fetch no longer strands the graph on Loading: a refresh arriving while a fetch was running was silently dropped, and the old root's reply was then discarded, leaving nothing to repaint the panel until HEAD next moved. The swallowed refresh is now queued and re-fires the moment the stale reply drains.",
+        summary: "The Markdown preview recolors immediately on a theme switch: it bakes its colors at build time and was previously rebuilt only on edits, so it kept the old theme's headings, links, and code colors until the file was touched or the preview was reopened.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A one-row terminal selection on a repeated row (a divider rule, a continuation marker) re-anchors to its own copy after the app repaints: the highlight used to jump to whichever identical row landed nearest, while copy kept returning the original text. The rows captured around the selection now break the tie.",
+        summary: "Image, PDF, CSV, and diff tabs follow the theme on Ghostty and Kitty: their canvases painted the reset background to inherit an iTerm2 session color those terminals ignore, leaving host-black islands inside an otherwise themed frame.",
     },
 ];
