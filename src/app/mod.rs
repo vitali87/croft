@@ -1772,6 +1772,11 @@ enum PromptKind {
     AnnotateTerminal {
         pane: usize,
         line: i32,
+        /// Scroll-clock reading `line` was captured against when the prompt
+        /// OPENED. The commit anchors with this pair: sampling a fresh
+        /// baseline at commit would mis-pin the note by every row that
+        /// streamed while the user typed it.
+        clock: i64,
         start: u16,
         len: u16,
         existing: Option<usize>,
@@ -1861,6 +1866,12 @@ pub struct CopyModeState {
     /// Selection anchor cell; `None` until v / V / Ctrl+V arms a selection.
     anchor: Option<(i32, u16)>,
     kind: CopySelKind,
+    /// Scroll-clock reading the coordinates above are valid against. The
+    /// pane re-anchors its painted selection to streaming content between
+    /// keypresses; every key handler folds the clock movement into these
+    /// coordinates first, or the keystroke would teleport the highlight
+    /// back to the stale absolute lines.
+    clock: i64,
 }
 
 /// Which shape the copy-mode selection takes: vim's v / V / Ctrl+V.
@@ -9494,7 +9505,11 @@ impl App {
     /// annotation, the prompt edits that note instead.
     fn begin_annotate_terminal(&mut self) {
         let pane = self.active_terminal;
-        let Some(sel) = self.terminals[pane].selection().filter(|s| s.has_area()) else {
+        // Selection and clock from ONE snapshot: separate reads let PTY
+        // output land in between, pairing a pre-output line with a
+        // post-output clock and pinning the note to the wrong row.
+        let (sel, clock) = self.terminals[pane].selection_and_clock();
+        let Some(sel) = sel.filter(|s| s.has_area()) else {
             self.status = String::from("Annotate: select some output first (drag or copy mode)");
             return;
         };
@@ -9502,7 +9517,10 @@ impl App {
         let (_, _, cols, _) = self.terminals[pane].grid_bounds();
         let end = if er > sr { cols.saturating_sub(1) } else { ec };
         let (start, len) = (sc, end.saturating_sub(sc) + 1);
-        let current = self.terminals[pane].annotations_current();
+        // Translate the existing annotations at the SAME captured clock as
+        // the selection, or output scrolling in between shifts them off the
+        // fixed `sr` and the same span duplicates instead of editing.
+        let current = self.terminals[pane].annotations_at_clock(clock);
         let existing = current
             .iter()
             .position(|&(l, s0, ln, _)| l == sr && s0 < start + len && start < s0 + ln);
@@ -9515,6 +9533,7 @@ impl App {
             kind: PromptKind::AnnotateTerminal {
                 pane,
                 line: sr,
+                clock,
                 start,
                 len,
                 existing,
@@ -23761,9 +23780,10 @@ impl App {
     /// at the shell's cursor cell (WezTerm's convention) and the pane paints
     /// it as a green modal block.
     fn open_terminal_copy_mode(&mut self) {
-        let t = self.terminal();
-        let (line, col) = t.cursor_line_col();
-        let (top, bottom, cols, _) = t.grid_bounds();
+        // Cursor, bounds, and clock from ONE snapshot (see
+        // `begin_annotate_terminal` for why the pairing must be atomic).
+        let ((line, col), (top, bottom, cols, _), clock) =
+            self.terminal_mut().cursor_bounds_and_clock();
         let line = line.clamp(top, bottom);
         let col = col.min(cols.saturating_sub(1));
         self.terminal_mut().set_copy_cursor(Some((line, col)));
@@ -23772,6 +23792,7 @@ impl App {
             col,
             anchor: None,
             kind: CopySelKind::Char,
+            clock,
         });
         self.status = String::from(
             "Copy mode: h/j/k/l w/b/e 0/$ g/G move, v/V/^V select, y copies, Esc exits",
@@ -23840,7 +23861,25 @@ impl App {
         let Some(mut st) = self.terminal_copy_mode.take() else {
             return;
         };
+        // Content streamed since the last key: fold the scroll-clock
+        // movement into the stored coordinates so this keystroke moves
+        // from where the pane's re-anchored highlight actually is.
+        let now = self.terminal_mut().scroll_clock();
+        let drift = (now - st.clock) as i32;
+        if drift != 0 {
+            st.line -= drift;
+            if let Some(a) = st.anchor.as_mut() {
+                a.0 -= drift;
+            }
+            st.clock = now;
+        }
         let (top, bottom, cols, rows) = self.terminal().grid_bounds();
+        // Content that fell off the scrollback pins to the oldest line,
+        // mirroring the pane's own rebase.
+        st.line = st.line.clamp(top, bottom);
+        if let Some(a) = st.anchor.as_mut() {
+            a.0 = a.0.clamp(top, bottom);
+        }
         let last_col = cols.saturating_sub(1);
         let half = (rows as i32 / 2).max(1);
         let page = (rows as i32 - 1).max(1);
@@ -26647,6 +26686,14 @@ impl App {
                     && !self.terminal().selection().is_some_and(|s| s.has_area())
                     && let Some((_, note)) = self.terminal().annotation_at(m.column, m.row)
                 {
+                    // This early return skips the shared mouse-up tail, so
+                    // run its cleanup here too: drop the pane-drag latch and
+                    // the zero-area selection the mouse-down planted, or the
+                    // clicked cell stays painted as a one-cell highlight.
+                    self.terminal_drag_from = None;
+                    if self.terminal().selection().is_some() {
+                        self.terminal_mut().clear_selection();
+                    }
                     self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
                         note,
                         (m.column, m.row),
@@ -29604,6 +29651,7 @@ impl App {
             PromptKind::AnnotateTerminal {
                 pane,
                 line,
+                clock,
                 start,
                 len,
                 existing,
@@ -29622,7 +29670,7 @@ impl App {
                         }
                         (None, true) => "Annotation cancelled (empty note)",
                         (None, false) => {
-                            t.add_annotation(line, start, len, text);
+                            t.add_annotation(line, clock, start, len, text);
                             "Annotated selection (click the span to read it)"
                         }
                     });

@@ -19036,6 +19036,68 @@ fn sticky_command_header_pins_the_command_while_scrolled_into_its_output() {
     );
 }
 
+/// Copy-mode coordinates live in the App while the pane re-anchors its
+/// selection to streaming content; each keystroke used to re-push the
+/// stale absolute lines, teleporting the highlight off the text the user
+/// was looking at.
+#[test]
+fn copy_mode_keys_follow_content_that_streamed_between_presses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let mut fill = String::new();
+    for i in 0..40 {
+        fill.push_str(&format!("row-{i}\r\n"));
+    }
+    fill.push_str("row-40");
+    app.terminals[0].feed_bytes_for_test(fill.as_bytes());
+    app.open_terminal_copy_mode();
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('v'), KeyModifiers::NONE));
+    // Five rows stream while the user pauses between keys; the pane
+    // re-anchors the selection to keep it on row-40.
+    let mut more = String::new();
+    for i in 0..5 {
+        more.push_str(&format!("\r\nx-{i}"));
+    }
+    app.terminals[0].feed_bytes_for_test(more.as_bytes());
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('k'), KeyModifiers::NONE));
+    let text = app.terminals[0].selection_text();
+    assert!(
+        text.contains("row-40"),
+        "the selection must stay on the content the user was on, got: {text:?}"
+    );
+}
+
+/// Clicking an annotated span pops its note, but that branch used to
+/// return before the mouse-up cleanup: the zero-area selection the
+/// mouse-down planted stayed painted as a one-cell highlight and the
+/// pane-drag latch stayed armed.
+#[test]
+fn clicking_an_annotated_span_still_clears_the_click_selection() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].feed_bytes_for_test(b"annotated words here\r\n");
+    let clock = app.terminals[0].scroll_clock();
+    app.terminals[0].add_annotation(0, clock, 0, 15, String::from("the note"));
+    let inner = app.terminals[0].last_inner;
+    let (cx, cy) = (inner.x + 2, inner.y);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), cx, cy));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), cx, cy));
+    assert!(app.hover_popup.is_some(), "the click must pop the note");
+    assert!(
+        app.terminals[0].selection().is_none(),
+        "the zero-area click selection must not stay painted"
+    );
+}
+
 #[test]
 fn a_plain_click_on_the_prompt_row_moves_the_shell_cursor() {
     let tmp = tempfile::tempdir().unwrap();
