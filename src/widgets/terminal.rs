@@ -2575,6 +2575,11 @@ impl PtyTerminal {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        // A degenerate pane (a host window shrunk to a sliver leaves the
+        // layout no room) must not reach alacritty: Term::resize panics on
+        // a zero/one-cell grid mid-reflow. Keep the last sane size; the
+        // grid simply clips until the window grows back.
+        let (cols, rows) = (cols.max(2), rows.max(2));
         if cols == self.cols && rows == self.rows {
             return;
         }
@@ -2820,7 +2825,19 @@ pub fn extract_selection_text(
         let trimmed = line.trim_end();
         out.push_str(trimmed);
         if line_idx != er {
-            out.push('\n');
+            // A soft-wrapped row (WRAPLINE on its last cell) continues the
+            // same logical line: no separator, so copied text, the durable
+            // command history, and the sticky header all see the line the
+            // user actually typed — a '\n' here corrupted stored commands
+            // and re-ran only their first fragment on paste. A hard row
+            // break keeps the newline.
+            let wrapped = cols > 0
+                && term.grid()[Point::new(Line(line_idx), Column(cols - 1))]
+                    .flags
+                    .contains(Flags::WRAPLINE);
+            if !wrapped {
+                out.push('\n');
+            }
         }
         line_idx += 1;
     }
@@ -5796,6 +5813,48 @@ mod tests {
         assert!(
             max2 >= max1 + 100,
             "row ids must keep advancing after saturation (got {max1} then {max2})"
+        );
+    }
+
+    /// A soft-wrapped logical line copies as ONE line: the WRAPLINE flag on
+    /// the wrapping row's last cell tells a continuation from a real row
+    /// break, so selection copy, the durable command history, and the
+    /// sticky header all see the text the user actually typed. A '\n' at
+    /// the wrap corrupted stored commands and re-ran only the first
+    /// fragment on paste. Hard breaks keep their newline.
+    #[test]
+    fn selection_over_a_soft_wrapped_line_copies_one_logical_line() {
+        let (_tmp, mut t) = quiet_pty();
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let cols = t.term.lock().columns();
+        // A fresh row below any spawn banner, then a line long enough to wrap.
+        feed_pty(&t, b"\r\n");
+        let start = t.term.lock().grid().cursor.point.line.0;
+        let long: String = "abcdefghij".repeat(6); // 60 chars > pane width
+        feed_pty(&t, long.as_bytes());
+        t.set_selection(Some(Selection {
+            anchor: (start, 0),
+            head: (start + 1, cols.saturating_sub(1) as u16),
+            block: false,
+        }));
+        assert_eq!(
+            t.selection_text(),
+            long,
+            "the wrapped rows must rejoin without a newline"
+        );
+        // A hard row break keeps its newline.
+        feed_pty(&t, b"\r\nsecond");
+        t.set_selection(Some(Selection {
+            anchor: (start + 1, 0),
+            head: (start + 2, 6),
+            block: false,
+        }));
+        assert!(
+            t.selection_text().contains('\n'),
+            "a real row break still copies as two lines: {:?}",
+            t.selection_text()
         );
     }
 

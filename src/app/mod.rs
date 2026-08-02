@@ -1860,6 +1860,11 @@ struct QuickHint {
 /// and kind once v / V / Ctrl+V arms one. The pane paints the cursor and
 /// the selection; this state owns the motions.
 pub struct CopyModeState {
+    /// Pane index the mode opened on. The coordinates and clock below are
+    /// meaningless against any other pane (each pane owns an independent
+    /// scroll clock), so a gesture that moves `active_terminal` while the
+    /// mode is up closes it instead of hijacking the new pane.
+    pane: usize,
     /// Cursor cell: absolute grid line + grid column.
     line: i32,
     col: u16,
@@ -20062,7 +20067,11 @@ impl App {
             .shell_cwd()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        pop.set_results(self.command_history.search("", pop.scope, &pop.cwd));
+        pop.host = self.terminal().shell_host().unwrap_or_default();
+        pop.set_results(
+            self.command_history
+                .search("", pop.scope, &pop.cwd, &pop.host),
+        );
         self.command_history_popup = Some(pop);
     }
 
@@ -20071,8 +20080,9 @@ impl App {
         let Some(pop) = self.command_history_popup.as_ref() else {
             return;
         };
-        let (query, scope, cwd) = (pop.query.clone(), pop.scope, pop.cwd.clone());
-        let results = self.command_history.search(&query, scope, &cwd);
+        let (query, scope, cwd, host) =
+            (pop.query.clone(), pop.scope, pop.cwd.clone(), pop.host.clone());
+        let results = self.command_history.search(&query, scope, &cwd, &host);
         if let Some(pop) = self.command_history_popup.as_mut() {
             pop.set_results(results);
         }
@@ -20168,7 +20178,7 @@ impl App {
         let needle: String = entry.line.trim_end().chars().take(60).collect();
         let Some(row) = lines
             .iter()
-            .rposition(|l| !needle.is_empty() && l.starts_with(&needle))
+            .rposition(|l| capture_row_matches(&needle, l))
         else {
             self.status = String::from("Captured line is no longer in the scrollback");
             return;
@@ -21096,6 +21106,7 @@ impl App {
                                 .as_deref()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_default(),
+                            host: t.shell_host().unwrap_or_default(),
                             exit: f.exit,
                             dur_ms: f.dur.as_millis() as u64,
                             ts,
@@ -23143,8 +23154,13 @@ impl App {
                 }
             }
             _ => {
-                let width = (full.width.saturating_mul(7) / 10).clamp(40, 100.min(full.width));
-                let height = (full.height.saturating_mul(6) / 10).clamp(10, full.height);
+                // Min bounds cap at the frame: Ord::clamp panics on min > max.
+                let max_w = 100.min(full.width).max(1);
+                let max_h = full.height.max(1);
+                let width =
+                    (full.width.saturating_mul(7) / 10).clamp(40.min(max_w), max_w);
+                let height =
+                    (full.height.saturating_mul(6) / 10).clamp(10.min(max_h), max_h);
                 Rect {
                     x: full.x + (full.width.saturating_sub(width)) / 2,
                     y: full.y + (full.height.saturating_sub(height)) / 4,
@@ -23163,9 +23179,13 @@ impl App {
             return;
         };
         // Centered box, the zoxide-jump fallback geometry: wide enough for
-        // command lines, anchored in the upper half like Quick Open.
-        let width = (full.width.saturating_mul(7) / 10).clamp(40, 110.min(full.width));
-        let height = (full.height.saturating_mul(6) / 10).clamp(10, full.height);
+        // command lines, anchored in the upper half like Quick Open. The
+        // minimum bounds cap at the frame so a tiny host window can never
+        // invert the clamp (Ord::clamp panics on min > max).
+        let max_w = 110.min(full.width).max(1);
+        let max_h = full.height.max(1);
+        let width = (full.width.saturating_mul(7) / 10).clamp(40.min(max_w), max_w);
+        let height = (full.height.saturating_mul(6) / 10).clamp(10.min(max_h), max_h);
         let rect = Rect {
             x: full.x + (full.width.saturating_sub(width)) / 2,
             y: full.y + (full.height.saturating_sub(height)) / 4,
@@ -23336,8 +23356,13 @@ impl App {
                 }
             }
             _ => {
-                let width = (full.width.saturating_mul(7) / 10).clamp(40, 100.min(full.width));
-                let height = (full.height.saturating_mul(6) / 10).clamp(10, full.height);
+                // Min bounds cap at the frame: Ord::clamp panics on min > max.
+                let max_w = 100.min(full.width).max(1);
+                let max_h = full.height.max(1);
+                let width =
+                    (full.width.saturating_mul(7) / 10).clamp(40.min(max_w), max_w);
+                let height =
+                    (full.height.saturating_mul(6) / 10).clamp(10.min(max_h), max_h);
                 Rect {
                     x: full.x + (full.width.saturating_sub(width)) / 2,
                     y: full.y + (full.height.saturating_sub(height)) / 4,
@@ -23788,6 +23813,7 @@ impl App {
         let col = col.min(cols.saturating_sub(1));
         self.terminal_mut().set_copy_cursor(Some((line, col)));
         self.terminal_copy_mode = Some(CopyModeState {
+            pane: self.active_terminal,
             line,
             col,
             anchor: None,
@@ -23816,6 +23842,12 @@ impl App {
         let Some(st) = self.terminal_copy_mode.as_ref() else {
             return;
         };
+        // Bound to its own pane — never paint another pane's grid (see
+        // `handle_terminal_copy_mode_key`).
+        if st.pane != self.active_terminal {
+            self.close_terminal_copy_mode();
+            return;
+        }
         let (line, col) = (st.line, st.col);
         let (_, _, cols, rows) = self.terminal().grid_bounds();
         let sel = st.anchor.map(|(al, ac)| match st.kind {
@@ -23861,6 +23893,15 @@ impl App {
         let Some(mut st) = self.terminal_copy_mode.take() else {
             return;
         };
+        // The mode is bound to the pane it opened on: if a gesture moved
+        // `active_terminal` since (a click on a sibling pane), the stored
+        // coordinates and clock describe the wrong pane — close instead of
+        // folding another pane's clock into them.
+        if st.pane != self.active_terminal {
+            self.terminal_copy_mode = Some(st);
+            self.close_terminal_copy_mode();
+            return;
+        }
         // Content streamed since the last key: fold the scroll-clock
         // movement into the stored coordinates so this keystroke moves
         // from where the pane's re-anchored highlight actually is.
@@ -24000,16 +24041,39 @@ impl App {
             KeyCode::Char('e') => {
                 let (text, colmap) = self.terminal().row_text(st.line);
                 let chars: Vec<char> = text.chars().collect();
+                let content = text.trim_end().chars().count();
                 let mut i = Self::char_idx_at_col(&colmap, st.col);
                 i += 1;
                 while i < chars.len() && !word(chars[i]) {
                     i += 1;
                 }
-                while i + 1 < chars.len() && word(chars[i + 1]) {
-                    i += 1;
-                }
-                if i < chars.len() {
-                    st.col = colmap.get(i).map_or(last_col, |&c| c as u16);
+                // Past the last word on this row (the scan ran into the
+                // trailing padding): hop to the next row's first word end,
+                // like vim's `e` at end of line — `w` and `b` both wrap,
+                // and without this `e` was a dead key at the row's last word.
+                if i >= content && st.line < bottom {
+                    st.line += 1;
+                    let (ntext, ncolmap) = self.terminal().row_text(st.line);
+                    let nchars: Vec<char> = ntext.chars().collect();
+                    let mut j = 0;
+                    while j < nchars.len() && !word(nchars[j]) {
+                        j += 1;
+                    }
+                    while j + 1 < nchars.len() && word(nchars[j + 1]) {
+                        j += 1;
+                    }
+                    st.col = if j < nchars.len() && word(nchars[j]) {
+                        ncolmap.get(j).map_or(0, |&c| c as u16)
+                    } else {
+                        0
+                    };
+                } else {
+                    while i + 1 < chars.len() && word(chars[i + 1]) {
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        st.col = colmap.get(i).map_or(last_col, |&c| c as u16);
+                    }
                 }
             }
             _ => {}
@@ -26430,6 +26494,16 @@ impl App {
                     self.poke_cursor();
                 } else if let Some(idx) = terminal_hit {
                     if self.active_terminal != idx {
+                        // Copy mode is bound to the pane it opened on; a
+                        // click on a sibling pane leaves it, tmux-style,
+                        // rather than hijacking the new pane's grid.
+                        if self
+                            .terminal_copy_mode
+                            .as_ref()
+                            .is_some_and(|st| st.pane != idx)
+                        {
+                            self.close_terminal_copy_mode();
+                        }
                         self.active_terminal = idx;
                     }
                     self.focus_pane(Pane::Terminal);
@@ -32788,6 +32862,21 @@ fn restore_host_terminal_state() {
 // crossterm Backend handle for `execute!`.
 const TERMINAL_RESTORE_SEQ: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[ q";
+
+/// Whether a grid row is where a captured line starts. The straight case is
+/// the row carrying the needle as a prefix; but a grid row's TEXT is bounded
+/// by the pane width (fewer chars still with wide glyphs), so in a pane
+/// narrower than the needle the first wrapped row is instead a PREFIX OF the
+/// needle. That direction requires a meaningful overlap so a short
+/// incidental row can't match.
+// ponytail: 20-char overlap floor is a heuristic; wire the WRAPLINE flag
+// through grid_lines if false matches ever show up in practice.
+fn capture_row_matches(needle: &str, row: &str) -> bool {
+    if needle.is_empty() || row.is_empty() {
+        return false;
+    }
+    row.starts_with(needle) || (row.chars().count() >= 20 && needle.starts_with(row))
+}
 
 fn install_terminal_restore_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();

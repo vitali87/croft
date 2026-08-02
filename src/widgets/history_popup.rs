@@ -28,6 +28,9 @@ pub struct HistoryPopup {
     /// The active pane's directory when the popup opened; the Dir scope
     /// filters against it and the footer shows it.
     pub cwd: String,
+    /// The active pane's OSC 7 host at open (empty = local), pairing with
+    /// `cwd` for the Dir scope.
+    pub host: String,
     pub last_rect: Rect,
 }
 
@@ -40,6 +43,7 @@ impl Default for HistoryPopup {
             selected: 0,
             scope: HistoryScope::All,
             cwd: String::new(),
+            host: String::new(),
             last_rect: Rect::default(),
         }
     }
