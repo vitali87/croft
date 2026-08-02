@@ -22866,31 +22866,6 @@ fn a_workspace_with_no_test_runner_refuses_every_run_gesture() {
     assert_refused(&mut app, "named run");
 }
 
-/// A captured line longer than the pane is wide can only appear in the grid
-/// as a WRAPPED row whose text is a prefix of the line; the jump's fixed
-/// 60-char needle then never matched and the CAPTURES click reported the
-/// line missing while it sat on screen.
-#[test]
-fn capture_jump_matches_lines_wider_than_the_pane() {
-    let needle = "error[E0308]: mismatched types in some very long rustc diagnostic line";
-    assert!(
-        crate::app::capture_row_matches(
-            needle,
-            "error[E0308]: mismatched types in some very long rustc diagnostic line and more",
-        ),
-        "a wide pane carries the needle as a row prefix"
-    );
-    assert!(
-        crate::app::capture_row_matches(needle, "error[E0308]: mismatched"),
-        "a narrow pane's wrapped first row is a PREFIX of the needle"
-    );
-    assert!(
-        !crate::app::capture_row_matches(needle, "error"),
-        "a short incidental row must not match"
-    );
-    assert!(!crate::app::capture_row_matches("", "anything"));
-}
-
 /// Ctrl+Shift+H on a tiny host window: the popup clamps inverted
 /// (min > max) below 40 columns or 10 rows and `Ord::clamp` panics,
 /// taking the raw-mode TUI down.

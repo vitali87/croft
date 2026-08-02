@@ -20174,16 +20174,11 @@ impl App {
         self.active_terminal = idx;
         self.set_bottom_panel_tab(BottomPanelTab::Terminal);
         self.focus_pane(Pane::Terminal);
-        let (lines, top) = self.terminals[idx].grid_lines();
         let needle: String = entry.line.trim_end().chars().take(60).collect();
-        let Some(row) = lines
-            .iter()
-            .rposition(|l| capture_row_matches(&needle, l))
-        else {
+        let Some(line) = self.terminals[idx].find_captured_line(&needle) else {
             self.status = String::from("Captured line is no longer in the scrollback");
             return;
         };
-        let line = top + row as i32;
         let (_, _, cols, _) = self.terminals[idx].grid_bounds();
         let t = &mut self.terminals[idx];
         t.set_selection(Some(crate::widgets::terminal::Selection {
@@ -21106,7 +21101,7 @@ impl App {
                                 .as_deref()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_default(),
-                            host: t.shell_host().unwrap_or_default(),
+                            host: f.host.clone().unwrap_or_default(),
                             exit: f.exit,
                             dur_ms: f.dur.as_millis() as u64,
                             ts,
@@ -32862,21 +32857,6 @@ fn restore_host_terminal_state() {
 // crossterm Backend handle for `execute!`.
 const TERMINAL_RESTORE_SEQ: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[ q";
-
-/// Whether a grid row is where a captured line starts. The straight case is
-/// the row carrying the needle as a prefix; but a grid row's TEXT is bounded
-/// by the pane width (fewer chars still with wide glyphs), so in a pane
-/// narrower than the needle the first wrapped row is instead a PREFIX OF the
-/// needle. That direction requires a meaningful overlap so a short
-/// incidental row can't match.
-// ponytail: 20-char overlap floor is a heuristic; wire the WRAPLINE flag
-// through grid_lines if false matches ever show up in practice.
-fn capture_row_matches(needle: &str, row: &str) -> bool {
-    if needle.is_empty() || row.is_empty() {
-        return false;
-    }
-    row.starts_with(needle) || (row.chars().count() >= 20 && needle.starts_with(row))
-}
 
 fn install_terminal_restore_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
