@@ -62,22 +62,22 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Closing a terminal pane can no longer freeze croft on Linux: with a background job still holding the pty, the reader thread never saw EOF and the whole UI hung on the join; a shutdown pipe now wakes it instantly. The shell is also reaped on every path, so a HUP-trapping shell no longer leaves a zombie process per closed pane.",
+        summary: "Run Test at Cursor no longer crashes croft when no file is open, and when a discovered test has a unique leaf name it runs exactly that test instead of every test whose name contains the same word.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Clicking a Local snapshot in the TIMELINE no longer destroys unsaved edits: a dirty tab is left intact and the snapshot diff opens beside it instead of replacing the buffer wholesale.",
+        summary: "Running a suite from its header runs only that suite on every runner: cargo anchors on the module separator, vitest and jest anchor the describe chain, so suite auth no longer sweeps auth-helper tests along.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Local history survives auto save: saves within 10 seconds merge into the newest snapshot (VS Code's mergeWindow) instead of churning the whole 50-entry store out in a minute of typing, snapshots store raw bytes so non-UTF-8 files get history too, recording runs off the render thread, the store key no longer depends on the Rust toolchain (existing stores migrate), and files outside the workspace root now list their snapshots instead of loading forever.",
+        summary: "A test run that dies before reporting (a compile error, a test renamed since discovery) no longer strands spinning Running dots or hides behind the old tally, even one with a stale failure: the marks roll back and the summary leads with run failed.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Restore Snapshot is honest again: a failed snapshot click disarms it (it used to silently write an older file's snapshot over a file not even on screen), and the restored file's tab shows the restored text instead of keeping the stale diff view.",
+        summary: "Clicking a test's name locates its source on a background thread (a big workspace no longer freezes the UI mid-click), honours .gitignore even outside a git checkout, never jumps into target or node_modules, and works for vitest and jest titles too: the jump prefers the test declaration over a comment that merely mentions the title.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Inline blame never paints another file's authors: switching files with the same line count used to wear the previous file's blame until the new fetch landed.",
+        summary: "Wide characters in test names clip at the Testing panel's edge instead of painting through the scrollbar and border into the neighbouring pane.",
     },
 ];

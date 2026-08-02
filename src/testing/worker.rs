@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 
 use super::model::{Activity, TestCase, TestStatus};
+use super::regex_escape;
 use super::parse::{
     parse_jest_json, parse_list_line, parse_pytest_collect_line, parse_pytest_line,
     parse_test_line, parse_vitest_list_line, parse_vitest_tap_line,
@@ -39,9 +40,13 @@ pub enum TestRequest {
     RunAll,
     /// Run a single test by its exact name (click-to-run from the tree).
     RunOne(String),
-    /// Run every test whose name contains the string (a suite, or run-at-cursor
-    /// by function name). cargo's name filter is a substring match.
+    /// Run every test whose name contains the string (run-at-cursor by
+    /// function name). cargo's name filter is a substring match.
     RunFilter(String),
+    /// Run a whole suite by its unanchored name (a header click). The cargo
+    /// arm anchors it with [`super::suite_pattern`] so `parse` cannot sweep
+    /// `parse_utils::b`; pytest gets it positionally as a node-ID prefix.
+    RunSuite(String),
     Discover,
     /// Rebind the worker's working directory (Explorer re-root). Without it the
     /// worker keeps shelling cargo in the launch dir captured at spawn, so after
@@ -131,6 +136,10 @@ impl TestWorker {
         let _ = self.request_tx.send(TestRequest::RunFilter(pattern));
     }
 
+    pub fn run_suite(&self, suite: String) {
+        let _ = self.request_tx.send(TestRequest::RunSuite(suite));
+    }
+
     pub fn discover(&self) {
         let _ = self.request_tx.send(TestRequest::Discover);
     }
@@ -200,7 +209,8 @@ fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, Te
         match req {
             TestRequest::RunAll => run_all(&root, &etx),
             TestRequest::RunOne(name) => run_one(&root, &etx, &name),
-            TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern),
+            TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern, false),
+            TestRequest::RunSuite(suite) => run_filter(&root, &etx, &suite, true),
             TestRequest::Discover => discover(&root, &etx),
             TestRequest::SetRoot(p) => {
                 root = p;
@@ -321,19 +331,6 @@ fn js_cmd<S: AsRef<std::ffi::OsStr>>(root: &Path, runner: &str, args: &[S]) -> C
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
-}
-
-/// Escape a test title for jest's `-t`, which is a REGEX matched against the
-/// full name; titles routinely contain `(`, `?`, `$`.
-fn regex_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if "\\^$.|?*+()[]{}".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// Split a croft JS node ID (`file::describe...::test`) into its file and an
@@ -563,16 +560,34 @@ fn vitest_one_args(name: &str) -> Vec<String> {
     args
 }
 
+/// `-t` regex for a suite click's describe chain: every segment after the
+/// file, escaped and joined the way vitest and jest build the full name they
+/// match `-t` against (describes + title joined with single spaces — vitest's
+/// `getTaskFullName`, jest's `getTestID`), anchored at the start and closed
+/// with the joining space so describe `auth` cannot sweep an `auth-helper`
+/// sibling. `None` when the suite is the whole file (no describe segments),
+/// where the positional file argument already scopes the run exactly.
+fn suite_title_anchor(pattern: &str) -> Option<String> {
+    let (_, rest) = pattern.split_once("::")?;
+    let joined = rest.split("::").map(regex_escape).collect::<Vec<_>>().join(" ");
+    Some(format!("^{joined} "))
+}
+
 /// vitest argv for a filter run: a suite click passes a node-ID prefix
 /// (`file` or `file::describe`), run-at-cursor a bare title. The file scopes
-/// the run when present; a describe segment (or the bare title) narrows via
-/// `-t`.
-fn vitest_filter_args(pattern: &str) -> Vec<String> {
+/// the run when present; a describe chain (anchored, see
+/// [`suite_title_anchor`]) or the bare title narrows via `-t`.
+fn vitest_filter_args(pattern: &str, suite: bool) -> Vec<String> {
     let mut args = vec![String::from("run")];
     let (file, title) = js_id_parts(pattern);
     if is_js_file(pattern) {
         args.push(file.to_string());
-        if let Some(t) = title {
+        if suite {
+            if let Some(anchor) = suite_title_anchor(pattern) {
+                args.push(String::from("-t"));
+                args.push(anchor);
+            }
+        } else if let Some(t) = title {
             args.push(String::from("-t"));
             args.push(regex_escape(t));
         }
@@ -599,14 +614,19 @@ fn jest_one_args(name: &str) -> Vec<String> {
 }
 
 /// jest argv for a filter run, mirroring [`vitest_filter_args`]: a node-ID
-/// prefix scopes by file (plus `-t` for a describe segment), a bare title
-/// goes through `-t` alone.
-fn jest_filter_args(pattern: &str) -> Vec<String> {
+/// prefix scopes by file (plus an anchored `-t` for a suite's describe
+/// chain), a bare title goes through `-t` alone.
+fn jest_filter_args(pattern: &str, suite: bool) -> Vec<String> {
     let mut args = Vec::new();
     if is_js_file(pattern) {
         let (file, title) = js_id_parts(pattern);
         args.push(file.to_string());
-        if let Some(t) = title {
+        if suite {
+            if let Some(anchor) = suite_title_anchor(pattern) {
+                args.push(String::from("-t"));
+                args.push(anchor);
+            }
+        } else if let Some(t) = title {
             args.push(String::from("-t"));
             args.push(regex_escape(t));
         }
@@ -760,14 +780,17 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
     tx.send(TestResponse::Finished { ok: Some(ok) });
 }
 
-/// Run every test matching a name filter. cargo's positional filter is a
-/// substring match, so the suite prefix or a bare fn name both work. pytest
+/// Run every test matching a name filter. `suite` marks a header click: the
+/// cargo arm then anchors the pattern with [`super::suite_pattern`], since a
+/// bare substring like `parse` would also sweep `parse_utils::b`. pytest
 /// splits the two shapes: a suite is a node-ID prefix (`tests/test_x.py`,
 /// `tests/test_x.py::TestGroup`) passed positionally, a bare function name
-/// (run-at-cursor) goes through `-k`, pytest's substring matcher. Like
-/// [`run_one`], the app has already marked the affected cases and shown the
-/// busy state, so no `Started` is sent.
-fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
+/// (run-at-cursor) goes through `-k`, pytest's substring matcher. vitest and
+/// jest anchor a suite's describe chain (see [`suite_title_anchor`]), since
+/// their `-t` is an unanchored regex over the full name. Like [`run_one`],
+/// the app has already marked the affected cases and shown the busy state,
+/// so no `Started` is sent.
+fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
     // See run_all: `None` refuses instead of falling through to cargo, and
     // `Refused` (not a bare Finished) rolls back the filtered Running marks.
     let Some(runner) = runner_for(root) else {
@@ -776,7 +799,9 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
     };
     let ok = match runner {
         Runner::Pytest => {
-            let cmd = if pattern.contains(".py") {
+            // A suite is always a node-ID prefix; the `.py` sniff keeps a
+            // node-ID handed to a plain filter run positional too.
+            let cmd = if suite || pattern.contains(".py") {
                 pytest_cmd(root, &["-v", "--color=no", pattern])
             } else {
                 pytest_cmd(root, &["-v", "--color=no", "-k", pattern])
@@ -784,14 +809,21 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
         Runner::Vitest => {
-            let cmd = js_cmd(root, "vitest", &vitest_filter_args(pattern));
+            let cmd = js_cmd(root, "vitest", &vitest_filter_args(pattern, suite));
             run_streaming(tx, cmd, one(parse_vitest_tap_line))
         }
         Runner::Jest => {
-            let cmd = js_cmd(root, "jest", &jest_filter_args(pattern));
+            let cmd = js_cmd(root, "jest", &jest_filter_args(pattern, suite));
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
         Runner::Cargo => {
+            let anchored;
+            let pattern = if suite {
+                anchored = super::suite_pattern(pattern);
+                &anchored
+            } else {
+                pattern
+            };
             let cmd = cargo_cmd(root, &["test", pattern, "--no-fail-fast", "--color=never"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
@@ -873,7 +905,8 @@ mod tests {
         let etx = EpochTx { tx: &tx, epoch: 0 };
         run_all(tmp.path(), &etx);
         run_one(tmp.path(), &etx, "a::b");
-        run_filter(tmp.path(), &etx, "a");
+        run_filter(tmp.path(), &etx, "a", false);
+        run_filter(tmp.path(), &etx, "a", true);
         discover(tmp.path(), &etx);
         let msgs: Vec<TestResponse> = rx.try_iter().map(|(_, r)| r).collect();
         assert!(
@@ -884,7 +917,7 @@ mod tests {
             msgs.iter()
                 .filter(|m| matches!(m, TestResponse::Refused))
                 .count(),
-            4,
+            5,
             "each refused request must answer with Refused, not a bare Finished"
         );
         assert!(
@@ -913,12 +946,12 @@ mod tests {
                 "--reporter=tap-flat"
             ]
         );
-        let args = vitest_filter_args("parses [ tokens");
+        let args = vitest_filter_args("parses [ tokens", false);
         assert_eq!(
             args,
             vec!["run", "-t", r"parses \[ tokens", "--reporter=tap-flat"]
         );
-        let args = vitest_filter_args("tests/a.test.js::group (x)");
+        let args = vitest_filter_args("tests/a.test.js::group (x)", false);
         assert_eq!(
             args,
             vec![
@@ -1183,12 +1216,36 @@ mod tests {
             vec!["tests/math.test.js", "-t", r"adds \(1 \+ 1\)", "--json"]
         );
         assert_eq!(
-            jest_filter_args("parses [ tokens"),
+            jest_filter_args("parses [ tokens", false),
             vec!["-t", r"parses \[ tokens", "--json"]
         );
         assert_eq!(
-            jest_filter_args("tests/a.test.js::group (x)"),
+            jest_filter_args("tests/a.test.js::group (x)", false),
             vec!["tests/a.test.js", "-t", r"group \(x\)", "--json"]
+        );
+    }
+
+    /// A suite click's `-t` must not be a bare substring: describe `auth`
+    /// would sweep `auth-helper handles retries` in the same file while the
+    /// panel marks only the suite's own cases as Running. vitest and jest
+    /// both match `-t` against the space-joined describe chain + title
+    /// (vitest `getTaskFullName`, jest `getTestID`), so the anchor is
+    /// `^segments… ` with the closing join space.
+    #[test]
+    fn a_js_suite_click_anchors_the_name_filter_to_the_describe_chain() {
+        assert_eq!(
+            vitest_filter_args("tests/a.test.js::auth", true),
+            vec!["run", "tests/a.test.js", "-t", "^auth ", "--reporter=tap-flat"]
+        );
+        assert_eq!(
+            jest_filter_args("tests/a.test.js::group (x)::inner", true),
+            vec!["tests/a.test.js", "-t", r"^group \(x\) inner ", "--json"]
+        );
+        // A suite that is the whole file needs no `-t`: the positional file
+        // argument already scopes the run exactly.
+        assert_eq!(
+            vitest_filter_args("tests/a.test.js", true),
+            vec!["run", "tests/a.test.js", "--reporter=tap-flat"]
         );
     }
 }

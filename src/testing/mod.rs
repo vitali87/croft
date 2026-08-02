@@ -19,3 +19,25 @@ pub mod worker;
 /// entry-point check and the worker's queued-request refusal.
 pub const NO_RUNNER_STATUS: &str =
     "No test runner detected in this workspace (is its extension enabled?)";
+
+/// The run pattern for a whole suite. cargo's positional filter and the
+/// panel's marking are substring matches, so a bare `parse` would also sweep
+/// `parse_utils::b`; anchoring with the `::` separator selects exactly the
+/// suite's own cases. One helper so the panel and the worker cannot drift.
+pub fn suite_pattern(suite: &str) -> String {
+    format!("{suite}::")
+}
+
+/// Escape a string for literal use inside a regex (test titles are arbitrary;
+/// an unbalanced bracket would abort the matcher). Shared by the JS runner
+/// argv builders and the source locator.
+pub(crate) fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\^$.|?*+()[]{}".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}

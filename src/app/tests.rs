@@ -23065,6 +23065,125 @@ fn a_workspace_with_no_test_runner_refuses_every_run_gesture() {
     assert_refused(&mut app, "named run");
 }
 
+/// cargo's positional filter is a substring match, so running suite `parse`
+/// with a bare pattern also sweeps `parse_utils::b` and every other
+/// prefix-sharing sibling. The suite gesture must anchor on `parse::`.
+#[test]
+fn running_a_suite_never_sweeps_prefix_sharing_siblings() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for n in ["parse::a", "parse_utils::b"] {
+        app.testing.apply_case(crate::testing::model::TestCase {
+            name: n.into(),
+            status: crate::testing::model::TestStatus::NotRun,
+        });
+    }
+
+    app.run_suite(String::from("parse"));
+
+    use crate::testing::model::TestStatus;
+    assert_eq!(
+        app.testing.status_of("parse::a"),
+        Some(TestStatus::Running),
+        "the suite's own case runs"
+    );
+    assert_eq!(
+        app.testing.status_of("parse_utils::b"),
+        Some(TestStatus::NotRun),
+        "a prefix-sharing sibling suite must stay untouched"
+    );
+}
+
+/// Run-at-cursor knows only the fn's leaf name. When the discovered tree
+/// holds exactly one case with that leaf, the run must target it exactly
+/// instead of handing cargo a bare substring that also matches `run_fast`.
+#[test]
+fn run_at_cursor_with_a_unique_leaf_runs_exactly_that_test() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for n in ["parse::run", "other::run_fast"] {
+        app.testing.apply_case(crate::testing::model::TestCase {
+            name: n.into(),
+            status: crate::testing::model::TestStatus::NotRun,
+        });
+    }
+
+    app.run_named_test(String::from("run"));
+
+    use crate::testing::model::TestStatus;
+    assert_eq!(
+        app.status, "Running test parse::run",
+        "a unique leaf resolves to its full name for an exact run"
+    );
+    assert_eq!(
+        app.testing.status_of("other::run_fast"),
+        Some(TestStatus::NotRun),
+        "a test merely containing the leaf must stay untouched"
+    );
+}
+
+/// Clicking a test's name greps the workspace for its `fn`; that walk runs
+/// on a background thread and the editor jump lands via the drain, so a big
+/// workspace can't freeze the render loop. Covers hit and miss.
+#[test]
+fn a_test_name_click_jumps_to_source_via_the_background_locator() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    let lib = tmp.path().join("src/lib.rs");
+    std::fs::write(
+        &lib,
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn target_case() { assert!(true); }\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.jump_to_test_source(String::from("tests::target_case"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        app.sync_explorer_panels();
+        if app.editor.path.as_deref() == Some(lib.as_path()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the locator result never arrived; editor at {:?}",
+            app.editor.path
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.editor.cursor_row, 3, "caret lands on `fn target_case`");
+
+    app.jump_to_test_source(String::from("nope::missing"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        app.sync_explorer_panels();
+        if app.status.contains("No source found for test nope::missing") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the miss status never arrived, status {:?}",
+            app.status
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Ctrl+Shift+H on a tiny host window: the popup clamps inverted
 /// (min > max) below 40 columns or 10 rows and `Ord::clamp` panics,
 /// taking the raw-mode TUI down.

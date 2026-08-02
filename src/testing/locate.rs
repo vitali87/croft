@@ -1,8 +1,10 @@
 //! Locate a test's source location by name. libtest's `--list` gives no file or
 //! line (the JSON format that does is nightly-only), so we find the `fn` in the
-//! source tree instead: walk the workspace (honouring `.gitignore`, so `target`
-//! is skipped), grep for `fn <leaf>`, and rank candidates by how well the file
-//! path matches the test's module path. Good enough to jump the editor there.
+//! source tree instead: walk the workspace (honouring `.gitignore` even outside
+//! a git checkout, with `target`/`node_modules` always skipped), grep for
+//! `fn <leaf>`, and rank candidates by how well the file path matches the
+//! test's module path. Good enough to jump the editor there. pytest and JS
+//! node IDs carry their file, so those skip the walk and grep just that file.
 
 use std::path::{Path, PathBuf};
 
@@ -32,15 +34,21 @@ pub fn find_test_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> 
     if full_name.contains(".py::") {
         return pytest_source(root, full_name);
     }
+    if let Some((file, _)) = full_name.split_once("::")
+        && crate::testing::parse::is_js_test_file(file)
+    {
+        return js_source(root, full_name);
+    }
     let mut segments: Vec<&str> = full_name.split("::").collect();
     let leaf = segments.pop()?;
     // Module segments minus the conventional `tests` wrapper: these are what a
     // file path is scored against (e.g. `widgets::testing` -> src/widgets/testing.rs).
     let module: Vec<&str> = segments.into_iter().filter(|s| *s != "tests").collect();
 
-    // `fn <leaf>` followed by `(`, `<` (generics) or whitespace. leaf is a Rust
-    // identifier, so nothing to escape.
-    let matcher = RegexMatcher::new(&format!(r"\bfn\s+{leaf}\s*[(<\s]")).ok()?;
+    // `fn <leaf>` followed by `(`, `<` (generics) or whitespace. leaf is
+    // escaped: it is normally a Rust identifier, but never trust a runner.
+    let matcher =
+        RegexMatcher::new(&format!(r"\bfn\s+{}\s*[(<\s]", super::regex_escape(leaf))).ok()?;
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(b'\x00'))
@@ -48,7 +56,19 @@ pub fn find_test_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> 
         .build();
 
     let mut best: Option<(PathBuf, u32, usize)> = None; // (path, line, score)
-    for entry in WalkBuilder::new(root).build().flatten() {
+    // `require_git(false)`: an extracted tarball or vendored drop has no
+    // .git, but its .gitignore still marks the generated trees. target/ and
+    // node_modules/ are skipped unconditionally — build output can define a
+    // same-named fn and win the path score.
+    for entry in WalkBuilder::new(root)
+        .require_git(false)
+        .filter_entry(|e| {
+            !(e.file_type().is_some_and(|t| t.is_dir())
+                && matches!(e.file_name().to_str(), Some("target" | "node_modules")))
+        })
+        .build()
+        .flatten()
+    {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some(RUST_EXT) {
             continue;
@@ -74,7 +94,7 @@ fn pytest_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
     let (file, rest) = full_name.split_once(".py::")?;
     let path = root.join(format!("{file}.py"));
     let leaf = rest.rsplit("::").next()?.split('[').next()?;
-    let matcher = RegexMatcher::new(&format!(r"\bdef\s+{leaf}\s*\(")).ok()?;
+    let matcher = RegexMatcher::new(&format!(r"\bdef\s+{}\s*\(", super::regex_escape(leaf))).ok()?;
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(b'\x00'))
@@ -86,11 +106,41 @@ fn pytest_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
     Some((path, line1.saturating_sub(1) as u32))
 }
 
+/// Resolve a JS node ID (`file::describe...::title`): the first segment is the
+/// test file, the last the title — an arbitrary string, so it is escaped and
+/// matched literally. The title alone can also live in a comment or fixture
+/// above the test, so a `test(`/`it(` declaration carrying it wins; the bare
+/// title is only a fallback (`xit`, a title split across lines).
+fn js_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
+    let (file, rest) = full_name.split_once("::")?;
+    let path = root.join(file);
+    let leaf = rest.rsplit("::").next()?;
+    let escaped = super::regex_escape(leaf);
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .memory_map(MmapChoice::never())
+        .build();
+    let decl = RegexMatcher::new(&format!(r#"\b(?:test|it)\b[^'"`]*['"`]{escaped}"#)).ok()?;
+    let mut sink = FirstLine(None);
+    searcher.search_path(&decl, &path, &mut sink).ok()?;
+    let line1 = match sink.0 {
+        Some(l) => l,
+        None => {
+            let bare = RegexMatcher::new(&escaped).ok()?;
+            let mut sink = FirstLine(None);
+            searcher.search_path(&bare, &path, &mut sink).ok()?;
+            sink.0?
+        }
+    };
+    Some((path, line1.saturating_sub(1) as u32))
+}
+
 /// The name of the nearest `fn` at or above `cursor_row` — the test the caret
 /// sits in, for run-at-cursor. Scans upward and returns the first `fn <ident>`
-/// it finds. `None` if the caret is above every function.
+/// it finds. `None` if the caret is above every function, or the buffer empty.
 pub fn enclosing_fn_name(lines: &[String], cursor_row: usize) -> Option<String> {
-    let start = cursor_row.min(lines.len().saturating_sub(1));
+    let start = cursor_row.min(lines.len().checked_sub(1)?);
     for line in lines[..=start].iter().rev() {
         if let Some(name) = fn_name_in(line) {
             return Some(name);
@@ -286,6 +336,105 @@ mod tests {
         assert_eq!(enclosing_fn_name(&lines, 2).as_deref(), Some("test_first"));
         assert_eq!(enclosing_fn_name(&lines, 5).as_deref(), Some("test_method"));
         assert_eq!(enclosing_fn_name(&lines, 0), None);
+    }
+
+    #[test]
+    fn an_empty_buffer_has_no_enclosing_fn() {
+        // Cmd+K Enter with no file open: Editor::new() holds zero lines, and
+        // this must be a clean None, not a slice-range panic.
+        assert_eq!(enclosing_fn_name(&[], 0), None);
+        assert_eq!(enclosing_fn_name(&[], 5), None);
+    }
+
+    #[test]
+    fn gitignore_is_honoured_even_outside_a_git_repo() {
+        // An extracted tarball or vendored drop has no .git; its .gitignore
+        // must still keep generated trees out of the jump-target search.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+        std::fs::create_dir_all(root.join("gen/widgets")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // The ignored decoy outscores the real file on the module path.
+        std::fs::write(root.join("gen/widgets/parse.rs"), "fn target_case() {}\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn target_case() {}\n").unwrap();
+
+        let (path, _) = find_test_source(root, "widgets::parse::tests::target_case").unwrap();
+        assert!(
+            path.ends_with("src/lib.rs"),
+            "an ignored dir must never win the jump target, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn build_output_dirs_are_skipped_even_without_a_gitignore() {
+        // No .git AND no .gitignore: target/ and node_modules/ still hold
+        // only generated or vendored code and must never be jump targets.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("target/debug/parse.rs"), "fn target_case() {}\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/parse.rs"), "fn target_case() {}\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn target_case() {}\n").unwrap();
+
+        let (path, _) = find_test_source(root, "widgets::parse::tests::target_case").unwrap();
+        assert!(
+            path.ends_with("src/lib.rs"),
+            "build output must never win the jump target, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn js_test_titles_resolve_to_their_file_and_line() {
+        // vitest/jest node IDs carry their file like pytest's, and the title
+        // is an arbitrary string: regex metacharacters are literals.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/math.test.ts"),
+            "import { test } from 'vitest'\n\ntest('adds (1 + 1)', () => {})\n\ntest('parses [ tokens', () => {})\n",
+        )
+        .unwrap();
+
+        let (path, line) = find_test_source(root, "src/math.test.ts::adds (1 + 1)").unwrap();
+        assert!(path.ends_with("src/math.test.ts"), "got {path:?}");
+        assert_eq!(line, 2, "0-based line of the first test title");
+        // A describe chain still resolves through the last segment, and an
+        // unbalanced bracket must not abort the regex build.
+        let (_, line) =
+            find_test_source(root, "src/math.test.ts::suite::parses [ tokens").unwrap();
+        assert_eq!(line, 4);
+    }
+
+    #[test]
+    fn a_title_in_a_comment_above_the_test_does_not_hijack_the_jump() {
+        // The title text often appears before the declaration — a comment, a
+        // fixture string — and the first bare match would land the jump
+        // there. The `test(`/`it(` line carrying the title must win.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("math.test.js"),
+            "// adds (1 + 1) covers the carry path\nconst fixture = 'adds (1 + 1)'\n\ntest('adds (1 + 1)', () => {})\n",
+        )
+        .unwrap();
+        let (_, line) = find_test_source(root, "math.test.js::adds (1 + 1)").unwrap();
+        assert_eq!(line, 3, "the declaration, not the comment or the fixture");
+    }
+
+    #[test]
+    fn a_title_only_in_an_exotic_declaration_still_resolves() {
+        // `xit(` has no `test`/`it` word boundary, so the declaration-shaped
+        // match finds nothing; the bare-title fallback must still resolve
+        // instead of reporting no source.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.test.js"), "xit('odd little title', () => {})\n").unwrap();
+        let (_, line) = find_test_source(root, "a.test.js::odd little title").unwrap();
+        assert_eq!(line, 0);
     }
 
     #[test]
