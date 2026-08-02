@@ -635,19 +635,16 @@ pub struct HintSpan {
     pub typed: usize,
 }
 
-/// One OSC 133 mark at its recording-time position. `line_rec` is the grid
-/// line the cursor sat on (0-based live screen), `hist_rec` the scrollback
-/// size at that moment; the current position is
-/// `line_rec - (history_now - hist_rec)`.
-///
-/// Ceiling: once scrollback saturates (5000 lines), `history_size` stops
-/// growing while content keeps scrolling, so surviving marks drift by the
-/// evicted-line count. Marks that old point near-evicted content anyway
-/// and are GC'd as they pass the scrollback floor.
+/// One OSC 133 mark at its recording-time anchor, keyed on the scroll
+/// clock like annotations and images (current position =
+/// `line_rec - (clock_now - clock_rec)`), NOT on `history_size`, whose
+/// saturation froze surviving marks onto viewport rows and whose zeroing
+/// on a scrollback wipe inverted the math outright. Marks past the
+/// scrollback floor are GC'd in `marks_snapshot`.
 struct StoredMark {
     kind: crate::shell_integration::OscEvent,
     line_rec: i32,
-    hist_rec: usize,
+    clock_rec: i64,
     /// Cursor column when the mark landed (`PromptEnd`'s column is where the
     /// typed command starts on its prompt line).
     col_rec: usize,
@@ -1398,8 +1395,12 @@ impl PtyTerminal {
                                                 // completion so the durable
                                                 // history records context.
                                                 let cmd = {
+                                                    let now = clock_for_thread
+                                                        .lock()
+                                                        .unwrap()
+                                                        .tick(&mut t);
                                                     let ms = marks_for_thread.lock().unwrap();
-                                                    last_command_input_text(&t, &ms)
+                                                    last_command_input_text(&t, &ms, now)
                                                 };
                                                 let cwd = osc7_for_thread.lock().unwrap().clone();
                                                 let host =
@@ -1417,7 +1418,7 @@ impl PtyTerminal {
                                         _ => None,
                                     };
                                     let line_rec = t.grid().cursor.point.line.0;
-                                    let hist_rec = t.grid().history_size();
+                                    let clock_rec = clock_for_thread.lock().unwrap().tick(&mut t);
                                     let col_rec = t.grid().cursor.point.column.0;
                                     let mut ms = marks_for_thread.lock().unwrap();
                                     if ms.len() >= MARKS_MAX {
@@ -1427,7 +1428,7 @@ impl PtyTerminal {
                                     ms.push(StoredMark {
                                         kind,
                                         line_rec,
-                                        hist_rec,
+                                        clock_rec,
                                         col_rec,
                                         dur,
                                     });
@@ -1443,15 +1444,22 @@ impl PtyTerminal {
                         // check here — the chunk's FINAL mode says nothing
                         // about where a wipe fell (`clear && vim`).
                         if screen_wiped || hist_wiped {
-                            let mut imgs = images_for_thread.lock().unwrap();
-                            if !imgs.is_empty() {
-                                let now = clock_for_thread.lock().unwrap().tick(&mut t);
-                                imgs.retain(|m| {
-                                    let line = m.line_rec - (now - m.clock_rec) as i32;
-                                    let wiped = if line >= 0 { screen_wiped } else { hist_wiped };
-                                    !wiped
-                                });
-                            }
+                            let now = clock_for_thread.lock().unwrap().tick(&mut t);
+                            let erased = |line_rec: i32, clock_rec: i64| {
+                                let line = line_rec - (now - clock_rec) as i32;
+                                if line >= 0 { screen_wiped } else { hist_wiped }
+                            };
+                            images_for_thread
+                                .lock()
+                                .unwrap()
+                                .retain(|m| !erased(m.line_rec, m.clock_rec));
+                            // Marks anchored to erased content go the same
+                            // way: a stale decoration dot's menu copies or
+                            // re-runs whatever later lands on its row.
+                            marks_for_thread
+                                .lock()
+                                .unwrap()
+                                .retain(|m| !erased(m.line_rec, m.clock_rec));
                         }
                         // Stamp newly-arrived rows for the timestamps gutter:
                         // every row the cursor moved past in this chunk gets
@@ -1567,18 +1575,18 @@ impl PtyTerminal {
         usize,
         Option<std::time::Duration>,
     )> {
-        let term = self.term.lock();
-        let hist_now = term.grid().history_size() as i32;
+        let mut term = self.term.lock();
+        let now = self.clock.lock().unwrap().tick(&mut term);
         let floor = term.grid().topmost_line().0;
         drop(term);
         let mut marks = self.marks.lock().unwrap();
-        marks.retain(|m| m.line_rec - (hist_now - m.hist_rec as i32) >= floor);
+        marks.retain(|m| m.line_rec - (now - m.clock_rec) as i32 >= floor);
         marks
             .iter()
             .map(|m| {
                 (
                     m.kind.clone(),
-                    m.line_rec - (hist_now - m.hist_rec as i32),
+                    m.line_rec - (now - m.clock_rec) as i32,
                     m.col_rec,
                     m.dur,
                 )
@@ -1784,13 +1792,13 @@ impl PtyTerminal {
         if line != cursor.line.0 {
             return None;
         }
-        let hist_now = term.grid().history_size() as i32;
+        let now = self.clock_now(&term);
         let ms = self.marks.lock().unwrap();
         let last = ms.last()?;
         if !matches!(last.kind, crate::shell_integration::OscEvent::PromptEnd) {
             return None;
         }
-        if last.line_rec - (hist_now - last.hist_rec as i32) != line {
+        if last.line_rec - (now - last.clock_rec) as i32 != line {
             return None;
         }
         let b_col = last.col_rec as u16;
@@ -1827,6 +1835,19 @@ impl PtyTerminal {
     /// session with integration moves it to the remote host).
     pub fn shell_host(&self) -> Option<String> {
         self.osc7_host.lock().unwrap().clone()
+    }
+
+    /// [`Self::shell_cwd`], trusted only when the REPORTING host is this
+    /// machine (empty, "localhost", or the local hostname — RFC 8089
+    /// semantics via the command history's canonicalizer): an in-pane ssh
+    /// session reports the remote's path, which is meaningless — and
+    /// silently wrong when it happens to exist — on the local filesystem.
+    pub fn local_shell_cwd(&self) -> Option<std::path::PathBuf> {
+        let host = self.shell_host().unwrap_or_default();
+        if !crate::command_history::is_local_host(&host) {
+            return None;
+        }
+        self.shell_cwd()
     }
 
     /// The pane's monotonic scroll-clock reading (see `clock_now`): the
@@ -2316,14 +2337,14 @@ impl PtyTerminal {
     /// can stage prompt-dependent gestures without a live shell.
     #[cfg(test)]
     pub fn push_mark_for_test(&self, kind: crate::shell_integration::OscEvent, col_rec: usize) {
-        let term = self.term.lock();
+        let mut term = self.term.lock();
         let line_rec = term.grid().cursor.point.line.0;
-        let hist_rec = term.grid().history_size();
+        let clock_rec = self.clock.lock().unwrap().tick(&mut term);
         drop(term);
         self.marks.lock().unwrap().push(StoredMark {
             kind,
             line_rec,
-            hist_rec,
+            clock_rec,
             col_rec,
             dur: None,
         });
@@ -2802,10 +2823,12 @@ impl PtyTerminal {
             processor.advance(&mut *term, b"\x1b[3J\x1b[2J\x1b[H");
             term.scroll_display(Scroll::Bottom);
         }
-        // The content the images anchored to is gone; without this they
-        // float over the fresh prompt (the wipe also zeroes history_size,
-        // which used to invert the anchor math outright).
+        // The content the images and OSC 133 marks anchored to is gone;
+        // keeping either leaves overlays (a floating picture, phantom
+        // decoration dots whose menus copy or re-run the wrong rows) over
+        // the fresh prompt.
         self.images.lock().unwrap().clear();
+        self.marks.lock().unwrap().clear();
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -2891,10 +2914,13 @@ pub fn row_text_and_cols(term: &Term<VoidListener>, line_idx: i32) -> (String, V
 /// the same span `pair_decorations` derives after the fact. Runs in the
 /// reader thread at the `133;D` mark with the term lock held; empty when
 /// the B/C marks are missing (no shell integration on this pane).
-fn last_command_input_text(term: &Term<VoidListener>, marks: &[StoredMark]) -> String {
+fn last_command_input_text(
+    term: &Term<VoidListener>,
+    marks: &[StoredMark],
+    clock_now: i64,
+) -> String {
     use crate::shell_integration::OscEvent as E;
-    let hist_now = term.grid().history_size() as i32;
-    let cur = |m: &StoredMark| m.line_rec - (hist_now - m.hist_rec as i32);
+    let cur = |m: &StoredMark| m.line_rec - (clock_now - m.clock_rec) as i32;
     let Some(ci) = marks
         .iter()
         .rposition(|m| matches!(m.kind, E::CommandStart))
@@ -3698,10 +3724,10 @@ impl Widget for &mut PtyTerminal {
                     if !running {
                         return None;
                     }
-                    let hist_now = term.grid().history_size() as i32;
+                    let now = self.clock_now(&term);
                     let last = ms.last().unwrap();
-                    let c_line = last.line_rec - (hist_now - last.hist_rec as i32);
-                    (c_line < top_row).then(|| last_command_input_text(&term, &ms))
+                    let c_line = last.line_rec - (now - last.clock_rec) as i32;
+                    (c_line < top_row).then(|| last_command_input_text(&term, &ms, now))
                 })
                 .filter(|t| !t.trim().is_empty());
             if let Some(text) = header {
@@ -4709,6 +4735,45 @@ mod tests {
         );
     }
 
+    /// A remote shell's OSC 7 (an in-pane ssh with integration) names a
+    /// path on the REMOTE machine: consumers that act on the local
+    /// filesystem (split-in-cwd, session restore) must not trust it just
+    /// because the same path happens to exist locally.
+    #[test]
+    fn a_remote_reported_cwd_is_not_trusted_for_local_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]7;file://prod-db-1/tmp\\007ok\\n'; sleep 30";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        wait_for_grid(&term, |ls| {
+            ls.iter().any(|l| l.contains("ok") && !l.contains("printf"))
+        });
+        assert_eq!(
+            term.shell_cwd(),
+            Some(std::path::PathBuf::from("/tmp")),
+            "staging: the raw report is visible"
+        );
+        assert_eq!(
+            term.local_shell_cwd(),
+            None,
+            "a path reported by another machine must not be reused locally"
+        );
+        let tmp2 = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]7;file://localhost/tmp\\007ok\\n'; sleep 30";
+        let term2 =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp2.path())
+                .unwrap();
+        wait_for_grid(&term2, |ls| {
+            ls.iter().any(|l| l.contains("ok") && !l.contains("printf"))
+        });
+        assert_eq!(
+            term2.local_shell_cwd(),
+            Some(std::path::PathBuf::from("/tmp")),
+            "a localhost report IS this machine (RFC 8089)"
+        );
+    }
+
     #[test]
     fn osc9_notifications_drain_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5147,12 +5212,107 @@ mod tests {
         );
     }
 
+    /// The zsh shim must emit `$PWD` percent-escaped (fish already does):
+    /// the sniffer unconditionally percent-DECODES OSC 7 paths, so a real
+    /// directory containing `%41` used to be reported as `A`, corrupting
+    /// the cwd every consumer sees.
+    #[test]
+    fn a_percent_directory_round_trips_through_the_zsh_shim() {
+        let zsh = "/bin/zsh";
+        if !std::path::Path::new(zsh).exists() {
+            return;
+        }
+        let user_dir = tempfile::tempdir().unwrap();
+        let odd = user_dir.path().join("a%41b");
+        std::fs::create_dir(&odd).unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let shim = crate::shell_integration::ensure_zsh_shim(cfg_dir.path()).unwrap();
+        let mut cmd = CommandBuilder::new(zsh);
+        cmd.arg("-i");
+        cmd.cwd(&odd);
+        cmd.env("ZDOTDIR", &shim);
+        cmd.env("CROFT_USER_ZDOTDIR", user_dir.path());
+        let term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        let mut waited = 0u32;
+        let cwd = loop {
+            if let Some(c) = term.shell_cwd() {
+                break c;
+            }
+            assert!(waited < 8000, "zsh never reported a cwd");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        };
+        assert!(
+            cwd.ends_with("a%41b"),
+            "the literal directory name must survive the OSC 7 round trip, got {cwd:?}"
+        );
+    }
+
     /// A bash new enough for `$ENV` + `--posix` injection (>= 4.4), for the
     /// e2e tests: Homebrew/Linux bash qualifies, macOS's system 3.2 not.
     fn modern_bash() -> Option<&'static str> {
         ["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash"]
             .into_iter()
             .find(|b| bash_env_injection_supported(b))
+    }
+
+    /// An empty Enter in a bash whose user set PROMPT_COMMAND as an ARRAY
+    /// (bash 5.1+, ble.sh and prompt frameworks do) must not fabricate a
+    /// command: the DEBUG-trap guard joined the array with a SPACE
+    /// (`${arr[*]}` under default IFS), so its own precmd entries never
+    /// matched and every blank prompt emitted a spurious 133;C + 133;D —
+    /// a phantom decoration that hijacked Cmd+K Shift+R/C/S.
+    #[test]
+    fn an_empty_enter_with_an_array_prompt_command_fabricates_no_command() {
+        let Some(bash) = modern_bash() else {
+            return;
+        };
+        // Array PROMPT_COMMAND execution needs bash >= 5.1.
+        let out = std::process::Command::new(bash)
+            .args(["-c", "echo ${BASH_VERSINFO[0]}${BASH_VERSINFO[1]}"])
+            .output()
+            .unwrap();
+        let v: u32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if v < 51 {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".bashrc"),
+            "mytheme() { :; }\nPROMPT_COMMAND=(mytheme)\n",
+        )
+        .unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        let mut cmd = CommandBuilder::new(bash);
+        cmd.cwd(home.path());
+        cmd.env("HOME", home.path());
+        let args = apply_shell_integration_env(&mut cmd, bash, cfg.path());
+        for a in &args {
+            cmd.arg(a);
+        }
+        cmd.arg("-i");
+        let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        let mut waited = 0u32;
+        while term.prompt_lines().is_empty() {
+            assert!(waited < 8000, "bash never emitted a prompt mark");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        let prompts_before = term.prompt_lines().len();
+        term.write_input(b"\n");
+        let mut waited = 0u32;
+        while term.prompt_lines().len() <= prompts_before {
+            assert!(waited < 8000, "the empty Enter never produced a new prompt");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        assert!(
+            pair_decorations(&term.marks_snapshot()).is_empty(),
+            "an empty Enter must not fabricate a finished command"
+        );
     }
 
     #[test]
@@ -6255,6 +6415,72 @@ mod tests {
         assert!(
             term.pane_images().is_empty(),
             "the wipe preceded the alt entry, so the primary images are gone"
+        );
+    }
+
+    /// Clearing the pane erases the content the OSC 133 marks anchored to:
+    /// keeping them used to invert their drift math (history_size zeroed)
+    /// so stale decoration dots later resurfaced on unrelated output rows,
+    /// where clicking one copied or re-ran the wrong text.
+    #[test]
+    fn clearing_the_terminal_drops_its_marks() {
+        use crate::shell_integration::OscEvent;
+        let (_tmp, mut t) = quiet_pty();
+        feed_pty(&t, b"\r\n$ ");
+        t.push_mark_for_test(OscEvent::PromptStart, 0);
+        t.push_mark_for_test(OscEvent::PromptEnd, 2);
+        feed_pty(&t, b"cmd\r\nout\r\n");
+        t.push_mark_for_test(OscEvent::CommandStart, 0);
+        t.push_mark_for_test(OscEvent::CommandEnd(Some(0)), 0);
+        assert_eq!(
+            pair_decorations(&t.marks_snapshot()).len(),
+            1,
+            "staging: one finished command"
+        );
+        t.clear_screen_and_scrollback();
+        assert!(
+            pair_decorations(&t.marks_snapshot()).is_empty(),
+            "cleared content keeps no command decorations"
+        );
+    }
+
+    /// A prompt mark recorded after the scrollback saturated must ride the
+    /// ring rotation like its content: under the history-size model the
+    /// delta froze, so the mark (and its decoration dot) drifted off its
+    /// row as output streamed.
+    #[test]
+    fn a_prompt_mark_rides_scrollback_past_saturation() {
+        use crate::shell_integration::OscEvent;
+        let (_tmp, mut t) = quiet_pty();
+        let mut chunk = String::new();
+        for i in 0..5200 {
+            chunk.push_str(&format!("pre-{i}\r\n"));
+        }
+        feed_pty(&t, chunk.as_bytes());
+        feed_pty(&t, b"$ marker-prompt");
+        t.push_mark_for_test(OscEvent::PromptStart, 0);
+        feed_pty(&t, b"\r\n");
+        let find = |t: &mut PtyTerminal| {
+            let (lines, top) = t.grid_lines();
+            top + lines
+                .iter()
+                .position(|l| l.starts_with("$ marker-prompt"))
+                .unwrap() as i32
+        };
+        assert_eq!(
+            t.marks_snapshot()[0].1,
+            find(&mut t),
+            "the mark starts on its prompt row"
+        );
+        let mut more = String::new();
+        for i in 0..60 {
+            more.push_str(&format!("post-{i}\r\n"));
+        }
+        feed_pty(&t, more.as_bytes());
+        assert_eq!(
+            t.marks_snapshot()[0].1,
+            find(&mut t),
+            "the mark must follow its prompt through ring rotation"
         );
     }
 

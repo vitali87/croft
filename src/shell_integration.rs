@@ -383,7 +383,9 @@ if [[ -o interactive ]] && (( ! ${+_croft_si_installed} )); then
       builtin unset _croft_cmd_inflight
       builtin printf '\033]133;D;%d\007' "$_croft_ec"
     fi
-    builtin printf '\033]7;file://%s%s\007' "${HOST:-localhost}" "$PWD"
+    # `%` percent-escaped: the sniffer percent-decodes every OSC 7 path,
+    # so a raw `%41` in a real directory name would decode to `A`.
+    builtin printf '\033]7;file://%s%s\007' "${HOST:-localhost}" "${PWD//\%/%25}"
     builtin printf '\033]133;A\007'
     # Mark where the typed command starts (133;B). Themes rebuild PS1 from
     # their own precmd (which ran before this one), so the zero-width
@@ -484,7 +486,8 @@ if [[ -z "$_croft_si_installed" ]]; then
       builtin unset _croft_cmd_inflight
       builtin printf '\033]133;D;%d\007' "$_croft_ec"
     fi
-    builtin printf '\033]7;file://%s%s\007' "${HOSTNAME:-localhost}" "$PWD"
+    # `%` percent-escaped: the sniffer percent-decodes every OSC 7 path.
+    builtin printf '\033]7;file://%s%s\007' "${HOSTNAME:-localhost}" "${PWD//%/%25}"
     builtin printf '\033]133;A\007'
     # Prompt themes rewrite PS1 from their own PROMPT_COMMAND entries, so
     # the zero-width input-start mark is re-asserted at every prompt.
@@ -500,6 +503,10 @@ if [[ -z "$_croft_si_installed" ]]; then
     [[ -n "$COMP_LINE" ]] && builtin return
     [[ -z "$_croft_at_prompt" ]] && builtin return
     _croft_at_prompt=
+    # `[*]` joins with the first char of IFS: scope it to `;` here or an
+    # ARRAY PROMPT_COMMAND joins with spaces and its own entries never
+    # match, fabricating a command on every empty Enter.
+    local IFS=';'
     case ";${PROMPT_COMMAND[*]};" in
       *";$BASH_COMMAND;"*) builtin return ;;
     esac

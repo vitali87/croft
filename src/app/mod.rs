@@ -9366,9 +9366,12 @@ impl App {
     /// directory if it has one, else the workspace root.
     fn next_terminal_cwd(&self) -> PathBuf {
         // The shell's own OSC 7 report (shell integration) beats sampling
-        // the process table — it is exact and free of proc-inspection races.
+        // the process table — it is exact and free of proc-inspection
+        // races — but only when the REPORTING host is this machine: an
+        // in-pane ssh session names a remote path that would silently
+        // resolve to the wrong local directory whenever it exists here.
         self.terminal()
-            .shell_cwd()
+            .local_shell_cwd()
             .filter(|p| p.is_dir())
             .or_else(|| {
                 self.terminal()
@@ -9402,7 +9405,7 @@ impl App {
             .iter()
             .map(|t| crate::terminal_session::PaneRecord {
                 cwd: t
-                    .shell_cwd()
+                    .local_shell_cwd()
                     .filter(|p| p.is_dir())
                     .or_else(|| t.pid().and_then(cwd_of_pid).filter(|p| p.is_dir()))
                     .unwrap_or_else(|| self.workspace_root.clone())

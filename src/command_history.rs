@@ -28,6 +28,13 @@ fn canon_host(h: &str) -> &str {
     }
 }
 
+/// Whether an OSC 7 reporting host means "this machine" (empty, the RFC
+/// 8089 "localhost", or the machine's own hostname). Shared with every
+/// consumer that acts on a shell-reported path on the LOCAL filesystem.
+pub fn is_local_host(h: &str) -> bool {
+    canon_host(h).is_empty()
+}
+
 /// Whether `h` names this machine (case-insensitive, with or without the
 /// mDNS-style domain the shells sometimes include).
 fn is_local_hostname(h: &str) -> bool {
