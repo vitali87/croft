@@ -108,20 +108,31 @@ fn pytest_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
 
 /// Resolve a JS node ID (`file::describe...::title`): the first segment is the
 /// test file, the last the title — an arbitrary string, so it is escaped and
-/// matched literally (the `test('title'` / `it("title"` line carries it).
+/// matched literally. The title alone can also live in a comment or fixture
+/// above the test, so a `test(`/`it(` declaration carrying it wins; the bare
+/// title is only a fallback (`xit`, a title split across lines).
 fn js_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
     let (file, rest) = full_name.split_once("::")?;
     let path = root.join(file);
     let leaf = rest.rsplit("::").next()?;
-    let matcher = RegexMatcher::new(&super::regex_escape(leaf)).ok()?;
+    let escaped = super::regex_escape(leaf);
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(b'\x00'))
         .memory_map(MmapChoice::never())
         .build();
+    let decl = RegexMatcher::new(&format!(r#"\b(?:test|it)\b[^'"`]*['"`]{escaped}"#)).ok()?;
     let mut sink = FirstLine(None);
-    searcher.search_path(&matcher, &path, &mut sink).ok()?;
-    let line1 = sink.0?;
+    searcher.search_path(&decl, &path, &mut sink).ok()?;
+    let line1 = match sink.0 {
+        Some(l) => l,
+        None => {
+            let bare = RegexMatcher::new(&escaped).ok()?;
+            let mut sink = FirstLine(None);
+            searcher.search_path(&bare, &path, &mut sink).ok()?;
+            sink.0?
+        }
+    };
     Some((path, line1.saturating_sub(1) as u32))
 }
 
@@ -396,6 +407,34 @@ mod tests {
         let (_, line) =
             find_test_source(root, "src/math.test.ts::suite::parses [ tokens").unwrap();
         assert_eq!(line, 4);
+    }
+
+    #[test]
+    fn a_title_in_a_comment_above_the_test_does_not_hijack_the_jump() {
+        // The title text often appears before the declaration — a comment, a
+        // fixture string — and the first bare match would land the jump
+        // there. The `test(`/`it(` line carrying the title must win.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("math.test.js"),
+            "// adds (1 + 1) covers the carry path\nconst fixture = 'adds (1 + 1)'\n\ntest('adds (1 + 1)', () => {})\n",
+        )
+        .unwrap();
+        let (_, line) = find_test_source(root, "math.test.js::adds (1 + 1)").unwrap();
+        assert_eq!(line, 3, "the declaration, not the comment or the fixture");
+    }
+
+    #[test]
+    fn a_title_only_in_an_exotic_declaration_still_resolves() {
+        // `xit(` has no `test`/`it` word boundary, so the declaration-shaped
+        // match finds nothing; the bare-title fallback must still resolve
+        // instead of reporting no source.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.test.js"), "xit('odd little title', () => {})\n").unwrap();
+        let (_, line) = find_test_source(root, "a.test.js::odd little title").unwrap();
+        assert_eq!(line, 0);
     }
 
     #[test]

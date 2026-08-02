@@ -59,6 +59,11 @@ pub struct TestingPanel {
     /// before the first run. Surfaces a failed run that reported no Failed
     /// case (compile error, zero matching tests) in the summary line.
     last_run_ok: Option<bool>,
+    /// Whether the last run streamed at least one Failed case. Distinguishes
+    /// a real reported failure from a run that died unreported while an OLD
+    /// Failed case still sits in the tree — the "run failed" marker keys on
+    /// this, not on the (possibly stale) failed tally.
+    run_reported_failed: bool,
     /// Latest cargo build-status line while busy (e.g. "Compiling ratatui"), so
     /// a long compile shows movement instead of a static "Discovering tests".
     progress: Option<String>,
@@ -91,6 +96,7 @@ impl TestingPanel {
             cases: Vec::new(),
             activity: Activity::Idle,
             last_run_ok: None,
+            run_reported_failed: false,
             progress: None,
             refused: false,
             prerun: Vec::new(),
@@ -115,6 +121,7 @@ impl TestingPanel {
         self.prerun.clear();
         self.activity = activity;
         self.last_run_ok = None;
+        self.run_reported_failed = false;
         self.progress = None;
         self.scroll = 0;
     }
@@ -127,6 +134,7 @@ impl TestingPanel {
         self.cases.clear();
         self.activity = Activity::Idle;
         self.last_run_ok = None;
+        self.run_reported_failed = false;
         self.progress = None;
         // The refusal latch and rollback snapshot belong to the old
         // workspace; carrying either across a re-root would surface a stale
@@ -147,6 +155,7 @@ impl TestingPanel {
     pub fn start_single(&mut self, name: &str) {
         self.activity = Activity::Running;
         self.progress = None;
+        self.run_reported_failed = false;
         // Snapshot the pre-run status (None = about to be inserted) so a
         // worker refusal can put the tree back exactly.
         let old = self.cases.iter().find(|c| c.name == name).map(|c| c.status);
@@ -164,6 +173,7 @@ impl TestingPanel {
     pub fn start_filter(&mut self, pattern: &str) {
         self.activity = Activity::Running;
         self.progress = None;
+        self.run_reported_failed = false;
         // Snapshot each selected case's pre-run status for a refusal rollback.
         self.prerun = Vec::new();
         for c in &mut self.cases {
@@ -177,6 +187,9 @@ impl TestingPanel {
     /// Apply one streamed result: update the matching case in place, or insert
     /// it (kept sorted by name so the tree is stable).
     pub fn apply_case(&mut self, case: TestCase) {
+        if case.status == TestStatus::Failed {
+            self.run_reported_failed = true;
+        }
         match self.cases.binary_search_by(|c| c.name.cmp(&case.name)) {
             Ok(i) => self.cases[i].status = case.status,
             Err(i) => self.cases.insert(i, case),
@@ -477,12 +490,13 @@ impl Widget for &mut TestingPanel {
             // A nonzero runner exit with no Failed case in the tree (compile
             // error, a filter matching nothing) would otherwise keep the old
             // green tally: say so.
-            let run_failed = self.last_run_ok == Some(false) && failed == 0;
+            let run_failed = self.last_run_ok == Some(false) && !self.run_reported_failed;
             // The marker leads so a narrow panel cannot clip it away.
+            let tally = format!("{passed} passed · {failed} failed · {skipped} skipped");
             let summary = if run_failed {
-                format!("run failed · {passed} passed · {skipped} skipped")
+                format!("run failed · {tally}")
             } else {
-                format!("{passed} passed · {failed} failed · {skipped} skipped")
+                tally
             };
             let color = if failed > 0 || run_failed {
                 self.theme.git_deleted()
@@ -779,6 +793,36 @@ mod tests {
         assert!(
             summary.contains("run failed"),
             "a nonzero exit with no Failed case must say so, got {summary:?}"
+        );
+    }
+
+    /// A run that dies unreported must stay visible even when an OLD failure
+    /// lingers in the tree: gating the marker on `failed == 0` let a stale
+    /// Failed case suppress "run failed", leaving a tally that reads as if
+    /// the run completed.
+    #[test]
+    fn a_dead_run_is_still_marked_when_an_old_failure_lingers() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "m::old".into(),
+            status: TestStatus::Failed,
+        });
+        p.apply_case(TestCase {
+            name: "m::b".into(),
+            status: TestStatus::Passed,
+        });
+        p.on_finished(Some(false));
+        p.start_single("m::b");
+        p.on_finished(Some(false)); // died before reporting anything
+
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let summary: String = (0..40).map(|x| buf[(x, 2)].symbol()).collect();
+        assert!(
+            summary.contains("run failed"),
+            "a dead run must not hide behind a stale failure, got {summary:?}"
         );
     }
 

@@ -560,16 +560,34 @@ fn vitest_one_args(name: &str) -> Vec<String> {
     args
 }
 
+/// `-t` regex for a suite click's describe chain: every segment after the
+/// file, escaped and joined the way vitest and jest build the full name they
+/// match `-t` against (describes + title joined with single spaces — vitest's
+/// `getTaskFullName`, jest's `getTestID`), anchored at the start and closed
+/// with the joining space so describe `auth` cannot sweep an `auth-helper`
+/// sibling. `None` when the suite is the whole file (no describe segments),
+/// where the positional file argument already scopes the run exactly.
+fn suite_title_anchor(pattern: &str) -> Option<String> {
+    let (_, rest) = pattern.split_once("::")?;
+    let joined = rest.split("::").map(regex_escape).collect::<Vec<_>>().join(" ");
+    Some(format!("^{joined} "))
+}
+
 /// vitest argv for a filter run: a suite click passes a node-ID prefix
 /// (`file` or `file::describe`), run-at-cursor a bare title. The file scopes
-/// the run when present; a describe segment (or the bare title) narrows via
-/// `-t`.
-fn vitest_filter_args(pattern: &str) -> Vec<String> {
+/// the run when present; a describe chain (anchored, see
+/// [`suite_title_anchor`]) or the bare title narrows via `-t`.
+fn vitest_filter_args(pattern: &str, suite: bool) -> Vec<String> {
     let mut args = vec![String::from("run")];
     let (file, title) = js_id_parts(pattern);
     if is_js_file(pattern) {
         args.push(file.to_string());
-        if let Some(t) = title {
+        if suite {
+            if let Some(anchor) = suite_title_anchor(pattern) {
+                args.push(String::from("-t"));
+                args.push(anchor);
+            }
+        } else if let Some(t) = title {
             args.push(String::from("-t"));
             args.push(regex_escape(t));
         }
@@ -596,14 +614,19 @@ fn jest_one_args(name: &str) -> Vec<String> {
 }
 
 /// jest argv for a filter run, mirroring [`vitest_filter_args`]: a node-ID
-/// prefix scopes by file (plus `-t` for a describe segment), a bare title
-/// goes through `-t` alone.
-fn jest_filter_args(pattern: &str) -> Vec<String> {
+/// prefix scopes by file (plus an anchored `-t` for a suite's describe
+/// chain), a bare title goes through `-t` alone.
+fn jest_filter_args(pattern: &str, suite: bool) -> Vec<String> {
     let mut args = Vec::new();
     if is_js_file(pattern) {
         let (file, title) = js_id_parts(pattern);
         args.push(file.to_string());
-        if let Some(t) = title {
+        if suite {
+            if let Some(anchor) = suite_title_anchor(pattern) {
+                args.push(String::from("-t"));
+                args.push(anchor);
+            }
+        } else if let Some(t) = title {
             args.push(String::from("-t"));
             args.push(regex_escape(t));
         }
@@ -762,9 +785,11 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
 /// bare substring like `parse` would also sweep `parse_utils::b`. pytest
 /// splits the two shapes: a suite is a node-ID prefix (`tests/test_x.py`,
 /// `tests/test_x.py::TestGroup`) passed positionally, a bare function name
-/// (run-at-cursor) goes through `-k`, pytest's substring matcher. Like
-/// [`run_one`], the app has already marked the affected cases and shown the
-/// busy state, so no `Started` is sent.
+/// (run-at-cursor) goes through `-k`, pytest's substring matcher. vitest and
+/// jest anchor a suite's describe chain (see [`suite_title_anchor`]), since
+/// their `-t` is an unanchored regex over the full name. Like [`run_one`],
+/// the app has already marked the affected cases and shown the busy state,
+/// so no `Started` is sent.
 fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
     // See run_all: `None` refuses instead of falling through to cargo, and
     // `Refused` (not a bare Finished) rolls back the filtered Running marks.
@@ -774,7 +799,9 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
     };
     let ok = match runner {
         Runner::Pytest => {
-            let cmd = if pattern.contains(".py") {
+            // A suite is always a node-ID prefix; the `.py` sniff keeps a
+            // node-ID handed to a plain filter run positional too.
+            let cmd = if suite || pattern.contains(".py") {
                 pytest_cmd(root, &["-v", "--color=no", pattern])
             } else {
                 pytest_cmd(root, &["-v", "--color=no", "-k", pattern])
@@ -782,11 +809,11 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
         Runner::Vitest => {
-            let cmd = js_cmd(root, "vitest", &vitest_filter_args(pattern));
+            let cmd = js_cmd(root, "vitest", &vitest_filter_args(pattern, suite));
             run_streaming(tx, cmd, one(parse_vitest_tap_line))
         }
         Runner::Jest => {
-            let cmd = js_cmd(root, "jest", &jest_filter_args(pattern));
+            let cmd = js_cmd(root, "jest", &jest_filter_args(pattern, suite));
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
         Runner::Cargo => {
@@ -919,12 +946,12 @@ mod tests {
                 "--reporter=tap-flat"
             ]
         );
-        let args = vitest_filter_args("parses [ tokens");
+        let args = vitest_filter_args("parses [ tokens", false);
         assert_eq!(
             args,
             vec!["run", "-t", r"parses \[ tokens", "--reporter=tap-flat"]
         );
-        let args = vitest_filter_args("tests/a.test.js::group (x)");
+        let args = vitest_filter_args("tests/a.test.js::group (x)", false);
         assert_eq!(
             args,
             vec![
@@ -1189,12 +1216,36 @@ mod tests {
             vec!["tests/math.test.js", "-t", r"adds \(1 \+ 1\)", "--json"]
         );
         assert_eq!(
-            jest_filter_args("parses [ tokens"),
+            jest_filter_args("parses [ tokens", false),
             vec!["-t", r"parses \[ tokens", "--json"]
         );
         assert_eq!(
-            jest_filter_args("tests/a.test.js::group (x)"),
+            jest_filter_args("tests/a.test.js::group (x)", false),
             vec!["tests/a.test.js", "-t", r"group \(x\)", "--json"]
+        );
+    }
+
+    /// A suite click's `-t` must not be a bare substring: describe `auth`
+    /// would sweep `auth-helper handles retries` in the same file while the
+    /// panel marks only the suite's own cases as Running. vitest and jest
+    /// both match `-t` against the space-joined describe chain + title
+    /// (vitest `getTaskFullName`, jest `getTestID`), so the anchor is
+    /// `^segments… ` with the closing join space.
+    #[test]
+    fn a_js_suite_click_anchors_the_name_filter_to_the_describe_chain() {
+        assert_eq!(
+            vitest_filter_args("tests/a.test.js::auth", true),
+            vec!["run", "tests/a.test.js", "-t", "^auth ", "--reporter=tap-flat"]
+        );
+        assert_eq!(
+            jest_filter_args("tests/a.test.js::group (x)::inner", true),
+            vec!["tests/a.test.js", "-t", r"^group \(x\) inner ", "--json"]
+        );
+        // A suite that is the whole file needs no `-t`: the positional file
+        // argument already scopes the run exactly.
+        assert_eq!(
+            vitest_filter_args("tests/a.test.js", true),
+            vec!["run", "tests/a.test.js", "--reporter=tap-flat"]
         );
     }
 }

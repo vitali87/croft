@@ -62,19 +62,19 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Run Test at Cursor no longer crashes croft when no file is open, and when the discovered tree knows the test it runs exactly that test instead of every test whose name contains the same word.",
+        summary: "Run Test at Cursor no longer crashes croft when no file is open, and when a discovered test has a unique leaf name it runs exactly that test instead of every test whose name contains the same word.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Running a suite from its header runs only that suite: the filter is anchored on the module separator, so suite parse no longer sweeps parse_utils tests along.",
+        summary: "Running a suite from its header runs only that suite on every runner: cargo anchors on the module separator, vitest and jest anchor the describe chain, so suite auth no longer sweeps auth-helper tests along.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A test run that dies before reporting (a compile error, a test renamed since discovery) no longer strands spinning Running dots or hides behind the old green tally: the marks roll back and the summary leads with run failed.",
+        summary: "A test run that dies before reporting (a compile error, a test renamed since discovery) no longer strands spinning Running dots or hides behind the old tally, even one with a stale failure: the marks roll back and the summary leads with run failed.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Clicking a test's name locates its source on a background thread (a big workspace no longer freezes the UI mid-click), honours .gitignore even outside a git checkout, never jumps into target or node_modules, and now works for vitest and jest titles too, regex brackets and all.",
+        summary: "Clicking a test's name locates its source on a background thread (a big workspace no longer freezes the UI mid-click), honours .gitignore even outside a git checkout, never jumps into target or node_modules, and works for vitest and jest titles too: the jump prefers the test declaration over a comment that merely mentions the title.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
