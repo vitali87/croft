@@ -15959,11 +15959,15 @@ impl App {
                 self.close_input_prompt();
                 let reverted = self.editor.revert_paths_to_disk(&paths);
                 self.sync_open_file_poll_mtime();
-                match reverted.len() {
-                    0 => {}
-                    1 => self.status = format!("Reloaded {} from disk", reverted[0].display()),
-                    n => self.status = format!("Reloaded {n} files from disk"),
-                }
+                // A failed reload (file deleted since the popup opened) keeps
+                // its unsaved edits — say so instead of silently doing nothing.
+                let failed = paths.len().saturating_sub(reverted.len());
+                self.status = match (reverted.len(), failed) {
+                    (0, _) => String::from("Reload from disk failed; unsaved edits kept"),
+                    (1, 0) => format!("Reloaded {} from disk", reverted[0].display()),
+                    (n, 0) => format!("Reloaded {n} files from disk"),
+                    (n, f) => format!("Reloaded {n} files; {f} failed and kept their edits"),
+                };
             }
             InputPurpose::AskNavigator {
                 file,
@@ -27006,16 +27010,20 @@ impl App {
                     let t = &mut self.terminals[idx];
                     // A child tracking the mouse (Claude Code, htop, vim) gets
                     // a real wheel report so it scrolls its own content. Shift
-                    // bypasses that for croft's scrollback. Otherwise fall back
-                    // to arrow keys for alternate-screen apps that don't track.
-                    if t.mouse_reporting() && !shift {
-                        t.report_mouse(
+                    // bypasses that for croft's scrollback. A report that
+                    // could not be delivered (the wheel sat on the pane
+                    // BORDER, outside the inner grid) falls through like any
+                    // non-tracking pane instead of swallowing the notch.
+                    if t.mouse_reporting()
+                        && !shift
+                        && t.report_mouse(
                             MouseButtonKind::WheelDown,
                             MouseAction::Press,
                             m.column,
                             m.row,
                             mouse_mods(&m),
-                        );
+                        )
+                    {
                     } else if !t.scroll_down(3) {
                         if t.app_cursor_keys() {
                             t.write_input(b"\x1bOB\x1bOB\x1bOB");
@@ -27065,14 +27073,17 @@ impl App {
                 } else if let Some(idx) = terminal_hit {
                     let shift = m.modifiers.contains(KeyModifiers::SHIFT);
                     let t = &mut self.terminals[idx];
-                    if t.mouse_reporting() && !shift {
-                        t.report_mouse(
+                    // Same border fall-through as the WheelDown arm below.
+                    if t.mouse_reporting()
+                        && !shift
+                        && t.report_mouse(
                             MouseButtonKind::WheelUp,
                             MouseAction::Press,
                             m.column,
                             m.row,
                             mouse_mods(&m),
-                        );
+                        )
+                    {
                     } else if !t.scroll_up(3) {
                         if t.app_cursor_keys() {
                             t.write_input(b"\x1bOA\x1bOA\x1bOA");

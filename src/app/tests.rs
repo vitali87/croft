@@ -23135,6 +23135,41 @@ fn the_terminal_image_yields_to_an_open_context_menu() {
 /// through to the program like its comment promises and like Shift+Home /
 /// Shift+PageUp/PageDown already do; it used to be swallowed because the
 /// bottom-reset arm had no alt-screen guard.
+/// A wheel notch on the pane BORDER while the child tracks the mouse used
+/// to vanish: the report was undeliverable (the border sits outside the
+/// inner grid) and the handler had no fall-through, so nothing scrolled —
+/// yet the same cell scrolls croft's scrollback fine on a non-tracking
+/// pane. An undeliverable report now falls back the same way.
+#[test]
+fn a_wheel_on_the_pane_border_scrolls_even_when_the_child_tracks_the_mouse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // Fill scrollback so there is history to scroll into, then have the
+    // child enable mouse tracking.
+    let mut feed = Vec::new();
+    for i in 0..80 {
+        feed.extend_from_slice(format!("row-{i}\r\n").as_bytes());
+    }
+    feed.extend_from_slice(b"\x1b[?1000h");
+    app.terminals[0].feed_bytes_for_test(&feed);
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.terminals[0].last_area;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::ScrollUp,
+        column: area.x,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        app.terminals[0].scroll_display_offset() > 0,
+        "the border notch must scroll the scrollback, not vanish"
+    );
+}
+
 #[test]
 fn shift_end_reaches_an_alt_screen_program() {
     let tmp = tempfile::tempdir().unwrap();
