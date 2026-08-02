@@ -127,6 +127,11 @@ impl TestingPanel {
         self.activity = Activity::Idle;
         self.last_run_ok = None;
         self.progress = None;
+        // The refusal latch and rollback snapshot belong to the old
+        // workspace; carrying either across a re-root would surface a stale
+        // no-runner status or restore cases into the new project's tree.
+        self.refused = false;
+        self.prerun.clear();
         self.scroll = 0;
     }
 
@@ -635,6 +640,25 @@ mod tests {
             "a start-inserted case disappears again on refusal"
         );
         assert!(p.take_refusal());
+
+        // A re-root (Explorer Make Root) drops both the latch and the
+        // snapshot: neither a stale no-runner status nor an old workspace's
+        // rollback may leak into the new project.
+        p.start_single("m::stale");
+        p.on_refused();
+        p.reset();
+        assert!(!p.take_refusal(), "reset clears the refusal latch");
+        p.apply_case(TestCase {
+            name: "other::t".into(),
+            status: TestStatus::Passed,
+        });
+        p.on_refused();
+        let t = p.cases.iter().find(|c| c.name == "other::t").unwrap();
+        assert_eq!(
+            t.status,
+            TestStatus::Passed,
+            "reset drops the old snapshot, so a later refusal restores nothing"
+        );
     }
 
     #[test]
