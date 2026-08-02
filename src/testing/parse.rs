@@ -109,10 +109,8 @@ pub fn parse_vitest_list_line(line: &str) -> Option<String> {
 pub fn parse_vitest_tap_line(line: &str) -> Option<TestCase> {
     let (ok, rest) = if let Some(r) = line.strip_prefix("ok ") {
         (true, r)
-    } else if let Some(r) = line.strip_prefix("not ok ") {
-        (false, r)
     } else {
-        return None;
+        (false, line.strip_prefix("not ok ")?)
     };
     let (_num, rest) = rest.split_once(" - ")?;
     let (id, directive) = match rest.rsplit_once(" # ") {
