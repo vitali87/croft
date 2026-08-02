@@ -307,38 +307,76 @@ impl ScrollClock {
 /// (`\x1b[2J`, erases the live screen), ED 3 (`\x1b[3J`, erases the
 /// scrollback) and RIS (`\x1bc`, both). Keyed on the bytes rather than on
 /// `history_size` movement, which is 0 → 0 when nothing has scrolled into
-/// history yet. A three-byte carry catches a sequence split across reads.
-/// Ceiling (ponytail): the verdict is per-chunk, so a wipe followed by an
-/// alt-screen entry in the SAME read is attributed to the alt screen and
-/// skipped; interleaving with the advance would need per-segment scans.
+/// history yet. The scan is POSITIONAL: it tracks alt-screen entry/exit
+/// (DECSET/DECRST 47/1047/1049) through the stream, so a wipe counts only
+/// where it landed — `clear && vim` wipes the primary screen even though
+/// the same chunk ends inside the alt screen. An unterminated trailing
+/// sequence (bounded) carries to the next read; consumed bytes are never
+/// rescanned, which keeps the alt tracking single-shot.
 #[derive(Default)]
 struct WipeSniffer {
     carry: Vec<u8>,
 }
 
+/// Longest carried partial sequence; a real DECSET list or ED is far
+/// shorter, and the bound stops a hostile unterminated CSI from growing.
+const WIPE_CARRY_MAX: usize = 64;
+
 impl WipeSniffer {
-    /// Returns (screen wiped, history wiped) for this chunk.
-    fn scan(&mut self, chunk: &[u8]) -> (bool, bool) {
+    /// Scan one chunk. `alt` is the terminal's alt-screen state where the
+    /// chunk STARTS. Returns (primary screen wiped, scrollback wiped).
+    fn scan(&mut self, chunk: &[u8], mut alt: bool) -> (bool, bool) {
+        let mut data = std::mem::take(&mut self.carry);
+        data.extend_from_slice(chunk);
         let mut screen = false;
         let mut hist = false;
-        let mut probe = std::mem::take(&mut self.carry);
-        probe.extend_from_slice(chunk);
-        for w in probe.windows(2) {
-            if w == b"\x1bc" {
-                screen = true;
-                hist = true;
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] != 0x1b {
+                i += 1;
+                continue;
+            }
+            let Some(&next) = data.get(i + 1) else {
+                self.carry = data.split_off(i);
+                return (screen, hist);
+            };
+            match next {
+                // RIS: full reset — everything is gone, back on primary.
+                b'c' => {
+                    screen = true;
+                    hist = true;
+                    alt = false;
+                    i += 2;
+                }
+                b'[' => {
+                    let mut j = i + 2;
+                    while j < data.len() && !(0x40..=0x7e).contains(&data[j]) {
+                        j += 1;
+                    }
+                    if j >= data.len() {
+                        if data.len() - i <= WIPE_CARRY_MAX {
+                            self.carry = data.split_off(i);
+                        }
+                        return (screen, hist);
+                    }
+                    let params = &data[i + 2..j];
+                    match data[j] {
+                        b'J' if params == b"2" && !alt => screen = true,
+                        b'J' if params == b"3" && !alt => hist = true,
+                        fin @ (b'h' | b'l') if params.first() == Some(&b'?') => {
+                            for p in params[1..].split(|&c| c == b';') {
+                                if p == b"47" || p == b"1047" || p == b"1049" {
+                                    alt = fin == b'h';
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    i = j + 1;
+                }
+                _ => i += 2,
             }
         }
-        for w in probe.windows(4) {
-            if w == b"\x1b[2J" {
-                screen = true;
-            } else if w == b"\x1b[3J" {
-                hist = true;
-            }
-        }
-        let keep = probe.len().min(3);
-        probe.drain(..probe.len() - keep);
-        self.carry = probe;
         (screen, hist)
     }
 }
@@ -1262,8 +1300,9 @@ impl PtyTerminal {
                         // the mark landed (alacritty drops the sequences
                         // themselves as unknown OSC).
                         let osc_events = osc_sniffer.scan(&buf[..n]);
-                        let (screen_wiped, hist_wiped) = wipe_sniffer.scan(&buf[..n]);
                         let mut t = term_for_thread.lock();
+                        let (screen_wiped, hist_wiped) =
+                            wipe_sniffer.scan(&buf[..n], t.mode().contains(TermMode::ALT_SCREEN));
                         let mut done = 0usize;
                         for (end, ev) in osc_events {
                             processor.advance(&mut *t, &buf[done..end]);
@@ -1362,11 +1401,12 @@ impl PtyTerminal {
                         processor.advance(&mut *t, &buf[done..n]);
                         // A destructive clear erases the content the pane's
                         // captured images anchored to: ED 2 the live screen
-                        // rows, ED 3 the scrollback ones, RIS both. Inside
-                        // the alt screen the sequences touch the alternate
-                        // grid, so primary-screen images are untouched.
-                        if (screen_wiped || hist_wiped) && !t.mode().contains(TermMode::ALT_SCREEN)
-                        {
+                        // rows, ED 3 the scrollback ones, RIS both. The
+                        // sniffer already excluded wipes that landed inside
+                        // the alt screen (positional tracking), so no mode
+                        // check here — the chunk's FINAL mode says nothing
+                        // about where a wipe fell (`clear && vim`).
+                        if screen_wiped || hist_wiped {
                             let mut imgs = images_for_thread.lock().unwrap();
                             if !imgs.is_empty() {
                                 let now = clock_for_thread.lock().unwrap().tick(&mut t);
@@ -6069,6 +6109,43 @@ mod tests {
         assert!(
             term.pane_images().is_empty(),
             "a screen wipe with empty history must still drop the pane's images"
+        );
+    }
+
+    /// `clear && vim`: the wipe and the alt-screen entry land in ONE PTY
+    /// chunk. Judging the wipe by the chunk's FINAL mode attributed it to
+    /// the alt screen and kept the invalidated primary images, which then
+    /// reappeared over unrelated content when the app exited.
+    #[test]
+    fn a_wipe_followed_by_alt_entry_in_one_chunk_still_drops_images() {
+        use base64::Engine;
+        let mut png_buf = Vec::new();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 0, 255]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_buf),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+        let tmp = tempfile::tempdir().unwrap();
+        // The wipe and the alt ENTRY share one write (one PTY chunk, the
+        // pane still in the alt screen when it ends); the exit comes later.
+        let script = format!(
+            "printf '\\033]1337;File=inline=1:{b64}\\007\\n'; read x; printf '\\033[2J\\033[3J\\033[?1049halt-owns-this'; sleep 1; printf '\\033[?1049l'; printf 'back\\n'; sleep 30"
+        );
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script], tmp.path()).unwrap();
+        let mut waited = 0u32;
+        while term.pane_images().is_empty() {
+            assert!(waited < 8000, "inline image never captured");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        term.write_input(b"\n");
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.starts_with("back")));
+        assert!(
+            term.pane_images().is_empty(),
+            "the wipe preceded the alt entry, so the primary images are gone"
         );
     }
 

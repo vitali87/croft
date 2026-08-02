@@ -23003,13 +23003,13 @@ fn a_scrolled_inline_image_reuses_its_baked_payload() {
     let (_tmp, mut app) =
         app_with_baked_terminal_image(crate::iterm2_inline::InlineImageProtocol::Kitty);
     let y0 = app.overlays.terminal_image.layout().unwrap().cell_y;
-    let bakes = crate::iterm2_inline::FIT_IMAGE_BAKES.load(std::sync::atomic::Ordering::Relaxed);
+    let bakes = crate::iterm2_inline::FIT_IMAGE_BAKES.with(|c| c.get());
     app.terminals[0].feed_bytes_for_test(b"\r\n\r\n");
     app.update_terminal_image_overlay();
     let l = app.overlays.terminal_image.layout().unwrap();
     assert_eq!(l.cell_y, y0 - 2, "the placement follows the anchor");
     assert_eq!(
-        crate::iterm2_inline::FIT_IMAGE_BAKES.load(std::sync::atomic::Ordering::Relaxed),
+        crate::iterm2_inline::FIT_IMAGE_BAKES.with(|c| c.get()),
         bakes,
         "a pure row move must not re-decode the image"
     );

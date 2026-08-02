@@ -577,14 +577,18 @@ pub fn fit_image(
     fit_image_auto(src_png, canvas_w_px, canvas_h_px, bg)
 }
 
+// Test-only counter of full `fit_image_auto` bakes, so tests can pin that
+// a pure anchor move does not re-decode a photo per scrolled row.
+// Thread-local: the bake runs on the asserting test's own thread, and a
+// process-global count would race with parallel tests under `cargo test`.
+#[cfg(test)]
+thread_local! {
+    pub static FIT_IMAGE_BAKES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Same as `fit_image` but accepts any format `image` can decode (PNG,
 /// JPEG, GIF first frame, BMP, WebP). Bakes the result back to a PNG sized
 /// to the supplied canvas with `bg` as the letterbox fill.
-/// Test-only counter of full [`fit_image_auto`] bakes, so tests can pin
-/// that a pure anchor move does not re-decode a photo per scrolled row.
-#[cfg(test)]
-pub static FIT_IMAGE_BAKES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 pub fn fit_image_auto(
     src: &[u8],
     canvas_w_px: u32,
@@ -592,7 +596,7 @@ pub fn fit_image_auto(
     bg: Rgba<u8>,
 ) -> Result<Vec<u8>, image::ImageError> {
     #[cfg(test)]
-    FIT_IMAGE_BAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    FIT_IMAGE_BAKES.with(|c| c.set(c.get() + 1));
     let img = image::load_from_memory(src)?.to_rgba8();
     let (sw, sh) = (img.width(), img.height());
     let scale = f64::min(
