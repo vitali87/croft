@@ -61,6 +61,9 @@ pub struct TestingPanel {
     /// Latest cargo build-status line while busy (e.g. "Compiling ratatui"), so
     /// a long compile shows movement instead of a static "Discovering tests".
     progress: Option<String>,
+    /// Latched by [`Self::on_refused`] and consumed by the app's drain, which
+    /// surfaces the no-runner status message.
+    refused: bool,
     scroll: usize,
 
     pub focus_gradient: bool,
@@ -82,6 +85,7 @@ impl TestingPanel {
             activity: Activity::Idle,
             last_run_ok: None,
             progress: None,
+            refused: false,
             scroll: 0,
             focus_gradient: false,
             theme: Theme::default(),
@@ -166,6 +170,27 @@ impl TestingPanel {
         if ok.is_some() {
             self.last_run_ok = ok;
         }
+    }
+
+    /// The worker refused a queued request because no enabled runner claims
+    /// the root anymore (disabled between the app's check and the queue
+    /// drain). Roll back the Running marks the `start_*` call painted — a
+    /// bare finish would strand them Running forever — and latch the refusal
+    /// for the app to surface as a status.
+    pub fn on_refused(&mut self) {
+        self.activity = Activity::Idle;
+        self.progress = None;
+        for c in &mut self.cases {
+            if c.status == TestStatus::Running {
+                c.status = TestStatus::NotRun;
+            }
+        }
+        self.refused = true;
+    }
+
+    /// Consume the refusal latch (one status message per refusal).
+    pub fn take_refusal(&mut self) -> bool {
+        std::mem::take(&mut self.refused)
     }
 
     pub fn is_running(&self) -> bool {
@@ -533,6 +558,38 @@ mod tests {
         assert_eq!(p.cases.len(), 3, "the rest of the tree is preserved");
         let b = p.cases.iter().find(|c| c.name == "m::b").unwrap();
         assert_eq!(b.status, TestStatus::Running, "only the target is Running");
+    }
+
+    /// A worker refusal (runner disabled between the app's check and the
+    /// queue drain) must roll the Running marks back to NotRun — a bare
+    /// finish stranded them Running forever — and latch one refusal for the
+    /// app's status line.
+    #[test]
+    fn a_refused_run_rolls_running_cases_back_and_latches_once() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        for n in ["m::a", "m::b"] {
+            p.apply_case(TestCase {
+                name: n.into(),
+                status: TestStatus::Passed,
+            });
+        }
+        p.on_finished(Some(true));
+        p.start_single("m::b");
+
+        p.on_refused();
+
+        assert!(!p.is_busy(), "a refusal returns the panel to idle");
+        let b = p.cases.iter().find(|c| c.name == "m::b").unwrap();
+        assert_eq!(
+            b.status,
+            TestStatus::NotRun,
+            "the refused case must not stay Running"
+        );
+        let a = p.cases.iter().find(|c| c.name == "m::a").unwrap();
+        assert_eq!(a.status, TestStatus::Passed, "untouched cases keep results");
+        assert!(p.take_refusal(), "the refusal is latched for the app");
+        assert!(!p.take_refusal(), "and consumed exactly once");
     }
 
     #[test]

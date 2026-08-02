@@ -13778,9 +13778,7 @@ impl App {
         if crate::testing::worker::runner_for(&self.tree.root).is_some() {
             return true;
         }
-        self.status = String::from(
-            "No test runner detected in this workspace (is its extension enabled?)",
-        );
+        self.status = String::from(crate::testing::NO_RUNNER_STATUS);
         false
     }
 
@@ -33067,6 +33065,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let dap_changed = app.poll_dap();
         let tests_changed =
             app.test_worker.drain(&mut app.testing) | app.drain_pending_test_debug();
+        // A queued run the worker refused (runner disabled after the entry
+        // check) rolled its cases back in the drain; say why nothing ran.
+        if app.testing.take_refusal() {
+            app.status = String::from(crate::testing::NO_RUNNER_STATUS);
+        }
         let mcp_changed = app.poll_mcp();
         let pair_changed =
             app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
