@@ -303,6 +303,84 @@ impl ScrollClock {
 /// scrollback with the exit time) and which saturates once the ring fills,
 /// freezing ids to screen positions. Alternate-screen output stamps
 /// nothing: it isn't scrollback rows, and the gutter is normal-screen only.
+/// Destructive-clear detector over the raw PTY byte stream: ED 2
+/// (`\x1b[2J`, erases the live screen), ED 3 (`\x1b[3J`, erases the
+/// scrollback) and RIS (`\x1bc`, both). Keyed on the bytes rather than on
+/// `history_size` movement, which is 0 → 0 when nothing has scrolled into
+/// history yet. The scan is POSITIONAL: it tracks alt-screen entry/exit
+/// (DECSET/DECRST 47/1047/1049) through the stream, so a wipe counts only
+/// where it landed — `clear && vim` wipes the primary screen even though
+/// the same chunk ends inside the alt screen. An unterminated trailing
+/// sequence (bounded) carries to the next read; consumed bytes are never
+/// rescanned, which keeps the alt tracking single-shot.
+#[derive(Default)]
+struct WipeSniffer {
+    carry: Vec<u8>,
+}
+
+/// Longest carried partial sequence; a real DECSET list or ED is far
+/// shorter, and the bound stops a hostile unterminated CSI from growing.
+const WIPE_CARRY_MAX: usize = 64;
+
+impl WipeSniffer {
+    /// Scan one chunk. `alt` is the terminal's alt-screen state where the
+    /// chunk STARTS. Returns (primary screen wiped, scrollback wiped).
+    fn scan(&mut self, chunk: &[u8], mut alt: bool) -> (bool, bool) {
+        let mut data = std::mem::take(&mut self.carry);
+        data.extend_from_slice(chunk);
+        let mut screen = false;
+        let mut hist = false;
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] != 0x1b {
+                i += 1;
+                continue;
+            }
+            let Some(&next) = data.get(i + 1) else {
+                self.carry = data.split_off(i);
+                return (screen, hist);
+            };
+            match next {
+                // RIS: full reset — everything is gone, back on primary.
+                b'c' => {
+                    screen = true;
+                    hist = true;
+                    alt = false;
+                    i += 2;
+                }
+                b'[' => {
+                    let mut j = i + 2;
+                    while j < data.len() && !(0x40..=0x7e).contains(&data[j]) {
+                        j += 1;
+                    }
+                    if j >= data.len() {
+                        if data.len() - i <= WIPE_CARRY_MAX {
+                            self.carry = data.split_off(i);
+                        }
+                        return (screen, hist);
+                    }
+                    let params = &data[i + 2..j];
+                    match data[j] {
+                        b'J' if params == b"2" && !alt => screen = true,
+                        b'J' if params == b"3" && !alt => hist = true,
+                        fin @ (b'h' | b'l') if params.first() == Some(&b'?') => {
+                            for p in params[1..].split(|&c| c == b';') {
+                                if p == b"47" || p == b"1047" || p == b"1049" {
+                                    alt = fin == b'h';
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    i = j + 1;
+                }
+                _ => i += 2,
+            }
+        }
+        (screen, hist)
+    }
+}
+
 fn stamp_chunk(
     term: &mut Term<VoidListener>,
     clock: &mut ScrollClock,
@@ -501,15 +579,20 @@ pub struct PtyTerminal {
     /// `inline=1`, the imgcat protocol), anchored like marks. Capped at
     /// [`IMAGES_MAX`]; the app overlays the newest visible one.
     images: Arc<std::sync::Mutex<Vec<StoredImage>>>,
+    /// Test-only capture of every byte written toward the child's stdin.
+    #[cfg(test)]
+    written_for_test: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
-/// One captured inline image at its recording-time anchor (same drift model
-/// as [`StoredMark`]: current line = `line_rec - (history_now - hist_rec)`).
+/// One captured inline image at its recording-time anchor, keyed on the
+/// scroll clock like annotations (current line =
+/// `line_rec - (clock_now - clock_rec)`), NOT on `history_size`, whose
+/// saturation froze the picture onto a viewport row in long-lived panes.
 struct StoredImage {
     seq: u64,
     data: std::sync::Arc<Vec<u8>>,
     line_rec: i32,
-    hist_rec: usize,
+    clock_rec: i64,
 }
 
 /// A pane inline image surfaced to the app: its per-pane id, the raw image
@@ -1025,17 +1108,17 @@ impl PtyTerminal {
     /// marks). Images whose anchor scrolled past the scrollback floor are
     /// garbage-collected here.
     pub fn pane_images(&self) -> Vec<PaneImage> {
-        let term = self.term.lock();
-        let hist_now = term.grid().history_size() as i32;
+        let mut term = self.term.lock();
+        let now = self.clock.lock().unwrap().tick(&mut term);
         let floor = term.grid().topmost_line().0;
         drop(term);
         let mut imgs = self.images.lock().unwrap();
-        imgs.retain(|m| m.line_rec - (hist_now - m.hist_rec as i32) >= floor);
+        imgs.retain(|m| m.line_rec - (now - m.clock_rec) as i32 >= floor);
         imgs.iter()
             .map(|m| PaneImage {
                 seq: m.seq,
                 data: m.data.clone(),
-                line: m.line_rec - (hist_now - m.hist_rec as i32),
+                line: m.line_rec - (now - m.clock_rec) as i32,
             })
             .collect()
     }
@@ -1191,6 +1274,7 @@ impl PtyTerminal {
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut port_sniffer = crate::port_detect::PortSniffer::new();
             let mut osc_sniffer = crate::shell_integration::OscSniffer::default();
+            let mut wipe_sniffer = WipeSniffer::default();
             let mut trigger_scanner = crate::triggers::TriggerScanner::new();
             let mut trigger_hits = Vec::new();
             // Per-pane monotonic id for captured inline images; the overlay
@@ -1217,6 +1301,8 @@ impl PtyTerminal {
                         // themselves as unknown OSC).
                         let osc_events = osc_sniffer.scan(&buf[..n]);
                         let mut t = term_for_thread.lock();
+                        let (screen_wiped, hist_wiped) =
+                            wipe_sniffer.scan(&buf[..n], t.mode().contains(TermMode::ALT_SCREEN));
                         let mut done = 0usize;
                         for (end, ev) in osc_events {
                             processor.advance(&mut *t, &buf[done..end]);
@@ -1238,11 +1324,10 @@ impl PtyTerminal {
                                 }
                                 E::InlineImage(data) => {
                                     // Anchor the picture at the cursor's grid
-                                    // position, exactly like a mark; the
-                                    // overlay derives the current line via
-                                    // the same drift model.
+                                    // position, keyed on the scroll clock like
+                                    // an annotation (lock order term → clock).
                                     let line_rec = t.grid().cursor.point.line.0;
-                                    let hist_rec = t.grid().history_size();
+                                    let clock_rec = clock_for_thread.lock().unwrap().tick(&mut t);
                                     let mut imgs = images_for_thread.lock().unwrap();
                                     if imgs.len() >= IMAGES_MAX {
                                         let drop_n = imgs.len() + 1 - IMAGES_MAX;
@@ -1253,7 +1338,7 @@ impl PtyTerminal {
                                         seq: image_seq,
                                         data: std::sync::Arc::new(data),
                                         line_rec,
-                                        hist_rec,
+                                        clock_rec,
                                     });
                                 }
                                 kind @ (E::PromptStart
@@ -1314,6 +1399,24 @@ impl PtyTerminal {
                             }
                         }
                         processor.advance(&mut *t, &buf[done..n]);
+                        // A destructive clear erases the content the pane's
+                        // captured images anchored to: ED 2 the live screen
+                        // rows, ED 3 the scrollback ones, RIS both. The
+                        // sniffer already excluded wipes that landed inside
+                        // the alt screen (positional tracking), so no mode
+                        // check here — the chunk's FINAL mode says nothing
+                        // about where a wipe fell (`clear && vim`).
+                        if screen_wiped || hist_wiped {
+                            let mut imgs = images_for_thread.lock().unwrap();
+                            if !imgs.is_empty() {
+                                let now = clock_for_thread.lock().unwrap().tick(&mut t);
+                                imgs.retain(|m| {
+                                    let line = m.line_rec - (now - m.clock_rec) as i32;
+                                    let wiped = if line >= 0 { screen_wiped } else { hist_wiped };
+                                    !wiped
+                                });
+                            }
+                        }
                         // Stamp newly-arrived rows for the timestamps gutter:
                         // every row the cursor moved past in this chunk gets
                         // the chunk's arrival time (one read of output is
@@ -1401,6 +1504,8 @@ impl PtyTerminal {
             trigger_rx,
             palette: crate::theme::VSCODE_ANSI,
             images,
+            #[cfg(test)]
+            written_for_test: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -2186,6 +2291,24 @@ impl PtyTerminal {
         });
     }
 
+    /// Test-only: record an inline image as the reader thread would,
+    /// anchored at the grid's CURRENT cursor row.
+    #[cfg(test)]
+    pub fn push_image_for_test(&self, data: Vec<u8>) {
+        let mut term = self.term.lock();
+        let line_rec = term.grid().cursor.point.line.0;
+        let clock_rec = self.clock.lock().unwrap().tick(&mut term);
+        drop(term);
+        let mut imgs = self.images.lock().unwrap();
+        let seq = imgs.last().map_or(0, |m| m.seq) + 1;
+        imgs.push(StoredImage {
+            seq,
+            data: std::sync::Arc::new(data),
+            line_rec,
+            clock_rec,
+        });
+    }
+
     /// Test-only: the raw state behind the corrected selection accessors —
     /// (stored selection, sel_scrolled, clock_base, alt anchor top, alt
     /// mode) — for diagnosing drift math from app-level tests.
@@ -2466,11 +2589,22 @@ impl PtyTerminal {
 
     pub fn write_input(&mut self, data: &[u8]) {
         self.reset_scrollback();
+        #[cfg(test)]
+        self.written_for_test
+            .lock()
+            .unwrap()
+            .extend_from_slice(data);
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(data);
             let _ = w.flush();
         }
         self.pty_dirty.store(true, Ordering::Release);
+    }
+
+    /// Test-only: every byte the app has written toward the child's stdin.
+    #[cfg(test)]
+    pub fn written_bytes_for_test(&self) -> Vec<u8> {
+        self.written_for_test.lock().unwrap().clone()
     }
 
     /// True when the child program has enabled any mouse-tracking mode
@@ -2600,10 +2734,17 @@ impl PtyTerminal {
         true
     }
 
-    pub fn reset_scrollback(&mut self) {
+    /// Jump the viewport back to the live bottom (Shift+End). Returns false
+    /// in the alternate screen — no scrollback there, so the chord belongs
+    /// to the program, exactly like its three scrolling siblings.
+    pub fn reset_scrollback(&mut self) -> bool {
         let mut term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
         term.scroll_display(Scroll::Bottom);
         self.pty_dirty.store(true, Ordering::Release);
+        true
     }
 
     /// Clear the visible screen and scrollback history (VS Code's terminal
@@ -2617,6 +2758,10 @@ impl PtyTerminal {
             processor.advance(&mut *term, b"\x1b[3J\x1b[2J\x1b[H");
             term.scroll_display(Scroll::Bottom);
         }
+        // The content the images anchored to is gone; without this they
+        // float over the fresh prompt (the wipe also zeroes history_size,
+        // which used to invert the anchor math outright).
+        self.images.lock().unwrap().clear();
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -5853,6 +5998,171 @@ mod tests {
         assert!(
             max2 >= max1 + 100,
             "row ids must keep advancing after saturation (got {max1} then {max2})"
+        );
+    }
+
+    /// An inline image captured after the scrollback saturated must ride
+    /// the ring rotation like the content it anchors: `history_size` stops
+    /// growing there, so a history-delta anchor freezes onto a viewport
+    /// row and the picture sits on top of every later command's output.
+    #[test]
+    fn an_inline_image_rides_scrollback_past_saturation() {
+        let (_tmp, t) = quiet_pty();
+        let mut chunk = String::new();
+        for i in 0..5200 {
+            chunk.push_str(&format!("pre-{i}\r\n"));
+        }
+        feed_pty(&t, chunk.as_bytes());
+        feed_pty(&t, b"image-anchor-row");
+        t.push_image_for_test(vec![9, 9, 9]);
+        feed_pty(&t, b"\r\n");
+        let find_anchor = |t: &PtyTerminal| {
+            let (lines, top) = t.grid_lines();
+            top + lines
+                .iter()
+                .position(|l| l.starts_with("image-anchor-row"))
+                .unwrap() as i32
+        };
+        assert_eq!(
+            t.pane_images().pop().unwrap().line,
+            find_anchor(&t),
+            "the anchor starts on its row"
+        );
+        let mut more = String::new();
+        for i in 0..60 {
+            more.push_str(&format!("post-{i}\r\n"));
+        }
+        feed_pty(&t, more.as_bytes());
+        assert_eq!(
+            t.pane_images().pop().unwrap().line,
+            find_anchor(&t),
+            "the anchor must follow its content through ring rotation"
+        );
+    }
+
+    /// Typing `clear` reaches the grid as ED 3 through the PTY reader
+    /// thread (modern terminfo wipes scrollback), never through the pane's
+    /// own Clear method: the reader must drop captured images too, or the
+    /// picture floats over the fresh prompt.
+    #[test]
+    fn a_program_emitted_scrollback_wipe_drops_captured_images() {
+        use base64::Engine;
+        let mut png_buf = Vec::new();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 255, 0, 255]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_buf),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+        let tmp = tempfile::tempdir().unwrap();
+        // Fill lines push real content into scrollback first (ED 3 can only
+        // shrink a nonempty history); the wipe then waits on stdin so the
+        // test can observe the capture before it lands.
+        let script = format!(
+            "i=0; while [ $i -lt 60 ]; do echo fill-$i; i=$((i+1)); done; printf '\\033]1337;File=inline=1:{b64}\\007\\n'; read x; printf '\\033[3J\\033[2J'; printf 'wiped\\n'; sleep 30"
+        );
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script], tmp.path()).unwrap();
+        let mut waited = 0u32;
+        while term.pane_images().is_empty() {
+            assert!(waited < 8000, "inline image never captured");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        term.write_input(b"\n");
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.starts_with("wiped")));
+        assert!(
+            term.pane_images().is_empty(),
+            "an ED 3 scrollback wipe from the program must drop the pane's images"
+        );
+    }
+
+    /// A wipe with EMPTY scrollback (picture captured on the first screen,
+    /// nothing scrolled into history yet) must drop the image too: the
+    /// history-shrink heuristic saw 0 → 0 and kept the stale overlay.
+    #[test]
+    fn a_zero_history_screen_wipe_drops_captured_images() {
+        use base64::Engine;
+        let mut png_buf = Vec::new();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_buf),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+        let tmp = tempfile::tempdir().unwrap();
+        let script = format!(
+            "printf '\\033]1337;File=inline=1:{b64}\\007\\n'; read x; printf '\\033[2J\\033[3J\\033[H'; printf 'wiped\\n'; sleep 30"
+        );
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script], tmp.path()).unwrap();
+        let mut waited = 0u32;
+        while term.pane_images().is_empty() {
+            assert!(waited < 8000, "inline image never captured");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        term.write_input(b"\n");
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.starts_with("wiped")));
+        assert!(
+            term.pane_images().is_empty(),
+            "a screen wipe with empty history must still drop the pane's images"
+        );
+    }
+
+    /// `clear && vim`: the wipe and the alt-screen entry land in ONE PTY
+    /// chunk. Judging the wipe by the chunk's FINAL mode attributed it to
+    /// the alt screen and kept the invalidated primary images, which then
+    /// reappeared over unrelated content when the app exited.
+    #[test]
+    fn a_wipe_followed_by_alt_entry_in_one_chunk_still_drops_images() {
+        use base64::Engine;
+        let mut png_buf = Vec::new();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 0, 255]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_buf),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+        let tmp = tempfile::tempdir().unwrap();
+        // The wipe and the alt ENTRY share one write (one PTY chunk, the
+        // pane still in the alt screen when it ends); the exit comes later.
+        let script = format!(
+            "printf '\\033]1337;File=inline=1:{b64}\\007\\n'; read x; printf '\\033[2J\\033[3J\\033[?1049halt-owns-this'; sleep 1; printf '\\033[?1049l'; printf 'back\\n'; sleep 30"
+        );
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script], tmp.path()).unwrap();
+        let mut waited = 0u32;
+        while term.pane_images().is_empty() {
+            assert!(waited < 8000, "inline image never captured");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        term.write_input(b"\n");
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.starts_with("back")));
+        assert!(
+            term.pane_images().is_empty(),
+            "the wipe preceded the alt entry, so the primary images are gone"
+        );
+    }
+
+    /// The pane's Clear wipes screen AND scrollback: the content an inline
+    /// image anchored to is gone, so the picture must go with it instead of
+    /// floating over the fresh prompt at a now-meaningless row.
+    #[test]
+    fn clearing_the_terminal_drops_its_captured_images() {
+        let (_tmp, mut t) = quiet_pty();
+        feed_pty(&t, b"\r\nsome output");
+        t.push_image_for_test(vec![1, 2, 3]);
+        feed_pty(&t, b"\r\n");
+        assert_eq!(t.pane_images().len(), 1);
+        t.clear_screen_and_scrollback();
+        assert!(
+            t.pane_images().is_empty(),
+            "a cleared pane keeps no image anchored to erased content"
         );
     }
 

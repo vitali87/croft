@@ -20322,10 +20322,7 @@ impl App {
                 KeyCode::PageUp => self.terminal_mut().scroll_up(page),
                 KeyCode::PageDown => self.terminal_mut().scroll_down(page),
                 KeyCode::Home => self.terminal_mut().scroll_to_top(),
-                _ => {
-                    self.terminal_mut().reset_scrollback();
-                    true
-                }
+                _ => self.terminal_mut().reset_scrollback(),
             };
             if scrolled {
                 return;
@@ -28509,11 +28506,41 @@ impl App {
             seq: img.seq,
             pane: idx,
         };
+        // An open right-click menu over the picture wins on the protocols
+        // whose post-frame blit would erase the overlapped menu rows
+        // (iTerm2/Sixel; Kitty solves this with the below-text z instead).
+        // The editor preview applies the same rule.
+        if self.context_menu_covers_rect(Rect {
+            x: desired.cell_x,
+            y: desired.cell_y,
+            width: desired.cell_w,
+            height: desired.cell_h,
+        }) {
+            self.overlays.terminal_image.request_clear_if_displayed();
+            self.overlays.terminal_image.invalidate_layout();
+            return;
+        }
         // Hot path: unchanged layout means nothing to rebake and no latch.
         if self.overlays.terminal_image.layout_matches(&desired) {
             return;
         }
+        // A pure anchor move (output scrolled, viewport scrolled) keeps the
+        // baked payload: same picture, same cell size, same protocol — only
+        // the placement row changed. Re-running the decode + resize +
+        // encode of a full-resolution photo per scrolled row stalled the
+        // render thread for the whole pane height.
+        let reusable = self.overlays.terminal_image.has_image()
+            && self.overlays.terminal_image.layout().is_some_and(|l| {
+                l.seq == desired.seq
+                    && l.pane == desired.pane
+                    && l.cell_w == desired.cell_w
+                    && l.cell_h == desired.cell_h
+            });
         self.overlays.terminal_image.request_clear_if_displayed();
+        if reusable {
+            self.overlays.terminal_image.set_layout(desired);
+            return;
+        }
         let bg = self.theme_bg_pixel();
         let baked = crate::iterm2_inline::fit_image_auto(
             &img.data,
@@ -28522,13 +28549,18 @@ impl App {
             bg,
         );
         if let Ok(baked) = baked
-            && let Some(raw) = crate::iterm2_inline::build_inline_image(
+            && let Some(raw) = crate::iterm2_inline::build_inline_image_z(
                 self.inline_protocol,
                 &baked,
                 cell_w,
                 cell_h,
                 true,
                 crate::iterm2_inline::KITTY_ID_TERMINAL,
+                // Below text and non-default background cells: the pane's
+                // default-bg cells are Color::Reset so the picture shows,
+                // while an opaque popup (the right-click menu) paints fully
+                // on top. Same placement the editor preview uses.
+                crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             )
         {
             let osc = crate::iterm2_inline::maybe_tmux_wrap(

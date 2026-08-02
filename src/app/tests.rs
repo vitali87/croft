@@ -22960,6 +22960,119 @@ fn copy_mode_e_skips_blank_rows_to_the_next_word_end() {
     assert_eq!(st.col, 3, "and lands on the end of 'next'");
 }
 
+/// A 100x1 blue PNG: one cell tall at any pane geometry, so a scrolled
+/// anchor changes only the placement row, never the baked cell size.
+fn wide_short_png() -> Vec<u8> {
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(100, 1, image::Rgba([0, 0, 255, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode test png");
+    png
+}
+
+/// Stage an app with an inline image captured at the pane's bottom row and
+/// the overlay freshly baked, on the given protocol.
+fn app_with_baked_terminal_image(
+    protocol: crate::iterm2_inline::InlineImageProtocol,
+) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.inline_protocol = protocol;
+    app.cell_pixel = Some((8, 16));
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let h = app.terminals[0].last_inner.height as usize;
+    app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
+    app.terminals[0].push_image_for_test(wide_short_png());
+    app.update_terminal_image_overlay();
+    assert!(
+        app.overlays.terminal_image.has_image(),
+        "staging: the picture must have baked"
+    );
+    (tmp, app)
+}
+
+/// Output scrolling under an on-screen inline image moves only the
+/// placement row; re-running the full decode + Lanczos resize + PNG encode
+/// per scrolled row froze the render thread for the whole pane height on
+/// any real photo.
+#[test]
+fn a_scrolled_inline_image_reuses_its_baked_payload() {
+    let (_tmp, mut app) =
+        app_with_baked_terminal_image(crate::iterm2_inline::InlineImageProtocol::Kitty);
+    let y0 = app.overlays.terminal_image.layout().unwrap().cell_y;
+    let bakes = crate::iterm2_inline::FIT_IMAGE_BAKES.with(|c| c.get());
+    app.terminals[0].feed_bytes_for_test(b"\r\n\r\n");
+    app.update_terminal_image_overlay();
+    let l = app.overlays.terminal_image.layout().unwrap();
+    assert_eq!(l.cell_y, y0 - 2, "the placement follows the anchor");
+    assert_eq!(
+        crate::iterm2_inline::FIT_IMAGE_BAKES.with(|c| c.get()),
+        bakes,
+        "a pure row move must not re-decode the image"
+    );
+}
+
+/// On iTerm2/Sixel the image blit happens after ratatui draws the frame:
+/// with the pane's right-click menu open over the picture, the blit erased
+/// the overlapped menu rows. The editor preview already suppresses its
+/// image under an open context menu; the terminal overlay must too.
+#[test]
+fn the_terminal_image_yields_to_an_open_context_menu() {
+    let (_tmp, mut app) =
+        app_with_baked_terminal_image(crate::iterm2_inline::InlineImageProtocol::ITerm2);
+    assert!(app.terminal_image_payload().is_some());
+    let l = app.overlays.terminal_image.layout().unwrap().clone();
+    // The pane's right-click menu, opened on the picture itself.
+    app.context_menu = Some(ContextMenu {
+        origin: (l.cell_x, l.cell_y),
+        items: vec![
+            MenuEntry::Item {
+                label: String::from("Rename Terminal"),
+                action: MenuAction::RenameTerminal(0),
+            },
+            MenuEntry::Item {
+                label: String::from("Clear"),
+                action: MenuAction::ClearTerminal(0),
+            },
+        ],
+        selected: 0,
+        open_submenu: None,
+        submenu_selected: 0,
+        target_dir: PathBuf::new(),
+    });
+    app.update_terminal_image_overlay();
+    assert!(
+        app.terminal_image_payload().is_none(),
+        "the menu must win over the picture while it is open"
+    );
+}
+
+/// In the alternate screen there is no scrollback, so Shift+End must fall
+/// through to the program like its comment promises and like Shift+Home /
+/// Shift+PageUp/PageDown already do; it used to be swallowed because the
+/// bottom-reset arm had no alt-screen guard.
+#[test]
+fn shift_end_reaches_an_alt_screen_program() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1049h");
+    app.handle_terminal_key(key(KeyCode::End, KeyModifiers::SHIFT));
+    let expected = key_to_bytes(
+        key(KeyCode::End, KeyModifiers::SHIFT),
+        app.terminals[0].app_cursor_keys(),
+    );
+    assert!(!expected.is_empty());
+    let written = app.terminals[0].written_bytes_for_test();
+    assert!(
+        written.ends_with(&expected),
+        "Shift+End must be encoded to the program in the alt screen, wrote {written:?}"
+    );
+}
+
 /// Copy mode is bound to the pane it opened on: a gesture that activates a
 /// sibling pane closes the mode (tmux-style) instead of folding the other
 /// pane's independent scroll clock into the stored coordinates and
