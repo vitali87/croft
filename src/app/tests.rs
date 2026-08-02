@@ -22888,9 +22888,13 @@ fn copy_mode_e_wraps_to_the_next_rows_word_end() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Terminal);
-    app.terminals[0].feed_bytes_for_test(b"alpha beta\r\nnext word");
+    // A fresh row first: whatever the spawned shell printed (a prompt, a
+    // banner — it varies by environment) must not shift the fed text, and
+    // the navigation below is cursor-relative rather than jumping to the
+    // scrollback top, so the test is hermetic against prior output.
+    app.terminals[0].feed_bytes_for_test(b"\r\nalpha beta\r\nnext word");
     app.open_terminal_copy_mode();
-    app.handle_terminal_copy_mode_key(key(KeyCode::Char('g'), KeyModifiers::NONE));
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('k'), KeyModifiers::NONE));
     app.handle_terminal_copy_mode_key(key(KeyCode::Char('0'), KeyModifiers::NONE));
     app.handle_terminal_copy_mode_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
     let st = app.terminal_copy_mode.as_ref().unwrap();
