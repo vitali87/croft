@@ -62,22 +62,22 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A snippet session survives deleting rows without crashing: backspacing a placeholder's line away and Tabbing on used to plant the caret's selection past the end of the buffer, and the next keystroke brought the whole app down.",
+        summary: "Closing a terminal pane can no longer freeze croft on Linux: with a background job still holding the pty, the reader thread never saw EOF and the whole UI hung on the join; a shutdown pipe now wakes it instantly. The shell is also reaped on every path, so a HUP-trapping shell no longer leaves a zombie process per closed pane.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A failed Reload from disk (the file vanished after the conflict popup opened) keeps the buffer marked unsaved and says so in the status bar, instead of silently flagging unsaved edits clean where the next sync sweep could discard them.",
+        summary: "Clicking a Local snapshot in the TIMELINE no longer destroys unsaved edits: a dirty tab is left intact and the snapshot diff opens beside it instead of replacing the buffer wholesale.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Deleting a user keybinding now releases its Cmd chord in iTerm2 on the next setup run: the installed forwarder used to stay behind forever, typing escape codes into every iTerm2 session. A forwarder you have since rewired in iTerm2 prefs is yours and is left alone.",
+        summary: "Local history survives auto save: saves within 10 seconds merge into the newest snapshot (VS Code's mergeWindow) instead of churning the whole 50-entry store out in a minute of typing, snapshots store raw bytes so non-UTF-8 files get history too, recording runs off the render thread, the store key no longer depends on the Rust toolchain (existing stores migrate), and files outside the workspace root now list their snapshots instead of loading forever.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The mouse wheel works on a terminal pane's border row while a full-screen app tracks the mouse: the notch used to vanish there instead of scrolling.",
+        summary: "Restore Snapshot is honest again: a failed snapshot click disarms it (it used to silently write an older file's snapshot over a file not even on screen), and the restored file's tab shows the restored text instead of keeping the stale diff view.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Problems file headers count only the diagnostics the active severity filter shows, not the file's full total.",
+        summary: "Inline blame never paints another file's authors: switching files with the same line count used to wear the previous file's blame until the new fetch landed.",
     },
 ];

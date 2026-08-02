@@ -2005,6 +2005,11 @@ impl Editor {
         if !self.blame_enabled {
             return None;
         }
+        // A reused tab (the preview) switches path before the new fetch
+        // lands; the old file's blame must not paint on the new one.
+        if self.blame_for != self.path {
+            return None;
+        }
         let blame = self.blame_lines.as_ref()?;
         // A line the git gutter flags as added/modified diverges from HEAD, so
         // its committed author is meaningless — show the uncommitted marker
@@ -2642,6 +2647,9 @@ impl Editor {
         self.image = None;
         self.sheet = None;
         self.markdown_preview = None;
+        // A real file supersedes any diff view this editor was showing —
+        // without this a restore-then-reload keeps rendering the stale diff.
+        self.diff = None;
         self.status = format!("Opened {}", path.display());
         // The buffer now matches disk; bump the edit seq so the LSP doc sync
         // sees the new content (an external reload lands here too, and without
@@ -8840,8 +8848,11 @@ impl EditorTabs {
         }
         // If a tab is already showing this path (as a plain file or a
         // diff), reuse it so we don't pile up duplicate tabs as the
-        // user clicks through the change list.
-        if let Some(idx) = self.find_tab_with_path(right) {
+        // user clicks through the change list — unless it holds unsaved
+        // edits, which replacing wholesale would silently destroy.
+        if let Some(idx) = self.find_tab_with_path(right)
+            && !self.editors[idx].dirty
+        {
             self.editors[idx] = e;
             self.select(idx);
             return Ok(());
@@ -8871,7 +8882,11 @@ impl EditorTabs {
             self.editors[self.active] = e;
             return Ok(());
         }
-        if let Some(idx) = self.find_tab_with_path(path) {
+        // Same dirty guard as `open_head_diff_with_text`: a deleted-on-disk
+        // file can still hold unsaved edits in its tab.
+        if let Some(idx) = self.find_tab_with_path(path)
+            && !self.editors[idx].dirty
+        {
             self.editors[idx] = e;
             self.select(idx);
             return Ok(());
@@ -9440,6 +9455,7 @@ mod tests {
     #[test]
     fn current_line_blame_annotation_reads_author_age_and_summary() {
         let mut e = editor_with("one\ntwo\n");
+        e.path = Some(PathBuf::from("f.rs"));
         e.set_blame(
             PathBuf::from("f.rs"),
             Some(vec![
@@ -9462,6 +9478,7 @@ mod tests {
     #[test]
     fn current_line_blame_annotation_marks_uncommitted_lines() {
         let mut e = editor_with("edited\n");
+        e.path = Some(PathBuf::from("f.rs"));
         e.set_blame(
             PathBuf::from("f.rs"),
             Some(vec![blame_line("Not Committed Yet", "x", 0, true)]),
@@ -9476,6 +9493,7 @@ mod tests {
     #[test]
     fn current_line_blame_annotation_is_none_when_disabled_or_unavailable() {
         let mut e = editor_with("one\n");
+        e.path = Some(PathBuf::from("f.rs"));
         // No blame fetched yet.
         assert!(e.current_line_blame_annotation().is_none());
         e.set_blame(
@@ -9491,6 +9509,72 @@ mod tests {
         e.blame_enabled = true;
         e.cursor_row = 9;
         assert!(e.current_line_blame_annotation().is_none());
+    }
+
+    /// A blame reply fetched for one file must never paint on another: the
+    /// preview tab is reused across files, and the async refetch takes frames
+    /// to land, so a same-line-count neighbour would wear the old blame.
+    #[test]
+    fn blame_for_another_file_never_paints_on_this_one() {
+        let mut e = editor_with("one\ntwo\n");
+        e.path = Some(PathBuf::from("a.rs"));
+        e.set_blame(
+            PathBuf::from("a.rs"),
+            Some(vec![
+                blame_line("Alice", "s", 5, false),
+                blame_line("Alice", "s", 5, false),
+            ]),
+        );
+        e.path = Some(PathBuf::from("b.rs"));
+        assert!(
+            e.current_line_blame_annotation().is_none(),
+            "a.rs blame painted on b.rs while its own fetch was still in flight"
+        );
+    }
+
+    /// Opening a real file into an editor showing a diff must drop the diff
+    /// view, or a restore-then-reload keeps rendering the stale side-by-side.
+    #[test]
+    fn opening_a_real_file_clears_a_stale_diff_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.txt");
+        std::fs::write(&path, "disk\n").unwrap();
+        let mut e = Editor::new();
+        e.diff = Some(crate::widgets::diff::DiffData::build_unified_deletion(
+            path.clone(),
+            "old\n",
+        ));
+        e.open(&path).unwrap();
+        assert!(
+            e.diff.is_none(),
+            "the stale diff kept rendering over the freshly opened file"
+        );
+    }
+
+    /// Deduping a snapshot/HEAD diff onto an existing tab must not destroy a
+    /// dirty buffer: the TIMELINE always targets the file being edited, so
+    /// replacing the tab wholesale silently discards unsaved edits.
+    #[test]
+    fn a_head_diff_never_replaces_a_dirty_tab_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.txt");
+        std::fs::write(&path, "disk\n").unwrap();
+        let mut tabs = EditorTabs::new();
+        tabs.open(&path).unwrap();
+        tabs.lines[0].push('x');
+        tabs.dirty = true;
+        tabs.open_head_diff_with_text(PathBuf::from("a.txt (local snapshot)"), "old\n", &path)
+            .unwrap();
+        assert!(
+            tabs.editors
+                .iter()
+                .any(|e| e.dirty && e.diff.is_none() && e.lines[0] == "diskx"),
+            "the dirty buffer was destroyed by the snapshot diff"
+        );
+        assert!(
+            tabs.editors.iter().any(|e| e.diff.is_some()),
+            "staging: the diff itself still opened in some tab"
+        );
     }
 
     #[test]

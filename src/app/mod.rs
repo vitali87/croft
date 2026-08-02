@@ -2043,7 +2043,11 @@ pub struct App {
     /// The snapshot currently shown in a local-history diff, `(live file,
     /// snapshot contents)`, so "Local History: Restore Snapshot" can write it
     /// back. Cleared when a non-snapshot diff opens.
-    history_restore: Option<(PathBuf, String)>,
+    history_restore: Option<(PathBuf, Vec<u8>)>,
+    /// Completed off-thread history recordings, drained to refresh the
+    /// TIMELINE once the snapshot actually exists on disk.
+    history_done_rx: std::sync::mpsc::Receiver<PathBuf>,
+    history_done_tx: std::sync::mpsc::Sender<PathBuf>,
     /// Background per-ecosystem dependency-resolution result for DEPENDENCIES.
     deps_rx: std::sync::mpsc::Receiver<Vec<Dependency>>,
     deps_tx: std::sync::mpsc::Sender<Vec<Dependency>>,
@@ -3355,6 +3359,7 @@ impl App {
         let explorer_views = ExplorerViewVisibility::from_prefs(loaded_prefs.explorer_views);
         let disabled_extensions = loaded_prefs.disabled_extensions.clone();
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
+        let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
         let (graph_tx, graph_rx) = std::sync::mpsc::channel();
         let (blame_tx, blame_rx) = std::sync::mpsc::channel();
         let (deps_tx, deps_rx) = std::sync::mpsc::channel();
@@ -3436,6 +3441,8 @@ impl App {
             explorer_views,
             timeline_rx,
             timeline_tx,
+            history_done_rx,
+            history_done_tx,
             timeline_fetched: None,
             blame_rx,
             blame_tx,
@@ -6642,22 +6649,28 @@ impl App {
                         self.timeline_fetched = Some(path.clone());
                         self.timeline.begin_loading(path.clone());
                         changed = true;
-                        if let Ok(rel) = path.strip_prefix(&self.tree.root) {
-                            let root = self.tree.root.clone();
-                            let rel = rel.to_string_lossy().into_owned();
-                            let tx = self.timeline_tx.clone();
-                            let history_root = self.history_root.clone();
-                            let abs = path.clone();
-                            let now = now_millis();
-                            std::thread::spawn(move || {
-                                // Merge git commits with local snapshots so the
-                                // TIMELINE shows both sources, like VS Code.
-                                let commits = crate::git::file_history(&root, &rel, 50);
-                                let snaps = crate::history::entries_in(&history_root, &abs);
-                                let entries = crate::history::merged_timeline(commits, &snaps, now);
-                                let _ = tx.send((path, entries));
-                            });
-                        }
+                        let rel = path
+                            .strip_prefix(&self.tree.root)
+                            .ok()
+                            .map(|r| r.to_string_lossy().into_owned());
+                        let root = self.tree.root.clone();
+                        let tx = self.timeline_tx.clone();
+                        let history_root = self.history_root.clone();
+                        let abs = path.clone();
+                        let now = now_millis();
+                        std::thread::spawn(move || {
+                            // Merge git commits with local snapshots so the
+                            // TIMELINE shows both sources, like VS Code. Git
+                            // history only exists inside the workspace, but
+                            // snapshots are path-keyed and repo-free, so a
+                            // file outside the root still lists its versions.
+                            let commits = rel
+                                .map(|rel| crate::git::file_history(&root, &rel, 50))
+                                .unwrap_or_default();
+                            let snaps = crate::history::entries_in(&history_root, &abs);
+                            let entries = crate::history::merged_timeline(commits, &snaps, now);
+                            let _ = tx.send((path, entries));
+                        });
                     }
                 }
                 None => {
@@ -6667,6 +6680,15 @@ impl App {
                         changed = true;
                     }
                 }
+            }
+        }
+        // A history snapshot finished writing: refetch the TIMELINE so the
+        // new version shows (resetting the marker before the write landed
+        // would list the store without it).
+        while let Ok(path) = self.history_done_rx.try_recv() {
+            if self.editor.path.as_deref() == Some(path.as_path()) {
+                self.timeline_fetched = None;
+                changed = true;
             }
         }
         // Drain any TIMELINE replies; ignore one for a since-closed file.
@@ -6741,6 +6763,9 @@ impl App {
     /// Open the diff a TIMELINE commit introduced for `path` (`git show <hash>
     /// -- <path>`) in a read-only side-by-side editor tab.
     fn open_timeline_diff(&mut self, path: PathBuf, hash: String) {
+        // Disarm first: every early exit below must leave "Restore Snapshot"
+        // pointing at nothing, never at whatever snapshot was viewed before.
+        self.history_restore = None;
         let rel = match path.strip_prefix(&self.tree.root) {
             Ok(r) => r.to_string_lossy().into_owned(),
             Err(_) => path.display().to_string(),
@@ -6754,12 +6779,18 @@ impl App {
                 self.status = String::from("Snapshot no longer available");
                 return;
             };
-            let Ok(content) = std::fs::read_to_string(&snap_file) else {
+            let Ok(content) = std::fs::read(&snap_file) else {
                 self.status = String::from("Could not read snapshot");
                 return;
             };
+            // Snapshots hold the file's raw bytes; decode like `Editor::open`
+            // so a UTF-16 file's history diffs as text, not mojibake.
+            let enc = encoding_rs::Encoding::for_bom(&content)
+                .map(|(e, _)| e)
+                .unwrap_or(encoding_rs::UTF_8);
+            let text = enc.decode(&content).0.into_owned();
             let label = std::path::PathBuf::from(format!("{rel} (local snapshot)"));
-            if let Err(e) = self.editor.open_head_diff_with_text(label, &content, &path) {
+            if let Err(e) = self.editor.open_head_diff_with_text(label, &text, &path) {
                 self.status = format!("Could not open snapshot diff: {e}");
                 return;
             }
@@ -6769,7 +6800,6 @@ impl App {
             return;
         }
         // A git commit row: no snapshot to restore.
-        self.history_restore = None;
         match crate::git::show_commit_file_diff(&self.tree.root, &hash, &rel) {
             Ok(raw) => {
                 let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
@@ -27357,17 +27387,22 @@ impl App {
     }
 
     /// Record a local-history snapshot of a file that just hit the disk, and
-    /// refresh the TIMELINE when it's the active file so the new version shows
-    /// immediately. Reads back what was written so the snapshot matches the
-    /// on-disk bytes exactly (encoding / EOL included).
+    /// refresh the TIMELINE when it's the active file so the new version shows.
+    /// Reads back what was written so the snapshot matches the on-disk bytes
+    /// exactly (encoding / EOL included). The IO runs off-thread — with auto
+    /// save this fires every second, and a large file's read+write on the
+    /// render thread is a visible stall.
     fn record_history_snapshot(&mut self, path: &Path) {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let _ = crate::history::record_in(&self.history_root, path, &content, now_millis());
-        if self.editor.path.as_deref() == Some(path) {
-            self.timeline_fetched = None;
-        }
+        let root = self.history_root.clone();
+        let path = path.to_path_buf();
+        let tx = self.history_done_tx.clone();
+        let millis = now_millis();
+        std::thread::spawn(move || {
+            if let Ok(bytes) = std::fs::read(&path) {
+                let _ = crate::history::record_in(&root, &path, &bytes, millis);
+            }
+            let _ = tx.send(path);
+        });
     }
 
     fn write_current_to_disk(&mut self) {
