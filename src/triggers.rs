@@ -18,9 +18,11 @@
 //! is idle and persist into scrollback for free; notify / bell triggers are
 //! matched once per completed output line by a byte-stream scanner in the
 //! PTY reader thread, with escape sequences stripped, a `\r` treated as a
-//! line rewrite (progress bars never spam), a hard per-line cap, and the
-//! whole scan skipped while the pane is in the alternate screen (a
-//! full-screen app owns the bytes; iTerm2 skips those too).
+//! line rewrite (progress bars never spam), a hard per-line cap, and
+//! alternate-screen content excluded POSITIONALLY (the scanner tracks
+//! DECSET/DECRST 47/1047/1049 and RIS through the stream itself, so a
+//! full-screen app's bytes never fire while primary text sharing a chunk
+//! with a transition still does; iTerm2 skips alt output too).
 
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -332,6 +334,16 @@ impl TriggerScanner {
                         }
                         self.csi.clear();
                         self.state = ScanState::Ground;
+                    } else if b == 0x18 || b == 0x1a {
+                        // CAN/SUB cancel the sequence (VT100).
+                        self.csi.clear();
+                        self.state = ScanState::Ground;
+                    } else if b == 0x1b {
+                        // ESC inside an incomplete CSI begins a NEW escape;
+                        // retaining it as a parameter would let a malformed
+                        // CSI swallow the following alt-screen entry.
+                        self.csi.clear();
+                        self.state = ScanState::Esc;
                     } else if self.csi.len() < CSI_CAP {
                         self.csi.push(b);
                     }
@@ -519,6 +531,32 @@ mod tests {
         // And RIS resets to the primary screen.
         sc.scan(b"\x1b[?1049h\x1bcBUILD FAILED\n", &s, &mut out);
         assert_eq!(out.len(), 1, "RIS must exit the alt screen: {out:?}");
+    }
+
+    /// CAN/SUB cancel an incomplete CSI and an ESC inside one starts a new
+    /// escape (VT100 semantics): retaining them as CSI parameters made the
+    /// malformed CSI swallow the following `ESC [?1049h`, so alt-screen
+    /// entry went unseen and full-screen content fired triggers.
+    #[test]
+    fn a_cancelled_csi_does_not_swallow_the_alt_screen_entry() {
+        let s = set(r##"[ { "regex": "SECRET", "action": "notify" } ]"##);
+        let mut sc = TriggerScanner::new();
+        let mut out = Vec::new();
+        // CAN aborts the dangling CSI; the alt entry after it must count.
+        sc.scan(b"\x1b[\x18\x1b[?1049hSECRET\n\x1b[?1049l", &s, &mut out);
+        assert!(
+            out.is_empty(),
+            "CAN-cancelled CSI ate the alt entry: {out:?}"
+        );
+        // SUB likewise.
+        sc.scan(b"\x1b[12\x1a\x1b[?1049hSECRET\n\x1b[?1049l", &s, &mut out);
+        assert!(
+            out.is_empty(),
+            "SUB-cancelled CSI ate the alt entry: {out:?}"
+        );
+        // An ESC inside an incomplete CSI begins a NEW escape sequence.
+        sc.scan(b"\x1b[12\x1b[?1049hSECRET\n\x1b[?1049l", &s, &mut out);
+        assert!(out.is_empty(), "ESC-in-CSI ate the alt entry: {out:?}");
     }
 
     #[test]

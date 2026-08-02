@@ -350,7 +350,10 @@ impl WipeSniffer {
                 }
                 b'[' => {
                     let mut j = i + 2;
-                    while j < data.len() && !(0x40..=0x7e).contains(&data[j]) {
+                    while j < data.len()
+                        && !(0x40..=0x7e).contains(&data[j])
+                        && !matches!(data[j], 0x18 | 0x1a | 0x1b)
+                    {
                         j += 1;
                     }
                     if j >= data.len() {
@@ -358,6 +361,14 @@ impl WipeSniffer {
                             self.carry = data.split_off(i);
                         }
                         return (screen, hist);
+                    }
+                    // CAN/SUB cancel the sequence and an ESC inside an
+                    // incomplete CSI begins a NEW escape (VT100) — none may
+                    // be swallowed as a parameter, or whatever follows a
+                    // cancelled CSI goes unseen.
+                    if matches!(data[j], 0x18 | 0x1a | 0x1b) {
+                        i = if data[j] == 0x1b { j } else { j + 1 };
+                        continue;
                     }
                     let params = &data[i + 2..j];
                     match data[j] {
@@ -6191,6 +6202,23 @@ mod tests {
             term.pane_images().is_empty(),
             "a screen wipe with empty history must still drop the pane's images"
         );
+    }
+
+    /// CAN/SUB cancel an incomplete CSI and an ESC inside one begins a new
+    /// escape (VT100): the wipe sniffer's CSI walk must not swallow the
+    /// sequence that follows a cancelled CSI, or a wipe (or alt entry)
+    /// right after one goes unseen.
+    #[test]
+    fn a_cancelled_csi_does_not_hide_a_wipe_from_the_sniffer() {
+        let mut w = WipeSniffer::default();
+        // ESC inside an incomplete CSI: the ED 3 after it must be seen.
+        let (_s, h) = w.scan(b"\x1b[12\x1b[3J", false);
+        assert!(h, "ESC-in-CSI swallowed the scrollback wipe");
+        // CAN aborts; the alt entry after it must be seen, so the ED 2
+        // inside the alt screen is correctly ignored.
+        let mut w = WipeSniffer::default();
+        let (s, _h) = w.scan(b"\x1b[\x18\x1b[?1049h\x1b[2J", false);
+        assert!(!s, "CAN-cancelled CSI hid the alt entry from the sniffer");
     }
 
     /// `clear && vim`: the wipe and the alt-screen entry land in ONE PTY
