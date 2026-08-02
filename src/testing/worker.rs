@@ -686,20 +686,29 @@ pub(crate) fn cargo_progress(line: &str) -> Option<String> {
 
 fn run_all(root: &Path, tx: &EpochTx) {
     tx.send(TestResponse::Started(Activity::Running));
-    let ok = match runner_for(root) {
-        Some(Runner::Pytest) => {
+    // `None` (no enabled runner claims the root) must never fall through to
+    // cargo: the app's entry points refuse first, and this second gate keeps
+    // a disabled runner from shelling anything even if a new call site
+    // forgets the check. Exhaustive matches below, no `_` arm, so a future
+    // Runner variant is a compile error here instead of silently cargo.
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Finished { ok: None });
+        return;
+    };
+    let ok = match runner {
+        Runner::Pytest => {
             let cmd = pytest_cmd(root, &["-v", "--color=no"]);
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Some(Runner::Vitest) => {
+        Runner::Vitest => {
             let cmd = js_cmd(root, "vitest", &["run", "--reporter=tap-flat"]);
             run_streaming(tx, cmd, one(parse_vitest_tap_line))
         }
-        Some(Runner::Jest) => {
+        Runner::Jest => {
             let cmd = js_cmd(root, "jest", &["--json"]);
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
-        _ => {
+        Runner::Cargo => {
             let cmd = cargo_cmd(root, &["test", "--no-fail-fast", "--color=never"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
@@ -714,20 +723,25 @@ fn run_all(root: &Path, tx: &EpochTx) {
 /// app marks just this case Running and keeps the rest of the tree, so a
 /// single-test run doesn't wipe the discovered list.
 fn run_one(root: &Path, tx: &EpochTx, name: &str) {
-    let ok = match runner_for(root) {
-        Some(Runner::Pytest) => {
+    // See run_all: `None` refuses instead of falling through to cargo.
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Finished { ok: None });
+        return;
+    };
+    let ok = match runner {
+        Runner::Pytest => {
             let cmd = pytest_cmd(root, &["-v", "--color=no", name]);
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Some(Runner::Vitest) => {
+        Runner::Vitest => {
             let cmd = js_cmd(root, "vitest", &vitest_one_args(name));
             run_streaming(tx, cmd, one(parse_vitest_tap_line))
         }
-        Some(Runner::Jest) => {
+        Runner::Jest => {
             let cmd = js_cmd(root, "jest", &jest_one_args(name));
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
-        _ => {
+        Runner::Cargo => {
             let cmd = cargo_cmd(root, &["test", name, "--color=never", "--", "--exact"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
@@ -744,8 +758,13 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
 /// [`run_one`], the app has already marked the affected cases and shown the
 /// busy state, so no `Started` is sent.
 fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
-    let ok = match runner_for(root) {
-        Some(Runner::Pytest) => {
+    // See run_all: `None` refuses instead of falling through to cargo.
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Finished { ok: None });
+        return;
+    };
+    let ok = match runner {
+        Runner::Pytest => {
             let cmd = if pattern.contains(".py") {
                 pytest_cmd(root, &["-v", "--color=no", pattern])
             } else {
@@ -753,15 +772,15 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str) {
             };
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Some(Runner::Vitest) => {
+        Runner::Vitest => {
             let cmd = js_cmd(root, "vitest", &vitest_filter_args(pattern));
             run_streaming(tx, cmd, one(parse_vitest_tap_line))
         }
-        Some(Runner::Jest) => {
+        Runner::Jest => {
             let cmd = js_cmd(root, "jest", &jest_filter_args(pattern));
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
         }
-        _ => {
+        Runner::Cargo => {
             let cmd = cargo_cmd(root, &["test", pattern, "--no-fail-fast", "--color=never"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
@@ -779,8 +798,13 @@ fn discover(root: &Path, tx: &EpochTx) {
         name,
         status: TestStatus::NotRun,
     };
-    match runner_for(root) {
-        Some(Runner::Pytest) => {
+    // See run_all: `None` refuses instead of falling through to cargo.
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Finished { ok: None });
+        return;
+    };
+    match runner {
+        Runner::Pytest => {
             let cmd = pytest_cmd(root, &["--collect-only", "-q", "--color=no"]);
             run_streaming(tx, cmd, |line| {
                 parse_pytest_collect_line(line)
@@ -789,7 +813,7 @@ fn discover(root: &Path, tx: &EpochTx) {
                     .collect()
             });
         }
-        Some(Runner::Vitest) => {
+        Runner::Vitest => {
             let cmd = js_cmd(root, "vitest", &["list"]);
             run_streaming(tx, cmd, |line| {
                 parse_vitest_list_line(line)
@@ -800,7 +824,7 @@ fn discover(root: &Path, tx: &EpochTx) {
         }
         // jest can only cheaply list FILES (`--listTests`, absolute paths);
         // per-test names come from the first run's `--json` document.
-        Some(Runner::Jest) => {
+        Runner::Jest => {
             let cmd = js_cmd(root, "jest", &["--listTests"]);
             run_streaming(tx, cmd, |line| {
                 let rel = Path::new(line.trim())
@@ -812,7 +836,7 @@ fn discover(root: &Path, tx: &EpochTx) {
                 }
             });
         }
-        _ => {
+        Runner::Cargo => {
             let cmd = cargo_cmd(root, &["test", "--color=never", "--", "--list"]);
             run_streaming(tx, cmd, |line| {
                 parse_list_line(line).map(not_run).into_iter().collect()

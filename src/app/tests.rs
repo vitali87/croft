@@ -222,6 +222,13 @@ fn caret_move_clears_lsp_occurrence_tints_and_edits_already_did() {
 fn clicking_the_gutter_play_glyph_runs_that_test() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();
+    // A real Cargo marker: the run gestures refuse a workspace no enabled
+    // runner claims, and this test pins the click-to-run wiring, not that.
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let f = tmp.path().join("t.rs");
     std::fs::write(&f, "#[test]\nfn my_case() { assert!(true); }\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -22765,4 +22772,34 @@ fn clicking_a_folder_in_the_explorer_keeps_the_keyboard_in_the_tree() {
         matches!(app.focus, Pane::Tree),
         "expanding a folder is a tree gesture: the keyboard stays in the Explorer"
     );
+}
+
+/// With no enabled runner claiming the workspace (`runner_for` is `None` —
+/// no recognised project, or its runner extension disabled), every Testing
+/// run gesture must refuse with a status instead of shelling `cargo test`
+/// in a directory cargo knows nothing about. Only discovery was guarded;
+/// the four run entry points started a spurious run.
+#[test]
+fn a_workspace_with_no_test_runner_refuses_every_run_gesture() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "no project here\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    fn assert_refused(app: &mut App, label: &str) {
+        assert!(!app.testing.is_busy(), "{label} must not start");
+        assert!(
+            app.status.contains("No test runner"),
+            "{label} must say why it refused: {:?}",
+            app.status
+        );
+        app.status.clear();
+    }
+    app.run_all_tests();
+    assert_refused(&mut app, "run-all");
+    app.run_test(String::from("some::test"));
+    assert_refused(&mut app, "single run");
+    app.run_suite(String::from("suite"));
+    assert_refused(&mut app, "suite run");
+    app.run_named_test(String::from("named"));
+    assert_refused(&mut app, "named run");
 }

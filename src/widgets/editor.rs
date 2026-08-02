@@ -70,14 +70,34 @@ pub struct PdfState {
     pub links: Option<crate::pdf::PageLinks>,
 }
 
-fn render_image_placeholder(image: &ImageView, path: Option<&Path>, inner: Rect, buf: &mut Buffer) {
+/// The background the image/sheet/diff canvases fill with. On iTerm2,
+/// `Reset` inherits the session bg that `SetColors` re-tints per theme, so
+/// the canvas matches the surrounding panes for free. Every other host
+/// (Ghostty, Kitty, sixel) ignores `SetColors`, so `Reset` falls through to
+/// the terminal's own background — and the frame prefill cannot save it,
+/// because these fills override the prefill (ratatui applies any `Some`
+/// bg, and `Some(Reset)` is `Some`). Those hosts paint the theme bg
+/// explicitly instead, or a CSV/PDF/diff tab sits as a host-black island
+/// inside an otherwise themed frame.
+fn canvas_bg(host_is_iterm2: bool, theme: crate::theme::Theme) -> Color {
+    if host_is_iterm2 {
+        Color::Reset
+    } else {
+        theme.editor_bg()
+    }
+}
+
+fn render_image_placeholder(
+    image: &ImageView,
+    path: Option<&Path>,
+    inner: Rect,
+    buf: &mut Buffer,
+    bg: Color,
+) {
     // Solid bg fill so the OSC-1337 inline image (emitted post-frame on
     // capable terminals) sits on a clean canvas; on non-capable terminals
     // the metadata header below is the only content the user sees.
-    // Inherit the iTerm2 session bg (set per active theme via SetColors) so
-    // the canvas matches the surrounding panes on both the dark-blue and the
-    // pure-black theme without threading the palette through every widget.
-    let bg_style = Style::default().bg(Color::Reset);
+    let bg_style = Style::default().bg(bg);
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
             buf[(x, y)].set_style(bg_style);
@@ -127,13 +147,11 @@ fn render_sheet(
     path: Option<&Path>,
     inner: Rect,
     buf: &mut Buffer,
+    bg: Color,
 ) {
     // Bg fill so the spreadsheet sits on a clean canvas regardless of
-    // what the previous tab left behind.
-    // Inherit the iTerm2 session bg (set per active theme via SetColors) so
-    // the canvas matches the surrounding panes on both the dark-blue and the
-    // pure-black theme without threading the palette through every widget.
-    let bg_style = Style::default().bg(Color::Reset);
+    // what the previous tab left behind (see [`canvas_bg`]).
+    let bg_style = Style::default().bg(bg);
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
             buf[(x, y)].set_style(bg_style);
@@ -225,9 +243,9 @@ fn render_sheet(
 
     // Data rows.
     let row_end = (sheet.scroll_row + data_rows).min(row_count);
-    // Base rows inherit the themed session bg (see the canvas fill above);
-    // alternating rows keep an explicit lift for the zebra stripe.
-    let row_style = Style::default().fg(Color::White).bg(Color::Reset);
+    // Base rows wear the canvas bg (see [`canvas_bg`]); alternating rows
+    // keep an explicit lift for the zebra stripe.
+    let row_style = Style::default().fg(Color::White).bg(bg);
     let alt_row_style = Style::default()
         .fg(Color::White)
         .bg(Color::Rgb(0x24, 0x29, 0x37));
@@ -287,13 +305,11 @@ fn render_diff(
     diff: &mut crate::widgets::diff::DiffData,
     inner: Rect,
     buf: &mut Buffer,
+    bg: Color,
 ) -> (Rect, Rect) {
     use crate::widgets::diff::DiffRow;
-    // Background fill so the diff sits on a clean canvas.
-    // Inherit the iTerm2 session bg (set per active theme via SetColors) so
-    // the canvas matches the surrounding panes on both the dark-blue and the
-    // pure-black theme without threading the palette through every widget.
-    let bg_style = Style::default().bg(Color::Reset);
+    // Background fill so the diff sits on a clean canvas (see [`canvas_bg`]).
+    let bg_style = Style::default().bg(bg);
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
             buf[(x, y)].set_style(bg_style);
@@ -304,7 +320,7 @@ fn render_diff(
         return (Rect::default(), Rect::default());
     }
     if diff.unified {
-        return render_unified_deletion(diff, inner, buf);
+        return render_unified_deletion(diff, inner, buf, bg);
     }
     let left_name = diff
         .left_path
@@ -410,7 +426,7 @@ fn render_diff(
         let row = diff.rows[row_idx];
         let (l_cell_bg, l_sign, l_text) = match row {
             DiffRow::Equal { left, .. } => (
-                Color::Reset,
+                bg,
                 ' ',
                 diff.left_lines.get(left).cloned().unwrap_or_default(),
             ),
@@ -428,7 +444,7 @@ fn render_diff(
         };
         let (r_cell_bg, r_sign, r_text) = match row {
             DiffRow::Equal { right, .. } => (
-                Color::Reset,
+                bg,
                 ' ',
                 diff.right_lines.get(right).cloned().unwrap_or_default(),
             ),
@@ -828,6 +844,7 @@ fn render_unified_deletion(
     diff: &mut crate::widgets::diff::DiffData,
     inner: Rect,
     buf: &mut Buffer,
+    bg: Color,
 ) -> (Rect, Rect) {
     use crate::widgets::diff::DiffRow;
     let name = diff
@@ -878,8 +895,8 @@ fn render_unified_deletion(
             DiffRow::Removed { left } | DiffRow::Replaced { left, .. } => {
                 (Some(left), '-', removed_bg)
             }
-            DiffRow::Equal { left, .. } => (Some(left), ' ', Color::Reset),
-            DiffRow::Added { .. } => (None, ' ', Color::Reset),
+            DiffRow::Equal { left, .. } => (Some(left), ' ', bg),
+            DiffRow::Added { .. } => (None, ' ', bg),
         };
         let label = left_idx
             .map(|i| format!("{:>width$} ", i + 1, width = gutter as usize - 1))
@@ -2849,6 +2866,19 @@ impl Editor {
     /// this the open file keeps the old theme's code colors until the next edit.
     pub fn rehighlight_for_theme(&mut self) {
         self.recompute_highlights();
+        // The markdown preview bakes the theme into its lines at build time
+        // and rebuilds only when the buffer edits (`built_seq`), so a theme
+        // switch must rebuild it here or it keeps the old colors until the
+        // user touches the file. Requires `self.theme` to already carry the
+        // new theme (the caller assigns it first).
+        if self.markdown_preview.is_some() {
+            let text = self.lines.join("\n");
+            let lines = crate::markdown::render_markdown(&text, self.theme, &mut self.registry);
+            if let Some(md) = self.markdown_preview.as_mut() {
+                md.lines = lines;
+                md.built_seq = self.edit_seq;
+            }
+        }
     }
 
     fn recompute_highlights(&mut self) {
@@ -6715,12 +6745,16 @@ impl Widget for &mut Editor {
         if height == 0 {
             return;
         }
+        let cbg = canvas_bg(
+            crate::iterm2_inline::detect_iterm2_inline_support(),
+            self.theme,
+        );
         if let Some(image) = self.image.as_ref() {
-            render_image_placeholder(image, self.path.as_deref(), inner, buf);
+            render_image_placeholder(image, self.path.as_deref(), inner, buf, cbg);
             return;
         }
         if let Some(view) = self.sheet.as_ref() {
-            render_sheet(view, self.path.as_deref(), inner, buf);
+            render_sheet(view, self.path.as_deref(), inner, buf, cbg);
             return;
         }
         if self.markdown_preview.is_some() {
@@ -6728,7 +6762,7 @@ impl Widget for &mut Editor {
             return;
         }
         if let Some(diff) = self.diff.as_mut() {
-            let (prev_arrow, next_arrow) = render_diff(diff, inner, buf);
+            let (prev_arrow, next_arrow) = render_diff(diff, inner, buf, cbg);
             self.diff_prev_arrow = prev_arrow;
             self.diff_next_arrow = next_arrow;
             return;
@@ -14167,6 +14201,87 @@ mod tests {
         };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         (e as &mut Editor).render(area, &mut buf);
+    }
+
+    /// On hosts that ignore iTerm2's `SetColors` (Ghostty, Kitty, sixel) the
+    /// image/CSV/diff canvases must paint the theme background explicitly:
+    /// their `Reset` fill overrides the non-iTerm2 frame prefill (ratatui
+    /// applies any `Some` bg), so with the chrome themed they were the only
+    /// host-black islands left in the frame.
+    #[test]
+    fn non_iterm2_canvases_paint_the_theme_background_not_reset() {
+        let themed = crate::theme::Theme::from_id("solarized-dark");
+        assert_eq!(themed.id(), "solarized-dark", "bundled theme resolves");
+        assert_eq!(
+            canvas_bg(false, themed),
+            themed.editor_bg(),
+            "a non-iTerm2 host fills the canvas with the theme bg"
+        );
+        assert_eq!(
+            canvas_bg(true, themed),
+            Color::Reset,
+            "iTerm2 keeps Reset so the SetColors session bg shows through"
+        );
+        // And the fill actually lands on every cell of the canvas.
+        let mut e = editor_with("");
+        e.theme = themed;
+        e.image = Some(ImageView {
+            bytes: Vec::new(),
+            format_label: String::from("png"),
+            pixel_w: 4,
+            pixel_h: 4,
+            byte_size: 1,
+            generation: 0,
+            pdf: None,
+        });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_image_placeholder(
+            e.image.as_ref().unwrap(),
+            None,
+            area,
+            &mut buf,
+            canvas_bg(false, themed),
+        );
+        assert_eq!(
+            buf[(1, area.height - 1)].bg,
+            themed.editor_bg(),
+            "the canvas body must wear the theme bg, not the host default"
+        );
+    }
+
+    /// Cmd+K Cmd+T while a preview is open: the preview bakes its colors at
+    /// build time and was rebuilt only when the buffer edited, so it kept the
+    /// previous theme's colors (chrome and code alike) until the user touched
+    /// the file or toggled the preview off and on.
+    #[test]
+    fn a_theme_switch_rebuilds_an_open_markdown_preview() {
+        let mut e = md_editor("```notalanguage\nplain code line\n```");
+        assert!(e.toggle_markdown_preview());
+        let themed = *crate::theme::Theme::all()
+            .iter()
+            .find(|t| t.syntax().fg != crate::theme::SyntaxPalette::BASE16.fg)
+            .expect("a bundled theme with a non-Base16 code palette");
+        e.theme = themed;
+        e.rehighlight_for_theme();
+        let (r, g, b) = themed.syntax().fg;
+        let md = e.markdown_preview.as_ref().expect("preview stays open");
+        let code = md
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref() == "plain code line")
+            .expect("the code line must render");
+        assert_eq!(
+            code.style.fg,
+            Some(Color::Rgb(r, g, b)),
+            "the preview must recolor on a theme switch, not wait for an edit"
+        );
     }
 
     #[test]

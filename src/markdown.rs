@@ -45,8 +45,9 @@ fn lang_for_fence(info: &str) -> Option<LangKind> {
 }
 
 /// Convert one highlighted source line into owned spans, filling unstyled
-/// gaps with the plain code foreground.
-fn code_line_spans(line: &str, spans: &[HiSpan]) -> Vec<Span<'static>> {
+/// gaps with `code_fg` — the theme's code foreground, never the Base16
+/// literal, so gaps match the captured tokens around them on every theme.
+fn code_line_spans(line: &str, spans: &[HiSpan], code_fg: Color) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
     for sp in spans {
@@ -55,7 +56,7 @@ fn code_line_spans(line: &str, spans: &[HiSpan]) -> Vec<Span<'static>> {
         if start > cursor {
             out.push(Span::styled(
                 line[cursor..start].to_string(),
-                Style::default().fg(FG),
+                Style::default().fg(code_fg),
             ));
         }
         if end > start {
@@ -66,7 +67,7 @@ fn code_line_spans(line: &str, spans: &[HiSpan]) -> Vec<Span<'static>> {
     if cursor < line.len() {
         out.push(Span::styled(
             line[cursor..].to_string(),
-            Style::default().fg(FG),
+            Style::default().fg(code_fg),
         ));
     }
     out
@@ -178,6 +179,8 @@ impl Renderer<'_> {
             return;
         };
         let bar = Span::styled("\u{258e} ", Style::default().fg(self.theme.accent()));
+        let (fr, fg_, fb) = self.theme.syntax().fg;
+        let code_fg = Color::Rgb(fr, fg_, fb);
         let highlighted = kind.map(|k| {
             let bytes = text.as_bytes();
             let line_starts = compute_line_starts(bytes);
@@ -186,8 +189,8 @@ impl Renderer<'_> {
         for (i, line) in text.lines().enumerate() {
             let mut spans = vec![bar.clone()];
             match highlighted.as_ref().and_then(|h| h.get(i)) {
-                Some(hi) if !hi.is_empty() => spans.extend(code_line_spans(line, hi)),
-                _ => spans.push(Span::styled(line.to_string(), Style::default().fg(FG))),
+                Some(hi) if !hi.is_empty() => spans.extend(code_line_spans(line, hi, code_fg)),
+                _ => spans.push(Span::styled(line.to_string(), Style::default().fg(code_fg))),
             }
             self.out.push(Line::from(spans));
         }
@@ -575,5 +578,33 @@ mod tests {
             .expect("link text must render");
         assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
         assert!(all_text(&lines).contains(&"\u{2500}".repeat(RULE_COLS)));
+    }
+
+    #[test]
+    fn code_block_text_follows_the_theme_palette_not_base16() {
+        // A fence in a language the highlighter doesn't know (and any gap the
+        // highlighter leaves) must paint the ACTIVE theme's code foreground.
+        // The hardcoded Base16 slate left cold-grey code islands inside an
+        // otherwise-themed Gruvbox/Dracula preview.
+        let theme = *crate::theme::Theme::all()
+            .iter()
+            .find(|t| t.syntax().fg != crate::theme::SyntaxPalette::BASE16.fg)
+            .expect("a bundled theme with a non-Base16 code palette");
+        let (r, g, b) = theme.syntax().fg;
+        let lines = render_markdown(
+            "```notalanguage\nplain code line\n```\n",
+            theme,
+            &mut LangRegistry::new(),
+        );
+        let code = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref() == "plain code line")
+            .expect("the code line must render");
+        assert_eq!(
+            code.style.fg,
+            Some(Color::Rgb(r, g, b)),
+            "unhighlighted code must wear the theme's code fg, not Base16 slate"
+        );
     }
 }

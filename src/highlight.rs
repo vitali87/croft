@@ -362,11 +362,6 @@ pub fn set_syntax_palette(palette: SyntaxPalette) {
     *SYNTAX.write().unwrap() = palette;
 }
 
-/// Palette, indexed by HIGHLIGHT_NAMES position.
-fn style_for(idx: usize) -> Style {
-    style_for_name(HIGHLIGHT_NAMES.get(idx).copied().unwrap_or(""))
-}
-
 /// The palette keyed by capture name, resolved against the active theme's
 /// [`SyntaxPalette`]. Shared by tree-sitter highlighting (via `style_for`) and
 /// by the LSP semantic-token overlay (via `semantic_style_for`) so both layers
@@ -745,6 +740,21 @@ pub fn highlight_text(
     text: &[u8],
     line_starts: &[usize],
 ) -> Vec<Vec<HiSpan>> {
+    // Snapshot the palette once per pass: the write happens only on a theme
+    // switch, and one read beats a lock round-trip per token.
+    let palette = *SYNTAX.read().unwrap();
+    highlight_text_with_palette(registry, kind, text, line_starts, &palette)
+}
+
+/// [`highlight_text`] against an explicit palette (pure in the palette — no
+/// global read, so tests can pin any theme's colors hermetically).
+fn highlight_text_with_palette(
+    registry: &mut LangRegistry,
+    kind: LangKind,
+    text: &[u8],
+    line_starts: &[usize],
+    palette: &SyntaxPalette,
+) -> Vec<Vec<HiSpan>> {
     let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); line_starts.len()];
     let cfg = match registry.get(kind) {
         Some(c) => c,
@@ -765,8 +775,13 @@ pub fn highlight_text(
             }
             Ok(HighlightEvent::Source { start, end }) => {
                 let style = match stack.last() {
-                    Some(idx) => style_for(*idx),
-                    None => Style::default().fg(rgb(0xc0, 0xc5, 0xce)),
+                    Some(idx) => palette_style_for_name(
+                        palette,
+                        HIGHLIGHT_NAMES.get(*idx).copied().unwrap_or(""),
+                    ),
+                    // Uncaptured source takes the palette's default fg, same
+                    // as the `variable`/`punctuation` arm — never a literal.
+                    None => palette_style_for_name(palette, ""),
                 };
                 project_range(start, end, style, line_starts, &mut per_line);
             }
@@ -1760,5 +1775,34 @@ def f() -> Config:\n\
         let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); 1];
         project_range(3, 3, Style::default(), &line_starts, &mut per_line);
         assert!(per_line[0].is_empty());
+    }
+
+    #[test]
+    fn uncaptured_source_follows_the_active_palette_not_base16() {
+        // Bytes tree-sitter's queries do not capture (the whitespace between
+        // tokens, gaps in sparse grammars) must take the ACTIVE palette's
+        // default foreground. Hardcoding Base16 slate there splits a
+        // Gruvbox/Dracula file into two foregrounds: captured `variable`
+        // runs in the theme's cream, uncaptured runs in cold slate.
+        let gruvbox_ish = SyntaxPalette {
+            fg: (0xeb, 0xdb, 0xb2),
+            ..SyntaxPalette::BASE16
+        };
+        let mut reg = LangRegistry::new();
+        let src = "let x = 1;\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text_with_palette(&mut reg, LangKind::Rust, src.as_bytes(), &ls, &gruvbox_ish);
+        let slate = Some(rgb(0xc0, 0xc5, 0xce));
+        let cream = Some(rgb(0xeb, 0xdb, 0xb2));
+        assert!(
+            h[0].iter().all(|s| s.style.fg != slate),
+            "no span may keep the Base16 default when the palette differs: {:?}",
+            h[0]
+        );
+        assert!(
+            h[0].iter().any(|s| s.style.fg == cream),
+            "default-foreground spans must use the palette fg: {:?}",
+            h[0]
+        );
     }
 }
