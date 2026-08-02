@@ -22932,6 +22932,34 @@ fn copy_mode_e_wraps_to_the_next_rows_word_end() {
     assert_eq!(st.col, 3, "and land on the end of 'next'");
 }
 
+/// vim's `e` keeps advancing across word-less lines: from the last word
+/// before a run of blank rows it lands on the end of the next word below
+/// them, not at column 0 of the first blank row.
+#[test]
+fn copy_mode_e_skips_blank_rows_to_the_next_word_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.terminals[0].feed_bytes_for_test(b"\r\nalpha\r\n\r\n\r\nnext word");
+    app.open_terminal_copy_mode();
+    for _ in 0..3 {
+        app.handle_terminal_copy_mode_key(key(KeyCode::Char('k'), KeyModifiers::NONE));
+    }
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('0'), KeyModifiers::NONE));
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
+    let st = app.terminal_copy_mode.as_ref().unwrap();
+    let alpha_row = st.line;
+    assert_eq!(st.col, 4, "first e lands on the end of 'alpha'");
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
+    let st = app.terminal_copy_mode.as_ref().unwrap();
+    assert_eq!(
+        st.line,
+        alpha_row + 3,
+        "e skips the two blank rows to the row with the next word"
+    );
+    assert_eq!(st.col, 3, "and lands on the end of 'next'");
+}
+
 /// Copy mode is bound to the pane it opened on: a gesture that activates a
 /// sibling pane closes the mode (tmux-style) instead of folding the other
 /// pane's independent scroll clock into the stored coordinates and

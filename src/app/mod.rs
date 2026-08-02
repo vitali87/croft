@@ -24035,21 +24035,29 @@ impl App {
                 // like vim's `e` at end of line — `w` and `b` both wrap,
                 // and without this `e` was a dead key at the row's last word.
                 if i >= content && st.line < bottom {
-                    st.line += 1;
-                    let (ntext, ncolmap) = self.terminal().row_text(st.line);
-                    let nchars: Vec<char> = ntext.chars().collect();
-                    let mut j = 0;
-                    while j < nchars.len() && !word(nchars[j]) {
-                        j += 1;
+                    // Word-less rows are skipped like vim: `e` lands on the
+                    // end of the next word wherever it lives below, and only
+                    // falls back to the next row's column 0 when nothing
+                    // down to the bottom has a word.
+                    let mut landed = None;
+                    let mut line = st.line + 1;
+                    while line <= bottom {
+                        let (ntext, ncolmap) = self.terminal().row_text(line);
+                        let nchars: Vec<char> = ntext.chars().collect();
+                        let mut j = 0;
+                        while j < nchars.len() && !word(nchars[j]) {
+                            j += 1;
+                        }
+                        if j < nchars.len() && word(nchars[j]) {
+                            while j + 1 < nchars.len() && word(nchars[j + 1]) {
+                                j += 1;
+                            }
+                            landed = Some((line, ncolmap.get(j).map_or(0, |&c| c as u16)));
+                            break;
+                        }
+                        line += 1;
                     }
-                    while j + 1 < nchars.len() && word(nchars[j + 1]) {
-                        j += 1;
-                    }
-                    st.col = if j < nchars.len() && word(nchars[j]) {
-                        ncolmap.get(j).map_or(0, |&c| c as u16)
-                    } else {
-                        0
-                    };
+                    (st.line, st.col) = landed.unwrap_or((st.line + 1, 0));
                 } else {
                     while i + 1 < chars.len() && word(chars[i + 1]) {
                         i += 1;
