@@ -70,7 +70,7 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A pane SSH'd into a remote host no longer leaks the remote directory into local actions: splits and session restore only trust the shell-reported cwd when this machine reported it.",
+        summary: "A pane SSH'd into a remote host no longer leaks the remote directory into local actions: splits and session restore only trust the shell-reported cwd when this machine reported it and the kernel confirms the shell really is in that directory.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,

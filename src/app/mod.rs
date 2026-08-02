@@ -42,6 +42,8 @@ use overlay::OverlayManager;
 use perf_hud::PerfHud;
 use welcome::WelcomeState;
 
+use crate::widgets::terminal::cwd_of_pid;
+
 use crate::widgets::{
     dependencies::{DependenciesPanel, Dependency, Ecosystem},
     editor::{Editor, EditorTabs},
@@ -32214,119 +32216,6 @@ fn run_mcp_command_blocking(
         })
     })();
     crate::mcp::McpOutcome { title, body }
-}
-
-/// Live cwd of a running process by PID, or None when the platform doesn't
-/// expose one. Used by `split_terminal` so a new pane lands wherever the
-/// user has `cd`'d the active shell.
-#[cfg(target_os = "linux")]
-fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
-    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
-}
-
-/// macOS: call `proc_pidinfo` with `PROC_PIDVNODEPATHINFO` directly via the
-/// libSystem FFI instead of shelling out to `lsof -d cwd`. Two reasons:
-///   1. `lsof` on Sonoma+ tickles the "App Management" / "App Data" TCC
-///      privacy class (the OS sees the responsible parent process — iTerm
-///      — inspecting another process's open files and prompts the user).
-///      `proc_pidinfo` against our own child PID needs no TCC entitlement.
-///   2. No fork/exec on the hot path of every terminal split.
-///
-/// Struct layout matches `<sys/proc_info.h>`. We read the path field of
-/// `pvi_cdir` (the cwd vnode) at the documented offset.
-#[cfg(target_os = "macos")]
-fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
-    use std::ffi::OsString;
-    use std::os::raw::{c_int, c_void};
-    use std::os::unix::ffi::OsStringExt;
-
-    const PROC_PIDVNODEPATHINFO: c_int = 9;
-    const MAXPATHLEN: usize = 1024;
-
-    #[repr(C)]
-    #[derive(Default, Clone, Copy)]
-    struct VinfoStat {
-        vst_dev: u32,
-        vst_mode: u16,
-        vst_nlink: u16,
-        vst_ino: u64,
-        vst_uid: u32,
-        vst_gid: u32,
-        vst_atime: i64,
-        vst_atimensec: i64,
-        vst_mtime: i64,
-        vst_mtimensec: i64,
-        vst_ctime: i64,
-        vst_ctimensec: i64,
-        vst_birthtime: i64,
-        vst_birthtimensec: i64,
-        vst_size: i64,
-        vst_blocks: i64,
-        vst_blksize: i32,
-        vst_flags: u32,
-        vst_gen: u32,
-        vst_rdev: u32,
-        vst_qspare: [i64; 2],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct VnodeInfo {
-        vi_stat: VinfoStat,
-        vi_type: i32,
-        vi_pad: i32,
-        vi_fsid: [i32; 2],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct VnodeInfoPath {
-        vip_vi: VnodeInfo,
-        vip_path: [u8; MAXPATHLEN],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct ProcVnodePathInfo {
-        pvi_cdir: VnodeInfoPath,
-        pvi_rdir: VnodeInfoPath,
-    }
-
-    unsafe extern "C" {
-        fn proc_pidinfo(
-            pid: c_int,
-            flavor: c_int,
-            arg: u64,
-            buffer: *mut c_void,
-            buffersize: c_int,
-        ) -> c_int;
-    }
-
-    let mut info: ProcVnodePathInfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<ProcVnodePathInfo>() as c_int;
-    let ret = unsafe {
-        proc_pidinfo(
-            pid as c_int,
-            PROC_PIDVNODEPATHINFO,
-            0,
-            &mut info as *mut _ as *mut c_void,
-            size,
-        )
-    };
-    if ret <= 0 {
-        return None;
-    }
-    let path = &info.pvi_cdir.vip_path;
-    let len = path.iter().position(|&b| b == 0).unwrap_or(0);
-    if len == 0 {
-        return None;
-    }
-    Some(PathBuf::from(OsString::from_vec(path[..len].to_vec())))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn cwd_of_pid(_pid: u32) -> Option<PathBuf> {
-    None
 }
 
 /// Paint the `[+]` and (when more than one terminal is open) `[-]` buttons

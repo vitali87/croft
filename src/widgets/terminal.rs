@@ -545,11 +545,6 @@ pub struct PtyTerminal {
     /// Latest OSC 7 reporting host (SSH inside the pane moves it to the
     /// remote's hostname); feeds the per-host accent rules.
     osc7_host: Arc<std::sync::Mutex<Option<String>>>,
-    /// Whether the newest OSC 7 report arrived while the SHELL owned the
-    /// tty (capture-time provenance): a report printed by a foreground job
-    /// (an ssh session) is never trusted for local filesystem use, even
-    /// after the job dies without a replacement report.
-    osc7_shell_owned: Arc<AtomicBool>,
     /// Host-accent dressing resolved by the app against the prefs rules:
     /// border / pill color and the watermark badge.
     pub accent: Option<(u8, u8, u8)>,
@@ -953,6 +948,122 @@ pub fn process_name(pid: i32) -> Option<String> {
         .filter(|n| !n.is_empty())
 }
 
+/// Live cwd of a running process by PID, or None when the platform doesn't
+/// expose one. Used by `split_terminal` so a new pane lands wherever the
+/// user has `cd`'d the active shell, and by [`PtyTerminal::local_shell_cwd`]
+/// as the ground truth an OSC 7 claim must match to be trusted.
+#[cfg(target_os = "linux")]
+pub fn cwd_of_pid(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// macOS: call `proc_pidinfo` with `PROC_PIDVNODEPATHINFO` directly via the
+/// libSystem FFI instead of shelling out to `lsof -d cwd`. Two reasons:
+///   1. `lsof` on Sonoma+ tickles the "App Management" / "App Data" TCC
+///      privacy class (the OS sees the responsible parent process — iTerm
+///      — inspecting another process's open files and prompts the user).
+///      `proc_pidinfo` against our own child PID needs no TCC entitlement.
+///   2. No fork/exec on the hot path of every terminal split.
+///
+/// Struct layout matches `<sys/proc_info.h>`. We read the path field of
+/// `pvi_cdir` (the cwd vnode) at the documented offset.
+#[cfg(target_os = "macos")]
+pub fn cwd_of_pid(pid: u32) -> Option<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::os::raw::{c_int, c_void};
+    use std::os::unix::ffi::OsStringExt;
+
+    const PROC_PIDVNODEPATHINFO: c_int = 9;
+    const MAXPATHLEN: usize = 1024;
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct VinfoStat {
+        vst_dev: u32,
+        vst_mode: u16,
+        vst_nlink: u16,
+        vst_ino: u64,
+        vst_uid: u32,
+        vst_gid: u32,
+        vst_atime: i64,
+        vst_atimensec: i64,
+        vst_mtime: i64,
+        vst_mtimensec: i64,
+        vst_ctime: i64,
+        vst_ctimensec: i64,
+        vst_birthtime: i64,
+        vst_birthtimensec: i64,
+        vst_size: i64,
+        vst_blocks: i64,
+        vst_blksize: i32,
+        vst_flags: u32,
+        vst_gen: u32,
+        vst_rdev: u32,
+        vst_qspare: [i64; 2],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VnodeInfo {
+        vi_stat: VinfoStat,
+        vi_type: i32,
+        vi_pad: i32,
+        vi_fsid: [i32; 2],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VnodeInfoPath {
+        vip_vi: VnodeInfo,
+        vip_path: [u8; MAXPATHLEN],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcVnodePathInfo {
+        pvi_cdir: VnodeInfoPath,
+        pvi_rdir: VnodeInfoPath,
+    }
+
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: c_int,
+            flavor: c_int,
+            arg: u64,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+    }
+
+    let mut info: ProcVnodePathInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcVnodePathInfo>() as c_int;
+    let ret = unsafe {
+        proc_pidinfo(
+            pid as c_int,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut c_void,
+            size,
+        )
+    };
+    if ret <= 0 {
+        return None;
+    }
+    let path = &info.pvi_cdir.vip_path;
+    let len = path.iter().position(|&b| b == 0).unwrap_or(0);
+    if len == 0 {
+        return None;
+    }
+    Some(std::path::PathBuf::from(OsString::from_vec(
+        path[..len].to_vec(),
+    )))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn cwd_of_pid(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// The label to show for a pane: a manual name wins, else the live foreground
 /// process name.
 pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
@@ -1300,13 +1411,6 @@ impl PtyTerminal {
         let clock_for_thread = clock.clone();
         let osc7_host = Arc::new(std::sync::Mutex::new(None::<String>));
         let osc7_host_for_thread = osc7_host.clone();
-        let osc7_shell_owned = Arc::new(AtomicBool::new(false));
-        let osc7_shell_owned_for_thread = osc7_shell_owned.clone();
-        // Capture-time provenance inputs for the reader thread: the pty fd
-        // for tcgetpgrp and the shell's pid. The reader thread is joined in
-        // Drop before the master closes, so the raw fd cannot dangle.
-        let master_fd_for_thread = pair.master.as_raw_fd();
-        let shell_pid_for_thread = shell_pid;
         // Trigger set shared with the reader thread; the inner Arc is swapped
         // by `set_triggers` on startup / config reload, picked up per chunk.
         let triggers = Arc::new(std::sync::Mutex::new(std::sync::Arc::new(
@@ -1355,23 +1459,8 @@ impl PtyTerminal {
                             use crate::shell_integration::OscEvent as E;
                             match ev {
                                 E::Cwd(p, host) => {
-                                    // Provenance AT CAPTURE: only a report
-                                    // that arrived while the shell owned
-                                    // the tty can have come from the local
-                                    // shell's own prompt hook; a foreground
-                                    // job's claim stays untrusted forever.
-                                    let shell_owned =
-                                        match (master_fd_for_thread, shell_pid_for_thread) {
-                                            (Some(fd), Some(pid)) => {
-                                                let fg = unsafe { libc::tcgetpgrp(fd) };
-                                                fg <= 0 || fg == pid
-                                            }
-                                            _ => true,
-                                        };
                                     *osc7_for_thread.lock().unwrap() = Some(p);
                                     *osc7_host_for_thread.lock().unwrap() = host;
-                                    osc7_shell_owned_for_thread
-                                        .store(shell_owned, Ordering::Release);
                                 }
                                 E::Notify(msg) => {
                                     notifications_for_thread.lock().unwrap().push(msg);
@@ -1564,7 +1653,6 @@ impl PtyTerminal {
             marks,
             osc7_cwd,
             osc7_host,
-            osc7_shell_owned,
             accent: None,
             accent_badge: None,
             notifications,
@@ -1865,25 +1953,28 @@ impl PtyTerminal {
         self.osc7_host.lock().unwrap().clone()
     }
 
-    /// [`Self::shell_cwd`], trusted only when the report provably came from
-    /// the LOCAL shell: the reporting host must be this machine (empty,
+    /// [`Self::shell_cwd`], trusted only when the report provably applies
+    /// to the LOCAL shell: the reporting host must be this machine (empty,
     /// "localhost", or the local hostname — RFC 8089 semantics via the
-    /// command history's canonicalizer) AND the shell must own the tty
-    /// (`foreground_is_shell`). The hostname alone is a self-report — a
-    /// remote session's output can claim any name — but while an ssh
-    /// client (or any app) holds the foreground group, whatever printed
-    /// the claim is not the local shell at its prompt; conversely a shell
-    /// at its prompt has just re-asserted its own OSC 7. The cost is that
-    /// a local tmux/pager forces the caller's `cwd_of_pid` fallback.
+    /// command history's canonicalizer) AND the claimed path must name the
+    /// directory the kernel says the shell is in ([`cwd_of_pid`]). PTY
+    /// bytes carry no author — any foreground job can print a
+    /// local-looking claim and die before the bytes are even parsed — so
+    /// no tty-ownership sample at any moment establishes provenance.
+    /// Matching the kernel's ground truth does: a forged claim equal to
+    /// the truth grants nothing, and one that differs is rejected. The
+    /// cost is that platforms without [`cwd_of_pid`] never trust a claim.
     pub fn local_shell_cwd(&self) -> Option<std::path::PathBuf> {
         let host = self.shell_host().unwrap_or_default();
-        if !crate::command_history::is_local_host(&host)
-            || !self.osc7_shell_owned.load(Ordering::Acquire)
-            || !self.foreground_is_shell()
-        {
+        if !crate::command_history::is_local_host(&host) {
             return None;
         }
-        self.shell_cwd()
+        let claim = self.shell_cwd()?;
+        let real = cwd_of_pid(self.pid()?)?;
+        // Symlink-tolerant equality (macOS reports /private/tmp for a
+        // shell sitting in /tmp): equal canonical paths name the same
+        // directory, so a claim passing this check cannot mislead.
+        (claim.canonicalize().ok()? == real.canonicalize().ok()?).then_some(claim)
     }
 
     /// The pane's monotonic scroll-clock reading (see `clock_now`): the
@@ -4435,12 +4526,86 @@ mod tests {
         );
     }
 
+    /// The buffered claim outliving its forger: a foreground job prints a
+    /// local-looking OSC 7 and dies, but the reader thread only PARSES
+    /// those bytes later (here: the render side held the term lock, the
+    /// production delay). Any tty-ownership sample taken at parse time
+    /// sees the shell back at its prompt — PTY bytes carry no author, so
+    /// timing can never establish provenance. The claim must be rejected
+    /// on content: it names a directory the shell is not actually in.
+    #[test]
+    fn a_claim_parsed_only_after_its_job_died_is_still_untrusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        // zsh -f: job control (the job gets its own pgroup) but no
+        // integration, so nothing overwrites the forged claim.
+        let mut term = PtyTerminal::new_running(
+            "/bin/zsh",
+            &[String::from("-f"), String::from("-i")],
+            tmp.path(),
+        )
+        .unwrap();
+        let mut waited = 0u32;
+        while waited < 4000 && !term.foreground_is_shell() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        // The job sleeps before printing, leaving time to stall the
+        // reader below; then it prints the claim and lingers briefly so
+        // the bytes enter the kernel buffer while it owns the tty.
+        let term_arc = term.term.clone();
+        term.write_input(
+            b"/bin/sh -c 'sleep 1; printf \"\\033]7;file://localhost/tmp\\007\"; sleep 1'\n",
+        );
+        // Wait for the job to take the tty and the reader to drain the
+        // command echo, THEN stall parsing by taking the term lock. The
+        // lock cannot be held from the start: with the reader parked,
+        // zsh's startup burst fills the kernel pty queue and blocks the
+        // shell before it ever runs the line. The claim plus one prompt
+        // redraw are small enough that nothing blocks during the stall.
+        let mut waited = 0u32;
+        while waited < 4000 && term.foreground_is_shell() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(!term.foreground_is_shell(), "staging: the job took the tty");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let guard = term_arc.lock();
+        // With parsing stalled, wait out the job's remaining life: claim
+        // printed, job dead, shell back at its prompt. tcgetpgrp is
+        // kernel state, untouched by our lock.
+        let mut waited = 0u32;
+        while waited < 8000 && !term.foreground_is_shell() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(
+            term.foreground_is_shell(),
+            "staging: the job is gone and the shell owns the tty again"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(guard);
+        let mut waited = 0u32;
+        while waited < 4000 && term.shell_cwd() != Some(std::path::PathBuf::from("/tmp")) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert_eq!(
+            term.shell_cwd(),
+            Some(std::path::PathBuf::from("/tmp")),
+            "staging: the claim was captured after the job died"
+        );
+        assert_eq!(
+            term.local_shell_cwd(),
+            None,
+            "a claim whose bytes were parsed after its job died must not be trusted"
+        );
+    }
+
     /// The forged claim outliving its forger: a foreground job prints an
     /// OSC 7 with a local-looking host and EXITS; the shell retakes the
     /// tty without re-reporting (no integration), so a foreground check at
-    /// consultation time passes on the stale cache. Provenance must be
-    /// recorded at CAPTURE: a report that arrived while a job owned the
-    /// tty never becomes trusted, however long ago the job died.
+    /// consultation time passes on the stale cache. A report that arrived
+    /// from a job never becomes trusted, however long ago the job died.
     #[test]
     fn a_stale_claim_from_a_dead_foreground_job_stays_untrusted() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4892,11 +5057,16 @@ mod tests {
             None,
             "a path reported by another machine must not be reused locally"
         );
-        let tmp2 = tempfile::tempdir().unwrap();
+        // The truthful counterpart: the reporter really sits in the
+        // directory it claims (spawned in /tmp), so the claim matches the
+        // kernel's cwd for the pane's shell and localhost IS this machine.
         let script = "printf '\\033]7;file://localhost/tmp\\007ok\\n'; sleep 30";
-        let term2 =
-            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp2.path())
-                .unwrap();
+        let term2 = PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), script.into()],
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
         wait_for_grid(&term2, |ls| {
             ls.iter().any(|l| l.contains("ok") && !l.contains("printf"))
         });
