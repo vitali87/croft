@@ -16,6 +16,40 @@ use std::path::{Path, PathBuf};
 /// Newest entries kept in memory and, after compaction, on disk.
 pub const HISTORY_MAX: usize = 10_000;
 
+/// Collapse every way OSC 7 spells "this machine" — empty (no integration,
+/// legacy entries), "localhost" (shim fallback), or the machine's own
+/// hostname — into "", so the Dir scope's host pairing only separates REAL
+/// remote hosts.
+fn canon_host(h: &str) -> &str {
+    if h.is_empty() || h.eq_ignore_ascii_case("localhost") || is_local_hostname(h) {
+        ""
+    } else {
+        h
+    }
+}
+
+/// Whether `h` names this machine (case-insensitive, with or without the
+/// mDNS-style domain the shells sometimes include).
+fn is_local_hostname(h: &str) -> bool {
+    static LOCAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let local = LOCAL.get_or_init(|| {
+        let mut buf = [0u8; 256];
+        // SAFETY: gethostname writes at most buf.len() bytes and
+        // NUL-terminates within it on every supported platform.
+        let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
+        if !ok {
+            return String::new();
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).to_string()
+    });
+    if local.is_empty() {
+        return false;
+    }
+    let short = |s: &str| s.split('.').next().unwrap_or(s).to_ascii_lowercase();
+    short(h) == short(local)
+}
+
 /// One finished shell command.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HistoryEntry {
@@ -24,6 +58,12 @@ pub struct HistoryEntry {
     /// shell never reported one.
     #[serde(default)]
     pub cwd: String,
+    /// The OSC 7 reporting hostname at finish time; empty for the local
+    /// machine. Without it, a command run at /home/dev/api over an in-pane
+    /// ssh session is indistinguishable from one run at the same local
+    /// path, and the Dir scope conflates them.
+    #[serde(default)]
+    pub host: String,
     #[serde(default)]
     pub exit: Option<i32>,
     #[serde(default)]
@@ -146,7 +186,13 @@ impl CommandHistory {
     /// occurrence wins, like atuin), case-insensitive substring `query`,
     /// narrowed by `scope` (`cwd` is the pane's current directory for
     /// [`HistoryScope::Dir`]).
-    pub fn search(&self, query: &str, scope: HistoryScope, cwd: &str) -> Vec<HistoryEntry> {
+    pub fn search(
+        &self,
+        query: &str,
+        scope: HistoryScope,
+        cwd: &str,
+        host: &str,
+    ) -> Vec<HistoryEntry> {
         let q = query.to_lowercase();
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -154,7 +200,13 @@ impl CommandHistory {
             match scope {
                 HistoryScope::All => {}
                 HistoryScope::Dir => {
-                    if e.cwd != cwd {
+                    // Same directory means same directory on the same
+                    // machine: the host pairs with the path. Local hosts
+                    // normalize to one value — the shims report the local
+                    // hostname (or "localhost"), while legacy entries and
+                    // panes without integration carry "" — so a local pane
+                    // still sees its own older history.
+                    if e.cwd != cwd || canon_host(&e.host) != canon_host(host) {
                         continue;
                     }
                 }
@@ -183,10 +235,53 @@ mod tests {
         HistoryEntry {
             cmd: cmd.to_string(),
             cwd: cwd.to_string(),
+            host: String::new(),
             exit,
             dur_ms: 42,
             ts,
         }
+    }
+
+    /// A command run at /x over an in-pane ssh session must not surface in
+    /// the Dir scope of a LOCAL pane sitting at /x — same path, different
+    /// machine.
+    #[test]
+    fn dir_scope_separates_hosts_sharing_a_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut h = CommandHistory::load(&tmp.path().join("h.jsonl"));
+        h.append(entry("local-build", "/x", Some(0), 1));
+        let mut remote = entry("remote-build", "/x", Some(0), 2);
+        remote.host = String::from("prod-box");
+        h.append(remote);
+        let local = h.search("", HistoryScope::Dir, "/x", "");
+        assert_eq!(local.len(), 1, "only the local /x command");
+        assert_eq!(local[0].cmd, "local-build");
+        let remote = h.search("", HistoryScope::Dir, "/x", "prod-box");
+        assert_eq!(remote.len(), 1, "only the remote /x command");
+        assert_eq!(remote[0].cmd, "remote-build");
+
+        // Every spelling of "this machine" is one host: a legacy entry
+        // (host "") must surface in a pane whose shim reports "localhost",
+        // and a "localhost" entry in a pane with no integration.
+        let mut shimmed = entry("shimmed-build", "/x", Some(0), 3);
+        shimmed.host = String::from("localhost");
+        h.append(shimmed);
+        let seen = h.search("", HistoryScope::Dir, "/x", "localhost");
+        let cmds: Vec<&str> = seen.iter().map(|e| e.cmd.as_str()).collect();
+        assert!(
+            cmds.contains(&"local-build") && cmds.contains(&"shimmed-build"),
+            "legacy and shim-reported local entries are one history: {cmds:?}"
+        );
+        assert!(!cmds.contains(&"remote-build"));
+
+        // Schema round trip: a reload keeps the stored host, and a legacy
+        // JSONL record with no "host" key deserializes to the local "".
+        let re = CommandHistory::load(&h.path);
+        let back = re.entries.iter().find(|e| e.cmd == "remote-build").unwrap();
+        assert_eq!(back.host, "prod-box", "the host survives the reload");
+        let legacy: HistoryEntry =
+            serde_json::from_str(r#"{"cmd":"old","cwd":"/x","exit":0,"dur_ms":1,"ts":1}"#).unwrap();
+        assert_eq!(legacy.host, "", "a pre-host record defaults to local");
     }
 
     #[test]
@@ -226,7 +321,7 @@ mod tests {
         h.append(entry("ls", "/tmp", Some(0), 3));
         h.append(entry("cargo test", "/repo", Some(1), 4)); // rerun, newest
 
-        let all = h.search("", HistoryScope::All, "");
+        let all = h.search("", HistoryScope::All, "", "");
         assert_eq!(
             all.iter().map(|e| e.cmd.as_str()).collect::<Vec<_>>(),
             vec!["cargo test", "ls", "cargo build"],
@@ -234,16 +329,16 @@ mod tests {
         );
         assert_eq!(all[0].exit, Some(1), "the newest occurrence wins");
 
-        let q = h.search("CARGO", HistoryScope::All, "");
+        let q = h.search("CARGO", HistoryScope::All, "", "");
         assert_eq!(q.len(), 2, "query is case-insensitive substring");
 
-        let dir = h.search("", HistoryScope::Dir, "/tmp");
+        let dir = h.search("", HistoryScope::Dir, "/tmp", "");
         assert_eq!(
             dir.iter().map(|e| e.cmd.as_str()).collect::<Vec<_>>(),
             vec!["ls"]
         );
 
-        let failed = h.search("", HistoryScope::Failed, "");
+        let failed = h.search("", HistoryScope::Failed, "", "");
         assert_eq!(
             failed.iter().map(|e| e.cmd.as_str()).collect::<Vec<_>>(),
             vec!["cargo test", "cargo build"],

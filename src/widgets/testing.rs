@@ -148,11 +148,7 @@ impl TestingPanel {
         self.progress = None;
         // Snapshot the pre-run status (None = about to be inserted) so a
         // worker refusal can put the tree back exactly.
-        let old = self
-            .cases
-            .iter()
-            .find(|c| c.name == name)
-            .map(|c| c.status);
+        let old = self.cases.iter().find(|c| c.name == name).map(|c| c.status);
         self.prerun = vec![(name.to_string(), old)];
         self.apply_case(TestCase {
             name: name.to_string(),

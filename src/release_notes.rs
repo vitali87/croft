@@ -62,22 +62,22 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A click on the shell prompt can no longer crash croft: with the prompt row rewritten shorter than where input started (a background progress writer, a shrunk pane), click-to-move-cursor hit inverted clamp bounds and panicked. It now degrades to the sane target instead.",
+        summary: "Copying a soft-wrapped line yields one logical line: selections, the durable command history, and the pinned command header used to join wrapped rows with a newline, so a long stored command re-ran only its first fragment when typed back from the history popup.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Terminal timestamps survive pagers and long sessions: entering git log, vim, or htop used to erase every arrival time and re-stamp the whole scrollback with the exit time, any multi-line progress redraw wiped the gutter, and panes past their scrollback depth froze to wrong times. Stamps now ride the same scroll clock as selections.",
+        summary: "Clicking a CAPTURES row finds its line in panes narrower than the captured text: the jump matched a fixed 60-character prefix against grid rows bounded by the pane width, so narrow splits (and wide-glyph lines) always reported the line missing.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Terminal annotations stay glued to their text: a note typed while output streamed used to land rows below the selected line, and in panes past their scrollback depth the amber span froze in place while content slid underneath. Notes now anchor where the prompt opened and follow content like selections do.",
+        summary: "Copy mode is bound to the pane it opened on: clicking a sibling pane now leaves the mode, where it used to keep a stale cursor on the old pane and paint a garbage selection onto the new one on the next keypress. vim's e motion also wraps to the next row like w and b instead of dying at a row's last word.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Copy-mode keys continue from where the highlight is: with output streaming, each keypress used to teleport the selection back to stale coordinates while the pane had re-anchored it to the content in view.",
+        summary: "A tiny host window can no longer crash croft: the command-history popup (and two sibling popups) inverted their size clamps below 40x10, and a pane squeezed to a sliver panicked inside the terminal engine's resize.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The pinned command header no longer corrupts the screen when the command spans several rows (a heredoc newline, a wrap shown in a widened pane): the row join printed a raw newline byte into the frame. Clicking an annotated note also no longer leaves a stray one-cell highlight behind.",
+        summary: "Command history distinguishes machines: a command run over an in-pane SSH session at /some/path no longer shows up in the directory-scoped history of a local pane sitting at the same path.",
     },
 ];

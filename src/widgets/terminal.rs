@@ -571,6 +571,10 @@ pub struct FinishedCommand {
     pub dur: std::time::Duration,
     pub cmd: String,
     pub cwd: Option<std::path::PathBuf>,
+    /// The OSC 7 reporting hostname AT COMPLETION time. Captured with the
+    /// 133;D mark, not read later at drain: an in-pane `ssh`/`exit` between
+    /// the two would attribute the command to the wrong machine.
+    pub host: Option<String>,
 }
 
 /// A finished command derived from the OSC 133 marks: the grid line of the
@@ -1277,11 +1281,14 @@ impl PtyTerminal {
                                                     last_command_input_text(&t, &ms)
                                                 };
                                                 let cwd = osc7_for_thread.lock().unwrap().clone();
+                                                let host =
+                                                    osc7_host_for_thread.lock().unwrap().clone();
                                                 let _ = finished_tx.send(FinishedCommand {
                                                     exit: *exit,
                                                     dur: d,
                                                     cmd,
                                                     cwd,
+                                                    host,
                                                 });
                                             }
                                             dur
@@ -1722,6 +1729,45 @@ impl PtyTerminal {
                 )
             })
             .collect()
+    }
+
+    /// The newest grid line where a captured line starts, or `None`. The
+    /// straight case is a row carrying `needle` as a prefix; a pane
+    /// narrower than the needle instead shows the line's FIRST WRAPPED ROW,
+    /// whose text is a prefix OF the needle. That reverse arm is gated on
+    /// real wrap metadata, not row length: the row must itself soft-wrap
+    /// (WRAPLINE on its last cell) — otherwise any short unrelated row
+    /// sharing the prefix would win — and continuation rows (the PREVIOUS
+    /// row wraps) never match either arm, or a later continuation sharing
+    /// the prefix would beat the true start under the newest-first scan.
+    pub fn find_captured_line(&self, needle: &str) -> Option<i32> {
+        if needle.is_empty() {
+            return None;
+        }
+        let term = self.term.lock();
+        let cols = term.columns();
+        let wraps = |line: i32| {
+            cols > 0
+                && term.grid()[Point::new(Line(line), Column(cols - 1))]
+                    .flags
+                    .contains(Flags::WRAPLINE)
+        };
+        let top = term.grid().topmost_line().0;
+        let bottom = term.screen_lines() as i32 - 1;
+        for line in (top..=bottom).rev() {
+            if line > top && wraps(line - 1) {
+                continue;
+            }
+            let (text, _) = row_text_and_cols(&term, line);
+            let t = text.trim_end();
+            if t.is_empty() {
+                continue;
+            }
+            if t.starts_with(needle) || (wraps(line) && needle.starts_with(t)) {
+                return Some(line);
+            }
+        }
+        None
     }
 
     /// Every annotation translated against an EXPLICIT clock reading — the
@@ -2575,6 +2621,11 @@ impl PtyTerminal {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        // A degenerate pane (a host window shrunk to a sliver leaves the
+        // layout no room) must not reach alacritty: Term::resize panics on
+        // a zero/one-cell grid mid-reflow. Keep the last sane size; the
+        // grid simply clips until the window grows back.
+        let (cols, rows) = (cols.max(2), rows.max(2));
         if cols == self.cols && rows == self.rows {
             return;
         }
@@ -2820,7 +2871,19 @@ pub fn extract_selection_text(
         let trimmed = line.trim_end();
         out.push_str(trimmed);
         if line_idx != er {
-            out.push('\n');
+            // A soft-wrapped row (WRAPLINE on its last cell) continues the
+            // same logical line: no separator, so copied text, the durable
+            // command history, and the sticky header all see the line the
+            // user actually typed — a '\n' here corrupted stored commands
+            // and re-ran only their first fragment on paste. A hard row
+            // break keeps the newline.
+            let wrapped = cols > 0
+                && term.grid()[Point::new(Line(line_idx), Column(cols - 1))]
+                    .flags
+                    .contains(Flags::WRAPLINE);
+            if !wrapped {
+                out.push('\n');
+            }
         }
         line_idx += 1;
     }
@@ -3095,13 +3158,7 @@ impl Widget for &mut PtyTerminal {
             let ann_now = self.clock_now(&term);
             self.annotations
                 .iter()
-                .map(|a| {
-                    (
-                        a.line_rec - (ann_now - a.clock_rec) as i32,
-                        a.start,
-                        a.len,
-                    )
-                })
+                .map(|a| (a.line_rec - (ann_now - a.clock_rec) as i32, a.start, a.len))
                 .collect()
         };
         let display_offset = term.grid().display_offset();
@@ -5796,6 +5853,84 @@ mod tests {
         assert!(
             max2 >= max1 + 100,
             "row ids must keep advancing after saturation (got {max1} then {max2})"
+        );
+    }
+
+    /// A captured line wider than the pane appears in the grid as a WRAPPED
+    /// first row (a prefix of the needle): the jump must find it, must not
+    /// be fooled by an unrelated short row sharing the prefix (only rows
+    /// that really soft-wrap qualify for the reverse arm), and must skip
+    /// continuation rows so the newest-first scan can't land mid-line.
+    #[test]
+    fn capture_jump_matches_wrapped_lines_without_false_prefixes() {
+        let (_tmp, mut t) = quiet_pty();
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let needle: String = format!("error[E0308]: {}", "x".repeat(60))
+            .chars()
+            .take(60)
+            .collect();
+        // An unrelated NON-wrapped row that happens to share the prefix.
+        feed_pty(&t, b"\r\nerror[E0308]: unrelated short\r\n");
+        assert_eq!(
+            t.find_captured_line(&needle),
+            None,
+            "a short non-wrapped lookalike must not match"
+        );
+        // The real captured line, wrapping across two grid rows.
+        let full = format!("error[E0308]: {}", "x".repeat(60));
+        feed_pty(&t, full.as_bytes());
+        let start = {
+            let term = t.term.lock();
+            term.grid().cursor.point.line.0 - 1
+        };
+        assert_eq!(
+            t.find_captured_line(&needle),
+            Some(start),
+            "the wrapped line's FIRST row is the jump target, not its continuation"
+        );
+    }
+
+    /// A soft-wrapped logical line copies as ONE line: the WRAPLINE flag on
+    /// the wrapping row's last cell tells a continuation from a real row
+    /// break, so selection copy, the durable command history, and the
+    /// sticky header all see the text the user actually typed. A '\n' at
+    /// the wrap corrupted stored commands and re-ran only the first
+    /// fragment on paste. Hard breaks keep their newline.
+    #[test]
+    fn selection_over_a_soft_wrapped_line_copies_one_logical_line() {
+        let (_tmp, mut t) = quiet_pty();
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let cols = t.term.lock().columns();
+        // A fresh row below any spawn banner, then a line long enough to wrap.
+        feed_pty(&t, b"\r\n");
+        let start = t.term.lock().grid().cursor.point.line.0;
+        let long: String = "abcdefghij".repeat(6); // 60 chars > pane width
+        feed_pty(&t, long.as_bytes());
+        t.set_selection(Some(Selection {
+            anchor: (start, 0),
+            head: (start + 1, cols.saturating_sub(1) as u16),
+            block: false,
+        }));
+        assert_eq!(
+            t.selection_text(),
+            long,
+            "the wrapped rows must rejoin without a newline"
+        );
+        // A hard row break keeps its newline.
+        feed_pty(&t, b"\r\nsecond");
+        t.set_selection(Some(Selection {
+            anchor: (start + 1, 0),
+            head: (start + 2, 6),
+            block: false,
+        }));
+        assert!(
+            t.selection_text().contains('\n'),
+            "a real row break still copies as two lines: {:?}",
+            t.selection_text()
         );
     }
 

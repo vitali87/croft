@@ -22865,3 +22865,128 @@ fn a_workspace_with_no_test_runner_refuses_every_run_gesture() {
     app.run_named_test(String::from("named"));
     assert_refused(&mut app, "named run");
 }
+
+/// Ctrl+Shift+H on a tiny host window: the popup clamps inverted
+/// (min > max) below 40 columns or 10 rows and `Ord::clamp` panics,
+/// taking the raw-mode TUI down.
+#[test]
+fn the_history_popup_survives_a_tiny_frame() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.open_command_history();
+    let backend = ratatui::backend::TestBackend::new(30, 8);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+}
+
+/// A zero-sized frame (a host window mid-collapse) has no cells at all:
+/// the fallback geometry used to floor each axis to one cell, handing
+/// back a 1×1 popup that sits outside the frame it was asked to fit.
+#[test]
+fn a_zero_sized_frame_gets_no_fallback_popup() {
+    let r = fallback_popup_rect(Rect::new(0, 0, 0, 0), 100);
+    assert_eq!(r.area(), 0, "no cells exist to draw into: {r:?}");
+    let r = fallback_popup_rect(Rect::new(0, 0, 80, 0), 110);
+    assert_eq!(r.area(), 0, "a zero-height frame cannot host rows: {r:?}");
+    let r = fallback_popup_rect(Rect::new(2, 3, 30, 8), 110);
+    assert!(
+        r.x >= 2 && r.y >= 3 && r.right() <= 32 && r.bottom() <= 11,
+        "a real frame keeps the popup inside it: {r:?}"
+    );
+}
+
+/// vim's `e` at the last word of a row hops to the next row's first word
+/// end, exactly like `w` and `b` already wrap; it used to be a dead key
+/// there because the scan ran into the row's trailing padding.
+#[test]
+fn copy_mode_e_wraps_to_the_next_rows_word_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    // A fresh row first: whatever the spawned shell printed (a prompt, a
+    // banner — it varies by environment) must not shift the fed text, and
+    // the navigation below is cursor-relative rather than jumping to the
+    // scrollback top, so the test is hermetic against prior output.
+    app.terminals[0].feed_bytes_for_test(b"\r\nalpha beta\r\nnext word");
+    app.open_terminal_copy_mode();
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('k'), KeyModifiers::NONE));
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('0'), KeyModifiers::NONE));
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
+    let st = app.terminal_copy_mode.as_ref().unwrap();
+    let first_row = st.line;
+    assert_eq!(st.col, 4, "first e lands on the end of 'alpha'");
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
+    assert_eq!(
+        app.terminal_copy_mode.as_ref().unwrap().col,
+        9,
+        "second e lands on the end of 'beta'"
+    );
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
+    let st = app.terminal_copy_mode.as_ref().unwrap();
+    assert_eq!(
+        st.line,
+        first_row + 1,
+        "e at the row's last word must wrap to the next row"
+    );
+    assert_eq!(st.col, 3, "and land on the end of 'next'");
+}
+
+/// vim's `e` keeps advancing across word-less lines: from the last word
+/// before a run of blank rows it lands on the end of the next word below
+/// them, not at column 0 of the first blank row.
+#[test]
+fn copy_mode_e_skips_blank_rows_to_the_next_word_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.terminals[0].feed_bytes_for_test(b"\r\nalpha\r\n\r\n\r\nnext word");
+    app.open_terminal_copy_mode();
+    for _ in 0..3 {
+        app.handle_terminal_copy_mode_key(key(KeyCode::Char('k'), KeyModifiers::NONE));
+    }
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('0'), KeyModifiers::NONE));
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
+    let st = app.terminal_copy_mode.as_ref().unwrap();
+    let alpha_row = st.line;
+    assert_eq!(st.col, 4, "first e lands on the end of 'alpha'");
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
+    let st = app.terminal_copy_mode.as_ref().unwrap();
+    assert_eq!(
+        st.line,
+        alpha_row + 3,
+        "e skips the two blank rows to the row with the next word"
+    );
+    assert_eq!(st.col, 3, "and lands on the end of 'next'");
+}
+
+/// Copy mode is bound to the pane it opened on: a gesture that activates a
+/// sibling pane closes the mode (tmux-style) instead of folding the other
+/// pane's independent scroll clock into the stored coordinates and
+/// painting a garbage selection there.
+#[test]
+fn copy_mode_closes_instead_of_hijacking_another_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.open_terminal_copy_mode();
+    assert!(app.terminal_copy_mode.is_some());
+    app.terminals.push(
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sleep",
+            &[String::from("30")],
+            tmp.path(),
+        )
+        .unwrap(),
+    );
+    app.active_terminal = 1;
+    app.handle_terminal_copy_mode_key(key(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert!(
+        app.terminal_copy_mode.is_none(),
+        "a pane switch closes copy mode instead of hijacking the new pane"
+    );
+    assert!(
+        app.terminals[1].selection().is_none(),
+        "the sibling pane must not inherit a painted selection"
+    );
+}
