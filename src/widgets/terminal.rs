@@ -207,9 +207,136 @@ const STALL_GAP_MS: u64 = 60_000;
 /// One user note pinned to a span of terminal output (iTerm2's
 /// annotations), anchored like a mark so it rides the scrollback.
 #[derive(Clone, Debug)]
+/// The pane's monotonic scroll clock: lines the primary screen has
+/// scrolled since the pane spawned, read from a one-cell tracer selection's
+/// drift. Immune to the `history_size` saturation that froze selections in
+/// long-lived panes (scrollback full for ages, so a history-growth delta
+/// was pinned at zero while content kept rotating through the ring). Alt
+/// screen freezes the clock — output goes to the alternate grid while
+/// primary content holds still. A dead tracer falls back to history growth
+/// since the last tick: exact for the viewport-pushing clear that killed
+/// it, zero for an alt-screen round trip.
+///
+/// Shared (behind a mutex) between the render thread — selection,
+/// copy-mode, and annotation re-anchoring — and the PTY reader thread,
+/// which keys arrival timestamps on it. Both sides hold the term lock
+/// first, then this mutex.
+struct ScrollClock {
+    /// Monotonic reading, folded up to the last `tick`.
+    base: i64,
+    /// Grid line the tracer selection was planted at during the last tick;
+    /// `None` before the first tick.
+    planted: Option<i32>,
+    /// `history_size` at the last tick: fallback delta source for the rare
+    /// windows where the tracer died (screen clear, alt-screen round trip).
+    hist: i64,
+}
+
+impl ScrollClock {
+    fn new() -> Self {
+        Self {
+            base: 0,
+            planted: None,
+            hist: 0,
+        }
+    }
+
+    /// Plant the one-cell tracer selection at `line` in alacritty's own
+    /// `Term::selection` slot (croft paints selections itself, so the slot
+    /// is otherwise unused). alacritty rotates it on every scroll —
+    /// including ring rotation once the scrollback is full, where
+    /// `history_size` saturates and stops counting — so its drift between
+    /// ticks is the true lines-scrolled count.
+    fn plant_tracer(term: &mut Term<VoidListener>, line: i32) {
+        let point = Point::new(Line(line), Column(0));
+        let mut tracer = TracerSelection::new(SelectionType::Simple, point, Side::Left);
+        tracer.update(point, Side::Right);
+        term.selection = Some(tracer);
+    }
+
+    /// Where the tracer sits now, when it survived since the last plant
+    /// (screen clears, alt-screen swaps and content rotating fully off the
+    /// scrollback kill it).
+    fn tracer_line(term: &Term<VoidListener>) -> Option<i32> {
+        let range = term.selection.as_ref()?.to_range(term)?;
+        Some(range.start.line.0)
+    }
+
+    fn now(&self, term: &Term<VoidListener>) -> i64 {
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return self.base;
+        }
+        match (self.planted, Self::tracer_line(term)) {
+            (Some(planted), Some(cur)) => self.base + i64::from(planted - cur),
+            _ => {
+                let growth = term.grid().history_size() as i64 - self.hist;
+                self.base + growth.max(0)
+            }
+        }
+    }
+
+    /// Fold the tracer's drift into the clock, re-plant it fresh and return
+    /// the folded reading. The newest history line is the parking spot:
+    /// application clears only touch live-screen rows, so nothing kills it
+    /// there, and it sits a full scrollback's depth from rotating off the
+    /// top before the next tick (every rendered frame ticks).
+    fn tick(&mut self, term: &mut Term<VoidListener>) -> i64 {
+        let now = self.now(term);
+        if !term.mode().contains(TermMode::ALT_SCREEN) {
+            self.base = now;
+            self.hist = term.grid().history_size() as i64;
+            let park = if self.hist > 0 { -1 } else { 0 };
+            Self::plant_tracer(term, park);
+            self.planted = Some(park);
+        }
+        now
+    }
+}
+
+/// One PTY chunk's arrival stamps for the timestamps gutter: every row the
+/// cursor advanced past gets the chunk's arrival time, keyed on the scroll
+/// clock (`clock reading + cursor grid line` = a stable content id) — NOT
+/// on `history_size`, which treated any upward cursor motion as a
+/// scrollback wipe (a `docker pull` progress redraw erased every stamp, an
+/// alt-screen round trip erased them and then re-stamped the whole
+/// scrollback with the exit time) and which saturates once the ring fills,
+/// freezing ids to screen positions. Alternate-screen output stamps
+/// nothing: it isn't scrollback rows, and the gutter is normal-screen only.
+fn stamp_chunk(
+    term: &mut Term<VoidListener>,
+    clock: &mut ScrollClock,
+    lt: &mut std::collections::BTreeMap<i64, u64>,
+    prev_id: &mut i64,
+    now_ms: u64,
+) {
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        return;
+    }
+    let now = clock.tick(term);
+    let cur_id = now + i64::from(term.grid().cursor.point.line.0);
+    // Stamp from the PREVIOUS cursor row inclusive (last touch wins: the
+    // row content just landed on is re-stamped as it fills). A redraw that
+    // moved the cursor UP re-arrives at existing rows: stamp only the
+    // cursor row, never wipe.
+    let from = (*prev_id).min(cur_id);
+    for a in from..=cur_id {
+        lt.insert(a, now_ms);
+    }
+    *prev_id = cur_id;
+    // Bounded by the largest configurable scrollback plus a screen;
+    // oldest stamps go first.
+    while lt.len() > 210_000 {
+        lt.pop_first();
+    }
+}
+
 struct PaneAnnotation {
+    /// Grid line the span sat on when recorded, paired with the scroll
+    /// clock reading at that instant. Translated with clock movement — NOT
+    /// `history_size` growth, which saturates once the scrollback fills and
+    /// froze annotations in exactly the long-lived panes they target.
     line_rec: i32,
-    hist_rec: usize,
+    clock_rec: i64,
     start: u16,
     len: u16,
     text: String,
@@ -281,14 +408,11 @@ pub struct PtyTerminal {
     /// their content up by one; subtracting the clock movement since this
     /// stamp keeps them glued to their text while output streams.
     sel_scrolled: i64,
-    /// Monotonic scroll clock, folded up to the last `tick_clock`.
-    clock_base: i64,
-    /// Grid line the tracer selection was planted at during the last tick;
-    /// `None` before the first tick.
-    clock_planted: Option<i32>,
-    /// `history_size` at the last tick: fallback delta source for the rare
-    /// windows where the tracer died (screen clear, alt-screen round trip).
-    clock_hist: i64,
+    /// The pane's monotonic scroll clock, shared with the PTY reader
+    /// thread: the render side re-anchors selections/annotations with it,
+    /// the reader keys arrival timestamps on it (both under the term lock,
+    /// then this mutex — always in that order).
+    clock: Arc<std::sync::Mutex<ScrollClock>>,
     /// Content anchor for a selection made on the alternate screen, where
     /// apps (Claude Code, vim) never scroll the grid — they repaint it in
     /// place, so no scroll clock can see the text move. `None` while the
@@ -1046,6 +1170,8 @@ impl PtyTerminal {
             std::collections::BTreeMap::<i64, u64>::new(),
         ));
         let line_times_for_thread = line_times.clone();
+        let clock = Arc::new(std::sync::Mutex::new(ScrollClock::new()));
+        let clock_for_thread = clock.clone();
         let osc7_host = Arc::new(std::sync::Mutex::new(None::<String>));
         let osc7_host_for_thread = osc7_host.clone();
         // Trigger set shared with the reader thread; the inner Arc is swapped
@@ -1066,12 +1192,12 @@ impl PtyTerminal {
             // layout key uses it to tell a new picture from a moved one.
             let mut image_seq = 0u64;
             // Command timing: armed by 133;C, consumed by the next 133;D.
-            // Cursor's absolute row after the previous chunk: the rows this
-            // chunk touched run from there to the cursor's new row, and each
-            // takes the chunk's arrival time (last touch wins, so a row is
-            // stamped when its content actually landed, not when the cursor
-            // first parked on it).
-            let mut prev_cursor_abs: i64 = 0;
+            // Content id of the cursor row after the previous chunk: the
+            // rows this chunk touched run from there to the cursor's new
+            // id, and each takes the chunk's arrival time (last touch wins,
+            // so a row is stamped when its content actually landed, not
+            // when the cursor first parked on it).
+            let mut prev_stamp_id: i64 = 0;
             let mut cmd_start: Option<std::time::Instant> = None;
             let mut buf = [0u8; 65536];
             loop {
@@ -1185,28 +1311,13 @@ impl PtyTerminal {
                         // the chunk's arrival time (one read of output is
                         // sub-millisecond, so chunk granularity is honest).
                         {
-                            let hist = t.grid().history_size() as i64;
-                            let cur_abs = hist + t.grid().cursor.point.line.0 as i64;
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
+                            let mut clock = clock_for_thread.lock().unwrap();
                             let mut lt = line_times_for_thread.lock().unwrap();
-                            if cur_abs < prev_cursor_abs {
-                                // ED 3 wiped the scrollback: history reset, so
-                                // every stored id belongs to a dead row.
-                                lt.clear();
-                                prev_cursor_abs = cur_abs;
-                            }
-                            for a in prev_cursor_abs..=cur_abs {
-                                lt.insert(a, now_ms);
-                            }
-                            prev_cursor_abs = cur_abs;
-                            // Bounded by the largest configurable scrollback
-                            // plus a screen; oldest stamps go first.
-                            while lt.len() > 210_000 {
-                                lt.pop_first();
-                            }
+                            stamp_chunk(&mut t, &mut clock, &mut lt, &mut prev_stamp_id, now_ms);
                         }
                         // Notify/bell triggers match completed output lines,
                         // never inside a full-screen app (the alt screen owns
@@ -1257,9 +1368,7 @@ impl PtyTerminal {
             selection: None,
             copy_cursor: None,
             sel_scrolled: 0,
-            clock_base: 0,
-            clock_planted: None,
-            clock_hist: 0,
+            clock,
             alt_sel: None,
             drag_selecting: false,
             manual_name: None,
@@ -1545,7 +1654,13 @@ impl PtyTerminal {
                 .unwrap_or(b_col)
         };
         let cur = cursor.column.0 as u16;
-        let target = vc.clamp(b_col, end_col.max(cur));
+        // The row may have been rewritten SHORTER than the recorded 133;B
+        // column (a backgrounded progress writer, a shrunk pane): the live
+        // bounds then sit left of `b_col`, and `clamp` with min > max
+        // panics. Bound the lower edge by the upper so the gesture
+        // degrades instead of taking the app down.
+        let hi = end_col.max(cur);
+        let target = vc.clamp(b_col.min(hi), hi);
         if target == cur {
             return None;
         }
@@ -1563,13 +1678,23 @@ impl PtyTerminal {
         self.osc7_host.lock().unwrap().clone()
     }
 
-    /// Pin a note to the span starting at current grid `line`, columns
-    /// `start..start+len` (Cmd+K N's commit).
-    pub fn add_annotation(&mut self, line: i32, start: u16, len: u16, text: String) {
-        let hist_rec = self.term.lock().grid().history_size();
+    /// The pane's monotonic scroll-clock reading (see `clock_now`): the
+    /// content anchor the app pairs with grid coordinates it captures now
+    /// (annotation prompts, copy mode), so the pair survives streaming
+    /// output and scrollback saturation alike.
+    pub fn scroll_clock(&mut self) -> i64 {
+        self.tick_clock()
+    }
+
+    /// Pin a note to the span starting at grid `line`, columns
+    /// `start..start+len` (Cmd+K N's commit). `clock` is the scroll-clock
+    /// reading `line` was captured against ([`Self::scroll_clock`] at the
+    /// prompt's OPEN) — sampling it here instead would mis-anchor the note
+    /// by every row that streamed while the user typed it.
+    pub fn add_annotation(&mut self, line: i32, clock: i64, start: u16, len: u16, text: String) {
         self.annotations.push(PaneAnnotation {
             line_rec: line,
-            hist_rec,
+            clock_rec: clock,
             start,
             len: len.max(1),
             text,
@@ -1581,17 +1706,15 @@ impl PtyTerminal {
     /// `(line, start, len, text)`. Spans whose content fell off the
     /// scrollback are dropped for good.
     pub fn annotations_current(&mut self) -> Vec<(i32, u16, u16, String)> {
-        let term = self.term.lock();
-        let hist_now = term.grid().history_size() as i32;
-        let top = term.grid().topmost_line().0;
-        drop(term);
+        let now = self.tick_clock();
+        let top = self.term.lock().grid().topmost_line().0;
         self.annotations
-            .retain(|a| a.line_rec - (hist_now - a.hist_rec as i32) >= top);
+            .retain(|a| a.line_rec - (now - a.clock_rec) as i32 >= top);
         self.annotations
             .iter()
             .map(|a| {
                 (
-                    a.line_rec - (hist_now - a.hist_rec as i32),
+                    a.line_rec - (now - a.clock_rec) as i32,
                     a.start,
                     a.len,
                     a.text.clone(),
@@ -1605,14 +1728,14 @@ impl PtyTerminal {
         let (vr, vc) = self.cell_at(col, row)?;
         let term = self.term.lock();
         let off = term.grid().display_offset() as i32;
-        let hist_now = term.grid().history_size() as i32;
+        let now = self.clock_now(&term);
         drop(term);
         let line = vr as i32 - off;
         self.annotations
             .iter()
             .enumerate()
             .find(|(_, a)| {
-                a.line_rec - (hist_now - a.hist_rec as i32) == line
+                a.line_rec - (now - a.clock_rec) as i32 == line
                     && vc >= a.start
                     && vc < a.start + a.len
             })
@@ -1636,11 +1759,13 @@ impl PtyTerminal {
     /// When the row at current grid `line` arrived (epoch millis), if the
     /// reader thread stamped it.
     pub fn row_time(&self, line: i32) -> Option<u64> {
-        let hist = self.term.lock().grid().history_size() as i64;
+        let term = self.term.lock();
+        let now = self.clock_now(&term);
+        drop(term);
         self.line_times
             .lock()
             .unwrap()
-            .get(&(line as i64 + hist))
+            .get(&(i64::from(line) + now))
             .copied()
     }
 
@@ -1716,66 +1841,16 @@ impl PtyTerminal {
         self.hyperlink_at(r as usize, c as usize)
     }
 
-    /// Plant the one-cell tracer selection at `line` in alacritty's own
-    /// `Term::selection` slot (croft paints selections itself, so the slot
-    /// is otherwise unused). alacritty rotates it on every scroll —
-    /// including ring rotation once the scrollback is full, where
-    /// `history_size` saturates and stops counting — so its drift between
-    /// ticks is the true lines-scrolled count.
-    fn plant_tracer(term: &mut Term<VoidListener>, line: i32) {
-        let point = Point::new(Line(line), Column(0));
-        let mut tracer = TracerSelection::new(SelectionType::Simple, point, Side::Left);
-        tracer.update(point, Side::Right);
-        term.selection = Some(tracer);
-    }
-
-    /// Where the tracer sits now, when it survived since the last plant
-    /// (screen clears, alt-screen swaps and content rotating fully off the
-    /// scrollback kill it).
-    fn tracer_line(term: &Term<VoidListener>) -> Option<i32> {
-        let range = term.selection.as_ref()?.to_range(term)?;
-        Some(range.start.line.0)
-    }
-
-    /// The monotonic scroll clock: lines the primary screen has scrolled
-    /// since the pane spawned, read from the tracer's drift. Immune to the
-    /// `history_size` saturation that froze selections in long-lived panes
-    /// (the Claude Code drag-select bug: scrollback full for ages, so the
-    /// old history-growth delta was pinned at zero while content kept
-    /// rotating through the ring). Alt screen freezes the clock — output
-    /// goes to the alternate grid while primary content holds still. A dead
-    /// tracer falls back to history growth since the last tick: exact for
-    /// the viewport-pushing clear that killed it, zero for an alt-screen
-    /// round trip.
+    /// The current scroll-clock reading against an already-locked term.
     fn clock_now(&self, term: &Term<VoidListener>) -> i64 {
-        if term.mode().contains(TermMode::ALT_SCREEN) {
-            return self.clock_base;
-        }
-        match (self.clock_planted, Self::tracer_line(term)) {
-            (Some(planted), Some(cur)) => self.clock_base + i64::from(planted - cur),
-            _ => {
-                let growth = term.grid().history_size() as i64 - self.clock_hist;
-                self.clock_base + growth.max(0)
-            }
-        }
+        self.clock.lock().unwrap().now(term)
     }
 
     /// Fold the tracer's drift into the clock, re-plant it fresh and return
-    /// the folded reading. The newest history line is the parking spot:
-    /// application clears only touch live-screen rows, so nothing kills it
-    /// there, and it sits a full scrollback's depth from rotating off the
-    /// top before the next tick (every rendered frame ticks).
+    /// the folded reading (see [`ScrollClock::tick`]).
     fn tick_clock(&mut self) -> i64 {
         let mut term = self.term.lock();
-        let now = self.clock_now(&term);
-        if !term.mode().contains(TermMode::ALT_SCREEN) {
-            self.clock_base = now;
-            self.clock_hist = term.grid().history_size() as i64;
-            let park = if self.clock_hist > 0 { -1 } else { 0 };
-            Self::plant_tracer(&mut term, park);
-            self.clock_planted = Some(park);
-        }
-        now
+        self.clock.lock().unwrap().tick(&mut term)
     }
 
     /// Stamp freshly-set selection / copy-cursor coordinates against a
@@ -1996,6 +2071,45 @@ impl PtyTerminal {
         p.advance(&mut *term, bytes);
     }
 
+    /// Test-only: run one reader-thread timestamp pass over the current
+    /// grid, exactly as a real chunk arrival would.
+    #[cfg(test)]
+    pub fn stamp_chunk_for_test(&self, prev_id: &mut i64, now_ms: u64) {
+        let mut term = self.term.lock();
+        let mut clock = self.clock.lock().unwrap();
+        let mut lt = self.line_times.lock().unwrap();
+        stamp_chunk(&mut term, &mut clock, &mut lt, prev_id, now_ms);
+    }
+
+    /// Test-only: the stamped (content id, arrival ms) pairs.
+    #[cfg(test)]
+    pub fn line_time_entries_for_test(&self) -> Vec<(i64, u64)> {
+        self.line_times
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&k, &v)| (k, v))
+            .collect()
+    }
+
+    /// Test-only: record an OSC 133 mark as the reader thread would,
+    /// stamped against the grid's CURRENT cursor/history state, so tests
+    /// can stage prompt-dependent gestures without a live shell.
+    #[cfg(test)]
+    pub fn push_mark_for_test(&self, kind: crate::shell_integration::OscEvent, col_rec: usize) {
+        let term = self.term.lock();
+        let line_rec = term.grid().cursor.point.line.0;
+        let hist_rec = term.grid().history_size();
+        drop(term);
+        self.marks.lock().unwrap().push(StoredMark {
+            kind,
+            line_rec,
+            hist_rec,
+            col_rec,
+            dur: None,
+        });
+    }
+
     /// Test-only: the raw state behind the corrected selection accessors —
     /// (stored selection, sel_scrolled, clock_base, alt anchor top, alt
     /// mode) — for diagnosing drift math from app-level tests.
@@ -2004,7 +2118,7 @@ impl PtyTerminal {
         (
             self.selection,
             self.sel_scrolled,
-            self.clock_base,
+            self.clock.lock().unwrap().base,
             self.alt_sel.as_ref().map(|a| a.top),
             self.term.lock().mode().contains(TermMode::ALT_SCREEN),
         )
@@ -2905,12 +3019,20 @@ impl Widget for &mut PtyTerminal {
         let trigger_set = self.triggers.lock().unwrap().clone();
 
         let term = self.term.lock();
-        // Annotation spans at their current grid lines (mark-style drift).
-        let ann_hist = term.grid().history_size() as i32;
+        // Annotation spans at their current grid lines, translated by the
+        // scroll clock (same anchor as selections — history growth
+        // saturates and froze these in long-lived panes).
+        let ann_now = self.clock_now(&term);
         let ann_spans: Vec<(i32, u16, u16)> = self
             .annotations
             .iter()
-            .map(|a| (a.line_rec - (ann_hist - a.hist_rec as i32), a.start, a.len))
+            .map(|a| {
+                (
+                    a.line_rec - (ann_now - a.clock_rec) as i32,
+                    a.start,
+                    a.len,
+                )
+            })
             .collect();
         let display_offset = term.grid().display_offset();
         let cursor_visible = term.mode().contains(TermMode::SHOW_CURSOR) && self.focused;
@@ -3170,9 +3292,11 @@ impl Widget for &mut PtyTerminal {
         // over content, painted only while the palette toggle is on.
         if self.show_timestamps && !alt_screen && inner.width > 14 {
             let lt = self.line_times.lock().unwrap();
-            let hist = term.grid().history_size() as i64;
+            // Row ids are `clock + grid line` — content-stable through
+            // scrollback saturation, matching the reader thread's stamps.
+            let clock_now = self.clock_now(&term);
             for y in 0..rows {
-                let abs = (y as i32 - display_offset as i32) as i64 + hist;
+                let abs = clock_now + (y as i32 - display_offset as i32) as i64;
                 let Some(&ms) = lt.get(&abs) else { continue };
                 let prev = lt.range(..abs).next_back().map(|(_, &v)| v);
                 let stalled = prev.is_some_and(|p| ms.saturating_sub(p) >= STALL_GAP_MS);
@@ -3257,7 +3381,10 @@ impl Widget for &mut PtyTerminal {
                     cell.set_symbol(" ");
                     cell.set_style(Style::default().bg(bg));
                 }
-                let label = format!("\u{25b6} {}", text.trim());
+                // A multi-row command (soft-wrapped or a quoted/heredoc
+                // newline) arrives with its rows joined by '\n'; a cell must
+                // never hold a control char, so the join becomes a space.
+                let label = format!("\u{25b6} {}", text.trim().replace('\n', " "));
                 let mut xw = inner.x + 1;
                 for ch in label.chars() {
                     if xw + 1 >= inner.x + inner.width {
@@ -3440,7 +3567,8 @@ mod tests {
                 .iter()
                 .position(|l| l.starts_with("note-worthy-line"))
                 .unwrap() as i32;
-        term.add_annotation(line, 0, 16, String::from("this is where it broke"));
+        let clock = term.scroll_clock();
+        term.add_annotation(line, clock, 0, 16, String::from("this is where it broke"));
         // The screen cell over the span resolves to the note.
         let (idx, text) = term
             .annotation_at(3, line as u16)
@@ -5525,6 +5653,222 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let t = PtyTerminal::new_running("/bin/sleep", &[String::from("30")], tmp.path()).unwrap();
         (tmp, t)
+    }
+
+    /// An alt-screen round trip (`git log`, vim, htop) used to wipe every
+    /// arrival stamp (the alternate grid has no history, so the cursor's
+    /// absolute id collapsed and looked like an ED 3 wipe) and then
+    /// re-stamp the whole scrollback with the exit time. Stamps are keyed
+    /// on the scroll clock now, which the alternate screen freezes.
+    #[test]
+    fn timestamps_survive_an_alt_screen_round_trip() {
+        let (_tmp, t) = quiet_pty();
+        let mut prev = 0i64;
+        feed_pty(&t, b"one\r\ntwo\r\nthree\r\n");
+        t.stamp_chunk_for_test(&mut prev, 1000);
+        let before = t.line_time_entries_for_test();
+        assert!(!before.is_empty(), "rows got stamped");
+        let (first_id, first_ms) = before[0];
+        assert_eq!(first_ms, 1000);
+        feed_pty(&t, b"\x1b[?1049h\x1b[Hpager-screen");
+        t.stamp_chunk_for_test(&mut prev, 2000);
+        feed_pty(&t, b"\x1b[?1049l");
+        t.stamp_chunk_for_test(&mut prev, 3000);
+        let after = t.line_time_entries_for_test();
+        assert_eq!(
+            before.iter().map(|&(k, _)| k).collect::<Vec<_>>(),
+            after.iter().map(|&(k, _)| k).collect::<Vec<_>>(),
+            "an alt-screen trip must not wipe or invent stamped rows"
+        );
+        let kept = after.iter().find(|&&(k, _)| k == first_id).unwrap().1;
+        assert_eq!(
+            kept, 1000,
+            "an old row must keep its true arrival time, not the pager's exit time"
+        );
+    }
+
+    /// Once the scrollback ring saturates, `history_size` stops moving, so
+    /// history-keyed row ids froze to screen positions: new rows overwrote
+    /// the same ids and the gutter looked up unrelated rows' times. Clock
+    /// ids keep advancing one per scrolled line forever.
+    #[test]
+    fn timestamps_keep_advancing_past_a_saturated_scrollback() {
+        let (_tmp, t) = quiet_pty();
+        let mut prev = 0i64;
+        let mut chunk = String::new();
+        for i in 0..5300 {
+            chunk.push_str(&format!("s-{i}\r\n"));
+        }
+        feed_pty(&t, chunk.as_bytes());
+        t.stamp_chunk_for_test(&mut prev, 1000);
+        let max1 = t
+            .line_time_entries_for_test()
+            .last()
+            .map(|&(k, _)| k)
+            .unwrap();
+        let mut more = String::new();
+        for i in 0..100 {
+            more.push_str(&format!("t-{i}\r\n"));
+        }
+        feed_pty(&t, more.as_bytes());
+        t.stamp_chunk_for_test(&mut prev, 2000);
+        let max2 = t
+            .line_time_entries_for_test()
+            .last()
+            .map(|&(k, _)| k)
+            .unwrap();
+        assert!(
+            max2 >= max1 + 100,
+            "row ids must keep advancing after saturation (got {max1} then {max2})"
+        );
+    }
+
+    /// The Annotate prompt captures its span when it OPENS; rows that
+    /// stream while the user types the note must not shift the pin. The
+    /// commit anchors with the open-time (line, clock) pair — sampling a
+    /// fresh baseline at commit pinned the note N rows below its text
+    /// after N rows of output.
+    #[test]
+    fn an_annotation_committed_after_output_streamed_pins_where_it_was_captured() {
+        let (_tmp, mut t) = quiet_pty();
+        feed_pty(&t, b"target-line alpha\r\n");
+        let (lines, top) = t.grid_lines();
+        let line = top
+            + lines
+                .iter()
+                .position(|l| l.starts_with("target-line"))
+                .unwrap() as i32;
+        let clock = t.scroll_clock();
+        // 40 rows stream while the note is being typed.
+        let mut more = String::new();
+        for i in 0..40 {
+            more.push_str(&format!("while-typing-{i}\r\n"));
+        }
+        feed_pty(&t, more.as_bytes());
+        t.add_annotation(line, clock, 0, 11, String::from("note"));
+        let cur = t.annotations_current();
+        assert_eq!(cur.len(), 1, "the annotation survives");
+        let term = t.term.lock();
+        let text = extract_selection_text(&term, cur[0].0, 0, cur[0].0, 20);
+        assert!(
+            text.starts_with("target-line alpha"),
+            "the note must pin to the text selected at open, got row: {text:?}"
+        );
+    }
+
+    /// Past `SCROLLBACK_LINES` the ring rotates while `history_size` stops
+    /// moving, so a history-growth anchor freezes to a screen position.
+    /// Annotations ride the scroll clock (like selections) and must keep
+    /// following their content in exactly the long-lived panes (Claude
+    /// Code, `tail -f`) the feature targets.
+    #[test]
+    fn an_annotation_survives_streaming_past_a_saturated_scrollback() {
+        let (_tmp, mut t) = quiet_pty();
+        let mut chunk = String::new();
+        for i in 0..5200 {
+            chunk.push_str(&format!("pre-{i}\r\n"));
+        }
+        feed_pty(&t, chunk.as_bytes());
+        feed_pty(&t, b"note-worthy-marker here\r\n");
+        let (lines, top) = t.grid_lines();
+        let line = top
+            + lines
+                .iter()
+                .position(|l| l.starts_with("note-worthy-marker"))
+                .unwrap() as i32;
+        let clock = t.scroll_clock();
+        t.add_annotation(line, clock, 0, 18, String::from("pinned"));
+        let mut more = String::new();
+        for i in 0..60 {
+            more.push_str(&format!("post-{i}\r\n"));
+        }
+        feed_pty(&t, more.as_bytes());
+        let cur = t.annotations_current();
+        assert_eq!(cur.len(), 1, "the annotation survives the rotation");
+        let term = t.term.lock();
+        let text = extract_selection_text(&term, cur[0].0, 0, cur[0].0, 25);
+        assert!(
+            text.starts_with("note-worthy-marker"),
+            "the note must follow its content through ring rotation, got row: {text:?}"
+        );
+    }
+
+    /// A command spanning several grid rows (a quoted/heredoc newline, or a
+    /// soft wrap shown in a later-widened pane) joins its rows with '\n' in
+    /// `extract_selection_text`; the sticky header used to print that byte
+    /// into a cell verbatim, corrupting the frame on the host terminal (the
+    /// screen-corruption class the pdftoppm/DAP capture fixes exist to stop).
+    #[test]
+    fn sticky_header_never_paints_a_control_char_for_a_multi_row_command() {
+        use crate::shell_integration::OscEvent;
+        let (_tmp, mut t) = quiet_pty();
+        // First render sizes the grid to the pane (78 cols), so the long
+        // command genuinely wraps.
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        feed_pty(&t, b"$ ");
+        t.push_mark_for_test(OscEvent::PromptEnd, 2);
+        // A multi-line typed command (heredoc / quoted newline): the input
+        // span covers two HARD rows, so the joined text carries a newline
+        // well inside the label's painted width.
+        feed_pty(&t, b"echo \"build-it-99\r\nsecond-line\"");
+        feed_pty(&t, b"\r\n");
+        t.push_mark_for_test(OscEvent::CommandStart, 0);
+        for i in 0..40 {
+            feed_pty(&t, format!("out-{i}\r\n").as_bytes());
+        }
+        t.push_mark_for_test(OscEvent::CommandEnd(Some(0)), 0);
+        assert!(
+            !t.command_decorations().is_empty(),
+            "the marks must pair into a decoration"
+        );
+        t.scroll_to_top();
+        for _ in 0..5 {
+            t.scroll_down(1);
+        }
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let inner = t.last_inner;
+        let top: String = (inner.x..inner.x + inner.width)
+            .map(|x| buf[(x, inner.y)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            top.contains("build-it-99"),
+            "the wrapped command must still pin: {top:?}"
+        );
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let sym = buf[(x, y)].symbol();
+                assert!(
+                    !sym.chars().any(|c| c.is_control()),
+                    "cell ({x},{y}) holds a control char: {sym:?}"
+                );
+            }
+        }
+    }
+
+    /// A prompt row rewritten SHORTER than the recorded 133;B column (a
+    /// backgrounded `\r\x1b[K` progress writer, or a pane shrunk under the
+    /// prompt) used to panic click-to-move: the clamp bounds inverted
+    /// (`min > max`) and `u16::clamp` asserts. A click is never allowed to
+    /// take the app down; the degraded gesture just clamps sanely.
+    #[test]
+    fn a_prompt_click_after_the_row_was_rewritten_shorter_does_not_panic() {
+        let (_tmp, mut t) = quiet_pty();
+        t.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        feed_pty(&t, b"user@host ~/Documents/croft % ");
+        t.push_mark_for_test(crate::shell_integration::OscEvent::PromptEnd, 30);
+        // The rewrite leaves 7 columns of text and the cursor at column 7,
+        // both left of the recorded prompt-end column 30.
+        feed_pty(&t, b"\r\x1b[Kworking");
+        let row = t.term.lock().grid().cursor.point.line.0 as u16;
+        let _ = t.prompt_click_arrows(5, row);
     }
 
     #[test]

@@ -1772,6 +1772,11 @@ enum PromptKind {
     AnnotateTerminal {
         pane: usize,
         line: i32,
+        /// Scroll-clock reading `line` was captured against when the prompt
+        /// OPENED. The commit anchors with this pair: sampling a fresh
+        /// baseline at commit would mis-pin the note by every row that
+        /// streamed while the user typed it.
+        clock: i64,
         start: u16,
         len: u16,
         existing: Option<usize>,
@@ -1861,6 +1866,12 @@ pub struct CopyModeState {
     /// Selection anchor cell; `None` until v / V / Ctrl+V arms a selection.
     anchor: Option<(i32, u16)>,
     kind: CopySelKind,
+    /// Scroll-clock reading the coordinates above are valid against. The
+    /// pane re-anchors its painted selection to streaming content between
+    /// keypresses; every key handler folds the clock movement into these
+    /// coordinates first, or the keystroke would teleport the highlight
+    /// back to the stale absolute lines.
+    clock: i64,
 }
 
 /// Which shape the copy-mode selection takes: vim's v / V / Ctrl+V.
@@ -9509,12 +9520,14 @@ impl App {
         let buffer = existing
             .and_then(|i| current.get(i).map(|a| a.3.clone()))
             .unwrap_or_default();
+        let clock = self.terminals[pane].scroll_clock();
         self.prompt = Some(Prompt {
             label: String::from("Annotate Selection"),
             buffer,
             kind: PromptKind::AnnotateTerminal {
                 pane,
                 line: sr,
+                clock,
                 start,
                 len,
                 existing,
@@ -23766,12 +23779,14 @@ impl App {
         let (top, bottom, cols, _) = t.grid_bounds();
         let line = line.clamp(top, bottom);
         let col = col.min(cols.saturating_sub(1));
+        let clock = self.terminal_mut().scroll_clock();
         self.terminal_mut().set_copy_cursor(Some((line, col)));
         self.terminal_copy_mode = Some(CopyModeState {
             line,
             col,
             anchor: None,
             kind: CopySelKind::Char,
+            clock,
         });
         self.status = String::from(
             "Copy mode: h/j/k/l w/b/e 0/$ g/G move, v/V/^V select, y copies, Esc exits",
@@ -23840,7 +23855,25 @@ impl App {
         let Some(mut st) = self.terminal_copy_mode.take() else {
             return;
         };
+        // Content streamed since the last key: fold the scroll-clock
+        // movement into the stored coordinates so this keystroke moves
+        // from where the pane's re-anchored highlight actually is.
+        let now = self.terminal_mut().scroll_clock();
+        let drift = (now - st.clock) as i32;
+        if drift != 0 {
+            st.line -= drift;
+            if let Some(a) = st.anchor.as_mut() {
+                a.0 -= drift;
+            }
+            st.clock = now;
+        }
         let (top, bottom, cols, rows) = self.terminal().grid_bounds();
+        // Content that fell off the scrollback pins to the oldest line,
+        // mirroring the pane's own rebase.
+        st.line = st.line.clamp(top, bottom);
+        if let Some(a) = st.anchor.as_mut() {
+            a.0 = a.0.clamp(top, bottom);
+        }
         let last_col = cols.saturating_sub(1);
         let half = (rows as i32 / 2).max(1);
         let page = (rows as i32 - 1).max(1);
@@ -26647,6 +26680,14 @@ impl App {
                     && !self.terminal().selection().is_some_and(|s| s.has_area())
                     && let Some((_, note)) = self.terminal().annotation_at(m.column, m.row)
                 {
+                    // This early return skips the shared mouse-up tail, so
+                    // run its cleanup here too: drop the pane-drag latch and
+                    // the zero-area selection the mouse-down planted, or the
+                    // clicked cell stays painted as a one-cell highlight.
+                    self.terminal_drag_from = None;
+                    if self.terminal().selection().is_some() {
+                        self.terminal_mut().clear_selection();
+                    }
                     self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
                         note,
                         (m.column, m.row),
@@ -29604,6 +29645,7 @@ impl App {
             PromptKind::AnnotateTerminal {
                 pane,
                 line,
+                clock,
                 start,
                 len,
                 existing,
@@ -29622,7 +29664,7 @@ impl App {
                         }
                         (None, true) => "Annotation cancelled (empty note)",
                         (None, false) => {
-                            t.add_annotation(line, start, len, text);
+                            t.add_annotation(line, clock, start, len, text);
                             "Annotated selection (click the span to read it)"
                         }
                     });

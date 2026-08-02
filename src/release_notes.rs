@@ -62,18 +62,22 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Disabling a test-runner extension now actually stops croft running that runner: with the Rust runner toggled off, the gutter play glyph and every Testing gesture still shelled `cargo test` (and with only a Python project, ran cargo in a directory with no Cargo.toml). All four run gestures now refuse with a status when no enabled runner claims the workspace.",
+        summary: "A click on the shell prompt can no longer crash croft: with the prompt row rewritten shorter than where input started (a background progress writer, a shrunk pane), click-to-move-cursor hit inverted clamp bounds and panicked. It now degrades to the sane target instead.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Source bytes the highlighter's queries don't capture (whitespace, gaps in sparse grammars) now take the theme's own code foreground: under Gruvbox or Dracula those bytes rendered in cold Base16 slate beside cream-colored tokens. The same fix covers unhighlighted fenced code in the Markdown preview.",
+        summary: "Terminal timestamps survive pagers and long sessions: entering git log, vim, or htop used to erase every arrival time and re-stamp the whole scrollback with the exit time, any multi-line progress redraw wiped the gutter, and panes past their scrollback depth froze to wrong times. Stamps now ride the same scroll clock as selections.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The Markdown preview recolors immediately on a theme switch: it bakes its colors at build time and was previously rebuilt only on edits, so it kept the old theme's headings, links, and code colors until the file was touched or the preview was reopened.",
+        summary: "Terminal annotations stay glued to their text: a note typed while output streamed used to land rows below the selected line, and in panes past their scrollback depth the amber span froze in place while content slid underneath. Notes now anchor where the prompt opened and follow content like selections do.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Image, PDF, CSV, and diff tabs follow the theme on Ghostty and Kitty: their canvases painted the reset background to inherit an iTerm2 session color those terminals ignore, leaving host-black islands inside an otherwise themed frame.",
+        summary: "Copy-mode keys continue from where the highlight is: with output streaming, each keypress used to teleport the selection back to stale coordinates while the pane had re-anchored it to the content in view.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "The pinned command header no longer corrupts the screen when the command spans several rows (a heredoc newline, a wrap shown in a widened pane): the row join printed a raw newline byte into the frame. Clicking an annotated note also no longer leaves a stray one-cell highlight behind.",
     },
 ];
