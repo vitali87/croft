@@ -11471,13 +11471,22 @@ mod tests {
     fn reopening_with_an_encoding_clears_both_history_stacks() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("enc.txt");
-        std::fs::write(&path, "plain\n").unwrap();
+        // 0xC2 0xA2 decodes to one char as UTF-8 ("\u{a2}") and two as
+        // Windows-1252 ("\u{c2}\u{a2}"), so the assertions below prove the
+        // buffer really was re-decoded, not merely re-read.
+        std::fs::write(&path, [0xC2_u8, 0xA2, b'\n']).unwrap();
         let mut e = Editor::new();
         e.open(&path).unwrap();
+        assert_eq!(e.lines, vec!["\u{a2}".to_string()], "staging: UTF-8 decode");
         e.insert_char('x');
         assert!(e.undo());
-        assert_eq!(e.lines, vec!["plain".to_string()], "staging: edit undone");
+        assert_eq!(e.lines, vec!["\u{a2}".to_string()], "staging: edit undone");
         e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
+        assert_eq!(
+            e.lines,
+            vec!["\u{c2}\u{a2}".to_string()],
+            "the buffer holds the Windows-1252 decode"
+        );
         assert!(
             !e.redo(),
             "redo must not resurrect the buffer decoded under the old encoding"
@@ -11486,7 +11495,7 @@ mod tests {
             !e.undo(),
             "undo history from before the re-decode is equally stale"
         );
-        assert_eq!(e.lines, vec!["plain".to_string()]);
+        assert_eq!(e.lines, vec!["\u{c2}\u{a2}".to_string()]);
     }
 
     #[test]

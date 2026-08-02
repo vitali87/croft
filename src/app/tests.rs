@@ -23285,6 +23285,41 @@ fn terminal_find_navigation_survives_streaming_output() {
     );
 }
 
+/// Clearing a pane invalidates find's whole world: the anchored match
+/// names content that no longer exists (and the clear can kill the scroll
+/// clock's tracer), so the anchor and active highlight must drop and the
+/// match count must honestly read zero instead of navigation walking from
+/// a phantom position over the emptied grid.
+#[test]
+fn clearing_a_pane_resets_its_find_anchor_and_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.terminals[0].feed_bytes_for_test(b"\r\nmatch-a\r\nmatch-b\r\n");
+    app.handle_terminal_key(key(KeyCode::Char('f'), KeyModifiers::SUPER));
+    for c in "match".chars() {
+        app.handle_terminal_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert!(
+        app.terminal_find_match.is_some(),
+        "staging: an anchored match exists"
+    );
+    assert!(
+        app.terminal_find.as_ref().unwrap().match_count > 0,
+        "staging: matches counted"
+    );
+    app.clear_terminal_at(0);
+    assert!(
+        app.terminal_find_match.is_none(),
+        "the cleared grid must drop the stale anchor"
+    );
+    assert_eq!(
+        app.terminal_find.as_ref().unwrap().match_count,
+        0,
+        "the match count must reflect the emptied grid"
+    );
+}
+
 /// Terminal find is bound to the pane it opened on: a gesture that
 /// activates a sibling pane must close it AND clear the highlight on the
 /// pane that owned it. Closing against the newly active pane instead left

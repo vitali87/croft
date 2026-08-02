@@ -80,4 +80,8 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
         kind: NoteKind::Fix,
         summary: "Reopen with Encoding clears the undo/redo history: a redo after re-decoding could silently reinstate the whole buffer as decoded under the previous encoding.",
     },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Clearing a terminal truly empties its scrollback now: the erase order used to slide the cleared screen contents into scrollback, still reachable by scrolling up.",
+    },
 ];

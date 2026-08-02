@@ -9531,6 +9531,23 @@ impl App {
     fn clear_terminal_at(&mut self, idx: usize) {
         if let Some(t) = self.terminals.get_mut(idx) {
             t.clear_screen_and_scrollback();
+            // The cleared grid invalidates find's state on this pane: the
+            // anchored match names content that no longer exists (and the
+            // clear can kill the scroll clock's tracer), so navigation
+            // restarts from scratch and the count reflects the empty grid.
+            if self.terminal_find.is_some() && self.terminal_find_pane == idx {
+                self.terminal_find_match = None;
+                self.terminals[idx].set_current_match(None, 0);
+                let (lines, _top) = self.terminals[idx].grid_lines();
+                if let Some(state) = self.terminal_find.as_mut() {
+                    state.match_count = crate::widgets::editor_find::count_matches(
+                        &lines,
+                        &state.query,
+                        state.opts,
+                    );
+                    state.match_index = None;
+                }
+            }
             self.status = String::from("Cleared terminal");
         }
     }

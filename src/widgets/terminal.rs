@@ -2980,7 +2980,11 @@ impl PtyTerminal {
         let mut processor = Processor::<StdSyncHandler>::new();
         {
             let mut term = self.term.lock();
-            processor.advance(&mut *term, b"\x1b[3J\x1b[2J\x1b[H");
+            // ED 2 BEFORE ED 3 (xterm.js / VS Code's clear() order):
+            // alacritty's primary-screen ED 2 scrolls the viewport INTO
+            // history rather than blanking in place, so erasing history
+            // first would leave the "cleared" rows alive in scrollback.
+            processor.advance(&mut *term, b"\x1b[2J\x1b[3J\x1b[H");
             term.scroll_display(Scroll::Bottom);
         }
         // The content the images and OSC 133 marks anchored to is gone;
