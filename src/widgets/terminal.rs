@@ -1725,9 +1725,15 @@ impl PtyTerminal {
     }
 
     /// The annotation index + note under screen cell (col, row), if any.
+    /// Annotations live on the primary screen; while an alt-screen app owns
+    /// the viewport their lines describe rows the user cannot see, so no
+    /// cell resolves.
     pub fn annotation_at(&self, col: u16, row: u16) -> Option<(usize, String)> {
         let (vr, vc) = self.cell_at(col, row)?;
         let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
         let off = term.grid().display_offset() as i32;
         let now = self.clock_now(&term);
         drop(term);
@@ -2307,6 +2313,41 @@ impl PtyTerminal {
         let term = self.term.lock();
         let p = term.grid().cursor.point;
         (p.line.0, p.column.0 as u16)
+    }
+
+    /// The drift-corrected selection together with the scroll-clock reading
+    /// it is valid against, from ONE terminal snapshot. Callers that pair a
+    /// grid coordinate with a clock (the annotation prompt) must use this:
+    /// reading them through separate locks lets PTY output land in between,
+    /// pairing a pre-output line with a post-output clock and anchoring to
+    /// the wrong content row.
+    pub fn selection_and_clock(&mut self) -> (Option<Selection>, i64) {
+        let mut term = self.term.lock();
+        let now = self.clock.lock().unwrap().tick(&mut term);
+        let sel = self.selection.map(|mut s| {
+            let delta = (now - self.sel_scrolled) as i32;
+            s.anchor.0 -= delta;
+            s.head.0 -= delta;
+            s
+        });
+        (sel, now)
+    }
+
+    /// Cursor cell, grid bounds, and the scroll-clock reading from ONE
+    /// terminal snapshot (copy mode's open — same atomicity argument as
+    /// [`Self::selection_and_clock`]).
+    #[allow(clippy::type_complexity)]
+    pub fn cursor_bounds_and_clock(&mut self) -> ((i32, u16), (i32, i32, u16, u16), i64) {
+        let mut term = self.term.lock();
+        let now = self.clock.lock().unwrap().tick(&mut term);
+        let p = term.grid().cursor.point;
+        let top = term.grid().topmost_line().0;
+        let bottom = term.screen_lines() as i32 - 1;
+        (
+            (p.line.0, p.column.0 as u16),
+            (top, bottom, self.cols, self.rows),
+            now,
+        )
     }
 
     /// One grid row as spacer-skipped text plus its char-index → grid-column
@@ -3022,19 +3063,24 @@ impl Widget for &mut PtyTerminal {
         let term = self.term.lock();
         // Annotation spans at their current grid lines, translated by the
         // scroll clock (same anchor as selections — history growth
-        // saturates and froze these in long-lived panes).
-        let ann_now = self.clock_now(&term);
-        let ann_spans: Vec<(i32, u16, u16)> = self
-            .annotations
-            .iter()
-            .map(|a| {
-                (
-                    a.line_rec - (ann_now - a.clock_rec) as i32,
-                    a.start,
-                    a.len,
-                )
-            })
-            .collect();
+        // saturates and froze these in long-lived panes). None while an
+        // alt-screen app owns the viewport: the spans name primary-screen
+        // rows, and painting them over vim/htop content is chart junk.
+        let ann_spans: Vec<(i32, u16, u16)> = if term.mode().contains(TermMode::ALT_SCREEN) {
+            Vec::new()
+        } else {
+            let ann_now = self.clock_now(&term);
+            self.annotations
+                .iter()
+                .map(|a| {
+                    (
+                        a.line_rec - (ann_now - a.clock_rec) as i32,
+                        a.start,
+                        a.len,
+                    )
+                })
+                .collect()
+        };
         let display_offset = term.grid().display_offset();
         let cursor_visible = term.mode().contains(TermMode::SHOW_CURSOR) && self.focused;
         let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
@@ -5727,6 +5773,38 @@ mod tests {
         assert!(
             max2 >= max1 + 100,
             "row ids must keep advancing after saturation (got {max1} then {max2})"
+        );
+    }
+
+    /// Annotations name PRIMARY-screen rows; while vim/htop own the
+    /// viewport the same line numbers describe unrelated alternate-grid
+    /// content, so neither the amber paint nor click hit-testing may
+    /// resolve there — and both come back when the app exits.
+    #[test]
+    fn annotations_hide_while_an_alt_screen_app_owns_the_viewport() {
+        let (_tmp, mut t) = quiet_pty();
+        t.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        feed_pty(&t, b"annotated content row\r\n");
+        let clock = t.scroll_clock();
+        t.add_annotation(0, clock, 0, 15, String::from("note"));
+        assert!(
+            t.annotation_at(3, 0).is_some(),
+            "the note resolves on the primary screen"
+        );
+        feed_pty(&t, b"\x1b[?1049h\x1b[Hvim-owns-this-screen");
+        assert!(
+            t.annotation_at(3, 0).is_none(),
+            "no hit while the alternate screen is up"
+        );
+        feed_pty(&t, b"\x1b[?1049l");
+        assert!(
+            t.annotation_at(3, 0).is_some(),
+            "back on the primary screen the note resolves again"
         );
     }
 

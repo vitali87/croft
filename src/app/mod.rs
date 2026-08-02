@@ -9505,7 +9505,11 @@ impl App {
     /// annotation, the prompt edits that note instead.
     fn begin_annotate_terminal(&mut self) {
         let pane = self.active_terminal;
-        let Some(sel) = self.terminals[pane].selection().filter(|s| s.has_area()) else {
+        // Selection and clock from ONE snapshot: separate reads let PTY
+        // output land in between, pairing a pre-output line with a
+        // post-output clock and pinning the note to the wrong row.
+        let (sel, clock) = self.terminals[pane].selection_and_clock();
+        let Some(sel) = sel.filter(|s| s.has_area()) else {
             self.status = String::from("Annotate: select some output first (drag or copy mode)");
             return;
         };
@@ -9520,7 +9524,6 @@ impl App {
         let buffer = existing
             .and_then(|i| current.get(i).map(|a| a.3.clone()))
             .unwrap_or_default();
-        let clock = self.terminals[pane].scroll_clock();
         self.prompt = Some(Prompt {
             label: String::from("Annotate Selection"),
             buffer,
@@ -23774,12 +23777,12 @@ impl App {
     /// at the shell's cursor cell (WezTerm's convention) and the pane paints
     /// it as a green modal block.
     fn open_terminal_copy_mode(&mut self) {
-        let t = self.terminal();
-        let (line, col) = t.cursor_line_col();
-        let (top, bottom, cols, _) = t.grid_bounds();
+        // Cursor, bounds, and clock from ONE snapshot (see
+        // `begin_annotate_terminal` for why the pairing must be atomic).
+        let ((line, col), (top, bottom, cols, _), clock) =
+            self.terminal_mut().cursor_bounds_and_clock();
         let line = line.clamp(top, bottom);
         let col = col.min(cols.saturating_sub(1));
-        let clock = self.terminal_mut().scroll_clock();
         self.terminal_mut().set_copy_cursor(Some((line, col)));
         self.terminal_copy_mode = Some(CopyModeState {
             line,
