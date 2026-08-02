@@ -62,22 +62,26 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Copying a soft-wrapped line yields one logical line: selections, the durable command history, and the pinned command header used to join wrapped rows with a newline, so a long stored command re-ran only its first fragment when typed back from the history popup.",
+        summary: "An imgcat picture rides the scrollback in long-lived panes: once the 5000-line history saturated, the anchor froze onto a viewport row and the picture sat on top of every later command's output.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Clicking a CAPTURES row finds its line in panes narrower than the captured text: the jump matched a fixed 60-character prefix against grid rows bounded by the pane width, so narrow splits (and wide-glyph lines) always reported the line missing.",
+        summary: "Clearing a pane clears its pictures too: the pane's Clear (and a program-emitted scrollback wipe, e.g. typing clear) used to leave the captured image floating over the fresh prompt.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Copy mode is bound to the pane it opened on: clicking a sibling pane now leaves the mode, where it used to keep a stale cursor on the old pane and paint a garbage selection onto the new one on the next keypress. vim's e motion also wraps to the next row like w and b instead of dying at a row's last word.",
+        summary: "Scrolling under an inline image is smooth: every scrolled row used to re-decode and re-resize the full photo on the render thread, stalling the UI during fast output.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A tiny host window can no longer crash croft: the command-history popup (and two sibling popups) inverted their size clamps below 40x10, and a pane squeezed to a sliver panicked inside the terminal engine's resize.",
+        summary: "On Ghostty/Kitty the terminal picture and the source-control badge no longer evict each other: both overlays shared one Kitty image id, so the badge's 2-second keepalive and the picture's re-emit kept replacing one another.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Command history distinguishes machines: a command run over an in-pane SSH session at /some/path no longer shows up in the directory-scoped history of a local pane sitting at the same path.",
+        summary: "The pane's right-click menu stays readable over a picture: the image now sits below text on Kitty and yields to the open menu on iTerm2/Sixel, matching the editor preview.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Shift+End reaches full-screen programs again: in the alternate screen it was swallowed by the scrollback reset while Shift+Home, Shift+PageUp and Shift+PageDown correctly fell through.",
     },
 ];

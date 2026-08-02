@@ -580,12 +580,19 @@ pub fn fit_image(
 /// Same as `fit_image` but accepts any format `image` can decode (PNG,
 /// JPEG, GIF first frame, BMP, WebP). Bakes the result back to a PNG sized
 /// to the supplied canvas with `bg` as the letterbox fill.
+/// Test-only counter of full [`fit_image_auto`] bakes, so tests can pin
+/// that a pure anchor move does not re-decode a photo per scrolled row.
+#[cfg(test)]
+pub static FIT_IMAGE_BAKES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub fn fit_image_auto(
     src: &[u8],
     canvas_w_px: u32,
     canvas_h_px: u32,
     bg: Rgba<u8>,
 ) -> Result<Vec<u8>, image::ImageError> {
+    #[cfg(test)]
+    FIT_IMAGE_BAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let img = image::load_from_memory(src)?.to_rgba8();
     let (sw, sh) = (img.width(), img.height());
     let scale = f64::min(
@@ -940,8 +947,6 @@ pub const KITTY_ID_LAYOUT_SIDEBAR: u32 = KITTY_ID_BASE + 15;
 pub const KITTY_ID_LAYOUT_PANEL: u32 = KITTY_ID_BASE + 16;
 pub const KITTY_ID_LAYOUT_CUSTOMIZE: u32 = KITTY_ID_BASE + 17;
 pub const KITTY_ID_MINIMAP: u32 = KITTY_ID_BASE + 18;
-/// The active terminal pane's newest captured inline image (imgcat).
-pub const KITTY_ID_TERMINAL: u32 = KITTY_ID_BASE + 19;
 /// Source-control change-count badge, emitted at z=1 over the SCM icon.
 pub const KITTY_ID_SCM_BADGE: u32 = KITTY_ID_BASE + 19;
 /// Explorer unsaved-file count badge, emitted at z=1 over the Explorer icon.
@@ -953,6 +958,10 @@ pub const KITTY_ID_TESTING: u32 = KITTY_ID_BASE + 22;
 pub const KITTY_ID_TESTING_BADGE: u32 = KITTY_ID_BASE + 23;
 /// PROBLEMS panel-tab count badge: an orange circle emitted after the label.
 pub const KITTY_ID_PROBLEMS_BADGE: u32 = KITTY_ID_BASE + 24;
+/// The active terminal pane's newest captured inline image (imgcat). It once
+/// shared +19 with the SCM badge, whose 2s keepalive and the picture's
+/// per-frame re-emit then evicted each other's placement in turn.
+pub const KITTY_ID_TERMINAL: u32 = KITTY_ID_BASE + 25;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it
@@ -987,6 +996,45 @@ mod tests {
     #[test]
     fn iterm_app_is_iterm2() {
         assert!(is_iterm2_term_program(Some("iTerm.app")));
+    }
+
+    /// Every fixed Kitty image id owns exactly one placement: two overlays
+    /// sharing an id replace each other's placement on every re-transmit
+    /// (the terminal pane picture once evicted the SCM badge and vice
+    /// versa, 2s keepalive against per-frame re-emit).
+    #[test]
+    fn kitty_image_ids_are_pairwise_distinct() {
+        let ids = [
+            ("EXPLORER", KITTY_ID_EXPLORER),
+            ("SEARCH", KITTY_ID_SEARCH),
+            ("SOURCE_CONTROL", KITTY_ID_SOURCE_CONTROL),
+            ("REMOTE", KITTY_ID_REMOTE),
+            ("RUN_DEBUG_BAR", KITTY_ID_RUN_DEBUG_BAR),
+            ("SETTINGS", KITTY_ID_SETTINGS),
+            ("RUN_DEBUG_PANEL", KITTY_ID_RUN_DEBUG_PANEL),
+            ("HERO", KITTY_ID_HERO),
+            ("SSH", KITTY_ID_SSH),
+            ("WELCOME", KITTY_ID_WELCOME),
+            ("EDITOR_LEFT", KITTY_ID_EDITOR_BASE),
+            ("EDITOR_RIGHT", KITTY_ID_EDITOR_BASE + 1),
+            ("EXTENSIONS", KITTY_ID_EXTENSIONS),
+            ("LAYOUT_SIDEBAR", KITTY_ID_LAYOUT_SIDEBAR),
+            ("LAYOUT_PANEL", KITTY_ID_LAYOUT_PANEL),
+            ("LAYOUT_CUSTOMIZE", KITTY_ID_LAYOUT_CUSTOMIZE),
+            ("MINIMAP", KITTY_ID_MINIMAP),
+            ("TERMINAL", KITTY_ID_TERMINAL),
+            ("SCM_BADGE", KITTY_ID_SCM_BADGE),
+            ("EXPLORER_BADGE", KITTY_ID_EXPLORER_BADGE),
+            ("REMOTE_BADGE", KITTY_ID_REMOTE_BADGE),
+            ("TESTING", KITTY_ID_TESTING),
+            ("TESTING_BADGE", KITTY_ID_TESTING_BADGE),
+            ("PROBLEMS_BADGE", KITTY_ID_PROBLEMS_BADGE),
+        ];
+        for (i, (an, a)) in ids.iter().enumerate() {
+            for (bn, b) in &ids[i + 1..] {
+                assert_ne!(a, b, "{an} and {bn} share Kitty image id {a:#x}");
+            }
+        }
     }
 
     #[test]
