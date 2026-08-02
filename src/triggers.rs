@@ -351,15 +351,19 @@ impl TriggerScanner {
                 ScanState::InString => match b {
                     0x07 => self.state = ScanState::Ground,
                     0x1b => self.state = ScanState::StringEsc,
+                    // CAN/SUB abort the control string (ECMA-48); staying
+                    // in-string would swallow ordinary output and the alt
+                    // boundary until an unrelated BEL/ST.
+                    0x18 | 0x1a => self.state = ScanState::Ground,
                     _ => {}
                 },
                 ScanState::StringEsc => {
-                    // `ESC \` (ST) ends the string; anything else is still
-                    // string body.
-                    self.state = if b == b'\\' {
-                        ScanState::Ground
-                    } else {
-                        ScanState::InString
+                    // `ESC \` (ST) ends the string; CAN/SUB abort it;
+                    // anything else is still string body.
+                    self.state = match b {
+                        b'\\' => ScanState::Ground,
+                        0x18 | 0x1a => ScanState::Ground,
+                        _ => ScanState::InString,
                     };
                 }
             }
@@ -557,6 +561,39 @@ mod tests {
         // An ESC inside an incomplete CSI begins a NEW escape sequence.
         sc.scan(b"\x1b[12\x1b[?1049hSECRET\n\x1b[?1049l", &s, &mut out);
         assert!(out.is_empty(), "ESC-in-CSI ate the alt entry: {out:?}");
+    }
+
+    /// CAN/SUB abort control strings too (ECMA-48): an unterminated OSC /
+    /// DCS / APC / PM / SOS cancelled by CAN or SUB used to keep the
+    /// scanner in its string state, swallowing ordinary output and the
+    /// alt-screen boundary until some unrelated BEL/ST arrived.
+    #[test]
+    fn can_and_sub_cancel_an_unterminated_control_string() {
+        let s = set(
+            r##"[ { "regex": "PRIMARY OK", "action": "notify" }, { "regex": "SECRET", "action": "notify" } ]"##,
+        );
+        for intro in [b"\x1b]".as_slice(), b"\x1bP", b"\x1b_", b"\x1b^", b"\x1bX"] {
+            for cancel in [0x18u8, 0x1a] {
+                let mut sc = TriggerScanner::new();
+                let mut out = Vec::new();
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(intro);
+                bytes.extend_from_slice(b"unterminated-body");
+                bytes.push(cancel);
+                bytes.extend_from_slice(b"PRIMARY OK\n\x1b[?1049hSECRET\n\x1b[?1049l");
+                sc.scan(&bytes, &s, &mut out);
+                assert_eq!(
+                    out.len(),
+                    1,
+                    "intro {intro:?} cancel {cancel:#x}: the cancelled string must \
+                     release the scanner: {out:?}"
+                );
+                assert_eq!(
+                    out[0].line, "PRIMARY OK",
+                    "intro {intro:?} cancel {cancel:#x}"
+                );
+            }
+        }
     }
 
     #[test]
