@@ -9517,7 +9517,10 @@ impl App {
         let (_, _, cols, _) = self.terminals[pane].grid_bounds();
         let end = if er > sr { cols.saturating_sub(1) } else { ec };
         let (start, len) = (sc, end.saturating_sub(sc) + 1);
-        let current = self.terminals[pane].annotations_current();
+        // Translate the existing annotations at the SAME captured clock as
+        // the selection, or output scrolling in between shifts them off the
+        // fixed `sr` and the same span duplicates instead of editing.
+        let current = self.terminals[pane].annotations_at_clock(clock);
         let existing = current
             .iter()
             .position(|&(l, s0, ln, _)| l == sr && s0 < start + len && start < s0 + ln);

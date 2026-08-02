@@ -1724,6 +1724,29 @@ impl PtyTerminal {
             .collect()
     }
 
+    /// Every annotation translated against an EXPLICIT clock reading — the
+    /// caller's own snapshot — as `(line, start, len, text)`. The
+    /// existing-note lookup in the annotate prompt compares these lines
+    /// against a selection captured WITH that reading; translating with a
+    /// fresh (later) clock instead let output that scrolled in between
+    /// shift the annotations away from the still-fixed selection line, so
+    /// annotating the same span opened an empty prompt and duplicated the
+    /// note. Pure translation: the scrolled-off GC stays in
+    /// [`Self::annotations_current`].
+    pub fn annotations_at_clock(&self, clock: i64) -> Vec<(i32, u16, u16, String)> {
+        self.annotations
+            .iter()
+            .map(|a| {
+                (
+                    a.line_rec - (clock - a.clock_rec) as i32,
+                    a.start,
+                    a.len,
+                    a.text.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// The annotation index + note under screen cell (col, row), if any.
     /// Annotations live on the primary screen; while an alt-screen app owns
     /// the viewport their lines describe rows the user cannot see, so no
@@ -5773,6 +5796,32 @@ mod tests {
         assert!(
             max2 >= max1 + 100,
             "row ids must keep advancing after saturation (got {max1} then {max2})"
+        );
+    }
+
+    /// The annotate prompt's existing-note lookup compares the selection
+    /// line captured at snapshot time against annotation lines; both must
+    /// translate at the SAME clock reading, or output scrolling between the
+    /// capture and the lookup shifts the annotations away from the fixed
+    /// selection line and the same span duplicates instead of editing.
+    #[test]
+    fn annotation_lookup_translates_at_the_callers_clock() {
+        let (_tmp, mut t) = quiet_pty();
+        feed_pty(&t, b"existing span\r\n");
+        let clock = t.scroll_clock();
+        t.add_annotation(0, clock, 0, 13, String::from("existing note"));
+        // The prompt captures selection + clock in one snapshot...
+        let (_, snap_clock) = t.selection_and_clock();
+        // ...then 30 rows land before the existing-note lookup runs.
+        let mut fill = String::new();
+        for i in 0..30 {
+            fill.push_str(&format!("late-{i}\r\n"));
+        }
+        feed_pty(&t, fill.as_bytes());
+        let cur = t.annotations_at_clock(snap_clock);
+        assert_eq!(
+            cur[0].0, 0,
+            "translated at the captured clock, the note still names the captured line"
         );
     }
 
