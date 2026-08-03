@@ -18464,7 +18464,10 @@ fn auto_save_surfaces_a_disk_conflict_instead_of_latching_silently() {
         .unwrap();
     std::fs::write(tmp.path().join("a.txt"), "external change wins\n").unwrap();
     age_last_edit(&mut app.editor);
-    app.tick_auto_save();
+    assert!(
+        app.tick_auto_save(),
+        "a conflict-only tick must signal a redraw so the prompt shows now, not on the next blink"
+    );
     assert!(app.editor.disk_conflict, "the conflict latches");
     assert!(
         app.input_prompt.is_some() || app.status.to_lowercase().contains("conflict"),

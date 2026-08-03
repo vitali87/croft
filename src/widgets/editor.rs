@@ -1453,8 +1453,11 @@ pub struct Editor {
     pub pdf_viewer_enabled: bool,
     pub csv_viewer_enabled: bool,
     pub dirty: bool,
-    /// Bumped on every buffer<->disk sync (save, load, reload). Undo
-    /// snapshots record it so a restore across a save point re-dirties.
+    /// Bumped on every SAVE (`mark_synced_with_disk`, reached only from
+    /// `write_buffer_to_disk`). Undo snapshots record it so a restore across
+    /// a save point re-dirties. Load/reload paths do not bump it; they clear
+    /// the undo stacks instead, so no stale snapshot can span them — a
+    /// change that preserves undo history across a reload must bump it too.
     save_seq: u64,
     pub status: String,
     pub last_area: Rect,

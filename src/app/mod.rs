@@ -27342,15 +27342,21 @@ impl App {
         for group in self.editor_layout.inactive_groups_mut() {
             sweep(&mut group.editors);
         }
-        if !conflicted.is_empty() {
+        let had_conflicts = !conflicted.is_empty();
+        if had_conflicts {
             self.prompt_disk_conflict(conflicted);
         }
         if saved_paths.is_empty() {
-            return false;
+            // A conflict-only tick still changed the UI (the prompt is up):
+            // returning false would defer it to the next incidental redraw.
+            return had_conflicts;
         }
         // Mirror the explicit-save path: a config file written by auto save
-        // must take effect exactly like one written by Cmd+S.
-        self.reload_config_if_needed();
+        // must take effect exactly like one written by Cmd+S — including one
+        // saved in a background tab or an inactive split.
+        for path in &saved_paths {
+            self.reload_config_for_path(path);
+        }
         if let Some(lsp) = self.lsp.as_ref() {
             for path in &saved_paths {
                 lsp.save_doc(path.clone());
@@ -27476,16 +27482,23 @@ impl App {
         let Some(path) = self.editor.path.clone() else {
             return;
         };
+        self.reload_config_for_path(&path);
+    }
+
+    /// Reload whichever of croft's own config files `path` is, if any.
+    /// Shared by the explicit-save path (active tab) and the auto-save
+    /// sweep (every written tab, background and inactive splits included).
+    fn reload_config_for_path(&mut self, path: &std::path::Path) {
         if path == crate::keymap::keybindings_path() {
-            self.keymap = crate::keymap::Keymap::load(&path);
+            self.keymap = crate::keymap::Keymap::load(path);
             self.status = String::from(
                 "Keybindings reloaded (for new Cmd chords, re-run croft setup-iterm2 / setup-ghostty)",
             );
         } else if path == crate::snippets::snippets_path() {
-            self.snippets = crate::snippets::SnippetSet::load(&path);
+            self.snippets = crate::snippets::SnippetSet::load(path);
             self.status = String::from("Snippets reloaded");
         } else if path == crate::triggers::triggers_path() {
-            self.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::load(&path));
+            self.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::load(path));
             self.status = format!(
                 "Triggers reloaded ({} active)",
                 self.triggers.triggers.len()
