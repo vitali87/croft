@@ -53,18 +53,15 @@ impl WorkspaceSymbolPicker {
         }
     }
 
-    /// Install the newest reply's rows, clamping the selection.
+    /// Install the newest reply's rows. Every reply answers a different
+    /// query (stale ones are dropped upstream), so the selection restarts
+    /// at the top: keeping row 5 of the previous set would hand Enter a
+    /// symbol the user never picked.
     pub fn set_results(&mut self, results: Vec<WorkspaceSymbolItem>) {
         self.results = results;
         self.loading = false;
-        if self.results.is_empty() {
-            self.selected = 0;
-        } else if self.selected >= self.results.len() {
-            self.selected = self.results.len() - 1;
-        }
-        if self.scroll > self.selected {
-            self.scroll = self.selected;
-        }
+        self.selected = 0;
+        self.scroll = 0;
     }
 
     /// The selected row's jump target.
@@ -348,6 +345,17 @@ mod tests {
             character: 0,
             container: None,
         }
+    }
+
+    #[test]
+    fn a_new_result_set_resets_the_selection_to_the_top() {
+        // Arrow to row 5, type another character: the reply is a different
+        // result set, and Enter must not land on row 5 of it.
+        let mut p = WorkspaceSymbolPicker::new(PathBuf::from("/w"), "");
+        p.set_results((0..10).map(|i| item(&format!("a{i}"), "a.rs")).collect());
+        p.selected = 5;
+        p.set_results((0..10).map(|i| item(&format!("b{i}"), "b.rs")).collect());
+        assert_eq!(p.selected, 0, "a fresh reply starts at the top");
     }
 
     #[test]

@@ -30,6 +30,10 @@ pub struct Task {
     pub command: String,
     pub source: String,
     pub is_build: bool,
+    /// tasks.json `group.isDefault` — the one task VS Code's Run Build
+    /// Task executes when several carry the build group. Always false for
+    /// convention-derived sources (Makefile, Cargo, …).
+    pub is_default: bool,
 }
 
 /// Every task the workspace's manifests declare, in source priority
@@ -46,10 +50,14 @@ pub fn discover_tasks(root: &Path) -> Vec<Task> {
     dedup(out)
 }
 
-/// The task `Cmd+Shift+B` runs: the first build-flagged task in source
-/// priority order.
+/// The task `Cmd+Shift+B` runs: the explicit `isDefault` build task when
+/// one is declared, else the first build-flagged task in source priority
+/// order.
 pub fn default_build_task(tasks: &[Task]) -> Option<&Task> {
-    tasks.iter().find(|t| t.is_build)
+    tasks
+        .iter()
+        .find(|t| t.is_build && t.is_default)
+        .or_else(|| tasks.iter().find(|t| t.is_build))
 }
 
 fn read_first(root: &Path, names: &[&str]) -> Option<String> {
@@ -89,11 +97,17 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
                 Some(g) => g.get("kind").and_then(|k| k.as_str()) == Some("build"),
                 None => false,
             };
+            let is_default = t
+                .get("group")
+                .and_then(|g| g.get("isDefault"))
+                .and_then(|d| d.as_bool())
+                .unwrap_or(false);
             Some(Task {
                 label,
                 command: line,
                 source: "tasks.json".to_string(),
                 is_build,
+                is_default,
             })
         })
         .collect()
@@ -131,6 +145,7 @@ fn makefile_tasks(root: &Path) -> Vec<Task> {
             command: format!("make {name}"),
             source: "Makefile".to_string(),
             is_build: name == "build" || name == "all",
+            is_default: false,
         });
     }
     out
@@ -166,6 +181,7 @@ fn justfile_tasks(root: &Path) -> Vec<Task> {
             command: format!("just {name}"),
             source: "justfile".to_string(),
             is_build: name == "build",
+            is_default: false,
         });
     }
     out
@@ -198,6 +214,7 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
             command: format!("{runner} {name}"),
             source: "package.json".to_string(),
             is_build: name == "build",
+            is_default: false,
         })
         .collect()
 }
@@ -218,6 +235,7 @@ fn cargo_tasks(root: &Path) -> Vec<Task> {
         command: cmd.to_string(),
         source: "Cargo.toml".to_string(),
         is_build,
+        is_default: false,
     })
     .collect()
 }
@@ -239,6 +257,7 @@ fn pyproject_tasks(root: &Path) -> Vec<Task> {
                 command: format!("uv run {name}"),
                 source: "pyproject.toml".to_string(),
                 is_build: false,
+                is_default: false,
             });
         }
     }
@@ -248,6 +267,7 @@ fn pyproject_tasks(root: &Path) -> Vec<Task> {
             command: "uv run pytest".to_string(),
             source: "pyproject.toml".to_string(),
             is_build: false,
+            is_default: false,
         });
     }
     out
@@ -463,6 +483,28 @@ mod tests {
         let cmds = commands(tmp.path());
         assert!(cmds.contains(&"uv run serve".to_string()), "{cmds:?}");
         assert!(cmds.contains(&"uv run pytest".to_string()), "{cmds:?}");
+    }
+
+    #[test]
+    fn an_explicit_vscode_default_build_wins_over_an_earlier_build_task() {
+        // Two build-group tasks; only the second carries `isDefault: true`.
+        // VS Code runs the default on Cmd+Shift+B, not the first-listed.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{"tasks":[
+  {"label":"build A","type":"shell","command":"make a","group":"build"},
+  {"label":"build B","type":"shell","command":"make b","group":{"kind":"build","isDefault":true}}
+]}"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            default_build_task(&tasks).unwrap().label,
+            "build B",
+            "the explicit default build outranks the first build-group task"
+        );
     }
 
     #[test]

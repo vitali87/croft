@@ -62,22 +62,26 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Run Test at Cursor no longer crashes croft when no file is open, and when a discovered test has a unique leaf name it runs exactly that test instead of every test whose name contains the same word.",
+        summary: "Stage, unstage, and revert in a Source Control diff act on the hunk you navigated to: a jump or scroll now supersedes an earlier click, so R can no longer revert an off-screen hunk you clicked minutes ago.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Running a suite from its header runs only that suite on every runner: cargo anchors on the module separator, vitest and jest anchor the describe chain, so suite auth no longer sweeps auth-helper tests along.",
+        summary: "Hunk staging works on files without a final newline and on CRLF files: patches carry each line's exact bytes and git's no-newline marker instead of being rejected outright.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A test run that dies before reporting (a compile error, a test renamed since discovery) no longer strands spinning Running dots or hides behind the old tally, even one with a stale failure: the marks roll back and the summary leads with run failed.",
+        summary: "Timeline snapshot diffs no longer offer S/U/R: hunk actions are gated to the real Source Control HEAD diff, so a local-history view can never write snapshot-derived patches into the git index.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Clicking a test's name locates its source on a background thread (a big workspace no longer freezes the UI mid-click), honours .gitignore even outside a git checkout, never jumps into target or node_modules, and works for vitest and jest titles too: the jump prefers the test declaration over a comment that merely mentions the title.",
+        summary: "Rerunning a task into its idle pane clears the shell's half-typed prompt line first, and a pane whose shell still sits in a previous workspace is left alone after Open Folder: the new project's build spawns fresh instead of running in the old directory.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Wide characters in test names clip at the Testing panel's edge instead of painting through the scrollbar and border into the neighbouring pane.",
+        summary: "Cmd+Shift+B honours tasks.json isDefault when several build tasks exist.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Workspace symbol search debounces instead of sending one LSP request per keystroke, keeps the selection on the top result when the query changes, and clears the no-server notice when the query is emptied.",
     },
 ];

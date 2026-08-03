@@ -2691,6 +2691,9 @@ pub struct App {
     pub workspace_symbols: Option<crate::widgets::workspace_symbols::WorkspaceSymbolPicker>,
     /// The newest `workspace/symbol` request id; stale replies are dropped.
     ws_symbols_request_id: Option<u64>,
+    /// Armed by a picker keystroke; `workspace_symbols_dispatch_due` fires
+    /// the request once the query has been still for the debounce window.
+    ws_symbols_pending: Option<std::time::Instant>,
     /// Receiver for an in-flight MCP sidecar command's result (the off-thread
     /// worker delivers one [`crate::mcp::McpOutcome`] then disconnects). `None`
     /// when no extension command is running; polled each frame by `poll_mcp`.
@@ -3696,6 +3699,7 @@ impl App {
             go_to_symbol: None,
             workspace_symbols: None,
             ws_symbols_request_id: None,
+            ws_symbols_pending: None,
             mcp_rx: None,
             mcp_started: None,
             mcp_busy_label: None,
@@ -6812,7 +6816,7 @@ impl App {
                 .unwrap_or(encoding_rs::UTF_8);
             let text = enc.decode(&content).0.into_owned();
             let label = std::path::PathBuf::from(format!("{rel} (local snapshot)"));
-            if let Err(e) = self.editor.open_head_diff_with_text(label, &text, &path) {
+            if let Err(e) = self.editor.open_head_diff_with_text(label, &text, &path, false) {
                 self.status = format!("Could not open snapshot diff: {e}");
                 return;
             }
@@ -15244,7 +15248,7 @@ impl App {
                         let label = std::path::PathBuf::from(format!("{} (HEAD)", entry.path));
                         match self
                             .editor
-                            .open_head_diff_with_text(label, &head_text, &abs)
+                            .open_head_diff_with_text(label, &head_text, &abs, true)
                         {
                             Ok(()) => true,
                             Err(e) => {
@@ -17647,11 +17651,24 @@ impl App {
     /// instead of stacking a new one; a busy pane gets a fresh sibling.
     pub fn run_project_task(&mut self, task: crate::tasks::Task) {
         let pane_name = format!("Task: {}", task.label);
-        let command = format!("{}\r", task.command);
+        // Ctrl-E + Ctrl-U first: the idle shell's line editor may hold a
+        // half-typed command that would otherwise concatenate and run
+        // (same rule `format_cd_command` pins for the cd seed).
+        let command = format!("\x05\x15{}\r", task.command);
         self.last_task = Some(task.clone());
-        if let Some(idx) = self.terminals.iter().position(|t| t.label() == pane_name)
-            && self.terminals[idx].foreground_is_shell()
-        {
+        // Reuse only a pane whose shell still lives under the current
+        // workspace: after a re-root the old pane's label still matches,
+        // and running the new project's build there builds the old one.
+        // An unknown cwd (android, remote) keeps today's reuse.
+        let root = self
+            .workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_root.clone());
+        if let Some(idx) = self.terminals.iter().position(|t| {
+            t.label() == pane_name
+                && t.foreground_is_shell()
+                && t.kernel_shell_cwd().is_none_or(|cwd| cwd.starts_with(&root))
+        }) {
             self.active_terminal = idx;
             self.terminals[idx].write_input(command.as_bytes());
             self.show_terminal = true;
@@ -17903,7 +17920,7 @@ impl App {
         let root = self.tree.root.clone();
         let built = match self.editor.diff.as_ref() {
             None => Err("Hunk actions work inside a Source Control diff"),
-            Some(diff) if diff.unified || diff.left_is_real_file => {
+            Some(diff) if !diff.left_is_git_head => {
                 Err("Hunk actions need a working-tree diff from Source Control")
             }
             Some(diff) => match diff.right_path.strip_prefix(&root) {
@@ -18007,7 +18024,7 @@ impl App {
         };
         if self
             .editor
-            .open_head_diff_with_text(label, &head, &path)
+            .open_head_diff_with_text(label, &head, &path, true)
             .is_ok()
             && let Some(diff) = self.editor.diff.as_mut()
         {
@@ -21672,12 +21689,6 @@ impl App {
         true
     }
 
-    /// Cmd/Ctrl+click on a printed `path:line[:col]` reference (compiler
-    /// errors, test failures, grep hits, tracebacks) jumps the editor
-    /// there. Relative paths resolve against the pane shell's live cwd,
-    /// then the workspace root; `~` against $HOME. The click only lands
-    /// when the resolved file exists, which also filters lookalikes such
-    /// as `host.com:443`.
     /// Seed the Search sidebar from the last `grep`/`rg` command run in the
     /// focused terminal, then run it. The Search panel already has multi-file
     /// replace-all, so this turns a terminal search into an editable,
@@ -21720,6 +21731,12 @@ impl App {
         true
     }
 
+    /// Cmd/Ctrl+click on a printed `path:line[:col]` reference (compiler
+    /// errors, test failures, grep hits, tracebacks) jumps the editor
+    /// there. Relative paths resolve against the pane shell's live cwd,
+    /// then the workspace root; `~` against $HOME. The click only lands
+    /// when the resolved file exists, which also filters lookalikes such
+    /// as `host.com:443`.
     fn terminal_file_click(&mut self, col: u16, row: u16) -> bool {
         let Some((text, c)) = self.terminal().line_text_at(col, row) else {
             return false;
@@ -22449,6 +22466,7 @@ impl App {
     fn close_workspace_symbols(&mut self) {
         if self.workspace_symbols.take().is_some() {
             self.ws_symbols_request_id = None;
+            self.ws_symbols_pending = None;
             self.overlays.command_palette_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
@@ -22458,8 +22476,11 @@ impl App {
         }
     }
 
-    /// Re-send the `workspace/symbol` query for the picker's current text.
-    /// Every call bumps the request id, so only the newest reply applies.
+    /// Note a query change and arm the debounce; the actual LSP request
+    /// fires from [`Self::workspace_symbols_dispatch_due`] once the query
+    /// has been still for the window. Firing per keystroke serialized a
+    /// round trip per character behind the per-client lock, starving every
+    /// other LSP feature on that server for the whole burst.
     fn workspace_symbols_requery(&mut self) {
         let Some(picker) = self.workspace_symbols.as_mut() else {
             return;
@@ -22467,10 +22488,41 @@ impl App {
         let query = picker.query.trim().to_string();
         if query.is_empty() {
             picker.set_results(Vec::new());
+            // A stale notice from the previous reply reads as an error;
+            // an empty query should show the type-to-search hint.
+            picker.unsupported = false;
             self.ws_symbols_request_id = None;
+            self.ws_symbols_pending = None;
             return;
         }
         picker.loading = true;
+        // Invalidate any in-flight request: its reply answers a query the
+        // user has typed past and would render stale results until the
+        // debounced request lands.
+        self.ws_symbols_request_id = None;
+        self.ws_symbols_pending = Some(std::time::Instant::now());
+    }
+
+    /// Debounced dispatch for [`Self::workspace_symbols_requery`]: called
+    /// each tick from the drain loop, sends the newest query once it has
+    /// been still for the window. Only the newest reply applies via
+    /// `ws_symbols_request_id`.
+    fn workspace_symbols_dispatch_due(&mut self) {
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
+        let Some(armed) = self.ws_symbols_pending else {
+            return;
+        };
+        if armed.elapsed() < DEBOUNCE {
+            return;
+        }
+        self.ws_symbols_pending = None;
+        let Some(picker) = self.workspace_symbols.as_mut() else {
+            return;
+        };
+        let query = picker.query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
         let Some(lsp) = self.lsp.as_mut() else {
             if let Some(p) = self.workspace_symbols.as_mut() {
                 p.loading = false;
@@ -27651,6 +27703,9 @@ impl App {
     /// into the old workspace.
     pub fn change_workspace_root(&mut self, new_root: PathBuf) {
         let display = new_root.display().to_string();
+        // The remembered task belongs to the old workspace; Rerun Last Task
+        // must rediscover, not rerun the old project's command here.
+        self.last_task = None;
         let mut shell_synced = true;
         if let Some(active) = self.terminals.get_mut(self.active_terminal) {
             if active.foreground_is_shell() {
@@ -33270,6 +33325,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // edit-seq it reads is current) and advance follow-cursor.
         let outline_sync_changed = app.sync_outline();
         let outline_changed = app.drain_lsp_document_symbols();
+        app.workspace_symbols_dispatch_due();
         let ws_symbols_changed = app.drain_lsp_workspace_symbols();
         // Refresh the Explorer's other stacked sub-views (Open Editors list,
         // Timeline git history, Dependencies) and drain their workers.
