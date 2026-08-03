@@ -18063,6 +18063,81 @@ fn drag_reorders_terminal_panes_and_active_follows_its_terminal() {
 }
 
 #[test]
+fn reordering_panes_defers_the_session_write_off_the_input_path() {
+    // move_terminal runs once per motion report during a drag. A full
+    // read-modify-write of the session file — plus a cwd syscall and a stat
+    // per pane — on each one violates the input-latency invariant, so the
+    // write is marked and flushed once per tick instead.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let _ = std::fs::remove_file(&app.terminal_session_path);
+    app.move_terminal(0, 1);
+    assert!(
+        !app.terminal_session_path.exists(),
+        "the session write must not sit on the input path"
+    );
+    assert!(app.terminal_session_dirty, "the move is recorded as pending");
+    app.flush_terminal_session();
+    assert!(
+        app.terminal_session_path.exists(),
+        "the deferred write lands on the flush"
+    );
+    assert!(!app.terminal_session_dirty);
+}
+
+#[test]
+fn a_drag_held_over_one_pane_does_not_flip_flop_between_frames() {
+    // The main loop drains the whole queued mouse burst before drawing, so
+    // several Drag events land with no redraw between them. Hit-testing
+    // must stay POSITIONAL across a move: `last_area` travels with the
+    // terminal object, so if the rects are not re-seated per slot, the
+    // second event swaps the panes straight back and the final order is
+    // the parity of how many motion reports the terminal happened to emit.
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    for (i, name) in ["one", "two", "three"].iter().enumerate() {
+        app.terminals[i].set_manual_name(Some(name.to_string()));
+    }
+    let backend = ratatui::backend::TestBackend::new(180, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let mouse = |kind, x: u16, y: u16| MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    };
+    let grab = app.terminal_label_rects[0];
+    let dest = app.terminals[1].last_area;
+    let (dx, dy) = (dest.x + dest.width / 2, dest.y + dest.height / 2);
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        grab.x + 1,
+        grab.y,
+    ));
+    // Four motion reports over the same cell, no redraw in between.
+    for _ in 0..4 {
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), dx, dy));
+    }
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), dx, dy));
+    let order: Vec<&str> = app
+        .terminals
+        .iter()
+        .map(|t| t.manual_name().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        order,
+        vec!["two", "one", "three"],
+        "the pane must settle where the pointer is, whatever the event count"
+    );
+}
+
+#[test]
 fn dragging_a_pane_label_and_a_rail_row_reorders_terminals_end_to_end() {
     // Full wiring pass over real hit rects: render a frame, press the first
     // pane's name pill, drag into the third pane, release - the terminal

@@ -12953,6 +12953,37 @@ mod tests {
     }
 
     #[test]
+    fn an_external_reload_moves_the_edit_seq_past_an_in_flight_token_request() {
+        // Semantic-token replies now echo the `edit_seq` their request was
+        // fired for, and the app drops a reply whose seq no longer matches.
+        // That guard is only meaningful while a reload actually MOVES the
+        // seq: drop the bump and a batch computed against the old text
+        // matches again, paints the new buffer at the old offsets, and gets
+        // persisted to the on-disk cache under the new content's key.
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "fn a() {}\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.apply_semantic_tokens(
+            tmp.path().to_path_buf(),
+            vec![0, 0, 2, 0, 0],
+            std::sync::Arc::new(vec!["keyword".to_string()]),
+            true,
+        );
+        let in_flight = e.edit_seq;
+        std::fs::write(tmp.path(), "fn bbbb() {}\nfn c() {}\n").unwrap();
+        e.reload_from_disk().unwrap();
+        assert_ne!(
+            e.edit_seq, in_flight,
+            "a reload must invalidate every in-flight token request"
+        );
+        assert!(
+            e.semantic_data.is_empty(),
+            "and drop the batch measured against the old text"
+        );
+    }
+
+    #[test]
     fn reload_or_flag_conflict_reloads_clean_buffer() {
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "old\n").unwrap();

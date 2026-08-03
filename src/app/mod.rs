@@ -2651,6 +2651,11 @@ pub struct App {
     /// Where the terminal-session snapshot lives
     /// (`terminal_sessions.json`); a field so tests point it at a tempdir.
     pub terminal_session_path: PathBuf,
+    /// A pane reorder is pending a session write. `move_terminal` runs once
+    /// per motion report during a drag, and the write is a full
+    /// read-modify-write of the session file plus a cwd syscall per pane, so
+    /// it is marked here and flushed once per tick instead of inline.
+    pub terminal_session_dirty: bool,
     /// Ctrl+Shift+Y copy mode on the active terminal pane (WezTerm / tmux):
     /// vi keys walk a cursor through the scrollback, v / V / Ctrl+V select,
     /// y copies. None when the mode is off.
@@ -3677,6 +3682,7 @@ impl App {
                 crate::command_history::history_path()
             }),
             command_history_popup: None,
+            terminal_session_dirty: false,
             terminal_session_path: if cfg!(test) {
                 std::env::temp_dir().join(format!(
                     "croft-test-terminal-sessions-{}.json",
@@ -5427,7 +5433,7 @@ impl App {
                 // rest. The editor refuses to let this range batch overwrite
                 // the full one when it arrives.
                 if let Some((start, end)) = viewport {
-                    lsp.request_semantic_tokens_range(path.clone(), start, end);
+                    lsp.request_semantic_tokens_range(path.clone(), start, end, seq);
                 }
             } else {
                 lsp.change_doc(path.clone(), text);
@@ -5435,7 +5441,7 @@ impl App {
             // Refresh the whole document's semantic tokens whenever it is
             // opened or changed. Gated by the same `seq` diff as did_change
             // above, so this fires once per edit-batch, not per keystroke.
-            lsp.request_semantic_tokens(path.clone());
+            lsp.request_semantic_tokens(path.clone(), seq);
             // Same cadence for inlay hints; the reply carries `seq` so a
             // stale batch (computed against older text) is dropped on drain.
             if self.inlay_hints_enabled {
@@ -6179,7 +6185,16 @@ impl App {
         }
         let mut changed = false;
         for u in updates {
-            if self.editor.path.as_deref() == Some(u.path.as_path()) {
+            // Drop a batch measured against text the buffer has moved past —
+            // an external reload swaps the whole document while a request is
+            // still in its retry backoff. Decoding it over the new lines
+            // paints the old file's colours at the wrong offsets, and the
+            // `is_full` cache store below would persist that under the NEW
+            // content's key, replaying it on every future open.
+            let mut applied_anywhere = false;
+            if self.editor.path.as_deref() == Some(u.path.as_path())
+                && self.editor.edit_seq == u.seq
+            {
                 self.editor.apply_semantic_tokens(
                     u.path.clone(),
                     u.data.clone(),
@@ -6187,9 +6202,10 @@ impl App {
                     u.is_full,
                 );
                 changed = true;
+                applied_anywhere = true;
             }
             for group in self.editor_layout.inactive_groups_mut() {
-                if group.path.as_deref() == Some(u.path.as_path()) {
+                if group.path.as_deref() == Some(u.path.as_path()) && group.edit_seq == u.seq {
                     group.apply_semantic_tokens(
                         u.path.clone(),
                         u.data.clone(),
@@ -6197,13 +6213,14 @@ impl App {
                         u.is_full,
                     );
                     changed = true;
+                    applied_anywhere = true;
                 }
             }
             // Persist whole-document batches so the next open of this exact
             // content paints these colours instantly instead of waiting out the
             // server's cold analysis. Only when a visible editor holds the file
             // unchanged, so the cache key matches the bytes the next open reads.
-            if u.is_full {
+            if u.is_full && applied_anywhere {
                 let mut clean_text = (self.editor.path.as_deref() == Some(u.path.as_path()))
                     .then(|| self.editor.clean_cache_text())
                     .flatten();
@@ -6447,8 +6464,10 @@ impl App {
             }
         }
         for p in paths {
-            if self.lsp_last_seen.contains_key(&p) {
-                lsp.request_semantic_tokens(p);
+            // Re-request at the seq the doc was last synced at, so a reply
+            // arriving after an external reload is recognised as stale.
+            if let Some(&seq) = self.lsp_last_seen.get(&p) {
+                lsp.request_semantic_tokens(p, seq);
             }
         }
     }
@@ -9823,15 +9842,35 @@ impl App {
         if from == to || from >= self.terminals.len() || to >= self.terminals.len() {
             return;
         }
+        // `last_area` is a SLOT's geometry, but it lives on the terminal
+        // object and so travels with it. The panes do not actually move on
+        // screen until the next frame, and the drag hit-tests `last_area`
+        // between frames — the main loop drains the whole queued mouse burst
+        // before drawing. Re-seat the rects in slot order so the next motion
+        // report over the same cell resolves to the pane now sitting there
+        // instead of swapping the two straight back, which made the final
+        // order the parity of however many motion reports arrived.
+        let slot_rects: Vec<Rect> = self.terminals.iter().map(|t| t.last_area).collect();
         let t = self.terminals.remove(from);
         self.terminals.insert(to, t);
+        for (term, rect) in self.terminals.iter_mut().zip(slot_rects) {
+            term.last_area = rect;
+        }
         self.active_terminal = match self.active_terminal {
             a if a == from => to,
             a if from < a && a <= to => a - 1,
             a if to <= a && a < from => a + 1,
             a => a,
         };
-        self.save_terminal_session();
+        self.terminal_session_dirty = true;
+    }
+
+    /// Write the pane session if a reorder marked it pending. Called once per
+    /// tick so a drag costs one write instead of one per motion report.
+    pub fn flush_terminal_session(&mut self) {
+        if std::mem::take(&mut self.terminal_session_dirty) {
+            self.save_terminal_session();
+        }
     }
 
     /// Drop the currently-active terminal. Thin wrapper kept for the
@@ -33356,6 +33395,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let collab_changed = app.poll_collab();
         let bells_changed = app.drain_terminal_bells();
         let labels_changed = app.refresh_terminal_labels();
+        app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
