@@ -859,9 +859,14 @@ impl LspManager {
     }
 
     /// Ask the server for the whole document's semantic tokens. Fire this
-    /// on open and (debounced) after edits; the freshest batch wins. No
-    /// request id: results are keyed by path. A no-op for languages whose
-    /// server advertises no `semanticTokensProvider`.
+    /// on open and (debounced) after edits. The reply carries two stamps and
+    /// the app needs both: `seq` identifies the document CONTENT the batch
+    /// was computed against (so a reply that outlived an external reload is
+    /// dropped), while `generation` orders overlapping requests for the same
+    /// path (two can be in flight at one `seq`, and the retry loop emits an
+    /// empty batch once its backoff runs out, so the loser must not win).
+    /// A no-op for languages whose server advertises no
+    /// `semanticTokensProvider`.
     pub fn request_semantic_tokens(&self, path: PathBuf, seq: u64) {
         let generation = self.next_semantic_generation();
         let _ = self.cmd_tx.send(Cmd::RequestSemanticTokens {
