@@ -9858,9 +9858,18 @@ impl App {
             } else {
                 Style::default()
             };
-            frame
-                .buffer_mut()
-                .set_string(row.x, y, format!(" {TERMINAL_RAIL_ICON} {shown}"), fg);
+            // Clip to the rail's OWN width, not the frame's. `rail_w` is
+            // clamped at the call site on a narrow panel, and `set_string`
+            // stops only at the buffer edge — so a full-width label used to
+            // paint its tail over whatever sits right of the panel (the
+            // secondary side bar, which renders earlier and stays overwritten).
+            frame.buffer_mut().set_stringn(
+                row.x,
+                y,
+                format!(" {TERMINAL_RAIL_ICON} {shown}"),
+                row.width as usize,
+                fg,
+            );
             self.terminal_rail_rects.push(row);
         }
     }
@@ -25786,9 +25795,13 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // (H) iTerm2 folds Cmd onto the Meta bit, so Cmd+click arrives as
-                // ALT (Go to Definition) and Cmd+Shift+click as ALT|SHIFT (navigate back).
-                if in_editor && m.modifiers.contains(KeyModifiers::ALT) {
+                // (H) Go to Definition rides CTRL, matching the terminal pane's
+                // file/URL clicks. SGR mouse reporting carries no super bit, so
+                // ALT is left to the editor's Alt+click multi-cursor below.
+                if in_editor
+                    && (m.modifiers.contains(KeyModifiers::CONTROL)
+                        || m.modifiers.contains(KeyModifiers::SUPER))
+                {
                     if m.modifiers.contains(KeyModifiers::SHIFT) {
                         self.nav_back();
                     } else {
