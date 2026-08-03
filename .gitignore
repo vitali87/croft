@@ -46,3 +46,7 @@ preview*.svg
 # Local secrets (Codeberg token, etc.) — never commit
 .env
 .env.*
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore

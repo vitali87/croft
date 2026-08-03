@@ -1853,6 +1853,14 @@ impl PtyTerminal {
         self.osc7_cwd.lock().unwrap().clone()
     }
 
+    /// The kernel-reported cwd of the pane's shell process. Unlike
+    /// [`Self::shell_cwd`] it needs no shell integration, so it answers for
+    /// any local pane; `None` when the pid or the kernel query is
+    /// unavailable (android, a dead shell, a remote pane's ssh process).
+    pub fn kernel_shell_cwd(&self) -> Option<std::path::PathBuf> {
+        cwd_of_pid(u32::try_from(self.shell_pid?).ok()?)
+    }
+
     /// OSC 9 notification payloads since the last drain.
     pub fn drain_notifications(&self) -> Vec<String> {
         std::mem::take(&mut *self.notifications.lock().unwrap())
