@@ -67,12 +67,23 @@ pub fn query(root: &Path) -> GitStatus {
     }
 }
 
-/// The git-ignored paths under `root`, absolute. `--directory` collapses a
-/// fully-ignored directory (e.g. `target/`) to a single entry instead of
-/// enumerating its contents, keeping the set small and the scan cheap;
-/// `-z` NUL-separates so no filename is ever quote-mangled.
+/// The git-ignored paths under `root`, absolute.
+///
+/// Two-step, because neither step alone is correct. `ls-files --directory`
+/// gives a cheap candidate set (a fully-ignored directory collapses to one
+/// entry instead of enumerating `target/`'s thousands of files), but it also
+/// collapses any ENTIRELY UNTRACKED directory whose contents all happen to be
+/// ignored — even when no rule matches the directory itself, so `logs/` shows
+/// up merely because `logs/app.log` is ignored. `check-ignore` then answers
+/// per path, exactly the per-resource question VS Code asks, and only its
+/// verdicts reach the set.
+///
+/// Both calls go through [`git_raw`]: filenames may carry leading or trailing
+/// whitespace (git sorts a leading-space name FIRST, so a blanket `trim()`
+/// eats it) or bytes that are not UTF-8, so the `-z` output is split on NUL
+/// and converted without lossy decoding.
 fn query_ignored(root: &Path) -> HashSet<PathBuf> {
-    let out = run_git(
+    let listed = git_raw(
         root,
         &[
             "ls-files",
@@ -82,12 +93,86 @@ fn query_ignored(root: &Path) -> HashSet<PathBuf> {
             "--directory",
             "--exclude-standard",
         ],
+        None,
     )
     .unwrap_or_default();
-    out.split('\0')
+    let mut stdin = Vec::with_capacity(listed.len());
+    for candidate in listed.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        stdin.extend_from_slice(candidate);
+        stdin.push(0);
+    }
+    if stdin.is_empty() {
+        return HashSet::new();
+    }
+    // check-ignore exits 1 when nothing matches: a verdict, not a failure, so
+    // `git_raw` deliberately does not gate on the exit status.
+    let confirmed = git_raw(root, &["check-ignore", "-z", "--stdin"], Some(&stdin)).unwrap_or_default();
+    confirmed
+        .split(|b| *b == 0)
         .filter(|s| !s.is_empty())
-        .map(|s| root.join(s.trim_end_matches('/')))
+        .map(|raw| join_raw(root, raw))
         .collect()
+}
+
+/// Join a raw `-z` path (trailing `/` stripped) onto `root` without passing
+/// through `str`: a filename is bytes, and on unix it need not be UTF-8.
+fn join_raw(root: &Path, raw: &[u8]) -> PathBuf {
+    let trimmed = raw.strip_suffix(b"/").unwrap_or(raw);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        root.join(std::ffi::OsStr::from_bytes(trimmed))
+    }
+    #[cfg(not(unix))]
+    {
+        root.join(String::from_utf8_lossy(trimmed).as_ref())
+    }
+}
+
+/// Spawn `git` under `root` and hand back stdout as RAW BYTES, optionally
+/// feeding `stdin_data` first. Unlike [`run_git`] this neither trims nor
+/// UTF-8-decodes, and it ignores the exit status — the callers here read
+/// NUL-separated filenames, and `check-ignore` uses exit 1 as an answer.
+fn git_raw(root: &Path, args: &[&str], stdin_data: Option<&[u8]>) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(root)
+        // A read-only poll must never take `index.lock` out from under a user
+        // mutation — same reason `run_git` sets it.
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .stdin(if stdin_data.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
+    let mut child = cmd.spawn().ok()?;
+    // Feed stdin from its OWN thread and read stdout concurrently.
+    // `check-ignore` echoes each match back as it reads, so both pipes fill
+    // on a large set; writing all of stdin before reading a byte of stdout
+    // deadlocks — git blocks writing stdout, stops draining stdin, and the
+    // writer waits forever. Measured threshold on macOS: ~143 KB flows,
+    // ~957 KB blocks.
+    let writer = match stdin_data {
+        Some(data) => {
+            let mut pipe = child.stdin.take()?;
+            let data = data.to_vec();
+            Some(std::thread::spawn(move || {
+                let _ = pipe.write_all(&data);
+                // Dropping the pipe closes it, which is what tells
+                // check-ignore the list is complete.
+            }))
+        }
+        None => None,
+    };
+    let out = child.wait_with_output().ok();
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    Some(out?.stdout)
 }
 
 fn is_git_repo(path: &Path) -> bool {
@@ -1940,6 +2025,89 @@ mod tests {
         );
         assert!(!s.ignored.contains(&p.join("keep.txt")));
         assert!(!s.ignored.contains(&p.join(".gitignore")));
+    }
+
+    #[test]
+    fn a_directory_git_does_not_ignore_is_not_reported_as_ignored() {
+        // `ls-files --directory` collapses any ENTIRELY untracked directory
+        // whose contents all happen to be ignored, even when no rule matches
+        // the directory itself. Reporting it would grey a folder VS Code
+        // paints normally (it asks check-ignore per resource).
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        std::fs::write(p.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::create_dir(p.join("logs")).unwrap();
+        std::fs::write(p.join("logs/app.log"), "").unwrap();
+        let s = query(p);
+        assert!(
+            s.ignored.contains(&p.join("logs/app.log")),
+            "the ignored file itself is still reported"
+        );
+        assert!(
+            !s.ignored.contains(&p.join("logs")),
+            "no rule matches `logs` itself, so it must not be greyed"
+        );
+    }
+
+    #[test]
+    fn git_raw_does_not_deadlock_on_a_payload_past_the_pipe_buffer() {
+        // check-ignore echoes each match back as it reads, so BOTH pipes
+        // fill. Writing all of stdin before reading a byte of stdout
+        // deadlocks once the payload passes the buffer: git blocks writing
+        // stdout, stops draining stdin, and the writer blocks forever.
+        // Measured on this machine: 143 KB flows, 957 KB blocks — so this
+        // uses ~1 MB. On the single-threaded version this test hangs.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        std::fs::write(p.join(".gitignore"), "*.log\n").unwrap();
+        let n = 20_000;
+        let mut payload = Vec::new();
+        for i in 0..n {
+            payload.extend_from_slice(
+                format!("padded-name-to-widen-the-pipe-payload-{i:06}.log").as_bytes(),
+            );
+            payload.push(0);
+        }
+        let out = git_raw(p, &["check-ignore", "-z", "--stdin"], Some(&payload)).unwrap_or_default();
+        let got = out.split(|b| *b == 0).filter(|s| !s.is_empty()).count();
+        assert_eq!(
+            got, n,
+            "every path must come back instead of stalling on a full pipe"
+        );
+    }
+
+    #[test]
+    fn a_filename_with_a_leading_space_is_reported_intact() {
+        // git sorts its output, so a leading-space name comes first — and a
+        // blanket trim() on the NUL-separated blob eats that space, naming a
+        // file that does not exist while the real one stays unmarked.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        std::fs::write(p.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(p.join(" leading.log"), "").unwrap();
+        std::fs::write(p.join("zz.log"), "").unwrap();
+        let s = query(p);
+        assert!(
+            s.ignored.contains(&p.join(" leading.log")),
+            "the leading space belongs to the filename; got {:?}",
+            s.ignored
+        );
+        assert!(s.ignored.contains(&p.join("zz.log")));
     }
 
     #[test]

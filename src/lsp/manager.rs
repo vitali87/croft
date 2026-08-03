@@ -323,14 +323,24 @@ pub struct FormatResult {
 
 /// A fresh batch of semantic tokens for a document, pushed to the editor
 /// to overlay on the tree-sitter highlights. Unlike the navigation
-/// requests this carries no `request_id`: it is keyed by `path` and the
-/// latest batch always wins. `data` is the raw relative-encoded LSP
+/// requests this carries no `request_id`: it is keyed by `path` + `seq`,
+/// and the latest batch for the CURRENT text always wins. `data` is the raw relative-encoded LSP
 /// array; the editor decodes it against its own buffer (where the text
 /// lives) so UTF-16 columns convert to byte offsets correctly. `legend`
 /// maps token-type indices to names.
 #[derive(Debug)]
 pub struct SemanticTokensUpdate {
     pub path: PathBuf,
+    /// Echoes the edit sequence the request was fired for. The app drops a
+    /// reply whose seq no longer matches the buffer — an external reload
+    /// swaps the whole text while a request is still in the retry backoff,
+    /// and decoding that batch over the new lines paints the old file's
+    /// colours at the wrong offsets (and would poison the on-disk cache
+    /// under the NEW content's key). Same guard as `InlayHintsUpdate`.
+    pub seq: u64,
+    /// Monotonic per-request stamp; the app drops a reply older than the
+    /// newest one already applied for this path (see `semantic_generation`).
+    pub generation: u64,
     pub data: Vec<u32>,
     pub legend: Arc<Vec<String>>,
     /// `true` for a whole-document `semanticTokens/full` batch, `false` for a
@@ -473,11 +483,15 @@ enum Cmd {
     },
     RequestSemanticTokens {
         path: PathBuf,
+        seq: u64,
+        generation: u64,
     },
     RequestSemanticTokensRange {
         path: PathBuf,
         start_line: u32,
         end_line: u32,
+        seq: u64,
+        generation: u64,
     },
     RequestInlayHints {
         path: PathBuf,
@@ -618,6 +632,13 @@ struct LangCapabilitySupport {
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
 pub struct LspManager {
+    /// Monotonic stamp handed to each semantic-token request. `seq`
+    /// identifies CONTENT, not a request: `sync_lsp` and a server-driven
+    /// refresh can have two full requests in flight at the same seq, and the
+    /// retry loop emits an EMPTY batch after exhausting its backoff — so
+    /// without an ordering stamp a late empty loser can blank a good overlay
+    /// and be persisted to the content-keyed cache.
+    semantic_generation: std::sync::atomic::AtomicU64,
     cmd_tx: tokio_mpsc::UnboundedSender<Cmd>,
     completion_rx: std_mpsc::Receiver<CompletionResult>,
     signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
@@ -736,6 +757,7 @@ impl LspManager {
             inlay_refresh.clone(),
         ));
         Ok(Self {
+            semantic_generation: std::sync::atomic::AtomicU64::new(0),
             cmd_tx,
             completion_rx,
             signature_help_rx,
@@ -837,21 +859,45 @@ impl LspManager {
     }
 
     /// Ask the server for the whole document's semantic tokens. Fire this
-    /// on open and (debounced) after edits; the freshest batch wins. No
-    /// request id: results are keyed by path. A no-op for languages whose
-    /// server advertises no `semanticTokensProvider`.
-    pub fn request_semantic_tokens(&self, path: PathBuf) {
-        let _ = self.cmd_tx.send(Cmd::RequestSemanticTokens { path });
+    /// on open and (debounced) after edits. The reply carries two stamps and
+    /// the app needs both: `seq` identifies the document CONTENT the batch
+    /// was computed against (so a reply that outlived an external reload is
+    /// dropped), while `generation` orders overlapping requests for the same
+    /// path (two can be in flight at one `seq`, and the retry loop emits an
+    /// empty batch once its backoff runs out, so the loser must not win).
+    /// A no-op for languages whose server advertises no
+    /// `semanticTokensProvider`.
+    pub fn request_semantic_tokens(&self, path: PathBuf, seq: u64) {
+        let generation = self.next_semantic_generation();
+        let _ = self.cmd_tx.send(Cmd::RequestSemanticTokens {
+            path,
+            seq,
+            generation,
+        });
+    }
+
+    fn next_semantic_generation(&self) -> u64 {
+        self.semantic_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Ask the server for semantic tokens covering only `start_line..end_line`
     /// (zero-based, half-open). Fire this on open with the editor's viewport so
     /// the visible code colours immediately, ahead of the whole-file request.
-    pub fn request_semantic_tokens_range(&self, path: PathBuf, start_line: u32, end_line: u32) {
+    pub fn request_semantic_tokens_range(
+        &self,
+        path: PathBuf,
+        start_line: u32,
+        end_line: u32,
+        seq: u64,
+    ) {
+        let generation = self.next_semantic_generation();
         let _ = self.cmd_tx.send(Cmd::RequestSemanticTokensRange {
             path,
             start_line,
             end_line,
+            seq,
+            generation,
         });
     }
 
@@ -1368,18 +1414,31 @@ async fn worker_loop(
                 return;
             }
             Cmd::OpenDoc { path, text } => state.open_doc(path, text).await,
-            Cmd::RequestSemanticTokens { path } => {
+            Cmd::RequestSemanticTokens {
+                path,
+                seq,
+                generation,
+            } => {
                 state
-                    .request_semantic_tokens(path, &tx.semantic_tokens)
+                    .request_semantic_tokens(path, seq, generation, &tx.semantic_tokens)
                     .await
             }
             Cmd::RequestSemanticTokensRange {
                 path,
                 start_line,
                 end_line,
+                seq,
+                generation,
             } => {
                 state
-                    .request_semantic_tokens_range(path, start_line, end_line, &tx.semantic_tokens)
+                    .request_semantic_tokens_range(
+                        path,
+                        start_line,
+                        end_line,
+                        seq,
+                        generation,
+                        &tx.semantic_tokens,
+                    )
                     .await
             }
             Cmd::RequestInlayHints {
@@ -2095,6 +2154,8 @@ impl WorkerState {
     async fn request_semantic_tokens(
         &mut self,
         path: PathBuf,
+        seq: u64,
+        generation: u64,
         tx: &std_mpsc::Sender<SemanticTokensUpdate>,
     ) {
         let Some(doc) = self.docs.get(&path) else {
@@ -2176,6 +2237,8 @@ impl WorkerState {
             ));
             let _ = tx.send(SemanticTokensUpdate {
                 path: path_clone,
+                seq,
+                generation,
                 data,
                 legend,
                 is_full: true,
@@ -2236,6 +2299,8 @@ impl WorkerState {
         path: PathBuf,
         start_line: u32,
         end_line: u32,
+        seq: u64,
+        generation: u64,
         tx: &std_mpsc::Sender<SemanticTokensUpdate>,
     ) {
         let Some(doc) = self.docs.get(&path) else {
@@ -2290,6 +2355,8 @@ impl WorkerState {
             ));
             let _ = tx.send(SemanticTokensUpdate {
                 path: path_clone,
+                seq,
+                generation,
                 data,
                 legend,
                 is_full: false,
@@ -5175,7 +5242,7 @@ mod tests {
         let manager = LspManager::new(root).expect("manager");
         manager.open_doc(file.clone(), text.clone());
         std::thread::sleep(Duration::from_millis(2500));
-        manager.request_semantic_tokens(file.clone());
+        manager.request_semantic_tokens(file.clone(), 0);
 
         let update = drain_semantic_blocking(&manager, Duration::from_secs(30))
             .expect("semantic tokens arrived");
@@ -5229,7 +5296,7 @@ mod tests {
         let manager = LspManager::new(root).expect("manager");
         manager.open_doc(file.clone(), text.clone());
         std::thread::sleep(Duration::from_millis(2500));
-        manager.request_semantic_tokens_range(file.clone(), 0, 2);
+        manager.request_semantic_tokens_range(file.clone(), 0, 2, 0);
 
         let update = drain_semantic_blocking(&manager, Duration::from_secs(30))
             .expect("range semantic tokens arrived");
@@ -5278,7 +5345,7 @@ mod tests {
         let manager = LspManager::new(root).expect("manager");
         manager.open_doc(file.clone(), sent);
         std::thread::sleep(Duration::from_millis(2500));
-        manager.request_semantic_tokens(file.clone());
+        manager.request_semantic_tokens(file.clone(), 0);
         let update = drain_semantic_blocking(&manager, Duration::from_secs(30))
             .expect("semantic tokens arrived");
 
