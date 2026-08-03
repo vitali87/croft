@@ -282,7 +282,10 @@ fn shift_alt_drag_starts_a_column_selection() {
         app.editor.box_selecting(),
         "Shift+Alt press must anchor a column selection"
     );
-    let mut drag = mouse(MouseEventKind::Drag(MouseButton::Left), col, row + 2);
+    // Drag DOWN AND ACROSS. A drag that only moves vertically produces
+    // zero-width selections on every row, which an implementation that ignored
+    // the anchor column entirely would also satisfy.
+    let mut drag = mouse(MouseEventKind::Drag(MouseButton::Left), col + 3, row + 2);
     drag.modifiers = KeyModifiers::ALT | KeyModifiers::SHIFT;
     app.handle_mouse(drag);
     assert!(
@@ -290,6 +293,25 @@ fn shift_alt_drag_starts_a_column_selection() {
         "Shift+Alt+drag must build a column of carets, got {}",
         app.editor.carets.len()
     );
+    // The head row's span lives in `selection`; the rows above it are carets.
+    // Every one must cover the SAME three columns — that is what makes it a
+    // column selection rather than a stack of bare cursors.
+    let head = app
+        .editor
+        .selection
+        .expect("the head row must span columns");
+    assert_eq!(
+        head.head.1 - head.anchor.1,
+        3,
+        "head row must span 3 columns"
+    );
+    for c in &app.editor.carets {
+        assert_eq!(
+            (c.anchor.1, c.head.1),
+            (head.anchor.1, head.head.1),
+            "every row of a column selection covers the same columns"
+        );
+    }
 }
 
 #[test]
@@ -308,6 +330,11 @@ fn alt_clicking_the_gutter_play_glyph_debugs_that_test() {
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();
+    // Occupy the build slot so the debug route reports it instead of detaching
+    // a real `cargo test --no-run` into a TempDir this test is about to delete.
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.pending_test_debug = Some((rx, String::from("other"), tmp.path().to_path_buf()));
+
     let col = app.editor.last_inner.x;
     let row = app.editor.last_inner.y + 1;
     let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
@@ -316,9 +343,14 @@ fn alt_clicking_the_gutter_play_glyph_debugs_that_test() {
     // The ALT guard at the top of the Down(Left) arm returns ~1000 lines before
     // the gutter's own hit-test, so without an explicit glyph check there the
     // documented gesture reaches Go to Definition instead of the debugger.
-    assert_eq!(
-        app.status, "Building test binary for my_case",
-        "Alt+click on the gutter play glyph must debug that test"
+    // Either debug status proves the click routed to the debugger; which one
+    // depends on whether the host has an lldb-dap installed, and a machine
+    // without one must not fail a test about a mouse gesture.
+    assert!(
+        app.status == "A test binary is already building"
+            || app.status.starts_with("lldb-dap not found"),
+        "Alt+click on the gutter play glyph must debug that test, got {:?}",
+        app.status
     );
 }
 
@@ -13259,8 +13291,10 @@ fn a_clamped_rail_never_paints_past_its_own_column() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.split_terminal().unwrap();
     app.terminal_pane_maximized = true;
-    app.terminals[0].set_manual_name(Some(String::from("WXYZ")));
-    app.terminals[1].set_manual_name(Some(String::from("WXYZ")));
+    // A label character no other widget can paint, so "this cell holds a label
+    // char" is proof of a bleed and not a coincidence with the panel's text.
+    app.terminals[0].set_manual_name(Some(String::from("§§§§")));
+    app.terminals[1].set_manual_name(Some(String::from("§§§§")));
 
     // Wide enough that the buffer edge cannot mask the bleed, narrow enough
     // that the clamp bites: the assertion is the rail's own right edge.
@@ -13279,20 +13313,29 @@ fn a_clamped_rail_never_paints_past_its_own_column() {
             .any(|r| r.width < TERMINAL_RAIL_W),
         "this layout must actually clamp the rail, or the test proves nothing"
     );
+    let cell = |x: u16, y: u16| {
+        term.backend()
+            .buffer()
+            .cell(ratatui::layout::Position::new(x, y))
+            .unwrap()
+            .symbol()
+            .to_string()
+    };
     for rail in &app.terminal_rail_rects {
         let past = rail.x + rail.width;
-        let bleed: String = (past..(past + 2).min(80))
-            .map(|x| {
-                term.backend()
-                    .buffer()
-                    .cell(ratatui::layout::Position::new(x, rail.y))
-                    .unwrap()
-                    .symbol()
-                    .to_string()
-            })
-            .collect();
+        // Inside the rail the label must actually be painted, or a future
+        // layout change could shrink the rail until nothing bleeds and the
+        // assertion below passes while the bug is fully restored.
+        let inside: String = (rail.x..past).map(|x| cell(x, rail.y)).collect();
         assert!(
-            !bleed.contains('Y') && !bleed.contains('Z'),
+            inside.contains('§'),
+            "the rail must paint some of its label, got {inside:?}"
+        );
+        // Every cell from the rail's right edge to the frame edge: not a fixed
+        // peephole, so the check survives any change to the pane constants.
+        let bleed: String = (past..80).map(|x| cell(x, rail.y)).collect();
+        assert!(
+            !bleed.contains('§'),
             "the rail label bled past its own column into {bleed:?}"
         );
     }

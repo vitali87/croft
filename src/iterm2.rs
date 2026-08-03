@@ -492,8 +492,9 @@ const HELP_MENU_EQUIV: &str = "@~?";
 
 // (H) Pointer key earlier croft versions wrote to route Cmd+click to Go to
 // Definition via a bracketed-paste sentinel; that transport never fired under
-// croft's mouse reporting, so go-to-definition now keys on the Meta/Alt bit
-// iTerm2 reports for Cmd+click. Re-running setup purges any stale copy.
+// croft's mouse reporting. Mouse reports carry no Cmd bit at all, so
+// go-to-definition keys on Ctrl+click and ALT belongs to the editor's
+// multi-cursor. Re-running setup purges any stale copy.
 const STALE_GOTO_DEF_POINTER_KEY: &str = "Button,0,1,c,";
 
 /// CSI-u Send-Hex payloads exposed to the crate for the Ghostty keybind

@@ -66,7 +66,7 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Alt+clicking the gutter play glyph debugs that test again instead of doing nothing.",
+        summary: "Alt+clicking the gutter play glyph now debugs that test. The gesture was documented but never worked: the click jumped to the definition under the pointer instead.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,

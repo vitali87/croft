@@ -25796,10 +25796,7 @@ impl App {
                 // (H) Go to Definition rides CTRL, matching the terminal pane's
                 // file/URL clicks. SGR mouse reporting carries no super bit, so
                 // ALT is left to the editor's Alt+click multi-cursor below.
-                if in_editor
-                    && (m.modifiers.contains(KeyModifiers::CONTROL)
-                        || m.modifiers.contains(KeyModifiers::SUPER))
-                {
+                if in_editor && m.modifiers.contains(KeyModifiers::CONTROL) {
                     if m.modifiers.contains(KeyModifiers::SHIFT) {
                         self.nav_back();
                     } else {
