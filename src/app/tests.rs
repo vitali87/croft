@@ -15094,6 +15094,44 @@ fn outline_symbols_apply_only_for_the_active_file() {
 }
 
 #[test]
+fn an_outline_reply_is_matched_by_request_not_by_the_larger_seq() {
+    use crate::lsp::manager::OutlineKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn a() {}\n");
+    let active = app.editor.path.clone().unwrap();
+
+    // `seq` is a per-Editor counter, and a file landing in a FRESH editor group
+    // (a Cmd+\ split, or close-and-reopen) restarts it at zero. So the request
+    // actually outstanding can carry a far smaller number than a reply still in
+    // flight from the group the user left, and "the highest seq is the newest"
+    // is simply false. Anything that pre-selects replies by size before this
+    // guard sees them keeps the stale one; the guard then rejects it on the
+    // exact-match rule, and sync_outline never re-requests because its
+    // (path, seq) key has not moved — the outline stays tree-sitter-only until
+    // the next edit.
+    app.outline_synced = Some((active.clone(), Some(1)));
+
+    let stale = vec![outline_sym(
+        "from_the_old_group",
+        OutlineKind::Function,
+        0,
+        0,
+    )];
+    assert!(
+        !app.apply_outline_symbols(active.clone(), 40, stale),
+        "a bigger seq is a reply from a previous editor group, not a newer one"
+    );
+    assert!(app.outline.is_empty(), "the stale reply must not populate");
+
+    let fresh = vec![outline_sym("outstanding", OutlineKind::Function, 0, 0)];
+    assert!(
+        app.apply_outline_symbols(active.clone(), 1, fresh),
+        "the reply matching the outstanding request applies however small its seq"
+    );
+    assert!(!app.outline.is_empty());
+}
+
+#[test]
 fn sync_outline_settles_empty_for_a_file_without_a_language_server() {
     // A plain text file has no language server, so no documentSymbol reply will
     // ever arrive. sync_outline must settle the panel to a loaded, empty state

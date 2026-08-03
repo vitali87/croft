@@ -404,7 +404,13 @@ fn run_command_streaming(
     log_tx: &std::sync::mpsc::Sender<String>,
 ) -> Result<std::process::ExitStatus> {
     use std::io::{BufRead, BufReader};
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // stdin must be closed, not inherited: this runs on the background install
+    // thread while the attached remote session owns the terminal, and rsync and
+    // the bulk lane's own ssh would otherwise read the user's keystrokes for
+    // the whole multi-minute transfer.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().context("spawning streaming subprocess")?;
     let stdout = child.stdout.take().expect("stdout pipe");
     let stderr = child.stderr.take().expect("stderr pipe");
@@ -518,7 +524,7 @@ fn try_local_cross_install_streaming(
         );
     }
 
-    let mut mkdir = ssh.command();
+    let mut mkdir = ssh.background_command();
     mkdir
         .arg(&ssh.host)
         .arg("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"");
@@ -540,7 +546,7 @@ fn try_local_cross_install_streaming(
         anyhow::bail!("rsync exited with {rsync_status}");
     }
 
-    let mut act = ssh.command();
+    let mut act = ssh.background_command();
     act.arg(&ssh.host).arg(activate_command(source_stamp));
     let act_status =
         run_command_streaming(act, log_tx).context("activating remote croft binary")?;
@@ -557,7 +563,7 @@ fn sync_local_source_to_remote_streaming(
     log_tx: &std::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut mkdir = ssh.command();
+    let mut mkdir = ssh.background_command();
     mkdir
         .arg(&ssh.host)
         .arg("mkdir -p \"$HOME/.cache/croft/source\"");
@@ -689,20 +695,47 @@ impl SshControl {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new("ssh");
-        command
-            .arg("-S")
-            .arg(&self.socket_path)
-            .arg("-o")
-            .arg("ControlMaster=no")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg("-o")
-            .arg("ServerAliveInterval=10")
-            .arg("-o")
-            .arg("ServerAliveCountMax=3");
-        command
+        ssh_socket_command(&self.socket_path, false)
     }
+
+    /// A command for the background install path, which runs while the user is
+    /// already attached. See [`ssh_socket_command`] for why `-n` is
+    /// load-bearing here.
+    fn background_command(&self) -> Command {
+        ssh_socket_command(&self.socket_path, true)
+    }
+}
+
+/// Build an ssh invocation over an existing control socket.
+///
+/// `background` marks a command that runs *while the remote session owns the
+/// terminal*. Such a command must not touch any of the three standard streams:
+/// ssh forwards the caller's stdin to the remote unless `-n` is given, so
+/// without it two processes read() the same tty and every keystroke reaches
+/// exactly one of them, and inherited stderr writes ssh diagnostics straight
+/// onto the alt screen. The interactive session is the one caller that must
+/// keep the terminal, so it passes `false`.
+fn ssh_socket_command(socket_path: &Path, background: bool) -> Command {
+    let mut command = Command::new("ssh");
+    command
+        .arg("-S")
+        .arg(socket_path)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("ServerAliveInterval=10")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3");
+    if background {
+        command
+            .arg("-n")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
+    command
 }
 
 impl Drop for SshControl {
@@ -2281,7 +2314,7 @@ fn activate_command(source_stamp: &str) -> String {
 /// remote-side activation. Written before the (long) local cross-compile.
 fn mark_remote_updating(ssh: &SshControl) {
     let _ = ssh
-        .command()
+        .background_command()
         .arg(&ssh.host)
         .arg("mkdir -p \"$HOME/.cache/croft\" && : > \"$HOME/.cache/croft/updating\"")
         .status();
@@ -2291,7 +2324,7 @@ fn mark_remote_updating(ssh: &SshControl) {
 /// brief "update failed" rather than hanging on "Updating" forever.
 fn clear_remote_updating(ssh: &SshControl) {
     let _ = ssh
-        .command()
+        .background_command()
         .arg(&ssh.host)
         .arg("rm -f \"$HOME/.cache/croft/updating\"")
         .status();
@@ -2988,6 +3021,30 @@ Host !blocked *.internal
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    // The other half of the launch-now bug class. Bytes are not the only
+    // shared resource: ssh forwards the caller's stdin to the remote command
+    // unless `-n` is given, and on this path that stdin is the terminal the
+    // attached remote croft is reading. Two processes then read() the same
+    // tty and each keystroke reaches exactly one of them, so typing into the
+    // remote session silently vanishes for as long as the background command
+    // runs. Verified against a real host: `ssh h 'sleep 1' < probe` drains
+    // all 16 bytes even though the remote command never reads stdin, while
+    // `ssh -n h 'sleep 1' < probe` leaves every byte for the next reader.
+    #[test]
+    fn background_ssh_never_reads_the_attached_sessions_stdin() {
+        let socket = PathBuf::from("/tmp/croft-ctl/ctl");
+        let background = args_of(&ssh_socket_command(&socket, true));
+        assert!(
+            background.iter().any(|a| a == "-n"),
+            "a background command sharing the session's tty steals its keystrokes"
+        );
+        let interactive = args_of(&ssh_socket_command(&socket, false));
+        assert!(
+            !interactive.iter().any(|a| a == "-n"),
+            "the interactive session is the one process that must keep the tty"
+        );
     }
 
     // The launch-now bug class: a background install shipping bytes through
