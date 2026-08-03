@@ -62,10 +62,14 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Typing into a remote session no longer loses keystrokes while an update installs in the background: the install's own connections no longer read the terminal the session is reading.",
+        summary: "Option+click now adds a second cursor and Shift+Option+drag selects a column, as in VS Code; Go to Definition by mouse moves to Ctrl+click, the same modifier the terminal already uses for file and link clicks.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The Outline and breadcrumb keep the symbols the language server sent for the file you are on, instead of losing them to a late reply for the file you just left.",
+        summary: "Alt+clicking the gutter play glyph debugs that test again instead of doing nothing.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "A maximized terminal's switcher rail no longer paints its label over the panel beside it when the window is narrow.",
     },
 ];
