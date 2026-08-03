@@ -4193,6 +4193,31 @@ fn workspace_symbol_queries_debounce_instead_of_firing_per_keystroke() {
 }
 
 #[test]
+fn a_reply_to_a_superseded_workspace_symbol_query_is_dropped() {
+    // Type, let the request dispatch, then type again: the in-flight
+    // reply answers a query the user has edited away from and must not
+    // render (workspace/symbol on a big project outlives the debounce).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_workspace_symbols("");
+    if let Some(p) = app.workspace_symbols.as_mut() {
+        p.query.push('a');
+    }
+    app.workspace_symbols_requery();
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    app.workspace_symbols_dispatch_due();
+    let id = app.ws_symbols_request_id.expect("the settled query dispatched");
+    if let Some(p) = app.workspace_symbols.as_mut() {
+        p.query.push('b');
+    }
+    app.workspace_symbols_requery();
+    assert!(
+        !app.apply_workspace_symbols(id, Vec::new(), false),
+        "a reply for the superseded query must be dropped, not rendered"
+    );
+}
+
+#[test]
 fn clearing_the_workspace_symbol_query_clears_the_unsupported_notice() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

@@ -22496,6 +22496,10 @@ impl App {
             return;
         }
         picker.loading = true;
+        // Invalidate any in-flight request: its reply answers a query the
+        // user has typed past and would render stale results until the
+        // debounced request lands.
+        self.ws_symbols_request_id = None;
         self.ws_symbols_pending = Some(std::time::Instant::now());
     }
 
