@@ -218,6 +218,110 @@ fn caret_move_clears_lsp_occurrence_tints_and_edits_already_did() {
     );
 }
 
+/// SGR mouse reporting carries only shift/meta/ctrl — there is no super bit
+/// (crossterm `parse_cb`), so Cmd+click and Option+click are the same event and
+/// Go to Definition cannot share ALT with VS Code's multi-cursor. ALT is the
+/// caret modifier; CTRL is go-to, matching the terminal pane's file/URL click.
+#[test]
+fn alt_click_adds_a_caret_and_ctrl_click_goes_to_definition() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("t.rs");
+    std::fs::write(&f, "fn main() {}\nlet x = 1;\nlet y = 2;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    // A body column clear of the gutter, on a different row from the caret.
+    let col = app.editor.last_inner.x + 8;
+    let row = app.editor.last_inner.y + 2;
+
+    let mut alt = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    alt.modifiers = KeyModifiers::ALT;
+    app.handle_mouse(alt);
+    assert!(
+        !app.editor.carets.is_empty(),
+        "Alt+click must add a secondary caret, not go to definition"
+    );
+
+    // Ctrl+click is go-to-definition. With no language server attached the
+    // jump cannot land, so what is pinned is that it does NOT add a caret.
+    let before = app.editor.carets.len();
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row + 1);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+    assert_eq!(
+        app.editor.carets.len(),
+        before,
+        "Ctrl+click is Go to Definition and must never add a caret"
+    );
+}
+
+#[test]
+fn shift_alt_drag_starts_a_column_selection() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("t.rs");
+    std::fs::write(&f, "aaaaaaaa\nbbbbbbbb\ncccccccc\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    // Clear of the gutter: the sign margin / line-number columns are not
+    // buffer positions, so begin_box_select would refuse there.
+    let col = app.editor.last_inner.x + 8;
+    let row = app.editor.last_inner.y;
+    let mut down = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    down.modifiers = KeyModifiers::ALT | KeyModifiers::SHIFT;
+    app.handle_mouse(down);
+    assert!(
+        app.editor.box_selecting(),
+        "Shift+Alt press must anchor a column selection"
+    );
+    let mut drag = mouse(MouseEventKind::Drag(MouseButton::Left), col, row + 2);
+    drag.modifiers = KeyModifiers::ALT | KeyModifiers::SHIFT;
+    app.handle_mouse(drag);
+    assert!(
+        app.editor.carets.len() >= 2,
+        "Shift+Alt+drag must build a column of carets, got {}",
+        app.editor.carets.len()
+    );
+}
+
+#[test]
+fn alt_clicking_the_gutter_play_glyph_debugs_that_test() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let f = tmp.path().join("t.rs");
+    std::fs::write(&f, "#[test]\nfn my_case() { assert!(true); }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let col = app.editor.last_inner.x;
+    let row = app.editor.last_inner.y + 1;
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::ALT;
+    app.handle_mouse(ev);
+    // The ALT guard at the top of the Down(Left) arm returns ~1000 lines before
+    // the gutter's own hit-test, so without an explicit glyph check there the
+    // documented gesture reaches Go to Definition instead of the debugger.
+    assert_eq!(
+        app.status, "Building test binary for my_case",
+        "Alt+click on the gutter play glyph must debug that test"
+    );
+}
+
 #[test]
 fn clicking_the_gutter_play_glyph_runs_that_test() {
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -13142,6 +13246,56 @@ fn maximized_terminal_fills_width_and_lists_others_in_rail() {
         vec![active],
         "only the maximized pane paints a restore button"
     );
+}
+
+#[test]
+fn a_clamped_rail_never_paints_past_its_own_column() {
+    // The rail width is clamped at the call site to
+    // `content.width.saturating_sub(20)`, but the label was always rendered as
+    // a fixed 7 cells (space + icon + space + 4 chars). `Buffer::set_string`
+    // clips at the FRAME edge, not at the rail rect, so on a narrow panel the
+    // tail of the label lands on whatever is drawn to the right of the panel.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.terminal_pane_maximized = true;
+    app.terminals[0].set_manual_name(Some(String::from("WXYZ")));
+    app.terminals[1].set_manual_name(Some(String::from("WXYZ")));
+
+    // Wide enough that the buffer edge cannot mask the bleed, narrow enough
+    // that the clamp bites: the assertion is the rail's own right edge.
+    // The bleed is only observable when something is DRAWN to the right of the
+    // panel, so the secondary side bar must be up: the panel clips at the frame
+    // edge otherwise and the overrun is silently truncated.
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.secondary_side_bar_visible = true;
+    app.sidebar_width = 21;
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert!(
+        app.terminal_rail_rects
+            .iter()
+            .any(|r| r.width < TERMINAL_RAIL_W),
+        "this layout must actually clamp the rail, or the test proves nothing"
+    );
+    for rail in &app.terminal_rail_rects {
+        let past = rail.x + rail.width;
+        let bleed: String = (past..(past + 2).min(80))
+            .map(|x| {
+                term.backend()
+                    .buffer()
+                    .cell(ratatui::layout::Position::new(x, rail.y))
+                    .unwrap()
+                    .symbol()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            !bleed.contains('Y') && !bleed.contains('Z'),
+            "the rail label bled past its own column into {bleed:?}"
+        );
+    }
 }
 
 #[test]
