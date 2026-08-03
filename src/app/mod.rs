@@ -9858,11 +9858,9 @@ impl App {
             } else {
                 Style::default()
             };
-            // Clip to the rail's OWN width, not the frame's. `rail_w` is
-            // clamped at the call site on a narrow panel, and `set_string`
-            // stops only at the buffer edge — so a full-width label used to
-            // paint its tail over whatever sits right of the panel (the
-            // secondary side bar, which renders earlier and stays overwritten).
+            // `set_string` clips at the buffer edge, not the rail's, so a
+            // label wider than a clamped rail would paint its tail over the
+            // panel to the right. Clip to the rail's own width.
             frame.buffer_mut().set_stringn(
                 row.x,
                 y,
