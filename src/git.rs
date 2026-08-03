@@ -138,6 +138,9 @@ fn git_raw(root: &Path, args: &[&str], stdin_data: Option<&[u8]>) -> Option<Vec<
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(root)
+        // A read-only poll must never take `index.lock` out from under a user
+        // mutation — same reason `run_git` sets it.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -147,12 +150,29 @@ fn git_raw(root: &Path, args: &[&str], stdin_data: Option<&[u8]>) -> Option<Vec<
             std::process::Stdio::null()
         });
     let mut child = cmd.spawn().ok()?;
-    if let Some(data) = stdin_data {
-        // Dropping the handle closes the pipe, which is what makes
-        // check-ignore stop reading and produce its answer.
-        child.stdin.take()?.write_all(data).ok()?;
+    // Feed stdin from its OWN thread and read stdout concurrently.
+    // `check-ignore` echoes each match back as it reads, so both pipes fill
+    // on a large set; writing all of stdin before reading a byte of stdout
+    // deadlocks — git blocks writing stdout, stops draining stdin, and the
+    // writer waits forever. Measured threshold on macOS: ~143 KB flows,
+    // ~957 KB blocks.
+    let writer = match stdin_data {
+        Some(data) => {
+            let mut pipe = child.stdin.take()?;
+            let data = data.to_vec();
+            Some(std::thread::spawn(move || {
+                let _ = pipe.write_all(&data);
+                // Dropping the pipe closes it, which is what tells
+                // check-ignore the list is complete.
+            }))
+        }
+        None => None,
+    };
+    let out = child.wait_with_output().ok();
+    if let Some(w) = writer {
+        let _ = w.join();
     }
-    Some(child.wait_with_output().ok()?.stdout)
+    Some(out?.stdout)
 }
 
 fn is_git_repo(path: &Path) -> bool {
@@ -2031,6 +2051,38 @@ mod tests {
         assert!(
             !s.ignored.contains(&p.join("logs")),
             "no rule matches `logs` itself, so it must not be greyed"
+        );
+    }
+
+    #[test]
+    fn git_raw_does_not_deadlock_on_a_payload_past_the_pipe_buffer() {
+        // check-ignore echoes each match back as it reads, so BOTH pipes
+        // fill. Writing all of stdin before reading a byte of stdout
+        // deadlocks once the payload passes the buffer: git blocks writing
+        // stdout, stops draining stdin, and the writer blocks forever.
+        // Measured on this machine: 143 KB flows, 957 KB blocks — so this
+        // uses ~1 MB. On the single-threaded version this test hangs.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        std::fs::write(p.join(".gitignore"), "*.log\n").unwrap();
+        let n = 20_000;
+        let mut payload = Vec::new();
+        for i in 0..n {
+            payload.extend_from_slice(
+                format!("padded-name-to-widen-the-pipe-payload-{i:06}.log").as_bytes(),
+            );
+            payload.push(0);
+        }
+        let out = git_raw(p, &["check-ignore", "-z", "--stdin"], Some(&payload)).unwrap_or_default();
+        let got = out.split(|b| *b == 0).filter(|s| !s.is_empty()).count();
+        assert_eq!(
+            got, n,
+            "every path must come back instead of stalling on a full pipe"
         );
     }
 

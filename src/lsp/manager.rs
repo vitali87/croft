@@ -338,6 +338,9 @@ pub struct SemanticTokensUpdate {
     /// colours at the wrong offsets (and would poison the on-disk cache
     /// under the NEW content's key). Same guard as `InlayHintsUpdate`.
     pub seq: u64,
+    /// Monotonic per-request stamp; the app drops a reply older than the
+    /// newest one already applied for this path (see `semantic_generation`).
+    pub generation: u64,
     pub data: Vec<u32>,
     pub legend: Arc<Vec<String>>,
     /// `true` for a whole-document `semanticTokens/full` batch, `false` for a
@@ -481,12 +484,14 @@ enum Cmd {
     RequestSemanticTokens {
         path: PathBuf,
         seq: u64,
+        generation: u64,
     },
     RequestSemanticTokensRange {
         path: PathBuf,
         start_line: u32,
         end_line: u32,
         seq: u64,
+        generation: u64,
     },
     RequestInlayHints {
         path: PathBuf,
@@ -627,6 +632,13 @@ struct LangCapabilitySupport {
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
 pub struct LspManager {
+    /// Monotonic stamp handed to each semantic-token request. `seq`
+    /// identifies CONTENT, not a request: `sync_lsp` and a server-driven
+    /// refresh can have two full requests in flight at the same seq, and the
+    /// retry loop emits an EMPTY batch after exhausting its backoff — so
+    /// without an ordering stamp a late empty loser can blank a good overlay
+    /// and be persisted to the content-keyed cache.
+    semantic_generation: std::sync::atomic::AtomicU64,
     cmd_tx: tokio_mpsc::UnboundedSender<Cmd>,
     completion_rx: std_mpsc::Receiver<CompletionResult>,
     signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
@@ -745,6 +757,7 @@ impl LspManager {
             inlay_refresh.clone(),
         ));
         Ok(Self {
+            semantic_generation: std::sync::atomic::AtomicU64::new(0),
             cmd_tx,
             completion_rx,
             signature_help_rx,
@@ -850,7 +863,17 @@ impl LspManager {
     /// request id: results are keyed by path. A no-op for languages whose
     /// server advertises no `semanticTokensProvider`.
     pub fn request_semantic_tokens(&self, path: PathBuf, seq: u64) {
-        let _ = self.cmd_tx.send(Cmd::RequestSemanticTokens { path, seq });
+        let generation = self.next_semantic_generation();
+        let _ = self.cmd_tx.send(Cmd::RequestSemanticTokens {
+            path,
+            seq,
+            generation,
+        });
+    }
+
+    fn next_semantic_generation(&self) -> u64 {
+        self.semantic_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Ask the server for semantic tokens covering only `start_line..end_line`
@@ -863,11 +886,13 @@ impl LspManager {
         end_line: u32,
         seq: u64,
     ) {
+        let generation = self.next_semantic_generation();
         let _ = self.cmd_tx.send(Cmd::RequestSemanticTokensRange {
             path,
             start_line,
             end_line,
             seq,
+            generation,
         });
     }
 
@@ -1384,9 +1409,13 @@ async fn worker_loop(
                 return;
             }
             Cmd::OpenDoc { path, text } => state.open_doc(path, text).await,
-            Cmd::RequestSemanticTokens { path, seq } => {
+            Cmd::RequestSemanticTokens {
+                path,
+                seq,
+                generation,
+            } => {
                 state
-                    .request_semantic_tokens(path, seq, &tx.semantic_tokens)
+                    .request_semantic_tokens(path, seq, generation, &tx.semantic_tokens)
                     .await
             }
             Cmd::RequestSemanticTokensRange {
@@ -1394,6 +1423,7 @@ async fn worker_loop(
                 start_line,
                 end_line,
                 seq,
+                generation,
             } => {
                 state
                     .request_semantic_tokens_range(
@@ -1401,6 +1431,7 @@ async fn worker_loop(
                         start_line,
                         end_line,
                         seq,
+                        generation,
                         &tx.semantic_tokens,
                     )
                     .await
@@ -2119,6 +2150,7 @@ impl WorkerState {
         &mut self,
         path: PathBuf,
         seq: u64,
+        generation: u64,
         tx: &std_mpsc::Sender<SemanticTokensUpdate>,
     ) {
         let Some(doc) = self.docs.get(&path) else {
@@ -2201,6 +2233,7 @@ impl WorkerState {
             let _ = tx.send(SemanticTokensUpdate {
                 path: path_clone,
                 seq,
+                generation,
                 data,
                 legend,
                 is_full: true,
@@ -2262,6 +2295,7 @@ impl WorkerState {
         start_line: u32,
         end_line: u32,
         seq: u64,
+        generation: u64,
         tx: &std_mpsc::Sender<SemanticTokensUpdate>,
     ) {
         let Some(doc) = self.docs.get(&path) else {
@@ -2317,6 +2351,7 @@ impl WorkerState {
             let _ = tx.send(SemanticTokensUpdate {
                 path: path_clone,
                 seq,
+                generation,
                 data,
                 legend,
                 is_full: false,

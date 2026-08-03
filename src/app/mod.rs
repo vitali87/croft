@@ -2485,6 +2485,13 @@ pub struct App {
     /// manager. sync_lsp diffs every tick against the current tabs to
     /// emit did_open / did_change / did_close.
     lsp_last_seen: std::collections::HashMap<PathBuf, u64>,
+    /// Newest semantic-token request generation already applied per path.
+    /// `seq` alone is not enough: two full requests can be in flight at the
+    /// same seq (`sync_lsp` plus a server-driven refresh), and the request
+    /// retry loop emits an EMPTY batch once its backoff is exhausted, so a
+    /// late empty loser would otherwise blank a good overlay and be written
+    /// to the content-keyed disk cache.
+    semantic_generation_seen: std::collections::HashMap<PathBuf, u64>,
     /// Diagnostics store: per file, the latest set from each server. Servers
     /// push complete sets via `textDocument/publishDiagnostics`, so the inner
     /// map is keyed by server name (ty + ruff can both publish for one file)
@@ -3635,6 +3642,7 @@ impl App {
                 }
             },
             lsp_last_seen: std::collections::HashMap::new(),
+            semantic_generation_seen: std::collections::HashMap::new(),
             lsp_diagnostics: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
@@ -6191,6 +6199,12 @@ impl App {
             // paints the old file's colours at the wrong offsets, and the
             // `is_full` cache store below would persist that under the NEW
             // content's key, replaying it on every future open.
+            if !semantic_reply_is_current(
+                self.semantic_generation_seen.get(&u.path).copied(),
+                u.generation,
+            ) {
+                continue;
+            }
             let mut applied_anywhere = false;
             if self.editor.path.as_deref() == Some(u.path.as_path())
                 && self.editor.edit_seq == u.seq
@@ -6220,6 +6234,10 @@ impl App {
             // content paints these colours instantly instead of waiting out the
             // server's cold analysis. Only when a visible editor holds the file
             // unchanged, so the cache key matches the bytes the next open reads.
+            if applied_anywhere {
+                self.semantic_generation_seen
+                    .insert(u.path.clone(), u.generation);
+            }
             if u.is_full && applied_anywhere {
                 let mut clean_text = (self.editor.path.as_deref() == Some(u.path.as_path()))
                     .then(|| self.editor.clean_cache_text())
@@ -32181,6 +32199,17 @@ fn sheet_visible_rows(inner: Rect) -> usize {
     // Renderer reserves 1 row for the header line, 1 row for the column
     // labels, and 1 row for the bottom status. Anything left is data.
     inner.height.saturating_sub(3) as usize
+}
+
+/// Whether a semantic-token reply may be applied, given the newest request
+/// generation already applied for that path. Replies for one path overlap:
+/// `sync_lsp` and a server-driven refresh can both have a full request in
+/// flight at the same `seq`, and the request's retry loop emits an EMPTY
+/// batch once its backoff is exhausted. Without this ordering check a late
+/// empty loser blanks a good overlay and — being `is_full` — is persisted to
+/// the content-keyed cache and replayed on every future open.
+fn semantic_reply_is_current(seen: Option<u64>, incoming: u64) -> bool {
+    seen.is_none_or(|s| incoming >= s)
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {

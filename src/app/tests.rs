@@ -18063,6 +18063,28 @@ fn drag_reorders_terminal_panes_and_active_follows_its_terminal() {
 }
 
 #[test]
+fn a_semantic_token_reply_older_than_the_applied_one_is_dropped() {
+    // Two full requests can be in flight for one path at the SAME seq
+    // (sync_lsp plus a server-driven refresh), and the request retry loop
+    // emits an empty batch once its backoff runs out. Ordering by request
+    // generation is what stops that late empty loser from blanking a good
+    // overlay and being persisted to the content-keyed cache.
+    assert!(
+        crate::app::semantic_reply_is_current(None, 7),
+        "the first reply for a path always applies"
+    );
+    assert!(crate::app::semantic_reply_is_current(Some(7), 8));
+    assert!(
+        crate::app::semantic_reply_is_current(Some(7), 7),
+        "the same request re-delivered is not stale"
+    );
+    assert!(
+        !crate::app::semantic_reply_is_current(Some(8), 7),
+        "a reply from an older request must never overwrite a newer one"
+    );
+}
+
+#[test]
 fn reordering_panes_defers_the_session_write_off_the_input_path() {
     // move_terminal runs once per motion report during a drag. A full
     // read-modify-write of the session file — plus a cwd syscall and a stat
