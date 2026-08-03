@@ -18453,6 +18453,83 @@ fn auto_save_writes_a_dirty_buffer_after_the_delay() {
 }
 
 #[test]
+fn auto_save_surfaces_a_disk_conflict_instead_of_latching_silently() {
+    // A dirty buffer collides with an external write: save_to_disk latches
+    // disk_conflict, due() then excludes the tab forever, and without a
+    // prompt the user learns nothing while auto save silently stops.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.auto_save = true;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "external change wins\n").unwrap();
+    age_last_edit(&mut app.editor);
+    app.tick_auto_save();
+    assert!(app.editor.disk_conflict, "the conflict latches");
+    assert!(
+        app.input_prompt.is_some() || app.status.to_lowercase().contains("conflict"),
+        "the collision must be surfaced, not swallowed; status: {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn merge_accept_refuses_a_non_text_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let png = tmp.path().join("p.png");
+    image::RgbaImage::new(1, 1).save(&png).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&png).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptCurrent);
+    assert_eq!(
+        app.status, "Merge conflict actions need a text file",
+        "a non-text tab must refuse, never consult a possibly-stale conflict cache"
+    );
+}
+
+#[test]
+fn replace_all_recounts_instead_of_reporting_zero() {
+    // Replacing `a` with `aa` doubles the matches; the title must recount,
+    // not read "No results" over a body still full of highlights.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "a");
+    app.open_editor_replace();
+    if let Some(s) = app.editor_find.as_mut() {
+        s.query = "a".to_string();
+        s.replace = "aa".to_string();
+    }
+    app.editor_find_replace_all();
+    assert_eq!(
+        app.editor_find.as_ref().unwrap().match_count,
+        2,
+        "the count reflects the buffer after the replace"
+    );
+}
+
+#[test]
+fn a_restored_dirty_tab_gets_an_auto_save_stamp() {
+    // A session-restored dirty tab has no last_edit_at; due() then never
+    // fires and the restored unsaved content sits unwritten forever.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    let state = app.capture_session_state();
+    let mut restored = App::new(tmp.path().to_path_buf()).unwrap();
+    restored.apply_session_state(&state);
+    let dirty = restored
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.dirty)
+        .expect("the dirty tab survives the restore");
+    assert!(
+        dirty.last_edit_at.is_some(),
+        "a restored dirty tab must be eligible for auto save"
+    );
+}
+
+#[test]
 fn auto_save_stays_off_by_default() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");

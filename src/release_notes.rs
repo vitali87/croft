@@ -62,26 +62,26 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Stage, unstage, and revert in a Source Control diff act on the hunk you navigated to: a jump or scroll now supersedes an earlier click, so R can no longer revert an off-screen hunk you clicked minutes ago.",
+        summary: "Undoing past an auto save re-dirties the buffer and re-saves, so Cmd+Z can no longer leave the editor silently disagreeing with the file on disk; a save also breaks typing coalescing, so one undo never discards work from both sides of a save point.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Hunk staging works on files without a final newline and on CRLF files: patches carry each line's exact bytes and git's no-newline marker instead of being rejected outright.",
+        summary: "Auto save now surfaces the reload-or-keep prompt when a dirty buffer collides with an external write, instead of silently stopping all auto saves for that file.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Timeline snapshot diffs no longer offer S/U/R: hunk actions are gated to the real Source Control HEAD diff, so a local-history view can never write snapshot-derived patches into the git index.",
+        summary: "Replace All rewrites exactly the matches the find bar shows: zero-width regex matches and Unicode case foldings the highlighter cannot display are no longer silently replaced, and the match count recounts after the replace instead of reading No results.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Rerunning a task into its idle pane clears the shell's half-typed prompt line first, and a pane whose shell still sits in a previous workspace is left alone after Open Folder: the new project's build spawns fresh instead of running in the old directory.",
+        summary: "Regex replacements understand VS Code's backslash escapes: a replacement \\n splits the line, \\t inserts a tab.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Cmd+Shift+B honours tasks.json isDefault when several build tasks exist.",
+        summary: "Switching a preview tab from a conflicted file to an image no longer lets a palette merge action crash croft on a stale conflict list; merge commands refuse non-text tabs outright.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Workspace symbol search debounces instead of sending one LSP request per keystroke, keeps the selection on the top result when the query changes, and clears the no-server notice when the query is emptied.",
+        summary: "Auto save reloads croft's own config files after writing them, matching Cmd+S, and session-restored unsaved tabs are eligible for auto save immediately.",
     },
 ];

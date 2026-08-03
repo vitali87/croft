@@ -1148,6 +1148,10 @@ struct Snapshot {
     selection: Option<EditorSelection>,
     carets: Vec<EditorSelection>,
     dirty: bool,
+    /// The editor's `save_seq` when this snapshot was taken. A restore that
+    /// crosses a save point re-dirties the buffer: its content no longer
+    /// matches disk even though the snapshot predates the edit.
+    save_seq: u64,
 }
 
 const UNDO_STACK_LIMIT: usize = 500;
@@ -1449,6 +1453,9 @@ pub struct Editor {
     pub pdf_viewer_enabled: bool,
     pub csv_viewer_enabled: bool,
     pub dirty: bool,
+    /// Bumped on every buffer<->disk sync (save, load, reload). Undo
+    /// snapshots record it so a restore across a save point re-dirties.
+    save_seq: u64,
     pub status: String,
     pub last_area: Rect,
     pub last_inner: Rect,
@@ -1709,6 +1716,7 @@ impl Editor {
             pdf_viewer_enabled: true,
             csv_viewer_enabled: true,
             dirty: false,
+            save_seq: 0,
             status: String::from("No file open"),
             last_area: Rect::default(),
             last_inner: Rect::default(),
@@ -2698,6 +2706,9 @@ impl Editor {
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
         self.lines = vec![String::new()];
+        // A whole-buffer swap like every other opener: caches memoised on
+        // edit_seq (conflicts, git marks) must not survive into this tab.
+        self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.scroll = 0;
         self.cursor_row = 0;
@@ -2729,6 +2740,9 @@ impl Editor {
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
         self.lines = vec![String::new()];
+        // A whole-buffer swap like every other opener: caches memoised on
+        // edit_seq (conflicts, git marks) must not survive into this tab.
+        self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.scroll = 0;
         self.cursor_row = 0;
@@ -2759,6 +2773,9 @@ impl Editor {
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
         self.lines = vec![String::new()];
+        // A whole-buffer swap like every other opener: caches memoised on
+        // edit_seq (conflicts, git marks) must not survive into this tab.
+        self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.scroll = 0;
         self.cursor_row = 0;
@@ -4105,6 +4122,7 @@ impl Editor {
             selection: self.selection,
             carets: self.carets.clone(),
             dirty: self.dirty,
+            save_seq: self.save_seq,
         }
     }
 
@@ -4161,7 +4179,10 @@ impl Editor {
         self.cursor_col = snap.cursor_col.min(self.line_char_len(self.cursor_row));
         self.selection = snap.selection;
         self.carets = snap.carets;
-        self.dirty = snap.dirty;
+        // Crossing a save point (auto save or Cmd+S since the snapshot)
+        // means the restored text differs from disk: stay dirty so the next
+        // sweep reconverges them instead of leaving a silent divergence.
+        self.dirty = snap.dirty || self.save_seq != snap.save_seq;
         self.last_edit_kind = None;
         // A restore changes the buffer content, so bump the change counter (the
         // app resyncs the LSP / git gutter off `edit_seq`) and drop the wrap /
@@ -4227,6 +4248,9 @@ impl Editor {
     fn mark_synced_with_disk(&mut self) {
         self.disk_stamp = self.path.as_deref().and_then(Self::disk_stamp_of);
         self.disk_conflict = false;
+        // A new buffer<->disk sync point; undo snapshots from before it
+        // restore as dirty (see `restore_snapshot`).
+        self.save_seq = self.save_seq.wrapping_add(1);
     }
 
     /// True when the file on disk no longer matches the (mtime, len) we last
@@ -4354,6 +4378,9 @@ impl Editor {
         let (encoded, _, _) = self.encoding.encode(&content);
         std::fs::write(&path, encoded)?;
         self.dirty = false;
+        // The next keystroke opens a fresh undo step: coalescing across the
+        // save point would make one Cmd+Z discard work from both sides.
+        self.last_edit_kind = None;
         self.status = format!("Saved {}", path.display());
         // The buffer now matches disk, so this is the new sync point and any
         // prior conflict is resolved.
@@ -4558,9 +4585,24 @@ impl Editor {
         self.clear_selection();
         let from = self.byte_index(row, col_chars);
         let to = self.byte_index(row, col_chars + len_chars);
-        self.lines[row].replace_range(from..to, text);
-        self.cursor_row = row;
-        self.cursor_col = col_chars + text.chars().count();
+        let breaks = text.matches('\n').count();
+        if breaks == 0 {
+            self.lines[row].replace_range(from..to, text);
+            self.cursor_row = row;
+            self.cursor_col = col_chars + text.chars().count();
+        } else {
+            // A replacement newline (VS Code's regex `\n`) becomes a real
+            // line break, never an embedded control char in one line.
+            let line = std::mem::take(&mut self.lines[row]);
+            let merged = format!("{}{}{}", &line[..from], text, &line[to..]);
+            self.lines
+                .splice(row..=row, merged.split('\n').map(str::to_string));
+            self.cursor_row = row + breaks;
+            self.cursor_col = text
+                .rsplit('\n')
+                .next()
+                .map_or(0, |tail| tail.chars().count());
+        }
         self.mark_buffer_changed();
         self.recompute_highlights();
     }
@@ -12812,6 +12854,81 @@ mod tests {
         assert!(!e.dirty);
         e.insert_char('z');
         assert!(e.dirty);
+    }
+
+    #[test]
+    fn switching_a_preview_tab_to_an_image_drops_the_stale_conflict_cache() {
+        // open_image swaps the whole buffer; a conflict list memoised on
+        // edit_seq from the previous text file must not survive, or a
+        // palette merge-resolve slices a one-line buffer with stale
+        // indices and panics.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = Editor::new();
+        e.lines = vec![
+            "<<<<<<< HEAD".to_string(),
+            "ours".to_string(),
+            "=======".to_string(),
+            "theirs".to_string(),
+            ">>>>>>> branch".to_string(),
+        ];
+        e.mark_buffer_changed();
+        assert_eq!(e.conflicts().len(), 1, "the conflict parses");
+        let png = tmp.path().join("p.png");
+        image::RgbaImage::new(1, 1).save(&png).unwrap();
+        e.open_image(&png).unwrap();
+        assert!(
+            e.conflicts().is_empty(),
+            "an image tab has no merge conflicts; a stale cache here is a panic waiting in resolution_lines"
+        );
+    }
+
+    #[test]
+    fn undo_past_a_save_re_dirties_the_buffer() {
+        // Auto save writes one second after a keystroke; Cmd+Z then restores
+        // the pre-edit snapshot with dirty:false while disk keeps the edit.
+        // dirty means "buffer differs from disk", so crossing a save point
+        // backwards must re-dirty or the divergence is permanent and silent.
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "hello\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_char('x');
+        assert!(matches!(e.save_to_disk(), Ok(SaveOutcome::Saved)));
+        assert!(!e.dirty);
+        assert!(e.undo());
+        assert!(
+            e.dirty,
+            "the undone buffer no longer matches disk and must say so"
+        );
+    }
+
+    #[test]
+    fn a_save_breaks_insert_coalescing() {
+        // Typing after a save must open a new undo step: coalescing across
+        // the save point makes one Cmd+Z discard work from both sides of it.
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_char('x');
+        assert!(matches!(e.save_to_disk(), Ok(SaveOutcome::Saved)));
+        e.insert_char('y');
+        assert!(e.undo());
+        assert_eq!(
+            e.lines[0], "x",
+            "undo steps back to the save point, not past it"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_replacement_splices_into_separate_lines() {
+        // A regex replacement containing a real newline (VS Code's \n) must
+        // become two buffer lines, never an embedded control char in one.
+        let mut e = Editor::new();
+        e.lines = vec!["abc".to_string()];
+        e.replace_find_match(0, 1, 1, "x\ny");
+        assert_eq!(e.lines, vec!["ax".to_string(), "yc".to_string()]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 1), "caret after the inserted text");
     }
 
     #[test]

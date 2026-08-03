@@ -8324,6 +8324,12 @@ impl App {
     /// wording in the status line. Backs both the palette's Merge Conflict
     /// commands and the Quick Fix picker rows.
     fn resolve_merge_at_cursor(&mut self, res: crate::merge::Resolution) {
+        // Palette commands reach here on any tab; a non-text view (image,
+        // sheet, diff) must refuse rather than consult the conflict cache.
+        if !self.editor_is_text() {
+            self.status = String::from("Merge conflict actions need a text file");
+            return;
+        }
         let row = self.editor.cursor_row;
         if !self.editor.resolve_conflict_at(row, res) {
             self.status = String::from("No merge conflict at the cursor");
@@ -18414,6 +18420,9 @@ impl App {
                     ed.lines.push(String::new());
                 }
                 ed.dirty = true;
+                // Make the restored unsaved content eligible for auto save:
+                // due() keys on last_edit_at, which a fresh Editor lacks.
+                ed.last_edit_at = Some(std::time::Instant::now());
             }
             let max_row = ed.lines.len().saturating_sub(1);
             ed.cursor_row = tab.cursor_row.min(max_row);
@@ -24768,11 +24777,15 @@ impl App {
         }
         self.editor.replace_all_lines(new_lines);
         self.editor.active_search_match = None;
-        self.editor.set_search_highlight(Some(needle), opts);
         if let Some(s) = self.editor_find.as_mut() {
-            s.match_count = 0;
+            // Recount against the new buffer: `a` -> `aa` doubles the
+            // matches, and a hard zero would read "No results" over a body
+            // still painted full of highlights.
+            s.match_count =
+                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts);
             s.match_index = None;
         }
+        self.editor.set_search_highlight(Some(needle), opts);
         self.status = if n == 1 {
             String::from("Replaced 1 occurrence")
         } else {
@@ -27304,13 +27317,24 @@ impl App {
                 && e.last_edit_at
                     .is_some_and(|t| t.elapsed() >= Self::AUTO_SAVE_DELAY)
         };
+        let mut conflicted: Vec<PathBuf> = Vec::new();
         let mut sweep = |editors: &mut [crate::widgets::editor::Editor]| {
             for e in editors.iter_mut().filter(|e| due(e)) {
                 // `save_to_disk` re-checks the disk and flags (never
                 // overwrites) an external change; auto save must not
                 // arm the force-overwrite path an explicit Cmd+S offers.
-                if let Ok(crate::widgets::editor::SaveOutcome::Saved) = e.save_to_disk() {
-                    saved_paths.extend(e.path.clone());
+                match e.save_to_disk() {
+                    Ok(crate::widgets::editor::SaveOutcome::Saved) => {
+                        saved_paths.extend(e.path.clone());
+                    }
+                    // The latch also removes the tab from `due`, so this is
+                    // the ONLY chance to tell the user: the FS sweep's
+                    // prompt fires on the transition into disk_conflict,
+                    // which this save just consumed.
+                    Ok(crate::widgets::editor::SaveOutcome::DiskConflict) => {
+                        conflicted.extend(e.path.clone());
+                    }
+                    Err(_) => {}
                 }
             }
         };
@@ -27318,9 +27342,15 @@ impl App {
         for group in self.editor_layout.inactive_groups_mut() {
             sweep(&mut group.editors);
         }
+        if !conflicted.is_empty() {
+            self.prompt_disk_conflict(conflicted);
+        }
         if saved_paths.is_empty() {
             return false;
         }
+        // Mirror the explicit-save path: a config file written by auto save
+        // must take effect exactly like one written by Cmd+S.
+        self.reload_config_if_needed();
         if let Some(lsp) = self.lsp.as_ref() {
             for path in &saved_paths {
                 lsp.save_doc(path.clone());
