@@ -195,41 +195,111 @@ pub fn expand_replacement(
             return Some(replacement.to_string());
         }
         let mut dst = String::new();
-        caps.expand(replacement, &mut dst);
+        caps.expand(&unescape_replacement(replacement), &mut dst);
         return Some(dst);
     }
     None
 }
 
-/// Replace every match of `needle` across `lines` (per line, exactly what
-/// the highlighter shows), returning the new lines and the number of
-/// matches replaced. Returns `None` when the needle is empty or the
-/// pattern can't compile, so callers leave the buffer untouched.
+/// Translate VS Code's regex-replacement escapes (`\n`, `\t`, `\r`, `\\`)
+/// into their characters; unknown escapes pass through untouched. Literal
+/// (non-regex) replacements are never unescaped.
+fn unescape_replacement(replacement: &str) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    let mut it = replacement.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Replace every match of `needle` across `lines` — exactly the matches
+/// the find bar counts, paints, and navigates: all of them enumerate via
+/// [`split_for_highlight`], so Replace All can never rewrite text the bar
+/// refused to show (zero-width regex matches, case foldings the literal
+/// scanner cannot map back into the line). Regex replacements expand `$n`
+/// capture references and VS Code's `\n`/`\t` escapes; a replacement
+/// newline splits the line. Returns `None` when the needle is empty or
+/// the pattern can't compile, so callers leave the buffer untouched.
 pub fn replace_all_in_lines(
     lines: &[String],
     needle: &str,
     replacement: &str,
     opts: SearchOpts,
 ) -> Option<(Vec<String>, usize)> {
-    let re = build_find_regex(needle, opts)?;
+    if needle.is_empty() {
+        return None;
+    }
+    let re = if opts.use_regex {
+        Some(build_find_regex(needle, opts)?)
+    } else {
+        None
+    };
+    let unescaped;
+    let replacement = if opts.use_regex {
+        unescaped = unescape_replacement(replacement);
+        unescaped.as_str()
+    } else {
+        replacement
+    };
     let mut total = 0usize;
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     for line in lines {
-        let count = re.find_iter(line).count();
-        if count == 0 {
+        let segs = split_for_highlight(line, needle, opts);
+        if !segs.iter().any(|(_, is_match)| *is_match) {
             out.push(line.clone());
             continue;
         }
-        total += count;
-        let replaced = if opts.use_regex {
-            re.replace_all(line, replacement).into_owned()
-        } else {
-            // Literal replacement: escape `$` so the substituted text is
-            // inserted verbatim rather than parsed as a capture reference.
-            let escaped = replacement.replace('$', "$$");
-            re.replace_all(line, escaped.as_str()).into_owned()
-        };
-        out.push(replaced);
+        let mut new = String::new();
+        // Byte offset of the current segment in `line`, for captures_at.
+        let mut pos = 0usize;
+        for (chunk, is_match) in &segs {
+            if !is_match {
+                new.push_str(chunk);
+            } else {
+                total += 1;
+                match &re {
+                    // The segment came from this same pattern (the two
+                    // builders emit identical regexes), so re-running it at
+                    // the segment's offset recovers the capture groups. The
+                    // guard falls back to the original text rather than
+                    // ever splicing a mismatched span.
+                    Some(re) => match re.captures_at(line, pos) {
+                        Some(caps)
+                            if caps.get(0).is_some_and(|m| {
+                                m.start() == pos && m.end() == pos + chunk.len()
+                            }) =>
+                        {
+                            caps.expand(replacement, &mut new);
+                        }
+                        _ => new.push_str(chunk),
+                    },
+                    // Literal replacement goes in verbatim: no capture
+                    // references, no escapes.
+                    None => new.push_str(replacement),
+                }
+            }
+            pos += chunk.len();
+        }
+        out.extend(
+            crate::widgets::editor::normalize_newlines(&new)
+                .split('\n')
+                .map(str::to_string),
+        );
     }
     Some((out, total))
 }
@@ -362,6 +432,77 @@ mod tests {
 
     fn lines(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn replace_all_touches_exactly_what_the_highlighter_shows() {
+        // The find bar's count, paint, and navigation all enumerate via
+        // split_for_highlight; Replace All must not rewrite text they
+        // never showed. Zero-width regex matches are skipped by the
+        // highlighter, and the literal scanner bails on lines whose
+        // lowercasing changes byte length (Kelvin sign) — both used to be
+        // rewritten anyway.
+        let re_opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let (out, n) =
+            replace_all_in_lines(&lines(&["banana"]), "a*", "-", re_opts).unwrap();
+        assert_eq!((out, n), (lines(&["b-n-n-"]), 3), "zero-width matches are not replaced");
+        let (out, n) = replace_all_in_lines(&lines(&["banana"]), "^", "// ", re_opts).unwrap();
+        assert_eq!((out, n), (lines(&["banana"]), 0), "an all-zero-width pattern replaces nothing");
+        let lit = SearchOpts::default();
+        // U+212A KELVIN SIGN: lowercasing shrinks the line's byte length,
+        // so the literal scanner bails and paints nothing on this line.
+        let kelvin = "300\u{212A}";
+        let (out, n) = replace_all_in_lines(&lines(&[kelvin]), "k", "x", lit).unwrap();
+        assert_eq!(
+            (out, n),
+            (lines(&[kelvin]), 0),
+            "a line the highlighter cannot show matches on is left untouched"
+        );
+    }
+
+    #[test]
+    fn regex_replacements_interpret_backslash_escapes() {
+        // VS Code's regex replace turns \n and \t into real characters; a
+        // replacement newline splits the line. Literal mode stays verbatim.
+        let re_opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let (out, n) =
+            replace_all_in_lines(&lines(&["abc"]), "b", r"x\ny", re_opts).unwrap();
+        assert_eq!((out, n), (lines(&["ax", "yc"]), 1));
+        let (out, _) = replace_all_in_lines(&lines(&["abc"]), "b", r"x\ty", re_opts).unwrap();
+        assert_eq!(out, lines(&["ax\tyc"]));
+        let (out, _) =
+            replace_all_in_lines(&lines(&["abc"]), "b", r"x\\ny", re_opts).unwrap();
+        assert_eq!(out, lines(&[r"ax\nyc"]), "an escaped backslash stays literal");
+        let (out, _) =
+            replace_all_in_lines(&lines(&["abc"]), "b", r"x\ny", SearchOpts::default()).unwrap();
+        assert_eq!(out, lines(&[r"ax\nyc"]), "literal mode inserts the text verbatim");
+    }
+
+    #[test]
+    fn carriage_returns_in_a_replacement_become_real_line_breaks() {
+        // The `\r` escape (and a pasted CRLF) must not leave a bare CR
+        // inside a buffer line: a CRLF file would then save `\r\r\n`, and
+        // every consumer counting lines would disagree with the text.
+        let re_opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let (out, n) = replace_all_in_lines(&lines(&["abc"]), "b", r"x\r\ny", re_opts).unwrap();
+        assert_eq!((out, n), (lines(&["ax", "yc"]), 1), "CRLF splits once, no stray CR");
+        let (out, _) = replace_all_in_lines(&lines(&["abc"]), "b", r"x\ry", re_opts).unwrap();
+        assert_eq!(out, lines(&["ax", "yc"]), "a lone CR is a line break too");
+        for line in replace_all_in_lines(&lines(&["abc"]), "b", r"x\r\ny", re_opts)
+            .unwrap()
+            .0
+        {
+            assert!(!line.contains('\r'), "no CR may survive in a line: {line:?}");
+        }
     }
 
     #[test]

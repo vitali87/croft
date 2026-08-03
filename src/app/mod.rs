@@ -8324,6 +8324,12 @@ impl App {
     /// wording in the status line. Backs both the palette's Merge Conflict
     /// commands and the Quick Fix picker rows.
     fn resolve_merge_at_cursor(&mut self, res: crate::merge::Resolution) {
+        // Palette commands reach here on any tab; a non-text view (image,
+        // sheet, diff) must refuse rather than consult the conflict cache.
+        if !self.editor_is_text() {
+            self.status = String::from("Merge conflict actions need a text file");
+            return;
+        }
         let row = self.editor.cursor_row;
         if !self.editor.resolve_conflict_at(row, res) {
             self.status = String::from("No merge conflict at the cursor");
@@ -18414,6 +18420,9 @@ impl App {
                     ed.lines.push(String::new());
                 }
                 ed.dirty = true;
+                // Make the restored unsaved content eligible for auto save:
+                // due() keys on last_edit_at, which a fresh Editor lacks.
+                ed.last_edit_at = Some(std::time::Instant::now());
             }
             let max_row = ed.lines.len().saturating_sub(1);
             ed.cursor_row = tab.cursor_row.min(max_row);
@@ -24768,11 +24777,15 @@ impl App {
         }
         self.editor.replace_all_lines(new_lines);
         self.editor.active_search_match = None;
-        self.editor.set_search_highlight(Some(needle), opts);
         if let Some(s) = self.editor_find.as_mut() {
-            s.match_count = 0;
+            // Recount against the new buffer: `a` -> `aa` doubles the
+            // matches, and a hard zero would read "No results" over a body
+            // still painted full of highlights.
+            s.match_count =
+                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts);
             s.match_index = None;
         }
+        self.editor.set_search_highlight(Some(needle), opts);
         self.status = if n == 1 {
             String::from("Replaced 1 occurrence")
         } else {
@@ -27304,13 +27317,24 @@ impl App {
                 && e.last_edit_at
                     .is_some_and(|t| t.elapsed() >= Self::AUTO_SAVE_DELAY)
         };
+        let mut conflicted: Vec<PathBuf> = Vec::new();
         let mut sweep = |editors: &mut [crate::widgets::editor::Editor]| {
             for e in editors.iter_mut().filter(|e| due(e)) {
                 // `save_to_disk` re-checks the disk and flags (never
                 // overwrites) an external change; auto save must not
                 // arm the force-overwrite path an explicit Cmd+S offers.
-                if let Ok(crate::widgets::editor::SaveOutcome::Saved) = e.save_to_disk() {
-                    saved_paths.extend(e.path.clone());
+                match e.save_to_disk() {
+                    Ok(crate::widgets::editor::SaveOutcome::Saved) => {
+                        saved_paths.extend(e.path.clone());
+                    }
+                    // The latch also removes the tab from `due`, so this is
+                    // the ONLY chance to tell the user: the FS sweep's
+                    // prompt fires on the transition into disk_conflict,
+                    // which this save just consumed.
+                    Ok(crate::widgets::editor::SaveOutcome::DiskConflict) => {
+                        conflicted.extend(e.path.clone());
+                    }
+                    Err(_) => {}
                 }
             }
         };
@@ -27318,8 +27342,20 @@ impl App {
         for group in self.editor_layout.inactive_groups_mut() {
             sweep(&mut group.editors);
         }
+        let had_conflicts = !conflicted.is_empty();
+        if had_conflicts {
+            self.prompt_disk_conflict(conflicted);
+        }
         if saved_paths.is_empty() {
-            return false;
+            // A conflict-only tick still changed the UI (the prompt is up):
+            // returning false would defer it to the next incidental redraw.
+            return had_conflicts;
+        }
+        // Mirror the explicit-save path: a config file written by auto save
+        // must take effect exactly like one written by Cmd+S — including one
+        // saved in a background tab or an inactive split.
+        for path in &saved_paths {
+            self.reload_config_for_path(path);
         }
         if let Some(lsp) = self.lsp.as_ref() {
             for path in &saved_paths {
@@ -27446,16 +27482,23 @@ impl App {
         let Some(path) = self.editor.path.clone() else {
             return;
         };
+        self.reload_config_for_path(&path);
+    }
+
+    /// Reload whichever of croft's own config files `path` is, if any.
+    /// Shared by the explicit-save path (active tab) and the auto-save
+    /// sweep (every written tab, background and inactive splits included).
+    fn reload_config_for_path(&mut self, path: &std::path::Path) {
         if path == crate::keymap::keybindings_path() {
-            self.keymap = crate::keymap::Keymap::load(&path);
+            self.keymap = crate::keymap::Keymap::load(path);
             self.status = String::from(
                 "Keybindings reloaded (for new Cmd chords, re-run croft setup-iterm2 / setup-ghostty)",
             );
         } else if path == crate::snippets::snippets_path() {
-            self.snippets = crate::snippets::SnippetSet::load(&path);
+            self.snippets = crate::snippets::SnippetSet::load(path);
             self.status = String::from("Snippets reloaded");
         } else if path == crate::triggers::triggers_path() {
-            self.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::load(&path));
+            self.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::load(path));
             self.status = format!(
                 "Triggers reloaded ({} active)",
                 self.triggers.triggers.len()
