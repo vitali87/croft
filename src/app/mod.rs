@@ -6954,20 +6954,32 @@ impl App {
         crate::outline_syntax::symbols_for(kind, text.as_bytes())
     }
 
-    /// Drain pending `documentSymbol` replies and apply the freshest to the
-    /// OUTLINE (guarded to the active file by `apply_outline_symbols`). Mirrors
-    /// the other `drain_lsp_*` pollers; the latest batch per file wins.
+    /// Drain pending `documentSymbol` replies and offer every one to
+    /// `apply_outline_symbols`, which is the sole judge of what applies.
+    ///
+    /// Deliberately no pre-selection. The drain used to collapse a tick's
+    /// replies to whichever ARRIVED last and discard the rest, which lost the
+    /// active file's reply whenever a slow one for the file just left landed
+    /// after it — the guard then rejected the survivor on path, and
+    /// `sync_outline` never re-requests because its `(path, seq)` key has not
+    /// changed. Picking the highest seq instead would be just as wrong: `seq`
+    /// is a per-`Editor` counter that RESTARTS at zero when a file lands in a
+    /// fresh editor group (a split, or close-and-reopen), so the outstanding
+    /// request can carry a lower number than a reply still in flight from the
+    /// old group. Offering all of them keeps the decision in the one place
+    /// that knows which request is outstanding.
     pub fn drain_lsp_document_symbols(&mut self) -> bool {
-        let mut latest: Option<(PathBuf, u64, Vec<crate::lsp::manager::OutlineSymbol>)> = None;
+        let mut replies = Vec::new();
         if let Some(lsp) = self.lsp.as_ref() {
             while let Some(r) = lsp.drain_document_symbols() {
-                latest = Some((r.path, r.seq, r.symbols));
+                replies.push((r.path, r.seq, r.symbols));
             }
         }
-        match latest {
-            Some((path, seq, symbols)) => self.apply_outline_symbols(path, seq, symbols),
-            None => false,
+        let mut applied = false;
+        for (path, seq, symbols) in replies {
+            applied |= self.apply_outline_symbols(path, seq, symbols);
         }
+        applied
     }
 
     pub fn drain_lsp_definition(&mut self) -> bool {

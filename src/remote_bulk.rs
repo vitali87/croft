@@ -75,7 +75,29 @@ impl BulkLane {
     /// or over the interactive socket otherwise. Used for long-running
     /// remote commands tied to the install (remote cargo build, tar
     /// pipe) so they never occupy the interactive master.
+    /// An ssh invocation on the bulk lane that runs a command and feeds it
+    /// nothing. Everything the lane carries runs in the background while the
+    /// attached remote session owns the terminal, so `-n` is not optional:
+    /// without it ssh forwards the caller's stdin to the remote, and the
+    /// caller's stdin is the tty the session is reading. The longest command on
+    /// this path is the fallback `cargo install`, which would otherwise hold
+    /// the user's keystrokes for the whole multi-minute build.
     pub fn ssh_command(&self, interactive_socket: &Path) -> Command {
+        let mut command = self.base_ssh_command(interactive_socket);
+        command.arg("-n").stdin(Stdio::null());
+        command
+    }
+
+    /// An ssh invocation the caller intends to WRITE to. Only the throughput
+    /// probe does: it pipes a fixed payload into a remote `cat` and times it.
+    /// It gets no `-n`, which would point ssh's stdin at /dev/null and drop the
+    /// pipe the probe writes into. Terminal isolation is not at stake here
+    /// because the caller replaces stdin with its own pipe either way.
+    pub fn probe_ssh_command(&self, interactive_socket: &Path) -> Command {
+        self.base_ssh_command(interactive_socket)
+    }
+
+    fn base_ssh_command(&self, interactive_socket: &Path) -> Command {
         let mut command = Command::new("ssh");
         command
             .arg("-S")
@@ -287,7 +309,7 @@ fn measure_throughput(
     interactive_socket: &Path,
     host: &str,
 ) -> Option<(u64, Duration)> {
-    let mut cmd = lane.ssh_command(interactive_socket);
+    let mut cmd = lane.probe_ssh_command(interactive_socket);
     cmd.arg(host)
         .arg("cat >/dev/null")
         .stdin(Stdio::piped())
@@ -389,6 +411,59 @@ mod tests {
             shared.rsync_throttle_args(),
             vec![String::from("--bwlimit=300")]
         );
+    }
+
+    // The lane's longest command is the fallback `cargo install`, which runs
+    // for minutes while the user is already attached. ssh forwards the caller's
+    // stdin to the remote unless `-n` is given, and here that stdin is the tty
+    // the attached session is reading: two processes read() it and each
+    // keystroke reaches exactly one of them, so typing vanishes for the whole
+    // build. Verified against a real host — `ssh h 'sleep 1' < probe` drains
+    // every byte, `ssh -n h 'sleep 1' < probe` leaves them all.
+    // The one lane command that FEEDS ssh rather than merely running something
+    // on the far end: the probe pipes THROUGHPUT_PROBE_BYTES into a remote
+    // `cat`. `-n` points ssh's stdin at /dev/null and drops the pipe's read
+    // end, so the probe would measure nothing, `establish` would fall back to
+    // the BWLIMIT_FLOOR_KBPS throttle, and every background install would crawl.
+    #[test]
+    fn the_throughput_probe_keeps_the_stdin_it_feeds() {
+        let lane = BulkLane::new(
+            LaneMode::Dedicated {
+                socket_path: PathBuf::from("/tmp/bulk/ctl"),
+            },
+            512,
+        );
+        let cmd = lane.probe_ssh_command(Path::new("/tmp/interactive/ctl"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.contains(&String::from("-n")),
+            "-n closes the pipe the probe writes into, so it would measure nothing"
+        );
+        assert!(args.contains(&String::from("/tmp/bulk/ctl")));
+    }
+
+    #[test]
+    fn every_lane_ssh_command_gives_up_the_callers_stdin() {
+        for mode in [
+            LaneMode::Dedicated {
+                socket_path: PathBuf::from("/tmp/bulk/ctl"),
+            },
+            LaneMode::SharedMux,
+        ] {
+            let lane = BulkLane::new(mode, 512);
+            let cmd = lane.ssh_command(Path::new("/tmp/interactive/ctl"));
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                args.contains(&String::from("-n")),
+                "a bulk command sharing the session's tty steals its keystrokes"
+            );
+        }
     }
 
     #[test]

@@ -62,22 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The Explorer no longer greys folders git does not actually ignore: a directory whose contents all happen to be ignored is confirmed against git check-ignore, the same per-file question VS Code asks, so only real matches dim.",
+        summary: "Typing into a remote session no longer loses keystrokes while an update installs in the background: the install's own connections no longer read the terminal the session is reading.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Ignored-file detection keeps filenames exactly as git reports them, so a name with a leading space or non-UTF-8 bytes is still recognised instead of silently naming a file that does not exist.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Dragging a terminal pane settles where the pointer is instead of flip-flopping: pane geometry now follows the slot, so the result no longer depends on how many mouse-motion reports arrived before the next frame.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Reordering panes writes the saved session once per tick rather than once per mouse-motion report, keeping a drag off the file-write path.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Semantic colours computed for a file that changed on disk mid-request are dropped instead of painted at the wrong offsets, and can no longer be cached under the new content and replayed on every future open.",
+        summary: "The Outline and breadcrumb keep the symbols the language server sent for the file you are on, instead of losing them to a late reply for the file you just left.",
     },
 ];
