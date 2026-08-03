@@ -4588,6 +4588,7 @@ impl Editor {
         self.clear_selection();
         let from = self.byte_index(row, col_chars);
         let to = self.byte_index(row, col_chars + len_chars);
+        let text = &normalize_newlines(text);
         let breaks = text.matches('\n').count();
         if breaks == 0 {
             self.lines[row].replace_range(from..to, text);
@@ -6688,8 +6689,16 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
 /// would then resolve one row off. Normalizing first keeps the two in lockstep
 /// and is a no-op for clean `\n`-only files.
 fn split_into_lines(text: &str) -> Vec<String> {
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    normalized.lines().map(|s| s.to_string()).collect()
+    normalize_newlines(text).lines().map(|s| s.to_string()).collect()
+}
+
+/// Fold every line-ending convention to `\n` so callers can split on it
+/// alone. Shared by the file loader and the find bar's replacement paths: a
+/// replacement carrying `\r` (VS Code's escape, or pasted CRLF text) must
+/// become a real line break, never a bare CR sitting inside a line — a CRLF
+/// buffer would then save `\r\r\n` and every line count would disagree.
+pub(crate) fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn shift_spans_for_view(spans: &[HiSpan], byte_start: usize) -> Vec<HiSpan> {
@@ -12921,6 +12930,15 @@ mod tests {
             e.lines[0], "x",
             "undo steps back to the save point, not past it"
         );
+    }
+
+    #[test]
+    fn a_replacement_carriage_return_does_not_survive_in_a_line() {
+        let mut e = Editor::new();
+        e.lines = vec!["abc".to_string()];
+        e.replace_find_match(0, 1, 1, "x\r\ny");
+        assert_eq!(e.lines, vec!["ax".to_string(), "yc".to_string()]);
+        assert!(e.lines.iter().all(|l| !l.contains('\r')));
     }
 
     #[test]

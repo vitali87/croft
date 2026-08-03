@@ -74,7 +74,7 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Regex replacements understand VS Code's backslash escapes: a replacement \\n splits the line, \\t inserts a tab.",
+        summary: "Regex replacements understand VS Code's backslash escapes: a replacement \\n splits the line, \\t inserts a tab, and \\r or a pasted CRLF becomes a real line break instead of a stray carriage return inside the text.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,

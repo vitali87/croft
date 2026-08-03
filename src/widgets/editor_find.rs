@@ -295,7 +295,11 @@ pub fn replace_all_in_lines(
             }
             pos += chunk.len();
         }
-        out.extend(new.split('\n').map(str::to_string));
+        out.extend(
+            crate::widgets::editor::normalize_newlines(&new)
+                .split('\n')
+                .map(str::to_string),
+        );
     }
     Some((out, total))
 }
@@ -478,6 +482,27 @@ mod tests {
         let (out, _) =
             replace_all_in_lines(&lines(&["abc"]), "b", r"x\ny", SearchOpts::default()).unwrap();
         assert_eq!(out, lines(&[r"ax\nyc"]), "literal mode inserts the text verbatim");
+    }
+
+    #[test]
+    fn carriage_returns_in_a_replacement_become_real_line_breaks() {
+        // The `\r` escape (and a pasted CRLF) must not leave a bare CR
+        // inside a buffer line: a CRLF file would then save `\r\r\n`, and
+        // every consumer counting lines would disagree with the text.
+        let re_opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let (out, n) = replace_all_in_lines(&lines(&["abc"]), "b", r"x\r\ny", re_opts).unwrap();
+        assert_eq!((out, n), (lines(&["ax", "yc"]), 1), "CRLF splits once, no stray CR");
+        let (out, _) = replace_all_in_lines(&lines(&["abc"]), "b", r"x\ry", re_opts).unwrap();
+        assert_eq!(out, lines(&["ax", "yc"]), "a lone CR is a line break too");
+        for line in replace_all_in_lines(&lines(&["abc"]), "b", r"x\r\ny", re_opts)
+            .unwrap()
+            .0
+        {
+            assert!(!line.contains('\r'), "no CR may survive in a line: {line:?}");
+        }
     }
 
     #[test]
