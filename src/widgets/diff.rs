@@ -62,6 +62,19 @@ pub struct DiffData {
     /// vertical scroll so the next jump re-anchors on what the user is
     /// actually looking at.
     pub nav_anchor: Option<usize>,
+    /// True only for the Source Control HEAD-vs-working-tree view, the one
+    /// diff whose left side is the git blob hunk patches are verified
+    /// against. Gates stage/unstage/revert: a Timeline snapshot diff is
+    /// built by the same opener and must not reach the git index.
+    pub left_is_git_head: bool,
+    /// Per-line CRLF flags and final-newline facts for byte-exact hunk
+    /// patches: the display lines are `str::lines()`-cleaned, which erases
+    /// both. Empty/false when raw text was not supplied (hunk actions are
+    /// gated to the builder that supplies it).
+    pub left_crlf: Vec<bool>,
+    pub right_crlf: Vec<bool>,
+    pub left_no_final_nl: bool,
+    pub right_no_final_nl: bool,
 }
 
 /// A single occurrence of the find needle inside a diff, located by the
@@ -176,6 +189,20 @@ impl DiffData {
             (Some(l), Some(r)) => l != r && rows.iter().all(|r| matches!(r, DiffRow::Equal { .. })),
             _ => false,
         };
+        // `str::lines()` (the display split) strips `\r` and forgets whether
+        // the file ended in a newline; record both so `hunk_patch` can emit
+        // byte-exact lines and the `\ No newline at end of file` marker.
+        let side_meta = |raw: Option<&str>, lines: usize| -> (Vec<bool>, bool) {
+            match raw {
+                Some(t) => (
+                    t.split('\n').take(lines).map(|l| l.ends_with('\r')).collect(),
+                    !t.is_empty() && !t.ends_with('\n'),
+                ),
+                None => (Vec::new(), false),
+            }
+        };
+        let (left_crlf, left_no_final_nl) = side_meta(left_raw, left_lines.len());
+        let (right_crlf, right_no_final_nl) = side_meta(right_raw, right_lines.len());
         Self {
             left_path,
             right_path,
@@ -190,6 +217,11 @@ impl DiffData {
             selection: None,
             find: DiffFindState::default(),
             nav_anchor: None,
+            left_is_git_head: false,
+            left_crlf,
+            right_crlf,
+            left_no_final_nl,
+            right_no_final_nl,
         }
     }
 
@@ -216,6 +248,11 @@ impl DiffData {
             selection: None,
             find: DiffFindState::default(),
             nav_anchor: None,
+            left_is_git_head: false,
+            left_crlf: Vec::new(),
+            right_crlf: Vec::new(),
+            left_no_final_nl: false,
+            right_no_final_nl: false,
         }
     }
 
@@ -261,6 +298,11 @@ impl DiffData {
                 selection: None,
                 find: DiffFindState::default(),
                 nav_anchor: None,
+                left_is_git_head: false,
+                left_crlf: Vec::new(),
+                right_crlf: Vec::new(),
+                left_no_final_nl: false,
+                right_no_final_nl: false,
             };
         }
         let mut pending_remove: Vec<usize> = Vec::new();
@@ -340,6 +382,11 @@ impl DiffData {
             selection: None,
             find: DiffFindState::default(),
             nav_anchor: None,
+            left_is_git_head: false,
+            left_crlf: Vec::new(),
+            right_crlf: Vec::new(),
+            left_no_final_nl: false,
+            right_no_final_nl: false,
         }
     }
 
@@ -416,6 +463,9 @@ impl DiffData {
 
     pub fn start_selection(&mut self, side: DiffSide, row: usize, col: usize) {
         let row = row.min(self.rows.len().saturating_sub(1));
+        // A click is also a hunk-action/jump anchor, like a landed jump; a
+        // later jump or scroll then supersedes it (see `action_row`).
+        self.nav_anchor = Some(row);
         self.selection = Some(DiffSelection {
             side,
             anchor_row: row,
@@ -494,6 +544,7 @@ impl DiffData {
         while end < chars.len() && is_word_char(chars[end]) {
             end += 1;
         }
+        self.nav_anchor = Some(row);
         self.selection = Some(DiffSelection {
             side,
             anchor_row: row,
@@ -858,13 +909,14 @@ impl DiffData {
         }
     }
 
-    /// The row hunk actions (stage / unstage / revert) anchor on: the
-    /// caret when the user has clicked, else the row the last hunk jump
-    /// landed on, else the top of the viewport — `hunk_range_at`'s
-    /// fall-forward then lands on the first visible hunk, which is the
-    /// one parked in view right after the diff opens.
+    /// The row hunk actions (stage / unstage / revert) anchor on: the most
+    /// recent click or hunk jump (both set `nav_anchor`, so the newer one
+    /// wins), else the top of the viewport — `hunk_range_at`'s fall-forward
+    /// then lands on the first visible hunk. A manual scroll clears the
+    /// anchor, so the action always targets something the user has seen:
+    /// a stale off-screen caret must never pick the hunk `R` destroys.
     pub fn action_row(&self) -> usize {
-        self.caret_row().or(self.nav_anchor).unwrap_or(self.scroll)
+        self.nav_anchor.unwrap_or(self.scroll)
     }
 
     /// Inclusive row range of the contiguous change hunk containing
@@ -927,6 +979,21 @@ impl DiffData {
         let mut old_count = 0usize;
         let mut new_count = 0usize;
         let mut body: Vec<String> = Vec::new();
+        // The display lines were `str::lines()`-cleaned; restore each line's
+        // `\r` so the patch byte-matches a CRLF file, and mark a missing
+        // final newline the way git spells it — otherwise `git apply`
+        // rejects every hunk that reaches the end of such a file.
+        const NO_NL: &str = "\\ No newline at end of file";
+        let left_line = |sig: char, i: usize| {
+            let cr = if self.left_crlf.get(i).copied().unwrap_or(false) { "\r" } else { "" };
+            format!("{sig}{}{cr}", self.left_lines[i])
+        };
+        let right_line = |sig: char, i: usize| {
+            let cr = if self.right_crlf.get(i).copied().unwrap_or(false) { "\r" } else { "" };
+            format!("{sig}{}{cr}", self.right_lines[i])
+        };
+        let left_last = |i: usize| i + 1 == self.left_lines.len() && self.left_no_final_nl;
+        let right_last = |i: usize| i + 1 == self.right_lines.len() && self.right_no_final_nl;
         // Within a change run, emit every `-` line before the `+` lines so
         // Replaced pairs read as a canonical delete-then-insert block.
         let mut minus: Vec<String> = Vec::new();
@@ -940,25 +1007,43 @@ impl DiffData {
                     new_start.get_or_insert(right + 1);
                     old_count += 1;
                     new_count += 1;
-                    body.push(format!(" {}", self.left_lines[left]));
+                    body.push(left_line(' ', left));
+                    // A context marker asserts BOTH sides end unterminated;
+                    // if only one does, the last "equal" line is not equal
+                    // byte-wise and git rightly refuses the patch.
+                    if left_last(left) && right_last(right) {
+                        body.push(NO_NL.into());
+                    }
                 }
                 DiffRow::Removed { left } => {
                     old_start.get_or_insert(left + 1);
                     old_count += 1;
-                    minus.push(format!("-{}", self.left_lines[left]));
+                    minus.push(left_line('-', left));
+                    if left_last(left) {
+                        minus.push(NO_NL.into());
+                    }
                 }
                 DiffRow::Added { right } => {
                     new_start.get_or_insert(right + 1);
                     new_count += 1;
-                    plus.push(format!("+{}", self.right_lines[right]));
+                    plus.push(right_line('+', right));
+                    if right_last(right) {
+                        plus.push(NO_NL.into());
+                    }
                 }
                 DiffRow::Replaced { left, right } => {
                     old_start.get_or_insert(left + 1);
                     new_start.get_or_insert(right + 1);
                     old_count += 1;
                     new_count += 1;
-                    minus.push(format!("-{}", self.left_lines[left]));
-                    plus.push(format!("+{}", self.right_lines[right]));
+                    minus.push(left_line('-', left));
+                    if left_last(left) {
+                        minus.push(NO_NL.into());
+                    }
+                    plus.push(right_line('+', right));
+                    if right_last(right) {
+                        plus.push(NO_NL.into());
+                    }
                 }
             }
         }
@@ -1345,6 +1430,118 @@ mod tests {
         // A context row falls forward to the next hunk, like Next Change.
         assert_eq!(d.hunk_range_at(2), Some((4, 5)));
         assert_eq!(d.hunk_range_at(0), Some((1, 1)));
+    }
+
+    #[test]
+    fn a_hunk_jump_after_a_click_moves_the_action_row() {
+        // Two hunks far apart; click on the first, then jump to the second.
+        // Stage/unstage/revert must act on the jump target, not the stale
+        // click, or `R` destroys a hunk the user is no longer looking at.
+        let left: Vec<String> = (1..=20).map(|i| format!("line{i}")).collect();
+        let mut right = left.clone();
+        right[1] = "LINE2".into();
+        right[17] = "LINE18".into();
+        let mut d = DiffData::build(PathBuf::new(), PathBuf::new(), left, right);
+        d.start_selection(DiffSide::Right, 1, 0);
+        assert_eq!(d.action_row(), 1, "a click targets the clicked row");
+        d.jump_next_change();
+        assert_eq!(
+            d.action_row(),
+            17,
+            "the jump target must win over the stale click"
+        );
+    }
+
+    /// Stage a croft-built hunk patch with real `git apply` — the only
+    /// oracle that matters for the patch shape.
+    fn git_apply_check(root: &std::path::Path, patch: &str) -> Result<(), String> {
+        use std::io::Write;
+        let mut child = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "apply", "--cached", "--check"])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(patch.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        }
+    }
+
+    fn git_repo_with(root: &std::path::Path, content: &str) {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-C", root.to_str().unwrap()])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(root.join("f.txt"), content).unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    fn head_diff(root: &std::path::Path, head: &str, work: &str) -> DiffData {
+        DiffData::build_with_byte_check(
+            PathBuf::new(),
+            root.join("f.txt"),
+            head.lines().map(str::to_string).collect(),
+            work.lines().map(str::to_string).collect(),
+            Some(head),
+            Some(work),
+        )
+    }
+
+    #[test]
+    fn hunk_patches_apply_to_files_without_a_final_newline() {
+        // `str::lines()` erases the missing-newline fact, so the patch used
+        // to claim `b\n` against a file ending in `b` and git rejected it:
+        // every hunk within three context lines of EOF was dead.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (head, work) = ("a\nb", "a\nB");
+        git_repo_with(&root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(&root, head, work);
+        let range = d.hunk_range_at(0).unwrap();
+        let patch = d.hunk_patch("f.txt", range);
+        if let Err(e) = git_apply_check(&root, &patch) {
+            panic!("git apply rejected the patch:\n{patch}\n{e}");
+        }
+    }
+
+    #[test]
+    fn hunk_patches_apply_to_crlf_files() {
+        // `str::lines()` also strips the `\r`, so a patch against a CRLF
+        // file never matched a single line of it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (head, work) = (
+            "l1\r\nl2\r\nl3\r\nl4\r\nl5\r\n",
+            "l1\r\nL2\r\nl3\r\nl4\r\nl5\r\n",
+        );
+        git_repo_with(&root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(&root, head, work);
+        let range = d.hunk_range_at(1).unwrap();
+        let patch = d.hunk_patch("f.txt", range);
+        if let Err(e) = git_apply_check(&root, &patch) {
+            panic!("git apply rejected the patch:\n{patch}\n{e}");
+        }
     }
 
     #[test]

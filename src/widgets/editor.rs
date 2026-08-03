@@ -8818,6 +8818,7 @@ impl EditorTabs {
         left_label: PathBuf,
         left_text: &str,
         right: &Path,
+        left_is_git_head: bool,
     ) -> Result<()> {
         let right_text = std::fs::read_to_string(right)
             .with_context(|| format!("reading {}", right.display()))?;
@@ -8837,6 +8838,7 @@ impl EditorTabs {
         if let Some(row) = data.first_change_row() {
             data.scroll_to_row(row);
         }
+        data.left_is_git_head = left_is_git_head;
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
         e.preview = false;
@@ -9563,7 +9565,7 @@ mod tests {
         tabs.open(&path).unwrap();
         tabs.lines[0].push('x');
         tabs.dirty = true;
-        tabs.open_head_diff_with_text(PathBuf::from("a.txt (local snapshot)"), "old\n", &path)
+        tabs.open_head_diff_with_text(PathBuf::from("a.txt (local snapshot)"), "old\n", &path, false)
             .unwrap();
         assert!(
             tabs.editors

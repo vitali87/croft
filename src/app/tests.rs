@@ -4085,6 +4085,130 @@ fn rerunning_a_task_reuses_its_pane_instead_of_stacking_new_ones() {
 }
 
 #[test]
+fn a_reused_task_pane_clears_a_half_typed_prompt_line_first() {
+    // A shell sitting at its prompt can hold unsubmitted text in the line
+    // editor; writing the task command raw would concatenate with it (the
+    // `format_cd_command` test pins the same rule for cd).
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let chord = key(
+        KeyCode::Char('B'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    app.handle_key(chord).unwrap();
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(5000) {
+        if app.terminals[app.active_terminal].foreground_is_shell() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    app.handle_key(chord).unwrap();
+    let bytes = app.terminals[app.active_terminal].written_bytes_for_test();
+    let needle = b"\x05\x15make build\r";
+    assert!(
+        bytes.windows(needle.len()).any(|w| w == needle),
+        "the reused-pane write must clear the line editor first (Ctrl-E Ctrl-U)"
+    );
+}
+
+#[test]
+fn a_task_pane_from_the_old_workspace_is_not_reused_after_a_re_root() {
+    // The pane's shell still sits in workspace A; running B's build task
+    // must not execute it there.
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    std::fs::write(a.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+    std::fs::write(b.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+    let mut app = App::new(a.path().to_path_buf()).unwrap();
+    let chord = key(
+        KeyCode::Char('B'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    app.handle_key(chord).unwrap();
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(5000) {
+        if app.terminals[app.active_terminal].foreground_is_shell() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Focus another pane so the re-root's active-pane `cd` cannot move the
+    // task pane along (the reviewer's scenario: it is NOT cd'd).
+    app.active_terminal = 0;
+    app.change_workspace_root(b.path().to_path_buf());
+    assert!(
+        app.last_task.is_none(),
+        "Rerun Last Task must not carry a task across a re-root"
+    );
+    let after = app.terminals.len();
+    app.handle_key(chord).unwrap();
+    assert_eq!(
+        app.terminals.len(),
+        after + 1,
+        "a task pane whose shell still sits in the old workspace must not be reused"
+    );
+}
+
+#[test]
+fn hunk_actions_refuse_a_timeline_snapshot_diff() {
+    // A local-history snapshot diff is built by the same opener as the
+    // Source Control diff; staging from it would apply snapshot-derived
+    // patches to the git index from a view that never mentions git.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("a.txt");
+    std::fs::write(&path, "new\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_head_diff_with_text(PathBuf::from("a.txt (local snapshot)"), "old\n", &path, false)
+        .unwrap();
+    app.stage_hunk_at_caret();
+    assert_eq!(
+        app.status, "Hunk actions need a working-tree diff from Source Control",
+        "a snapshot diff must refuse hunk actions"
+    );
+}
+
+#[test]
+fn workspace_symbol_queries_debounce_instead_of_firing_per_keystroke() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_workspace_symbols("");
+    if let Some(p) = app.workspace_symbols.as_mut() {
+        p.query.push('a');
+    }
+    app.workspace_symbols_requery();
+    assert!(
+        app.ws_symbols_request_id.is_none(),
+        "a keystroke must not dispatch workspace/symbol synchronously"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    app.workspace_symbols_dispatch_due();
+    assert!(
+        app.ws_symbols_request_id.is_some()
+            || app.workspace_symbols.as_ref().unwrap().unsupported,
+        "the settled query must dispatch (or surface no-LSP) after the window"
+    );
+}
+
+#[test]
+fn clearing_the_workspace_symbol_query_clears_the_unsupported_notice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_workspace_symbols("");
+    if let Some(p) = app.workspace_symbols.as_mut() {
+        p.unsupported = true;
+        p.query.clear();
+    }
+    app.workspace_symbols_requery();
+    assert!(
+        !app.workspace_symbols.as_ref().unwrap().unsupported,
+        "an emptied query shows the type-to-search hint, not a stale notice"
+    );
+}
+
+#[test]
 fn run_task_palette_command_opens_the_task_picker() {
     use crate::widgets::list_picker::ListPurpose;
     let tmp = tempfile::tempdir().unwrap();
@@ -4435,7 +4559,7 @@ fn enter_on_a_removed_line_in_a_source_control_diff_opens_the_working_file() {
     // label on the left, the real working file on the right.
     let label = std::path::PathBuf::from("foo.txt (HEAD)");
     app.editor
-        .open_head_diff_with_text(label, "alpha\nbravo\ncharlie\n", &foo)
+        .open_head_diff_with_text(label, "alpha\nbravo\ncharlie\n", &foo, true)
         .unwrap();
     app.focus = Pane::Editor;
     // Rows: 0 Equal alpha, 1 Removed bravo, 2 Equal charlie. Click row 1.
@@ -18463,6 +18587,9 @@ fn typing_in_the_picker_without_a_language_server_reports_unsupported() {
     app.open_workspace_symbols("");
     app.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE))
         .unwrap();
+    // The query dispatches on the debounce tick, not the keystroke.
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    app.workspace_symbols_dispatch_due();
     let picker = app.workspace_symbols.as_ref().unwrap();
     assert!(
         picker.unsupported,

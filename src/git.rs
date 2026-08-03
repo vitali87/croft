@@ -603,9 +603,12 @@ pub fn apply_patch(
     if let Some(stdin) = child.stdin.take() {
         use std::io::Write;
         let mut stdin = stdin;
-        stdin
-            .write_all(patch.as_bytes())
-            .map_err(|e| format!("failed to feed patch to git apply: {e}"))?;
+        if let Err(e) = stdin.write_all(patch.as_bytes()) {
+            // Reap before bailing or the failed child lingers as a zombie.
+            drop(stdin);
+            let _ = child.wait();
+            return Err(format!("failed to feed patch to git apply: {e}"));
+        }
     }
     let output = child
         .wait_with_output()
