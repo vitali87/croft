@@ -3586,7 +3586,6 @@ fn one_of_supported<B>(cap: &Option<OneOf<bool, B>>) -> bool {
     }
 }
 
-/// Hover capability (`boolean | HoverOptions`), same bare-`false` rule.
 /// Answer a formatting request that cannot reach a server. `unsupported` is
 /// the honest shape for every one of these: no client in this worker can
 /// format the file. The app turns it into "No formatter available for this
@@ -3600,6 +3599,7 @@ fn answer_unsupported(tx: &std_mpsc::Sender<FormatResult>, request_id: u64, path
     });
 }
 
+/// Hover capability (`boolean | HoverOptions`), same bare-`false` rule.
 fn hover_supported(cap: &Option<HoverProviderCapability>) -> bool {
     match cap {
         Some(HoverProviderCapability::Simple(b)) => *b,

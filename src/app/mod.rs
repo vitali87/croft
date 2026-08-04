@@ -27442,6 +27442,24 @@ impl App {
             && self.editor.image.is_none()
     }
 
+    /// Arm the deferred write for the active tab, ahead of the format request
+    /// whose reply will complete it.
+    ///
+    /// The latch holds one path because the manager tracks one
+    /// `format_request_id`: arming a second file abandons the first reply, so
+    /// simply overwriting the latch dropped the first file's save entirely,
+    /// leaving it dirty and unwritten with nothing reported. Flush it here
+    /// instead. It goes to disk unformatted, which is the honest outcome once
+    /// its formatter reply can no longer arrive.
+    fn arm_deferred_save(&mut self) {
+        if let Some(pending) = std::mem::take(&mut self.save_after_format)
+            && self.editor.path.as_deref() != Some(pending.as_path())
+        {
+            self.write_tab_to_disk(&pending);
+        }
+        self.save_after_format = self.editor.path.clone();
+    }
+
     /// Write the deferred buffer to disk once its format reply has landed.
     /// A no-op unless [`Self::save`] armed `save_after_format`.
     fn complete_pending_save(&mut self) {
@@ -27639,7 +27657,7 @@ impl App {
         // Format-on-save: defer the write until the format reply arrives, then
         // `drain_lsp_format` calls `complete_pending_save`.
         if self.format_on_save_eligible(self.editor_language_supports_formatting()) {
-            self.save_after_format = self.editor.path.clone();
+            self.arm_deferred_save();
             self.start_format_document();
             return;
         }

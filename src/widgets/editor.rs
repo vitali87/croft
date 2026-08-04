@@ -2664,10 +2664,17 @@ impl Editor {
         self.wrap_override = None;
         // Folds are line numbers into the OLD file. A preview tab is reused for
         // the next single-click, so without this the incoming file arrives with
-        // the previous one's blocks collapsed.
-        self.folded.clear();
-        self.hidden_ranges.clear();
-        self.fold_epoch_lines = 0;
+        // the previous one's blocks collapsed. Only for a DIFFERENT file
+        // though: `open` is also the same-path reload behind every FS-sync
+        // sweep, and dropping the set there popped the user's blocks open
+        // whenever anything rewrote the file. That case is already covered by
+        // the render-time `fold_epoch_lines` guard, which drops folds if the
+        // reload changed the line count.
+        if changed_file {
+            self.folded.clear();
+            self.hidden_ranges.clear();
+            self.fold_epoch_lines = 0;
+        }
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -6174,8 +6181,9 @@ impl Editor {
         self.scroll = line.min(self.lines.len().saturating_sub(1));
         self.scroll_sub = row.saturating_sub(acc);
         let last_visible = (self.scroll + viewport - 1).min(self.lines.len().saturating_sub(1));
-        if self.cursor_row < self.scroll {
-            self.cursor_row = self.scroll;
+        let floor = self.caret_floor_row().min(last_visible);
+        if self.cursor_row < floor {
+            self.cursor_row = floor;
         } else if self.cursor_row > last_visible {
             self.cursor_row = last_visible;
         }
@@ -6194,13 +6202,32 @@ impl Editor {
         }
         self.scroll = top.min(self.lines.len().saturating_sub(viewport));
         let last_visible = (self.scroll + viewport - 1).min(self.lines.len().saturating_sub(1));
-        if self.cursor_row < self.scroll {
-            self.cursor_row = self.scroll;
+        let floor = self.caret_floor_row().min(last_visible);
+        if self.cursor_row < floor {
+            self.cursor_row = floor;
         } else if self.cursor_row > last_visible {
             self.cursor_row = last_visible;
         }
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         self.last_edit_kind = None;
+    }
+
+    /// Topmost line the caret may be dragged to when the viewport scrolls out
+    /// from under it: the first row the sticky band does not cover. Parking it
+    /// on `scroll` itself puts it under the pinned headers, where it cannot be
+    /// seen and where the band would have to yield to stay honest — which
+    /// deleted the band for the whole of a wheel scroll.
+    ///
+    /// The band is measured from the previous frame's `sticky_lines` (the app
+    /// layer rebuilds them from `scroll` on the next render). A burst of wheel
+    /// events can therefore be one header out mid-gesture, which the render's
+    /// own caret guard absorbs by trimming the band for that frame.
+    fn caret_floor_row(&self) -> usize {
+        if self.wrap_enabled() || self.sticky_lines.is_empty() {
+            return self.scroll;
+        }
+        let rows_avail = (self.last_inner.height as usize).saturating_sub(1);
+        self.scroll + self.sticky_lines.len().min(rows_avail)
     }
 
     /// Double-click word selection: place the cursor at the click point, then
@@ -7032,6 +7059,16 @@ impl Widget for &mut Editor {
             self.folded.clear();
             self.hidden_ranges.clear();
         }
+        // A caret on a hidden line has no painted row, so nothing is drawn and
+        // the user cannot see where they are. Every direct `cursor_row` setter
+        // can land there — go-to-definition, search, Ctrl+G, a restored session
+        // — and enumerating them is how one gets missed, so normalise here,
+        // where all of them converge before anything is painted. One binary
+        // search against `hidden_ranges` when a fold exists, nothing when none
+        // does.
+        if !self.folded.is_empty() && self.is_line_hidden(self.cursor_row) {
+            self.reveal_cursor_fold();
+        }
         let wrap = self.wrap_enabled();
         if wrap {
             // Wrapped text folds onto extra rows instead of scrolling sideways.
@@ -7784,17 +7821,24 @@ impl Widget for &mut Editor {
         if !wrap && !self.sticky_lines.is_empty() && inner.height > 1 {
             let bg = self.theme.sticky_scroll_bg();
             let text_w = (inner.x + inner.width).saturating_sub(text_x);
-            // Never paint over the caret's own row. `scroll_view_to` drags the
-            // caret down to `scroll` whenever it drifts above the viewport, so
-            // the caret sits on the very row the band wants — and a caret under
-            // the band cannot be seen at all. Yield the innermost headers
-            // instead; they are the ones the caret's own line is closest to.
+            // Never paint over the caret's own row: a caret under the band
+            // cannot be seen at all. `caret_floor_row` keeps a scroll from
+            // parking it there, so this normally trims nothing; it still has to
+            // hold for the frames where the caret arrived some other way.
+            //
+            // The caret's PAINTED row, from the layout built above — counting
+            // buffer lines instead would overstate it whenever a collapsed fold
+            // or a comment box sits between the top of the viewport and the
+            // caret, and the band would paint straight over it. `None` means
+            // the caret's line is not painted at all (scrolled off, or hidden
+            // inside a fold), so nothing needs to be kept clear.
             let rows_avail = (inner.height - 1) as usize;
-            let max_rows = match self.cursor_row.checked_sub(self.scroll) {
-                // Caret on screen: the band stops above its row.
-                Some(caret_row) => rows_avail.min(caret_row),
-                // Caret scrolled off above the viewport, so it is not painted
-                // and the band cannot hide it.
+            let caret_row = self
+                .last_wrap_rows
+                .iter()
+                .position(|r| matches!(r, VisRow::Text { line, .. } if *line == self.cursor_row));
+            let max_rows = match caret_row {
+                Some(row) => rows_avail.min(row),
                 None => rows_avail,
             };
             let sticky = self.sticky_lines.clone();
@@ -13169,6 +13213,36 @@ mod tests {
         );
     }
 
+    /// `open` also serves the same-path reload, so clearing the fold set there
+    /// unconditionally made every FS-sync sweep pop the user's blocks open:
+    /// a `git checkout`, an external formatter, or another split saving the
+    /// file. Only a DIFFERENT file arriving in this tab invalidates them.
+    #[test]
+    fn an_external_reload_of_the_same_file_keeps_its_folds() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "def f():\n    a\n    b\ntail\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1), "the block starts collapsed");
+        // An external rewrite of the same shape: same line count, same length,
+        // so only the mtime moves.
+        std::fs::write(tmp.path(), "def f():\n    A\n    B\ntail\n").unwrap();
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path())
+            .unwrap()
+            .set_modified(newer)
+            .unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.lines[1], "    A", "the reload landed");
+        assert!(
+            e.is_line_hidden(1),
+            "the fold must survive a reload of the file it was set on"
+        );
+    }
+
     #[test]
     fn reload_or_flag_conflict_reloads_clean_buffer() {
         let tmp = NamedTempFile::new().unwrap();
@@ -16590,6 +16664,81 @@ mod tests {
         );
     }
 
+    /// The wheel drags the caret along with the viewport (`scroll_view_to`
+    /// clamps it to `scroll`), which used to park it on the very row the band
+    /// wants. Suppressing the band there would delete sticky scroll for the
+    /// one gesture it exists to serve, so the caret lands below the band
+    /// instead.
+    #[test]
+    fn a_wheel_scroll_keeps_the_band_and_parks_the_caret_below_it() {
+        let text = (0..80)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = editor_with(&text);
+        e.focused = true;
+        e.sticky_lines = vec![0, 10];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 15,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf); // seats `last_inner` for scroll_down
+        assert_eq!(e.cursor_row, 0, "caret starts on the first line");
+        e.scroll_down(20);
+        (&mut e).render(area, &mut buf);
+        let top = e.last_inner.y;
+        assert_eq!(
+            e.sticky_line_at(5, top),
+            Some(0),
+            "the band must survive a wheel scroll"
+        );
+        assert_eq!(e.sticky_line_at(5, top + 1), Some(10));
+        assert!(
+            e.cursor_row >= e.scroll + 2,
+            "caret dragged below the two-row band, not under it (row {}, scroll {})",
+            e.cursor_row,
+            e.scroll
+        );
+    }
+
+    /// The band stops above the caret's PAINTED row. A collapsed fold between
+    /// the top of the viewport and the caret removes rows, so counting buffer
+    /// lines overstates how far down the caret is and the band paints over it.
+    #[test]
+    fn the_band_stops_above_the_caret_with_a_fold_between_them() {
+        let mut text: Vec<String> = (0..10).map(|i| format!("head{i}")).collect();
+        text.push(String::from("def f():"));
+        text.extend((0..3).map(|i| format!("    body{i}")));
+        text.extend((0..10).map(|i| format!("tail{i}")));
+        let mut e = editor_with(&text.join("\n"));
+        e.focused = true;
+        e.scroll = 10;
+        e.toggle_fold(10); // hides lines 11..=13
+        assert!(e.is_line_hidden(12), "the fold body is hidden");
+        // Line 14 is the second PAINTED row (row 0 is the fold header on 10),
+        // even though it is four buffer lines below the top.
+        e.cursor_row = 14;
+        e.sticky_lines = vec![0, 5];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 15,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let top = e.last_inner.y;
+        assert_eq!(e.sticky_line_at(5, top), Some(0), "outermost header pins");
+        assert_eq!(
+            e.sticky_line_at(5, top + 1),
+            None,
+            "the caret's own painted row must stay clear of the band"
+        );
+    }
+
     #[test]
     fn sticky_scroll_hidden_without_pinned_lines() {
         let mut e = editor_with("a\nb\nc\n");
@@ -16886,6 +17035,36 @@ mod tests {
             "the edit revealed the region it landed in"
         );
         assert!(e.lines[1].contains('Z'), "and the text went to line 1");
+    }
+
+    /// Waiting for an EDIT to reveal the fold is too late for a jump: a caret
+    /// on a hidden line has no painted row at all, so `cursor_screen_pos`
+    /// returns `None` and no caret is drawn anywhere on screen. Ctrl+G stands
+    /// in for every direct `cursor_row` setter (go-to-definition, search).
+    #[test]
+    fn jumping_into_a_collapsed_block_opens_it_so_the_caret_is_painted() {
+        let mut e = editor_with("fn a() {\n    x\n    y\n}\nafter");
+        e.focused = true;
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1), "the block starts collapsed");
+        e.goto_line(2); // one-based: line index 1, inside the fold
+        assert_eq!(e.cursor_row, 1);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        assert!(
+            !e.is_line_hidden(1),
+            "the jump target's own block must open"
+        );
+        assert!(
+            e.cursor_screen_pos().is_some(),
+            "so the caret has somewhere to be painted"
+        );
     }
 
     #[test]

@@ -70,11 +70,15 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The cursor no longer walks into a collapsed fold. Arrow keys step over the whole block, and an edit that lands inside one opens it, so typing can never change lines you cannot see.",
+        summary: "A second Save while the formatter is still working no longer loses the first file. It is written straight away rather than waiting for a reply that can no longer arrive.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Sticky scroll no longer paints over the cursor's own line.",
+        summary: "The cursor no longer ends up inside a collapsed fold. Arrow keys step over the whole block, and anything that jumps into one (Go to Definition, search, Ctrl+G) opens it, so the cursor is always somewhere you can see.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Sticky scroll no longer paints over the cursor's own line, and no longer vanishes as you scroll: the cursor is carried to the first line below the pinned headers instead of underneath them.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,

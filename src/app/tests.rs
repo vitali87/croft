@@ -18426,6 +18426,41 @@ fn format_on_save_eligible_requires_pref_and_formatter_and_code_file() {
 }
 
 #[test]
+fn a_second_save_while_a_format_is_in_flight_still_writes_the_first_file() {
+    // The latch holds ONE path and the manager tracks one format request id,
+    // so arming a second file abandons the first reply. Overwriting the latch
+    // therefore lost the first save outright: a.py stayed dirty and unwritten,
+    // with no error and no status.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    let b = tmp.path().join("b.py");
+    std::fs::write(&a, "a=1\n").unwrap();
+    std::fs::write(&b, "b=1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.insert_char('X');
+    app.arm_deferred_save(); // Cmd+S on a.py
+
+    // The user moves on and saves the other file before the first reply lands.
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.insert_char('Y');
+    app.arm_deferred_save(); // Cmd+S on b.py
+
+    assert!(
+        std::fs::read_to_string(&a).unwrap().starts_with('X'),
+        "a.py's save must survive the second Cmd+S, got {:?}",
+        std::fs::read_to_string(&a).unwrap()
+    );
+    // b.py is still deferred, waiting on its own format reply.
+    assert_eq!(app.save_after_format.as_deref(), Some(b.as_path()));
+    app.complete_pending_save();
+    assert!(
+        std::fs::read_to_string(&b).unwrap().starts_with('Y'),
+        "and b.py lands when its reply arrives"
+    );
+}
+
+#[test]
 fn a_deferred_format_save_writes_the_file_it_was_asked_to_save() {
     // `save()` armed a bare bool and returned; the write happened later, from
     // the format reply, through `write_current_to_disk` — which saves the
