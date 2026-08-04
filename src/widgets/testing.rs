@@ -191,7 +191,26 @@ impl TestingPanel {
             self.run_reported_failed = true;
         }
         match self.cases.binary_search_by(|c| c.name.cmp(&case.name)) {
-            Ok(i) => self.cases[i].status = case.status,
+            Ok(i) => {
+                // A failure reported by THIS run is never downgraded. Two test
+                // harnesses in one `cargo test --no-fail-fast` (an ordinary
+                // workspace) can report the same test path, and stdout carries
+                // no harness identity to tell them apart — cargo's "Running
+                // unittests …" banner is on stderr, a separate stream read by a
+                // separate thread, so no reliable ordering exists between them.
+                // This row therefore stands for every test with that name, and
+                // is only honest if it shows the worst outcome: a pass landing
+                // second used to erase a real failure, leaving a green tally
+                // and no badge. Scoped to a run — the run-start paths clear the
+                // tree or mark the case Running first, so a Failed sitting here
+                // came from the run in progress.
+                let downgrade = self.activity == Activity::Running
+                    && self.cases[i].status == TestStatus::Failed
+                    && case.status != TestStatus::Failed;
+                if !downgrade {
+                    self.cases[i].status = case.status;
+                }
+            }
             Err(i) => self.cases.insert(i, case),
         }
     }
@@ -627,13 +646,71 @@ mod tests {
             status: TestStatus::Failed,
         });
         assert_eq!(p.failed_count(), 2);
-        // Re-applying a name updates in place, never duplicates.
+        // Re-applying a name updates in place, never duplicates. (Shown with a
+        // Running case: a reported failure is deliberately NOT downgraded — see
+        // `a_duplicate_name_from_another_harness_cannot_erase_the_failure`.)
         p.apply_case(TestCase {
-            name: "m::b".into(),
+            name: "m::d".into(),
+            status: TestStatus::Running,
+        });
+        assert_eq!(p.cases.len(), 4);
+        p.apply_case(TestCase {
+            name: "m::d".into(),
             status: TestStatus::Passed,
         });
-        assert_eq!(p.failed_count(), 1);
-        assert_eq!(p.cases.len(), 3);
+        assert_eq!(p.failed_count(), 2);
+        assert_eq!(p.cases.len(), 4);
+    }
+
+    /// libtest prints only `test <path> ... <outcome>` on stdout; the harness
+    /// it belongs to ("Running unittests src/lib.rs (…)") is cargo's, on
+    /// stderr, a different stream read by a different thread. So two harnesses
+    /// in one `cargo test --no-fail-fast` — an ordinary workspace, and croft
+    /// always passes that flag — report the same name into one row. Verified
+    /// against real cargo output: a failing `a` and a passing `b` emit
+    /// "test tests::works ... FAILED" then "test tests::works ... ok".
+    /// The row stands for both, so it has to carry the worse outcome; letting
+    /// the pass land turned a genuinely failing run green, with no beaker badge
+    /// and no "run failed" marker (`run_reported_failed` had already latched,
+    /// which suppresses it).
+    #[test]
+    fn a_duplicate_name_from_another_harness_cannot_erase_the_failure() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "tests::works".into(),
+            status: TestStatus::Failed,
+        });
+        p.apply_case(TestCase {
+            name: "tests::works".into(),
+            status: TestStatus::Passed,
+        });
+        assert_eq!(p.cases.len(), 1, "the two harnesses share one row");
+        assert_eq!(
+            p.failed_count(),
+            1,
+            "and that row must still report the failure"
+        );
+    }
+
+    /// The no-downgrade rule is scoped to a run. Discovery re-lists the tree
+    /// with every case NotRun, and a stale Failed from an earlier run must not
+    /// survive that.
+    #[test]
+    fn discovery_still_clears_a_previous_runs_failure() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "tests::works".into(),
+            status: TestStatus::Failed,
+        });
+        p.on_finished(Some(false));
+        p.on_busy_started(Activity::Discovering);
+        p.apply_case(TestCase {
+            name: "tests::works".into(),
+            status: TestStatus::NotRun,
+        });
+        assert_eq!(p.failed_count(), 0);
     }
 
     #[test]

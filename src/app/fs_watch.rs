@@ -55,7 +55,12 @@ pub struct FsWatch {
     poll_last_check: Instant,
     poll_interval: Duration,
     poll_dir_mtimes: BTreeMap<PathBuf, Option<SystemTime>>,
-    poll_open_file_mtime: Option<(PathBuf, Option<(SystemTime, u64)>)>,
+    /// Per-file stamps for EVERY open tab, not just the focused one. A file
+    /// sitting directly in a boundary dir gets no watch at all (that is the
+    /// iron law that keeps the FSEvents storm dead) and an in-place write does
+    /// not move its parent dir's mtime, so this stat is the only thing that can
+    /// see it change. Bounded by the number of open tabs, once per poll tick.
+    poll_open_files: BTreeMap<PathBuf, Option<(SystemTime, u64)>>,
 }
 
 impl FsWatch {
@@ -67,7 +72,7 @@ impl FsWatch {
             poll_last_check: Instant::now(),
             poll_interval: FS_POLL_INTERVAL,
             poll_dir_mtimes: Self::snapshot_expanded_dir_mtimes(tree),
-            poll_open_file_mtime: None,
+            poll_open_files: BTreeMap::new(),
         }
     }
 
@@ -103,8 +108,15 @@ impl FsWatch {
         }
     }
 
-    pub fn sync_open_file_mtime(&mut self, open_path: Option<&Path>) {
-        self.poll_open_file_mtime = open_path.map(|p| (p.to_path_buf(), Self::file_stamp(p)));
+    pub fn sync_open_file_mtime(&mut self, open_paths: &[PathBuf]) {
+        self.poll_open_files = Self::stamp_all(open_paths);
+    }
+
+    fn stamp_all(paths: &[PathBuf]) -> BTreeMap<PathBuf, Option<(SystemTime, u64)>> {
+        paths
+            .iter()
+            .map(|p| (p.clone(), Self::file_stamp(p)))
+            .collect()
     }
 
     pub fn drain(&mut self, tree: &mut FileTree, editor: &EditorTabs) -> FsDrain {
@@ -153,14 +165,22 @@ impl FsWatch {
         out
     }
 
-    pub fn poll(&mut self, tree: &mut FileTree, open_path: Option<&Path>) -> FsPoll {
+    /// Whether the next `poll` would do any work. `drain_fs_events` runs every
+    /// frame while the poll fires at most every `FS_POLL_INTERVAL`, so the
+    /// caller checks this before collecting the open-tab paths — otherwise the
+    /// frame pays a Vec of PathBuf clones just to have `poll` drop it.
+    pub fn poll_due(&self) -> bool {
+        self.poll_last_check.elapsed() >= self.poll_interval
+    }
+
+    pub fn poll(&mut self, tree: &mut FileTree, open_paths: &[PathBuf]) -> FsPoll {
         let mut out = FsPoll::default();
-        if self.poll_last_check.elapsed() < self.poll_interval {
+        if !self.poll_due() {
             return out;
         }
         let poll_start = Instant::now();
         self.poll_last_check = poll_start;
-        out.open_file_changed = self.poll_open_file_change(open_path);
+        out.open_file_changed = self.poll_open_file_change(open_paths);
         let current = Self::snapshot_expanded_dir_mtimes(tree);
         let changed_dirs: Vec<PathBuf> = current
             .iter()
@@ -189,18 +209,16 @@ impl FsWatch {
         out
     }
 
-    fn poll_open_file_change(&mut self, open_path: Option<&Path>) -> bool {
-        let current = open_path.map(|p| (p.to_path_buf(), Self::file_stamp(p)));
-        let changed = match (&self.poll_open_file_mtime, &current) {
-            (Some((old_path, old_stamp)), Some((path, stamp))) if old_path == path => {
-                old_stamp != stamp
-            }
-            _ => {
-                self.poll_open_file_mtime = current;
-                return false;
-            }
-        };
-        self.poll_open_file_mtime = current;
+    /// True when any file backing an open tab has a different stamp than the
+    /// last poll saw. A path we have no previous stamp for (a tab just opened)
+    /// is only baselined — it is not a change — and a path that has gone away
+    /// with its tab simply drops out.
+    fn poll_open_file_change(&mut self, open_paths: &[PathBuf]) -> bool {
+        let current = Self::stamp_all(open_paths);
+        let changed = current.iter().any(
+            |(path, stamp)| matches!(self.poll_open_files.get(path), Some(old) if old != stamp),
+        );
+        self.poll_open_files = current;
         changed
     }
 
