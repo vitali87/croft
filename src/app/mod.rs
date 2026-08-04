@@ -2386,6 +2386,15 @@ pub struct App {
     /// right edge, in lock-step with `terminals`. Clicking one hands that
     /// terminal the maximized pane. Empty outside maximize mode.
     terminal_rail_rects: Vec<Rect>,
+    /// The maximize rail's own column, so the wheel can scroll it. Empty
+    /// whenever the rail is not on screen.
+    terminal_rail_area: Rect,
+    /// First terminal shown in the rail when there are more terminals than
+    /// rows. Clamped during paint, so nothing else has to keep it honest.
+    terminal_rail_scroll: usize,
+    /// Which terminal the rail last scrolled into view, so the reveal fires
+    /// when the active pane changes and never fights a deliberate wheel.
+    terminal_rail_revealed: Option<usize>,
     /// Hit-test rectangles of the pane name pills at each pane's top-left, in
     /// lock-step with `terminals`. A press on one starts a drag-reorder;
     /// hidden or unlabeled panes hold an empty rect. Empty with one terminal.
@@ -3605,6 +3614,9 @@ impl App {
             terminal_close_buttons: Vec::new(),
             terminal_max_buttons: Vec::new(),
             terminal_rail_rects: Vec::new(),
+            terminal_rail_area: Rect::default(),
+            terminal_rail_scroll: 0,
+            terminal_rail_revealed: None,
             terminal_label_rects: Vec::new(),
             terminal_drag_from: None,
             terminal_pane_maximized: false,
@@ -8155,19 +8167,11 @@ impl App {
         {
             return;
         }
-        let n = if let Some(sel) = self.editor.selection {
-            let (a, h) = sel.normalised();
-            self.editor.cursor_row = a.0;
-            self.editor.cursor_col = 0;
-            self.editor.clear_selection();
-            h.0 - a.0 + 1
-        } else {
-            1
-        };
-        let yanked = self.editor.delete_lines(n);
+        let yanked = self.editor.delete_caret_lines();
         if !yanked.is_empty() {
             copy_to_clipboard(&yanked);
         }
+        let n = yanked.lines().count();
         self.status = format!("Deleted {n} {}", if n == 1 { "line" } else { "lines" });
     }
 
@@ -9599,10 +9603,25 @@ impl App {
         shells
     }
 
+    /// Where the profile dropdown hangs: under the `⌄` caret of the pane it was
+    /// opened from, with the menu auto-clamping up/left to stay on screen.
+    /// Anchoring on the first caret in the vec is wrong twice over — hidden
+    /// panes hold `Rect::default()` placeholders so a button's position names
+    /// its terminal, and side by side every pane has a live caret, so every
+    /// pane's dropdown would hang under the leftmost one. Falls back to the
+    /// toolbar's top-right corner before the caret has been painted.
+    fn terminal_caret_origin(&self, pane: usize) -> (u16, u16) {
+        self.terminal_profile_buttons
+            .get(pane)
+            .filter(|c| c.width > 0)
+            .map(|c| (c.x, c.y.saturating_add(1)))
+            .unwrap_or((self.last_frame_area.width.saturating_sub(20), 1))
+    }
+
     /// Open the terminal-profile dropdown (VS Code's `⌄` next to `+`): a compact
     /// context menu anchored under the caret, one row per shell. Picking a row
     /// opens a new pane running that shell.
-    fn open_terminal_profile_picker(&mut self) {
+    fn open_terminal_profile_picker(&mut self, pane: usize) {
         let items: Vec<MenuEntry> = self
             .terminal_profiles()
             .into_iter()
@@ -9615,14 +9634,7 @@ impl App {
             self.status = String::from("No terminal profiles found");
             return;
         }
-        // Anchor under the `⌄` caret; the menu auto-clamps up/left to stay on
-        // screen. Fall back to the toolbar's top-right corner if the caret rect
-        // hasn't been painted yet.
-        let origin = self
-            .terminal_profile_buttons
-            .first()
-            .map(|c| (c.x, c.y.saturating_add(1)))
-            .unwrap_or((self.last_frame_area.width.saturating_sub(20), 1));
+        let origin = self.terminal_caret_origin(pane);
         // The dropdown is anchored under the `⌄` caret in the terminal
         // toolbar and grows downward into the terminal panel — it never
         // overlaps the editor's welcome logo, so the cached OSC-1337 image
@@ -9812,11 +9824,19 @@ impl App {
         }
     }
 
+    /// Drop the rail's hit rects and its column. Both must go together: a
+    /// stale area would keep swallowing the wheel after the rail left screen.
+    fn clear_terminal_rail(&mut self) {
+        self.terminal_rail_rects.clear();
+        self.terminal_rail_area = Rect::default();
+    }
+
     /// Paint the maximize-mode rail: one row per terminal down the panel's
     /// right edge — the active one highlighted, the rest hover-lit — so the
     /// user can shuffle between maximized terminals. Records one hit rect
     /// per row in `terminal_rail_rects`, index-aligned with `terminals`.
     fn paint_terminal_rail(&mut self, frame: &mut ratatui::Frame, rail: Rect) {
+        self.terminal_rail_area = rail;
         if rail.width == 0 || rail.height == 0 {
             return;
         }
@@ -9828,11 +9848,33 @@ impl App {
         } else {
             Color::Rgb(0x09, 0x4d, 0x77)
         };
-        for i in 0..self.terminals.len() {
-            let y = rail.y + i as u16;
-            if y >= rail.y + rail.height {
-                break;
+        // With more terminals than rows the rail is a window over the list,
+        // scrolled by the wheel — the panel floors at 3 rows, so four panes
+        // are enough to reach this. Switching panes scrolls the new one into
+        // view so its highlight is never off-screen, but only on the frame the
+        // active pane CHANGES: revealing every frame would pin the window
+        // whenever the active pane sits at either end and make the wheel inert.
+        let rows = rail.height as usize;
+        let max_scroll = self.terminals.len().saturating_sub(rows);
+        let mut scroll = self.terminal_rail_scroll.min(max_scroll);
+        if self.terminal_rail_revealed != Some(self.active_terminal) {
+            if self.active_terminal < scroll {
+                scroll = self.active_terminal;
+            } else if self.active_terminal >= scroll + rows {
+                scroll = self.active_terminal + 1 - rows;
             }
+            self.terminal_rail_revealed = Some(self.active_terminal);
+        }
+        self.terminal_rail_scroll = scroll;
+        for i in 0..self.terminals.len() {
+            // Rows outside the window still push a placeholder, so a rect's
+            // position in the vec keeps naming its terminal. `rect_contains`
+            // rejects empty rects, so they can never phantom-match a click.
+            if i < scroll || i >= scroll + rows {
+                self.terminal_rail_rects.push(Rect::default());
+                continue;
+            }
+            let y = rail.y + (i - scroll) as u16;
             let row = Rect {
                 x: rail.x,
                 y,
@@ -9890,15 +9932,33 @@ impl App {
         let slot_rects: Vec<Rect> = self.terminals.iter().map(|t| t.last_area).collect();
         let t = self.terminals.remove(from);
         self.terminals.insert(to, t);
-        for (term, rect) in self.terminals.iter_mut().zip(slot_rects) {
-            term.last_area = rect;
-        }
         self.active_terminal = match self.active_terminal {
             a if a == from => to,
             a if from < a && a <= to => a - 1,
             a if to <= a && a < from => a + 1,
             a => a,
         };
+        if self.terminal_pane_maximized {
+            // Maximize mode has exactly one live rect, and it belongs to
+            // whichever pane was active at the LAST PAINT — not to the dragged
+            // terminal, since the press and the drag are drained together. So
+            // neither positional rule works here: find the live rect and hand
+            // it to the pane the drag leaves active, which is the one that will
+            // own the panel on the next frame.
+            let pane = slot_rects
+                .iter()
+                .copied()
+                .find(|r| r.width > 0)
+                .unwrap_or_default();
+            let active = self.active_terminal;
+            for (i, term) in self.terminals.iter_mut().enumerate() {
+                term.last_area = if i == active { pane } else { Rect::default() };
+            }
+        } else {
+            for (term, rect) in self.terminals.iter_mut().zip(slot_rects) {
+                term.last_area = rect;
+            }
+        }
         self.terminal_session_dirty = true;
     }
 
@@ -11175,7 +11235,7 @@ impl App {
                     let n = self.terminals.len().max(1);
                     let multi = self.terminals.len() > 1;
                     let maximized = self.terminal_pane_maximized && multi;
-                    self.terminal_rail_rects.clear();
+                    self.clear_terminal_rail();
                     // Maximize mode: the active pane owns the panel's width
                     // minus a right rail listing every terminal (VS Code's
                     // terminal-tabs list); hidden panes drop their hit rects
@@ -11276,7 +11336,13 @@ impl App {
                         let mut label_rect = Rect::default();
                         if multi {
                             let label = self.terminals[i].label().to_string();
-                            let room = col.width.saturating_sub(14) as usize;
+                            // The pill is painted AFTER the header buttons and
+                            // wins the shared cells, so its budget has to
+                            // clear the button strip plus the pill's own
+                            // widest decoration (a leading `⚠` or `⇶` and the
+                            // two spaces every pill carries).
+                            let room =
+                                col.width.saturating_sub(TERMINAL_BUTTON_STRIP_W + 4) as usize;
                             // While broadcast input is on, every pane that
                             // receives the mirrored keystrokes wears an
                             // unmissable red pill with a ⇶ marker
@@ -11324,13 +11390,27 @@ impl App {
                                 } else {
                                     crate::widgets::header_pill::action_style(brand, false)
                                 };
+                                // `room` bounds how much of the name is worth
+                                // showing, but it counts CHARACTERS while the
+                                // buffer advances by display CELLS, so a CJK
+                                // or emoji name is twice as wide as its budget
+                                // and would still reach the buttons. Clip the
+                                // paint to the cells before the button strip —
+                                // `set_stringn` measures grapheme width, which
+                                // is the same clamp the rail rows use — and
+                                // take the drag handle's width from what was
+                                // actually painted.
+                                let budget =
+                                    col.width.saturating_sub(TERMINAL_BUTTON_STRIP_W) as usize;
+                                let (end_x, _) = frame
+                                    .buffer_mut()
+                                    .set_stringn(col.x, col.y, text, budget, style);
                                 label_rect = Rect {
                                     x: col.x,
                                     y: col.y,
-                                    width: (text.chars().count() as u16).min(col.width),
+                                    width: end_x.saturating_sub(col.x),
                                     height: 1,
                                 };
-                                frame.buffer_mut().set_string(col.x, col.y, text, style);
                             }
                         }
                         self.terminal_label_rects.push(label_rect);
@@ -11345,7 +11425,7 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
-                    self.terminal_rail_rects.clear();
+                    self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
                     }
@@ -11359,7 +11439,7 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
-                    self.terminal_rail_rects.clear();
+                    self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
                     }
@@ -11373,7 +11453,7 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
-                    self.terminal_rail_rects.clear();
+                    self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
                     }
@@ -11386,7 +11466,7 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
-                    self.terminal_rail_rects.clear();
+                    self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
                     }
@@ -11399,7 +11479,7 @@ impl App {
             self.terminal_close_buttons.clear();
             self.terminal_max_buttons.clear();
             self.terminal_label_rects.clear();
-            self.terminal_rail_rects.clear();
+            self.clear_terminal_rail();
             self.problems_tab_rect = Rect::default();
             self.output_tab_rect = Rect::default();
             self.ports_tab_rect = Rect::default();
@@ -19506,9 +19586,10 @@ impl App {
     }
 
     /// Vim-style chord layer for the editor: `cmd+gg` jumps to top, `cmd+G`
-    /// jumps to bottom, `cmd+dd` deletes a line, `cmd+yy` yanks a line.
-    /// Counts go between the chord start and the completion key
-    /// (`cmd+g 12 g` jumps to line 12; `cmd+d 3 d` deletes three lines).
+    /// jumps to bottom, `cmd+yy` yanks a line. Counts go between the chord
+    /// start and the completion key (`cmd+g 12 g` jumps to line 12). There is
+    /// no `cmd+dd`: `cmd+d` is Add Selection to Next Match, and Delete Line
+    /// moved to `cmd+shift+k`.
     /// Returns true when the key was consumed; false means the caller
     /// should continue with normal editor handling.
     fn handle_editor_vim_chord(&mut self, key: KeyEvent) -> bool {
@@ -26028,12 +26109,12 @@ impl App {
                     }
                     return;
                 }
-                if self
+                if let Some(idx) = self
                     .terminal_profile_buttons
                     .iter()
-                    .any(|r| rect_contains(*r, m.column, m.row))
+                    .position(|r| rect_contains(*r, m.column, m.row))
                 {
-                    self.open_terminal_profile_picker();
+                    self.open_terminal_profile_picker(idx);
                     return;
                 }
                 if let Some(idx) = self
@@ -27216,6 +27297,10 @@ impl App {
                     } else {
                         self.editor.scroll_down(3);
                     }
+                } else if rect_contains(self.terminal_rail_area, m.column, m.row) {
+                    // The rail is its own scrollable list, like VS Code's
+                    // terminal tabs. Paint clamps the offset.
+                    self.terminal_rail_scroll = self.terminal_rail_scroll.saturating_add(1);
                 } else if let Some(idx) = terminal_hit {
                     let shift = m.modifiers.contains(KeyModifiers::SHIFT);
                     let t = &mut self.terminals[idx];
@@ -27281,6 +27366,8 @@ impl App {
                     } else {
                         self.editor.scroll_up(3);
                     }
+                } else if rect_contains(self.terminal_rail_area, m.column, m.row) {
+                    self.terminal_rail_scroll = self.terminal_rail_scroll.saturating_sub(1);
                 } else if let Some(idx) = terminal_hit {
                     let shift = m.modifiers.contains(KeyModifiers::SHIFT);
                     let t = &mut self.terminals[idx];
@@ -32329,6 +32416,13 @@ const TERMINAL_MAX_LABEL: &str = " \u{eb4c} ";
 const TERMINAL_RESTORE_LABEL: &str = " \u{eb4d} ";
 /// Codicon terminal (Nerd Fonts `cod-terminal` = U+EA85), leading each
 /// maximize-rail row the way VS Code's terminal tabs list does.
+/// Cells the pane's header buttons occupy, measured in from its right edge:
+/// `⛶`, `-`, `∨` and `+` at three each, plus the one blank column right of
+/// `+`. The name pill paints after the buttons and would win the shared cells,
+/// so it is clipped to the width left of this strip.
+/// `a_long_pane_label_never_overpaints_the_maximize_button` pins it, so adding
+/// a fifth button fails a test rather than quietly erasing a glyph again.
+const TERMINAL_BUTTON_STRIP_W: u16 = 13;
 const TERMINAL_RAIL_ICON: char = '\u{ea85}';
 /// How many label characters a rail row shows. Fixed and deliberately tiny:
 /// the rail is a switcher, not a directory, so four letters identify a pane.

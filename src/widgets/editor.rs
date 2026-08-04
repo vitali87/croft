@@ -4486,6 +4486,63 @@ impl Editor {
         yanked
     }
 
+    /// Delete every line touched by the primary cursor or selection and by
+    /// each secondary caret, yanking the removed text. VS Code's
+    /// `editor.action.deleteLines` works across all cursors, and `Cmd+D`
+    /// exists to make them: deleting only the primary's line would strand the
+    /// others, still painted on rows that moved out from under them.
+    pub fn delete_caret_lines(&mut self) -> String {
+        self.pin_on_edit();
+        if self.lines.is_empty() {
+            return String::new();
+        }
+        self.push_undo(EditKind::DeleteLines);
+        let last = self.lines.len() - 1;
+        let primary = self
+            .selection
+            .unwrap_or_else(|| EditorSelection::new(self.cursor_row, self.cursor_col));
+        // Mark while collecting, then scan once: the rows come out sorted and
+        // deduped without a sort, and Change All Occurrences (Cmd+F2) can put
+        // a caret on every match in the file.
+        let mut doomed = vec![false; self.lines.len()];
+        for sel in std::iter::once(primary).chain(self.carets.iter().copied()) {
+            let (a, h) = sel.normalised();
+            for slot in &mut doomed[a.0.min(last)..=h.0.min(last)] {
+                *slot = true;
+            }
+        }
+        let rows: Vec<usize> = doomed
+            .iter()
+            .enumerate()
+            .filter_map(|(r, &drop)| drop.then_some(r))
+            .collect();
+        let yanked = rows
+            .iter()
+            .map(|&r| self.lines[r].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        // One retain pass, not a `remove` per row: removing tens of thousands
+        // of rows one at a time is quadratic — a multi-second freeze on a large
+        // file, on the render thread.
+        let mut i = 0;
+        self.lines.retain(|_| {
+            let keep = !doomed[i];
+            i += 1;
+            keep
+        });
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.selection = None;
+        self.carets.clear();
+        self.cursor_row = rows[0].min(self.lines.len() - 1);
+        self.cursor_col = 0;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        yanked
+    }
+
     pub fn kill_to_bol(&mut self) -> String {
         self.pin_on_edit();
         if self.lines.is_empty() {

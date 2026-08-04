@@ -236,7 +236,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `Ctrl`+`Shift`+`o` / `Cmd`+`Shift`+`O` | Go to Symbol in Editor: fuzzy-search the file's symbols and jump (type `:` then a number to go to a line) |
 | `Cmd`+`g` `g` | Go to the top of the file (`Cmd`+`N` `Cmd`+`g` `g` for line N) |
 | `Cmd`+`Shift`+`G` | Go to the bottom of the file (with a leading count, that line) |
-| `Cmd`+`Shift`+`K` / `Ctrl`+`Shift`+`K` | Delete Line: remove the cursor's line, or every line a selection touches; yanks to clipboard |
+| `Cmd`+`Shift`+`K` / `Ctrl`+`Shift`+`K` | Delete Line: remove every line touched by a cursor or its selection, so it composes with the extra cursors `Cmd`+`D` and `Opt`+click create; yanks to clipboard |
 | `Cmd`+`y` `y` | Yank the current line (`Cmd`+`N` `Cmd`+`y` `y` for N lines) |
 | `Cmd`+`D` / `Ctrl`+`D` | Add Selection to Next Find Match: select the word under the cursor, then grow the multi-cursor one occurrence per press |
 | `Option`+click | Add (or toggle off) a secondary caret at the click |
@@ -402,6 +402,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `Cmd+K` `M` | Maximize the active terminal across the panel; press again to restore the even split |
 | Click the `⛶` button (beside `-`) | Maximize that pane: it takes the panel's full width and the other terminals move to a rail down the right edge; the button becomes a restore glyph while maximized |
 | Click a rail row | While maximized: hand that terminal the maximized pane (the highlight marks the active one), so you can shuffle between full-size terminals |
+| Wheel over the rail | Scroll the rail when there are more terminals than it has rows; switching panes always scrolls the new one back into view |
 | Right-click a terminal pane | Open the pane menu: **Rename Terminal**, **Clear**, **Quick Select**, **Copy Mode**, **Command History**, **Open Scrollback in Editor**, **Reopen Closed Terminal** (while one is in its undo window), **Maximize Terminal** (or **Restore Terminal Split**), **Broadcast Input** (and, while broadcasting, **Exclude from Broadcast**) |
 
 With two or more panes open, each pane's header shows its live foreground process (`zsh`, `vim`, `node`…); a manual rename overrides that label.
