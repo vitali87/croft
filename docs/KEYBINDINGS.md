@@ -220,6 +220,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | Click a breadcrumb symbol | The breadcrumbs bar above the editor shows the file path and the enclosing symbol trail at the caret; clicking a symbol crumb jumps to it |
 | Click a sticky-scroll header | Sticky scroll pins the enclosing scope headers (class, function) to the top while you scroll; clicking one jumps to that line |
 | Click the gutter fold chevron | Toggle the fold on that line: a `▾` marks an expanded foldable block (a function, loop, struct — any line whose body is more indented), a `▸` marks a collapsed one. Also on `Cmd+K` `Cmd+L` at the cursor, and Command Palette "Toggle Fold" / "Fold All" / "Unfold All" |
+| Arrow keys over a fold | Up and Down step over a collapsed block rather than into it; an edit that lands inside one (from search, Go to Definition or Go to Line) opens it, so typing never changes lines you cannot see |
 | Mouse drag | Select text; every other occurrence of a single-line selection highlights in blue |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
 | `Cmd`+`Opt`+`C` / `Ctrl`+`Opt`+`C` | Copy Path: put the active file's absolute path on the system clipboard (also on the editor tab right-click menu) |

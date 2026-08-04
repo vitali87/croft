@@ -18426,6 +18426,80 @@ fn format_on_save_eligible_requires_pref_and_formatter_and_code_file() {
 }
 
 #[test]
+fn a_second_save_while_a_format_is_in_flight_still_writes_the_first_file() {
+    // The latch holds ONE path and the manager tracks one format request id,
+    // so arming a second file abandons the first reply. Overwriting the latch
+    // therefore lost the first save outright: a.py stayed dirty and unwritten,
+    // with no error and no status.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    let b = tmp.path().join("b.py");
+    std::fs::write(&a, "a=1\n").unwrap();
+    std::fs::write(&b, "b=1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.insert_char('X');
+    app.arm_deferred_save(); // Cmd+S on a.py
+
+    // The user moves on and saves the other file before the first reply lands.
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.insert_char('Y');
+    app.arm_deferred_save(); // Cmd+S on b.py
+
+    assert!(
+        std::fs::read_to_string(&a).unwrap().starts_with('X'),
+        "a.py's save must survive the second Cmd+S, got {:?}",
+        std::fs::read_to_string(&a).unwrap()
+    );
+    // b.py is still deferred, waiting on its own format reply.
+    assert_eq!(app.save_after_format.as_deref(), Some(b.as_path()));
+    app.complete_pending_save();
+    assert!(
+        std::fs::read_to_string(&b).unwrap().starts_with('Y'),
+        "and b.py lands when its reply arrives"
+    );
+}
+
+#[test]
+fn a_deferred_format_save_writes_the_file_it_was_asked_to_save() {
+    // `save()` armed a bare bool and returned; the write happened later, from
+    // the format reply, through `write_current_to_disk` — which saves the
+    // ACTIVE tab. Switching tabs while the formatter thought left the file the
+    // user pressed Cmd+S on unwritten and still dirty, and wrote the other tab
+    // instead, snapshot and didSave included.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    let b = tmp.path().join("b.py");
+    std::fs::write(&a, "a=1\n").unwrap();
+    std::fs::write(&b, "b=1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.insert_char('X');
+    app.save_after_format = Some(a.clone());
+    // The formatter is still thinking; the user moves to the other file.
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.insert_char('Y');
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "b.py is active"
+    );
+
+    app.complete_pending_save();
+
+    assert!(
+        std::fs::read_to_string(&a).unwrap().starts_with('X'),
+        "the file the save was asked for must be written, got {:?}",
+        std::fs::read_to_string(&a).unwrap()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&b).unwrap(),
+        "b=1\n",
+        "the tab that merely happened to be active must NOT be written"
+    );
+}
+
+#[test]
 fn complete_pending_save_writes_formatted_buffer_to_disk() {
     let tmp = tempfile::tempdir().unwrap();
     let f = tmp.path().join("m.py");
@@ -18435,10 +18509,10 @@ fn complete_pending_save_writes_formatted_buffer_to_disk() {
     // Simulate a format edit landing in the buffer, then the deferred save
     // firing when the format response arrives.
     app.editor.insert_char('y');
-    app.save_after_format = true;
+    app.save_after_format = Some(f.clone());
     app.complete_pending_save();
     assert!(
-        !app.save_after_format,
+        app.save_after_format.is_none(),
         "the deferred-save latch is consumed"
     );
     let on_disk = std::fs::read_to_string(&f).unwrap();

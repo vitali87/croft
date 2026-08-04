@@ -210,16 +210,25 @@ impl ZoxideJump {
 /// reads like the shell (`~/Documents/croft`) instead of a long absolute
 /// path. Purely cosmetic; the jump still uses the absolute `PathBuf`.
 fn display_path(path: &Path) -> String {
+    match std::env::var_os("HOME") {
+        Some(home) => collapse_home(path, &home.to_string_lossy()),
+        None => path.to_string_lossy().into_owned(),
+    }
+}
+
+/// The collapsing itself, with `home` passed in. Split out from
+/// [`display_path`] so its test needs no `$HOME`: the env var is
+/// process-global, and repointing it at a directory that cannot be created
+/// broke unrelated tests running in parallel that resolve `$HOME` to reach
+/// the cache dir.
+fn collapse_home(path: &Path, home: &str) -> String {
     let full = path.to_string_lossy();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = home.to_string_lossy();
-        if !home.is_empty() {
-            if full == home {
-                return String::from("~");
-            }
-            if let Some(rest) = full.strip_prefix(&format!("{home}/")) {
-                return format!("~/{rest}");
-            }
+    if !home.is_empty() {
+        if full == home {
+            return String::from("~");
+        }
+        if let Some(rest) = full.strip_prefix(&format!("{home}/")) {
+            return format!("~/{rest}");
         }
     }
     full.into_owned()
@@ -560,22 +569,24 @@ mod tests {
 
     #[test]
     fn display_path_collapses_home_to_tilde() {
-        // Serialize with every other $HOME-mutating test in this binary.
-        let _guard = crate::HOME_LOCK.lock().unwrap();
-        let saved = std::env::var_os("HOME");
-        // SAFETY: guarded by HOME_LOCK; set and restored within this test.
-        unsafe {
-            std::env::set_var("HOME", "/Users/v");
-        }
+        // `collapse_home`, not `display_path`: taking the home directory as an
+        // argument keeps this test off the process-global $HOME that every
+        // other test in the binary reads concurrently.
         assert_eq!(
-            display_path(Path::new("/Users/v/Documents/croft")),
+            collapse_home(Path::new("/Users/v/Documents/croft"), "/Users/v"),
             "~/Documents/croft"
         );
-        assert_eq!(display_path(Path::new("/Users/v")), "~");
-        assert_eq!(display_path(Path::new("/etc/hosts")), "/etc/hosts");
-        match saved {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+        assert_eq!(collapse_home(Path::new("/Users/v"), "/Users/v"), "~");
+        assert_eq!(
+            collapse_home(Path::new("/etc/hosts"), "/Users/v"),
+            "/etc/hosts"
+        );
+        // A prefix that only looks like home must not be collapsed.
+        assert_eq!(
+            collapse_home(Path::new("/Users/vitali/x"), "/Users/v"),
+            "/Users/vitali/x"
+        );
+        // No home at all leaves the path untouched.
+        assert_eq!(collapse_home(Path::new("/Users/v"), ""), "/Users/v");
     }
 }

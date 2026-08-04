@@ -62,22 +62,34 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A terminal pane's name pill no longer paints over its own ⛶ maximize button, including names written in wide characters. The button stayed clickable underneath, so those cells maximized the pane instead of starting the drag-reorder the pill offers.",
+        summary: "Format on Save now writes the file you asked to save. Switching tabs while the formatter was still working saved the other tab instead and left yours unwritten, with no error.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The maximize rail now scrolls when there are more terminals than rows, and always shows the pane you just switched to. Panes past the bottom edge previously had no row and no way to click them.",
+        summary: "A Format on Save that cannot reach a formatter no longer swallows the save silently: the file is written and the reason is reported.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Delete Line (Cmd+Shift+K) now deletes every cursor's line, so it composes with the extra cursors Cmd+D creates instead of leaving them stranded.",
+        summary: "A second Save while the formatter is still working no longer loses the first file. It is written straight away rather than waiting for a reply that can no longer arrive.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The terminal profile dropdown now opens under the ∨ caret you actually clicked. It hung under the leftmost pane's caret when panes sat side by side, and at the window's top-left corner while a pane was maximized.",
+        summary: "The cursor no longer ends up inside a collapsed fold. Arrow keys step over the whole block, and anything that jumps into one (Go to Definition, search, Ctrl+G) opens it, so the cursor is always somewhere you can see.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Dragging a maximized pane to a new rail position keeps the pane's own geometry, so clicks in the rest of that drag land where they look.",
+        summary: "Sticky scroll no longer paints over the cursor's own line, and no longer vanishes as you scroll: the cursor is carried to the first line below the pinned headers instead of underneath them.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Opening another file into the same tab no longer inherits the previous file's collapsed blocks.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Breadcrumbs measure wide characters correctly, so a CJK path segment is no longer half-overwritten by the crumb after it and clicks land on the right symbol.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Fold All on a large file no longer makes every frame expensive: the folded-line lookup is derived once per fold change instead of per rendered row.",
     },
 ];
