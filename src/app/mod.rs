@@ -27762,7 +27762,7 @@ impl App {
             }
             Ok(SaveOutcome::DiskConflict) => {
                 self.status = format!(
-                    "{} changed on disk since you opened it - open the tab and press Cmd+S to overwrite",
+                    "{} changed on disk since you opened it - open the tab and press Cmd+S twice to overwrite, or close it to keep the disk version",
                     path.display()
                 );
             }

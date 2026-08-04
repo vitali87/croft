@@ -2674,6 +2674,13 @@ impl Editor {
             self.folded.clear();
             self.hidden_ranges.clear();
             self.fold_epoch_lines = 0;
+        } else if !self.folded.is_empty() {
+            // The retained headers were measured against text that has just
+            // been replaced. Re-measure their spans, or a reload that keeps the
+            // line count while moving the indentation leaves the cache hiding
+            // lines the folds no longer cover — the epoch guard below only
+            // catches a change in line COUNT.
+            self.rebuild_hidden_ranges();
         }
         self.scroll = 0;
         self.cursor_row = 0;
@@ -4153,6 +4160,13 @@ impl Editor {
             .copied()
             .filter(|&h| matches!(self.fold_range(h), Some((_, end)) if h < row && row <= end))
             .collect();
+        if covering.is_empty() {
+            // Nothing to reveal, so the spans are still current. `pin_on_edit`
+            // calls this on every mutation: rebuilding here would rescan the
+            // whole buffer once per keystroke for every folded header, which
+            // after Fold All is the expensive case this cache exists to avoid.
+            return;
+        }
         for h in covering {
             self.folded.remove(&h);
         }
@@ -13240,6 +13254,37 @@ mod tests {
         assert!(
             e.is_line_hidden(1),
             "the fold must survive a reload of the file it was set on"
+        );
+    }
+
+    /// Keeping `folded` across a same-path reload is only half the job: the
+    /// cached spans were measured against the OLD text. A reload that keeps the
+    /// line count but moves the indentation (an external formatter, a
+    /// `git checkout`) slips past the render-time `fold_epoch_lines` guard, so
+    /// the stale cache goes on hiding lines the fold no longer covers.
+    #[test]
+    fn a_same_path_reload_remeasures_the_fold_spans() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "def f():\n    a\n    b\ntail\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1), "the block starts collapsed");
+        // Same line count, same length: only the indentation moved, so the
+        // header no longer has a body to fold.
+        std::fs::write(tmp.path(), "def f():\na    \nb    \ntail\n").unwrap();
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path())
+            .unwrap()
+            .set_modified(newer)
+            .unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.lines[1], "a    ", "the reload landed");
+        assert!(
+            !e.is_line_hidden(1),
+            "a line the fold no longer covers must not stay hidden"
         );
     }
 
