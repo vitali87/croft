@@ -246,7 +246,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `Cmd`+`.` / `Ctrl`+`.` | Quick Fix: ask the language server for the code actions at the cursor (auto-import, fix-all, organize imports, refactors) and pick one from a menu; the diagnostics on the line ride along as context. One action with a deferred edit resolves and applies on pick (`codeAction/resolve`); also on the editor right-click menu and as Command Palette "Quick Fix"|
 | `Cmd`+`.` / `Ctrl`+`.` inside a merge conflict | Resolve Merge Conflict picker: Accept Current / Accept Incoming / Accept Both (also Command Palette "Merge Conflict: Accept Current / Incoming / Both"); conflict regions render with VS Code's green (current) / blue (incoming) tints |
 | `F2` | Rename Symbol across every file it touches (open tabs edit in-memory and stay dirty) |
-| `F12` / `Cmd`/`Option`+click | Go to Definition (`Cmd`+`Shift`+click navigates back) |
+| `F12` / `Ctrl`+click | Go to Definition (`Shift`+`Ctrl`+click navigates back); `Ctrl` because mouse reports carry no `Cmd` bit and `Option` belongs to multi-cursor |
 | `Shift`+`F12` | Go to References (project-wide; one use jumps, several open a picker) |
 | `Ctrl`+`Shift`+`F12` | Go to Declaration (where the server implements it; hidden for TypeScript) |
 | `Ctrl`+`F12` | Go to Type Definition |
