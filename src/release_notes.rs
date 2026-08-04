@@ -62,14 +62,22 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Option+click now adds a second cursor and Shift+Option+drag selects a column, as in VS Code; Go to Definition by mouse moves to Ctrl+click, the same modifier the terminal already uses for file and link clicks.",
+        summary: "A terminal pane's name pill no longer paints over its own ⛶ maximize button. The button stayed clickable underneath, so those cells maximized the pane instead of starting the drag-reorder the pill offers.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Alt+clicking the gutter play glyph now debugs that test. The gesture was documented but never worked: the click jumped to the definition under the pointer instead.",
+        summary: "The maximize rail now scrolls when there are more terminals than rows, and always shows the pane you just switched to. Panes past the bottom edge previously had no row and no way to click them.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A maximized terminal's switcher rail no longer paints its label over the panel beside it when the window is narrow.",
+        summary: "Delete Line (Cmd+Shift+K) now deletes every cursor's line, so it composes with the extra cursors Cmd+D creates instead of leaving them stranded.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "The terminal profile dropdown opens under its ∨ caret again while a pane is maximized, instead of at the top-left corner of the window.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Dragging a maximized pane to a new rail position keeps the pane's own geometry, so clicks in the rest of that drag land where they look.",
     },
 ];

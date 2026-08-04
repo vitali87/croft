@@ -13411,6 +13411,242 @@ fn clicking_rail_row_switches_terminal_and_stays_maximized() {
 }
 
 #[test]
+fn a_long_pane_label_never_overpaints_the_maximize_button() {
+    // The header buttons lay out right-to-left, and the `⛶` added by this span
+    // is the leftmost of four, at `col.width - 13`. The pane pill's width
+    // budget still reserved room for three buttons, so a label that fills its
+    // budget painted straight over the glyph — worst with the broadcast `⇶`
+    // or a host accent, whose prefixes widen the pill by two more cells and
+    // erase it entirely. The button's hit rect stays live underneath, so those
+    // cells silently maximize instead of starting the drag-reorder the pill
+    // advertises.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for _ in 0..3 {
+        app.split_terminal().unwrap();
+    }
+    // A label character no other widget paints, long enough to fill whatever
+    // budget the pill is given, so this stays a bleed test rather than a test
+    // of one particular label length.
+    for t in app.terminals.iter_mut() {
+        t.set_manual_name(Some("§".repeat(30)));
+    }
+    // Broadcast is on so the pill wears its widest form.
+    app.broadcast_input = true;
+    let backend = ratatui::backend::TestBackend::new(140, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let cell = |x: u16, y: u16| {
+        term.backend()
+            .buffer()
+            .cell(ratatui::layout::Position::new(x, y))
+            .unwrap()
+            .symbol()
+            .to_string()
+    };
+    let mut checked = 0;
+    for (i, btn) in app.terminal_max_buttons.iter().enumerate() {
+        if btn.width == 0 {
+            continue;
+        }
+        // The pill must actually be painted and long enough to reach the
+        // button, or a narrower layout would pass this while the bug stands.
+        let pill = app.terminal_label_rects[i];
+        assert!(
+            pill.width > 0 && pill.x + pill.width >= btn.x,
+            "pane {i}'s pill must reach the button for this to prove anything, \
+             pill={pill:?} button={btn:?}"
+        );
+        let painted: String = (btn.x..btn.x + btn.width).map(|x| cell(x, btn.y)).collect();
+        assert!(
+            !painted.contains('§'),
+            "pane {i}'s label painted over its maximize button: {painted:?}"
+        );
+        assert!(
+            painted.contains('\u{eb4c}'),
+            "pane {i}'s maximize glyph must survive, got {painted:?}"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 2,
+        "this layout must paint maximize buttons to test"
+    );
+}
+
+#[test]
+fn the_profile_picker_anchors_under_the_pane_that_owns_the_caret() {
+    // Hidden panes push `Rect::default()` placeholders so a button's position
+    // in the vec names its terminal. The picker still anchored on `.first()`,
+    // which in maximize mode is the placeholder for terminal 0 whenever some
+    // other pane is the maximized one, dropping the dropdown at the window's
+    // top-left corner instead of under the caret it was opened from.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    app.terminal_pane_maximized = true;
+    assert_eq!(
+        app.active_terminal, 2,
+        "the newest pane is the maximized one"
+    );
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let caret = app.terminal_profile_buttons[2];
+    assert!(caret.width > 0, "the maximized pane paints a profile caret");
+    assert_eq!(
+        app.terminal_profile_buttons[0],
+        ratatui::layout::Rect::default(),
+        "the hidden pane holds a placeholder, which is what `.first()` found"
+    );
+    assert_eq!(
+        app.terminal_caret_origin(),
+        (caret.x, caret.y + 1),
+        "the dropdown anchors under the caret that is actually on screen"
+    );
+}
+
+#[test]
+fn a_rail_taller_than_the_panel_scrolls_instead_of_dropping_terminals() {
+    // The rail painted one row per terminal and stopped at the panel's bottom
+    // edge, so with more terminals than rows the tail simply vanished: no row,
+    // no hit rect, and if the active terminal was among them nothing in the
+    // rail was highlighted at all. The panel floor is 3 rows, so four panes
+    // are enough to reach this.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for _ in 0..5 {
+        app.split_terminal().unwrap();
+    }
+    app.terminal_pane_maximized = true;
+    app.terminal_height = Some(TERMINAL_HEIGHT_MIN);
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let live = |app: &App| -> usize {
+        app.terminal_rail_rects
+            .iter()
+            .filter(|r| r.width > 0)
+            .count()
+    };
+    assert!(
+        live(&app) < app.terminals.len(),
+        "this layout must actually overflow the rail, or the test proves nothing"
+    );
+    assert_eq!(
+        app.terminal_rail_rects.len(),
+        app.terminals.len(),
+        "off-window rows still hold a placeholder so a rect's position names \
+         its terminal"
+    );
+    // The active terminal is the last one, past the window's bottom edge.
+    assert!(
+        app.terminal_rail_rects[app.active_terminal].width > 0,
+        "the rail must scroll to keep the active terminal visible"
+    );
+
+    // The wheel reaches the terminals the window has scrolled past.
+    let rail = app.terminal_rail_area;
+    assert!(
+        rail.width > 0,
+        "the rail records its own area for the wheel"
+    );
+    for _ in 0..app.terminals.len() {
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: rail.x,
+            row: rail.y,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.terminal_rail_rects[0].width > 0,
+        "scrolling the rail up must reach the first terminal"
+    );
+}
+
+#[test]
+fn reordering_a_maximized_pane_keeps_its_rect_with_the_terminal() {
+    // `move_terminal` re-seats `last_area` in SLOT order, which is right for
+    // the even split, where a slot's geometry is positional. In maximize mode
+    // the only live rect belongs to whichever pane is active, and the drag
+    // keeps the DRAGGED terminal active — so seating by slot handed the full
+    // pane rect to a hidden terminal and left the active one with an empty
+    // rect for the rest of the mouse burst.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    app.terminal_pane_maximized = true;
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.active_terminal, 2);
+    let pane = app.terminals[2].last_area;
+    assert!(
+        pane.width > 100,
+        "the maximized pane owns the panel's width"
+    );
+
+    // The rail drag: press row 2, cross row 0. No redraw in between, exactly
+    // as the main loop drains a mouse burst before painting.
+    app.move_terminal(2, 0);
+
+    assert_eq!(app.active_terminal, 0, "the dragged terminal stays active");
+    assert_eq!(
+        app.terminals[0].last_area, pane,
+        "the maximized rect travels with the terminal that is still maximized"
+    );
+    assert!(
+        app.terminals.iter().skip(1).all(|t| t.last_area.width == 0),
+        "the hidden panes keep empty rects"
+    );
+}
+
+#[test]
+fn delete_line_deletes_every_carets_line() {
+    // Cmd+D (Add Selection to Next Match) and Cmd+Shift+K (Delete Line) landed
+    // in the same commit, but Delete Line only ever removed the primary
+    // cursor's line: `delete_lines` calls `clear_selection`, which clears the
+    // selection and leaves `carets` untouched. VS Code's deleteLines removes
+    // every cursor's line, so the two bindings must compose.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let file = tmp.path().join("a.txt");
+    std::fs::write(&file, "foo\nbar\nfoo\nbaz\n").unwrap();
+    app.editor.open(&file).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+
+    // Cmd+D twice: the first selects the word under the cursor, the second
+    // adds the next match, demoting row 0 to a secondary caret.
+    app.start_select_next_occurrence();
+    app.start_select_next_occurrence();
+    assert_eq!(app.editor.carets.len(), 1, "row 0 is now a secondary caret");
+    assert_eq!(
+        app.editor.cursor_row, 2,
+        "the primary moved to the next match"
+    );
+
+    app.delete_current_line();
+
+    assert_eq!(
+        app.editor.lines,
+        vec![String::from("bar"), String::from("baz")],
+        "both matched lines go, not just the primary's"
+    );
+    assert!(
+        app.editor.carets.is_empty(),
+        "no stale caret is left painted on a line that no longer exists"
+    );
+}
+
+#[test]
 fn clicking_restore_button_returns_to_split_layout() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
