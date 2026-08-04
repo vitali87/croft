@@ -3235,7 +3235,11 @@ impl WorkerState {
         insert_spaces: bool,
         tx: &std_mpsc::Sender<FormatResult>,
     ) {
+        // Every bail below MUST still answer. The app defers the format-on-save
+        // write until a reply lands, so a silent `return` strands the latch:
+        // no write, no error, and the user believes the file was saved.
         let Some(doc) = self.docs.get(&path) else {
+            answer_unsupported(tx, request_id, path);
             return;
         };
         let lang = doc.language;
@@ -3244,6 +3248,7 @@ impl WorkerState {
         // without reopening (mirrors `request_rename`).
         self.ensure_clients(lang, &root).await;
         let Some(clients) = self.clients.get(&(lang, root)) else {
+            answer_unsupported(tx, request_id, path);
             return;
         };
         let picked = clients
@@ -3260,6 +3265,7 @@ impl WorkerState {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
+            answer_unsupported(tx, request_id, path);
             return;
         };
         let tx = tx.clone();
@@ -3581,6 +3587,19 @@ fn one_of_supported<B>(cap: &Option<OneOf<bool, B>>) -> bool {
 }
 
 /// Hover capability (`boolean | HoverOptions`), same bare-`false` rule.
+/// Answer a formatting request that cannot reach a server. `unsupported` is
+/// the honest shape for every one of these: no client in this worker can
+/// format the file. The app turns it into "No formatter available for this
+/// file" and, crucially, still performs the deferred save.
+fn answer_unsupported(tx: &std_mpsc::Sender<FormatResult>, request_id: u64, path: PathBuf) {
+    let _ = tx.send(FormatResult {
+        request_id,
+        path,
+        edits: None,
+        unsupported: true,
+    });
+}
+
 fn hover_supported(cap: &Option<HoverProviderCapability>) -> bool {
     match cap {
         Some(HoverProviderCapability::Simple(b)) => *b,
@@ -5374,6 +5393,50 @@ mod tests {
         assert!(
             colored_on(3),
             "body parameter must be colored on its real row (line 3); overlay={overlay:?}"
+        );
+    }
+
+    /// A formatting request the worker cannot route MUST still answer, or the
+    /// app's format-on-save latch stays armed forever: `save()` defers the
+    /// write until a reply lands, so a silent bail means Cmd+S wrote nothing
+    /// and said nothing. The per-LANGUAGE capability map that gates the
+    /// feature is true for any file of that language, including ones this
+    /// worker never tracked (outside the project root, failed didOpen).
+    #[test]
+    fn an_unroutable_format_request_still_answers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let (fmt_tx, fmt_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            registry: ServerRegistry::new(),
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+        let never_opened = root.join("stray.py");
+
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .request_formatting(7, never_opened.clone(), 4, true, &fmt_tx)
+                .await;
+        });
+
+        let reply = fmt_rx
+            .try_recv()
+            .expect("an untracked document must still get a reply");
+        assert_eq!(reply.request_id, 7);
+        assert_eq!(reply.path, never_opened);
+        assert!(
+            reply.unsupported,
+            "the reply must tell the app no formatter is reachable"
         );
     }
 

@@ -1343,6 +1343,14 @@ struct SnippetSession {
     stops: std::collections::VecDeque<(usize, usize, usize)>,
 }
 
+// Counts `rebuild_hidden_ranges` calls so a test can pin that the fold lookup
+// is derived once per fold change and not per rendered row. Plain comment, not
+// a doc comment: those cannot attach to a `thread_local!`.
+#[cfg(test)]
+thread_local! {
+    static FOLD_RANGE_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
@@ -1541,6 +1549,12 @@ pub struct Editor {
     /// end) is hidden from the render while its index is in this set. Purely a
     /// view: the buffer is untouched, so every edit/undo path ignores it.
     folded: std::collections::BTreeSet<usize>,
+    /// Merged, ascending, disjoint spans of lines hidden by `folded`, rebuilt
+    /// only when the fold set or the buffer changes. `is_line_hidden` runs on
+    /// every rendered row of every frame, and deriving it from `folded` there
+    /// meant re-scanning each folded region per row — Fold All on a large file
+    /// turned one frame into millions of iterations.
+    hidden_ranges: Vec<(usize, usize)>,
     /// `self.lines.len()` at the moment `folded` was last set. Fold headers are
     /// line indexes, so an insert/delete anywhere shifts them; when the count
     /// no longer matches, the render drops every fold rather than hide the
@@ -1741,6 +1755,7 @@ impl Editor {
             box_anchor: None,
             snippet: None,
             folded: std::collections::BTreeSet::new(),
+            hidden_ranges: Vec::new(),
             fold_epoch_lines: 0,
             preview: false,
             pinned: false,
@@ -2647,6 +2662,12 @@ impl Editor {
             .and_then(|e| e.to_str())
             .and_then(lang_for_extension);
         self.wrap_override = None;
+        // Folds are line numbers into the OLD file. A preview tab is reused for
+        // the next single-click, so without this the incoming file arrives with
+        // the previous one's blocks collapsed.
+        self.folded.clear();
+        self.hidden_ranges.clear();
+        self.fold_epoch_lines = 0;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -3237,6 +3258,9 @@ impl Editor {
     /// single-click on another file can't silently replace your edits).
     fn pin_on_edit(&mut self) {
         self.preview = false;
+        // Every mutating entry point calls this, so it is the one place that
+        // can guarantee no edit ever lands on a line hidden inside a fold.
+        self.reveal_cursor_fold();
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -4068,14 +4092,86 @@ impl Editor {
             .find(|&h| matches!(self.fold_range(h), Some((_, end)) if line <= end))
     }
 
-    /// Whether `line` is hidden inside a collapsed region. Testing every folded
-    /// header is enough even with nesting: an outer fold's range covers any
-    /// inner fold's range, so a line hidden by the inner is also covered by the
-    /// outer. ponytail: O(folds) per query, fine for realistic fold counts.
+    /// Whether `line` is hidden inside a collapsed region. A binary search over
+    /// the merged spans in [`Self::hidden_ranges`], which the fold writes keep
+    /// current — this is called for every rendered row of every frame.
     pub fn is_line_hidden(&self, line: usize) -> bool {
-        self.folded
+        self.hidden_ranges
+            .binary_search_by(|&(header, end)| {
+                if line <= header {
+                    std::cmp::Ordering::Greater
+                } else if line > end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    }
+
+    /// Recompute [`Self::hidden_ranges`] from `folded`. Every write to `folded`
+    /// must call this. Headers are visited in ascending order and any header
+    /// already inside the span being built is skipped: an inner fold's range is
+    /// contained by its outer's, so it can add nothing.
+    fn rebuild_hidden_ranges(&mut self) {
+        #[cfg(test)]
+        FOLD_RANGE_REBUILDS.with(|c| c.set(c.get() + 1));
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for &h in &self.folded {
+            if let Some(&(_, end)) = out.last()
+                && h <= end
+            {
+                continue;
+            }
+            if let Some(span) = self.fold_range(h) {
+                out.push(span);
+            }
+        }
+        self.hidden_ranges = out;
+    }
+
+    /// Unfold whatever collapsed region the cursor is sitting inside. Movement
+    /// is not the only way in — search, go-to-definition and goto-line all set
+    /// `cursor_row` directly — and a caret on a hidden line cannot be painted
+    /// at all (`cursor_screen_pos` has no row for it), so an edit there would
+    /// change content the user cannot see. Cheap when nothing is folded.
+    pub fn reveal_cursor_fold(&mut self) {
+        if self.folded.is_empty() {
+            return;
+        }
+        let row = self.cursor_row;
+        let covering: Vec<usize> = self
+            .folded
             .iter()
-            .any(|&h| matches!(self.fold_range(h), Some((_, end)) if h < line && line <= end))
+            .copied()
+            .filter(|&h| matches!(self.fold_range(h), Some((_, end)) if h < row && row <= end))
+            .collect();
+        for h in covering {
+            self.folded.remove(&h);
+        }
+        self.rebuild_hidden_ranges();
+    }
+
+    /// Next visible line at or after `line`, walking out of any collapsed
+    /// region. `None` past the end of the buffer.
+    fn next_visible_line(&self, line: usize) -> Option<usize> {
+        let mut l = line;
+        while l < self.lines.len() {
+            if !self.is_line_hidden(l) {
+                return Some(l);
+            }
+            l += 1;
+        }
+        None
+    }
+
+    /// Previous visible line at or before `line`.
+    fn prev_visible_line(&self, line: usize) -> usize {
+        let mut l = line;
+        while l > 0 && self.is_line_hidden(l) {
+            l -= 1;
+        }
+        l
     }
 
     /// Toggle the fold owning `line` (VS Code `editor.toggleFold`). Collapsing a
@@ -4085,17 +4181,20 @@ impl Editor {
         let Some(header) = self.enclosing_fold_header(line) else {
             return;
         };
-        if !self.folded.remove(&header) {
+        let collapsing = !self.folded.remove(&header);
+        if collapsing {
             self.folded.insert(header);
-            if self.is_line_hidden(self.cursor_row) {
-                let len = self
-                    .lines
-                    .get(header)
-                    .map(|s| s.chars().count())
-                    .unwrap_or(0);
-                self.cursor_row = header;
-                self.cursor_col = self.cursor_col.min(len);
-            }
+        }
+        // Both branches changed the fold set, so both must refresh the spans.
+        self.rebuild_hidden_ranges();
+        if collapsing && self.is_line_hidden(self.cursor_row) {
+            let len = self
+                .lines
+                .get(header)
+                .map(|s| s.chars().count())
+                .unwrap_or(0);
+            self.cursor_row = header;
+            self.cursor_col = self.cursor_col.min(len);
         }
         self.fold_epoch_lines = self.lines.len();
     }
@@ -4107,6 +4206,7 @@ impl Editor {
             .filter(|&l| self.is_foldable(l))
             .collect();
         self.fold_epoch_lines = self.lines.len();
+        self.rebuild_hidden_ranges();
         while self.cursor_row > 0 && self.is_line_hidden(self.cursor_row) {
             self.cursor_row -= 1;
         }
@@ -4115,6 +4215,7 @@ impl Editor {
     /// Expand every fold (VS Code "Unfold All", Cmd+K Cmd+J).
     pub fn unfold_all(&mut self) {
         self.folded.clear();
+        self.hidden_ranges.clear();
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -4395,7 +4496,8 @@ impl Editor {
         if self.wrap_enabled() {
             self.wrap_move_vertical(-1);
         } else if self.cursor_row > 0 {
-            self.cursor_row -= 1;
+            // Step over a collapsed region, as `move_down` does.
+            self.cursor_row = self.prev_visible_line(self.cursor_row - 1);
             self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         }
         self.last_edit_kind = None;
@@ -4405,8 +4507,13 @@ impl Editor {
         if self.wrap_enabled() {
             self.wrap_move_vertical(1);
         } else if self.cursor_row + 1 < self.lines.len() {
-            self.cursor_row += 1;
-            self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+            // Step OVER a collapsed region rather than into it, the way VS Code
+            // does: the fold stays shut and the caret lands on the next line
+            // the user can actually see.
+            if let Some(next) = self.next_visible_line(self.cursor_row + 1) {
+                self.cursor_row = next;
+                self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+            }
         }
         self.last_edit_kind = None;
     }
@@ -6923,6 +7030,7 @@ impl Widget for &mut Editor {
         // rather than hide the wrong lines (see `fold_epoch_lines`).
         if !self.folded.is_empty() && self.lines.len() != self.fold_epoch_lines {
             self.folded.clear();
+            self.hidden_ranges.clear();
         }
         let wrap = self.wrap_enabled();
         if wrap {
@@ -7676,7 +7784,19 @@ impl Widget for &mut Editor {
         if !wrap && !self.sticky_lines.is_empty() && inner.height > 1 {
             let bg = self.theme.sticky_scroll_bg();
             let text_w = (inner.x + inner.width).saturating_sub(text_x);
-            let max_rows = (inner.height - 1) as usize;
+            // Never paint over the caret's own row. `scroll_view_to` drags the
+            // caret down to `scroll` whenever it drifts above the viewport, so
+            // the caret sits on the very row the band wants — and a caret under
+            // the band cannot be seen at all. Yield the innermost headers
+            // instead; they are the ones the caret's own line is closest to.
+            let rows_avail = (inner.height - 1) as usize;
+            let max_rows = match self.cursor_row.checked_sub(self.scroll) {
+                // Caret on screen: the band stops above its row.
+                Some(caret_row) => rows_avail.min(caret_row),
+                // Caret scrolled off above the viewport, so it is not painted
+                // and the band cannot hide it.
+                None => rows_avail,
+            };
             let sticky = self.sticky_lines.clone();
             for (i, &line) in sticky.iter().take(max_rows).enumerate() {
                 let y = inner.y + i as u16;
@@ -9348,8 +9468,6 @@ impl Widget for &mut EditorTabs {
                     break;
                 }
                 let avail = (max_x - x) as usize;
-                let shown: String = crumb.label.chars().take(avail).collect();
-                let sw = shown.chars().count() as u16;
                 // Symbol crumbs (clickable) read brighter than the informational
                 // path crumbs, mirroring VS Code's active/inactive breadcrumbs.
                 let fg = if crumb.target.is_some() {
@@ -9357,9 +9475,20 @@ impl Widget for &mut EditorTabs {
                 } else {
                     Color::DarkGray
                 };
-                buf.set_string(x, crumb_y, &shown, Style::default().fg(fg).bg(bg));
+                // Budget and advance in display CELLS: `set_stringn` clips by
+                // grapheme width and reports where it stopped, so a CJK or
+                // emoji crumb neither overruns the bar nor gets painted over by
+                // the next crumb, and its hit rect covers what was drawn.
+                let (end_x, _) = buf.set_stringn(
+                    x,
+                    crumb_y,
+                    &crumb.label,
+                    avail,
+                    Style::default().fg(fg).bg(bg),
+                );
+                let sw = end_x.saturating_sub(x);
                 self.breadcrumb_ranges.push((x, sw, crumb.target));
-                x += sw;
+                x = end_x;
             }
             body = Rect {
                 y: body.y + 1,
@@ -16292,6 +16421,35 @@ mod tests {
     // ---- Breadcrumbs bar ----
 
     #[test]
+    fn sticky_scroll_never_covers_the_caret_row() {
+        // The sticky band floats over the topmost content rows, and
+        // `scroll_view_to` pulls the caret down to `scroll` whenever it drifts
+        // above the viewport — so the caret lands on exactly the row the band
+        // repaints, and vanishes. VS Code keeps the cursor line clear of its
+        // sticky widget.
+        let mut e = editor_with(&format!("fn a() {{\n{}}}\n", "    x\n".repeat(60)));
+        e.scroll = 3;
+        e.cursor_row = 3;
+        e.sticky_lines = vec![0];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let caret = e
+            .cursor_screen_pos()
+            .expect("the caret must have a screen row");
+        assert!(
+            !e.sticky_click_rows.iter().any(|&(y, _)| y == caret.1),
+            "the sticky band painted over the caret's own row {}",
+            caret.1
+        );
+    }
+
+    #[test]
     fn breadcrumb_row_renders_below_tab_strip_and_maps_symbol_clicks() {
         let mut tabs = EditorTabs::new();
         tabs.breadcrumbs = vec![
@@ -16327,6 +16485,63 @@ mod tests {
     }
 
     #[test]
+    fn breadcrumbs_measure_wide_glyphs_in_display_cells() {
+        // The bar budgeted and advanced in `char`s while the buffer advances by
+        // display CELLS, so every crumb after a CJK one was painted right of
+        // the rect recorded for it and its click missed. Same class as the
+        // terminal pane pill.
+        let mut tabs = EditorTabs::new();
+        tabs.breadcrumbs = vec![
+            Crumb {
+                label: "文档文档".into(),
+                target: None,
+            },
+            Crumb {
+                label: "build".into(),
+                target: Some((5, 2)),
+            },
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tabs).render(area, &mut buf);
+        let by = area.y + 1;
+        // The column where "build" was actually PAINTED: scan cells, since a
+        // wide glyph takes one cell and leaves the next as a spacer.
+        let row: String = (0..area.width)
+            .map(|x| buf[(x, by)].symbol().to_string())
+            .collect::<Vec<_>>()
+            .concat();
+        // The advance was a char count while the glyphs take two cells each,
+        // so the separator and the next crumb were painted four cells INTO
+        // this label and destroyed its second half.
+        // A wide glyph owns one cell and leaves the next as a spacer, so the
+        // concatenated row interleaves blanks: count the glyphs instead.
+        assert_eq!(
+            (row.matches('文').count(), row.matches('档').count()),
+            (2, 2),
+            "the whole wide label must survive, got {row:?}"
+        );
+        assert!(
+            row.contains("build"),
+            "and the next crumb must still be painted, got {row:?}"
+        );
+        // The recorded hit rect must cover every cell the label was painted on,
+        // or clicking its right half misses.
+        let (x, w, _) = tabs.breadcrumb_ranges[0];
+        assert_eq!(w, 8, "a 4-char CJK label occupies 8 cells, not 4");
+        let (next_x, _, _) = tabs.breadcrumb_ranges[1];
+        assert!(
+            next_x >= x + w,
+            "the next crumb must start past this one, got {next_x} vs {x}+{w}"
+        );
+    }
+
+    #[test]
     fn breadcrumb_bar_hidden_when_there_are_no_crumbs() {
         let mut tabs = EditorTabs::new();
         tabs.breadcrumbs.clear();
@@ -16352,6 +16567,10 @@ mod tests {
         let mut e = editor_with(&text);
         e.focused = true;
         e.scroll = 20;
+        // The caret must sit inside the viewport and below the band: with it on
+        // the top visible row there is nowhere for the band to go that would
+        // not hide it, and render pulls `scroll` back to the caret.
+        e.cursor_row = 25;
         e.sticky_lines = vec![0, 10];
         let area = Rect {
             x: 0,
@@ -16626,6 +16845,105 @@ mod tests {
             "the closing brace at base indent stays"
         );
         assert!(!e.is_line_hidden(4));
+    }
+
+    #[test]
+    fn moving_down_steps_over_a_folded_block_instead_of_into_it() {
+        // `is_line_hidden` was consulted only by the render loops and by the
+        // fold toggles' own cursor snap. No cursor-movement path knew about
+        // folds, so Down walked straight into a collapsed region: the caret
+        // vanished (`cursor_screen_pos` cannot map a hidden line) and anything
+        // typed went into content the user could not see.
+        let mut e = editor_with("fn a() {\n    x\n    y\n}\nafter");
+        e.toggle_fold(0);
+        assert_eq!(e.cursor_row, 0, "the fold snapped the caret to the header");
+        e.move_down();
+        assert_eq!(
+            e.cursor_row, 3,
+            "Down clears the whole collapsed body, landing on the next visible line"
+        );
+        assert!(!e.is_line_hidden(e.cursor_row));
+        e.move_up();
+        assert_eq!(e.cursor_row, 0, "Up steps back over it the same way");
+    }
+
+    #[test]
+    fn editing_reveals_a_fold_the_caret_ended_up_inside() {
+        // Not every way into a fold is an arrow key — search, go-to-definition
+        // and goto-line all set `cursor_row` directly. Wherever the caret came
+        // from, an edit must never land on a line the user cannot see.
+        let mut e = editor_with("fn a() {\n    x\n    y\n}\nafter");
+        e.toggle_fold(0);
+        e.cursor_row = 1;
+        // Past the indent: typing at column 0 would strip line 1's leading
+        // whitespace and collapse the fold RANGE, which unhides the line for a
+        // reason that has nothing to do with the caret.
+        e.cursor_col = 5;
+        assert!(e.is_line_hidden(1), "the caret is parked inside the fold");
+        e.insert_char('Z');
+        assert!(
+            !e.is_line_hidden(1),
+            "the edit revealed the region it landed in"
+        );
+        assert!(e.lines[1].contains('Z'), "and the text went to line 1");
+    }
+
+    #[test]
+    fn opening_another_file_clears_fold_state() {
+        // `open` resets scroll, cursor, selection, undo, tokens and hints, but
+        // left `folded` alone. A preview tab is REUSED for the next
+        // single-click, so the new file arrived with the old file's fold
+        // headers collapsed — and the line-count guard only fires when the two
+        // files differ in length.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+        std::fs::write(&a, "fn a() {\n    x\n}\n").unwrap();
+        std::fs::write(&b, "fn b() {\n    y\n}\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&a).unwrap();
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1), "a.rs is folded");
+        e.open(&b).unwrap();
+        assert!(
+            !e.is_line_hidden(1),
+            "the next file must not inherit the previous file's folds"
+        );
+    }
+
+    #[test]
+    fn the_fold_lookup_is_derived_once_per_fold_change_not_per_query() {
+        // `is_line_hidden` ran on every rendered row of every frame and
+        // re-derived itself from `folded`, scanning each folded region. Fold
+        // All on a large file turned a single frame into millions of
+        // iterations. The spans are now built once per fold write.
+        let text = (0..400)
+            .map(|i| format!("fn f{i}() {{\n    body\n}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = editor_with(&text);
+        e.fold_all();
+        assert!(
+            !e.folded.is_empty(),
+            "Fold All must actually fold something"
+        );
+
+        FOLD_RANGE_REBUILDS.with(|c| c.set(0));
+        for line in 0..e.lines.len() {
+            std::hint::black_box(e.is_line_hidden(line));
+        }
+        assert_eq!(
+            FOLD_RANGE_REBUILDS.with(|c| c.get()),
+            0,
+            "querying must never rebuild the spans"
+        );
+
+        e.toggle_fold(0);
+        assert_eq!(
+            FOLD_RANGE_REBUILDS.with(|c| c.get()),
+            1,
+            "changing the fold set rebuilds exactly once"
+        );
     }
 
     #[test]

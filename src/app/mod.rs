@@ -2016,7 +2016,7 @@ pub struct App {
     auto_save: bool,
     /// Latch set while a save is waiting on a format reply. `drain_lsp_format`
     /// consumes it to write the (now formatted) buffer to disk.
-    save_after_format: bool,
+    save_after_format: Option<PathBuf>,
     /// Background `git log` results for the TIMELINE, keyed by the file they
     /// describe so a stale reply for a since-closed file is ignored on drain.
     timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
@@ -3464,7 +3464,7 @@ impl App {
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
             auto_save: loaded_prefs.auto_save,
-            save_after_format: false,
+            save_after_format: None,
             outline,
             open_editors,
             timeline,
@@ -27445,9 +27445,17 @@ impl App {
     /// Write the deferred buffer to disk once its format reply has landed.
     /// A no-op unless [`Self::save`] armed `save_after_format`.
     fn complete_pending_save(&mut self) {
-        if std::mem::take(&mut self.save_after_format) {
+        let Some(path) = std::mem::take(&mut self.save_after_format) else {
+            return;
+        };
+        // Write the tab the save was ASKED for. The reply can land long after
+        // the user moved on, and `write_current_to_disk` targets whatever is
+        // active — which wrote an unrequested file and left this one dirty.
+        if self.editor.path.as_deref() == Some(path.as_path()) {
             self.write_current_to_disk();
+            return;
         }
+        self.write_tab_to_disk(&path);
     }
 
     /// Flip `editor.formatOnSave`, persist it, and report the new state.
@@ -27631,7 +27639,7 @@ impl App {
         // Format-on-save: defer the write until the format reply arrives, then
         // `drain_lsp_format` calls `complete_pending_save`.
         if self.format_on_save_eligible(self.editor_language_supports_formatting()) {
-            self.save_after_format = true;
+            self.save_after_format = self.editor.path.clone();
             self.start_format_document();
             return;
         }
@@ -27701,6 +27709,47 @@ impl App {
             }
             let _ = tx.send(path);
         });
+    }
+
+    /// Save the open tab for `path` wherever it lives — background tab of the
+    /// focused group, or any inactive split — without disturbing the focus.
+    /// Used by the deferred format-on-save write when the user has moved on.
+    fn write_tab_to_disk(&mut self, path: &std::path::Path) {
+        use crate::widgets::editor::SaveOutcome;
+        let found = self
+            .editor
+            .editors
+            .iter_mut()
+            .chain(
+                self.editor_layout
+                    .inactive_groups_mut()
+                    .into_iter()
+                    .flat_map(|g| g.editors.iter_mut()),
+            )
+            .find(|e| e.path.as_deref() == Some(path));
+        let Some(editor) = found else {
+            // The tab was closed while the formatter was thinking; there is no
+            // buffer left to write and the disk file is untouched.
+            self.status = String::from("Save skipped: the tab was closed");
+            return;
+        };
+        match editor.save_to_disk() {
+            Ok(SaveOutcome::Saved) => {
+                self.status = editor.status.clone();
+                self.record_history_snapshot(path);
+                if let Some(lsp) = self.lsp.as_ref() {
+                    lsp.save_doc(path.to_path_buf());
+                }
+                self.reload_config_for_path(path);
+            }
+            Ok(SaveOutcome::DiskConflict) => {
+                self.status = format!(
+                    "{} changed on disk since you opened it - open the tab and press Cmd+S to overwrite",
+                    path.display()
+                );
+            }
+            Err(e) => self.status = format!("Save failed: {e}"),
+        }
     }
 
     fn write_current_to_disk(&mut self) {
