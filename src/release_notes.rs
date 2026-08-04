@@ -62,7 +62,7 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A terminal pane's name pill no longer paints over its own ⛶ maximize button. The button stayed clickable underneath, so those cells maximized the pane instead of starting the drag-reorder the pill offers.",
+        summary: "A terminal pane's name pill no longer paints over its own ⛶ maximize button, including names written in wide characters. The button stayed clickable underneath, so those cells maximized the pane instead of starting the drag-reorder the pill offers.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
@@ -74,7 +74,7 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The terminal profile dropdown opens under its ∨ caret again while a pane is maximized, instead of at the top-left corner of the window.",
+        summary: "The terminal profile dropdown now opens under the ∨ caret you actually clicked. It hung under the leftmost pane's caret when panes sat side by side, and at the window's top-left corner while a pane was maximized.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,

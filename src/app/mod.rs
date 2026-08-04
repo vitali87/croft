@@ -9603,24 +9603,25 @@ impl App {
         shells
     }
 
-    /// Open the terminal-profile dropdown (VS Code's `⌄` next to `+`): a compact
-    /// context menu anchored under the caret, one row per shell. Picking a row
-    /// opens a new pane running that shell.
-    /// Where the terminal-profile dropdown hangs: under the `⌄` caret, with the
-    /// menu auto-clamping up/left to stay on screen. Falls back to the
+    /// Where the profile dropdown hangs: under the `⌄` caret of the pane it was
+    /// opened from, with the menu auto-clamping up/left to stay on screen.
+    /// Anchoring on the first caret in the vec is wrong twice over — hidden
+    /// panes hold `Rect::default()` placeholders so a button's position names
+    /// its terminal, and side by side every pane has a live caret, so every
+    /// pane's dropdown would hang under the leftmost one. Falls back to the
     /// toolbar's top-right corner before the caret has been painted.
-    /// Hidden panes hold `Rect::default()` placeholders so a button's position
-    /// in the vec names its terminal, so the anchor must skip them: in
-    /// maximize mode every caret but the maximized pane's is a placeholder.
-    fn terminal_caret_origin(&self) -> (u16, u16) {
+    fn terminal_caret_origin(&self, pane: usize) -> (u16, u16) {
         self.terminal_profile_buttons
-            .iter()
-            .find(|c| c.width > 0)
+            .get(pane)
+            .filter(|c| c.width > 0)
             .map(|c| (c.x, c.y.saturating_add(1)))
             .unwrap_or((self.last_frame_area.width.saturating_sub(20), 1))
     }
 
-    fn open_terminal_profile_picker(&mut self) {
+    /// Open the terminal-profile dropdown (VS Code's `⌄` next to `+`): a compact
+    /// context menu anchored under the caret, one row per shell. Picking a row
+    /// opens a new pane running that shell.
+    fn open_terminal_profile_picker(&mut self, pane: usize) {
         let items: Vec<MenuEntry> = self
             .terminal_profiles()
             .into_iter()
@@ -9633,7 +9634,7 @@ impl App {
             self.status = String::from("No terminal profiles found");
             return;
         }
-        let origin = self.terminal_caret_origin();
+        let origin = self.terminal_caret_origin(pane);
         // The dropdown is anchored under the `⌄` caret in the terminal
         // toolbar and grows downward into the terminal panel — it never
         // overlaps the editor's welcome logo, so the cached OSC-1337 image
@@ -9931,22 +9932,33 @@ impl App {
         let slot_rects: Vec<Rect> = self.terminals.iter().map(|t| t.last_area).collect();
         let t = self.terminals.remove(from);
         self.terminals.insert(to, t);
-        // Split mode only. In maximize mode the sole live rect is the
-        // maximized pane's, and the drag keeps the DRAGGED terminal active, so
-        // seating by slot would hand the pane to a hidden terminal and leave
-        // the active one with an empty rect for the rest of the mouse burst.
-        // There the rects must travel with the terminals.
-        if !self.terminal_pane_maximized {
-            for (term, rect) in self.terminals.iter_mut().zip(slot_rects) {
-                term.last_area = rect;
-            }
-        }
         self.active_terminal = match self.active_terminal {
             a if a == from => to,
             a if from < a && a <= to => a - 1,
             a if to <= a && a < from => a + 1,
             a => a,
         };
+        if self.terminal_pane_maximized {
+            // Maximize mode has exactly one live rect, and it belongs to
+            // whichever pane was active at the LAST PAINT — not to the dragged
+            // terminal, since the press and the drag are drained together. So
+            // neither positional rule works here: find the live rect and hand
+            // it to the pane the drag leaves active, which is the one that will
+            // own the panel on the next frame.
+            let pane = slot_rects
+                .iter()
+                .copied()
+                .find(|r| r.width > 0)
+                .unwrap_or_default();
+            let active = self.active_terminal;
+            for (i, term) in self.terminals.iter_mut().enumerate() {
+                term.last_area = if i == active { pane } else { Rect::default() };
+            }
+        } else {
+            for (term, rect) in self.terminals.iter_mut().zip(slot_rects) {
+                term.last_area = rect;
+            }
+        }
         self.terminal_session_dirty = true;
     }
 
@@ -11326,11 +11338,11 @@ impl App {
                             let label = self.terminals[i].label().to_string();
                             // The pill is painted AFTER the header buttons and
                             // wins the shared cells, so its budget has to
-                            // clear them: four 3-cell buttons, the 1-cell
-                            // margin right of `+`, and the pill's own widest
-                            // decoration (a leading `⚠` or `⇶` plus the two
-                            // spaces every pill carries).
-                            let room = col.width.saturating_sub(17) as usize;
+                            // clear the button strip plus the pill's own
+                            // widest decoration (a leading `⚠` or `⇶` and the
+                            // two spaces every pill carries).
+                            let room =
+                                col.width.saturating_sub(TERMINAL_BUTTON_STRIP_W + 4) as usize;
                             // While broadcast input is on, every pane that
                             // receives the mirrored keystrokes wears an
                             // unmissable red pill with a ⇶ marker
@@ -11378,13 +11390,27 @@ impl App {
                                 } else {
                                     crate::widgets::header_pill::action_style(brand, false)
                                 };
+                                // `room` bounds how much of the name is worth
+                                // showing, but it counts CHARACTERS while the
+                                // buffer advances by display CELLS, so a CJK
+                                // or emoji name is twice as wide as its budget
+                                // and would still reach the buttons. Clip the
+                                // paint to the cells before the button strip —
+                                // `set_stringn` measures grapheme width, which
+                                // is the same clamp the rail rows use — and
+                                // take the drag handle's width from what was
+                                // actually painted.
+                                let budget =
+                                    col.width.saturating_sub(TERMINAL_BUTTON_STRIP_W) as usize;
+                                let (end_x, _) = frame
+                                    .buffer_mut()
+                                    .set_stringn(col.x, col.y, text, budget, style);
                                 label_rect = Rect {
                                     x: col.x,
                                     y: col.y,
-                                    width: (text.chars().count() as u16).min(col.width),
+                                    width: end_x.saturating_sub(col.x),
                                     height: 1,
                                 };
-                                frame.buffer_mut().set_string(col.x, col.y, text, style);
                             }
                         }
                         self.terminal_label_rects.push(label_rect);
@@ -26083,12 +26109,12 @@ impl App {
                     }
                     return;
                 }
-                if self
+                if let Some(idx) = self
                     .terminal_profile_buttons
                     .iter()
-                    .any(|r| rect_contains(*r, m.column, m.row))
+                    .position(|r| rect_contains(*r, m.column, m.row))
                 {
-                    self.open_terminal_profile_picker();
+                    self.open_terminal_profile_picker(idx);
                     return;
                 }
                 if let Some(idx) = self
@@ -32390,6 +32416,13 @@ const TERMINAL_MAX_LABEL: &str = " \u{eb4c} ";
 const TERMINAL_RESTORE_LABEL: &str = " \u{eb4d} ";
 /// Codicon terminal (Nerd Fonts `cod-terminal` = U+EA85), leading each
 /// maximize-rail row the way VS Code's terminal tabs list does.
+/// Cells the pane's header buttons occupy, measured in from its right edge:
+/// `⛶`, `-`, `∨` and `+` at three each, plus the one blank column right of
+/// `+`. The name pill paints after the buttons and would win the shared cells,
+/// so it is clipped to the width left of this strip.
+/// `a_long_pane_label_never_overpaints_the_maximize_button` pins it, so adding
+/// a fifth button fails a test rather than quietly erasing a glyph again.
+const TERMINAL_BUTTON_STRIP_W: u16 = 13;
 const TERMINAL_RAIL_ICON: char = '\u{ea85}';
 /// How many label characters a rail row shows. Fixed and deliberately tiny:
 /// the rail is a switcher, not a directory, so four letters identify a pane.

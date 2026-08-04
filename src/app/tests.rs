@@ -13420,22 +13420,31 @@ fn a_long_pane_label_never_overpaints_the_maximize_button() {
     // erase it entirely. The button's hit rect stays live underneath, so those
     // cells silently maximize instead of starting the drag-reorder the pill
     // advertises.
+    //
+    // Both label characters are deliberate: `§` is one cell, so it pins the
+    // char budget, and `項` is two, so it pins that the CLIP is measured in
+    // display cells. A budget counted in chars passes the `§` case while a
+    // wide-character name still runs over the button.
+    for name in ["§".repeat(30), "項".repeat(30)] {
+        assert_pane_pill_clears_its_buttons(&name);
+    }
+}
+
+fn assert_pane_pill_clears_its_buttons(name: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     for _ in 0..3 {
         app.split_terminal().unwrap();
     }
-    // A label character no other widget paints, long enough to fill whatever
-    // budget the pill is given, so this stays a bleed test rather than a test
-    // of one particular label length.
     for t in app.terminals.iter_mut() {
-        t.set_manual_name(Some("§".repeat(30)));
+        t.set_manual_name(Some(String::from(name)));
     }
     // Broadcast is on so the pill wears its widest form.
     app.broadcast_input = true;
     let backend = ratatui::backend::TestBackend::new(140, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
+    let glyph = name.chars().next().unwrap();
 
     let cell = |x: u16, y: u16| {
         term.backend()
@@ -13460,12 +13469,12 @@ fn a_long_pane_label_never_overpaints_the_maximize_button() {
         );
         let painted: String = (btn.x..btn.x + btn.width).map(|x| cell(x, btn.y)).collect();
         assert!(
-            !painted.contains('§'),
-            "pane {i}'s label painted over its maximize button: {painted:?}"
+            !painted.contains(glyph),
+            "pane {i}'s {glyph:?} label painted over its maximize button: {painted:?}"
         );
         assert!(
             painted.contains('\u{eb4c}'),
-            "pane {i}'s maximize glyph must survive, got {painted:?}"
+            "pane {i}'s maximize glyph must survive a {glyph:?} label, got {painted:?}"
         );
         checked += 1;
     }
@@ -13503,9 +13512,24 @@ fn the_profile_picker_anchors_under_the_pane_that_owns_the_caret() {
         "the hidden pane holds a placeholder, which is what `.first()` found"
     );
     assert_eq!(
-        app.terminal_caret_origin(),
+        app.terminal_caret_origin(2),
         (caret.x, caret.y + 1),
         "the dropdown anchors under the caret that is actually on screen"
+    );
+
+    // Side by side every pane has a live caret, so anchoring on the first
+    // live one would hang every pane's dropdown under the leftmost.
+    app.terminal_pane_maximized = false;
+    term.draw(|f| app.render(f)).unwrap();
+    let rightmost = app.terminal_profile_buttons[2];
+    assert!(
+        rightmost.x > app.terminal_profile_buttons[0].x,
+        "the panes must really be side by side for this to prove anything"
+    );
+    assert_eq!(
+        app.terminal_caret_origin(2),
+        (rightmost.x, rightmost.y + 1),
+        "each pane's dropdown anchors under its OWN caret"
     );
 }
 
@@ -13593,18 +13617,40 @@ fn reordering_a_maximized_pane_keeps_its_rect_with_the_terminal() {
         "the maximized pane owns the panel's width"
     );
 
-    // The rail drag: press row 2, cross row 0. No redraw in between, exactly
-    // as the main loop drains a mouse burst before painting.
-    app.move_terminal(2, 0);
+    // The real gesture: press rail row 0, drag onto row 2, with NO redraw in
+    // between — the main loop drains the whole burst before painting, so the
+    // live pane rect still belongs to whichever pane was active at the last
+    // paint, not to the one being dragged.
+    let press = app.terminal_rail_rects[0];
+    let target = app.terminal_rail_rects[2];
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: press.x + 1,
+        row: press.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        column: target.x + 1,
+        row: target.y,
+        modifiers: KeyModifiers::NONE,
+    });
 
-    assert_eq!(app.active_terminal, 0, "the dragged terminal stays active");
+    assert_eq!(app.active_terminal, 2, "the dragged terminal stays active");
     assert_eq!(
-        app.terminals[0].last_area, pane,
-        "the maximized rect travels with the terminal that is still maximized"
+        app.terminals[2].last_area, pane,
+        "the live pane rect follows the pane the drag leaves active"
     );
     assert!(
-        app.terminals.iter().skip(1).all(|t| t.last_area.width == 0),
+        app.terminals[..2].iter().all(|t| t.last_area.width == 0),
         "the hidden panes keep empty rects"
+    );
+    // The whole point: the next motion report in this same burst must resolve
+    // to the pane that owns the panel, not to a hidden one.
+    assert_eq!(
+        app.terminal_at_pos(pane.x + pane.width / 2, pane.y + pane.height / 2),
+        Some(2),
+        "a hit inside the maximized pane names the active terminal"
     );
 }
 
@@ -16671,7 +16717,7 @@ fn opening_the_profile_menu_keeps_the_welcome_logo() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.overlays.welcome.mark_displayed();
-    app.open_terminal_profile_picker();
+    app.open_terminal_profile_picker(0);
     assert!(app.context_menu.is_some(), "the menu opens");
     assert!(
         !app.consume_welcome_image_clear(),

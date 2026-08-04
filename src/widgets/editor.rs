@@ -4516,10 +4516,20 @@ impl Editor {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n";
-        // Descending, so each removal leaves the lower indices valid.
-        for &r in rows.iter().rev() {
-            self.lines.remove(r);
+        // One retain pass, not a `remove` per row: Change All Occurrences
+        // (Cmd+F2) can set a caret on every match in the file, and removing
+        // tens of thousands of rows one at a time is quadratic — a multi-second
+        // freeze on a large file, on the render thread.
+        let mut doomed = vec![false; self.lines.len()];
+        for &r in &rows {
+            doomed[r] = true;
         }
+        let mut i = 0;
+        self.lines.retain(|_| {
+            let keep = !doomed[i];
+            i += 1;
+            keep
+        });
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
