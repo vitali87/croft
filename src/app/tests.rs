@@ -13597,15 +13597,18 @@ fn a_rail_taller_than_the_panel_scrolls_instead_of_dropping_terminals() {
 #[test]
 fn reordering_a_maximized_pane_keeps_its_rect_with_the_terminal() {
     // `move_terminal` re-seats `last_area` in SLOT order, which is right for
-    // the even split, where a slot's geometry is positional. In maximize mode
-    // the only live rect belongs to whichever pane is active, and the drag
-    // keeps the DRAGGED terminal active — so seating by slot handed the full
-    // pane rect to a hidden terminal and left the active one with an empty
-    // rect for the rest of the mouse burst.
+    // the even split, where a slot's geometry is positional. Maximize mode has
+    // exactly ONE live rect and it belongs to whichever pane was active at the
+    // last PAINT — not to the dragged terminal, since the press and the drag
+    // are drained together — so seating by slot left the pane the drag makes
+    // active holding an empty rect for the rest of the burst.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.split_terminal().unwrap();
     app.split_terminal().unwrap();
+    for (i, t) in app.terminals.iter_mut().enumerate() {
+        t.set_manual_name(Some(format!("pane{i}")));
+    }
     app.terminal_pane_maximized = true;
     let backend = ratatui::backend::TestBackend::new(180, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -13636,6 +13639,14 @@ fn reordering_a_maximized_pane_keeps_its_rect_with_the_terminal() {
         modifiers: KeyModifiers::NONE,
     });
 
+    // The reorder must actually have happened: without this every assertion
+    // below also holds when the gesture is a no-op, since slot 2 already owned
+    // the pane before the drag.
+    assert_eq!(
+        app.terminals[2].label(),
+        "pane0",
+        "the dragged terminal must have moved from slot 0 to slot 2"
+    );
     assert_eq!(app.active_terminal, 2, "the dragged terminal stays active");
     assert_eq!(
         app.terminals[2].last_area, pane,

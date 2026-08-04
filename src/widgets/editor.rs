@@ -4501,29 +4501,30 @@ impl Editor {
         let primary = self
             .selection
             .unwrap_or_else(|| EditorSelection::new(self.cursor_row, self.cursor_col));
-        let mut rows: Vec<usize> = Vec::new();
+        // Mark while collecting, then scan once: the rows come out sorted and
+        // deduped without a sort, and Change All Occurrences (Cmd+F2) can put
+        // a caret on every match in the file.
+        let mut doomed = vec![false; self.lines.len()];
         for sel in std::iter::once(primary).chain(self.carets.iter().copied()) {
             let (a, h) = sel.normalised();
-            for r in a.0.min(last)..=h.0.min(last) {
-                rows.push(r);
+            for slot in &mut doomed[a.0.min(last)..=h.0.min(last)] {
+                *slot = true;
             }
         }
-        rows.sort_unstable();
-        rows.dedup();
+        let rows: Vec<usize> = doomed
+            .iter()
+            .enumerate()
+            .filter_map(|(r, &drop)| drop.then_some(r))
+            .collect();
         let yanked = rows
             .iter()
             .map(|&r| self.lines[r].as_str())
             .collect::<Vec<_>>()
             .join("\n")
             + "\n";
-        // One retain pass, not a `remove` per row: Change All Occurrences
-        // (Cmd+F2) can set a caret on every match in the file, and removing
-        // tens of thousands of rows one at a time is quadratic — a multi-second
-        // freeze on a large file, on the render thread.
-        let mut doomed = vec![false; self.lines.len()];
-        for &r in &rows {
-            doomed[r] = true;
-        }
+        // One retain pass, not a `remove` per row: removing tens of thousands
+        // of rows one at a time is quadratic — a multi-second freeze on a large
+        // file, on the render thread.
         let mut i = 0;
         self.lines.retain(|_| {
             let keep = !doomed[i];
