@@ -37,6 +37,8 @@ preview*.svg
 
 # Local caches and scratch
 .cgr-hash-cache.json
+.cgr-dir-mtimes.json
+.cgr-parser-fingerprint
 .tmp/
 
 # Debugger build artifacts (build_debuggable_binary drops <stem>.dbg next to source)

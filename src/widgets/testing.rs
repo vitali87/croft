@@ -204,9 +204,13 @@ impl TestingPanel {
                 // and no badge. Scoped to a run — the run-start paths clear the
                 // tree or mark the case Running first, so a Failed sitting here
                 // came from the run in progress.
+                // `Running` is exempt: it is not a result but the run-start
+                // mark, which `start_single` paints through this same call.
+                // Blocking it froze a fixed test on its old red row, hid the
+                // fact that a run had started, and then discarded the pass.
                 let downgrade = self.activity == Activity::Running
                     && self.cases[i].status == TestStatus::Failed
-                    && case.status != TestStatus::Failed;
+                    && !matches!(case.status, TestStatus::Failed | TestStatus::Running);
                 if !downgrade {
                     self.cases[i].status = case.status;
                 }
@@ -691,6 +695,34 @@ mod tests {
             1,
             "and that row must still report the failure"
         );
+    }
+
+    /// The no-downgrade rule must not swallow a run-start mark: `start_single`
+    /// sets `Running` THROUGH `apply_case`, so a guard that also blocked that
+    /// left the row red, hid the Running dot, and then discarded the pass —
+    /// making a fixed test impossible to clear by re-running it.
+    #[test]
+    fn re_running_a_failed_test_can_still_turn_it_green() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "tests::works".into(),
+            status: TestStatus::Failed,
+        });
+        p.on_finished(Some(false));
+        // The user fixes the test and clicks the row's play glyph.
+        p.start_single("tests::works");
+        assert_eq!(
+            p.cases[0].status,
+            TestStatus::Running,
+            "the run-start mark must land, or there is no sign a run began"
+        );
+        p.apply_case(TestCase {
+            name: "tests::works".into(),
+            status: TestStatus::Passed,
+        });
+        p.on_finished(Some(true));
+        assert_eq!(p.failed_count(), 0, "the fixed test must go green");
     }
 
     /// The no-downgrade rule is scoped to a run. Discovery re-lists the tree

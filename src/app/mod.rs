@@ -4932,15 +4932,23 @@ impl App {
     }
 
     /// Sweep EVERY open tab for external on-disk changes, not just the
-    /// focused one. Clean tabs reload silently; dirty tabs are flagged as
-    /// conflicts (the buffer and the disk are both preserved). Returns true
-    /// if any tab reloaded or entered conflict, so the caller redraws.
+    /// focused one — in every editor GROUP, not just the focused one either.
+    /// The poll stats each open path once and re-baselines its stamp, so a
+    /// change reported to a sweep that could not reach the tab is burned: no
+    /// later tick reports it again and that pane keeps stale text forever.
+    /// Clean tabs reload silently; dirty tabs are flagged as conflicts (the
+    /// buffer and the disk are both preserved). Returns true if any tab
+    /// reloaded or entered conflict, so the caller redraws.
     fn reload_open_file_after_external_change(&mut self) -> bool {
         let guest = self.is_collab_guest();
         let root = self.tree.root.clone();
-        let report = self
-            .editor
-            .reload_externally_changed_tabs(&|p| guest && collab_file_key(&root, p).is_some());
+        let skip = |p: &Path| guest && collab_file_key(&root, p).is_some();
+        let mut report = self.editor.reload_externally_changed_tabs(&skip);
+        for group in self.editor_layout.inactive_groups_mut() {
+            let extra = group.reload_externally_changed_tabs(&skip);
+            report.reloaded.extend(extra.reloaded);
+            report.conflicts.extend(extra.conflicts);
+        }
         if report.is_empty() {
             return false;
         }
