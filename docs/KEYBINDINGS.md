@@ -414,7 +414,7 @@ The panel's layout survives restarts: the pane arrangement, each pane's director
 
 ## Ports
 
-The PORTS tab in the bottom panel group lists the loopback ports croft has noticed this session, from scraping terminal output (`http://localhost:PORT` banners, `listening on :PORT` lines) and a periodic socket poll of the shell's process subtree. A newly announced port also raises a transient, click-only toast in the bottom-right corner. On a remote session, forwarding rides the existing SSH master (no second connection); on a local session a port is already reachable, so the only action is to open it.
+The PORTS tab in the bottom panel group lists the loopback ports croft has noticed this session, from scraping terminal output (`http://localhost:PORT` banners, `listening on :PORT` lines) and a periodic socket poll of the shell's process subtree. A newly announced port also raises a transient, click-only toast in the bottom-right corner. The poll only surfaces ports owned by a pane's own processes, so one outside it (a port a container publishes, say) is found by the terminal scrape; it still drops off the list when it genuinely stops listening. On a remote session, forwarding rides the existing SSH master (no second connection); on a local session a port is already reachable, so the only action is to open it.
 
 | Keys | Action |
 |------|--------|
@@ -422,7 +422,7 @@ The PORTS tab in the bottom panel group lists the loopback ports croft has notic
 | `⏎` | Open the selected port in your browser (forwarding it home first on a remote session) |
 | `f` | Forward the selected remote port without opening |
 | `c` | Copy the selected port's address |
-| `x` | Stop watching the port (tearing down its forward on a remote session) |
+| `x` | On a forwarded port, stop forwarding it: the tunnel comes down, the row stays, and you can forward it again. Otherwise dismiss the row, which also stops croft re-detecting that port this session |
 | Click a port row | Select it; **double-click** opens it in your browser (forwarding it home first on a remote session), same as `⏎` |
 | Click the toast buttons | `Forward & Open` / `Forward` / `Open` / dismiss, depending on whether the session is remote |
 

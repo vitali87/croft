@@ -2434,8 +2434,8 @@ pub struct App {
     /// complete listener set per cycle), so the blocking `lsof`/`ps` never runs
     /// on the event loop (keeps input at 0ms). A full set, not individual hits,
     /// so the app can reconcile ports that stopped listening.
-    port_poll_rx: std::sync::mpsc::Receiver<Vec<crate::port_detect::PortHit>>,
-    port_poll_tx: std::sync::mpsc::Sender<Vec<crate::port_detect::PortHit>>,
+    port_poll_rx: std::sync::mpsc::Receiver<PortPoll>,
+    port_poll_tx: std::sync::mpsc::Sender<PortPoll>,
     /// True while a poll thread is in flight, so cadence ticks don't pile up
     /// overlapping `lsof` invocations.
     port_poll_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -3007,6 +3007,14 @@ pub struct MinimapLayout {
     bg: (u8, u8, u8),
     /// Active selection `(start_row, end_row)`; a change recomposites the band.
     selection: Option<(usize, usize)>,
+}
+
+/// One socket-poll result. `hits` is the pane-subtree scan that decides what to
+/// surface; `listening` is every loopback port on the box, the only set that can
+/// say a port has stopped. `None` when neither probe ran.
+struct PortPoll {
+    hits: Vec<crate::port_detect::PortHit>,
+    listening: Option<std::collections::HashSet<u16>>,
 }
 
 /// The per-frame minimap overlays (everything not baked into the raster).
@@ -21194,11 +21202,7 @@ impl App {
         let mut staged: Vec<PendingRemotePull> = Vec::new();
         let now = std::time::Instant::now();
         for src in paths {
-            let request_id = format!(
-                "{}-{}",
-                std::process::id(),
-                now.elapsed().as_nanos().wrapping_add(staged.len() as u128),
-            );
+            let request_id = Self::relay_request_id("pull");
             let basename = src
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -21240,11 +21244,7 @@ impl App {
             return;
         };
         self.ensure_relay_dir();
-        let request_id = format!(
-            "clip-{}-{}",
-            std::process::id(),
-            std::time::Instant::now().elapsed().as_nanos(),
-        );
+        let request_id = Self::relay_request_id("clip");
         let mut line = String::from("clipboard\t");
         line.push_str(&request_id);
         line.push('\n');
@@ -21699,9 +21699,8 @@ impl App {
         // Latest background-poll snapshot (a complete listener set): add new
         // ports, then reconcile so ports that stopped listening go not-live and
         // eventually drop. Only the newest queued snapshot matters.
-        if let Some(snapshot) = self.port_poll_rx.try_iter().last() {
-            let live: std::collections::HashSet<u16> = snapshot.iter().map(|h| h.port).collect();
-            for hit in snapshot {
+        if let Some(poll) = self.port_poll_rx.try_iter().last() {
+            for hit in poll.hits {
                 if self
                     .ports
                     .upsert(hit.port, hit.url, hit.process, origin.clone())
@@ -21709,13 +21708,19 @@ impl App {
                     changed = true;
                 }
             }
-            let outcome = self.ports.reconcile_live(&live);
-            if outcome.changed {
-                changed = true;
-            }
-            // A dropped forward's tunnel is no longer needed — cancel it.
-            for (local, remote) in outcome.torn_down {
-                self.request_remote_unforward(local, remote);
+            // Reconcile only against the unscoped listener set. `None` means
+            // neither `lsof` nor `ss` ran, which is no evidence at all — far
+            // better to leave every row alone than to retire live ports and
+            // cancel their tunnels on a failed probe.
+            if let Some(live) = poll.listening {
+                let outcome = self.ports.reconcile_live(&live);
+                if outcome.changed {
+                    changed = true;
+                }
+                // A dropped forward's tunnel is no longer needed — cancel it.
+                for (local, remote) in outcome.torn_down {
+                    self.request_remote_unforward(local, remote);
+                }
             }
         }
         // On cadence, kick off a fresh poll off-thread — `lsof`/`ps` block for
@@ -21736,17 +21741,20 @@ impl App {
                 let inflight = self.port_poll_inflight.clone();
                 inflight.store(true, std::sync::atomic::Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    // One complete snapshot across all terminals' subtrees, so
-                    // the app can tell a still-listening port from a gone one.
-                    let mut snapshot: Vec<crate::port_detect::PortHit> = Vec::new();
+                    // Two questions, two scans. The subtree scan says what to
+                    // SURFACE (a system daemon is not the user's dev server);
+                    // the unscoped one says what is still UP, which the subtree
+                    // cannot answer for a port nobody in it owns.
+                    let mut hits: Vec<crate::port_detect::PortHit> = Vec::new();
                     for pid in pids {
                         for hit in crate::port_detect::poll_listeners(pid) {
-                            if !snapshot.iter().any(|h| h.port == hit.port) {
-                                snapshot.push(hit);
+                            if !hits.iter().any(|h| h.port == hit.port) {
+                                hits.push(hit);
                             }
                         }
                     }
-                    let _ = tx.send(snapshot);
+                    let listening = crate::port_detect::poll_all_listening();
+                    let _ = tx.send(PortPoll { hits, listening });
                     inflight.store(false, std::sync::atomic::Ordering::Relaxed);
                 });
             }
@@ -21873,15 +21881,20 @@ impl App {
             return;
         };
         let port = entry.port;
-        let teardown = match (&entry.origin, entry.forwarded, entry.local_port) {
-            (PortOrigin::Remote(_), true, Some(local)) => Some((local, port)),
-            _ => None,
-        };
-        self.ports.remove(port);
-        if let Some((local, remote)) = teardown {
-            self.request_remote_unforward(local, remote);
+        let forwarded = matches!(
+            (&entry.origin, entry.forwarded, entry.local_port),
+            (PortOrigin::Remote(_), true, Some(_))
+        );
+        // Two different gestures share `x`. Stopping a forward leaves the
+        // server running and the row in place, so the port must stay
+        // detectable; dismissing the row is the one that suppresses it.
+        if forwarded {
+            if let Some((local, remote)) = self.ports.stop_forwarding(port) {
+                self.request_remote_unforward(local, remote);
+            }
             self.status = format!("Stopped forwarding port {port} (the server keeps running)");
         } else {
+            self.ports.remove(port);
             self.status = format!("Dismissed port {port} from the list (the server keeps running)");
         }
     }
@@ -22073,6 +22086,17 @@ impl App {
         true
     }
 
+    /// A relay request id: the kind, this process, and a per-process counter.
+    /// The relay keys its remote inbox directory by this id, so two requests
+    /// raised in the same instant must not share one — the first reply would
+    /// satisfy both pending pulls and delete the directory out from under the
+    /// second, which then times out with its tunnel already up.
+    fn relay_request_id(kind: &str) -> String {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{kind}-{}-{n}", std::process::id())
+    }
+
     /// Ask the local launcher (via the drop relay) to forward `port` home over
     /// the live SSH master, optionally opening the local browser once it's up.
     fn request_remote_forward(&mut self, port: u16, open: bool) {
@@ -22081,11 +22105,7 @@ impl App {
             return;
         };
         self.ensure_relay_dir();
-        let request_id = format!(
-            "forward-{}-{}",
-            std::process::id(),
-            std::time::Instant::now().elapsed().as_nanos(),
-        );
+        let request_id = Self::relay_request_id("forward");
         let line = format!("forward\t{request_id}\t{port}\t{}\n", u8::from(open));
         match append_to_relay_log(&log_path, &line) {
             Ok(()) => {
@@ -22110,11 +22130,7 @@ impl App {
             return;
         };
         self.ensure_relay_dir();
-        let request_id = format!(
-            "unforward-{}-{}",
-            std::process::id(),
-            std::time::Instant::now().elapsed().as_nanos(),
-        );
+        let request_id = Self::relay_request_id("unforward");
         let line = format!("unforward\t{request_id}\t{local}\t{remote}\n");
         let _ = append_to_relay_log(&log_path, &line);
     }
@@ -22125,11 +22141,7 @@ impl App {
             return;
         };
         self.ensure_relay_dir();
-        let request_id = format!(
-            "open-{}-{}",
-            std::process::id(),
-            std::time::Instant::now().elapsed().as_nanos(),
-        );
+        let request_id = Self::relay_request_id("open");
         let mut line = String::from("open\t");
         line.push_str(&request_id);
         line.push('\t');
@@ -29217,7 +29229,17 @@ impl App {
             self.disable_minimap_image();
             return;
         }
+        // The raster is emitted at Kitty z=0 after ratatui's diff, so anything
+        // ratatui paints over the strip gets painted back over every frame.
+        // Only a menu that actually reaches the strip may evict it: arming the
+        // clear latch for every right-click anywhere would wipe and repaint the
+        // whole screen on the cell-buffer protocols. The layout is kept, so the
+        // raster comes back without a rebake once the menu closes.
         self.minimap_img_rect = strip;
+        if self.menu_covers(strip) {
+            self.overlays.minimap.hide_and_request_clear();
+            return;
+        }
         let cell_w = strip.width;
         let cell_h = strip.height;
         let bg = self.theme.editor_bg_rgb();
@@ -29393,6 +29415,19 @@ impl App {
         Some((ed_rect, full_strip, img))
     }
 
+    /// Whether the open context menu (or its submenu, which floats further
+    /// out) overlaps `r`. Menus are clamped to the frame, not snapped to it, so
+    /// a right-click far from the minimap leaves the strip untouched.
+    fn menu_covers(&self, r: Rect) -> bool {
+        if r.width == 0 || r.height == 0 {
+            return false;
+        }
+        [self.menu_rect(), self.submenu_rect()]
+            .into_iter()
+            .flatten()
+            .any(|m| m.intersects(r))
+    }
+
     pub fn minimap_image_payload(&self) -> Option<(&str, &MinimapLayout)> {
         if self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
@@ -29405,6 +29440,7 @@ impl App {
             || self.branch_picker.is_some()
             || self.input_prompt.is_some()
             || self.list_picker.is_some()
+            || self.menu_covers(self.minimap_img_rect)
         {
             return None;
         }

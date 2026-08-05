@@ -62,22 +62,26 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Reopen with Encoding no longer throws away unsaved changes. It used to re-read the file over your edits with no warning and no way to undo, even when you picked the encoding already in use.",
+        summary: "Running a test suite no longer offers to forward a port. Croft read the case count out of lines like \"running 289 tests\", and a clock time out of lines like \"started at 03:15\", and announced them as dev servers.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "UTF-16 files now open, edit and save like any other file. Saving keeps the file's encoding and byte-order mark instead of quietly rewriting it as plain UTF-8 while still reporting the old encoding, and an encoding you picked survives a reload.",
+        summary: "A port croft cannot trace to one of its own panes, such as one a container publishes, now stays in the PORTS list for as long as it is actually listening. It used to vanish seconds after being detected, taking the tunnel you had just set up with it.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Git change bars in a split pane now update after a commit. Only the focused pane was refreshed, so the other one kept marking lines that were already committed.",
+        summary: "Forwarding two ports at once now works. Both requests were sent under the same id, so one of them sat there until it timed out even though its tunnel was already up.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "The parameter-hints popup stays inside the editor. A long signature pushed it out over the file tree.",
+        summary: "Stopping a forward in the PORTS list no longer hides the port for the rest of the session. The server is still running, so the row stays and you can forward it again.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "On a narrow window, clicking the line and column readout no longer opens the Problems panel.",
+        summary: "The PORTS list scrolls, so a selection past the bottom of the panel stays visible instead of acting on a row you cannot see.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "The minimap no longer paints over its own right-click menu.",
     },
 ];

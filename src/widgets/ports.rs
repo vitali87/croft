@@ -105,6 +105,9 @@ pub struct PortsPanel {
     /// Body-row hit rects (index into `entries`), recomputed each render.
     row_rects: Vec<(Rect, usize)>,
     first_row_y: u16,
+    /// Index of the first entry drawn, so a selection past the panel height
+    /// scrolls into view instead of disappearing.
+    scroll: usize,
 }
 
 impl PortsPanel {
@@ -120,6 +123,7 @@ impl PortsPanel {
             last_area: Rect::default(),
             row_rects: Vec::new(),
             first_row_y: 0,
+            scroll: 0,
         }
     }
 
@@ -202,6 +206,12 @@ impl PortsPanel {
     /// gone is marked not-live, and stays gone past a short grace is dropped —
     /// the row follows the server, forwarded or not. A dropped forward's
     /// `(local, remote)` pair is reported so the app can tear the tunnel down.
+    ///
+    /// `live` must therefore be EVERY loopback listener on the box
+    /// ([`crate::port_detect::poll_all_listening`]), not the pane-subtree scan
+    /// that decides what to surface: a container's published port is nobody's
+    /// descendant, and retiring it for missing from a snapshot that could never
+    /// contain it dropped a live row and cancelled its tunnel.
     pub fn reconcile_live(&mut self, live: &HashSet<u16>) -> ReconcileOutcome {
         const GRACE_CYCLES: u8 = 2;
         let before = self.entries.len();
@@ -246,6 +256,17 @@ impl PortsPanel {
         if self.selected >= self.entries.len() {
             self.selected = self.entries.len().saturating_sub(1);
         }
+    }
+
+    /// Stop forwarding `port`, reporting its `(local, remote)` tunnel for
+    /// teardown. The server is still listening, so unlike [`Self::remove`] the
+    /// row stays and the port is not suppressed — `x` is labelled "stop
+    /// forwarding" there, and the user must be able to forward it again.
+    pub fn stop_forwarding(&mut self, port: u16) -> Option<(u16, u16)> {
+        let e = self.entries.iter_mut().find(|e| e.port == port)?;
+        let local = e.local_port.take()?;
+        e.forwarded = false;
+        Some((local, port))
     }
 
     /// Record that a remote port is now forwarded to `local_port`.
@@ -336,7 +357,30 @@ impl Widget for &mut PortsPanel {
         if self.selected >= self.entries.len() {
             self.selected = self.entries.len() - 1;
         }
-        for (row, entry) in self.entries.iter().enumerate().take(body_h as usize) {
+        // Scroll so the selection is always on screen: `f` and `x` act on it,
+        // and acting on a row the user cannot see is how a tunnel gets torn
+        // down by surprise.
+        let body_h_usize = body_h as usize;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if body_h_usize > 0 && self.selected >= self.scroll + body_h_usize {
+            self.scroll = self.selected + 1 - body_h_usize;
+        }
+        // And never scrolled past the last full page, or a panel that grew (the
+        // splitter dragged up, the terminal maximized) or a list that shrank
+        // would draw a handful of rows into a tall body with the rest above the
+        // top, invisible and unclickable.
+        self.scroll = self
+            .scroll
+            .min(self.entries.len().saturating_sub(body_h_usize));
+        for (row, (idx, entry)) in self
+            .entries
+            .iter()
+            .enumerate()
+            .skip(self.scroll)
+            .take(body_h_usize)
+            .enumerate()
+        {
             let y = self.first_row_y + row as u16;
             let r = Rect {
                 x: area.x,
@@ -344,8 +388,8 @@ impl Widget for &mut PortsPanel {
                 width: area.width,
                 height: 1,
             };
-            self.row_rects.push((r, row));
-            let selected = row == self.selected;
+            self.row_rects.push((r, idx));
+            let selected = idx == self.selected;
             let hovered =
                 crate::widgets::hover::row_hover_bg(r, self.hover_pointer, false).is_some();
             if selected || hovered {
@@ -613,6 +657,72 @@ mod tests {
             "seen again => live, miss count reset"
         );
         assert_eq!(p.len(), 1);
+    }
+
+    /// `x` on a forwarded port is labelled "stop forwarding", and the status
+    /// says the server keeps running. Blacklisting the port there means the
+    /// still-listening server can never be forwarded again this session.
+    #[test]
+    fn stopping_a_forward_leaves_the_port_forwardable_again() {
+        let mut p = PortsPanel::new();
+        p.upsert(3000, None, None, PortOrigin::Remote("box".into()));
+        p.mark_forwarded(3000, 3001);
+        assert_eq!(p.stop_forwarding(3000), Some((3001, 3000)));
+        let e = p.selected().expect("the row stays, the server is still up");
+        assert!(!e.forwarded, "but no longer marked forwarded");
+        assert_eq!(e.local_port, None, "and its stale local port is cleared");
+        assert_eq!(p.forwarded_count(), 0);
+    }
+
+    /// The body renders `body_h` rows. Without a scroll offset, moving the
+    /// selection past that leaves nothing highlighted while `f` and `x` still
+    /// act on the invisible entry.
+    #[test]
+    fn the_selected_row_scrolls_into_view() {
+        let mut p = PortsPanel::new();
+        for port in [3000u16, 3001, 3002, 3003, 3004, 3005, 3006] {
+            p.upsert(port, None, None, PortOrigin::Local);
+        }
+        // Height 5 = header + 3 body rows + hint line.
+        p.select_index(6);
+        let out = render(&mut p, 80, 5);
+        assert!(out.contains("3006"), "the selected row must be on screen");
+        assert!(
+            p.row_at(1, p.first_row_y).is_some(),
+            "and the visible rows must still hit-test"
+        );
+        // Clicking the top visible row must select the entry actually drawn
+        // there, not entry 0.
+        let idx = p.row_at(1, p.first_row_y).unwrap();
+        assert_eq!(
+            p.entries[idx].port, 3004,
+            "row rects must carry the scrolled index"
+        );
+    }
+
+    /// The panel can grow (splitter dragged up, terminal maximized) and the
+    /// list can shrink. A scroll offset left where it was then draws a handful
+    /// of rows into a tall body with the rest above the top, invisible and
+    /// unclickable, since `row_rects` only carries what was drawn.
+    #[test]
+    fn the_scroll_offset_shrinks_when_the_panel_grows() {
+        let mut p = PortsPanel::new();
+        for port in [3000u16, 3001, 3002, 3003, 3004, 3005, 3006] {
+            p.upsert(port, None, None, PortOrigin::Local);
+        }
+        p.select_index(6);
+        render(&mut p, 80, 5); // 3 body rows: scrolled to the bottom.
+        let tall = render(&mut p, 80, 20); // 18 body rows: everything fits.
+        assert!(
+            tall.contains("3000"),
+            "the first row must come back into view"
+        );
+        assert!(tall.contains("3006"), "and the last one must stay");
+        assert_eq!(
+            p.row_at(1, p.first_row_y),
+            Some(0),
+            "the top row must hit-test as the first entry"
+        );
     }
 
     #[test]

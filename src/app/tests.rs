@@ -18802,6 +18802,78 @@ fn minimap_edit_rebakes_in_place_but_a_moved_strip_arms_the_clear() {
 }
 
 #[test]
+fn an_open_context_menu_hides_the_minimap_raster() {
+    // The raster is emitted at Kitty z=0 (above text) AFTER ratatui's diff, on
+    // every frame. The minimap's own right-click menu is anchored on the strip,
+    // so without a gate the raster paints back over the menu the user just
+    // opened. `cb0481b` fixed the same collision for the welcome logo. The gate
+    // has to be rect-precise, not "any menu is open": arming the clear latch
+    // for a menu elsewhere wipes and repaints the whole screen on the
+    // cell-buffer protocols.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.cell_pixel = Some((8, 16));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.editor.lines = (0..80).map(|i| format!("line {i}")).collect();
+    let strip = ratatui::layout::Rect {
+        x: 100,
+        y: 1,
+        width: 6,
+        height: 40,
+    };
+    app.update_minimap_overlay(strip);
+    assert!(app.minimap_image_payload().is_some(), "minimap must bake");
+    let _ = app.consume_minimap_image_clear();
+    app.mark_minimap_image_displayed();
+
+    app.open_minimap_menu(102, 5);
+    app.update_minimap_overlay(strip);
+    assert!(
+        app.minimap_image_payload().is_none(),
+        "no re-emit while a menu covers the strip, or it repaints over the menu"
+    );
+    assert!(
+        app.consume_minimap_image_clear(),
+        "and the placed image must be evicted, not left on the Kitty layer"
+    );
+
+    app.context_menu = None;
+    app.update_minimap_overlay(strip);
+    assert!(
+        app.minimap_image_payload().is_some(),
+        "the minimap comes back once the menu closes"
+    );
+
+    // A menu is clamped to the frame, not snapped to its right edge, so a
+    // right-click far from the strip never reaches it.
+    app.mark_minimap_image_displayed();
+    app.open_minimap_menu(2, 5);
+    app.update_minimap_overlay(strip);
+    assert!(
+        app.minimap_image_payload().is_some(),
+        "a menu nowhere near the strip must leave the minimap alone"
+    );
+    assert!(
+        !app.consume_minimap_image_clear(),
+        "and must not arm the screen-wiping clear latch"
+    );
+}
+
+#[test]
+fn relay_request_ids_are_unique_per_request() {
+    // `Instant::now().elapsed()` measures the gap between an instant and
+    // itself, so the id was `<kind>-<pid>-0` almost every time. The relay keys
+    // its remote inbox directory by request id, so two requests raised in the
+    // same second collided: the first reply satisfied both pending pulls and
+    // deleted the directory out from under the second, which then timed out
+    // 120s later - with its file already destroyed or its tunnel already up.
+    let ids: Vec<String> = (0..64).map(|_| App::relay_request_id("forward")).collect();
+    let unique: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "every request id must be distinct");
+    assert!(ids[0].starts_with("forward-"), "kind stays in the id");
+}
+
+#[test]
 fn image_eviction_wipes_the_screen_only_on_cell_buffer_protocols() {
     // The `terminal.clear()` the main loop fires when an image-clear latch is
     // armed exists to evict CACHED IMAGE CELLS: iTerm2 OSC-1337 and sixel
