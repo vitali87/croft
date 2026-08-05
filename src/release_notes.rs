@@ -62,10 +62,22 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A failing test is no longer reported as passing. When two test harnesses in one workspace contain a test of the same name, the row they share now shows the failure instead of whichever result arrived last.",
+        summary: "Reopen with Encoding no longer throws away unsaved changes. It used to re-read the file over your edits with no warning and no way to undo, even when you picked the encoding already in use.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A file open in a background tab now picks up changes made outside croft. Only the tab you were looking at was being checked, so an edit to a file at the top of the project could sit unnoticed until you saved and hit a conflict.",
+        summary: "Saving keeps the file's encoding and its byte-order mark, instead of quietly rewriting it as plain UTF-8 while still reporting the old encoding.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Git change bars in a split pane now update after a commit. Only the focused pane was refreshed, so the other one kept marking lines that were already committed.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "The parameter-hints popup stays inside the editor. A long signature pushed it out over the file tree.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "On a narrow window, clicking the line and column readout no longer opens the Problems panel.",
     },
 ];

@@ -2854,6 +2854,140 @@ fn drain_fs_events_polling_fallback_reloads_clean_open_file_without_watcher_even
     assert!(!app.editor.dirty);
 }
 
+/// The right cluster is painted over the left paragraph, but the diagnostics
+/// hit rect was clipped only to the frame edge — never to where that cluster
+/// starts. So on a narrow terminal the cells that visibly read "Ln 1, Col 1"
+/// still answered to the diagnostics click and opened PROBLEMS, while the
+/// counts they claimed to be were not on screen at all.
+#[test]
+fn clicking_the_position_readout_does_not_open_problems() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut term = Terminal::new(TestBackend::new(50, 20)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Find the status row and the column where the position readout paints.
+    let buf = term.backend().buffer();
+    let row = buf.area.height - 1;
+    let text: String = (0..buf.area.width)
+        .map(|x| buf[(x, row)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    let ln_col =
+        text.find("Ln ")
+            .unwrap_or_else(|| panic!("no position readout in status row {text:?}")) as u16;
+
+    // The right cluster begins with " Ln", so its left edge is one cell before.
+    let rx = ln_col.saturating_sub(1);
+    assert!(
+        app.status_diag_rect.right() <= rx,
+        "the diagnostics hit rect must stop where the right cluster starts \
+         (rect {:?} reaches {}, cluster starts at {}); row reads {text:?}",
+        app.status_diag_rect,
+        app.status_diag_rect.right(),
+        rx
+    );
+    // And concretely: the cells that visibly read "Col 1" must not be a
+    // diagnostics target.
+    let col_at = text.find("Col ").unwrap() as u16;
+    assert!(
+        !rect_contains(app.status_diag_rect, col_at, row),
+        "clicking the column readout opened PROBLEMS"
+    );
+}
+
+/// Inactive split groups render their editors, so their git gutters paint from
+/// whatever baseline they hold. `sync_git_gutters` fetched baselines for the
+/// ACTIVE group only, so a tab in the other pane painted bars against nothing
+/// (or, after a commit, against a baseline that HEAD had moved past) and never
+/// self-corrected: focusing it makes `git_baseline_for == path`, so the fetch
+/// is skipped from then on.
+#[test]
+fn git_gutter_baselines_are_fetched_for_inactive_split_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "a@b"],
+        vec!["config", "user.name", "a"],
+    ] {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(&args)
+            .status();
+    }
+    let f = root.join("seed.txt");
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-m", "init", "--quiet"]] {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(&args)
+            .status();
+    }
+
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.split_editor(); // both groups now hold seed.txt; right is focused
+    app.sync_git_gutters();
+
+    let inactive_baselines: Vec<Option<std::path::PathBuf>> = app
+        .editor_layout
+        .inactive_groups()
+        .into_iter()
+        .flat_map(|g| g.editors.iter())
+        .filter(|e| e.path.as_deref() == Some(f.as_path()))
+        .map(|e| e.git_baseline_for.clone())
+        .collect();
+    assert!(
+        !inactive_baselines.is_empty(),
+        "the inactive group holds a tab on seed.txt"
+    );
+    for baseline in inactive_baselines {
+        assert_eq!(
+            baseline.as_deref(),
+            Some(f.as_path()),
+            "a tab in an inactive split group needs its git baseline too"
+        );
+    }
+}
+
+/// "Reopen with Encoding" re-reads the file from disk over the buffer AND
+/// clears both history stacks, so unsaved work was gone with no confirmation
+/// and no way back through Cmd+Z. The status-bar encoding segment is a newly
+/// clickable target sitting a few cells from the Ln/Col readout, so this is
+/// easy to hit by accident — including by picking the encoding already in use,
+/// which otherwise looks like a no-op.
+#[test]
+fn reopen_with_encoding_refuses_to_discard_unsaved_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("notes.txt");
+    std::fs::write(&f, "keep me\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor.cursor_col = 0;
+    app.editor.insert_char('X');
+    assert!(app.editor.dirty, "the buffer has unsaved work");
+
+    app.dispatch_menu_action(
+        MenuAction::SetEncoding(encoding_rs::UTF_8),
+        tmp.path().to_path_buf(),
+    );
+
+    assert!(
+        app.editor.lines[0].starts_with('X'),
+        "the unsaved edit must survive, got {:?}",
+        app.editor.lines[0]
+    );
+    assert!(app.editor.dirty, "and the buffer is still dirty");
+    assert!(
+        app.status.to_lowercase().contains("save"),
+        "the refusal must say what to do, got {:?}",
+        app.status
+    );
+}
+
 /// A boundary dir (any repo root: it holds `.git`) gets NO FSEvents watch on
 /// macOS, by the iron law that keeps the build-churn storm dead. An in-place
 /// write does not move the parent dir's mtime either, so for a file sitting
