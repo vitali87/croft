@@ -2646,6 +2646,16 @@ impl Editor {
             anyhow::bail!("Binary file");
         }
         let changed_file = self.path.as_deref() != Some(path);
+        // `open` is also the same-path reload behind the FS-sync sweep and
+        // every revert, so auto-detection here would throw away an encoding
+        // the user picked through "Reopen with Encoding" — decoding the same
+        // bytes as UTF-8 and handing the next save the mojibake to write back.
+        // The choice sticks until the file itself declares otherwise.
+        let enc = if changed_file || sniffed.is_some() {
+            enc
+        } else {
+            self.encoding
+        };
         self.encoding = enc;
         // `decode` strips the BOM, so remember it or the next save drops it.
         self.bom = sniffed.is_some();
@@ -12885,6 +12895,32 @@ mod tests {
         e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
         assert_eq!(e.lines[0], "café", "Windows-1252 decodes 0xE9 as é");
         assert_eq!(e.encoding, encoding_rs::WINDOWS_1252);
+    }
+
+    /// A same-path reload (the FS-sync sweep on a clean buffer, or an explicit
+    /// revert) re-enters `open`, which auto-detects. Without a guard that
+    /// throws away the encoding the user picked through "Reopen with
+    /// Encoding", and the bytes get decoded as UTF-8 — so the buffer fills
+    /// with replacement characters and the next save writes them over the
+    /// original file.
+    #[test]
+    fn a_reload_keeps_the_encoding_the_user_reopened_with() {
+        use std::io::Write as _;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&[b'c', b'a', b'f', 0xE9]).unwrap();
+        tmp.flush().unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
+        // The file changes on disk, still Windows-1252 and still BOM-less.
+        std::fs::write(tmp.path(), [b't', b'h', 0xE9]).unwrap();
+        e.reload_if_clean().unwrap().unwrap();
+        assert_eq!(
+            e.encoding,
+            encoding_rs::WINDOWS_1252,
+            "a same-path reload must keep the encoding the user chose"
+        );
+        assert_eq!(e.lines[0], "thé", "and decode the new bytes with it");
     }
 
     /// A UTF-16 file must survive the whole round trip: open, edit, save,

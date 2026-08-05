@@ -66,7 +66,7 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "UTF-16 files now open, edit and save like any other file. Saving keeps the file's encoding and byte-order mark instead of quietly rewriting it as plain UTF-8 while still reporting the old encoding.",
+        summary: "UTF-16 files now open, edit and save like any other file. Saving keeps the file's encoding and byte-order mark instead of quietly rewriting it as plain UTF-8 while still reporting the old encoding, and an encoding you picked survives a reload.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,

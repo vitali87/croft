@@ -69,7 +69,9 @@ src/
 │   │                    taking its output at face value wrote a file disagreeing with the encoding the status bar reported). UTF-16 output
 │   │                    ALWAYS carries its BOM, and `open` sniffs the BOM BEFORE the `is_binary` heuristic, since UTF-16 text is half NUL
 │   │                    bytes and would otherwise be rejected as binary: without both halves croft could write UTF-16 it could never reopen.
-│   │                    `reopen_with_encoding` records the encoding `decode` ACTUALLY used, which a BOM overrides. "Reopen with Encoding"
+│   │                    `reopen_with_encoding` records the encoding `decode` ACTUALLY used, which a BOM overrides, and the choice STICKS
+│   │                    across a same-path reload (`open` is also the FS-sync sweep and every revert, so re-detecting there would decode the
+│   │                    file as UTF-8 and hand the next save the mojibake to write back). "Reopen with Encoding"
 │   │                    refuses on a dirty buffer and points at undo, never at saving: the buffer may hold mojibake from a wrong decode, and
 │   │                    saving would write those replacement chars over the real bytes.
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
