@@ -2854,6 +2854,93 @@ fn drain_fs_events_polling_fallback_reloads_clean_open_file_without_watcher_even
     assert!(!app.editor.dirty);
 }
 
+/// A boundary dir (any repo root: it holds `.git`) gets NO FSEvents watch on
+/// macOS, by the iron law that keeps the build-churn storm dead. An in-place
+/// write does not move the parent dir's mtime either, so for a file sitting
+/// directly in one, the poll's per-file stat is the ONLY thing that can notice
+/// a change — and it tracked the ACTIVE tab alone, leaving a background tab on
+/// stale text indefinitely.
+#[test]
+fn the_poll_notices_a_background_tab_whose_file_changed_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bg = tmp.path().join("bg.txt");
+    let front = tmp.path().join("front.txt");
+    std::fs::write(&bg, "old\n").unwrap();
+    std::fs::write(&front, "front\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&bg).unwrap();
+    app.editor.open_pinned(&front).unwrap(); // front.txt is now the active tab
+    app.sync_open_file_poll_mtime();
+    app.fs_watch.disable();
+    // Baseline the dir mtimes so the sweep cannot be driven by `dirs_changed`.
+    app.fs_watch.force_poll_due();
+    let _ = app.drain_fs_events();
+
+    // Rewrite the BACKGROUND file in place: same directory entry, so the dir's
+    // own mtime does not move.
+    std::fs::write(&bg, "new content\n").unwrap();
+    app.fs_watch.force_poll_due();
+    let _ = app.drain_fs_events();
+
+    let reloaded = app
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(bg.as_path()))
+        .expect("the background tab is still open")
+        .lines
+        .clone();
+    assert_eq!(
+        reloaded,
+        vec!["new content"],
+        "a background tab must pick up an in-place external write"
+    );
+}
+
+/// The external-change sweep has to reach every editor GROUP, not just the
+/// focused one. The poll stats each open tab exactly once and re-baselines its
+/// stamp, so a change it reports and the sweep then misses is burned: no later
+/// tick sees it again and the split pane keeps stale text forever.
+#[test]
+fn an_external_write_reloads_a_tab_in_an_inactive_split_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let side = tmp.path().join("side.txt");
+    let front = tmp.path().join("front.txt");
+    std::fs::write(&side, "old\n").unwrap();
+    std::fs::write(&front, "front\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&side).unwrap();
+    app.split_editor(); // side.txt is now open in BOTH groups; right is focused
+    app.editor.open_pinned(&front).unwrap(); // focused group moves to front.txt
+    app.sync_open_file_poll_mtime();
+    app.fs_watch.disable();
+    app.fs_watch.force_poll_due();
+    let _ = app.drain_fs_events();
+
+    std::fs::write(&side, "new content\n").unwrap();
+    app.fs_watch.force_poll_due();
+    let _ = app.drain_fs_events();
+
+    let stale: Vec<String> = app
+        .editor_layout
+        .inactive_groups()
+        .into_iter()
+        .flat_map(|g| g.editors.iter())
+        .filter(|e| e.path.as_deref() == Some(side.as_path()))
+        .map(|e| e.lines.join("\n"))
+        .collect();
+    assert!(
+        !stale.is_empty(),
+        "the inactive group still holds a tab on side.txt"
+    );
+    for text in stale {
+        assert_eq!(
+            text, "new content",
+            "a tab in an inactive split group must reload too"
+        );
+    }
+}
+
 /// Watcher backends on Linux fire `Access(...)` events when croft (or any
 /// other process) reads the open file — the inotify subsystem does not
 /// distinguish a benign read from a real content change. Treating those

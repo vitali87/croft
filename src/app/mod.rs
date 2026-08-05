@@ -4916,20 +4916,39 @@ impl App {
     }
 
     fn sync_open_file_poll_mtime(&mut self) {
-        self.fs_watch
-            .sync_open_file_mtime(self.editor.path.as_deref());
+        let paths = self.open_tab_paths();
+        self.fs_watch.sync_open_file_mtime(&paths);
+    }
+
+    /// Every file backing an open tab, across all editor groups. The poll
+    /// stats these, so a background tab in a dir that carries no watch still
+    /// sees an external write.
+    fn open_tab_paths(&self) -> Vec<PathBuf> {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter_map(|e| e.path.clone())
+            .collect()
     }
 
     /// Sweep EVERY open tab for external on-disk changes, not just the
-    /// focused one. Clean tabs reload silently; dirty tabs are flagged as
-    /// conflicts (the buffer and the disk are both preserved). Returns true
-    /// if any tab reloaded or entered conflict, so the caller redraws.
+    /// focused one — in every editor GROUP, not just the focused one either.
+    /// The poll stats each open path once and re-baselines its stamp, so a
+    /// change reported to a sweep that could not reach the tab is burned: no
+    /// later tick reports it again and that pane keeps stale text forever.
+    /// Clean tabs reload silently; dirty tabs are flagged as conflicts (the
+    /// buffer and the disk are both preserved). Returns true if any tab
+    /// reloaded or entered conflict, so the caller redraws.
     fn reload_open_file_after_external_change(&mut self) -> bool {
         let guest = self.is_collab_guest();
         let root = self.tree.root.clone();
-        let report = self
-            .editor
-            .reload_externally_changed_tabs(&|p| guest && collab_file_key(&root, p).is_some());
+        let skip = |p: &Path| guest && collab_file_key(&root, p).is_some();
+        let mut report = self.editor.reload_externally_changed_tabs(&skip);
+        for group in self.editor_layout.inactive_groups_mut() {
+            let extra = group.reload_externally_changed_tabs(&skip);
+            report.reloaded.extend(extra.reloaded);
+            report.conflicts.extend(extra.conflicts);
+        }
         if report.is_empty() {
             return false;
         }
@@ -4985,9 +5004,13 @@ impl App {
     }
 
     fn poll_filesystem_changes(&mut self) -> bool {
-        let poll = self
-            .fs_watch
-            .poll(&mut self.tree, self.editor.path.as_deref());
+        // Runs every frame; the poll itself fires at most every 50ms and backs
+        // off from there, so don't build the path list until it would be used.
+        if !self.fs_watch.poll_due() {
+            return false;
+        }
+        let open_paths = self.open_tab_paths();
+        let poll = self.fs_watch.poll(&mut self.tree, &open_paths);
         // Any directory change can also be a write to a file open in some
         // tab (background or active), so sweep all tabs whenever the poll
         // saw activity, not only when the active file's own stat moved.

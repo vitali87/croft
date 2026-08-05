@@ -62,34 +62,10 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Format on Save now writes the file you asked to save. Switching tabs while the formatter was still working saved the other tab instead and left yours unwritten, with no error.",
+        summary: "A failing test is no longer reported as passing. When two test harnesses in one workspace contain a test of the same name, the row they share now shows the failure instead of whichever result arrived last.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "A Format on Save that cannot reach a formatter no longer swallows the save silently: the file is written and the reason is reported.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "A second Save while the formatter is still working no longer loses the first file. It is written straight away rather than waiting for a reply that can no longer arrive.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "The cursor no longer ends up inside a collapsed fold. Arrow keys step over the whole block, and anything that jumps into one (Go to Definition, search, Ctrl+G) opens it, so the cursor is always somewhere you can see.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Sticky scroll no longer paints over the cursor's own line, and no longer vanishes as you scroll: the cursor is carried to the first line below the pinned headers instead of underneath them.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Opening another file into the same tab no longer inherits the previous file's collapsed blocks.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Breadcrumbs measure wide characters correctly, so a CJK path segment is no longer half-overwritten by the crumb after it and clicks land on the right symbol.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Fold All on a large file no longer makes every frame expensive: the folded-line lookup is derived once per fold change instead of per rendered row.",
+        summary: "A file open in a background tab now picks up changes made outside croft. Only the tab you were looking at was being checked, so an edit to a file at the top of the project could sit unnoticed until you saved and hit a conflict.",
     },
 ];
