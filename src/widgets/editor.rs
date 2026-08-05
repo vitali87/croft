@@ -2632,14 +2632,20 @@ impl Editor {
             anyhow::bail!("File too large ({} bytes)", meta.len());
         }
         let bytes = std::fs::read(path)?;
-        if is_binary(&bytes) {
-            anyhow::bail!("Binary file");
-        }
         // Decode with the file's BOM-declared encoding if it has one, else
         // UTF-8. A later "Reopen with Encoding" overrides this.
-        let changed_file = self.path.as_deref() != Some(path);
         let sniffed = encoding_rs::Encoding::for_bom(&bytes);
         let enc = sniffed.map(|(e, _)| e).unwrap_or(encoding_rs::UTF_8);
+        // The BOM sniff comes FIRST: UTF-16 text is half NUL bytes, so the
+        // binary heuristic would reject every UTF-16 file — including the ones
+        // croft itself writes when the user picks UTF-16 from the encoding
+        // menu. A byte-order mark is a positive declaration of text, so it
+        // settles the question the heuristic is only guessing at.
+        let bom_declares_text = enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE;
+        if !bom_declares_text && is_binary(&bytes) {
+            anyhow::bail!("Binary file");
+        }
+        let changed_file = self.path.as_deref() != Some(path);
         self.encoding = enc;
         // `decode` strips the BOM, so remember it or the next save drops it.
         self.bom = sniffed.is_some();
@@ -3380,8 +3386,13 @@ impl Editor {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No file open"))?;
         let bytes = std::fs::read(&path)?;
-        let text = enc.decode(&bytes).0.into_owned();
-        self.encoding = enc;
+        // `decode` does its own BOM sniffing and OVERRIDES the encoding passed
+        // in when the file carries one, returning what it actually used. Take
+        // that, or the buffer would hold text decoded one way while claiming to
+        // be another — and the save would then re-encode it wrongly.
+        let (decoded, used, _) = enc.decode(&bytes);
+        let text = decoded.into_owned();
+        self.encoding = used;
         // Re-sniff against the bytes just read: reinterpreting the file under a
         // new encoding must not carry the previous one's BOM answer over.
         self.bom = encoding_rs::Encoding::for_bom(&bytes).is_some();
@@ -4513,9 +4524,12 @@ impl Editor {
         if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
             let le = enc == encoding_rs::UTF_16LE;
             let mut out = Vec::with_capacity(content.len() * 2 + 2);
-            if self.bom {
-                out.extend_from_slice(if le { &[0xFF, 0xFE] } else { &[0xFE, 0xFF] });
-            }
+            // ALWAYS, regardless of whether the source had one: UTF-16 is
+            // otherwise indistinguishable from binary, so a file written
+            // without it cannot be reopened by croft or auto-detected by
+            // anything else. VS Code's UTF-16 entries write it unconditionally
+            // for the same reason.
+            out.extend_from_slice(if le { &[0xFF, 0xFE] } else { &[0xFE, 0xFF] });
             for unit in content.encode_utf16() {
                 out.extend_from_slice(&if le {
                     unit.to_le_bytes()
@@ -12873,36 +12887,59 @@ mod tests {
         assert_eq!(e.encoding, encoding_rs::WINDOWS_1252);
     }
 
-    /// `encoding_rs::Encoding::encode` routes through `output_encoding()`,
-    /// which maps UTF-16LE/BE (and REPLACEMENT) to UTF-8 and hands back the
-    /// string's own UTF-8 bytes; the returned "encoding actually used" was
-    /// discarded. So a buffer declaring UTF-16 was written as UTF-8 while the
-    /// status bar went on claiming UTF-16LE.
-    ///
-    /// Reached through "Reopen with Encoding", not `open`: `is_binary` rejects
-    /// the NUL bytes of a real UTF-16 file before `open` ever decodes it, so
-    /// croft cannot open one directly (a separate, known limitation).
+    /// A UTF-16 file must survive the whole round trip: open, edit, save,
+    /// open again. Two things blocked it. `Encoding::encode` is decode-only
+    /// for UTF-16 per the WHATWG spec, so it silently emitted UTF-8; and
+    /// `is_binary` runs BEFORE the BOM sniff, so UTF-16's NUL bytes were
+    /// rejected as binary — meaning croft could offer UTF-16 in the encoding
+    /// picker and then never read back what it wrote.
     #[test]
-    fn saving_a_utf16_buffer_writes_utf16_not_utf8() {
+    fn a_utf16_file_survives_open_edit_save_open() {
         let tmp = NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "hi\n").unwrap();
+        let mut bytes = vec![0xFF, 0xFE]; // UTF-16LE BOM
+        for u in "hi\nthere\n".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(tmp.path(), &bytes).unwrap();
+
         let mut e = Editor::new();
         e.open(tmp.path()).unwrap();
-        e.reopen_with_encoding(encoding_rs::UTF_16LE).unwrap();
-        assert_eq!(e.encoding, encoding_rs::UTF_16LE);
-        let buffer_text = e.lines.join("\n");
-        e.dirty = true;
+        assert_eq!(e.encoding, encoding_rs::UTF_16LE, "opened as UTF-16LE");
+        assert_eq!(e.lines[0], "hi");
+        assert_eq!(e.lines[1], "there");
+        e.cursor_col = 2;
+        e.insert_char('!');
         e.save_to_disk().unwrap();
 
-        // Whatever the buffer holds, the bytes on disk must read back as that
-        // text under the encoding the buffer claims.
         let out = std::fs::read(tmp.path()).unwrap();
-        let (text, _, _) = encoding_rs::UTF_16LE.decode(&out);
-        assert_eq!(
-            text.trim_end_matches('\n'),
-            buffer_text.trim_end_matches('\n'),
-            "a UTF-16LE buffer must round-trip through a UTF-16LE file"
-        );
+        assert_eq!(&out[..2], &[0xFF, 0xFE], "the BOM must survive");
+        let mut e2 = Editor::new();
+        e2.open(tmp.path())
+            .expect("croft must be able to reopen what it just wrote");
+        assert_eq!(e2.encoding, encoding_rs::UTF_16LE);
+        assert_eq!(e2.lines[0], "hi!", "the edit round-tripped");
+        assert_eq!(e2.lines[1], "there");
+    }
+
+    /// UTF-16 is self-describing only via its BOM: without one, the bytes are
+    /// NUL-laden and no tool (croft included) can tell them from binary. VS
+    /// Code always writes it for its UTF-16 entries, so a file that never had
+    /// one still gets one when saved as UTF-16.
+    #[test]
+    fn saving_as_utf16_always_writes_a_bom() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "plain\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert!(!e.bom, "the source file had no BOM");
+        e.encoding = encoding_rs::UTF_16BE;
+        e.dirty = true;
+        e.save_to_disk().unwrap();
+        let out = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&out[..2], &[0xFE, 0xFF], "UTF-16BE BOM written anyway");
+        let mut e2 = Editor::new();
+        e2.open(tmp.path()).expect("and it reopens");
+        assert_eq!(e2.lines[0], "plain");
     }
 
     /// A UTF-8 BOM is stripped by `decode` and nothing re-emitted it, so every

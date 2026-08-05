@@ -2981,9 +2981,17 @@ fn reopen_with_encoding_refuses_to_discard_unsaved_edits() {
         app.editor.lines[0]
     );
     assert!(app.editor.dirty, "and the buffer is still dirty");
+    let msg = app.status.to_lowercase();
     assert!(
-        app.status.to_lowercase().contains("save"),
-        "the refusal must say what to do, got {:?}",
+        msg.contains("undo"),
+        "the refusal must point at the non-destructive route, got {:?}",
+        app.status
+    );
+    // Never "save first": the buffer may be showing mojibake from a wrong
+    // decode, and saving writes those replacement chars over the real bytes.
+    assert!(
+        !msg.contains("save the file first") && !msg.contains("save first"),
+        "must not advise the destructive route, got {:?}",
         app.status
     );
 }

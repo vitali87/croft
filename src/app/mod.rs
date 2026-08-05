@@ -5542,11 +5542,16 @@ impl App {
     /// just a path compare per tab.
     ///
     /// `read_file_at_head` is a `git show` (~tens of ms) but runs at most once
-    /// per (file, HEAD) pair, never on the keystroke path.
+    /// per (file, HEAD) pair, never on the keystroke path. Baselines are shared
+    /// across groups within a sweep: a split usually holds the SAME file in two
+    /// panes, and a HEAD move invalidates every tab in every group at once, so
+    /// without the cache one tick would shell out once per tab per group.
     /// ponytail: synchronous fetch on the tick. Move to the git worker thread
     /// if opening a file in a huge repo ever visibly hitches.
     fn sync_git_gutters(&mut self) {
         let root = self.tree.root.clone();
+        let mut fetched: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
+            std::collections::HashMap::new();
         let groups =
             std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
         for ed in groups.flat_map(|g| g.editors.iter_mut()) {
@@ -5559,12 +5564,16 @@ impl App {
             // Untracked files / non-repo dirs yield Err here, so the gutter
             // simply shows nothing; the baseline-for marker still updates so we
             // don't re-shell every tick.
-            let head = path
-                .strip_prefix(&root)
-                .ok()
-                .and_then(|rel| rel.to_str())
-                .and_then(|rel| crate::git::read_file_at_head(&root, rel).ok())
-                .map(|text| text.lines().map(str::to_string).collect());
+            let head = fetched
+                .entry(path.clone())
+                .or_insert_with(|| {
+                    path.strip_prefix(&root)
+                        .ok()
+                        .and_then(|rel| rel.to_str())
+                        .and_then(|rel| crate::git::read_file_at_head(&root, rel).ok())
+                        .map(|text| text.lines().map(str::to_string).collect())
+                })
+                .clone();
             ed.set_git_head_lines(path, head);
         }
     }
@@ -28618,8 +28627,13 @@ impl App {
                 // encoding already in use looks like a no-op, so this is easy
                 // to hit by accident. Never discard on its behalf.
                 if self.editor.dirty {
+                    // Deliberately NOT "save first": the buffer may be showing
+                    // mojibake precisely because it was decoded wrongly, and
+                    // saving writes those replacement characters over the
+                    // original bytes. Undoing is the one route that loses
+                    // nothing on either side.
                     self.status = String::from(
-                        "Reopen with Encoding discards unsaved changes - save the file first",
+                        "Reopen with Encoding replaces the buffer from disk. Undo your unsaved changes first (Cmd+Z), or copy them elsewhere.",
                     );
                 } else {
                     match self.editor.reopen_with_encoding(enc) {

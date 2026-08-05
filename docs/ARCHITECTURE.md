@@ -64,10 +64,14 @@ src/
 ├── vim.rs               native modal (vim-style) editing: a pure key state machine (modes, counts, operators, text objects, f/t, search, ex-commands) that emits editing intents the app applies; toggled with Cmd+E
 ├── voice.rs             voice input for the Termux OSK mic key: delegates to `termux-dialog speech` (Android's SpeechRecognizer, the same engine Gboard's mic uses), auto-installs the `termux-api` package (InstallState), and sends the transcript over a channel the app injects via handle_key; a tap opens the system speech dialog, the result is injected when Android finalizes on silence (a second tap cancels, since killing preempts the result); uses `termux-dialog speech`, NOT the `termux-speech-to-text` service, because the service closes its output on onEndOfSpeech and so discards the final onResults transcript; runs in its own process group so cancel kills the whole tree; a tap rather than hold because Termux steals finger-holds for text selection
 ├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + ensure-install (pkg on Termux, curl script elsewhere) with a logged outcome + InstallState surfaced to the Cmd+Z jump popup
-│   │                    Saves re-encode through `Editor::encode_for_disk`, which re-emits the file's byte-order mark and hand-rolls UTF-16 —
-│   │                    `encoding_rs` is decode-only for UTF-16 by the WHATWG spec, so `Encoding::encode` silently falls back to UTF-8 and
-│   │                    taking its output at face value wrote a file disagreeing with the encoding the status bar reported. "Reopen with
-│   │                    Encoding" refuses on a dirty buffer: it re-reads over the buffer AND clears both history stacks, so there is no undo.
+│   │                    Saves re-encode through `Editor::encode_for_disk`, which re-emits the file's byte-order mark and hand-rolls UTF-16
+│   │                    (`encoding_rs` is decode-only for UTF-16 by the WHATWG spec, so `Encoding::encode` silently falls back to UTF-8, and
+│   │                    taking its output at face value wrote a file disagreeing with the encoding the status bar reported). UTF-16 output
+│   │                    ALWAYS carries its BOM, and `open` sniffs the BOM BEFORE the `is_binary` heuristic, since UTF-16 text is half NUL
+│   │                    bytes and would otherwise be rejected as binary: without both halves croft could write UTF-16 it could never reopen.
+│   │                    `reopen_with_encoding` records the encoding `decode` ACTUALLY used, which a BOM overrides. "Reopen with Encoding"
+│   │                    refuses on a dirty buffer and points at undo, never at saving: the buffer may hold mojibake from a wrong decode, and
+│   │                    saving would write those replacement chars over the real bytes.
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
 │   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
 │   ├── click.rs         double / triple click detection
