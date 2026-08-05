@@ -5072,8 +5072,15 @@ impl App {
                 self.git_gutter_head_oid = oid;
                 // HEAD moved: the COMMITS graph gained (or lost) commits.
                 self.refresh_commit_graph();
-                for ed in &mut self.editor.editors {
-                    ed.git_baseline_for = None;
+                // Every group, not just the focused one: inactive split
+                // panes render their editors too, so a baseline left at the
+                // old HEAD keeps painting bars on lines that are now clean.
+                for group in std::iter::once(&mut self.editor)
+                    .chain(self.editor_layout.inactive_groups_mut())
+                {
+                    for ed in &mut group.editors {
+                        ed.git_baseline_for = None;
+                    }
                 }
                 // Blame is dated against HEAD too; force a refetch so the
                 // annotation reflects the new commit.
@@ -5535,12 +5542,19 @@ impl App {
     /// just a path compare per tab.
     ///
     /// `read_file_at_head` is a `git show` (~tens of ms) but runs at most once
-    /// per (file, HEAD) pair, never on the keystroke path.
+    /// per (file, HEAD) pair, never on the keystroke path. Baselines are shared
+    /// across groups within a sweep: a split usually holds the SAME file in two
+    /// panes, and a HEAD move invalidates every tab in every group at once, so
+    /// without the cache one tick would shell out once per tab per group.
     /// ponytail: synchronous fetch on the tick. Move to the git worker thread
     /// if opening a file in a huge repo ever visibly hitches.
     fn sync_git_gutters(&mut self) {
         let root = self.tree.root.clone();
-        for ed in &mut self.editor.editors {
+        let mut fetched: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
+            std::collections::HashMap::new();
+        let groups =
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        for ed in groups.flat_map(|g| g.editors.iter_mut()) {
             let Some(path) = ed.path.clone() else {
                 continue;
             };
@@ -5550,12 +5564,16 @@ impl App {
             // Untracked files / non-repo dirs yield Err here, so the gutter
             // simply shows nothing; the baseline-for marker still updates so we
             // don't re-shell every tick.
-            let head = path
-                .strip_prefix(&root)
-                .ok()
-                .and_then(|rel| rel.to_str())
-                .and_then(|rel| crate::git::read_file_at_head(&root, rel).ok())
-                .map(|text| text.lines().map(str::to_string).collect());
+            let head = fetched
+                .entry(path.clone())
+                .or_insert_with(|| {
+                    path.strip_prefix(&root)
+                        .ok()
+                        .and_then(|rel| rel.to_str())
+                        .and_then(|rel| crate::git::read_file_at_head(&root, rel).ok())
+                        .map(|text| text.lines().map(str::to_string).collect())
+                })
+                .clone();
             ed.set_git_head_lines(path, head);
         }
     }
@@ -11737,6 +11755,17 @@ impl App {
         self.status_language_rect = Rect::default();
         if status_h > 0 && right_total > 0 && right_total <= status_rect.width {
             let rx = status_rect.right() - right_total;
+            // The right cluster paints OVER the left paragraph, so the
+            // diagnostics hit rect must stop where it starts. Clipped only to
+            // the frame edge, it went on answering for cells that now read
+            // "Ln 1, Col 1" — opening PROBLEMS from a click on the position
+            // readout, with the counts it claimed not even on screen.
+            if self.status_diag_rect.x >= rx {
+                // Entirely behind the cluster: not on screen, so not a target.
+                self.status_diag_rect = Rect::default();
+            } else if self.status_diag_rect.right() > rx {
+                self.status_diag_rect.width = rx - self.status_diag_rect.x;
+            }
             frame.render_widget(
                 Paragraph::new(Line::from(right)).style(Style::default().bg(status_bg)),
                 Rect {
@@ -28590,10 +28619,29 @@ impl App {
                 }
                 self.status = format!("End of Line: {}", eol.label());
             }
-            MenuAction::SetEncoding(enc) => match self.editor.reopen_with_encoding(enc) {
-                Ok(()) => self.status = format!("Reopened with {}", enc.name()),
-                Err(e) => self.status = format!("Reopen failed: {e}"),
-            },
+            MenuAction::SetEncoding(enc) => {
+                // Reopening re-reads the file over the buffer and clears both
+                // history stacks, so unsaved work would be gone with no way
+                // back through Cmd+Z. The encoding segment sits a few cells
+                // from the Ln/Col readout in the status bar, and picking the
+                // encoding already in use looks like a no-op, so this is easy
+                // to hit by accident. Never discard on its behalf.
+                if self.editor.dirty {
+                    // Deliberately NOT "save first": the buffer may be showing
+                    // mojibake precisely because it was decoded wrongly, and
+                    // saving writes those replacement characters over the
+                    // original bytes. Undoing is the one route that loses
+                    // nothing on either side.
+                    self.status = String::from(
+                        "Reopen with Encoding replaces the buffer from disk. Undo your unsaved changes first (Cmd+Z), or copy them elsewhere.",
+                    );
+                } else {
+                    match self.editor.reopen_with_encoding(enc) {
+                        Ok(()) => self.status = format!("Reopened with {}", enc.name()),
+                        Err(e) => self.status = format!("Reopen failed: {e}"),
+                    }
+                }
+            }
             MenuAction::SetIndentStyle(style) => {
                 self.editor.set_indent_style(style);
                 self.status = style.label();

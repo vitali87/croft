@@ -1587,6 +1587,9 @@ pub struct Editor {
     /// Text encoding the buffer was decoded from and is re-encoded to on save.
     /// Defaults to UTF-8; the status bar's "Reopen with Encoding" switches it.
     pub encoding: &'static encoding_rs::Encoding,
+    /// Whether the file on disk began with a byte-order mark. `decode` strips
+    /// it, so without remembering it every save silently dropped it.
+    bom: bool,
     /// Per-tab override for soft-wrap (VS Code "View: Toggle Word Wrap",
     /// Alt+Z). `None` means follow the language default (`wrap_enabled`
     /// wraps Markdown only); `Some(true)`/`Some(false)` force it on/off for
@@ -1766,6 +1769,7 @@ impl Editor {
             indent_override: None,
             eol: LineEnding::Lf,
             encoding: encoding_rs::UTF_8,
+            bom: false,
             wrap_override: None,
             highlights: Vec::new(),
             semantic_overlay: Vec::new(),
@@ -2628,16 +2632,33 @@ impl Editor {
             anyhow::bail!("File too large ({} bytes)", meta.len());
         }
         let bytes = std::fs::read(path)?;
-        if is_binary(&bytes) {
-            anyhow::bail!("Binary file");
-        }
         // Decode with the file's BOM-declared encoding if it has one, else
         // UTF-8. A later "Reopen with Encoding" overrides this.
+        let sniffed = encoding_rs::Encoding::for_bom(&bytes);
+        let enc = sniffed.map(|(e, _)| e).unwrap_or(encoding_rs::UTF_8);
+        // The BOM sniff comes FIRST: UTF-16 text is half NUL bytes, so the
+        // binary heuristic would reject every UTF-16 file — including the ones
+        // croft itself writes when the user picks UTF-16 from the encoding
+        // menu. A byte-order mark is a positive declaration of text, so it
+        // settles the question the heuristic is only guessing at.
+        let bom_declares_text = enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE;
+        if !bom_declares_text && is_binary(&bytes) {
+            anyhow::bail!("Binary file");
+        }
         let changed_file = self.path.as_deref() != Some(path);
-        let enc = encoding_rs::Encoding::for_bom(&bytes)
-            .map(|(e, _)| e)
-            .unwrap_or(encoding_rs::UTF_8);
+        // `open` is also the same-path reload behind the FS-sync sweep and
+        // every revert, so auto-detection here would throw away an encoding
+        // the user picked through "Reopen with Encoding" — decoding the same
+        // bytes as UTF-8 and handing the next save the mojibake to write back.
+        // The choice sticks until the file itself declares otherwise.
+        let enc = if changed_file || sniffed.is_some() {
+            enc
+        } else {
+            self.encoding
+        };
         self.encoding = enc;
+        // `decode` strips the BOM, so remember it or the next save drops it.
+        self.bom = sniffed.is_some();
         let text = enc.decode(&bytes).0.into_owned();
         // Detect the file's line-ending style before normalisation so a save
         // preserves it (and the status bar reports it). A single `\r\n` marks
@@ -3375,8 +3396,16 @@ impl Editor {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No file open"))?;
         let bytes = std::fs::read(&path)?;
-        let text = enc.decode(&bytes).0.into_owned();
-        self.encoding = enc;
+        // `decode` does its own BOM sniffing and OVERRIDES the encoding passed
+        // in when the file carries one, returning what it actually used. Take
+        // that, or the buffer would hold text decoded one way while claiming to
+        // be another — and the save would then re-encode it wrongly.
+        let (decoded, used, _) = enc.decode(&bytes);
+        let text = decoded.into_owned();
+        self.encoding = used;
+        // Re-sniff against the bytes just read: reinterpreting the file under a
+        // new encoding must not carry the previous one's BOM answer over.
+        self.bom = encoding_rs::Encoding::for_bom(&bytes).is_some();
         self.eol = if text.contains("\r\n") {
             LineEnding::Crlf
         } else {
@@ -4491,6 +4520,46 @@ impl Editor {
         self.write_buffer_to_disk()
     }
 
+    /// Encode the buffer for disk in the encoding it claims, re-emitting the
+    /// byte-order mark if the file had one.
+    ///
+    /// UTF-16 is hand-rolled because `encoding_rs` deliberately cannot produce
+    /// it: the WHATWG Encoding Standard makes UTF-16 decode-only, so
+    /// `Encoding::encode` routes UTF-16LE/BE (and REPLACEMENT) through
+    /// `output_encoding()` to UTF-8 and hands back the string's UTF-8 bytes.
+    /// Taking that output at face value wrote a file that disagreed with the
+    /// encoding the status bar reported for it.
+    fn encode_for_disk(&self, content: &str) -> Vec<u8> {
+        let enc = self.encoding;
+        if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
+            let le = enc == encoding_rs::UTF_16LE;
+            let mut out = Vec::with_capacity(content.len() * 2 + 2);
+            // ALWAYS, regardless of whether the source had one: UTF-16 is
+            // otherwise indistinguishable from binary, so a file written
+            // without it cannot be reopened by croft or auto-detected by
+            // anything else. VS Code's UTF-16 entries write it unconditionally
+            // for the same reason.
+            out.extend_from_slice(if le { &[0xFF, 0xFE] } else { &[0xFE, 0xFF] });
+            for unit in content.encode_utf16() {
+                out.extend_from_slice(&if le {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
+            return out;
+        }
+        // Unmappable characters are replaced per encoding_rs, matching VS Code.
+        let (encoded, _, _) = enc.encode(content);
+        if self.bom && enc == encoding_rs::UTF_8 {
+            let mut out = Vec::with_capacity(encoded.len() + 3);
+            out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            out.extend_from_slice(&encoded);
+            return out;
+        }
+        encoded.into_owned()
+    }
+
     fn write_buffer_to_disk(&mut self) -> Result<()> {
         let path = self
             .path
@@ -4498,9 +4567,7 @@ impl Editor {
             .ok_or_else(|| anyhow::anyhow!("No file open"))?
             .clone();
         let content = self.lines.join(self.eol.sequence());
-        // Re-encode to the buffer's encoding (UTF-8 is identity). Unmappable
-        // characters are replaced per encoding_rs, matching VS Code.
-        let (encoded, _, _) = self.encoding.encode(&content);
+        let encoded = self.encode_for_disk(&content);
         std::fs::write(&path, encoded)?;
         self.dirty = false;
         // The next keystroke opens a fresh undo step: coalescing across the
@@ -12828,6 +12895,106 @@ mod tests {
         e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
         assert_eq!(e.lines[0], "café", "Windows-1252 decodes 0xE9 as é");
         assert_eq!(e.encoding, encoding_rs::WINDOWS_1252);
+    }
+
+    /// A same-path reload (the FS-sync sweep on a clean buffer, or an explicit
+    /// revert) re-enters `open`, which auto-detects. Without a guard that
+    /// throws away the encoding the user picked through "Reopen with
+    /// Encoding", and the bytes get decoded as UTF-8 — so the buffer fills
+    /// with replacement characters and the next save writes them over the
+    /// original file.
+    #[test]
+    fn a_reload_keeps_the_encoding_the_user_reopened_with() {
+        use std::io::Write as _;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&[b'c', b'a', b'f', 0xE9]).unwrap();
+        tmp.flush().unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
+        // The file changes on disk, still Windows-1252 and still BOM-less.
+        std::fs::write(tmp.path(), [b't', b'h', 0xE9]).unwrap();
+        e.reload_if_clean().unwrap().unwrap();
+        assert_eq!(
+            e.encoding,
+            encoding_rs::WINDOWS_1252,
+            "a same-path reload must keep the encoding the user chose"
+        );
+        assert_eq!(e.lines[0], "thé", "and decode the new bytes with it");
+    }
+
+    /// A UTF-16 file must survive the whole round trip: open, edit, save,
+    /// open again. Two things blocked it. `Encoding::encode` is decode-only
+    /// for UTF-16 per the WHATWG spec, so it silently emitted UTF-8; and
+    /// `is_binary` runs BEFORE the BOM sniff, so UTF-16's NUL bytes were
+    /// rejected as binary — meaning croft could offer UTF-16 in the encoding
+    /// picker and then never read back what it wrote.
+    #[test]
+    fn a_utf16_file_survives_open_edit_save_open() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut bytes = vec![0xFF, 0xFE]; // UTF-16LE BOM
+        for u in "hi\nthere\n".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(tmp.path(), &bytes).unwrap();
+
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.encoding, encoding_rs::UTF_16LE, "opened as UTF-16LE");
+        assert_eq!(e.lines[0], "hi");
+        assert_eq!(e.lines[1], "there");
+        e.cursor_col = 2;
+        e.insert_char('!');
+        e.save_to_disk().unwrap();
+
+        let out = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&out[..2], &[0xFF, 0xFE], "the BOM must survive");
+        let mut e2 = Editor::new();
+        e2.open(tmp.path())
+            .expect("croft must be able to reopen what it just wrote");
+        assert_eq!(e2.encoding, encoding_rs::UTF_16LE);
+        assert_eq!(e2.lines[0], "hi!", "the edit round-tripped");
+        assert_eq!(e2.lines[1], "there");
+    }
+
+    /// UTF-16 is self-describing only via its BOM: without one, the bytes are
+    /// NUL-laden and no tool (croft included) can tell them from binary. VS
+    /// Code always writes it for its UTF-16 entries, so a file that never had
+    /// one still gets one when saved as UTF-16.
+    #[test]
+    fn saving_as_utf16_always_writes_a_bom() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "plain\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert!(!e.bom, "the source file had no BOM");
+        e.encoding = encoding_rs::UTF_16BE;
+        e.dirty = true;
+        e.save_to_disk().unwrap();
+        let out = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&out[..2], &[0xFE, 0xFF], "UTF-16BE BOM written anyway");
+        let mut e2 = Editor::new();
+        e2.open(tmp.path()).expect("and it reopens");
+        assert_eq!(e2.lines[0], "plain");
+    }
+
+    /// A UTF-8 BOM is stripped by `decode` and nothing re-emitted it, so every
+    /// save quietly dropped it.
+    #[test]
+    fn saving_keeps_a_utf8_bom() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"hi\n");
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.lines[0], "hi");
+        e.cursor_col = 2;
+        e.insert_char('!');
+        e.save_to_disk().unwrap();
+        let out = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&out[..3], &[0xEF, 0xBB, 0xBF], "the UTF-8 BOM must survive");
+        assert_eq!(&out[3..6], b"hi!");
     }
 
     #[test]

@@ -72,6 +72,14 @@ impl SignatureHelpPopup {
         if x.saturating_add(width) > viewport.right() {
             x = viewport.right().saturating_sub(width);
         }
+        // Back inside the pane's own left edge. The overflow clamp above pushes
+        // a wide signature left without a floor, and the width clamp below
+        // cannot repair it: `x - viewport.x` saturates to 0 once x is left of
+        // the pane, so the popup kept its full width and painted over the
+        // sidebar (or the other split). Same clamp `hover_popup` already has.
+        if x < viewport.x {
+            x = viewport.x;
+        }
         // Above the caret if it fits, else below.
         let y = if cy >= viewport.y + height {
             cy - height
@@ -143,6 +151,45 @@ mod tests {
             label: label.to_string(),
             active_param: active,
         }
+    }
+
+    /// The overflow clamp pushed `x` left to fit a wide signature, but nothing
+    /// clamped it back to the pane's own left edge — and the trailing width
+    /// clamp cannot repair it, since `x - viewport.x` saturates to 0 once `x`
+    /// is left of the pane. With the sidebar open (or in a split) the popup
+    /// painted over the Explorer, outside the editor entirely. `hover_popup`
+    /// has the missing clamp; this one, with MAX_WIDTH 100 against the
+    /// completion popup's 60, is the one wide enough to hit it.
+    #[test]
+    fn a_wide_signature_stays_inside_its_pane() {
+        let label = format!("fn {}(a: i32, b: i32)", "x".repeat(80)); // 97 chars
+        let p = SignatureHelpPopup::new(
+            vec![sig(&label, Some((3, 5)))],
+            0,
+            (60, 20),
+            PathBuf::from("f.rs"),
+            1,
+        );
+        // 120-col terminal with the Explorer sidebar open.
+        let vp = Rect {
+            x: 37,
+            y: 1,
+            width: 83,
+            height: 40,
+        };
+        let r = p.area_for(vp);
+        assert!(
+            r.x >= vp.x,
+            "popup must not start left of its pane (x {} < {})",
+            r.x,
+            vp.x
+        );
+        assert!(
+            r.right() <= vp.right(),
+            "and must not run past its right edge ({} > {})",
+            r.right(),
+            vp.right()
+        );
     }
 
     #[test]
