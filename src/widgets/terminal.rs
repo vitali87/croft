@@ -3181,6 +3181,13 @@ fn last_command_input_text(
 /// Epoch millis → local wall-clock `HH:MM:SS` (libc localtime, the same
 /// no-date-crate route the trash metadata writer takes).
 fn hhmmss(millis: u64) -> String {
+    // `localtime_r` takes a `*const time_t`, so the binding's own definition is
+    // the only correct type here. musl's is mid-migration to 64-bit and libc
+    // marks the alias deprecated ahead of the change, which `-D warnings`
+    // turns into a build error on the Linux targets; naming the field type
+    // through `tm` is not possible (it has no `time_t` member), so the alias
+    // stays and the deprecation is acknowledged at this one call.
+    #[allow(deprecated)]
     let secs = (millis / 1000) as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {

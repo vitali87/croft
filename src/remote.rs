@@ -564,9 +564,7 @@ fn sync_local_source_to_remote_streaming(
 ) -> Result<()> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut mkdir = ssh.background_command();
-    mkdir
-        .arg(&ssh.host)
-        .arg("mkdir -p \"$HOME/.cache/croft/source\"");
+    mkdir.arg(&ssh.host).arg(REMOTE_SOURCE_DIR_PREP);
     let mkdir_status =
         run_command_streaming(mkdir, log_tx).context("creating remote source dir")?;
     if !mkdir_status.success() {
@@ -1652,19 +1650,43 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// A `Command` for a cross-build tool, resolved to its absolute path and run
 /// with the augmented PATH so its own child processes resolve too.
-/// A cross-build tool with croft's own PATH augmentation, run FROM THE
-/// CHECKOUT. The working directory is not cosmetic: `rust-toolchain.toml`
-/// lives there, and rustup resolves the channel from the directory it is
-/// invoked in. A probe run anywhere else answers for the default toolchain
-/// while `cargo zigbuild` (which sets `current_dir(source)`) answers for the
-/// pinned one, and a target installed on only one of them makes the guard
-/// report success right before the build fails with E0463.
 fn cross_tool_command(tool: &str) -> Command {
     let program = cross_tool_program(tool).unwrap_or_else(|| PathBuf::from(tool));
     let mut command = Command::new(program);
+    command.env("PATH", cross_tool_path());
     command
-        .env("PATH", cross_tool_path())
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+}
+
+/// The checkout, when this binary still has one. A croft installed from a
+/// release (or built in a Nix sandbox) has a `CARGO_MANIFEST_DIR` that does
+/// not exist at runtime, and handing a missing directory to `current_dir`
+/// fails the spawn with ENOENT before the tool ever runs - which would turn
+/// "cargo is not installed" into the diagnosis on a machine where cargo works
+/// fine. No checkout also means no cross-build, so the fast path is
+/// unavailable either way and the existing reason reporting covers it.
+fn checkout_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    dir.is_dir().then_some(dir)
+}
+
+/// A cross-build tool run FROM THE CHECKOUT, for the calls whose ANSWER
+/// depends on which toolchain is resolved. `rust-toolchain.toml` lives there
+/// and rustup reads the channel from its working directory, so a target query
+/// run anywhere else answers for the default toolchain while `cargo zigbuild`
+/// (which sets `current_dir(source)`) answers for the pinned one. A target
+/// present on only one of them makes the guard report success immediately
+/// before the build dies with E0463 - four days of silent fallback to a
+/// remote `cargo install` after the 1.95.0 to 1.97.1 bump.
+///
+/// Deliberately NOT used for the mere "is this binary present" probes: those
+/// have the same answer in any directory, and running them in the checkout
+/// would make an availability check trigger a multi-hundred-MB rustup
+/// auto-install of the pinned channel.
+fn cross_tool_command_in_checkout(tool: &str) -> Command {
+    let mut command = cross_tool_command(tool);
+    if let Some(dir) = checkout_dir() {
+        command.current_dir(dir);
+    }
     command
 }
 
@@ -1747,6 +1769,19 @@ fn ship_binary_rsync_command(
 
 /// Build the rsync that mirrors the source tree to the remote for the
 /// `cargo install` fallback, routed and paced by the bulk lane.
+/// Prepare the remote source dir, evicting anything a previous croft shipped
+/// there by mistake.
+///
+/// `target.noindex` is a macOS-local build-dir name; a Linux box never creates
+/// one, so any copy on the remote can only be the artifact tree the old
+/// deny-list synced (23 to 27 GB per host was measured). rsync will not clean
+/// it up on its own: an EXCLUDED path is protected from `--delete`, so without
+/// this the wasted disk would sit there for the life of the machine. The
+/// remote's own `target/` is deliberately untouched - that is the incremental
+/// build cache the install depends on.
+const REMOTE_SOURCE_DIR_PREP: &str = "mkdir -p \"$HOME/.cache/croft/source\" && \
+     rm -rf \"$HOME/.cache/croft/source/target.noindex\"";
+
 /// rsync filter rules that ship exactly [`SOURCE_STAMP_INPUTS`] and nothing
 /// else.
 ///
@@ -1759,6 +1794,13 @@ fn ship_binary_rsync_command(
 /// what "the source" is.
 fn source_sync_filter_args() -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
+    // First match wins in rsync, so the every-level denials go first: a root
+    // allow-list alone would re-admit `assets/.DS_Store` and any nested
+    // `target/`, which the stamp walk skips and would therefore ship without
+    // ever being a reason to reinstall.
+    for name in SOURCE_SKIP_NAMES {
+        args.push(format!("--exclude={name}"));
+    }
     for name in SOURCE_STAMP_INPUTS {
         // `/name` admits the entry itself; `/name/***` admits a directory's
         // whole subtree without needing a rule per level.
@@ -1767,6 +1809,17 @@ fn source_sync_filter_args() -> Vec<String> {
     }
     args.push(String::from("--exclude=*"));
     args
+}
+
+/// The build inputs that actually exist under `source`, as relative paths.
+/// The tar fallback has no filter language worth the name, so it names the
+/// members instead - the same allow-list, expressed the way tar accepts it.
+fn source_sync_tar_members(source: &Path) -> Vec<&'static str> {
+    SOURCE_STAMP_INPUTS
+        .iter()
+        .copied()
+        .filter(|name| source.join(name).exists())
+        .collect()
 }
 
 fn source_sync_rsync_command(
@@ -1807,7 +1860,7 @@ pub fn arch_to_musl_triple(arch: &str) -> Option<&'static str> {
 }
 
 fn rust_target_installed(triple: &str) -> bool {
-    let Ok(output) = cross_tool_command("rustup")
+    let Ok(output) = cross_tool_command_in_checkout("rustup")
         .args(["target", "list", "--installed"])
         .output()
     else {
@@ -2105,7 +2158,7 @@ fn sync_via_rsync(ssh: &SshControl) -> Result<()> {
     let mkdir_status = ssh
         .command()
         .arg(&ssh.host)
-        .arg("mkdir -p \"$HOME/.cache/croft/source\"")
+        .arg(REMOTE_SOURCE_DIR_PREP)
         .status()
         .context("creating remote source dir")?;
     if !mkdir_status.success() {
@@ -2119,16 +2172,9 @@ fn sync_via_rsync(ssh: &SshControl) -> Result<()> {
     source_arg.push("/");
     let dest = format!("{}:.cache/croft/source/", ssh.host);
     let status = Command::new("rsync")
-        .args([
-            "-a",
-            "-z",
-            "--delete",
-            "--exclude=target",
-            "--exclude=.git",
-            "--exclude=.DS_Store",
-            "--exclude=assets/.DS_Store",
-            "-e",
-        ])
+        .args(["-a", "-z", "--delete"])
+        .args(source_sync_filter_args())
+        .arg("-e")
         .arg(&ssh_e)
         .arg(&source_arg)
         .arg(&dest)
@@ -2149,17 +2195,15 @@ fn sync_via_tar(ssh: &SshControl) -> Result<()> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut tar = Command::new("tar")
         .env("COPYFILE_DISABLE", "1")
-        .args([
-            "-czf",
-            "-",
-            "--exclude=.git",
-            "--exclude=target",
-            "--exclude=.DS_Store",
-            "--exclude=assets/.DS_Store",
-            "-C",
-        ])
+        .args(["-czf", "-"])
+        .args(
+            SOURCE_SKIP_NAMES
+                .iter()
+                .map(|name| format!("--exclude={name}")),
+        )
+        .arg("-C")
         .arg(&source)
-        .arg(".")
+        .args(source_sync_tar_members(&source))
         .stdout(Stdio::piped())
         .spawn()
         .with_context(|| format!("packing {}", source.display()))?;
@@ -2168,10 +2212,9 @@ fn sync_via_tar(ssh: &SshControl) -> Result<()> {
     let mut remote = ssh
         .command()
         .arg(&ssh.host)
-        .arg(
-            "mkdir -p \"$HOME/.cache/croft/source\" && \
-             tar -xzf - -C \"$HOME/.cache/croft/source\"",
-        )
+        .arg(format!(
+            "{REMOTE_SOURCE_DIR_PREP} && tar -xzf - -C \"$HOME/.cache/croft/source\""
+        ))
         .stdin(Stdio::from(tar_stdout))
         .spawn()
         .context("copying croft source to remote")?;
@@ -2381,6 +2424,11 @@ fn local_source_stamp() -> Result<String> {
 /// docs, and editor scratch dirs can never stall the hash or force a reship —
 /// the old deny-list stamp read a 98 GB `target.noindex` on every connect and
 /// changed after every local build.
+/// Names skipped at EVERY level of the crate source, by the stamp walk and by
+/// the sync filters alike. Sharing the list is what makes "the stamp and the
+/// sync agree on what the source is" a fact rather than a hope.
+const SOURCE_SKIP_NAMES: &[&str] = &[".git", "target", ".DS_Store"];
+
 const SOURCE_STAMP_INPUTS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
@@ -2420,7 +2468,7 @@ fn hash_source_dir(root: &PathBuf, dir: &PathBuf, hasher: &mut impl Hasher) -> R
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if matches!(name.as_ref(), ".git" | "target" | ".DS_Store") {
+        if SOURCE_SKIP_NAMES.contains(&name.as_ref()) {
             continue;
         }
         let meta = entry
@@ -2487,6 +2535,12 @@ mod tests {
         std::fs::write(src.join("target.noindex/debug/croft"), "HUGE").unwrap();
         std::fs::write(src.join("target/debug/croft"), "HUGE").unwrap();
         std::fs::write(src.join(".git/config"), "gitdir").unwrap();
+        // Nested junk: a root-anchored allow-list alone re-admits these,
+        // because `/assets/***` beats `--exclude=*`. The stamp walk skips them
+        // at every level, so the sync has to as well or the two disagree.
+        std::fs::write(src.join("assets/.DS_Store"), "finder").unwrap();
+        std::fs::create_dir_all(src.join("src/vendor/target")).unwrap();
+        std::fs::write(src.join("src/vendor/target/blob"), "HUGE").unwrap();
 
         let mut rsync = Command::new("rsync");
         rsync.arg("-a").args(source_sync_filter_args());
@@ -2508,12 +2562,69 @@ mod tests {
         ] {
             assert!(dst.join(shipped).exists(), "{shipped} must be shipped");
         }
-        for withheld in ["target.noindex", "target", ".git"] {
+        for withheld in [
+            "target.noindex",
+            "target",
+            ".git",
+            "assets/.DS_Store",
+            "src/vendor/target",
+        ] {
             assert!(
                 !dst.join(withheld).exists(),
                 "{withheld} must never be shipped: this is the 176 GB bug"
             );
         }
+    }
+
+    /// rsync will not clean up what the old deny-list already shipped: an
+    /// excluded path is PROTECTED from `--delete`, so the 23-27 GB sitting in
+    /// each box's source cache would outlive the fix. The dir prep evicts it,
+    /// and must never touch the remote's own `target/`, which is the
+    /// incremental build cache every subsequent install depends on.
+    #[test]
+    fn the_remote_dir_prep_evicts_shipped_artifacts_but_keeps_the_build_cache() {
+        assert!(
+            REMOTE_SOURCE_DIR_PREP.contains("mkdir -p \"$HOME/.cache/croft/source\""),
+            "the sync still needs its destination created"
+        );
+        assert!(
+            REMOTE_SOURCE_DIR_PREP.contains("rm -rf \"$HOME/.cache/croft/source/target.noindex\""),
+            "the artifact tree a previous croft shipped must be reclaimed"
+        );
+        assert!(
+            !REMOTE_SOURCE_DIR_PREP.contains("source/target\""),
+            "removing the remote's own target/ would force a from-scratch rebuild every install"
+        );
+    }
+
+    /// The tar fallback (no rsync on either side) shipped `.` under the same
+    /// broken `--exclude=target`, so it packed the whole artifact tree into a
+    /// gzip pipe - worse than the rsync path, and reached on exactly the same
+    /// first-install flow. It names its members from the allow-list now.
+    #[test]
+    fn the_tar_fallback_packs_only_build_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("checkout");
+        std::fs::create_dir_all(src.join("src")).unwrap();
+        std::fs::create_dir_all(src.join("target.noindex")).unwrap();
+        std::fs::write(src.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(src.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(src.join("target.noindex/blob"), "HUGE").unwrap();
+
+        let members = source_sync_tar_members(&src);
+        assert!(members.contains(&"src"), "src is a build input");
+        assert!(
+            members.contains(&"Cargo.toml"),
+            "Cargo.toml is a build input"
+        );
+        assert!(
+            !members.iter().any(|m| m.starts_with("target")),
+            "the artifact tree must never be packed"
+        );
+        assert!(
+            !members.contains(&"build.rs"),
+            "a member that does not exist must not be named, or tar fails"
+        );
     }
 
     /// A rustup target belongs to ONE toolchain. Bumping `rust-toolchain.toml`
@@ -2524,17 +2635,25 @@ mod tests {
     /// for four days. This test is the thing that notices.
     #[test]
     fn the_pinned_toolchain_has_every_cross_target() {
-        // Termux and a pure Nix shell provide cargo without rustup: there is
-        // no toolchain to interrogate, and neither launches remote croft.
-        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let Ok(out) = Command::new("rustup")
+        // Only machines that have actually set up the cross fast path are held
+        // to it. A fresh clone, a CI lint runner, Termux, a Nix shell with no
+        // zig: none of them ship remote installs, and failing their `cargo
+        // test` over a target they will never use is noise, not a signal. The
+        // skip is announced, because a guard that vanishes silently is how the
+        // original guard managed to be useless.
+        if let Some(reason) = cross_compile_unavailable_reason() {
+            eprintln!("SKIP the_pinned_toolchain_has_every_cross_target: {reason}");
+            return;
+        }
+        let Ok(out) = cross_tool_command_in_checkout("rustup")
             .args(["target", "list", "--installed"])
-            .current_dir(&source)
             .output()
         else {
+            eprintln!("SKIP the_pinned_toolchain_has_every_cross_target: rustup would not run");
             return;
         };
         if !out.status.success() {
+            eprintln!("SKIP the_pinned_toolchain_has_every_cross_target: rustup errored");
             return;
         }
         let text = String::from_utf8_lossy(&out.stdout);
@@ -2554,22 +2673,29 @@ mod tests {
         );
     }
 
-    /// The probe and the build must ask the SAME toolchain. `cargo zigbuild`
-    /// runs in the checkout, where `rust-toolchain.toml` pins the channel; a
-    /// rustup probe with no working directory answers for the DEFAULT channel
-    /// instead. When those differ the guard reports "target installed" and the
-    /// build dies with E0463, which is why the missing target above went
-    /// unreported for four days.
+    /// The target query and the build must ask the SAME toolchain.
+    /// `cargo zigbuild` runs in the checkout, where `rust-toolchain.toml` pins
+    /// the channel; a rustup query with no working directory answers for the
+    /// DEFAULT channel instead. When those differ the guard reports "target
+    /// installed" and the build dies with E0463, which is why a missing target
+    /// went unreported for four days.
+    ///
+    /// The plain probes must NOT inherit that directory: their answer does not
+    /// depend on the toolchain, and running `cargo --version` inside the
+    /// checkout makes an availability check auto-install the pinned channel.
     #[test]
-    fn cross_tool_commands_run_where_the_toolchain_file_applies() {
+    fn only_toolchain_sensitive_calls_run_in_the_checkout() {
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        for tool in ["rustup", "cargo"] {
-            assert_eq!(
-                cross_tool_command(tool).get_current_dir(),
-                Some(source.as_path()),
-                "{tool} must resolve the pinned toolchain, not the default one"
-            );
-        }
+        assert_eq!(
+            cross_tool_command_in_checkout("rustup").get_current_dir(),
+            Some(source.as_path()),
+            "a target query must resolve the pinned toolchain"
+        );
+        assert_eq!(
+            cross_tool_command("cargo").get_current_dir(),
+            None,
+            "a presence probe must not trigger a toolchain auto-install"
+        );
     }
 
     #[test]
@@ -3283,10 +3409,12 @@ Host !blocked *.internal
             args.iter().any(|a| a == "--exclude=*"),
             "the allow-list is only an allow-list if everything else is denied"
         );
-        assert!(
-            !args.iter().any(|a| a.starts_with("--exclude=target")),
-            "a deny-list rule here means the old bug is creeping back"
-        );
+        for name in SOURCE_SKIP_NAMES {
+            assert!(
+                args.iter().any(|a| a == &format!("--exclude={name}")),
+                "{name} is skipped by the stamp walk, so it must not be shipped"
+            );
+        }
         assert!(args.iter().any(|a| a == "--delete"));
     }
 

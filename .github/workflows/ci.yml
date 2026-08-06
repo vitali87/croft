@@ -66,8 +66,13 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Install zig and cargo-zigbuild
+        # cargo-zigbuild probes `python3 -m ziglang` before looking for a zig
+        # binary on PATH. Recent runner images mark the system Python as
+        # externally managed, so pip needs the override.
         run: |
-          pip install ziglang
+          python3 -m pip install --break-system-packages ziglang \
+            || python3 -m pip install ziglang
+          python3 -m ziglang version
           cargo install cargo-zigbuild --locked
       # Byte-for-byte the command src/remote.rs runs for a remote install.
       - name: cargo zigbuild --profile remote-fast

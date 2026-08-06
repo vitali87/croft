@@ -18,6 +18,11 @@ const FS_WATCH_PROTECTED_NAMES: &[&str] = &["Library", ".Trash"];
 /// a parent-of-repos root (~/Documents measured at ~140k dirs / 7.6s) to a
 /// fraction of a second, while comfortably covering any normal single repo in
 /// full. See `collect_macos_watch_targets`.
+///
+/// macOS-only, like its one use site: on Linux the inotify backend needs no
+/// such walk, and an unconditional const is a `dead_code` error there under
+/// `-D warnings`.
+#[cfg(target_os = "macos")]
 const WATCH_WALK_DIR_BUDGET: usize = 8_192;
 
 type FsWatcherInit = (
