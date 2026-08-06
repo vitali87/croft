@@ -4832,9 +4832,17 @@ mod tests {
             extract_selection_text(&t, -off, 0, rows as i32 - 1 - off, cols.saturating_sub(1))
         }
         let tmp = tempfile::tempdir().unwrap();
-        let mut term =
-            PtyTerminal::new_running("/bin/echo", &[String::from("CLEAR-PROBE-XYZ")], tmp.path())
-                .unwrap();
+        // The spawn banner prints the command's argv, so the probe must never
+        // appear verbatim in argv: under load the banner lands before the
+        // child's output, the wait below matches the BANNER, and the clear
+        // fires before the probe exists - which the assert then finds alive.
+        // The shell concatenation keeps argv and output distinct.
+        let mut term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from("echo CLEAR-PROBE-\"\"XYZ")],
+            tmp.path(),
+        )
+        .unwrap();
         let mut waited = 0u32;
         while waited < 4000 && !dump(&term).contains("CLEAR-PROBE-XYZ") {
             std::thread::sleep(std::time::Duration::from_millis(20));
