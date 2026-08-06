@@ -34,7 +34,14 @@ jobs:
       # same binaries croft needs at runtime on a Linux box. The runner
       # ships neither.
       - name: Install suite runtime dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh poppler-utils
+        # The chmod keeps compinit's "insecure directories" interactive
+        # prompt from wedging every spawned zsh before its first prompt
+        # (croft never calls compinit; the runner's own zsh startup does).
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh poppler-utils
+          for d in /usr/share/zsh /usr/local/share/zsh; do
+            if [ -d "$d" ]; then sudo chmod -R go-w "$d"; fi
+          done
       # rust-toolchain.toml is the single source of truth; `rustup show`
       # installs exactly the pinned channel and its components.
       - name: Install the pinned toolchain
