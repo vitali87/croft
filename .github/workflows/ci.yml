@@ -29,6 +29,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The suite's terminal tests drive /bin/zsh (the shim they exist to
+      # cover) and the PDF tests rasterise through poppler's pdftoppm - the
+      # same binaries croft needs at runtime on a Linux box. The runner
+      # ships neither.
+      - name: Install suite runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh poppler-utils
       # rust-toolchain.toml is the single source of truth; `rustup show`
       # installs exactly the pinned channel and its components.
       - name: Install the pinned toolchain
@@ -107,8 +113,11 @@ jobs:
         # ANDROID_NDK_LATEST_HOME is exported by the runner image into the
         # process environment, which the `env` context does NOT see - so it
         # has to be expanded by the shell, not by an expression.
+        # --platform 24: bionic only exports openpty/forkpty from API 23,
+        # and cargo-ndk's default level is older, so the link dies on
+        # `undefined symbol: openpty`. 24 is what Termux itself targets.
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           echo "Using NDK at $ANDROID_NDK_HOME"
           test -d "$ANDROID_NDK_HOME"
-          cargo ndk --target arm64-v8a build --locked --bin croft
+          cargo ndk --target arm64-v8a --platform 24 build --locked --bin croft
