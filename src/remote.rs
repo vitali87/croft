@@ -564,7 +564,7 @@ fn sync_local_source_to_remote_streaming(
 ) -> Result<()> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut mkdir = ssh.background_command();
-    mkdir.arg(&ssh.host).arg(REMOTE_SOURCE_DIR_PREP);
+    mkdir.arg(&ssh.host).arg(remote_source_dir_prep(&source));
     let mkdir_status =
         run_command_streaming(mkdir, log_tx).context("creating remote source dir")?;
     if !mkdir_status.success() {
@@ -1767,20 +1767,42 @@ fn ship_binary_rsync_command(
     rsync
 }
 
-/// Build the rsync that mirrors the source tree to the remote for the
-/// `cargo install` fallback, routed and paced by the bulk lane.
-/// Prepare the remote source dir, evicting anything a previous croft shipped
-/// there by mistake.
+/// Prepare the remote source dir: clear every stale top-level entry, keeping
+/// only `target/` (the incremental build cache the install depends on) and
+/// the [`SOURCE_STAMP_INPUTS`] actually present in the local checkout.
 ///
-/// `target.noindex` is a macOS-local build-dir name; a Linux box never creates
-/// one, so any copy on the remote can only be the artifact tree the old
-/// deny-list synced (23 to 27 GB per host was measured). rsync will not clean
-/// it up on its own: an EXCLUDED path is protected from `--delete`, so without
-/// this the wasted disk would sit there for the life of the machine. The
-/// remote's own `target/` is deliberately untouched - that is the incremental
-/// build cache the install depends on.
-const REMOTE_SOURCE_DIR_PREP: &str = "mkdir -p \"$HOME/.cache/croft/source\" && \
-     rm -rf \"$HOME/.cache/croft/source/target.noindex\"";
+/// Neither transfer can be trusted to clean up after a previous croft: the
+/// allow-list's `--exclude=*` PROTECTS every unlisted path from rsync's
+/// `--delete` (which is how the old deny-list's shipped `target.noindex`
+/// trees, 23 to 27 GB per host, would have outlived the allow-list fix), and
+/// the tar fallback never deletes at all, so an input since removed from the
+/// checkout or a stale `.cargo/config.toml` - which would silently
+/// reconfigure every later remote build - persists forever. Inputs the local
+/// checkout still contains are deliberately KEPT: rsync deletes staleness
+/// inside them itself, wiping them would re-ship the whole tree every sync,
+/// and two croft processes updating the same host concurrently must never
+/// yank the source out from under the other's running `cargo install`
+/// (identical files are a no-op to `rsync -a`, so a concurrent sync of the
+/// same checkout touches nothing).
+fn remote_source_dir_prep(source: &Path) -> String {
+    let keeps: String = std::iter::once("target")
+        .chain(
+            SOURCE_STAMP_INPUTS
+                .iter()
+                .copied()
+                .filter(|name| source.join(name).exists()),
+        )
+        .map(|name| format!("! -name '{name}' "))
+        .collect();
+    // The `/.` dereferences a symlinked source dir (a relocated cache on a
+    // small-root VPS): find does not follow a symlink given as its start
+    // point, and would otherwise clean nothing while exiting 0.
+    format!(
+        "mkdir -p \"$HOME/.cache/croft/source\" && \
+         find \"$HOME/.cache/croft/source/.\" -mindepth 1 -maxdepth 1 \
+         {keeps}-exec rm -rf {{}} +"
+    )
+}
 
 /// rsync filter rules that ship exactly [`SOURCE_STAMP_INPUTS`] and nothing
 /// else.
@@ -2158,7 +2180,7 @@ fn sync_via_rsync(ssh: &SshControl) -> Result<()> {
     let mkdir_status = ssh
         .command()
         .arg(&ssh.host)
-        .arg(REMOTE_SOURCE_DIR_PREP)
+        .arg(remote_source_dir_prep(&source))
         .status()
         .context("creating remote source dir")?;
     if !mkdir_status.success() {
@@ -2213,7 +2235,8 @@ fn sync_via_tar(ssh: &SshControl) -> Result<()> {
         .command()
         .arg(&ssh.host)
         .arg(format!(
-            "{REMOTE_SOURCE_DIR_PREP} && tar -xzf - -C \"$HOME/.cache/croft/source\""
+            "{} && tar -xzf - -C \"$HOME/.cache/croft/source\"",
+            remote_source_dir_prep(&source)
         ))
         .stdin(Stdio::from(tar_stdout))
         .spawn()
@@ -2576,25 +2599,114 @@ mod tests {
         }
     }
 
-    /// rsync will not clean up what the old deny-list already shipped: an
-    /// excluded path is PROTECTED from `--delete`, so the 23-27 GB sitting in
-    /// each box's source cache would outlive the fix. The dir prep evicts it,
-    /// and must never touch the remote's own `target/`, which is the
-    /// incremental build cache every subsequent install depends on.
-    #[test]
-    fn the_remote_dir_prep_evicts_shipped_artifacts_but_keeps_the_build_cache() {
+    /// Stage a remote source dir holding both legitimate content and every
+    /// kind of junk a previous croft could have left behind.
+    fn staged_remote_source(home: &std::path::Path) -> std::path::PathBuf {
+        let source = home.join(".cache/croft/source");
+        std::fs::create_dir_all(source.join("target/remote-fast")).unwrap();
+        std::fs::create_dir_all(source.join("target.noindex/debug")).unwrap();
+        std::fs::create_dir_all(source.join(".cargo")).unwrap();
+        std::fs::write(source.join(".cargo/config.toml"), "[build]\njobs = 1\n").unwrap();
+        std::fs::write(source.join("build.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(source.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(source.join("Cargo.toml"), "[package]\n").unwrap();
+        source
+    }
+
+    fn assert_prep_outcome(source: &std::path::Path) {
         assert!(
-            REMOTE_SOURCE_DIR_PREP.contains("mkdir -p \"$HOME/.cache/croft/source\""),
-            "the sync still needs its destination created"
+            source.join("target/remote-fast").is_dir(),
+            "removing the remote's own target/ would force a from-scratch rebuild every install"
         );
         assert!(
-            REMOTE_SOURCE_DIR_PREP.contains("rm -rf \"$HOME/.cache/croft/source/target.noindex\""),
+            source.join("src/main.rs").is_file() && source.join("Cargo.toml").is_file(),
+            "inputs present in the local checkout must survive: deleting them re-ships \
+             everything and yanks the tree out from under a concurrent cargo install"
+        );
+        assert!(
+            !source.join("target.noindex").exists(),
             "the artifact tree a previous croft shipped must be reclaimed"
         );
         assert!(
-            !REMOTE_SOURCE_DIR_PREP.contains("source/target\""),
-            "removing the remote's own target/ would force a from-scratch rebuild every install"
+            !source.join(".cargo").exists(),
+            "a stale dotfile like .cargo/config.toml would silently reconfigure every later remote build"
         );
+        assert!(
+            !source.join("build.rs").exists(),
+            "an input no longer in the local checkout must not survive on the remote (tar never deletes)"
+        );
+    }
+
+    /// rsync will not clean up what a previous croft already shipped: the
+    /// allow-list's `--exclude=*` PROTECTS every unlisted path from
+    /// `--delete`, and the tar fallback never deletes anything. So the prep
+    /// must clear the remote source dir of everything except `target/` (the
+    /// incremental build cache) and the inputs the local checkout actually
+    /// contains - shipped artifact trees, a stale `.cargo/config.toml` that
+    /// would silently reconfigure every later remote build, and inputs since
+    /// removed from the checkout all go. Current inputs stay: deleting them
+    /// would re-ship the whole tree every sync and race a concurrent
+    /// `cargo install` reading it. The test runs the real command against a
+    /// staged HOME.
+    #[test]
+    fn the_remote_dir_prep_evicts_stale_entries_but_keeps_cache_and_inputs() {
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(checkout.path().join("src")).unwrap();
+        std::fs::write(checkout.path().join("Cargo.toml"), "[package]\n").unwrap();
+        // No build.rs in this checkout: the staged remote copy is stale.
+        let prep = remote_source_dir_prep(checkout.path());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = staged_remote_source(tmp.path());
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&prep)
+            .env("HOME", tmp.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "the prep command must run under plain sh");
+        assert_prep_outcome(&source);
+
+        let empty = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&prep)
+            .env("HOME", empty.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "a first install has no source dir yet");
+    }
+
+    /// A relocated cache is ordinary on a small-root VPS: the source dir is a
+    /// symlink onto a bigger volume. `find` does not follow a symlinked start
+    /// point on its own, silently cleaning nothing with a success exit code,
+    /// so the prep must dereference it explicitly.
+    #[test]
+    fn the_remote_dir_prep_follows_a_symlinked_source_dir() {
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(checkout.path().join("src")).unwrap();
+        std::fs::write(checkout.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let prep = remote_source_dir_prep(checkout.path());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        let source = staged_remote_source(real.path());
+        std::fs::create_dir_all(tmp.path().join(".cache/croft")).unwrap();
+        std::os::unix::fs::symlink(
+            real.path().join(".cache/croft/source"),
+            tmp.path().join(".cache/croft/source"),
+        )
+        .unwrap();
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&prep)
+            .env("HOME", tmp.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "the prep command must run under plain sh");
+        assert_prep_outcome(&source);
     }
 
     /// The tar fallback (no rsync on either side) shipped `.` under the same
