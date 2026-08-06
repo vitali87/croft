@@ -18923,6 +18923,11 @@ fn reordering_panes_defers_the_session_write_off_the_input_path() {
     // write is marked and flushed once per tick instead.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The test-mode session path is per PROCESS, shared by every test in
+    // this binary: a concurrent test's save would recreate the file between
+    // the remove below and the non-existence assert. Absence is only
+    // provable on a path this test owns alone.
+    app.terminal_session_path = tmp.path().join("terminal-sessions.json");
     app.split_terminal().unwrap();
     let _ = std::fs::remove_file(&app.terminal_session_path);
     app.move_terminal(0, 1);
