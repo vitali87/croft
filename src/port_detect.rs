@@ -88,9 +88,11 @@ fn is_clock_time(text: &str, start: usize, digits: &str) -> bool {
     if hour.is_empty() || hour.len() > 2 {
         return false;
     }
-    // `0.0.0.0:80` and `127.0.0.1:8080` end in a digit too; the dot is what
-    // tells an address apart from an hour.
-    !head[..head.len() - hour.len()].ends_with('.')
+    // Only a STANDALONE number reads as an hour: `0.0.0.0:80` and
+    // `127.0.0.1:8080` end in a digit too but the dot marks an address, and
+    // in `api1:80` or `web-1:80` the digits are a hostname's tail.
+    !head[..head.len() - hour.len()]
+        .ends_with(|c: char| c == '.' || c == '-' || c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// A general http(s) URL token, for Cmd/Ctrl+click in the terminal (any host,
@@ -507,6 +509,10 @@ mod tests {
             ("bound to 0.0.0.0:9229", 9229),
             ("bound to 0.0.0.0:80", 80),
             ("listening on 127.0.0.1:80", 80),
+            // A numeric-suffixed hostname is not a clock: only a STANDALONE
+            // one or two digit number before the colon reads as an hour.
+            ("bound to api1:80", 80),
+            ("listening on web-1:80", 80),
         ] {
             let hits = scan(line);
             assert_eq!(hits.len(), 1, "{line:?}");
