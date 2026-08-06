@@ -830,7 +830,11 @@ fn install_launcher(path: Option<PathBuf>, user: bool, yes: bool) -> Result<()> 
     Ok(())
 }
 
-const CROSS_TARGETS: &[&str] = &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
+/// The triples `croft <host>` cross-builds for. A rustup target belongs to ONE
+/// toolchain, so these must be re-added whenever `rust-toolchain.toml` moves;
+/// `remote::tests::the_pinned_toolchain_has_every_cross_target` is the guard.
+pub(crate) const CROSS_TARGETS: &[&str] =
+    &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
 
 fn setup_cross(yes: bool) -> Result<()> {
     println!(
@@ -913,9 +917,18 @@ fn install_cargo_zigbuild_if_missing() -> Result<()> {
     Ok(())
 }
 
+/// Add `triple` to the toolchain the cross-build actually uses.
+///
+/// Both rustup calls run FROM THE CHECKOUT so `rust-toolchain.toml` resolves
+/// the pinned channel. Run from anywhere else, rustup answers for the default
+/// toolchain: `setup-cross` would then print "already installed" for a target
+/// that belongs to another channel entirely and exit successfully, having
+/// fixed nothing, while `croft <host>` kept compiling on the remote box.
 fn install_rust_target_if_missing(triple: &str) -> Result<()> {
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
     let installed = std::process::Command::new("rustup")
         .args(["target", "list", "--installed"])
+        .current_dir(checkout)
         .output()
         .context("rustup target list --installed")?;
     if !installed.status.success() {
@@ -931,6 +944,7 @@ fn install_rust_target_if_missing(triple: &str) -> Result<()> {
     println!("Adding rustup target {triple}");
     let status = std::process::Command::new("rustup")
         .args(["target", "add", triple])
+        .current_dir(checkout)
         .status()
         .context("rustup target add")?;
     if !status.success() {

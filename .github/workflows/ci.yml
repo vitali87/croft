@@ -1,0 +1,109 @@
+name: CI
+
+# The gates that used to exist only as habit on one Mac.
+#
+# The cross-build jobs are the point. `croft <host>` cross-compiles a static
+# binary locally and ships it; when the pinned toolchain lacks a target, that
+# path silently degrades to a full `cargo install` on the user's box, with
+# nothing but a line in ~/.cache/croft/install.log to say so. Rustup targets
+# belong to ONE toolchain, so bumping rust-toolchain.toml orphans every one of
+# them - which is what the 1.95.0 -> 1.97.1 bump did, unnoticed for four days.
+#
+# These jobs run the REAL build (zig for musl, the NDK for Android), not
+# `cargo check`: croft's tree-sitter grammars are C, so their build scripts
+# need a working cross C compiler and a check alone fails before it can prove
+# anything useful.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml is the single source of truth; `rustup show`
+      # installs exactly the pinned channel and its components.
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (zero warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        # The suite spawns PTYs and real shells; keep the thread count modest
+        # so the timing-sensitive terminal tests are not starved.
+        run: cargo test --locked
+        env:
+          RUST_TEST_THREADS: 4
+
+  cross-musl:
+    name: ship-path build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # CROSS_TARGETS in src/cli.rs: the triples `croft <host>` ships.
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup show
+      - name: Add the target to the PINNED toolchain
+        # Run from the checkout so rust-toolchain.toml resolves the channel.
+        # Adding to the default toolchain instead is precisely the bug this
+        # job exists to catch.
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install zig and cargo-zigbuild
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild --locked
+      # Byte-for-byte the command src/remote.rs runs for a remote install.
+      - name: cargo zigbuild --profile remote-fast
+        run: cargo zigbuild --profile remote-fast --locked --bin croft --target ${{ matrix.target }}
+      - name: The shipped artifact must exist and be a Linux ELF
+        run: |
+          bin="target/${{ matrix.target }}/remote-fast/croft"
+          test -x "$bin"
+          file "$bin"
+          file "$bin" | grep -q 'ELF 64-bit LSB'
+
+  android:
+    name: Android build (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup show
+      - name: Add the Android target to the PINNED toolchain
+        run: rustup target add aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      # Termux builds croft natively on the phone, so nothing ships this
+      # artifact. Compiling it here is what catches code that cannot build on
+      # Android at all - otherwise the only way to find out is on the device,
+      # by hand, after the fact. cargo-ndk wires the runner's NDK into the C
+      # build scripts the tree-sitter grammars need.
+      - name: cargo ndk build
+        # ANDROID_NDK_LATEST_HOME is exported by the runner image into the
+        # process environment, which the `env` context does NOT see - so it
+        # has to be expanded by the shell, not by an expression.
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          echo "Using NDK at $ANDROID_NDK_HOME"
+          test -d "$ANDROID_NDK_HOME"
+          cargo ndk --target arm64-v8a build --locked --bin croft

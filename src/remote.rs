@@ -1652,10 +1652,19 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// A `Command` for a cross-build tool, resolved to its absolute path and run
 /// with the augmented PATH so its own child processes resolve too.
+/// A cross-build tool with croft's own PATH augmentation, run FROM THE
+/// CHECKOUT. The working directory is not cosmetic: `rust-toolchain.toml`
+/// lives there, and rustup resolves the channel from the directory it is
+/// invoked in. A probe run anywhere else answers for the default toolchain
+/// while `cargo zigbuild` (which sets `current_dir(source)`) answers for the
+/// pinned one, and a target installed on only one of them makes the guard
+/// report success right before the build fails with E0463.
 fn cross_tool_command(tool: &str) -> Command {
     let program = cross_tool_program(tool).unwrap_or_else(|| PathBuf::from(tool));
     let mut command = Command::new(program);
-    command.env("PATH", cross_tool_path());
+    command
+        .env("PATH", cross_tool_path())
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     command
 }
 
@@ -1738,6 +1747,28 @@ fn ship_binary_rsync_command(
 
 /// Build the rsync that mirrors the source tree to the remote for the
 /// `cargo install` fallback, routed and paced by the bulk lane.
+/// rsync filter rules that ship exactly [`SOURCE_STAMP_INPUTS`] and nothing
+/// else.
+///
+/// An ALLOW-list, deliberately. The deny-list this replaces excluded `target`,
+/// which never matched this repo's real build directory `target.noindex`, so
+/// every fallback install pushed the whole 176 GB artifact tree to the remote
+/// box at the bulk lane's couple of MB/s. A deny-list has to be updated every
+/// time the tree grows a new directory; an allow-list derived from the very
+/// list the stamp hashes cannot drift, and the two can never disagree about
+/// what "the source" is.
+fn source_sync_filter_args() -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    for name in SOURCE_STAMP_INPUTS {
+        // `/name` admits the entry itself; `/name/***` admits a directory's
+        // whole subtree without needing a rule per level.
+        args.push(format!("--include=/{name}"));
+        args.push(format!("--include=/{name}/***"));
+    }
+    args.push(String::from("--exclude=*"));
+    args
+}
+
 fn source_sync_rsync_command(
     lane: &crate::remote_bulk::BulkLane,
     interactive_socket: &Path,
@@ -1745,15 +1776,8 @@ fn source_sync_rsync_command(
     dest: &str,
 ) -> Command {
     let mut rsync = Command::new("rsync");
-    rsync.args([
-        "-a",
-        "-z",
-        "--delete",
-        "--exclude=target",
-        "--exclude=.git",
-        "--exclude=.DS_Store",
-        "--exclude=assets/.DS_Store",
-    ]);
+    rsync.args(["-a", "-z", "--delete"]);
+    rsync.args(source_sync_filter_args());
     rsync.args(lane.rsync_throttle_args());
     rsync.arg("-e").arg(lane.rsync_ssh_arg(interactive_socket));
     rsync.arg(source_arg).arg(dest);
@@ -2430,6 +2454,124 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The source sync must ship the BUILD INPUTS and nothing else.
+    ///
+    /// It used to deny-list `target`, which never matched this repo's actual
+    /// build directory, `target.noindex`. Every fallback install therefore
+    /// rsynced 176 GB of build artifacts to the user's box, throttled to a
+    /// couple of MB/s, to deliver a source tree whose only job was to be
+    /// compiled there. Three boxes were 23-27 GB deep in it before anyone
+    /// noticed. The stamp learned this lesson already (SOURCE_STAMP_INPUTS);
+    /// the rsync did not, so now they share one list and cannot drift apart.
+    #[test]
+    fn the_source_sync_ships_only_build_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("checkout");
+        let dst = tmp.path().join("staged");
+        for dir in [
+            "src",
+            "assets",
+            "target.noindex/debug",
+            "target/debug",
+            ".git",
+        ] {
+            std::fs::create_dir_all(src.join(dir)).unwrap();
+        }
+        std::fs::write(src.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(src.join("assets/logo.png"), "png").unwrap();
+        std::fs::write(src.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(src.join("Cargo.lock"), "lock").unwrap();
+        std::fs::write(src.join("build.rs"), "fn main() {}").unwrap();
+        std::fs::write(src.join("rust-toolchain.toml"), "[toolchain]").unwrap();
+        // The three things that must never cross the wire.
+        std::fs::write(src.join("target.noindex/debug/croft"), "HUGE").unwrap();
+        std::fs::write(src.join("target/debug/croft"), "HUGE").unwrap();
+        std::fs::write(src.join(".git/config"), "gitdir").unwrap();
+
+        let mut rsync = Command::new("rsync");
+        rsync.arg("-a").args(source_sync_filter_args());
+        rsync
+            .arg(format!("{}/", src.display()))
+            .arg(format!("{}/", dst.display()));
+        let Ok(status) = rsync.status() else {
+            return; // no rsync on this box; the remote path is unusable anyway
+        };
+        assert!(status.success(), "rsync exited with {status}");
+
+        for shipped in [
+            "src/main.rs",
+            "assets/logo.png",
+            "Cargo.toml",
+            "Cargo.lock",
+            "build.rs",
+            "rust-toolchain.toml",
+        ] {
+            assert!(dst.join(shipped).exists(), "{shipped} must be shipped");
+        }
+        for withheld in ["target.noindex", "target", ".git"] {
+            assert!(
+                !dst.join(withheld).exists(),
+                "{withheld} must never be shipped: this is the 176 GB bug"
+            );
+        }
+    }
+
+    /// A rustup target belongs to ONE toolchain. Bumping `rust-toolchain.toml`
+    /// therefore orphans every cross target, and `croft <host>` degrades from
+    /// "ship a 34 MB prebuilt binary" to "compile the whole crate graph on the
+    /// user's VPS" with nothing but a line in `~/.cache/croft/install.log` to
+    /// say so. That is exactly what the 1.95.0 -> 1.97.1 bump did, unnoticed
+    /// for four days. This test is the thing that notices.
+    #[test]
+    fn the_pinned_toolchain_has_every_cross_target() {
+        // Termux and a pure Nix shell provide cargo without rustup: there is
+        // no toolchain to interrogate, and neither launches remote croft.
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let Ok(out) = Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .current_dir(&source)
+            .output()
+        else {
+            return;
+        };
+        if !out.status.success() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let installed: Vec<&str> = text.lines().map(str::trim).collect();
+        let missing: Vec<&str> = crate::cli::CROSS_TARGETS
+            .iter()
+            .copied()
+            .filter(|t| !installed.contains(t))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the pinned toolchain is missing {missing:?}, so every remote \
+             update will compile croft on the remote box instead of shipping \
+             a prebuilt binary. Fix from inside this checkout, so the \
+             rust-toolchain.toml override applies:\n    rustup target add {}",
+            missing.join(" ")
+        );
+    }
+
+    /// The probe and the build must ask the SAME toolchain. `cargo zigbuild`
+    /// runs in the checkout, where `rust-toolchain.toml` pins the channel; a
+    /// rustup probe with no working directory answers for the DEFAULT channel
+    /// instead. When those differ the guard reports "target installed" and the
+    /// build dies with E0463, which is why the missing target above went
+    /// unreported for four days.
+    #[test]
+    fn cross_tool_commands_run_where_the_toolchain_file_applies() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for tool in ["rustup", "cargo"] {
+            assert_eq!(
+                cross_tool_command(tool).get_current_dir(),
+                Some(source.as_path()),
+                "{tool} must resolve the pinned toolchain, not the default one"
+            );
+        }
+    }
+
     #[test]
     fn source_stamp_tracks_build_inputs_only() {
         // The stamp decides whether a remote reinstall is needed, so it must
@@ -3100,8 +3242,16 @@ Host !blocked *.internal
         assert!(args.iter().any(|a| a == "--checksum"));
     }
 
+    /// The lane wiring, plus the allow-list that replaced the deny-list.
+    ///
+    /// The previous version of this test asserted `--exclude=target` under the
+    /// comment "shipping target/ would be gigabytes through the lane". It
+    /// passed on every run while 176 GB of `target.noindex` went over the wire,
+    /// because it checked the RULE and never the OUTCOME. The outcome is now
+    /// pinned by `the_source_sync_ships_only_build_inputs`, which runs rsync
+    /// for real; this one only guarantees the allow-list reaches the command.
     #[test]
-    fn source_sync_honors_the_bulk_lane_and_keeps_the_incremental_excludes() {
+    fn source_sync_honors_the_bulk_lane_and_allow_lists_the_build_inputs() {
         let lane = crate::remote_bulk::BulkLane::new(
             crate::remote_bulk::LaneMode::Dedicated {
                 socket_path: PathBuf::from("/tmp/bulk/ctl"),
@@ -3123,11 +3273,20 @@ Host !blocked *.internal
         assert!(e.contains("/tmp/bulk/ctl"));
         assert!(!e.contains("/tmp/interactive/ctl"));
         assert!(args.iter().any(|a| a == "--bwlimit=700"));
+        for name in SOURCE_STAMP_INPUTS {
+            assert!(
+                args.iter().any(|a| a == &format!("--include=/{name}")),
+                "{name} is a build input and must be shipped"
+            );
+        }
         assert!(
-            args.iter().any(|a| a == "--exclude=target"),
-            "shipping target/ would be gigabytes through the lane"
+            args.iter().any(|a| a == "--exclude=*"),
+            "the allow-list is only an allow-list if everything else is denied"
         );
-        assert!(args.iter().any(|a| a == "--exclude=.git"));
+        assert!(
+            !args.iter().any(|a| a.starts_with("--exclude=target")),
+            "a deny-list rule here means the old bug is creeping back"
+        );
         assert!(args.iter().any(|a| a == "--delete"));
     }
 
