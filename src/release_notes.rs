@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Running croft's test suite from a shell hosted inside croft no longer opens authenticated connections to the live session host: every test-built app inherited the session's exported socket and token and dialed in as a construction side effect, so under test that environment read is now inert, like the collab seat fixed in 0.1.689.",
+    summary: "Reading page 2 of a PDF while pdflatex rebuilds it can no longer silently snap you back to page 1: the reload now comes up on your page in a single rasterisation, so a transient render failure keeps the last good page AND your place instead of half-restoring the tab.",
 }];

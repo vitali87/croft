@@ -326,11 +326,28 @@ fn page_count_via_mdls(pdf: &Path) -> Option<u32> {
     s.trim().parse::<u32>().ok()
 }
 
+/// Test-only: the next `rasterize_page` call for exactly this (path, page)
+/// fails once, simulating a transient rasteriser failure (a spawn refused
+/// under load, an OOM-killed child). Keyed on the full path so parallel
+/// tests rendering the same page number of their own tempdir files never
+/// see each other's injection.
+#[cfg(test)]
+pub static FAIL_RASTERIZE_ONCE_FOR_TEST: std::sync::Mutex<Option<(PathBuf, u32)>> =
+    std::sync::Mutex::new(None);
+
 /// Rasterise `page` (1-based) of `pdf` to PNG bytes at ~144 DPI. Returns
 /// the encoded PNG. The caller is responsible for cleaning up no temp
 /// files — every backend writes to a per-call temp path that we delete
 /// before returning.
 pub fn rasterize_page(pdf: &Path, page: u32, backend: PdfBackend) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    {
+        let mut fail = FAIL_RASTERIZE_ONCE_FOR_TEST.lock().unwrap();
+        if fail.as_ref() == Some(&(pdf.to_path_buf(), page)) {
+            *fail = None;
+            return Err(std::io::Error::other("transient failure injected by test"));
+        }
+    }
     match backend {
         PdfBackend::PdftoppmCli => rasterize_with_pdftoppm(pdf, page),
         PdfBackend::SipsCli => {
