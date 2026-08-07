@@ -71,6 +71,9 @@ pub enum Command {
     QuickOpen,
     GoToSymbol,
     GoToWorkspaceSymbol,
+    /// VS Code "Go Back" (Ctrl+-): return to the location before the last
+    /// navigation jump (Go to Definition, a reference pick, a symbol jump).
+    NavigateBack,
     ToggleVimMode,
     // --- View / navigation ---
     ShowExplorer,
@@ -191,6 +194,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::QuickOpen,
     Command::GoToSymbol,
     Command::GoToWorkspaceSymbol,
+    Command::NavigateBack,
     Command::ToggleVimMode,
     Command::ShowExplorer,
     Command::ShowSearch,
@@ -295,6 +299,7 @@ impl Command {
             Command::QuickOpen => "Go to File",
             Command::GoToSymbol => "Go to Symbol in Editor",
             Command::GoToWorkspaceSymbol => "Go to Symbol in Workspace",
+            Command::NavigateBack => "Go Back",
             Command::ToggleVimMode => "Toggle Vim Mode",
             Command::ShowExplorer => "View: Show Explorer",
             Command::ShowSearch => "View: Show Search",
@@ -400,6 +405,7 @@ impl Command {
             Command::QuickOpen => "Cmd+P",
             Command::GoToSymbol => "Cmd+Shift+O",
             Command::GoToWorkspaceSymbol => "Cmd+P #",
+            Command::NavigateBack => "Ctrl+-",
             Command::ToggleVimMode => "Cmd+E",
             Command::ShowExplorer => "Cmd+Shift+E",
             Command::ShowSearch => "Cmd+Shift+F",
@@ -511,6 +517,7 @@ impl Command {
             Command::QuickOpen => "quick_open",
             Command::GoToSymbol => "go_to_symbol",
             Command::GoToWorkspaceSymbol => "go_to_workspace_symbol",
+            Command::NavigateBack => "navigate_back",
             Command::ToggleVimMode => "toggle_vim_mode",
             Command::ShowExplorer => "show_explorer",
             Command::ShowSearch => "show_search",

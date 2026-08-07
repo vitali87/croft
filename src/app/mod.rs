@@ -1002,6 +1002,8 @@ enum MenuAction {
         row: usize,
         col: usize,
     },
+    /// Return to the location before the last navigation jump (#31).
+    NavigateBack,
     /// Editor body: LSP "Quick Fix" of the position at buffer `(row, col)`.
     QuickFixAt {
         row: usize,
@@ -1171,6 +1173,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ChangeAllOccurrencesAt { .. } => Some("⌘F2"),
         MenuAction::GoToDefinitionAt { .. } => Some("F12"),
         MenuAction::GoToReferencesAt { .. } => Some("⇧F12"),
+        MenuAction::NavigateBack => Some("⌃-"),
         MenuAction::QuickFixAt { .. } => Some("⌘."),
         MenuAction::GoToDeclarationAt { .. } => Some("⌃⇧F12"),
         MenuAction::GoToTypeDefinitionAt { .. } => Some("⌃F12"),
@@ -19222,6 +19225,13 @@ impl App {
             }
             return;
         }
+        // VS Code "Go Back" (Ctrl+-): the keyboard twin of the
+        // Ctrl+Shift+click chord, so navigation history is reachable
+        // without depending on the host terminal's mouse delivery (#31).
+        if is_navigate_back_key(key) {
+            self.nav_back();
+            return;
+        }
         // VS Code "Transpose Characters around the Cursor" (Ctrl+T).
         if is_transpose_key(key) {
             if self.editor_is_text() {
@@ -23306,6 +23316,7 @@ impl App {
             Cmd::QuickOpen => self.open_file_finder(),
             Cmd::GoToSymbol => self.open_go_to_symbol(),
             Cmd::GoToWorkspaceSymbol => self.open_workspace_symbols(""),
+            Cmd::NavigateBack => self.nav_back(),
             Cmd::ToggleVimMode => self.toggle_vim_mode(),
             Cmd::ShowExplorer => self.set_sidebar_view(SidebarView::Explorer),
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
@@ -25933,6 +25944,7 @@ impl App {
                             },
                         ));
                     }
+                    items.push((String::from("Go Back"), MenuAction::NavigateBack));
                     items.push((
                         String::from("Rename Symbol"),
                         MenuAction::RenameSymbolAt { row, col },
@@ -28556,6 +28568,7 @@ impl App {
                 self.focus_pane(Pane::Editor);
                 self.start_change_all_occurrences();
             }
+            MenuAction::NavigateBack => self.nav_back(),
             MenuAction::GoToDefinitionAt { row, col } => {
                 self.editor.cursor_row = row;
                 self.editor.cursor_col = col;
@@ -31451,6 +31464,19 @@ fn is_select_to_bracket_key(key: KeyEvent) -> bool {
 /// `editor.action.transpose`). A raw control byte, so it needs no iTerm2 /
 /// Ghostty forwarder; the editor intercepts it only when focused, leaving the
 /// shell's own `Ctrl+T` intact when the terminal is focused.
+/// VS Code "Go Back" (Ctrl+-). The kitty keyboard protocol delivers the
+/// chord as `-` + CONTROL; the legacy encoding folds Ctrl+- into 0x1F,
+/// which decodes as `_` + CONTROL, so both spellings are accepted.
+fn is_navigate_back_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    (c == '-' || c == '_')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 fn is_transpose_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;

@@ -1695,6 +1695,52 @@ fn go_back_returns_to_the_location_before_a_definition_jump() {
     );
 }
 
+/// #31: navigate-back rested entirely on the Ctrl+Shift+click mouse chord.
+/// The VS Code keyboard chord (Ctrl+-) and the palette command are the
+/// fallbacks that work when the host terminal never delivers that chord.
+#[test]
+fn ctrl_minus_and_the_palette_both_navigate_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn main() {}\nlet x = helper();\n").unwrap();
+    std::fs::write(&b, "fn helper() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.focus_pane(Pane::Editor);
+
+    // The keyboard chord.
+    app.go_to_definition(b.clone(), 0, 3);
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    app.handle_key(key(KeyCode::Char('-'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "Ctrl+- goes back"
+    );
+
+    // The legacy encoding: Ctrl+- folds to 0x1F, decoded as Ctrl+_.
+    app.go_to_definition(b.clone(), 0, 3);
+    app.handle_key(key(KeyCode::Char('_'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "the legacy Ctrl+- spelling goes back too"
+    );
+
+    // The palette command.
+    app.go_to_definition(b.clone(), 0, 3);
+    app.run_command(crate::widgets::command_palette::Command::NavigateBack);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "the Go Back palette command goes back"
+    );
+}
+
 #[test]
 fn go_back_with_empty_history_stays_put() {
     let tmp = tempfile::tempdir().unwrap();
