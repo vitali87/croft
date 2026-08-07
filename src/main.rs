@@ -57,14 +57,6 @@ use anyhow::Result;
 use clap::Parser;
 use cli::Cli;
 
-/// Process-wide lock serializing tests that mutate shared environment state
-/// (notably `$HOME`). Cargo runs a binary's tests on multiple threads in one
-/// process, so any test that calls `set_var`/`remove_var` on `HOME` races every
-/// other test reading it (`file_finder`, `zoxide`, the relay tests). Each such
-/// test must hold this lock for its whole body.
-#[cfg(test)]
-pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     cli.run()

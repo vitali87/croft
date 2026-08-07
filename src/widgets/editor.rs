@@ -1218,11 +1218,17 @@ pub struct ExternalReloadReport {
     pub reloaded: Vec<PathBuf>,
     /// Paths of dirty tabs flagged as conflicts (not reloaded, not saved).
     pub conflicts: Vec<PathBuf>,
+    /// Paths whose disk copy changed but whose reload FAILED (the file
+    /// became unreadable, was replaced by a directory, a PDF's re-render
+    /// died). The tab keeps its last good view; dropping these on the
+    /// floor left the user staring at stale content with no indication
+    /// the sweep even tried (#37).
+    pub failed: Vec<PathBuf>,
 }
 
 impl ExternalReloadReport {
     pub fn is_empty(&self) -> bool {
-        self.reloaded.is_empty() && self.conflicts.is_empty()
+        self.reloaded.is_empty() && self.conflicts.is_empty() && self.failed.is_empty()
     }
 }
 
@@ -8821,7 +8827,12 @@ impl EditorTabs {
                         report.conflicts.push(p);
                     }
                 }
-                ExternalChange::Unchanged | ExternalChange::ReloadFailed => {}
+                ExternalChange::ReloadFailed => {
+                    if let Some(p) = path {
+                        report.failed.push(p);
+                    }
+                }
+                ExternalChange::Unchanged => {}
             }
         }
         report
@@ -13812,6 +13823,32 @@ mod tests {
             "the next save must prompt again for the changed buffer"
         );
         assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "cafe\n");
+    }
+
+    #[test]
+    fn a_failed_external_reload_is_reported_not_swallowed() {
+        // #37: `ReloadFailed` was dropped on the floor — the user's file is
+        // replaced on disk by something unreadable (here: a directory), the
+        // sweep tries and fails to reload, and nothing said so.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut tabs = EditorTabs::new();
+        tabs.open_pinned(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let report = tabs.reload_externally_changed_tabs(&|_| false);
+        assert_eq!(
+            report.failed,
+            vec![path.clone()],
+            "the failure must surface in the report"
+        );
+        assert!(!report.is_empty(), "a failed reload is not an empty sweep");
+        assert_eq!(
+            tabs.iter_tabs().next().unwrap().lines[0],
+            "one",
+            "the last good buffer survives the failed reload"
+        );
     }
 
     #[test]

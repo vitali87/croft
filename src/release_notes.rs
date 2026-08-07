@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Language servers for the workspace's evident languages now start the moment croft opens (a Cargo.toml at the root starts rust-analyzer, and so on) instead of at the first file open, so the server's cold indexing overlaps with you browsing the tree — the long gap before hover, definitions and diagnostics answered on the first .rs file is gone.",
+    summary: "A file that changes on disk but cannot be re-read (replaced by a directory, permissions yanked, a PDF whose re-render dies) no longer fails silently: the tab keeps its last good view and the status line says the reload failed, instead of letting stale content read as current.",
 }];

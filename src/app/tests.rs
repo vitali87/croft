@@ -12695,10 +12695,13 @@ fn finder_drop_on_remote_view_with_no_target_reports_clear_status() {
 }
 
 fn relay_test_lock() -> &'static std::sync::Mutex<()> {
-    // The relay tests mutate $HOME, so share the crate-wide HOME_LOCK rather
-    // than a private mutex — otherwise they could race the file_finder / zoxide
-    // $HOME tests running on another thread of the same binary.
-    &crate::HOME_LOCK
+    // The relay tests share the cache-dir test override, the
+    // CROFT_RELAY_KEY env var, and real relay directories, so they still
+    // serialize against each other — but no test mutates `$HOME` any more
+    // (#37), so the old crate-wide HOME_LOCK is gone and this lock is
+    // private to the relay family.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
 }
 
 /// Point `$HOME` (hence `croft_cache_dir`) at a temp dir and set a fixed
@@ -12710,25 +12713,39 @@ fn relay_test_lock() -> &'static std::sync::Mutex<()> {
 const TEST_RELAY_KEY: &str = "0123456789abcdef";
 
 fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
-    let prev_home = std::env::var_os("HOME");
-    let prev_key = std::env::var_os("CROFT_RELAY_KEY");
-    // SAFETY: relay tests hold relay_test_lock, serializing env mutation.
+    // The cache dir is redirected through its test override instead of
+    // repointing the process-global `$HOME` (#37): unrelated test threads
+    // resolve `$HOME` at call time and a substituted value made them fail
+    // inside the fake home. CROFT_RELAY_KEY stays an env var — it is
+    // croft-specific and `relay_dir` is its only reader, so no unrelated
+    // reader can race on it. The restore is RAII so a panicking `body`
+    // cannot leak the redirected globals into later relay tests.
+    struct RestoreRelayGlobals {
+        prev_key: Option<std::ffi::OsString>,
+    }
+    impl Drop for RestoreRelayGlobals {
+        fn drop(&mut self) {
+            *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+            // SAFETY: relay tests hold relay_test_lock, serializing this
+            // mutation.
+            unsafe {
+                match self.prev_key.take() {
+                    Some(k) => std::env::set_var("CROFT_RELAY_KEY", k),
+                    None => std::env::remove_var("CROFT_RELAY_KEY"),
+                }
+            }
+        }
+    }
+    let _restore = RestoreRelayGlobals {
+        prev_key: std::env::var_os("CROFT_RELAY_KEY"),
+    };
+    *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() =
+        Some(home.join(".cache").join("croft"));
+    // SAFETY: relay tests hold relay_test_lock, serializing this mutation.
     unsafe {
-        std::env::set_var("HOME", home);
         std::env::set_var("CROFT_RELAY_KEY", TEST_RELAY_KEY);
     }
-    let out = body();
-    unsafe {
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_key {
-            Some(k) => std::env::set_var("CROFT_RELAY_KEY", k),
-            None => std::env::remove_var("CROFT_RELAY_KEY"),
-        }
-    }
-    out
+    body()
 }
 
 #[test]
@@ -25194,5 +25211,32 @@ fn copy_mode_closes_instead_of_hijacking_another_pane() {
     assert!(
         app.terminals[1].selection().is_none(),
         "the sibling pane must not inherit a painted selection"
+    );
+}
+
+/// #37: a failed external reload was silently discarded — the sweep tried,
+/// the re-read died (file replaced by a directory), and nothing said so.
+/// The tab keeps its last good view and the status line reports it.
+#[test]
+fn a_failed_external_reload_reports_in_the_status_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("f.txt");
+    std::fs::write(&f, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    std::fs::remove_file(&f).unwrap();
+    std::fs::create_dir(&f).unwrap();
+    assert!(
+        app.reload_open_file_after_external_change(),
+        "a failed reload is redraw-worthy, not an empty sweep"
+    );
+    assert!(
+        app.status.contains("Reload failed"),
+        "the status line must name the failure; got: {}",
+        app.status
+    );
+    assert_eq!(
+        app.editor.lines[0], "one",
+        "the last good buffer survives the failed reload"
     );
 }

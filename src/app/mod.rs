@@ -4960,8 +4960,10 @@ impl App {
     /// change reported to a sweep that could not reach the tab is burned: no
     /// later tick reports it again and that pane keeps stale text forever.
     /// Clean tabs reload silently; dirty tabs are flagged as conflicts (the
-    /// buffer and the disk are both preserved). Returns true if any tab
-    /// reloaded or entered conflict, so the caller redraws.
+    /// buffer and the disk are both preserved); tabs whose reload FAILED
+    /// keep their last good view and say so in the status line (#37).
+    /// Returns true if any tab reloaded, failed, or entered conflict, so
+    /// the caller redraws.
     fn reload_open_file_after_external_change(&mut self) -> bool {
         let guest = self.is_collab_guest();
         let root = self.tree.root.clone();
@@ -4971,21 +4973,42 @@ impl App {
             let extra = group.reload_externally_changed_tabs(&skip);
             report.reloaded.extend(extra.reloaded);
             report.conflicts.extend(extra.conflicts);
+            report.failed.extend(extra.failed);
         }
         if report.is_empty() {
             return false;
         }
         self.refresh_git_status_debounced();
-        match (report.reloaded.len(), report.conflicts.len()) {
-            (1, 0) => {
+        match (
+            report.reloaded.len(),
+            report.conflicts.len(),
+            report.failed.len(),
+        ) {
+            // A dirty-buffer collision outranks everything: it needs a
+            // decision, so it gets the modal.
+            (_, c, _) if c > 0 => {
+                self.prompt_disk_conflict(report.conflicts.clone());
+            }
+            // A failed reload used to be silently discarded (#37): the tab
+            // keeps its last good view, and the status must say so instead
+            // of letting the user read stale content as current.
+            (0, 0, 1) => {
+                let p = report.failed[0].display();
+                self.status = format!("Reload failed for {p}; keeping the last good view");
+            }
+            (r, 0, f) if f > 0 => {
+                self.status = if r == 0 {
+                    format!("Reload failed for {f} files changed on disk")
+                } else {
+                    format!("Reloaded {r} files, reload failed for {f} (kept their last good view)")
+                };
+            }
+            (1, 0, 0) => {
                 let p = report.reloaded[0].display();
                 self.status = format!("Reloaded {p} (external change)");
             }
-            (n, 0) => {
+            (n, ..) => {
                 self.status = format!("Reloaded {n} files changed on disk");
-            }
-            (_, _) => {
-                self.prompt_disk_conflict(report.conflicts.clone());
             }
         }
         // Keep the watcher's active-file baseline aligned with the reload so
@@ -32765,7 +32788,20 @@ fn remote_persistence_status(is_remote: bool, persistent: bool) -> Option<&'stat
     }
 }
 
+/// Test-only redirect for [`croft_cache_dir`], so the relay tests steer the
+/// relay rendezvous without repointing the process-global `$HOME` (#37):
+/// every concurrent test thread resolves `$HOME` at call time (the PDF
+/// rasteriser's scratch dir, the session paths), and a substituted value
+/// leaking across threads made unrelated tests fail inside the fake home.
+#[cfg(test)]
+pub static CACHE_DIR_OVERRIDE_FOR_TEST: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
 fn croft_cache_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
+        return dir;
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
