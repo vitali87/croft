@@ -469,10 +469,19 @@ pub fn is_path_under_noise_dir(path: &Path) -> bool {
 ///      `~/.croft/lsp.log` but `~/Library/Logs/*` is a reasonable
 ///      Cmd+P target too).
 fn macos_blocked_paths() -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Vec::new();
-    };
-    let home = PathBuf::from(home);
+    match std::env::var_os("HOME") {
+        Some(home) => macos_blocked_paths_for(&PathBuf::from(home)),
+        None => Vec::new(),
+    }
+}
+
+/// The pure half of [`macos_blocked_paths`], taking the home directory as
+/// an argument so tests never repoint the process-global `$HOME` (#37):
+/// the env var is resolved at call time by every concurrent reader (the
+/// PDF rasteriser's cache dir, the session paths), and a substituted value
+/// leaking across test threads made unrelated tests fail on paths inside
+/// the fake home.
+fn macos_blocked_paths_for(home: &Path) -> Vec<PathBuf> {
     let lib = home.join("Library");
     [
         "Containers",
@@ -504,9 +513,14 @@ fn macos_blocked_paths() -> Vec<PathBuf> {
 }
 
 pub fn build_file_index(root: &Path) -> Vec<FileEntry> {
+    build_file_index_with_blocked(root, macos_blocked_paths())
+}
+
+/// [`build_file_index`] with the blocked-path set injected, so tests drive
+/// the macOS exclusion rules against a fake home without mutating `$HOME`.
+fn build_file_index_with_blocked(root: &Path, blocked: Vec<PathBuf>) -> Vec<FileEntry> {
     let collected: Arc<Mutex<Vec<FileEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let root_buf = root.to_path_buf();
-    let blocked = macos_blocked_paths();
     let walker = WalkBuilder::new(root)
         .git_ignore(true)
         .require_git(false)
@@ -1012,18 +1026,11 @@ mod tests {
         let logs = fake_home.join("Library").join("Logs");
         std::fs::create_dir_all(&logs).unwrap();
         std::fs::write(logs.join("app.log"), b"").unwrap();
-        // Serialize with every other $HOME-mutating test in this binary.
-        let _guard = crate::HOME_LOCK.lock().unwrap();
-        let saved = std::env::var_os("HOME");
-        // SAFETY: guarded by HOME_LOCK; the value is restored below.
-        unsafe {
-            std::env::set_var("HOME", fake_home);
-        }
-        let entries = build_file_index(fake_home);
-        match saved {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+        // The blocked set is injected instead of repointing `$HOME` (#37):
+        // concurrent tests resolve the env var at call time, and a
+        // substituted value made unrelated readers (the PDF rasteriser's
+        // cache dir) fail on paths inside the fake home.
+        let entries = build_file_index_with_blocked(fake_home, macos_blocked_paths_for(fake_home));
         let names: Vec<&str> = entries.iter().map(|e| e.rel.as_str()).collect();
         assert!(
             names.contains(&"Library/Logs/app.log"),
