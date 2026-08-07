@@ -100,6 +100,30 @@ pub fn root_markers(lang: Language) -> &'static [&'static str] {
         .unwrap_or(&[])
 }
 
+/// Languages whose project-root markers sit directly in `dir` — the
+/// workspace-open equivalent of VS Code's `workspaceContains` activation.
+/// Used to pre-warm the evident language servers at startup so their cold
+/// indexing overlaps with the user browsing the tree instead of starting
+/// only when the first file opens (#27). Deliberately non-recursive: the
+/// scan is a handful of stat calls, never a walk.
+pub fn languages_evident_in(dir: &std::path::Path) -> Vec<Language> {
+    let mut out: Vec<Language> = table()
+        .records
+        .keys()
+        .filter_map(|id| resolve(id))
+        .filter(|&lang| {
+            root_markers(lang)
+                .iter()
+                .any(|marker| dir.join(marker).exists())
+        })
+        .collect();
+    // The table is a HashMap; a stable order keeps spawn logs and tests
+    // deterministic.
+    out.sort_by_key(|l| l.lsp_id());
+    out.dedup();
+    out
+}
+
 /// The server family a language belongs to; itself when it has no `family`.
 pub fn server_family(lang: Language) -> Language {
     table()
@@ -121,6 +145,24 @@ mod tests {
         assert_eq!(from_extension("rs"), Some(Language::RUST));
         assert_eq!(from_extension("yml"), Some(Language::YAML));
         assert_eq!(from_extension("xyz"), None);
+    }
+
+    /// #27: the workspace-open scan behind server pre-warm. A marker at
+    /// the root makes its language evident; nothing recurses, so a marker
+    /// buried in a subdirectory does not.
+    #[test]
+    fn languages_evident_in_reads_root_markers_non_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(languages_evident_in(dir.path()).is_empty());
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(languages_evident_in(dir.path()), vec![Language::RUST]);
+        std::fs::write(dir.path().join("go.mod"), "module x\n").unwrap();
+        let both = languages_evident_in(dir.path());
+        assert!(both.contains(&Language::RUST) && both.contains(&Language::GO));
+        // Buried markers stay invisible: the scan is stat calls, not a walk.
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("pyproject.toml"), "").unwrap();
+        assert!(!languages_evident_in(dir.path()).contains(&Language::PYTHON));
     }
 
     #[test]

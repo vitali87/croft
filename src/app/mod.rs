@@ -3838,6 +3838,14 @@ impl App {
         // file opened before the first theme switch already highlights in the
         // active theme's colors (not the Base16 default).
         crate::highlight::set_syntax_palette(app.theme.syntax());
+        // Pre-warm the workspace's evident language servers (Cargo.toml →
+        // rust-analyzer, and so on), VS Code's `workspaceContains`
+        // activation: the cold indexing overlaps with the user browsing
+        // the tree instead of starting only at the first file open (#27).
+        // The send is one channel post; the spawns run on the LSP worker.
+        if let Some(lsp) = app.lsp.as_ref() {
+            lsp.prewarm_workspace();
+        }
         Ok(app)
     }
 

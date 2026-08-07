@@ -481,6 +481,11 @@ enum Cmd {
         path: PathBuf,
         text: String,
     },
+    /// Spawn the servers for every language whose project-root marker sits
+    /// in the workspace root, before any file of theirs is opened (#27):
+    /// rust-analyzer's cold indexing then overlaps with the user browsing
+    /// the tree instead of starting at the first `.rs` open.
+    PrewarmWorkspace,
     RequestSemanticTokens {
         path: PathBuf,
         seq: u64,
@@ -793,6 +798,17 @@ impl LspManager {
 
     pub fn open_doc(&self, path: PathBuf, text: String) {
         let _ = self.cmd_tx.send(Cmd::OpenDoc { path, text });
+    }
+
+    /// Pre-warm the workspace's evident language servers (VS Code's
+    /// `workspaceContains` activation). Inert under test: the suite builds
+    /// hundreds of Apps in marker-bearing tempdirs and must never spawn a
+    /// real rust-analyzer as a construction side effect.
+    pub fn prewarm_workspace(&self) {
+        if cfg!(test) {
+            return;
+        }
+        let _ = self.cmd_tx.send(Cmd::PrewarmWorkspace);
     }
 
     pub fn change_doc(&self, path: PathBuf, text: String) {
@@ -1414,6 +1430,7 @@ async fn worker_loop(
                 return;
             }
             Cmd::OpenDoc { path, text } => state.open_doc(path, text).await,
+            Cmd::PrewarmWorkspace => state.prewarm_workspace().await,
             Cmd::RequestSemanticTokens {
                 path,
                 seq,
@@ -1806,6 +1823,23 @@ impl WorkerState {
             self.clients.insert(key.clone(), spawned);
         }
         self.clients.get(&key).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Spawn (or begin provisioning) the servers for every language whose
+    /// root marker is evident in the workspace root — exactly what the
+    /// first `open_doc` of that language would do, minus the document.
+    async fn prewarm_workspace(&mut self) {
+        let root = self.workspace_root.clone();
+        for lang in crate::lsp::languages::languages_evident_in(&root) {
+            let clients = self.ensure_clients(lang, &root).await;
+            if !clients.is_empty() {
+                log_file::log(&format!(
+                    "lsp prewarm: {} server(s) up for {}",
+                    clients.len(),
+                    lang.lsp_id()
+                ));
+            }
+        }
     }
 
     async fn open_doc(&mut self, path: PathBuf, text: String) {
