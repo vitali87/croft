@@ -8,7 +8,7 @@ croft has no separate "Windows" target. Inside WSL2 you are running real Linux, 
 
 ```bash
 # inside your WSL2 distro (Ubuntu, Debian, etc.)
-cargo install --git https://github.com/vitali87/croft.git
+cargo install --git https://github.com/vitali87/croft.git --locked
 ```
 
 The one thing WSL does **not** change is the terminal. A WSL shell renders into whatever Windows terminal emulator is hosting it, and that choice decides whether you get croft's full icon/image UI or the degraded text fallback:
