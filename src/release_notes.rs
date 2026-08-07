@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Reading page 2 of a PDF while pdflatex rebuilds it can no longer silently snap you back to page 1: the reload now comes up on your page in a single rasterisation, so a transient render failure keeps the last good page AND your place instead of half-restoring the tab.",
+    summary: "Quick-select now sees a URL (or path, digest, any match) that wraps across the pane edge as one whole match: the label lands on its first cell and copies the full text, where before the wrapped tail was mislabelled as a path fragment and the head was invisible.",
 }];

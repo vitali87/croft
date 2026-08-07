@@ -32,6 +32,11 @@ pub struct QuickMatch {
     pub start: usize,
     pub len: usize,
     pub text: String,
+    /// Continuation segments `(row, start, len)` when the match wraps the
+    /// pane edge: the head span above anchors the label, these carry the
+    /// rest of the highlight one display row at a time. Empty for the
+    /// common single-row match.
+    pub tail: Vec<(usize, usize, usize)>,
 }
 
 /// The pattern set, most-specific first: a row span claimed by an earlier
@@ -82,15 +87,39 @@ static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 /// Scan viewport rows for pattern matches. Rows are the spacer-skipped text
-/// of each visible line, top to bottom. Matches come back sorted by
-/// (row, start); overlapping spans keep the most-specific (earliest) pattern.
-pub fn find_matches(lines: &[String]) -> Vec<QuickMatch> {
+/// of each visible line, top to bottom; `wraps[i]` says row `i` soft-wraps
+/// into row `i + 1` (alacritty's `WRAPLINE`), and each such run is stitched
+/// into one LOGICAL line before scanning — a URL crossing the pane edge is
+/// one match, not an invisible head plus a path-fragment tail (#64). Match
+/// coordinates come back in display-row space: the head span (where the
+/// label sits) plus `tail` segments for continuation rows. Matches are
+/// sorted by (row, start); overlapping spans keep the most-specific
+/// (earliest) pattern.
+pub fn find_matches_wrapped(lines: &[String], wraps: &[bool]) -> Vec<QuickMatch> {
     let mut out = Vec::new();
-    for (row, line) in lines.iter().enumerate() {
-        // Byte spans already claimed on this row, by pattern priority.
+    let mut row = 0usize;
+    while row < lines.len() {
+        // The logical line: this row plus every row soft-wrapped onto it. A
+        // final row wrapping off the bottom of the viewport has no
+        // continuation to stitch; its visible fragment scans as-is (labels
+        // the user cannot see cannot be typed).
+        let mut end_row = row;
+        while wraps.get(end_row).copied().unwrap_or(false) && end_row + 1 < lines.len() {
+            end_row += 1;
+        }
+        let mut text = String::new();
+        // (row, char offset of the row within the logical text, row char len)
+        let mut row_spans: Vec<(usize, usize, usize)> = Vec::new();
+        for (r, line) in lines.iter().enumerate().take(end_row + 1).skip(row) {
+            row_spans.push((r, text.chars().count(), line.chars().count()));
+            text.push_str(line);
+        }
+        // Byte spans already claimed on this logical line, by pattern
+        // priority — a URL spanning rows claims its whole span, so later
+        // patterns cannot shred the continuation into fragments.
         let mut taken: Vec<(usize, usize)> = Vec::new();
         for re in PATTERNS.iter() {
-            for caps in re.captures_iter(line) {
+            for caps in re.captures_iter(&text) {
                 let whole = caps.get(0).expect("group 0 always present");
                 if taken
                     .iter()
@@ -103,14 +132,28 @@ pub fn find_matches(lines: &[String]) -> Vec<QuickMatch> {
                 // one (markdown URL, diff path, sha256 digest), else the
                 // whole match; the label sits at the selected span's start.
                 let sel = caps.get(1).unwrap_or(whole);
+                let start = text[..sel.start()].chars().count();
+                let len = sel.as_str().chars().count();
+                let mut segs = row_spans.iter().filter_map(|&(r, rstart, rlen)| {
+                    let s = start.max(rstart);
+                    let e = (start + len).min(rstart + rlen);
+                    // Lazy `then`, not `then_some`: `e - s` underflows for
+                    // the rows the span does not overlap.
+                    (s < e).then(|| (r, s - rstart, e - s))
+                });
+                let Some((hrow, hstart, hlen)) = segs.next() else {
+                    continue;
+                };
                 out.push(QuickMatch {
-                    row,
-                    start: line[..sel.start()].chars().count(),
-                    len: sel.as_str().chars().count(),
+                    row: hrow,
+                    start: hstart,
+                    len: hlen,
                     text: sel.as_str().to_string(),
+                    tail: segs.collect(),
                 });
             }
         }
+        row = end_row + 1;
     }
     out.sort_by_key(|m| (m.row, m.start));
     out
@@ -172,6 +215,12 @@ mod tests {
         rows.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The unwrapped case the pattern tests exercise: every row its own
+    /// logical line.
+    fn find_matches(lines: &[String]) -> Vec<QuickMatch> {
+        find_matches_wrapped(lines, &vec![false; lines.len()])
+    }
+
     /// More matches than labels: the BOTTOM of the screen keeps its labels
     /// (nearest the prompt, the likeliest target) and the top overflow is
     /// dropped — `take(n)` used to keep the top and leave everything near
@@ -184,6 +233,7 @@ mod tests {
                 start: 0,
                 len: 3,
                 text: format!("m{r}"),
+                tail: Vec::new(),
             })
             .collect();
         let labels = assign_labels(matches.len(), "abc");
@@ -203,6 +253,64 @@ mod tests {
             (19, labels[0].as_str()),
             "the bottom-most match keeps the cheapest label"
         );
+    }
+
+    /// The #64 defect: a URL wrapping the pane edge was invisible as a URL —
+    /// scanning display rows independently, the head fragment matched
+    /// nothing and the tail was labelled as a filesystem-path fragment, so
+    /// typing the label copied `/drift.io/path` instead of what the user
+    /// sees. Stitched scanning must see it whole, anchor the label on the
+    /// head, and carry the continuation rows as tail segments.
+    #[test]
+    fn a_match_wrapping_the_pane_edge_is_seen_whole_and_anchored_on_its_head() {
+        let m = find_matches_wrapped(
+            &lines(&["fetching http:/", "/drift.io/path now"]),
+            &[true, false],
+        );
+        assert_eq!(m.len(), 1, "one URL, not a path fragment: {m:?}");
+        assert_eq!(m[0].text, "http://drift.io/path");
+        assert_eq!(
+            (m[0].row, m[0].start, m[0].len),
+            (0, 9, 6),
+            "the label anchors on the head fragment"
+        );
+        assert_eq!(
+            m[0].tail,
+            vec![(1, 0, 14)],
+            "the continuation row rides along as a tail segment"
+        );
+    }
+
+    /// A row that merely ENDS where the next one starts is not a wrap:
+    /// without the flag the rows stay independent and the tail is a path of
+    /// its own, exactly the pre-stitching behavior.
+    #[test]
+    fn an_unwrapped_row_boundary_still_scans_rows_independently() {
+        let m = find_matches_wrapped(
+            &lines(&["fetching http:/", "/drift.io/path now"]),
+            &[false, false],
+        );
+        assert!(
+            m.iter().any(|q| q.text == "/drift.io/path"),
+            "no wrap flag, so the tail is its own path match: {m:?}"
+        );
+        assert!(m.iter().all(|q| q.tail.is_empty()));
+    }
+
+    /// A match spanning THREE rows (a long URL through a narrow pane)
+    /// carries one tail segment per continuation row.
+    #[test]
+    fn a_match_spanning_three_wrapped_rows_carries_two_tail_segments() {
+        let m = find_matches_wrapped(
+            &lines(&["see https://cra", "tes.io/api/v1/c", "rates/regex ok"]),
+            &[true, true, false],
+        );
+        let url = m
+            .iter()
+            .find(|q| q.text == "https://crates.io/api/v1/crates/regex")
+            .expect("the stitched URL");
+        assert_eq!((url.row, url.start, url.len), (0, 4, 11));
+        assert_eq!(url.tail, vec![(1, 0, 15), (2, 0, 11)]);
     }
 
     #[test]
