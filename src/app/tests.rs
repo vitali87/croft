@@ -24803,23 +24803,37 @@ fn quick_select_labels_follow_content_that_streams_below_them() {
     // Park the cursor at the pane bottom so every further row SCROLLS.
     let h = app.terminals[0].last_inner.height as usize;
     app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
-    app.terminals[0].feed_bytes_for_test(b"http://drift.io");
+    // One atomic feed, opening with its own newline: the live child
+    // shell's prompt can flush between feed calls under suite load (#62),
+    // and a prompt landing just before the URL used to push it across the
+    // pane edge, wrapping the match. Advancing "\r\n" + URL under one grid
+    // lock keeps the URL at column 0 whether the prompt arrives before
+    // this chunk (its row is above) or after it (it appends to the right).
+    app.terminals[0].feed_bytes_for_test(b"\r\nhttp://drift.io");
     app.open_terminal_quick_select();
     assert!(app.terminal_quick_select.is_some(), "staging: one hint");
     app.terminals[0].feed_bytes_for_test(b"\r\nx1\r\nx2\r\nx3");
     term.draw(|f| app.render(f)).unwrap();
     let buf = term.backend().buffer().clone();
-    let rows: Vec<String> = (0..buf.area.height)
-        .map(|y| {
-            (0..buf.area.width)
-                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                .collect()
+    // Join the pane's inner rows into one stream before searching, so pane
+    // geometry can't split the needle across a row boundary (#62), and
+    // don't pin WHICH gold label the URL drew: when the live shell's
+    // prompt lands above the URL its path is a match too, and label
+    // assignment is bottom-priority, so the URL's letter depends on that
+    // race. The invariant is that SOME label still covers the URL's first
+    // cell after the scroll — the 'h' is overlaid, the rest is intact.
+    let inner = app.terminals[0].last_inner;
+    let joined: String = (inner.y..inner.y + inner.height)
+        .flat_map(|y| {
+            (inner.x..inner.x + inner.width)
+                .map(move |x| (x, y))
+                .map(|(x, y)| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
         })
         .collect();
     assert!(
-        rows.iter().any(|r| r.contains("attp://drift.io")),
-        "the label 'a' must still overlay its own URL's first cell after the\n\
-         content scrolled; rows: {rows:?}"
+        joined.contains("ttp://drift.io") && !joined.contains("http://drift.io"),
+        "a label must still overlay the URL's first cell after the content\n\
+         scrolled (the 'h' covered, the tail intact); pane text: {joined:?}"
     );
 }
 
