@@ -143,8 +143,18 @@ impl CompletionPopup {
         if x.saturating_add(width) > viewport.right() {
             x = viewport.right().saturating_sub(width);
         }
+        // Floor at the pane's own edges (#42): a popup wider than the pane
+        // was pushed left past `viewport.x` and painted over the Explorer —
+        // the trailing width clamp cannot repair an x already left of the
+        // pane. Same floors the hover and signature-help popups carry.
+        if x < viewport.x {
+            x = viewport.x;
+        }
         if y.saturating_add(height) > viewport.bottom() {
             y = cy.saturating_sub(height);
+        }
+        if y < viewport.y {
+            y = viewport.y;
         }
         Rect {
             x,
@@ -379,6 +389,63 @@ mod tests {
         };
         let area = p.area_for(viewport);
         assert!(area.right() <= viewport.right());
+    }
+
+    /// #42: a popup wider than the editor pane was pushed left past the
+    /// pane's own left edge and painted over the Explorer — the right-edge
+    /// clamp had no floor, and the trailing width clamp cannot repair an x
+    /// already left of the pane. Same defect class the signature-help
+    /// popup fixed in PR #40; the hover popup always carried the floor.
+    #[test]
+    fn a_popup_wider_than_the_pane_stays_inside_it() {
+        // The issue's proven probe: a 32-column Explorer, a 40-column
+        // editor pane, one 54-char label (width clamps to MAX_WIDTH 60,
+        // wider than the pane).
+        let mut p = popup(
+            vec![item(
+                "a_very_long_completion_label_that_overflows_the_pane_x",
+            )],
+            "",
+        );
+        p.anchor = (44, 6);
+        let viewport = Rect {
+            x: 32,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let area = p.area_for(viewport);
+        assert!(
+            area.x >= viewport.x,
+            "the popup must never escape the pane's left edge into the \
+             Explorer; area {area:?} vs viewport {viewport:?}"
+        );
+        assert!(area.right() <= viewport.right());
+        // Clamped to the pane, the width shrinks to what fits.
+        assert_eq!(area.width, viewport.width);
+    }
+
+    /// The vertical twin: flipping above a top-of-pane anchor must not
+    /// escape past the viewport's top into the tab strip.
+    #[test]
+    fn a_popup_flipped_above_a_top_anchor_stays_inside_the_pane() {
+        // A pane SHORTER than the popup (a squeezed editor above a tall
+        // bottom panel): the flip above the anchor lands past the top.
+        let items: Vec<CompletionItem> = (0..10).map(|i| item(&format!("it{i}"))).collect();
+        let mut p = popup(items, "");
+        p.anchor = (40, 13);
+        let viewport = Rect {
+            x: 32,
+            y: 4,
+            width: 40,
+            height: 10,
+        };
+        let area = p.area_for(viewport);
+        assert!(
+            area.y >= viewport.y,
+            "the popup must never escape the pane's top edge; area {area:?}"
+        );
+        assert!(area.bottom() <= viewport.bottom());
     }
 
     #[test]

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "The OUTPUT tab's channel picker now scrolls: with more log channels than the panel is tall, the overflow rows were unreachable by any gesture. The list opens at the active channel, the wheel moves the window, and a slim scrollbar marks the rest.",
+    summary: "The completion popup stays inside its editor pane: when the pane was narrower than the popup (a long Rust or TypeScript symbol in a split), it was pushed left past the pane's edge and painted over the Explorer; a squeezed short pane could likewise leak it over the tab strip.",
 }];
