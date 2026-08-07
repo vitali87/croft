@@ -47,6 +47,8 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
+      - name: Formatting (pinned rustfmt, zero diffs)
+        run: cargo fmt --check
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets -- -D warnings
       - name: Tests
