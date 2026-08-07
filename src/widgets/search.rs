@@ -2684,22 +2684,43 @@ mod tests {
         let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
         q_tx.send(SearchRequest::Query("c".into(), SearchOpts::default()))
             .unwrap();
-        // Wait past the 120ms debounce so the worker is committed.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let switched_at = std::time::Instant::now();
+        // Stage on the scan observably RUNNING — the first Hits batch —
+        // not on sleeping past the debounce: a sleep equal to the
+        // debounce races the worker's own timer on a knife edge, and
+        // when the send wins the new query displaces "c" in the debounce
+        // loop, silently skipping the cancellation path this test exists
+        // to cover (#68).
+        let mut c_hits = 0usize;
+        let staging = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while c_hits == 0 && std::time::Instant::now() < staging {
+            if let Ok(SearchEvent::Hits(q, _, hits)) =
+                e_rx.recv_timeout(std::time::Duration::from_millis(100))
+                && q == "c"
+            {
+                c_hits += hits.len();
+            }
+        }
+        assert!(
+            c_hits > 0,
+            "staging: the \"c\" scan never started streaming"
+        );
         q_tx.send(SearchRequest::Query(
             "zzznoneatall".into(),
             SearchOpts::default(),
         ))
         .unwrap();
-        // Done for the new query must arrive within 1.5s of submission.
-        // Without cancellation, the worker would still be plowing through
-        // the 4M-match "c" scan and Done would not arrive for many seconds.
-        let deadline = switched_at + std::time::Duration::from_millis(1500);
+        // The cancellation proof is structural, not wall-clock (#68): a
+        // cancelled "c" scan is cut short, streaming fewer than its full
+        // 4M matches before its Done; an uncancelled one streams every
+        // single match first. A tight arrival deadline on the second Done
+        // measured the same fact through scheduler latency and flaked
+        // under suite load — the long timeout here only guards a hang.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut second_done = false;
         while std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match e_rx.recv_timeout(remaining.max(std::time::Duration::from_millis(50))) {
+                Ok(SearchEvent::Hits(q, _, hits)) if q == "c" => c_hits += hits.len(),
                 Ok(SearchEvent::Done(q, _)) if q == "zzznoneatall" => {
                     second_done = true;
                     break;
@@ -2711,7 +2732,11 @@ mod tests {
         join.join().unwrap();
         assert!(
             second_done,
-            "worker must cancel the in-flight scan and emit Done for the new query within 1.5s"
+            "worker must emit Done for the new query after cancelling the in-flight scan"
+        );
+        assert!(
+            c_hits < 4_000_000,
+            "the in-flight scan must be cancelled, not run to completion; it streamed all {c_hits} matches"
         );
     }
 
