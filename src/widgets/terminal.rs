@@ -4112,6 +4112,21 @@ pub fn cell_in_selection(row: i32, col: u16, sr: i32, sc: u16, er: i32, ec: u16)
 mod tests {
     use super::*;
 
+    /// The zsh the shim tests drive, or an ANNOUNCED skip on a machine
+    /// without one (#52). CI provisions zsh, so the gate holds where it
+    /// matters; on a zsh-less dev box these tests must skip with a reason
+    /// — a hard spawn failure (or a silent `return`) makes "suite green"
+    /// ambiguous. Same convention as the cross-compile and PDF gates.
+    fn zsh_or_skip() -> Option<&'static str> {
+        let zsh = "/bin/zsh";
+        if std::path::Path::new(zsh).exists() {
+            Some(zsh)
+        } else {
+            eprintln!("SKIPPED: {zsh} not installed on this machine");
+            None
+        }
+    }
+
     fn fresh_term(cols: usize, rows: usize) -> Term<VoidListener> {
         let cfg = Config {
             scrolling_history: 1000,
@@ -4730,15 +4745,13 @@ mod tests {
     /// on content: it names a directory the shell is not actually in.
     #[test]
     fn a_claim_parsed_only_after_its_job_died_is_still_untrusted() {
+        let Some(zsh) = zsh_or_skip() else { return };
         let tmp = tempfile::tempdir().unwrap();
         // zsh -f: job control (the job gets its own pgroup) but no
         // integration, so nothing overwrites the forged claim.
-        let mut term = PtyTerminal::new_running(
-            "/bin/zsh",
-            &[String::from("-f"), String::from("-i")],
-            tmp.path(),
-        )
-        .unwrap();
+        let mut term =
+            PtyTerminal::new_running(zsh, &[String::from("-f"), String::from("-i")], tmp.path())
+                .unwrap();
         let mut waited = 0u32;
         while waited < 4000 && !term.foreground_is_shell() {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -4803,16 +4816,14 @@ mod tests {
     /// from a job never becomes trusted, however long ago the job died.
     #[test]
     fn a_stale_claim_from_a_dead_foreground_job_stays_untrusted() {
+        let Some(zsh) = zsh_or_skip() else { return };
         let tmp = tempfile::tempdir().unwrap();
         // zsh -f: job control (the claim's job gets its own pgroup, like a
         // real ssh client) but NO integration — the shell never overwrites
         // the stale claim with a fresh trusted report of its own.
-        let mut term = PtyTerminal::new_running(
-            "/bin/zsh",
-            &[String::from("-f"), String::from("-i")],
-            tmp.path(),
-        )
-        .unwrap();
+        let mut term =
+            PtyTerminal::new_running(zsh, &[String::from("-f"), String::from("-i")], tmp.path())
+                .unwrap();
         let mut waited = 0u32;
         while waited < 4000 && !term.foreground_is_shell() {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -5371,10 +5382,7 @@ mod tests {
         // the user's real .zshrc (their theme, aliases) never ran. A
         // poisoned CROFT_USER_ZDOTDIR pointing at the shim must be ignored
         // in favour of $HOME.
-        let zsh = "/bin/zsh";
-        if !std::path::Path::new(zsh).exists() {
-            return;
-        }
+        let Some(zsh) = zsh_or_skip() else { return };
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
             home.path().join(".zshrc"),
@@ -5630,10 +5638,7 @@ mod tests {
         // the foreign .zshenv restores the REAL ZDOTDIR when sourced; croft's
         // shim must re-read ZDOTDIR after chaining and source the user's rc
         // from wherever it landed.
-        let zsh = "/bin/zsh";
-        if !std::path::Path::new(zsh).exists() {
-            return;
-        }
+        let Some(zsh) = zsh_or_skip() else { return };
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
             home.path().join(".zshrc"),
@@ -5692,10 +5697,7 @@ mod tests {
         // The real proof: an interactive zsh reading croft's ZDOTDIR shim
         // must emit OSC 133 prompt marks and an OSC 7 cwd report at its
         // first prompt, with the user's own (here: empty) dotfiles sourced.
-        let zsh = "/bin/zsh";
-        if !std::path::Path::new(zsh).exists() {
-            return; // no zsh on this machine; covered on macOS dev boxes
-        }
+        let Some(zsh) = zsh_or_skip() else { return };
         let user_dir = tempfile::tempdir().unwrap();
         let cfg_dir = tempfile::tempdir().unwrap();
         let shim = crate::shell_integration::ensure_zsh_shim(cfg_dir.path()).unwrap();
@@ -5727,10 +5729,7 @@ mod tests {
     /// the cwd every consumer sees.
     #[test]
     fn a_percent_directory_round_trips_through_the_zsh_shim() {
-        let zsh = "/bin/zsh";
-        if !std::path::Path::new(zsh).exists() {
-            return;
-        }
+        let Some(zsh) = zsh_or_skip() else { return };
         let user_dir = tempfile::tempdir().unwrap();
         let odd = user_dir.path().join("a%41b");
         std::fs::create_dir(&odd).unwrap();
@@ -5870,10 +5869,7 @@ mod tests {
         // PromptEnd (133;B) mark. The shim must emit it itself — relying on
         // a chained foreign integration (Ghostty's) leaves remote Linux
         // panes with no input span at all.
-        let zsh = "/bin/zsh";
-        if !std::path::Path::new(zsh).exists() {
-            return;
-        }
+        let Some(zsh) = zsh_or_skip() else { return };
         let user_dir = tempfile::tempdir().unwrap();
         let cfg_dir = tempfile::tempdir().unwrap();
         let shim = crate::shell_integration::ensure_zsh_shim(cfg_dir.path()).unwrap();
