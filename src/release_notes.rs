@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Quick-select now sees a URL (or path, digest, any match) that wraps across the pane edge as one whole match: the label lands on its first cell and copies the full text, where before the wrapped tail was mislabelled as a path fragment and the head was invisible.",
+    summary: "The OUTPUT tab's channel picker now scrolls: with more log channels than the panel is tall, the overflow rows were unreachable by any gesture. The list opens at the active channel, the wheel moves the window, and a slim scrollbar marks the rest.",
 }];
