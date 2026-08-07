@@ -11,11 +11,11 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 
 use super::model::{Activity, TestCase, TestStatus};
-use super::regex_escape;
 use super::parse::{
     parse_jest_json, parse_list_line, parse_pytest_collect_line, parse_pytest_line,
     parse_test_line, parse_vitest_list_line, parse_vitest_tap_line,
 };
+use super::regex_escape;
 use crate::output::{self, OutputLevel};
 use crate::widgets::testing::TestingPanel;
 
@@ -569,7 +569,11 @@ fn vitest_one_args(name: &str) -> Vec<String> {
 /// where the positional file argument already scopes the run exactly.
 fn suite_title_anchor(pattern: &str) -> Option<String> {
     let (_, rest) = pattern.split_once("::")?;
-    let joined = rest.split("::").map(regex_escape).collect::<Vec<_>>().join(" ");
+    let joined = rest
+        .split("::")
+        .map(regex_escape)
+        .collect::<Vec<_>>()
+        .join(" ");
     Some(format!("^{joined} "))
 }
 
@@ -1235,7 +1239,13 @@ mod tests {
     fn a_js_suite_click_anchors_the_name_filter_to_the_describe_chain() {
         assert_eq!(
             vitest_filter_args("tests/a.test.js::auth", true),
-            vec!["run", "tests/a.test.js", "-t", "^auth ", "--reporter=tap-flat"]
+            vec![
+                "run",
+                "tests/a.test.js",
+                "-t",
+                "^auth ",
+                "--reporter=tap-flat"
+            ]
         );
         assert_eq!(
             jest_filter_args("tests/a.test.js::group (x)::inner", true),

@@ -106,7 +106,8 @@ fn query_ignored(root: &Path) -> HashSet<PathBuf> {
     }
     // check-ignore exits 1 when nothing matches: a verdict, not a failure, so
     // `git_raw` deliberately does not gate on the exit status.
-    let confirmed = git_raw(root, &["check-ignore", "-z", "--stdin"], Some(&stdin)).unwrap_or_default();
+    let confirmed =
+        git_raw(root, &["check-ignore", "-z", "--stdin"], Some(&stdin)).unwrap_or_default();
     confirmed
         .split(|b| *b == 0)
         .filter(|s| !s.is_empty())
@@ -2078,7 +2079,8 @@ mod tests {
             );
             payload.push(0);
         }
-        let out = git_raw(p, &["check-ignore", "-z", "--stdin"], Some(&payload)).unwrap_or_default();
+        let out =
+            git_raw(p, &["check-ignore", "-z", "--stdin"], Some(&payload)).unwrap_or_default();
         let got = out.split(|b| *b == 0).filter(|s| !s.is_empty()).count();
         assert_eq!(
             got, n,

@@ -94,7 +94,8 @@ fn pytest_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
     let (file, rest) = full_name.split_once(".py::")?;
     let path = root.join(format!("{file}.py"));
     let leaf = rest.rsplit("::").next()?.split('[').next()?;
-    let matcher = RegexMatcher::new(&format!(r"\bdef\s+{}\s*\(", super::regex_escape(leaf))).ok()?;
+    let matcher =
+        RegexMatcher::new(&format!(r"\bdef\s+{}\s*\(", super::regex_escape(leaf))).ok()?;
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(b'\x00'))
@@ -376,7 +377,11 @@ mod tests {
         std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("target/debug/parse.rs"), "fn target_case() {}\n").unwrap();
-        std::fs::write(root.join("node_modules/pkg/parse.rs"), "fn target_case() {}\n").unwrap();
+        std::fs::write(
+            root.join("node_modules/pkg/parse.rs"),
+            "fn target_case() {}\n",
+        )
+        .unwrap();
         std::fs::write(root.join("src/lib.rs"), "fn target_case() {}\n").unwrap();
 
         let (path, _) = find_test_source(root, "widgets::parse::tests::target_case").unwrap();
@@ -404,8 +409,7 @@ mod tests {
         assert_eq!(line, 2, "0-based line of the first test title");
         // A describe chain still resolves through the last segment, and an
         // unbalanced bracket must not abort the regex build.
-        let (_, line) =
-            find_test_source(root, "src/math.test.ts::suite::parses [ tokens").unwrap();
+        let (_, line) = find_test_source(root, "src/math.test.ts::suite::parses [ tokens").unwrap();
         assert_eq!(line, 4);
     }
 
@@ -432,7 +436,11 @@ mod tests {
         // instead of reporting no source.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        std::fs::write(root.join("a.test.js"), "xit('odd little title', () => {})\n").unwrap();
+        std::fs::write(
+            root.join("a.test.js"),
+            "xit('odd little title', () => {})\n",
+        )
+        .unwrap();
         let (_, line) = find_test_source(root, "a.test.js::odd little title").unwrap();
         assert_eq!(line, 0);
     }

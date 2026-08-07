@@ -446,11 +446,18 @@ mod tests {
             use_regex: true,
             ..SearchOpts::default()
         };
-        let (out, n) =
-            replace_all_in_lines(&lines(&["banana"]), "a*", "-", re_opts).unwrap();
-        assert_eq!((out, n), (lines(&["b-n-n-"]), 3), "zero-width matches are not replaced");
+        let (out, n) = replace_all_in_lines(&lines(&["banana"]), "a*", "-", re_opts).unwrap();
+        assert_eq!(
+            (out, n),
+            (lines(&["b-n-n-"]), 3),
+            "zero-width matches are not replaced"
+        );
         let (out, n) = replace_all_in_lines(&lines(&["banana"]), "^", "// ", re_opts).unwrap();
-        assert_eq!((out, n), (lines(&["banana"]), 0), "an all-zero-width pattern replaces nothing");
+        assert_eq!(
+            (out, n),
+            (lines(&["banana"]), 0),
+            "an all-zero-width pattern replaces nothing"
+        );
         let lit = SearchOpts::default();
         // U+212A KELVIN SIGN: lowercasing shrinks the line's byte length,
         // so the literal scanner bails and paints nothing on this line.
@@ -471,17 +478,23 @@ mod tests {
             use_regex: true,
             ..SearchOpts::default()
         };
-        let (out, n) =
-            replace_all_in_lines(&lines(&["abc"]), "b", r"x\ny", re_opts).unwrap();
+        let (out, n) = replace_all_in_lines(&lines(&["abc"]), "b", r"x\ny", re_opts).unwrap();
         assert_eq!((out, n), (lines(&["ax", "yc"]), 1));
         let (out, _) = replace_all_in_lines(&lines(&["abc"]), "b", r"x\ty", re_opts).unwrap();
         assert_eq!(out, lines(&["ax\tyc"]));
-        let (out, _) =
-            replace_all_in_lines(&lines(&["abc"]), "b", r"x\\ny", re_opts).unwrap();
-        assert_eq!(out, lines(&[r"ax\nyc"]), "an escaped backslash stays literal");
+        let (out, _) = replace_all_in_lines(&lines(&["abc"]), "b", r"x\\ny", re_opts).unwrap();
+        assert_eq!(
+            out,
+            lines(&[r"ax\nyc"]),
+            "an escaped backslash stays literal"
+        );
         let (out, _) =
             replace_all_in_lines(&lines(&["abc"]), "b", r"x\ny", SearchOpts::default()).unwrap();
-        assert_eq!(out, lines(&[r"ax\nyc"]), "literal mode inserts the text verbatim");
+        assert_eq!(
+            out,
+            lines(&[r"ax\nyc"]),
+            "literal mode inserts the text verbatim"
+        );
     }
 
     #[test]
@@ -494,14 +507,21 @@ mod tests {
             ..SearchOpts::default()
         };
         let (out, n) = replace_all_in_lines(&lines(&["abc"]), "b", r"x\r\ny", re_opts).unwrap();
-        assert_eq!((out, n), (lines(&["ax", "yc"]), 1), "CRLF splits once, no stray CR");
+        assert_eq!(
+            (out, n),
+            (lines(&["ax", "yc"]), 1),
+            "CRLF splits once, no stray CR"
+        );
         let (out, _) = replace_all_in_lines(&lines(&["abc"]), "b", r"x\ry", re_opts).unwrap();
         assert_eq!(out, lines(&["ax", "yc"]), "a lone CR is a line break too");
         for line in replace_all_in_lines(&lines(&["abc"]), "b", r"x\r\ny", re_opts)
             .unwrap()
             .0
         {
-            assert!(!line.contains('\r'), "no CR may survive in a line: {line:?}");
+            assert!(
+                !line.contains('\r'),
+                "no CR may survive in a line: {line:?}"
+            );
         }
     }
 
