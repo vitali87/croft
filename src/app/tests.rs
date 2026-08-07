@@ -8226,15 +8226,23 @@ fn clicking_source_control_does_not_block_on_git_and_posts_a_changes_request() {
     // racing with that startup reply.
     std::thread::sleep(std::time::Duration::from_millis(150));
     let _ = app.drain_git_responses();
-    let started = std::time::Instant::now();
-    app.set_sidebar_view(SidebarView::SourceControl);
-    let elapsed = started.elapsed();
     // The synchronous shell-out used to take 15-50 ms minimum on
     // any real machine; an order of magnitude headroom catches the
-    // regression even on a fast CI box.
+    // regression even on a fast CI box. A single wall-clock sample
+    // measures the scheduler as much as the code under suite load
+    // (#57): one preemption between the clock reads adds milliseconds
+    // with no regression present. The MINIMUM of several attempts is
+    // immune — a preemption doesn't repeat on every try, while a
+    // genuine synchronous shell-out fails all of them.
+    let mut fastest = std::time::Duration::MAX;
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        app.set_sidebar_view(SidebarView::SourceControl);
+        fastest = fastest.min(started.elapsed());
+    }
     assert!(
-        elapsed < std::time::Duration::from_millis(5),
-        "Source Control click must not block on git; took {elapsed:?}",
+        fastest < std::time::Duration::from_millis(5),
+        "Source Control click must not block on git; fastest of 5 took {fastest:?}",
     );
     // The Changes request must have landed on the worker — give it
     // up to 2 s to respond, then drain. The response carries the
