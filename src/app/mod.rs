@@ -29075,9 +29075,11 @@ impl App {
                 crate::iterm2_inline::KITTY_ID_EDITOR_BASE + side as u32,
                 // Below text and below non-default background cells, so a
                 // right-click menu or any other opaque popup paints fully on
-                // top. The preview still shows: the editor widget fills its
-                // canvas with the DEFAULT bg (`Color::Reset`), which this z
-                // stays above. Same placement the sidebar illustrations use.
+                // top. The preview still shows: on Kitty the editor widget
+                // keeps its canvas at the DEFAULT bg (`image_canvas_bg`),
+                // which this z stays above — an explicit canvas fill would
+                // paint over the picture. Same placement the sidebar
+                // illustrations use.
                 crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             )
         {

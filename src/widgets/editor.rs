@@ -87,6 +87,27 @@ fn canvas_bg(host_is_iterm2: bool, theme: crate::theme::Theme) -> Color {
     }
 }
 
+/// The background the image/PDF canvas fills with — a separate choice from
+/// [`canvas_bg`] because the picture is an inline image the canvas must not
+/// occlude. Kitty places the preview at `KITTY_Z_BELOW_TEXT_AND_BG` and
+/// draws any cell with a non-default background OVER an image that deep, so
+/// the canvas has to keep the DEFAULT background there; iTerm2 keeps
+/// `Reset` for the [`canvas_bg`] reason (the `SetColors` session bg).
+/// Neither host shows an untinted island while a picture is up: the bake
+/// letterboxes with the theme bg pixel, covering every canvas cell. Sixel
+/// blits into the cell buffer over the canvas, and a no-graphics host shows
+/// only the placeholder, so both keep the themed fill.
+fn image_canvas_bg(
+    protocol: crate::iterm2_inline::InlineImageProtocol,
+    theme: crate::theme::Theme,
+) -> Color {
+    use crate::iterm2_inline::InlineImageProtocol;
+    match protocol {
+        InlineImageProtocol::ITerm2 | InlineImageProtocol::Kitty => Color::Reset,
+        InlineImageProtocol::Sixel | InlineImageProtocol::None => theme.editor_bg(),
+    }
+}
+
 fn render_image_placeholder(
     image: &ImageView,
     path: Option<&Path>,
@@ -7203,7 +7224,11 @@ impl Widget for &mut Editor {
             self.theme,
         );
         if let Some(image) = self.image.as_ref() {
-            render_image_placeholder(image, self.path.as_deref(), inner, buf, cbg);
+            let ibg = image_canvas_bg(
+                crate::iterm2_inline::detect_inline_image_protocol(),
+                self.theme,
+            );
+            render_image_placeholder(image, self.path.as_deref(), inner, buf, ibg);
             return;
         }
         if let Some(view) = self.sheet.as_ref() {
@@ -15294,6 +15319,71 @@ mod tests {
             buf[(1, area.height - 1)].bg,
             themed.editor_bg(),
             "the canvas body must wear the theme bg, not the host default"
+        );
+    }
+
+    /// The editor picture sits at `KITTY_Z_BELOW_TEXT_AND_BG`, and Kitty
+    /// draws any cell with a non-default background OVER an image that deep.
+    /// Painting the canvas with the explicit theme bg (the CSV/diff island
+    /// fix) therefore hid the preview behind its own canvas on Ghostty/Kitty
+    /// — transmitted every frame, never visible. The image canvas must keep
+    /// the DEFAULT background on the protocols that layer the picture
+    /// against the cells (Kitty) or blit it over them post-frame (iTerm2);
+    /// the themed look survives because the bake letterboxes with the theme
+    /// bg pixel. Sixel and no-graphics hosts keep the themed fill.
+    #[test]
+    fn the_kitty_image_canvas_keeps_the_default_bg_so_the_deep_z_preview_shows() {
+        use crate::iterm2_inline::InlineImageProtocol;
+        let themed = crate::theme::Theme::from_id("solarized-dark");
+        assert_eq!(themed.id(), "solarized-dark", "bundled theme resolves");
+        assert_eq!(
+            image_canvas_bg(InlineImageProtocol::Kitty, themed),
+            Color::Reset,
+            "Kitty layers the deep-z image below non-default-bg cells, so the picture canvas must stay default-bg"
+        );
+        assert_eq!(
+            image_canvas_bg(InlineImageProtocol::ITerm2, themed),
+            Color::Reset,
+            "iTerm2 keeps Reset so the SetColors session bg shows through"
+        );
+        assert_eq!(
+            image_canvas_bg(InlineImageProtocol::Sixel, themed),
+            themed.editor_bg(),
+            "sixel blits into the cell buffer over the canvas, so the themed fill stays"
+        );
+        assert_eq!(
+            image_canvas_bg(InlineImageProtocol::None, themed),
+            themed.editor_bg(),
+            "with no graphics the placeholder is all the user sees; it stays themed"
+        );
+        // And the Kitty choice actually lands on every canvas cell.
+        let image = ImageView {
+            bytes: Vec::new(),
+            format_label: String::from("png"),
+            pixel_w: 4,
+            pixel_h: 4,
+            byte_size: 1,
+            generation: 0,
+            pdf: None,
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_image_placeholder(
+            &image,
+            None,
+            area,
+            &mut buf,
+            image_canvas_bg(InlineImageProtocol::Kitty, themed),
+        );
+        assert_eq!(
+            buf[(1, area.height - 1)].bg,
+            Color::Reset,
+            "every canvas cell must keep the default background or Kitty paints it over the image"
         );
     }
 
