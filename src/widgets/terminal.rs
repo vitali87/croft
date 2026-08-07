@@ -5502,7 +5502,7 @@ mod tests {
         // covering the sleep between CommandStart and CommandEnd, and the
         // same completion must arrive once through the notification drain.
         let tmp = tempfile::tempdir().unwrap();
-        let script = "printf '\\033]133;A\\007$ cmd\\n\\033]133;B\\007\\033]133;C\\007'; sleep 0.3; printf 'out\\n\\033]133;D;2\\007'";
+        let script = "printf '\\033]133;A\\007$ cmd\\n\\033]133;B\\007\\033]133;C\\007'; sleep 1; printf 'out\\n\\033]133;D;2\\007'";
         let term =
             PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
                 .unwrap();
@@ -5512,8 +5512,11 @@ mod tests {
             if let Some(d) = decos.first() {
                 assert_eq!(d.exit, Some(2), "exit code from 133;D;2");
                 let dur = d.duration.expect("duration must be measured");
+                // Marks are arrival-stamped by the reader thread, so a late
+                // pickup of the pre-sleep chunk shrinks the measured gap
+                // under suite load (#65): the floor sits at half the sleep.
                 assert!(
-                    dur >= std::time::Duration::from_millis(250),
+                    dur >= std::time::Duration::from_millis(500),
                     "duration must cover the sleep; got {dur:?}"
                 );
                 break;
@@ -5529,7 +5532,7 @@ mod tests {
         let finished = term.drain_finished_commands();
         assert_eq!(finished.len(), 1, "one completion in the drain");
         assert_eq!(finished[0].exit, Some(2));
-        assert!(finished[0].dur >= std::time::Duration::from_millis(250));
+        assert!(finished[0].dur >= std::time::Duration::from_millis(500));
         assert!(
             term.drain_finished_commands().is_empty(),
             "a second drain returns nothing"
