@@ -1181,6 +1181,12 @@ pub enum SaveOutcome {
     /// The file changed on disk since we last synced; the save was refused
     /// to avoid clobbering the external edit. The caller must force it.
     DiskConflict,
+    /// The buffer holds characters the chosen encoding cannot represent, so
+    /// writing would replace them with HTML numeric character references and
+    /// lose the originals irreversibly (the buffer itself is unchanged, so
+    /// undo cannot bring them back). The save was refused; the caller
+    /// surfaces it and sets `lossy_save_armed` to write anyway.
+    EncodingLoss,
 }
 
 /// Per-tab results of an FS-sync sweep across all open tabs
@@ -1697,6 +1703,15 @@ pub struct Editor {
     /// the flag drives the conflict warning and makes `save_to_disk` refuse
     /// to overwrite until the user forces it.
     pub disk_conflict: bool,
+    /// Set when a save was refused because `encoding` cannot represent the
+    /// buffer. Latches like `disk_conflict` so auto save stops retrying (and
+    /// stops re-reporting) a file only an explicit Cmd+S can resolve; cleared
+    /// by a successful write and by any reopen, which may change `encoding`.
+    pub encoding_loss: bool,
+    /// One-shot consent to write characters `encoding` cannot represent,
+    /// answering an `EncodingLoss` refusal. Set by the explicit-save path
+    /// only (never by auto save) and consumed by the write it authorises.
+    pub lossy_save_armed: bool,
     /// When the buffer last changed, driving the auto-save delay. `None`
     /// until the first edit.
     pub last_edit_at: Option<std::time::Instant>,
@@ -1796,6 +1811,8 @@ impl Editor {
             diff_next_arrow: Rect::default(),
             disk_stamp: None,
             disk_conflict: false,
+            encoding_loss: false,
+            lossy_save_armed: false,
             last_edit_at: None,
         }
     }
@@ -2008,6 +2025,14 @@ impl Editor {
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
         self.occurrences.clear();
+        // Lossy-save consent named the unmappable characters the buffer held
+        // when the prompt fired; an edit changes what a write would destroy,
+        // so stale consent must not carry over (unlike `force_save_armed`,
+        // whose overwrite consent is about the DISK state, which typing does
+        // not touch). Clearing the latch also lets auto save retry a buffer
+        // the user fixed by deleting the offending characters.
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
     }
 
     /// Install (or clear) the git-gutter HEAD baseline for `path`. The app
@@ -2678,6 +2703,10 @@ impl Editor {
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
+        // A whole-buffer swap: whatever the previous contents could not be
+        // encoded as is no longer this tab's problem.
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
         self.lang = path
             .extension()
             .and_then(|e| e.to_str())
@@ -2764,6 +2793,10 @@ impl Editor {
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
+        // A whole-buffer swap: whatever the previous contents could not be
+        // encoded as is no longer this tab's problem.
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
         self.lines = vec![String::new()];
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
@@ -2798,6 +2831,10 @@ impl Editor {
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
+        // A whole-buffer swap: whatever the previous contents could not be
+        // encoded as is no longer this tab's problem.
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
         self.lines = vec![String::new()];
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
@@ -2831,6 +2868,10 @@ impl Editor {
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
+        // A whole-buffer swap: whatever the previous contents could not be
+        // encoded as is no longer this tab's problem.
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
         self.lines = vec![String::new()];
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
@@ -3430,6 +3471,11 @@ impl Editor {
         // The buffer now matches disk decoded as `enc`, so it is clean; bump the
         // edit seq so the LSP/outline/highlight resync sees the new content.
         self.dirty = false;
+        // The encoding just changed, so a refusal recorded against the old
+        // one is stale — without this, auto save would keep skipping a tab
+        // whose new encoding covers the buffer fine.
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.recompute_highlights();
         Ok(())
@@ -4510,13 +4556,17 @@ impl Editor {
             self.disk_conflict = true;
             return Ok(SaveOutcome::DiskConflict);
         }
-        self.write_buffer_to_disk()?;
-        Ok(SaveOutcome::Saved)
+        self.write_buffer_to_disk()
     }
 
-    /// Save unconditionally, overwriting any external change. The "Overwrite"
-    /// half of a conflict resolution.
-    pub fn save_to_disk_force(&mut self) -> Result<()> {
+    /// Save past a disk conflict, overwriting the external change. The
+    /// "Overwrite" half of a conflict resolution.
+    ///
+    /// It does NOT bypass the encoding-loss guard: consenting to overwrite
+    /// someone else's edit is not consent to mangle your own characters, so a
+    /// buffer with both problems still reports `EncodingLoss` here and needs
+    /// `lossy_save_armed` on top.
+    pub fn save_to_disk_force(&mut self) -> Result<SaveOutcome> {
         self.write_buffer_to_disk()
     }
 
@@ -4529,7 +4579,13 @@ impl Editor {
     /// `output_encoding()` to UTF-8 and hands back the string's UTF-8 bytes.
     /// Taking that output at face value wrote a file that disagreed with the
     /// encoding the status bar reported for it.
-    fn encode_for_disk(&self, content: &str) -> Vec<u8> {
+    ///
+    /// Returns the bytes and whether the encoder had to substitute: for a
+    /// legacy encoding `encoding_rs` does NOT write `?` the way iconv-lite
+    /// (and so VS Code) does — per the WHATWG Encoding Standard it emits an
+    /// HTML numeric character reference, which is valid content that no
+    /// longer round-trips. Callers must not write that without consent.
+    fn encode_for_disk(&self, content: &str) -> (Vec<u8>, bool) {
         let enc = self.encoding;
         if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
             let le = enc == encoding_rs::UTF_16LE;
@@ -4547,28 +4603,75 @@ impl Editor {
                     unit.to_be_bytes()
                 });
             }
-            return out;
+            // Every `char` encodes to UTF-16 losslessly (a `str` cannot hold
+            // an unpaired surrogate), so this branch never substitutes.
+            return (out, false);
         }
-        // Unmappable characters are replaced per encoding_rs, matching VS Code.
-        let (encoded, _, _) = enc.encode(content);
+        let (encoded, _, had_errors) = enc.encode(content);
         if self.bom && enc == encoding_rs::UTF_8 {
             let mut out = Vec::with_capacity(encoded.len() + 3);
             out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
             out.extend_from_slice(&encoded);
-            return out;
+            return (out, had_errors);
         }
-        encoded.into_owned()
+        (encoded.into_owned(), had_errors)
     }
 
-    fn write_buffer_to_disk(&mut self) -> Result<()> {
+    /// The distinct characters `encoding` cannot represent, in first-seen
+    /// order and capped, for the message an `EncodingLoss` refusal shows.
+    ///
+    /// Walks the buffer and encodes each non-ASCII character on its own, so
+    /// call it once to build that message rather than per frame. Empty for
+    /// UTF-8 and UTF-16, which cover every `char`.
+    pub fn unmappable_chars(&self) -> Vec<char> {
+        /// Enough to name the problem without turning the status line into a
+        /// character dump.
+        const MAX: usize = 8;
+        let enc = self.encoding;
+        if enc == encoding_rs::UTF_8 || enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE
+        {
+            return Vec::new();
+        }
+        let mut out: Vec<char> = Vec::new();
+        let mut buf = [0u8; 4];
+        for line in &self.lines {
+            // ASCII is mappable in every encoding croft offers, and is the
+            // overwhelming majority of a source file: skip it without paying
+            // for an encode call.
+            for ch in line.chars().filter(|c| !c.is_ascii()) {
+                if out.contains(&ch) {
+                    continue;
+                }
+                let (_, _, had_errors) = enc.encode(ch.encode_utf8(&mut buf));
+                if had_errors {
+                    out.push(ch);
+                    if out.len() == MAX {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn write_buffer_to_disk(&mut self) -> Result<SaveOutcome> {
         let path = self
             .path
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No file open"))?
             .clone();
         let content = self.lines.join(self.eol.sequence());
-        let encoded = self.encode_for_disk(&content);
+        let (encoded, had_errors) = self.encode_for_disk(&content);
+        // The single choke point every save funnels through, so no caller can
+        // route around the guard. The consent flag survives a failed write
+        // (the user still consented) and is cleared only once the bytes land.
+        if had_errors && !self.lossy_save_armed {
+            self.encoding_loss = true;
+            return Ok(SaveOutcome::EncodingLoss);
+        }
         std::fs::write(&path, encoded)?;
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
         self.dirty = false;
         // The next keystroke opens a fresh undo step: coalescing across the
         // save point would make one Cmd+Z discard work from both sides.
@@ -4577,7 +4680,7 @@ impl Editor {
         // The buffer now matches disk, so this is the new sync point and any
         // prior conflict is resolved.
         self.mark_synced_with_disk();
-        Ok(())
+        Ok(SaveOutcome::Saved)
     }
 
     pub fn move_up(&mut self) {
@@ -6961,7 +7064,10 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
 /// would then resolve one row off. Normalizing first keeps the two in lockstep
 /// and is a no-op for clean `\n`-only files.
 fn split_into_lines(text: &str) -> Vec<String> {
-    normalize_newlines(text).lines().map(|s| s.to_string()).collect()
+    normalize_newlines(text)
+        .lines()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Fold every line-ending convention to `\n` so callers can split on it
@@ -9930,8 +10036,13 @@ mod tests {
         tabs.open(&path).unwrap();
         tabs.lines[0].push('x');
         tabs.dirty = true;
-        tabs.open_head_diff_with_text(PathBuf::from("a.txt (local snapshot)"), "old\n", &path, false)
-            .unwrap();
+        tabs.open_head_diff_with_text(
+            PathBuf::from("a.txt (local snapshot)"),
+            "old\n",
+            &path,
+            false,
+        )
+        .unwrap();
         assert!(
             tabs.editors
                 .iter()
@@ -13360,7 +13471,11 @@ mod tests {
         e.lines = vec!["abc".to_string()];
         e.replace_find_match(0, 1, 1, "x\ny");
         assert_eq!(e.lines, vec!["ax".to_string(), "yc".to_string()]);
-        assert_eq!((e.cursor_row, e.cursor_col), (1, 1), "caret after the inserted text");
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (1, 1),
+            "caret after the inserted text"
+        );
     }
 
     #[test]
@@ -13551,6 +13666,108 @@ mod tests {
                 .contains("local")
         );
         assert!(!e.disk_conflict);
+    }
+
+    /// A legacy encoding that cannot represent the buffer must never write
+    /// silently: `encoding_rs` substitutes HTML numeric character references
+    /// (NOT `?`), so the file ends up holding ASCII text that no longer
+    /// round-trips, while the buffer still shows the originals.
+    #[test]
+    fn saving_text_the_encoding_cannot_represent_is_refused_not_silently_mangled() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "cafe\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
+        // € lives at 0x80 in Windows-1252, so only the CJK is unmappable.
+        e.lines = vec![String::from("日本語 costs 5€")];
+        e.dirty = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::EncodingLoss);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path()).unwrap(),
+            "cafe\n",
+            "a refused save must leave the file untouched"
+        );
+        assert!(e.encoding_loss, "the refusal latches so auto save skips it");
+        assert_eq!(e.unmappable_chars(), vec!['日', '本', '語']);
+        // Explicit consent (the second Cmd+S) writes the replacements.
+        e.lossy_save_armed = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(
+            std::fs::read(tmp.path()).unwrap(),
+            b"&#26085;&#26412;&#35486; costs 5\x80",
+            "consent writes encoding_rs' references, and € as the 0x80 byte"
+        );
+        assert!(!e.encoding_loss);
+        assert!(!e.lossy_save_armed, "consent is one-shot");
+    }
+
+    /// The refusal must not fire for a buffer the encoding covers, and must
+    /// not fire at all for UTF-8/UTF-16, which cover everything.
+    #[test]
+    fn a_representable_buffer_saves_without_a_prompt() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "cafe\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
+        e.lines = vec![String::from("café")];
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"caf\xE9");
+        assert!(e.unmappable_chars().is_empty());
+        // The same text in UTF-8 is always representable.
+        let mut u = Editor::new();
+        u.open(tmp.path()).unwrap();
+        u.lines = vec![String::from("日本語")];
+        assert_eq!(u.encoding, encoding_rs::UTF_8);
+        assert_eq!(u.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert!(u.unmappable_chars().is_empty());
+    }
+
+    /// Switching the buffer to an encoding that covers it must clear the
+    /// latch, or auto save would stay wedged on a file that is now fine.
+    #[test]
+    fn reopening_with_another_encoding_clears_the_encoding_loss_latch() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "日本語").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.encoding = encoding_rs::WINDOWS_1252;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::EncodingLoss);
+        assert!(e.encoding_loss);
+        e.reopen_with_encoding(encoding_rs::UTF_8).unwrap();
+        assert!(!e.encoding_loss);
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+    }
+
+    /// Armed consent covers the buffer the prompt described. An edit changes
+    /// what the write would destroy, so it must revoke the stale consent (and
+    /// the auto-save latch) and make the next save prompt afresh — otherwise
+    /// characters typed after the prompt get mangled under a consent that
+    /// never named them.
+    #[test]
+    fn an_edit_after_a_lossy_refusal_revokes_the_armed_consent() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "cafe\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
+        e.lines = vec![String::from("日")];
+        e.dirty = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::EncodingLoss);
+        e.lossy_save_armed = true; // the app arms the second Cmd+S...
+        e.insert_char('本'); // ...but the user edits instead of pressing it
+        assert!(!e.lossy_save_armed, "an edit revokes the stale consent");
+        assert!(
+            !e.encoding_loss,
+            "the latch clears too, so a fixed-up buffer resumes auto save"
+        );
+        assert_eq!(
+            e.save_to_disk().unwrap(),
+            SaveOutcome::EncodingLoss,
+            "the next save must prompt again for the changed buffer"
+        );
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "cafe\n");
     }
 
     #[test]
