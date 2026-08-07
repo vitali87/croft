@@ -56,12 +56,44 @@ static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// `Listening on port 8080`, `serving at :8080`, `bound to 0.0.0.0:8080` — the
-/// announce lines that carry no scheme. Kept deliberately tight (an explicit
-/// verb) so a stray number in ordinary output isn't mistaken for a port.
+/// announce lines that carry no scheme. The number must be introduced by the
+/// word `port` or by a colon: an announce verb followed by a bare number is
+/// ordinary output (`running 289 tests`, `Started 15 workers`), and inventing
+/// a port from it offers to forward one nothing is listening on. The colon
+/// branch still needs [`is_clock_time`] to reject `Started backup at 03:15`.
 static BARE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:listening|serving|started|running|bound)\b[^\n]{0,40}?[:\s](\d{2,5})\b")
-        .expect("bare port regex")
+    Regex::new(
+        r"(?i)\b(?:listening|serving|started|running|bound)\b[^\n]{0,40}?(?:\bport\b\s*:?\s*|:\s*)(\d{2,5})\b",
+    )
+    .expect("bare port regex")
 });
+
+/// Whether the digits captured at `start` in `text` are the minutes of a clock
+/// time (`03:15`, `running since 10:22`) rather than a port. An address keeps
+/// its host in front of the colon (`0.0.0.0:8080`, `[::1]:80`), so only a bare
+/// one or two digit number introducing the colon reads as an hour.
+fn is_clock_time(text: &str, start: usize, digits: &str) -> bool {
+    if digits.len() != 2 {
+        return false;
+    }
+    let before = text[..start].trim_end();
+    let Some(head) = before.strip_suffix(':') else {
+        return false;
+    };
+    let hour: String = head
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if hour.is_empty() || hour.len() > 2 {
+        return false;
+    }
+    // Only a STANDALONE number reads as an hour: `0.0.0.0:80` and
+    // `127.0.0.1:8080` end in a digit too but the dot marks an address, and
+    // in `api1:80` or `web-1:80` the digits are a hostname's tail.
+    !head[..head.len() - hour.len()]
+        .ends_with(|c: char| c == '.' || c == '-' || c == '_' || c.is_ascii_alphanumeric())
+}
 
 /// A general http(s) URL token, for Cmd/Ctrl+click in the terminal (any host,
 /// not just loopback). Stops at whitespace and the brackets/quotes that
@@ -196,6 +228,7 @@ fn scan_with_pos(text: &str) -> Vec<(usize, PortHit)> {
     }
     for cap in BARE_RE.captures_iter(text) {
         if let Some(g) = cap.get(1)
+            && !is_clock_time(text, g.start(), g.as_str())
             && let Some(port) = parse_port(g.as_str())
             && !out.iter().any(|(_, h)| h.port == port)
         {
@@ -249,6 +282,40 @@ pub fn poll_listeners(shell_pid: i32) -> Vec<PortHit> {
         return hits;
     }
     poll_via_ss(&pids).unwrap_or_default()
+}
+
+/// Every loopback TCP port listening on this machine, whoever owns it. The
+/// scoped [`poll_listeners`] decides what to SURFACE (a system daemon is not
+/// the user's dev server); this decides what is still UP, which is a different
+/// question and one the subtree scope cannot answer — a container's published
+/// port, or a server started before croft, is nobody's descendant. `None` when
+/// neither tool ran, so the caller can tell "nothing is listening" from "no
+/// evidence" and leave the registry alone rather than retiring live rows.
+pub fn poll_all_listening() -> Option<HashSet<u16>> {
+    let out = Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
+        .output()
+        .ok();
+    if let Some(out) = out
+        && (out.status.success() || !out.stdout.is_empty())
+    {
+        return Some(
+            parse_lsof(&String::from_utf8_lossy(&out.stdout))
+                .into_iter()
+                .map(|h| h.port)
+                .collect(),
+        );
+    }
+    let out = Command::new("ss").args(["-tlnH"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(3).and_then(loopback_port))
+            .collect(),
+    )
 }
 
 fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
@@ -379,6 +446,78 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].port, 8080);
         assert!(hits[0].url.is_none());
+    }
+
+    /// The reconciliation snapshot must cover every loopback listener, not just
+    /// a croft pane's process subtree. A container's published port is nobody's
+    /// descendant; judging it by the scoped scan retired the row and cancelled
+    /// its tunnel seconds after the output scrape found it. This test's own
+    /// listener is owned by the test binary, which is exactly such an outsider.
+    #[test]
+    fn the_reconciliation_snapshot_covers_listeners_outside_any_subtree() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let port = listener.local_addr().unwrap().port();
+        let Some(all) = poll_all_listening() else {
+            // No lsof and no ss: the app skips reconciliation entirely, which
+            // is the safe direction, and there is nothing to assert here.
+            return;
+        };
+        assert!(
+            all.contains(&port),
+            "port {port} is listening but missing from the snapshot"
+        );
+    }
+
+    /// A test harness counting its cases is not a dev server. Matching a bare
+    /// number after an announce verb fabricates a port, which on a remote
+    /// session offers to `ssh -O forward` a port nothing is listening on.
+    #[test]
+    fn a_plain_count_after_an_announce_verb_is_not_a_port() {
+        for line in [
+            "running 289 tests",
+            "Started 15 workers",
+            "started 42 jobs, running 1200 checks",
+        ] {
+            assert!(scan(line).is_empty(), "{line:?} must not report a port");
+        }
+    }
+
+    /// A clock time is not a port either. The colon branch has to let
+    /// `0.0.0.0:80` through, so the digits before it are what separate an
+    /// address from an hour.
+    #[test]
+    fn a_clock_time_after_an_announce_verb_is_not_a_port() {
+        for line in [
+            "Started backup at 03:15",
+            "server started, running since 10:22",
+            "running 289 tests across 12:30 minutes",
+        ] {
+            assert!(scan(line).is_empty(), "{line:?} must not report a port");
+        }
+    }
+
+    /// The announce forms the scrape exists for still match: a spelled-out
+    /// `port N`, `port: N` (Express's own boilerplate), and a `host:N` / `:N`
+    /// address, including the two-digit well-known ones a clock could shadow.
+    #[test]
+    fn announce_lines_with_a_port_or_a_colon_still_match() {
+        for (line, port) in [
+            ("Listening on port 8080", 8080u16),
+            ("Example app listening on port: 3000", 3000),
+            ("Server listening on port : 8080", 8080),
+            ("serving at :4000", 4000),
+            ("bound to 0.0.0.0:9229", 9229),
+            ("bound to 0.0.0.0:80", 80),
+            ("listening on 127.0.0.1:80", 80),
+            // A numeric-suffixed hostname is not a clock: only a STANDALONE
+            // one or two digit number before the colon reads as an hour.
+            ("bound to api1:80", 80),
+            ("listening on web-1:80", 80),
+        ] {
+            let hits = scan(line);
+            assert_eq!(hits.len(), 1, "{line:?}");
+            assert_eq!(hits[0].port, port, "{line:?}");
+        }
     }
 
     #[test]
