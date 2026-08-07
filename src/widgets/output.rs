@@ -57,6 +57,14 @@ pub struct OutputPanel {
     /// Pin the viewport to the newest line until the user scrolls up.
     follow_tail: bool,
     dropdown_open: bool,
+    /// First channel row visible in the open dropdown (#45): with more
+    /// channels than the body is tall, the wheel (and PageUp/Down) moves
+    /// this window instead of the log, so every channel stays reachable.
+    /// Reset to the selection on every open; clamped at render.
+    dropdown_scroll: usize,
+    /// The open dropdown's scrollbar track, for click-to-jump. Empty when
+    /// the list fits.
+    dropdown_scrollbar: Rect,
 
     pub focus_gradient: bool,
     pub theme: Theme,
@@ -90,6 +98,8 @@ impl OutputPanel {
             scroll: 0,
             follow_tail: true,
             dropdown_open: false,
+            dropdown_scroll: 0,
+            dropdown_scrollbar: Rect::default(),
             focus_gradient: false,
             theme: Theme::default(),
             focused: false,
@@ -199,11 +209,24 @@ impl OutputPanel {
     }
 
     pub fn scroll_up(&mut self, n: usize) {
+        // An open channel list owns the wheel: scrolling must move the
+        // list's window, never the log underneath it (#45).
+        if self.dropdown_open {
+            self.dropdown_scroll = self.dropdown_scroll.saturating_sub(n);
+            return;
+        }
         self.scroll = self.scroll.saturating_sub(n);
         self.follow_tail = false;
     }
 
     pub fn scroll_down(&mut self, n: usize) {
+        if self.dropdown_open {
+            // Loose clamp; the render clamps exactly against the body
+            // height it is given.
+            self.dropdown_scroll =
+                (self.dropdown_scroll + n).min(self.channels.len().saturating_sub(1));
+            return;
+        }
         self.scroll = (self.scroll + n).min(self.max_scroll());
         if self.scroll >= self.max_scroll() {
             self.follow_tail = true;
@@ -241,12 +264,29 @@ impl OutputPanel {
                 self.select(idx);
                 return true;
             }
+            // A click on the list's scrollbar track jumps the window.
+            if rect_has(self.dropdown_scrollbar, x, y) {
+                if let Some(metrics) = scrollbar::vertical_metrics(
+                    self.dropdown_scrollbar,
+                    self.channels.len(),
+                    self.dropdown_scrollbar.height as usize,
+                    self.dropdown_scroll,
+                ) {
+                    self.dropdown_scroll = scrollbar::scroll_for_y(metrics, y);
+                }
+                return true;
+            }
             // A click anywhere else closes the dropdown without selecting.
             self.dropdown_open = false;
             return true;
         }
         if rect_has(self.dropdown_rect, x, y) {
             self.dropdown_open = !self.dropdown_open;
+            if self.dropdown_open {
+                // Open with the active channel in view however deep it
+                // sits; the render clamps to the last full window.
+                self.dropdown_scroll = self.selected;
+            }
             return true;
         }
         if rect_has(self.clear_rect, x, y) {
@@ -278,6 +318,7 @@ impl Widget for &mut OutputPanel {
         self.last_area = area;
         self.last_scrollbar = Rect::default();
         self.dropdown_rect = Rect::default();
+        self.dropdown_scrollbar = Rect::default();
         self.level_rect = Rect::default();
         self.rpc_rect = Rect::default();
         self.clear_rect = Rect::default();
@@ -442,12 +483,16 @@ impl OutputPanel {
     fn render_dropdown(&mut self, body: Rect, buf: &mut Buffer, accent: Color) {
         let n = self.channels.len() as u16;
         let h = n.min(body.height);
+        // One extra column carries the scrollbar when the list overflows,
+        // so the longest channel name is never overpainted by the track.
+        let overflow = n > h;
         let w = self
             .channels
             .iter()
             .map(|c| c.chars().count() as u16 + 2)
             .max()
             .unwrap_or(8)
+            .saturating_add(overflow as u16)
             .min(body.width);
         let area = Rect {
             x: body.x + 1,
@@ -455,6 +500,11 @@ impl OutputPanel {
             width: w,
             height: h,
         };
+        // Clamp the window so the last page is always full; the wheel
+        // clamps loosely and this is the exact bound (#45).
+        self.dropdown_scroll = self
+            .dropdown_scroll
+            .min((n as usize).saturating_sub(h as usize));
         buf.set_style(area, Style::default().bg(self.theme.editor_bg()));
         crate::gradient::paint_gradient_box(
             buf,
@@ -465,12 +515,33 @@ impl OutputPanel {
                 height: area.height,
             },
         );
-        for (row, name) in self.channels.iter().enumerate().take(h as usize) {
-            let y = area.y + row as u16;
+        if overflow {
+            let track = Rect {
+                x: area.x + area.width - 1,
+                y: area.y,
+                width: 1,
+                height: area.height,
+            };
+            self.dropdown_scrollbar = track;
+            if let Some(metrics) =
+                scrollbar::vertical_metrics(track, n as usize, h as usize, self.dropdown_scroll)
+            {
+                scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            }
+        }
+        for (row, name) in self
+            .channels
+            .iter()
+            .enumerate()
+            .skip(self.dropdown_scroll)
+            .take(h as usize)
+        {
+            let y = area.y + (row - self.dropdown_scroll) as u16;
             let r = Rect {
                 x: area.x,
                 y,
-                width: area.width,
+                // The scrollbar column is its own hit target, not the row's.
+                width: area.width - overflow as u16,
                 height: 1,
             };
             self.dropdown_items.push((r, row));
@@ -488,7 +559,7 @@ impl OutputPanel {
                 area.x + 1,
                 y,
                 name,
-                area.width.saturating_sub(1) as usize,
+                r.width.saturating_sub(1) as usize,
                 Style::default().fg(fg),
             );
         }
@@ -516,6 +587,60 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// #45: with more channels than the panel body is tall, the overflow
+    /// rows were neither drawn nor registered as hit targets — unreachable
+    /// by any gesture, with nothing indicating truncation. The wheel over
+    /// the open dropdown must scroll the LIST (not the log) and give every
+    /// channel a clickable rect.
+    #[test]
+    fn dropdown_overflow_channels_are_reachable_by_scrolling() {
+        let mut p = OutputPanel::new();
+        p.channels = (0..12).map(|i| format!("chan-{i:02}")).collect();
+        p.dropdown_open = true;
+        // 7 rows total: 1 toolbar + 6 body — six of twelve channels fit.
+        let _ = render(&mut p, 40, 7);
+        let visible: Vec<usize> = p.dropdown_items.iter().map(|&(_, i)| i).collect();
+        assert!(
+            !visible.contains(&11),
+            "staging: the last channel starts off-screen; got {visible:?}"
+        );
+        p.scroll_down(6);
+        let _ = render(&mut p, 40, 7);
+        let visible: Vec<usize> = p.dropdown_items.iter().map(|&(_, i)| i).collect();
+        assert!(
+            visible.contains(&11),
+            "scrolling must bring the last channel into reach; got {visible:?}"
+        );
+        let &(r, _) = p.dropdown_items.iter().find(|&&(_, i)| i == 11).unwrap();
+        assert!(p.click(r.x, r.y), "the row consumes the click");
+        assert_eq!(
+            p.selected, 11,
+            "the click lands on the scrolled row's channel"
+        );
+        // Selecting closed the dropdown; the log wheel works again.
+        assert!(!p.dropdown_open);
+    }
+
+    /// Opening the dropdown starts the window AT the current selection, so
+    /// the active channel is immediately visible however deep it sits.
+    #[test]
+    fn dropdown_opens_with_the_selection_in_view() {
+        let mut p = OutputPanel::new();
+        p.channels = (0..12).map(|i| format!("chan-{i:02}")).collect();
+        p.selected = 10;
+        let _ = render(&mut p, 40, 7);
+        // Toggle open through the real gesture: a click on the picker.
+        let r = p.dropdown_rect;
+        assert!(p.click(r.x, r.y), "the picker consumes the click");
+        assert!(p.dropdown_open);
+        let _ = render(&mut p, 40, 7);
+        let visible: Vec<usize> = p.dropdown_items.iter().map(|&(_, i)| i).collect();
+        assert!(
+            visible.contains(&10),
+            "the selected channel must be in the opening window; got {visible:?}"
+        );
     }
 
     #[test]
