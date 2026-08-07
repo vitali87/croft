@@ -350,12 +350,27 @@ pub(crate) fn serve_with_token(
 }
 
 /// Write `frame` to every connected client, pruning the ones whose
-/// connection died. Returns whether any client was pruned.
+/// connection died — including a WEDGED one (#53): a `kill -STOP`ped
+/// client stops draining, its socket buffer fills, and a plain `write_all`
+/// here blocked the PTY pump forever while holding the clients lock,
+/// starving every other client and every future attach. The bounded write
+/// treats a peer that drains nothing for [`WRITE_FRAME_DEADLINE`] as gone.
+/// After any prune the shared size and roster are recomputed, so a dead
+/// ghost releases the min winsize it was pinning. Returns whether any
+/// client was pruned.
 fn broadcast(host: &Host, frame: &[u8]) -> bool {
-    let mut clients = host.clients.lock().unwrap();
-    let before = clients.len();
-    clients.retain(|c| c.tx.lock().unwrap().write_all(frame).is_ok());
-    clients.len() != before
+    let pruned = {
+        let mut clients = host.clients.lock().unwrap();
+        let before = clients.len();
+        let deadline = Instant::now() + WRITE_FRAME_DEADLINE;
+        clients.retain(|c| write_frame_bounded(&mut c.tx.lock().unwrap(), frame, deadline));
+        clients.len() != before
+    };
+    if pruned {
+        apply_winsize(host, false);
+        update_presence(host);
+    }
+    pruned
 }
 
 /// Resize the PTY to the minimum size across clients. `force_repaint`
@@ -366,10 +381,7 @@ fn broadcast(host: &Host, frame: &[u8]) -> bool {
 fn apply_winsize(host: &Host, force_repaint: bool) {
     let target = {
         let clients = host.clients.lock().unwrap();
-        match min_winsize(clients.iter().map(|c| (c.cols, c.rows))) {
-            Some(t) => t,
-            None => return,
-        }
+        min_winsize(clients.iter().map(|c| (c.cols, c.rows)))
     };
     let mut last = host.last_size.lock().unwrap();
     let master = host.master.lock().unwrap();
@@ -379,12 +391,23 @@ fn apply_winsize(host: &Host, force_repaint: bool) {
         pixel_width: 0,
         pixel_height: 0,
     };
-    if *last != target {
-        let _ = master.resize(size(target.0, target.1));
-        *last = target;
-    } else if force_repaint {
-        let _ = master.resize(size(target.0, target.1.saturating_sub(1).max(1)));
-        let _ = master.resize(size(target.0, target.1));
+    match target {
+        Some(target) if *last != target => {
+            let _ = master.resize(size(target.0, target.1));
+            *last = target;
+        }
+        // The jiggle runs at the CURRENT size whenever a repaint was asked
+        // for, even with no sized client connected (#53): an attach from a
+        // 0x0 PTY (`script`, headless CI) used to return before this
+        // branch, so an observer-only attach never produced a Resize and
+        // the inner croft never repainted — a blank screen with a blinking
+        // cursor and no way to recover.
+        _ if force_repaint => {
+            let (cols, rows) = *last;
+            let _ = master.resize(size(cols, rows.saturating_sub(1).max(1)));
+            let _ = master.resize(size(cols, rows));
+        }
+        _ => {}
     }
 }
 
@@ -859,6 +882,58 @@ pub(crate) fn write_frame_blocking(stream: &mut UnixStream, frame: &[u8]) -> boo
     )
 }
 
+/// Write a whole frame to a BLOCKING socket without ever entering an
+/// unbounded kernel write (#53): [`write_frame_blocking`] only bounds a
+/// socket that is already non-blocking — on the server's blocking client
+/// streams the first `write` against a full buffer parks in the kernel and
+/// the deadline is unreachable. Waiting for writability with `poll(2)`
+/// bounds the stall without flipping `O_NONBLOCK`, which is shared with the
+/// client thread's blocking reads on the same file description. False means
+/// the peer is unusable (dead, or draining nothing for the whole deadline).
+fn write_frame_bounded(stream: &mut UnixStream, frame: &[u8], deadline: Instant) -> bool {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut written = 0;
+    while written < frame.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if r < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if r == 0 {
+            // Writability never arrived inside the deadline: the peer is
+            // wedged.
+            return false;
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return false;
+        }
+        match stream.write(&frame[written..]) {
+            Ok(0) => return false,
+            Ok(n) => written += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 fn write_frame_blocking_with_deadline(
     stream: &mut impl Write,
     frame: &[u8],
@@ -1188,8 +1263,12 @@ mod tests {
     const TEST_TOKEN: &str = "test-token";
 
     fn spawn_test_server(socket: PathBuf) -> std::thread::JoinHandle<i32> {
+        spawn_test_server_with(socket, vec![String::from("cat")])
+    }
+
+    fn spawn_test_server_with(socket: PathBuf, inner: Vec<String>) -> std::thread::JoinHandle<i32> {
         std::thread::spawn(move || {
-            serve_with_token(&socket, None, &[String::from("cat")], TEST_TOKEN).expect("serve")
+            serve_with_token(&socket, None, &inner, TEST_TOKEN).expect("serve")
         })
     }
 
@@ -1255,6 +1334,77 @@ mod tests {
         );
         assert_eq!(server.join().unwrap(), 0);
         assert!(!socket.exists(), "server must unlink its socket on exit");
+    }
+
+    /// #53 part 2: an attach from a 0x0 PTY (`script`, headless CI) is a
+    /// pure observer — and with no sized client connected, `apply_winsize`
+    /// used to return before the repaint jiggle, so the inner croft never
+    /// received a Resize and the observer stared at a blank screen. The
+    /// jiggle must fire at the current size for EVERY accepted attach.
+    #[test]
+    fn an_observer_only_attach_still_jiggles_the_inner_pty() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        // An inner command that reports every WINCH it receives: the only
+        // observable proof the jiggle reached the PTY.
+        let server = spawn_test_server_with(
+            socket.clone(),
+            vec![
+                String::from("/bin/sh"),
+                String::from("-c"),
+                String::from("trap 'printf WINCHED' WINCH; while :; do sleep 0.05; done"),
+            ],
+        );
+        wait_alive(&socket);
+        let mut observer = TestClient::connect(&socket, "observer", 0, 0);
+        observer
+            .read_until(|f| matches!(f, Frame::Bytes(b) if b.windows(7).any(|w| w == b"WINCHED")));
+        drop(observer);
+        drop(server);
+    }
+
+    /// #53 part 3: a client that stops draining (kill -STOP, a wedged
+    /// terminal) filled its socket buffer, and the plain `write_all` in
+    /// `broadcast` then blocked the PTY pump forever while holding the
+    /// clients lock — every other client starved. The bounded write must
+    /// evict the ghost at the deadline and the survivors keep flowing.
+    #[test]
+    fn a_wedged_client_is_evicted_instead_of_freezing_the_pump() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let mut owner = TestClient::connect(&socket, "owner", 120, 40);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        // The ghost attaches and never reads again.
+        let ghost = TestClient::connect(&socket, "ghost", 80, 24);
+        let frames = owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        assert_eq!(roster(&frames).unwrap().len(), 2, "staging: ghost seated");
+        // Flood: cat echoes everything back through broadcast; the ghost's
+        // socket buffer fills and the write deadline must evict it rather
+        // than wedge the pump. The owner keeps draining throughout.
+        let chunk = vec![b'x'; 32 * 1024];
+        let mut evicted = false;
+        for _ in 0..64 {
+            owner.send(&encode_bytes_frame(&chunk));
+            let frames = owner.read_until(|f| {
+                matches!(f, Frame::Control(Control::Presence { .. }))
+                    || matches!(f, Frame::Bytes(_))
+            });
+            if frames
+                .iter()
+                .any(|f| matches!(f, Frame::Control(Control::Presence { .. })))
+                && roster(&frames).is_some_and(|ps| ps.len() == 1)
+            {
+                evicted = true;
+                break;
+            }
+        }
+        assert!(
+            evicted,
+            "the wedged ghost must be evicted and the roster shrink to the owner"
+        );
+        drop(ghost);
     }
 
     #[test]
