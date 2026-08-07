@@ -12713,28 +12713,39 @@ fn relay_test_lock() -> &'static std::sync::Mutex<()> {
 const TEST_RELAY_KEY: &str = "0123456789abcdef";
 
 fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
-    let prev_key = std::env::var_os("CROFT_RELAY_KEY");
     // The cache dir is redirected through its test override instead of
     // repointing the process-global `$HOME` (#37): unrelated test threads
     // resolve `$HOME` at call time and a substituted value made them fail
     // inside the fake home. CROFT_RELAY_KEY stays an env var — it is
     // croft-specific and `relay_dir` is its only reader, so no unrelated
-    // reader can race on it.
+    // reader can race on it. The restore is RAII so a panicking `body`
+    // cannot leak the redirected globals into later relay tests.
+    struct RestoreRelayGlobals {
+        prev_key: Option<std::ffi::OsString>,
+    }
+    impl Drop for RestoreRelayGlobals {
+        fn drop(&mut self) {
+            *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+            // SAFETY: relay tests hold relay_test_lock, serializing this
+            // mutation.
+            unsafe {
+                match self.prev_key.take() {
+                    Some(k) => std::env::set_var("CROFT_RELAY_KEY", k),
+                    None => std::env::remove_var("CROFT_RELAY_KEY"),
+                }
+            }
+        }
+    }
+    let _restore = RestoreRelayGlobals {
+        prev_key: std::env::var_os("CROFT_RELAY_KEY"),
+    };
     *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() =
         Some(home.join(".cache").join("croft"));
     // SAFETY: relay tests hold relay_test_lock, serializing this mutation.
     unsafe {
         std::env::set_var("CROFT_RELAY_KEY", TEST_RELAY_KEY);
     }
-    let out = body();
-    *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
-    unsafe {
-        match prev_key {
-            Some(k) => std::env::set_var("CROFT_RELAY_KEY", k),
-            None => std::env::remove_var("CROFT_RELAY_KEY"),
-        }
-    }
-    out
+    body()
 }
 
 #[test]
