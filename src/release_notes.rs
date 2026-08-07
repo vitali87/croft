@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Go Back is now a first-class command: Ctrl+- (the VS Code chord) returns to the location before the last navigation jump, alongside a Command Palette entry and an editor right-click item — it used to be reachable only through the Shift+Ctrl+click mouse chord.",
+    kind: NoteKind::Fix,
+    summary: "Language servers for the workspace's evident languages now start the moment croft opens (a Cargo.toml at the root starts rust-analyzer, and so on) instead of at the first file open, so the server's cold indexing overlaps with you browsing the tree — the long gap before hover, definitions and diagnostics answered on the first .rs file is gone.",
 }];
