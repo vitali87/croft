@@ -62,22 +62,14 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Reopen with Encoding no longer throws away unsaved changes. It used to re-read the file over your edits with no warning and no way to undo, even when you picked the encoding already in use.",
+        summary: "Updating croft on a remote machine is fast again. It had been shipping the entire local build directory, 176 GB of it, over a throttled link before compiling on the remote box, because the transfer skipped a folder named \"target\" while the real one is called \"target.noindex\".",
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "UTF-16 files now open, edit and save like any other file. Saving keeps the file's encoding and byte-order mark instead of quietly rewriting it as plain UTF-8 while still reporting the old encoding, and an encoding you picked survives a reload.",
+        summary: "A remote update now ships a prebuilt binary instead of compiling on your server. Bumping the Rust version had quietly dropped the cross-compiler targets, and the check meant to catch that asked the wrong toolchain, so it always reported everything was fine.",
     },
     ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Git change bars in a split pane now update after a commit. Only the focused pane was refreshed, so the other one kept marking lines that were already committed.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "The parameter-hints popup stays inside the editor. A long signature pushed it out over the file tree.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "On a narrow window, clicking the line and column readout no longer opens the Problems panel.",
+        kind: NoteKind::Feature,
+        summary: "Continuous integration now builds croft for Linux x86-64, Linux ARM64 and Android on every change, alongside the lint and test suites, so a platform can no longer break without anyone noticing.",
     },
 ];

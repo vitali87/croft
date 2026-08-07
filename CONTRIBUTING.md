@@ -122,3 +122,28 @@ name ends in `.noindex`, which Spotlight ignores. See
 [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory) for the
 one line setup. With it applied your build directory is `target.noindex/` rather
 than `target/`.
+
+## Bumping the Rust toolchain
+
+`rust-toolchain.toml` is the single source of truth for the channel, and
+**rustup targets belong to one toolchain**. Bumping the pin orphans every
+cross target, which silently turns `croft <host>` from "ship a prebuilt static
+binary" into "compile the whole crate graph on the user's box". A 1.95.0 to
+1.97.1 bump did exactly that for four days.
+
+So a toolchain bump is not finished until this passes, run **from inside the
+checkout** so the pin applies:
+
+```bash
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+cargo zigbuild --profile remote-fast --locked --bin croft \
+  --target x86_64-unknown-linux-musl
+```
+
+The binary has to exist at the end. `remote::tests::the_pinned_toolchain_has_every_cross_target`
+fails the suite when a target is missing, and `.github/workflows/ci.yml` runs
+the real ship-path build for both musl triples plus an Android NDK build on
+every pull request.
+
+When a remote update feels slow, read `~/.cache/croft/install.log` first: it
+records the exact reason the fast path was skipped.
