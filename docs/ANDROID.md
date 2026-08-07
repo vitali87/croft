@@ -9,7 +9,7 @@ There is **no required setup command** on Android. After `cargo install`, croft 
 ## Install
 
 ```bash
-cargo install --git https://github.com/vitali87/croft.git
+cargo install --git https://github.com/vitali87/croft.git --locked
 ```
 
 This builds croft into `~/.cargo/bin/croft` inside Termux. Re-run to upgrade.

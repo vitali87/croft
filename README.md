@@ -49,7 +49,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ## Install
 
 ```bash
-cargo install --git https://github.com/vitali87/croft.git
+cargo install --git https://github.com/vitali87/croft.git --locked
 ```
 
 This compiles croft from the latest `main` into `~/.cargo/bin/croft`. Re-run to upgrade. To build from source instead:
@@ -57,7 +57,7 @@ This compiles croft from the latest `main` into `~/.cargo/bin/croft`. Re-run to 
 ```bash
 git clone https://github.com/vitali87/croft.git
 cd croft
-cargo build --release && cargo install --path .
+cargo build --release && cargo install --path . --locked
 ```
 
 **macOS:** the build directory churns the Spotlight index and can spike your CPU and fans. Before building, point Cargo at a `.noindex` directory Spotlight ignores; see [MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
