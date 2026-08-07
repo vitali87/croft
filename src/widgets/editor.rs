@@ -1697,6 +1697,13 @@ pub struct Editor {
     /// while set; rebuilt lazily when `built_seq` falls behind `edit_seq`.
     pub markdown_preview: Option<crate::markdown::MarkdownPreview>,
     pub image: Option<ImageView>,
+    /// A reload's request that `open_pdf` come up on this page instead of
+    /// page 1, so the reader's place survives an external rebuild in ONE
+    /// rasterisation. Rendering page 1 first and re-rendering afterwards
+    /// opened a window where a transient failure silently snapped the
+    /// reader back to page 1 (#72). Set by `reload_from_disk`, consumed
+    /// (or cleared) by the `open` it wraps.
+    pdf_restore_page: Option<u32>,
     /// Read-only spreadsheet preview for `.csv` / `.tsv` / `.xlsx` / etc.
     /// Mutually exclusive with `image` and the text path; none of the
     /// editor's text fields are populated when this is `Some`.
@@ -1826,6 +1833,7 @@ impl Editor {
             active_search_match: None,
             markdown_preview: None,
             image: None,
+            pdf_restore_page: None,
             sheet: None,
             diff: None,
             diff_prev_arrow: Rect::default(),
@@ -2881,7 +2889,16 @@ impl Editor {
             .ok_or_else(|| anyhow::anyhow!("Install poppler (pdftoppm) to preview PDFs"))?;
         let meta = std::fs::metadata(path)?;
         let page_count = crate::pdf::detect_page_count(path);
-        let bytes = crate::pdf::rasterize_page(path, 1, backend)
+        // A reload comes up on the reader's page in this single
+        // rasterisation — clamped when the count is known, so a genuinely
+        // shrunken document lands on its new last page. On failure the
+        // whole open fails and the caller's failed-reload path keeps the
+        // last good render AND the place (#72).
+        let page = match self.pdf_restore_page.take() {
+            Some(p) => p.clamp(1, page_count.unwrap_or(p).max(1)),
+            None => 1,
+        };
+        let bytes = crate::pdf::rasterize_page(path, page, backend)
             .map_err(|e| anyhow::anyhow!("PDF render failed: {e}"))?;
         let (pixel_w, pixel_h) = image::load_from_memory(&bytes)
             .map(|img| (img.width(), img.height()))
@@ -2916,7 +2933,7 @@ impl Editor {
             generation: next_image_generation(),
             pdf: Some(PdfState {
                 source_path: path.to_path_buf(),
-                current_page: 1,
+                current_page: page,
                 page_count,
                 backend,
                 source_byte_size: meta.len(),
@@ -4511,19 +4528,21 @@ impl Editor {
         let prev_row = self.cursor_row;
         let prev_col = self.cursor_col;
         let prev_scroll = self.scroll;
-        let prev_pdf_page = self.pdf_page();
+        // A PDF's page is its cursor: a rebuild on disk (pdflatex finishing)
+        // must not snap the reader back to page 1. `open_pdf` consumes the
+        // request and comes up on that page directly — restoring it with a
+        // second render after the open left a window where that render's
+        // transient failure lost the reader's place (#72).
+        self.pdf_restore_page = self.pdf_page().filter(|&p| p > 1);
         let result = self.open(&path);
+        // Cleared even when the open bailed before reaching `open_pdf`, so
+        // the request can never leak into an unrelated later open.
+        self.pdf_restore_page = None;
         // Clamp the restored cursor to the new contents so it stays valid
         // even if the file shrank.
         self.cursor_row = prev_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = prev_col.min(self.line_char_len(self.cursor_row));
         self.scroll = prev_scroll.min(self.lines.len().saturating_sub(1));
-        // A PDF's page is its cursor: a rebuild on disk (pdflatex finishing)
-        // must not snap the reader back to page 1. `set_pdf_page` clamps to
-        // the new page count if the document shrank.
-        if let Some(page) = prev_pdf_page.filter(|&p| p > 1) {
-            self.set_pdf_page(page);
-        }
         result
     }
 
@@ -13956,7 +13975,91 @@ mod tests {
         assert_eq!(
             tabs.pdf_page(),
             Some(2),
-            "an external rebuild must not move the reader back to page 1"
+            "an external rebuild must not move the reader back to page 1; status: {:?}",
+            tabs.iter_tabs().next().unwrap().status
+        );
+    }
+
+    /// The transient arm of the rebuild race (#72): the reader is on page 2,
+    /// the file is rebuilt, and the rasterisation of THEIR page fails once
+    /// (a spawn refused under load). That failure must flow into the
+    /// failed-reload path — last good render, place kept — never leave a
+    /// half-restored tab sitting on page 1. The next sweep recovers.
+    #[test]
+    fn a_transient_page_render_failure_during_reload_keeps_the_readers_place() {
+        if crate::pdf::detect_backend().is_none() {
+            eprintln!("skipping: no PDF rasteriser installed");
+            return;
+        }
+        let two_page_pdf = concat!(
+            "%PDF-1.4\n",
+            "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+            "2 0 obj<</Type/Pages/Kids[3 0 R 5 0 R]/Count 2>>endobj\n",
+            "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R>>endobj\n",
+            "4 0 obj<</Length 27>>stream\n0 0 1 rg 10 10 100 100 re f\nendstream endobj\n",
+            "5 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 6 0 R>>endobj\n",
+            "6 0 obj<</Length 27>>stream\n1 0 0 rg 10 10 100 100 re f\nendstream endobj\n",
+            "trailer<</Root 1 0 R/Size 7>>\n%%EOF\n",
+        );
+        let bump_mtime = |path: &Path, secs: u64| {
+            let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(secs);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(newer)
+                .unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deck.pdf");
+        std::fs::write(&path, two_page_pdf).unwrap();
+        let mut tabs = EditorTabs::new();
+        tabs.open_pinned(&path).unwrap();
+        assert!(tabs.change_pdf_page(1), "two pages, so page 2 renders");
+        let good_bytes = tabs
+            .iter_tabs()
+            .next()
+            .unwrap()
+            .image
+            .as_ref()
+            .unwrap()
+            .bytes
+            .clone();
+        std::fs::write(&path, two_page_pdf).unwrap();
+        bump_mtime(&path, 2);
+        *crate::pdf::FAIL_RASTERIZE_ONCE_FOR_TEST.lock().unwrap() = Some((path.clone(), 2));
+        let report = tabs.reload_externally_changed_tabs(&|_| false);
+        assert!(
+            report.reloaded.is_empty(),
+            "a reload that cannot restore the reader's page is a failed \
+             reload, not a successful one that lost their place"
+        );
+        assert_eq!(
+            tabs.pdf_page(),
+            Some(2),
+            "a transient render failure must not snap the reader to page 1; status: {:?}",
+            tabs.iter_tabs().next().unwrap().status
+        );
+        assert_eq!(
+            tabs.iter_tabs()
+                .next()
+                .unwrap()
+                .image
+                .as_ref()
+                .unwrap()
+                .bytes,
+            good_bytes,
+            "the last good render survives the transient failure"
+        );
+        // The failure was transient: the next sweep reloads and the reader
+        // is still on their page.
+        bump_mtime(&path, 4);
+        let report = tabs.reload_externally_changed_tabs(&|_| false);
+        assert_eq!(report.reloaded, vec![path.clone()]);
+        assert_eq!(
+            tabs.pdf_page(),
+            Some(2),
+            "recovery re-renders the reader's page"
         );
     }
 
