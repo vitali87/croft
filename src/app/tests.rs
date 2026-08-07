@@ -24842,6 +24842,83 @@ fn quick_select_labels_follow_content_that_streams_below_them() {
     );
 }
 
+/// The #64 defect end-to-end: a URL wrapping the pane edge was invisible as
+/// a URL — the scanner saw display rows independently, so the head fragment
+/// matched nothing and the tail was labelled as a filesystem path, and
+/// typing the label copied `/drift.io` instead of what the user sees.
+/// Stitched scanning must stage the WHOLE URL, anchored on its head.
+#[test]
+fn quick_select_sees_a_match_that_wraps_the_pane_edge_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // One atomic feed (#62): its own newline pins the pad to column 0, the
+    // pad parks the URL six cells before the pane edge, so "http:/" fills
+    // the row (setting WRAPLINE) and "/drift.io" continues on the next.
+    let w = app.terminals[0].last_inner.width as usize;
+    let mut chunk = String::from("\r\n");
+    chunk.push_str(&"x".repeat(w - 6));
+    chunk.push_str("http://drift.io");
+    app.terminals[0].feed_bytes_for_test(chunk.as_bytes());
+    app.open_terminal_quick_select();
+    let state = app
+        .terminal_quick_select
+        .as_ref()
+        .expect("staging: the pane holds at least the wrapped URL");
+    // `starts_with`, not equality: the live child shell's prompt can land
+    // right after the fed chunk, gluing itself onto the URL's tail within
+    // the same logical line — the head is the invariant.
+    let url = state
+        .hints
+        .iter()
+        .find(|h| h.text.starts_with("http://drift.io"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the wrapped URL must be staged whole; hints were: {:?}",
+                state
+                    .hints
+                    .iter()
+                    .map(|h| (h.line, h.start, h.text.as_str()))
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        url.start,
+        w - 6,
+        "the label anchors on the URL's first cell, not the wrap row"
+    );
+    assert!(
+        !url.tail.is_empty(),
+        "the continuation row rides along as a tail segment"
+    );
+    assert!(
+        !state.hints.iter().any(|h| h.text == "/drift.io"),
+        "the wrapped tail must not be labelled as a path fragment; hints: {:?}",
+        state
+            .hints
+            .iter()
+            .map(|h| h.text.as_str())
+            .collect::<Vec<_>>()
+    );
+    // Committing the URL's label copies the whole URL, not the fragment.
+    let label = url.label.clone();
+    for c in label.chars() {
+        app.handle_terminal_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert!(
+        app.terminal_quick_select.is_none(),
+        "committing a label must close quick-select"
+    );
+    assert!(
+        app.status.contains("Copied"),
+        "commit must report the copy, status was: {}",
+        app.status
+    );
+}
+
 /// Quick-select is bound to the pane it opened on, exactly like copy mode:
 /// after a pane switch its labels must close, never be pushed onto (or
 /// pasted into) the newly active pane at the old pane's coordinates.

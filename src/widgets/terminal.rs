@@ -1234,24 +1234,34 @@ impl PtyTerminal {
         (lines, -off)
     }
 
-    /// [`Self::visible_lines`] plus the scroll clock, all from ONE term
-    /// lock: coordinates and clock captured together so output landing
-    /// between two separate reads can never mis-pair them (quick-select
-    /// anchors its labels on this snapshot).
-    pub fn visible_lines_and_clock(&mut self) -> (Vec<String>, i32, i64) {
+    /// [`Self::visible_lines`] plus per-row soft-wrap flags and the scroll
+    /// clock, all from ONE term lock: coordinates and clock captured
+    /// together so output landing between two separate reads can never
+    /// mis-pair them (quick-select anchors its labels on this snapshot).
+    /// `wraps[i]` says row `i` continues into row `i + 1` (WRAPLINE on its
+    /// last cell); a wrapping row keeps its trailing spaces — they are real
+    /// cells mid-line, and trimming them would glue the next row's first
+    /// word onto this one when the rows are stitched for scanning (#64).
+    pub fn visible_lines_and_clock(&mut self) -> (Vec<String>, Vec<bool>, i32, i64) {
         let mut term = self.term.lock();
         let clock = self.clock.lock().unwrap().tick(&mut term);
         if term.columns() == 0 {
-            return (Vec::new(), 0, clock);
+            return (Vec::new(), Vec::new(), 0, clock);
         }
         let off = term.grid().display_offset() as i32;
         let rows = term.screen_lines() as i32;
+        let cols = term.columns();
         let mut lines = Vec::new();
+        let mut wraps = Vec::new();
         for l in -off..rows - off {
             let (s, _cols) = row_text_and_cols(&term, l);
-            lines.push(s.trim_end().to_string());
+            let wrapped = term.grid()[Point::new(Line(l), Column(cols - 1))]
+                .flags
+                .contains(Flags::WRAPLINE);
+            lines.push(if wrapped { s } else { s.trim_end().to_string() });
+            wraps.push(wrapped);
         }
-        (lines, -off, clock)
+        (lines, wraps, -off, clock)
     }
 
     /// Swap in a new trigger set. The app calls this for every pane on every

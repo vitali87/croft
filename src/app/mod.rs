@@ -1886,6 +1886,10 @@ struct QuickHint {
     len: usize,
     text: String,
     label: String,
+    /// Continuation segments `(absolute line, start, len)` when the match
+    /// wraps the pane edge: highlighted alongside the head span, but the
+    /// label glyph only ever paints on the head.
+    tail: Vec<(i32, usize, usize)>,
 }
 
 /// Active copy-mode session on the focused terminal pane (WezTerm / tmux
@@ -24162,8 +24166,8 @@ impl App {
     /// match getting the cheapest one (WezTerm / tmux-thumbs), and overlays
     /// them for the render loop.
     fn open_terminal_quick_select(&mut self) {
-        let (lines, top, clock) = self.terminal_mut().visible_lines_and_clock();
-        let matches = crate::quick_select::find_matches(&lines);
+        let (lines, wraps, top, clock) = self.terminal_mut().visible_lines_and_clock();
+        let matches = crate::quick_select::find_matches_wrapped(&lines, &wraps);
         if matches.is_empty() {
             self.status = String::from("Quick select: nothing to match on screen");
             return;
@@ -24179,6 +24183,11 @@ impl App {
                 len: m.len,
                 text: m.text,
                 label,
+                tail: m
+                    .tail
+                    .iter()
+                    .map(|&(r, s, l)| (top + r as i32, s, l))
+                    .collect(),
             })
             .collect();
         self.push_quick_select_hints(&hints, "", clock);
@@ -24204,12 +24213,26 @@ impl App {
         let spans: Vec<crate::widgets::terminal::HintSpan> = hints
             .iter()
             .filter(|h| h.label.starts_with(typed))
-            .map(|h| crate::widgets::terminal::HintSpan {
-                line: h.line,
-                start: h.start,
-                len: h.len,
-                label: h.label.clone(),
-                typed: typed.len(),
+            .flat_map(|h| {
+                // The head span carries the label glyph; a wrapped match's
+                // tail segments highlight their continuation rows with the
+                // label fully "typed" so no glyph ever paints on them.
+                std::iter::once(crate::widgets::terminal::HintSpan {
+                    line: h.line,
+                    start: h.start,
+                    len: h.len,
+                    label: h.label.clone(),
+                    typed: typed.len(),
+                })
+                .chain(h.tail.iter().map(|&(line, start, len)| {
+                    crate::widgets::terminal::HintSpan {
+                        line,
+                        start,
+                        len,
+                        label: h.label.clone(),
+                        typed: h.label.len(),
+                    }
+                }))
             })
             .collect();
         self.terminal_mut().set_hints(Some(spans), clock);
