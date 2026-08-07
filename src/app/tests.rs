@@ -20157,9 +20157,9 @@ fn finished_commands_land_in_durable_history_and_the_popup_types_them() {
     app.command_history =
         crate::command_history::CommandHistory::load(&tmp.path().join("hist.jsonl"));
     // Full OSC 133 marks around a fake command (B → command text → C →
-    // 0.25s of "runtime" → D;0), then a read so the popup's Enter-typed
+    // 1s of "runtime" → D;0), then a read so the popup's Enter-typed
     // bytes are observable through the shell.
-    let script = "printf '\\033]133;A\\007$ \\033]133;B\\007kubectl get pods\\n\\033]133;C\\007'; sleep 0.25; printf 'out\\n\\033]133;D;0\\007'; read x; echo typed-$x; sleep 30";
+    let script = "printf '\\033]133;A\\007$ \\033]133;B\\007kubectl get pods\\n\\033]133;C\\007'; sleep 1; printf 'out\\n\\033]133;D;0\\007'; read x; echo typed-$x; sleep 30";
     app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
         "/bin/sh",
         &[String::from("-c"), String::from(script)],
@@ -20179,8 +20179,13 @@ fn finished_commands_land_in_durable_history_and_the_popup_types_them() {
         "the typed text travels with the completion"
     );
     assert_eq!(e.exit, Some(0));
+    // The marks are stamped when the reader thread PARSES them, not when
+    // the child wrote them, so under suite load a late pickup of the
+    // pre-sleep chunk shrinks the measured gap (#65). The floor at half
+    // the sleep keeps a wrong-span measurement red while giving scheduler
+    // skew ~10x the largest undershoot ever observed (~55ms).
     assert!(
-        e.dur_ms >= 200,
+        e.dur_ms >= 500,
         "duration must cover the C→D gap, got {}",
         e.dur_ms
     );
