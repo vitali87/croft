@@ -15380,11 +15380,25 @@ mod tests {
             &mut buf,
             image_canvas_bg(InlineImageProtocol::Kitty, themed),
         );
-        assert_eq!(
-            buf[(1, area.height - 1)].bg,
+        // The metadata pill on the first row keeps its explicit bg by design:
+        // the overlay anchors the picture one row BELOW it
+        // (`update_editor_image_overlay` carves off the header row), so the
+        // pill never overlaps the image. Every cell in the picture band under
+        // it must stay default-bg.
+        assert_ne!(
+            buf[(1, area.y)].bg,
             Color::Reset,
-            "every canvas cell must keep the default background or Kitty paints it over the image"
+            "the metadata pill row keeps its own background"
         );
+        for y in area.y + 1..area.bottom() {
+            for x in area.x..area.right() {
+                assert_eq!(
+                    buf[(x, y)].bg,
+                    Color::Reset,
+                    "canvas cell ({x}, {y}) must keep the default background or Kitty paints it over the image"
+                );
+            }
+        }
     }
 
     /// Cmd+K Cmd+T while a preview is open: the preview bakes its colors at
