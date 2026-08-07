@@ -248,6 +248,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `Cmd`+`.` / `Ctrl`+`.` inside a merge conflict | Resolve Merge Conflict picker: Accept Current / Accept Incoming / Accept Both (also Command Palette "Merge Conflict: Accept Current / Incoming / Both"); conflict regions render with VS Code's green (current) / blue (incoming) tints |
 | `F2` | Rename Symbol across every file it touches (open tabs edit in-memory and stay dirty) |
 | `F12` / `Ctrl`+click | Go to Definition (`Shift`+`Ctrl`+click navigates back); `Ctrl` because mouse reports carry no `Cmd` bit and `Option` belongs to multi-cursor |
+| `Ctrl`+`-` | Go Back: return to the location before the last navigation jump (the keyboard twin of `Shift`+`Ctrl`+click; also on the editor right-click menu and as Command Palette "Go Back") |
 | `Shift`+`F12` | Go to References (project-wide; one use jumps, several open a picker) |
 | `Ctrl`+`Shift`+`F12` | Go to Declaration (where the server implements it; hidden for TypeScript) |
 | `Ctrl`+`F12` | Go to Type Definition |

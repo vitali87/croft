@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "The completion popup stays inside its editor pane: when the pane was narrower than the popup (a long Rust or TypeScript symbol in a split), it was pushed left past the pane's edge and painted over the Explorer; a squeezed short pane could likewise leak it over the tab strip.",
+    kind: NoteKind::Feature,
+    summary: "Go Back is now a first-class command: Ctrl+- (the VS Code chord) returns to the location before the last navigation jump, alongside a Command Palette entry and an editor right-click item — it used to be reachable only through the Shift+Ctrl+click mouse chord.",
 }];

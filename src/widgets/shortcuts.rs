@@ -407,6 +407,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_vim_toggle_key",
             },
             ShortcutEntry {
+                keys: "Ctrl+-",
+                description: "Go Back: return to the location before the last navigation jump",
+                handler: "is_navigate_back_key",
+            },
+            ShortcutEntry {
                 keys: "Ctrl+T",
                 description: "Transpose the characters around the cursor",
                 handler: "is_transpose_key",
