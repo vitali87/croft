@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Opening an image or PDF on Ghostty, Kitty, or WezTerm shows the picture again. Since 0.1.665 the preview was transmitted and then hidden behind its own canvas: the canvas cells took an explicit theme background, which the Kitty graphics protocol paints over any image placed at the preview's deep z-layer.",
+    summary: "Running croft's test suite from a shell hosted inside croft no longer fails five pair/collab tests: the session's exported collab seat leaked into every test-built app, so under test the environment read is now inert and the suite is hermetic wherever it is launched.",
 }];

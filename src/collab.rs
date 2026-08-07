@@ -660,8 +660,33 @@ impl CollabChannel {
     ///
     /// [`from_env`]: Self::from_env
     pub fn env_config() -> Option<(std::path::PathBuf, CollabRole)> {
-        let socket = std::path::PathBuf::from(std::env::var_os("CROFT_COLLAB_SOCKET")?);
-        let role = match std::env::var("CROFT_COLLAB_ROLE").ok()?.as_str() {
+        // Hermetic under test: croft exports these vars into its child
+        // shells, so a `cargo test` launched from a croft session handed
+        // every test-built App a live Owner seat — skipping the single-host
+        // lock gate and failing the pair/collab tests that exercise it
+        // (#55). Same treatment as the theme registry's config read. Tests
+        // that want a collab config inject it directly.
+        if cfg!(test) {
+            return None;
+        }
+        Self::env_config_from(
+            std::env::var_os("CROFT_COLLAB_SOCKET"),
+            std::env::var("CROFT_COLLAB_ROLE").ok(),
+        )
+    }
+
+    /// The pure half of [`env_config`]: parse the launch-tail exports.
+    /// Separate so the parsing contract stays testable without touching the
+    /// process environment (in-process `set_var` races sibling test
+    /// threads).
+    ///
+    /// [`env_config`]: Self::env_config
+    fn env_config_from(
+        socket: Option<std::ffi::OsString>,
+        role: Option<String>,
+    ) -> Option<(std::path::PathBuf, CollabRole)> {
+        let socket = std::path::PathBuf::from(socket?);
+        let role = match role?.as_str() {
             "owner" => CollabRole::Owner,
             "guest" => CollabRole::Guest,
             _ => return None,
@@ -1299,6 +1324,60 @@ fn relay_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests must never inherit a live collab seat from the shell that ran
+    /// the suite. Croft exports `CROFT_COLLAB_SOCKET`/`CROFT_COLLAB_ROLE`
+    /// into its child shells, so a `cargo test` launched from a croft
+    /// session (the dogfooding path) used to hand every test-built `App` a
+    /// `Some((_, Owner))` collab config — skipping the single-host lock
+    /// gate and deterministically failing five pair/collab tests (#55).
+    /// Under `cfg(test)` the env read must be inert no matter what the
+    /// environment holds. (Asserted through `env_config` itself rather
+    /// than by mutating the environment: `set_var` races sibling test
+    /// threads, #37.)
+    #[test]
+    fn env_config_is_hermetic_under_test() {
+        assert_eq!(
+            CollabChannel::env_config(),
+            None,
+            "a test-built App must not inherit the launching shell's collab seat"
+        );
+    }
+
+    /// The launch-tail contract `env_config` enforces, pinned through the
+    /// pure parser so the hermetic `cfg(test)` default above can't hide a
+    /// parsing regression: both roles parse, an unknown role is refused
+    /// (forward-compat: a newer launch tail must not seat an old binary in
+    /// a role it doesn't understand), and a missing socket or role means
+    /// "not a collab participant".
+    #[test]
+    fn env_config_parses_the_launch_tail_exports() {
+        let sock = std::ffi::OsString::from("/tmp/collab.sock");
+        assert_eq!(
+            CollabChannel::env_config_from(Some(sock.clone()), Some("owner".into())),
+            Some((
+                std::path::PathBuf::from("/tmp/collab.sock"),
+                CollabRole::Owner
+            )),
+        );
+        assert_eq!(
+            CollabChannel::env_config_from(Some(sock.clone()), Some("guest".into())),
+            Some((
+                std::path::PathBuf::from("/tmp/collab.sock"),
+                CollabRole::Guest
+            )),
+        );
+        assert_eq!(
+            CollabChannel::env_config_from(Some(sock.clone()), Some("navigator".into())),
+            None,
+            "an unrecognized role must refuse the seat, not guess one"
+        );
+        assert_eq!(CollabChannel::env_config_from(Some(sock), None), None);
+        assert_eq!(
+            CollabChannel::env_config_from(None, Some("owner".into())),
+            None
+        );
+    }
 
     /// The defining CRDT property: two replicas that make *concurrent* edits
     /// (each unaware of the other's) and then exchange ops must arrive at the
