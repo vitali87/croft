@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Running croft's test suite from a shell hosted inside croft no longer fails five pair/collab tests: the session's exported collab seat leaked into every test-built app, so under test the environment read is now inert and the suite is hermetic wherever it is launched.",
+    summary: "Running croft's test suite from a shell hosted inside croft no longer opens authenticated connections to the live session host: every test-built app inherited the session's exported socket and token and dialed in as a construction side effect, so under test that environment read is now inert, like the collab seat fixed in 0.1.689.",
 }];

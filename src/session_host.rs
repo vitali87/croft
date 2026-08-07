@@ -763,6 +763,15 @@ impl InnerChannel {
     /// host put in the inner croft's environment; None when not running
     /// under a session host.
     pub fn from_env() -> Option<Self> {
+        // Hermetic under test: the host's exported socket/token pair
+        // reaches a `cargo test` run from a croft-hosted shell, and
+        // connecting here made every test-built App authenticate to the
+        // developer's live session host as a construction side effect
+        // (#60). Same treatment as the collab env read (#55); tests that
+        // want a channel dial a socket they own via [`Self::connect`].
+        if cfg!(test) {
+            return None;
+        }
         let socket = PathBuf::from(std::env::var_os("CROFT_SESSION_SOCKET")?);
         let token = std::env::var("CROFT_SESSION_TOKEN").ok()?;
         Self::connect(&socket, &token)
@@ -914,6 +923,25 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests must never authenticate to the developer's live session host.
+    /// The host puts `CROFT_SESSION_SOCKET`/`CROFT_SESSION_TOKEN` in every
+    /// inner croft's environment, and that environment reaches a `cargo
+    /// test` run from a croft-hosted shell — so each test-built `App` used
+    /// to open a real `UnixStream` to the running host and send the
+    /// `Control::Inner { token }` frame as a construction side effect
+    /// (#60). Under `cfg(test)` the env read must be inert no matter what
+    /// the environment holds; tests that want a channel dial a socket they
+    /// own via `InnerChannel::connect`. (Asserted through `from_env`
+    /// itself rather than by mutating the environment: `set_var` races
+    /// sibling test threads, #37.)
+    #[test]
+    fn from_env_is_hermetic_under_test() {
+        assert!(
+            InnerChannel::from_env().is_none(),
+            "a test-built App must not connect to the launching shell's session host"
+        );
+    }
 
     #[test]
     fn collab_socket_for_mux_swaps_only_the_socket_kind() {
