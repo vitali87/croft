@@ -27866,22 +27866,16 @@ impl App {
                 );
             }
             Ok(SaveOutcome::EncodingLoss) => {
-                let enc = editor.encoding.name();
-                // A format-on-save tab routes EVERY Cmd+S through this
-                // deferred write, so the still-focused case must arm the
-                // press-again consent here or the refusal would loop forever
-                // with no way to accept it.
-                if self.editor.path.as_deref() == Some(path) {
-                    self.prompt_encoding_loss();
-                } else {
-                    // A tab the user moved away from never gets lossy
-                    // consent; resolving needs it back in front of them.
-                    self.status = format!(
-                        "{} not saved: it has characters {} cannot represent - open the tab and press Cmd+S to resolve",
-                        path.display(),
-                        enc
-                    );
-                }
+                // Both callers route a still-focused tab to
+                // `write_current_to_disk`, which arms the press-again consent
+                // itself; this function only ever runs for a tab the user
+                // moved away from, and such a tab never gets lossy consent —
+                // resolving needs it back in front of them.
+                self.status = format!(
+                    "{} not saved: it has characters {} cannot represent - open the tab and press Cmd+S to resolve",
+                    path.display(),
+                    editor.encoding.name()
+                );
             }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
