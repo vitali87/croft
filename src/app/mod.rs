@@ -6914,7 +6914,10 @@ impl App {
                 .unwrap_or(encoding_rs::UTF_8);
             let text = enc.decode(&content).0.into_owned();
             let label = std::path::PathBuf::from(format!("{rel} (local snapshot)"));
-            if let Err(e) = self.editor.open_head_diff_with_text(label, &text, &path, false) {
+            if let Err(e) = self
+                .editor
+                .open_head_diff_with_text(label, &text, &path, false)
+            {
                 self.status = format!("Could not open snapshot diff: {e}");
                 return;
             }
@@ -17889,7 +17892,8 @@ impl App {
         if let Some(idx) = self.terminals.iter().position(|t| {
             t.label() == pane_name
                 && t.foreground_is_shell()
-                && t.kernel_shell_cwd().is_none_or(|cwd| cwd.starts_with(&root))
+                && t.kernel_shell_cwd()
+                    .is_none_or(|cwd| cwd.starts_with(&root))
         }) {
             self.active_terminal = idx;
             self.terminals[idx].write_input(command.as_bytes());
@@ -27564,6 +27568,10 @@ impl App {
             e.dirty
                 && e.path.is_some()
                 && !e.disk_conflict
+                // A latched encoding refusal: only an explicit Cmd+S can
+                // consent to the lossy write, so retrying here would just
+                // re-refuse every tick.
+                && !e.encoding_loss
                 && !(guest
                     && e.path
                         .as_ref()
@@ -27572,6 +27580,9 @@ impl App {
                     .is_some_and(|t| t.elapsed() >= Self::AUTO_SAVE_DELAY)
         };
         let mut conflicted: Vec<PathBuf> = Vec::new();
+        // "name (encoding)" per refused tab: the refusal message names each
+        // tab's OWN encoding, which need not be the active tab's.
+        let mut lossy: Vec<String> = Vec::new();
         let mut sweep = |editors: &mut [crate::widgets::editor::Editor]| {
             for e in editors.iter_mut().filter(|e| due(e)) {
                 // `save_to_disk` re-checks the disk and flags (never
@@ -27588,6 +27599,20 @@ impl App {
                     Ok(crate::widgets::editor::SaveOutcome::DiskConflict) => {
                         conflicted.extend(e.path.clone());
                     }
+                    // Same transition-only reporting as the conflict arm:
+                    // the latch just set removes the tab from `due`, so
+                    // this tick is the one chance to say why it stopped
+                    // saving. Never arms the lossy write — consent is the
+                    // explicit path's alone.
+                    Ok(crate::widgets::editor::SaveOutcome::EncodingLoss) => {
+                        if let Some(name) = e.path.as_ref().and_then(|p| p.file_name()) {
+                            lossy.push(format!(
+                                "{} ({})",
+                                name.to_string_lossy(),
+                                e.encoding.name()
+                            ));
+                        }
+                    }
                     Err(_) => {}
                 }
             }
@@ -27600,10 +27625,20 @@ impl App {
         if had_conflicts {
             self.prompt_disk_conflict(conflicted);
         }
+        let had_lossy = !lossy.is_empty();
+        if had_lossy {
+            // The status line, not the modal prompt: nothing was lost and
+            // nothing is racing, so an auto-save refusal must not steal the
+            // keyboard mid-typing burst.
+            self.status = format!(
+                "Auto save paused for {}: the buffer has characters the encoding cannot represent - open the tab and press Cmd+S to resolve",
+                lossy.join(", ")
+            );
+        }
         if saved_paths.is_empty() {
-            // A conflict-only tick still changed the UI (the prompt is up):
+            // A conflict-only (or refusal-only) tick still changed the UI:
             // returning false would defer it to the next incidental redraw.
-            return had_conflicts;
+            return had_conflicts || had_lossy;
         }
         // Mirror the explicit-save path: a config file written by auto save
         // must take effect exactly like one written by Cmd+S — including one
@@ -27705,14 +27740,26 @@ impl App {
         // Cmd+S overwrites the external change. Consume it here so it never
         // lingers past the press it was meant for.
         if std::mem::take(&mut self.force_save_armed) {
+            use crate::widgets::editor::SaveOutcome;
             match self.editor.save_to_disk_force() {
-                Ok(()) => {
+                Ok(SaveOutcome::Saved) => {
                     self.status = self.editor.status.clone();
                     if let Some(path) = self.editor.path.clone() {
                         self.record_history_snapshot(&path);
                     }
                     self.lsp_notify_saved();
                     self.reload_config_if_needed();
+                }
+                // Overwriting the external change was consented to; mangling
+                // the buffer's characters was not. Route the refusal through
+                // the same prompt-and-rearm as a plain save, keeping the
+                // overwrite consent so the NEXT Cmd+S resolves both at once.
+                Ok(SaveOutcome::EncodingLoss) => {
+                    self.force_save_armed = true;
+                    self.prompt_encoding_loss();
+                }
+                Ok(SaveOutcome::DiskConflict) => {
+                    unreachable!("force save never reports a conflict")
                 }
                 Err(e) => self.status = format!("Save failed: {e}"),
             }
@@ -27830,6 +27877,18 @@ impl App {
                     path.display()
                 );
             }
+            Ok(SaveOutcome::EncodingLoss) => {
+                // Both callers route a still-focused tab to
+                // `write_current_to_disk`, which arms the press-again consent
+                // itself; this function only ever runs for a tab the user
+                // moved away from, and such a tab never gets lossy consent —
+                // resolving needs it back in front of them.
+                self.status = format!(
+                    "{} not saved: it has characters {} cannot represent - open the tab and press Cmd+S to resolve",
+                    path.display(),
+                    editor.encoding.name()
+                );
+            }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
@@ -27857,8 +27916,27 @@ impl App {
                     "{name} changed on disk since you opened it - press Cmd+S again to overwrite, or close the tab to keep the disk version"
                 );
             }
+            Ok(SaveOutcome::EncodingLoss) => self.prompt_encoding_loss(),
             Err(e) => self.status = format!("Save failed: {e}"),
         }
+    }
+
+    /// An explicit save was refused because the encoding cannot represent the
+    /// buffer (`SaveOutcome::EncodingLoss`). Arm the one-shot lossy consent
+    /// and spell out exactly what the next Cmd+S will destroy, mirroring the
+    /// press-again flow of a disk conflict. The alternative exits are the
+    /// same two the refusal preserved: reopen the status-bar encoding picker
+    /// (a clean buffer switches encodings losslessly) or edit the characters
+    /// out.
+    fn prompt_encoding_loss(&mut self) {
+        self.editor.lossy_save_armed = true;
+        let chars = self.editor.unmappable_chars();
+        let shown: String = chars.iter().map(|c| format!("{c} ")).collect();
+        self.status = format!(
+            "Not saved: {} cannot represent {}- press Cmd+S again to replace them with &#…; references (irreversible), or switch encoding via the status bar",
+            self.editor.encoding.name(),
+            shown
+        );
     }
 
     /// Whether an open context menu (or its submenu panel) overlaps `rect`

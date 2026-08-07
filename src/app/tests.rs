@@ -4526,7 +4526,12 @@ fn hunk_actions_refuse_a_timeline_snapshot_diff() {
     std::fs::write(&path, "new\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor
-        .open_head_diff_with_text(PathBuf::from("a.txt (local snapshot)"), "old\n", &path, false)
+        .open_head_diff_with_text(
+            PathBuf::from("a.txt (local snapshot)"),
+            "old\n",
+            &path,
+            false,
+        )
         .unwrap();
     app.stage_hunk_at_caret();
     assert_eq!(
@@ -4551,8 +4556,7 @@ fn workspace_symbol_queries_debounce_instead_of_firing_per_keystroke() {
     std::thread::sleep(std::time::Duration::from_millis(250));
     app.workspace_symbols_dispatch_due();
     assert!(
-        app.ws_symbols_request_id.is_some()
-            || app.workspace_symbols.as_ref().unwrap().unsupported,
+        app.ws_symbols_request_id.is_some() || app.workspace_symbols.as_ref().unwrap().unsupported,
         "the settled query must dispatch (or surface no-LSP) after the window"
     );
 }
@@ -4571,7 +4575,9 @@ fn a_reply_to_a_superseded_workspace_symbol_query_is_dropped() {
     app.workspace_symbols_requery();
     std::thread::sleep(std::time::Duration::from_millis(250));
     app.workspace_symbols_dispatch_due();
-    let id = app.ws_symbols_request_id.expect("the settled query dispatched");
+    let id = app
+        .ws_symbols_request_id
+        .expect("the settled query dispatched");
     if let Some(p) = app.workspace_symbols.as_mut() {
         p.query.push('b');
     }
@@ -18995,6 +19001,11 @@ fn reordering_panes_defers_the_session_write_off_the_input_path() {
     // write is marked and flushed once per tick instead.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The test-mode session path is per PROCESS, shared by every test in
+    // this binary: a concurrent test's save would recreate the file between
+    // the remove below and the non-existence assert. Absence is only
+    // provable on a path this test owns alone.
+    app.terminal_session_path = tmp.path().join("terminal-sessions.json");
     app.split_terminal().unwrap();
     let _ = std::fs::remove_file(&app.terminal_session_path);
     app.move_terminal(0, 1);
@@ -19002,7 +19013,10 @@ fn reordering_panes_defers_the_session_write_off_the_input_path() {
         !app.terminal_session_path.exists(),
         "the session write must not sit on the input path"
     );
-    assert!(app.terminal_session_dirty, "the move is recorded as pending");
+    assert!(
+        app.terminal_session_dirty,
+        "the move is recorded as pending"
+    );
     app.flush_terminal_session();
     assert!(
         app.terminal_session_path.exists(),
@@ -19473,6 +19487,119 @@ fn auto_save_surfaces_a_disk_conflict_instead_of_latching_silently() {
         app.input_prompt.is_some() || app.status.to_lowercase().contains("conflict"),
         "the collision must be surfaced, not swallowed; status: {:?}",
         app.status
+    );
+}
+
+#[test]
+fn explicit_save_prompts_before_a_lossy_encoding_write_then_second_press_consents() {
+    // Issue #41: encoding_rs substitutes HTML numeric character references
+    // (not `?`) for unmappable characters, so an unguarded save silently
+    // rewrites 日本語 as `&#26085;…` on disk while the buffer looks fine.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "plain");
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    app.editor.lines = vec![String::from("日本語 costs 5€")];
+    app.editor.dirty = true;
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+        "plain",
+        "the first Cmd+S must refuse, leaving the file untouched"
+    );
+    assert!(
+        app.status.contains("windows-1252") && app.status.contains('日'),
+        "the refusal must name the encoding and the doomed characters; status: {:?}",
+        app.status
+    );
+    assert!(
+        app.editor.lossy_save_armed,
+        "the refusal arms the second press"
+    );
+    app.save();
+    assert_eq!(
+        std::fs::read(tmp.path().join("a.txt")).unwrap(),
+        b"&#26085;&#26412;&#35486; costs 5\x80",
+        "the second Cmd+S is explicit consent to the lossy write"
+    );
+    assert!(!app.editor.dirty, "the consented save completes normally");
+}
+
+#[test]
+fn an_edit_between_refusal_and_consent_forces_a_fresh_prompt() {
+    // The first Cmd+S arms the second — but consent named the characters the
+    // buffer held at prompt time. Typing in between changes what the write
+    // would destroy, so the next Cmd+S must refuse and re-prompt (now naming
+    // the new character too), and only the press after that writes.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "plain");
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    app.editor.lines = vec![String::from("日")];
+    app.editor.dirty = true;
+    app.save();
+    assert!(
+        app.editor.lossy_save_armed,
+        "the refusal arms the second press"
+    );
+    app.editor.insert_char('語');
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+        "plain",
+        "the edit revoked the consent, so this press must refuse again"
+    );
+    assert!(
+        app.status.contains('語'),
+        "the fresh prompt must name the newly typed character; status: {:?}",
+        app.status
+    );
+    app.save();
+    assert_eq!(
+        std::fs::read(tmp.path().join("a.txt")).unwrap(),
+        b"&#35486;&#26085;",
+        "consent given after the prompt that named both characters writes"
+    );
+}
+
+#[test]
+fn auto_save_surfaces_an_encoding_refusal_instead_of_latching_silently() {
+    // The same latch-and-tell contract as the disk-conflict arm: the refusal
+    // removes the tab from due(), so the transition tick must both redraw
+    // and say why auto save stopped — and must never write the mangled bytes.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "plain");
+    app.auto_save = true;
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    app.editor.lines = vec![String::from("日本語")];
+    app.editor.dirty = true;
+    age_last_edit(&mut app.editor);
+    assert!(
+        app.tick_auto_save(),
+        "a refusal-only tick must signal a redraw so the message shows now"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+        "plain",
+        "auto save must never write the substituted bytes"
+    );
+    assert!(app.editor.encoding_loss, "the refusal latches");
+    assert!(
+        !app.editor.lossy_save_armed,
+        "auto save must never consent to the lossy write on the user's behalf"
+    );
+    assert!(
+        app.status.contains("a.txt") && app.status.contains("windows-1252"),
+        "the stall must be surfaced with the tab and its encoding; status: {:?}",
+        app.status
+    );
+    assert!(
+        !app.tick_auto_save(),
+        "the latch keeps later ticks quiet instead of re-refusing every second"
     );
 }
 
@@ -24404,7 +24531,10 @@ fn a_test_name_click_jumps_to_source_via_the_background_locator() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         app.sync_explorer_panels();
-        if app.status.contains("No source found for test nope::missing") {
+        if app
+            .status
+            .contains("No source found for test nope::missing")
+        {
             break;
         }
         assert!(
