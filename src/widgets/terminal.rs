@@ -4670,22 +4670,40 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             waited += 20;
         }
+        // Stage the decoy: the shim's own prompt-time OSC 7 reports the
+        // shell's real cwd (the tempdir), so `shell_cwd()` is `Some` long
+        // before the forged claim exists — an `is_some()` stage exits on
+        // this report and reads the wrong value (#69).
+        let mut waited = 0u32;
+        while waited < 4000 && term.shell_cwd().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
         // A foreground job (the ssh stand-in) prints an OSC 7 claiming
-        // this machine's own hostname.
+        // this machine's own hostname. It sleeps BEFORE printing, so the
+        // tty is lost to the job well before the claim can be parsed —
+        // deterministically the ordering that flaked under suite load.
         term.write_input(
-            format!("printf '\\033]7;file://{local}/tmp\\007'; sleep 10\n").as_bytes(),
+            format!("sleep 0.5; printf '\\033]7;file://{local}/tmp\\007'; sleep 10\n").as_bytes(),
         );
         let mut waited = 0u32;
-        while waited < 4000 && (term.foreground_is_shell() || term.shell_cwd().is_none()) {
+        while waited < 4000 && term.foreground_is_shell() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(!term.foreground_is_shell(), "staging: a job owns the tty");
+        // Wait for the claim ITSELF: any earlier `Some` is the decoy.
+        let claim = std::path::PathBuf::from("/tmp");
+        let mut waited = 0u32;
+        while waited < 6000 && term.shell_cwd().as_deref() != Some(claim.as_path()) {
             std::thread::sleep(std::time::Duration::from_millis(20));
             waited += 20;
         }
         assert_eq!(
             term.shell_cwd(),
-            Some(std::path::PathBuf::from("/tmp")),
+            Some(claim),
             "staging: the claim was captured"
         );
-        assert!(!term.foreground_is_shell(), "staging: a job owns the tty");
         assert_eq!(
             term.local_shell_cwd(),
             None,
