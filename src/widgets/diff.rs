@@ -195,7 +195,10 @@ impl DiffData {
         let side_meta = |raw: Option<&str>, lines: usize| -> (Vec<bool>, bool) {
             match raw {
                 Some(t) => (
-                    t.split('\n').take(lines).map(|l| l.ends_with('\r')).collect(),
+                    t.split('\n')
+                        .take(lines)
+                        .map(|l| l.ends_with('\r'))
+                        .collect(),
                     !t.is_empty() && !t.ends_with('\n'),
                 ),
                 None => (Vec::new(), false),
@@ -985,11 +988,19 @@ impl DiffData {
         // rejects every hunk that reaches the end of such a file.
         const NO_NL: &str = "\\ No newline at end of file";
         let left_line = |sig: char, i: usize| {
-            let cr = if self.left_crlf.get(i).copied().unwrap_or(false) { "\r" } else { "" };
+            let cr = if self.left_crlf.get(i).copied().unwrap_or(false) {
+                "\r"
+            } else {
+                ""
+            };
             format!("{sig}{}{cr}", self.left_lines[i])
         };
         let right_line = |sig: char, i: usize| {
-            let cr = if self.right_crlf.get(i).copied().unwrap_or(false) { "\r" } else { "" };
+            let cr = if self.right_crlf.get(i).copied().unwrap_or(false) {
+                "\r"
+            } else {
+                ""
+            };
             format!("{sig}{}{cr}", self.right_lines[i])
         };
         let left_last = |i: usize| i + 1 == self.left_lines.len() && self.left_no_final_nl;
