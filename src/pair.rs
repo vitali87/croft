@@ -2236,7 +2236,10 @@ mod tests {
         }
 
         fn wait_until(&self, what: &str, mut cond: impl FnMut(&Self) -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // A liveness backstop, generous on purpose: the python3 helper
+            // and relay round trips race the parallel suite's load (#47),
+            // and a tight ceiling here measured the machine, not croft.
+            let deadline = Instant::now() + Duration::from_secs(60);
             while !cond(self) {
                 assert!(Instant::now() < deadline, "timed out waiting for {what}");
                 std::thread::sleep(Duration::from_millis(10));
@@ -2440,7 +2443,7 @@ mod tests {
         let state = host.state_for_tests().expect("pilot state");
         // Wait until the PILOT finished the turn (its reader cleared the
         // latch); the App has not polled yet.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while state.lock().unwrap().turn_active() {
             assert!(Instant::now() < deadline, "the fake turn never finished");
             std::thread::sleep(Duration::from_millis(5));
@@ -3382,7 +3385,7 @@ mod tests {
         send_turn(&pilot.state, &pilot.sink, "fix demo.txt").unwrap();
         let end = pilot
             .turn_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(60))
             .expect("turn ends");
         assert!(!end.is_error && !end.cancelled, "{}", end.text);
         server.join().unwrap();
@@ -3565,8 +3568,9 @@ mod tests {
             h.doc().as_deref() == Some("hello streamed edit")
         });
         // The pilot's REPL input is already at EOF; once the turn ends it
-        // must return promptly despite the child sleeping for 60s.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // must return promptly despite the child sleeping for 60s — half
+        // that sleep keeps the discriminant while absorbing suite load.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !pilot.is_finished() {
             assert!(
                 Instant::now() < deadline,
@@ -4099,7 +4103,7 @@ mod tests {
             crate::pair_host::PairHost::spawn_cmd(&harness.socket, "navigator", None, cmd).unwrap();
         host.send_task("@demo.txt look this over").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut events: Vec<crate::pair_host::PairEvent> = Vec::new();
         while !events
             .iter()
@@ -4233,7 +4237,7 @@ mod tests {
             crate::pair_host::PairHost::spawn_cmd(&harness.socket, "nav", None, cmd).unwrap();
         host.send_task("@demo.txt look this over").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !host
             .poll()
             .iter()
@@ -4312,7 +4316,7 @@ mod tests {
         // Drive one turn so the child reaches its sleep (ignoring stdin EOF).
         host.send_ask_turn("demo.txt", (0, 0), "", "do a thing", "line zero\nline one")
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !host
             .poll()
             .iter()
@@ -4438,7 +4442,7 @@ mod tests {
             crate::pair_host::PairHost::spawn_cmd(&harness.socket, "navigator", None, cmd).unwrap();
         host.send_yield_turn("demo.txt", "hello world").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut events: Vec<crate::pair_host::PairEvent> = Vec::new();
         while !events
             .iter()

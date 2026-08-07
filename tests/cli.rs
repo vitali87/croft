@@ -39,7 +39,7 @@ fn setup_terminal_help_works() {
 fn probe_subcommands_answer_instantly_even_with_a_stripped_path() {
     let dir = tempfile::tempdir().unwrap();
     let slow_shell = dir.path().join("slow-shell");
-    std::fs::write(&slow_shell, "#!/bin/sh\nsleep 10\n").unwrap();
+    std::fs::write(&slow_shell, "#!/bin/sh\nsleep 30\n").unwrap();
     let mut perm = std::fs::metadata(&slow_shell).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
     std::fs::set_permissions(&slow_shell, perm).unwrap();
@@ -52,12 +52,14 @@ fn probe_subcommands_answer_instantly_even_with_a_stripped_path() {
             .env("SHELL", &slow_shell)
             .assert()
             .success();
-        // The discriminant is the 10s sleeping shell: a probe that runs the
+        // The discriminant is the 30s sleeping shell: a probe that runs the
         // PATH repair blocks on it, one that early-outs answers in well
-        // under a second. 5s tolerates a loaded box without ever passing
-        // the failure mode.
+        // under a second. The measured span also covers the cargo_bin
+        // spawn, which a suite-saturated box once pushed past a 5s ceiling
+        // (#50) — half the sleep keeps the failure mode unreachable while
+        // giving load an order of magnitude more headroom.
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
+            start.elapsed() < std::time::Duration::from_secs(15),
             "{sub} --probe took {:?} with a stripped PATH",
             start.elapsed()
         );
