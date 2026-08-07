@@ -378,8 +378,16 @@ fn broadcast(host: &Host, frame: &[u8]) -> bool {
     let pruned = {
         let mut clients = host.clients.lock().unwrap();
         let before = clients.len();
-        let deadline = Instant::now() + WRITE_FRAME_DEADLINE;
-        clients.retain(|c| write_frame_bounded(&mut c.tx.lock().unwrap(), frame, deadline));
+        // A fresh deadline PER CLIENT: retain visits them sequentially,
+        // and a shared deadline consumed by one wedged peer would evict
+        // every healthy client after it without a single write attempted.
+        clients.retain(|c| {
+            write_frame_bounded(
+                &mut c.tx.lock().unwrap(),
+                frame,
+                Instant::now() + WRITE_FRAME_DEADLINE,
+            )
+        });
         clients.len() != before
     };
     if pruned {
@@ -656,34 +664,63 @@ pub fn attach_or_create(socket: &Path, workspace: Option<&Path>, inner: &[String
     }
 }
 
-/// SIGTERM every process whose command line names this session's socket
-/// (the server's argv carries `--socket <path>`, unique per session), then
-/// wait for the socket to die, unlinking leftovers. `pgrep -f` because a
-/// pre-0.1.698 server offers no remote-exit verb and no recorded pid.
+/// Terminate this session's server: candidates come from one `ps` listing
+/// (portable to macOS, which has no /proc), gated by LITERAL substring
+/// checks — the command line must name both `session-host` and this exact
+/// socket path — so an attached client, a shell that echoed the path, or a
+/// regex metacharacter in the path can never widen the match the way a
+/// bare `pgrep -f <path>` did. SIGTERM first; a server still alive at the
+/// deadline gets SIGKILL (its inner croft sees the PTY master close and
+/// exits). The socket and sidecars are unlinked only once the server is
+/// actually dead — unlinking a live server's socket would orphan it and
+/// its inner croft forever, invisible to every future attach.
 fn kill_stale_server(socket: &Path) {
     let me = std::process::id();
-    if let Ok(out) = std::process::Command::new("pgrep")
-        .arg("-f")
-        .arg(socket.as_os_str())
-        .output()
-    {
-        for pid in String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .filter_map(|t| t.parse::<u32>().ok())
-            .filter(|&pid| pid != me)
-        {
+    let socket_str = socket.to_string_lossy();
+    let candidates = |socket_str: &str| -> Vec<u32> {
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-eo", "pid=,command="])
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim_start();
+                let (pid, cmd) = line.split_once(' ')?;
+                let pid: u32 = pid.parse().ok()?;
+                (pid != me && cmd.contains("session-host") && cmd.contains(socket_str))
+                    .then_some(pid)
+            })
+            .collect()
+    };
+    for (sig, wait) in [
+        (libc::SIGTERM, Duration::from_secs(5)),
+        (libc::SIGKILL, Duration::from_secs(2)),
+    ] {
+        let pids = candidates(&socket_str);
+        if pids.is_empty() && !crate::session::is_alive(socket) {
+            break;
+        }
+        for pid in pids {
             unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                libc::kill(pid as libc::pid_t, sig);
             }
         }
+        let deadline = Instant::now() + wait;
+        while crate::session::is_alive(socket) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !crate::session::is_alive(socket) {
+            break;
+        }
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while crate::session::is_alive(socket) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(25));
+    if !crate::session::is_alive(socket) {
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_file(presence_path(socket));
+        crate::session::remove_meta(socket);
     }
-    let _ = std::fs::remove_file(socket);
-    let _ = std::fs::remove_file(presence_path(socket));
-    crate::session::remove_meta(socket);
 }
 
 /// The argv (after the croft binary itself) that runs a detached server for
@@ -768,15 +805,19 @@ fn mismatch_banner(server: Option<&str>, client: &str) -> String {
         Some(v) => format!("croft {v}"),
         None => String::from("pre-0.1.698 (reports no version)"),
     };
-    format!(
-        "
-croft session version mismatch
-           session server: {server}
-           this croft:     croft {client}
-         The session may render incorrectly until the server is restarted.
-         [C] continue anyway   [R] restart session (its terminals die)   [any other key] detach
-"
-    )
+    // Joined with explicit CRLFs: raw mode disables ONLCR, so a bare LF
+    // staircases — and a multi-line string literal carries the source
+    // file's LFs, which is exactly what rustfmt turns escapes into.
+    [
+        "",
+        "croft session version mismatch",
+        &format!("  session server: {server}"),
+        &format!("  this croft:     croft {client}"),
+        "The session may render incorrectly until the server is restarted.",
+        "[C] continue anyway   [R] restart session (its terminals die)   [any other key] detach",
+        "",
+    ]
+    .join("\r\n")
 }
 
 pub fn attach_client(socket: &Path) -> Result<PumpOutcome> {
@@ -859,7 +900,15 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
         drop(out);
         let mut key = [0u8; 1];
         let n = std::io::stdin().lock().read(&mut key).unwrap_or(0);
-        match mismatch_action(if n == 1 { key[0] } else { 0 }) {
+        // A closed or non-tty stdin (piped attach, headless CI) cannot
+        // answer: continue, the pre-banner behavior, rather than silently
+        // exiting 0 as if the session ended.
+        if n == 0 {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(b"stdin closed; continuing\r\n");
+            let _ = out.flush();
+        }
+        match mismatch_action(if n == 1 { key[0] } else { b'c' }) {
             MismatchAction::Continue => {}
             MismatchAction::Restart => {
                 let _ = tx
@@ -1592,6 +1641,11 @@ mod tests {
         let banner = mismatch_banner(Some("0.1.638"), "0.1.698");
         assert!(banner.contains("0.1.638") && banner.contains("0.1.698"));
         assert!(banner.contains("[C]") && banner.contains("[R]"));
+        assert!(
+            !banner.replace("\r\n", "").contains('\n'),
+            "raw mode disables ONLCR: every newline must be CRLF or the \
+             banner staircases"
+        );
         let old = mismatch_banner(None, "0.1.698");
         assert!(
             old.contains("reports no version"),
