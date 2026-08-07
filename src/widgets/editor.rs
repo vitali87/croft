@@ -2025,6 +2025,14 @@ impl Editor {
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
         self.occurrences.clear();
+        // Lossy-save consent named the unmappable characters the buffer held
+        // when the prompt fired; an edit changes what a write would destroy,
+        // so stale consent must not carry over (unlike `force_save_armed`,
+        // whose overwrite consent is about the DISK state, which typing does
+        // not touch). Clearing the latch also lets auto save retry a buffer
+        // the user fixed by deleting the offending characters.
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
     }
 
     /// Install (or clear) the git-gutter HEAD baseline for `path`. The app
@@ -13730,6 +13738,36 @@ mod tests {
         e.reopen_with_encoding(encoding_rs::UTF_8).unwrap();
         assert!(!e.encoding_loss);
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+    }
+
+    /// Armed consent covers the buffer the prompt described. An edit changes
+    /// what the write would destroy, so it must revoke the stale consent (and
+    /// the auto-save latch) and make the next save prompt afresh — otherwise
+    /// characters typed after the prompt get mangled under a consent that
+    /// never named them.
+    #[test]
+    fn an_edit_after_a_lossy_refusal_revokes_the_armed_consent() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "cafe\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
+        e.lines = vec![String::from("日")];
+        e.dirty = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::EncodingLoss);
+        e.lossy_save_armed = true; // the app arms the second Cmd+S...
+        e.insert_char('本'); // ...but the user edits instead of pressing it
+        assert!(!e.lossy_save_armed, "an edit revokes the stale consent");
+        assert!(
+            !e.encoding_loss,
+            "the latch clears too, so a fixed-up buffer resumes auto save"
+        );
+        assert_eq!(
+            e.save_to_disk().unwrap(),
+            SaveOutcome::EncodingLoss,
+            "the next save must prompt again for the changed buffer"
+        );
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "cafe\n");
     }
 
     #[test]

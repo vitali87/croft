@@ -77,8 +77,9 @@ src/
 │   │                    A save whose encoding cannot represent the buffer is REFUSED (`SaveOutcome::EncodingLoss`): `encoding_rs` substitutes
 │   │                    HTML numeric character references (`&#26085;`), not `?`, so the write would be silent irreversible loss. The refusal
 │   │                    latches (`encoding_loss`, so auto save stops retrying) and the explicit path arms a one-shot consent
-│   │                    (`lossy_save_armed`): the second Cmd+S — told which characters are doomed — writes the substitutions. Force save
-│   │                    (disk-conflict overwrite) does NOT bypass the guard; only the armed consent does.
+│   │                    (`lossy_save_armed`): the second Cmd+S — told which characters are doomed — writes the substitutions. Any edit revokes
+│   │                    both flags (`mark_buffer_changed`): consent named the characters at prompt time, so a changed buffer re-prompts. Force
+│   │                    save (disk-conflict overwrite) does NOT bypass the guard; only the armed consent does.
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
 │   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
 │   ├── click.rs         double / triple click detection

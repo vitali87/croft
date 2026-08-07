@@ -19455,6 +19455,44 @@ fn explicit_save_prompts_before_a_lossy_encoding_write_then_second_press_consent
 }
 
 #[test]
+fn an_edit_between_refusal_and_consent_forces_a_fresh_prompt() {
+    // The first Cmd+S arms the second — but consent named the characters the
+    // buffer held at prompt time. Typing in between changes what the write
+    // would destroy, so the next Cmd+S must refuse and re-prompt (now naming
+    // the new character too), and only the press after that writes.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "plain");
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    app.editor.lines = vec![String::from("日")];
+    app.editor.dirty = true;
+    app.save();
+    assert!(
+        app.editor.lossy_save_armed,
+        "the refusal arms the second press"
+    );
+    app.editor.insert_char('語');
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+        "plain",
+        "the edit revoked the consent, so this press must refuse again"
+    );
+    assert!(
+        app.status.contains('語'),
+        "the fresh prompt must name the newly typed character; status: {:?}",
+        app.status
+    );
+    app.save();
+    assert_eq!(
+        std::fs::read(tmp.path().join("a.txt")).unwrap(),
+        b"&#35486;&#26085;",
+        "consent given after the prompt that named both characters writes"
+    );
+}
+
+#[test]
 fn auto_save_surfaces_an_encoding_refusal_instead_of_latching_silently() {
     // The same latch-and-tell contract as the disk-conflict arm: the refusal
     // removes the tab from due(), so the transition tick must both redraw
