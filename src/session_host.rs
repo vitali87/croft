@@ -39,7 +39,16 @@ pub const FRAME_CONTROL: u8 = 1;
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Control {
     /// First message a client must send: identity and terminal size.
-    Hello { name: String, cols: u16, rows: u16 },
+    /// `version` is the client's crate version (#53); pre-0.1.698 clients
+    /// never send it (`default` keeps their Hello parsing) and pre-0.1.698
+    /// servers ignore the unknown field (compact JSON tolerates extras).
+    Hello {
+        name: String,
+        cols: u16,
+        rows: u16,
+        #[serde(default)]
+        version: String,
+    },
     /// Client terminal was resized.
     Resize { cols: u16, rows: u16 },
     /// Host to clients: the current participant roster.
@@ -63,6 +72,13 @@ pub enum Control {
     /// pump exits as on a detach). Honored from a control-holding client or
     /// the inner channel.
     Kick { id: u64 },
+    /// Host to the registering client, directly after its Hello (#53):
+    /// the server's crate version, so the client can detect skew against a
+    /// long-lived server that survived binary upgrades. Pre-0.1.698
+    /// servers never send it, which the client detects by timeout;
+    /// pre-0.1.698 clients skip the unknown variant (the frame decoder
+    /// drops malformed control payloads without poisoning the stream).
+    ServerHello { version: String },
     /// Host to privileged channels only: participant `id` is now the one
     /// typing (sent when the writing client changes, not per keystroke).
     /// Ordered before that client's bytes reach the PTY, so the inner croft
@@ -350,12 +366,35 @@ pub(crate) fn serve_with_token(
 }
 
 /// Write `frame` to every connected client, pruning the ones whose
-/// connection died. Returns whether any client was pruned.
+/// connection died — including a WEDGED one (#53): a `kill -STOP`ped
+/// client stops draining, its socket buffer fills, and a plain `write_all`
+/// here blocked the PTY pump forever while holding the clients lock,
+/// starving every other client and every future attach. The bounded write
+/// treats a peer that drains nothing for [`WRITE_FRAME_DEADLINE`] as gone.
+/// After any prune the shared size and roster are recomputed, so a dead
+/// ghost releases the min winsize it was pinning. Returns whether any
+/// client was pruned.
 fn broadcast(host: &Host, frame: &[u8]) -> bool {
-    let mut clients = host.clients.lock().unwrap();
-    let before = clients.len();
-    clients.retain(|c| c.tx.lock().unwrap().write_all(frame).is_ok());
-    clients.len() != before
+    let pruned = {
+        let mut clients = host.clients.lock().unwrap();
+        let before = clients.len();
+        // A fresh deadline PER CLIENT: retain visits them sequentially,
+        // and a shared deadline consumed by one wedged peer would evict
+        // every healthy client after it without a single write attempted.
+        clients.retain(|c| {
+            write_frame_bounded(
+                &mut c.tx.lock().unwrap(),
+                frame,
+                Instant::now() + WRITE_FRAME_DEADLINE,
+            )
+        });
+        clients.len() != before
+    };
+    if pruned {
+        apply_winsize(host, false);
+        update_presence(host);
+    }
+    pruned
 }
 
 /// Resize the PTY to the minimum size across clients. `force_repaint`
@@ -366,10 +405,7 @@ fn broadcast(host: &Host, frame: &[u8]) -> bool {
 fn apply_winsize(host: &Host, force_repaint: bool) {
     let target = {
         let clients = host.clients.lock().unwrap();
-        match min_winsize(clients.iter().map(|c| (c.cols, c.rows))) {
-            Some(t) => t,
-            None => return,
-        }
+        min_winsize(clients.iter().map(|c| (c.cols, c.rows)))
     };
     let mut last = host.last_size.lock().unwrap();
     let master = host.master.lock().unwrap();
@@ -379,12 +415,23 @@ fn apply_winsize(host: &Host, force_repaint: bool) {
         pixel_width: 0,
         pixel_height: 0,
     };
-    if *last != target {
-        let _ = master.resize(size(target.0, target.1));
-        *last = target;
-    } else if force_repaint {
-        let _ = master.resize(size(target.0, target.1.saturating_sub(1).max(1)));
-        let _ = master.resize(size(target.0, target.1));
+    match target {
+        Some(target) if *last != target => {
+            let _ = master.resize(size(target.0, target.1));
+            *last = target;
+        }
+        // The jiggle runs at the CURRENT size whenever a repaint was asked
+        // for, even with no sized client connected (#53): an attach from a
+        // 0x0 PTY (`script`, headless CI) used to return before this
+        // branch, so an observer-only attach never produced a Resize and
+        // the inner croft never repainted — a blank screen with a blinking
+        // cursor and no way to recover.
+        _ if force_repaint => {
+            let (cols, rows) = *last;
+            let _ = master.resize(size(cols, rows.saturating_sub(1).max(1)));
+            let _ = master.resize(size(cols, rows));
+        }
+        _ => {}
     }
 }
 
@@ -450,9 +497,18 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                             .write_all(&encode_control_frame(&Control::Typing { id }));
                     }
                 }
-                Frame::Control(Control::Hello { name, cols, rows })
-                    if my_id.is_none() && !privileged =>
-                {
+                Frame::Control(Control::Hello {
+                    name, cols, rows, ..
+                }) if my_id.is_none() && !privileged => {
+                    // Answer with our version FIRST: registration below makes
+                    // this client a broadcast target, and the ServerHello must
+                    // beat any PTY bytes so the attaching client's version
+                    // phase ends on the first frame (#53).
+                    let _ = tx.lock().unwrap().write_all(&encode_control_frame(
+                        &Control::ServerHello {
+                            version: String::from(env!("CARGO_PKG_VERSION")),
+                        },
+                    ));
                     let id = host.next_id.fetch_add(1, Ordering::Relaxed);
                     my_id = Some(id);
                     {
@@ -585,17 +641,86 @@ fn kick(host: &Host, privileged: bool, requester: Option<u64>, target: u64) {
 /// dtach `-A` semantics: attach the session on `socket` if it is alive,
 /// otherwise spawn a detached server for `inner` first, then attach.
 pub fn attach_or_create(socket: &Path, workspace: Option<&Path>, inner: &[String]) -> Result<i32> {
-    if !crate::session::is_alive(socket) {
-        spawn_detached_server(socket, workspace, inner)?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !crate::session::is_alive(socket) {
-            if Instant::now() > deadline {
-                anyhow::bail!("session host did not start on {}", socket.display());
+    loop {
+        if !crate::session::is_alive(socket) {
+            spawn_detached_server(socket, workspace, inner)?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !crate::session::is_alive(socket) {
+                if Instant::now() > deadline {
+                    anyhow::bail!("session host did not start on {}", socket.display());
+                }
+                std::thread::sleep(Duration::from_millis(25));
             }
-            std::thread::sleep(Duration::from_millis(25));
+        }
+        match attach_client(socket)? {
+            PumpOutcome::Exit(code) => return Ok(code),
+            // The user chose R on the version-mismatch banner (#53): kill
+            // the stale server and loop — the respawn above starts a server
+            // of THIS binary's version, so the next attach matches.
+            PumpOutcome::RestartRequested => {
+                kill_stale_server(socket);
+            }
         }
     }
-    attach_client(socket)
+}
+
+/// Terminate this session's server: candidates come from one `ps` listing
+/// (portable to macOS, which has no /proc), gated by LITERAL substring
+/// checks — the command line must name both `session-host` and this exact
+/// socket path — so an attached client, a shell that echoed the path, or a
+/// regex metacharacter in the path can never widen the match the way a
+/// bare `pgrep -f <path>` did. SIGTERM first; a server still alive at the
+/// deadline gets SIGKILL (its inner croft sees the PTY master close and
+/// exits). The socket and sidecars are unlinked only once the server is
+/// actually dead — unlinking a live server's socket would orphan it and
+/// its inner croft forever, invisible to every future attach.
+fn kill_stale_server(socket: &Path) {
+    let me = std::process::id();
+    let socket_str = socket.to_string_lossy();
+    let candidates = |socket_str: &str| -> Vec<u32> {
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-eo", "pid=,command="])
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim_start();
+                let (pid, cmd) = line.split_once(' ')?;
+                let pid: u32 = pid.parse().ok()?;
+                (pid != me && cmd.contains("session-host") && cmd.contains(socket_str))
+                    .then_some(pid)
+            })
+            .collect()
+    };
+    for (sig, wait) in [
+        (libc::SIGTERM, Duration::from_secs(5)),
+        (libc::SIGKILL, Duration::from_secs(2)),
+    ] {
+        let pids = candidates(&socket_str);
+        if pids.is_empty() && !crate::session::is_alive(socket) {
+            break;
+        }
+        for pid in pids {
+            unsafe {
+                libc::kill(pid as libc::pid_t, sig);
+            }
+        }
+        let deadline = Instant::now() + wait;
+        while crate::session::is_alive(socket) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !crate::session::is_alive(socket) {
+            break;
+        }
+    }
+    if !crate::session::is_alive(socket) {
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_file(presence_path(socket));
+        crate::session::remove_meta(socket);
+    }
 }
 
 /// The argv (after the croft binary itself) that runs a detached server for
@@ -642,7 +767,60 @@ fn spawn_detached_server(socket: &Path, workspace: Option<&Path>, inner: &[Strin
 /// (0 on detach). Deliberately does nothing else to the terminal: every
 /// mode change (alt screen, mouse, Kitty flags) belongs to the inner croft
 /// and passes through as bytes, exactly as under dtach.
-pub fn attach_client(socket: &Path) -> Result<i32> {
+/// How one attach ended: the session finished (or the client detached),
+/// or the user chose to restart a version-skewed session (#53).
+pub enum PumpOutcome {
+    Exit(i32),
+    RestartRequested,
+}
+
+/// How long the client waits for [`Control::ServerHello`] after its Hello.
+/// A matching server answers in the same scheduling quantum (the reply is
+/// written before the client is even registered for broadcasts); only a
+/// pre-0.1.698 server stays silent, so expiry means "old server", not
+/// "slow server" — and the attach still proceeds after the banner, so the
+/// cost of a false positive is one keypress, never a refused attach.
+const SERVER_HELLO_DEADLINE: Duration = Duration::from_secs(2);
+
+/// What the user chose on the version-mismatch banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MismatchAction {
+    Continue,
+    Restart,
+    Detach,
+}
+
+fn mismatch_action(key: u8) -> MismatchAction {
+    match key {
+        b'c' | b'C' => MismatchAction::Continue,
+        b'r' | b'R' => MismatchAction::Restart,
+        _ => MismatchAction::Detach,
+    }
+}
+
+/// The plain-text banner for a version-skewed attach: visible, actionable,
+/// never a silent blank screen (#53). Raw mode is active, hence the CRLFs.
+fn mismatch_banner(server: Option<&str>, client: &str) -> String {
+    let server = match server {
+        Some(v) => format!("croft {v}"),
+        None => String::from("pre-0.1.698 (reports no version)"),
+    };
+    // Joined with explicit CRLFs: raw mode disables ONLCR, so a bare LF
+    // staircases — and a multi-line string literal carries the source
+    // file's LFs, which is exactly what rustfmt turns escapes into.
+    [
+        "",
+        "croft session version mismatch",
+        &format!("  session server: {server}"),
+        &format!("  this croft:     croft {client}"),
+        "The session may render incorrectly until the server is restarted.",
+        "[C] continue anyway   [R] restart session (its terminals die)   [any other key] detach",
+        "",
+    ]
+    .join("\r\n")
+}
+
+pub fn attach_client(socket: &Path) -> Result<PumpOutcome> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connecting to {}", socket.display()))?;
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
@@ -651,7 +829,7 @@ pub fn attach_client(socket: &Path) -> Result<i32> {
     result
 }
 
-fn attach_client_pump(stream: &mut UnixStream) -> Result<i32> {
+fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let tx = Arc::new(Mutex::new(stream.try_clone().context("cloning socket")?));
     tx.lock()
@@ -660,8 +838,94 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<i32> {
             name: client_name(),
             cols,
             rows,
+            version: String::from(env!("CARGO_PKG_VERSION")),
         }))
         .context("sending hello")?;
+
+    // Version phase (#53): wait briefly for the server's ServerHello. PTY
+    // bytes racing it are buffered and replayed after the decision so
+    // nothing is dropped. This runs BEFORE the stdin thread spawns, so a
+    // banner keypress is read here, not swallowed by the forwarder.
+    let mut pending: Vec<Vec<u8>> = Vec::new();
+    let mut reader = FrameReader::new();
+    let mut server_version: Option<String> = None;
+    {
+        let mut buf = [0u8; 65536];
+        let phase_deadline = Instant::now() + SERVER_HELLO_DEADLINE;
+        'phase: while server_version.is_none() {
+            let remaining = phase_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            stream
+                .set_read_timeout(Some(remaining))
+                .context("setting read timeout")?;
+            match stream.read(&mut buf) {
+                Ok(0) => return Ok(PumpOutcome::Exit(0)),
+                Ok(n) => {
+                    for frame in reader.push(&buf[..n]) {
+                        match frame {
+                            Frame::Control(Control::ServerHello { version }) => {
+                                server_version = Some(version);
+                            }
+                            Frame::Control(Control::Exit { code }) => {
+                                return Ok(PumpOutcome::Exit(code));
+                            }
+                            Frame::Bytes(bytes) => pending.push(bytes),
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break 'phase;
+                }
+                Err(_) => return Ok(PumpOutcome::Exit(0)),
+            }
+        }
+        stream
+            .set_read_timeout(None)
+            .context("clearing read timeout")?;
+    }
+    let client_version = env!("CARGO_PKG_VERSION");
+    if server_version.as_deref() != Some(client_version) {
+        let mut out = std::io::stdout().lock();
+        out.write_all(mismatch_banner(server_version.as_deref(), client_version).as_bytes())
+            .context("writing banner")?;
+        out.flush().context("flushing banner")?;
+        drop(out);
+        let mut key = [0u8; 1];
+        let n = std::io::stdin().lock().read(&mut key).unwrap_or(0);
+        // A closed or non-tty stdin (piped attach, headless CI) cannot
+        // answer: continue, the pre-banner behavior, rather than silently
+        // exiting 0 as if the session ended.
+        if n == 0 {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(b"stdin closed; continuing\r\n");
+            let _ = out.flush();
+        }
+        match mismatch_action(if n == 1 { key[0] } else { b'c' }) {
+            MismatchAction::Continue => {}
+            MismatchAction::Restart => {
+                let _ = tx
+                    .lock()
+                    .unwrap()
+                    .write_all(&encode_control_frame(&Control::Detach));
+                return Ok(PumpOutcome::RestartRequested);
+            }
+            MismatchAction::Detach => {
+                let _ = tx
+                    .lock()
+                    .unwrap()
+                    .write_all(&encode_control_frame(&Control::Detach));
+                return Ok(PumpOutcome::Exit(0));
+            }
+        }
+    }
 
     // stdin -> socket. The thread parks on a blocking read; it dies with the
     // process when the session ends (the CLI exits right after we return).
@@ -722,13 +986,18 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<i32> {
     }
 
     // socket -> stdout, until the host reports the inner croft's exit or the
-    // connection drops (server killed; treated as a detach).
+    // connection drops (server killed; treated as a detach). The version
+    // phase's reader carries any partial frame; its buffered PTY bytes
+    // replay first so nothing raced away.
     let mut out = std::io::stdout().lock();
-    let mut reader = FrameReader::new();
+    for bytes in pending.drain(..) {
+        out.write_all(&bytes).context("writing to terminal")?;
+    }
+    out.flush().context("flushing terminal")?;
     let mut buf = [0u8; 65536];
     loop {
         let n = match stream.read(&mut buf) {
-            Ok(0) | Err(_) => return Ok(0),
+            Ok(0) | Err(_) => return Ok(PumpOutcome::Exit(0)),
             Ok(n) => n,
         };
         for frame in reader.push(&buf[..n]) {
@@ -737,7 +1006,7 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<i32> {
                     out.write_all(&bytes).context("writing to terminal")?;
                     out.flush().context("flushing terminal")?;
                 }
-                Frame::Control(Control::Exit { code }) => return Ok(code),
+                Frame::Control(Control::Exit { code }) => return Ok(PumpOutcome::Exit(code)),
                 // Roster changes surface inside the inner croft (which polls
                 // the presence sidecar), not in this thin pump.
                 _ => {}
@@ -857,6 +1126,58 @@ pub(crate) fn write_frame_blocking(stream: &mut UnixStream, frame: &[u8]) -> boo
         frame,
         std::time::Instant::now() + WRITE_FRAME_DEADLINE,
     )
+}
+
+/// Write a whole frame to a BLOCKING socket without ever entering an
+/// unbounded kernel write (#53): [`write_frame_blocking`] only bounds a
+/// socket that is already non-blocking — on the server's blocking client
+/// streams the first `write` against a full buffer parks in the kernel and
+/// the deadline is unreachable. Waiting for writability with `poll(2)`
+/// bounds the stall without flipping `O_NONBLOCK`, which is shared with the
+/// client thread's blocking reads on the same file description. False means
+/// the peer is unusable (dead, or draining nothing for the whole deadline).
+fn write_frame_bounded(stream: &mut UnixStream, frame: &[u8], deadline: Instant) -> bool {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut written = 0;
+    while written < frame.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if r < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if r == 0 {
+            // Writability never arrived inside the deadline: the peer is
+            // wedged.
+            return false;
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return false;
+        }
+        match stream.write(&frame[written..]) {
+            Ok(0) => return false,
+            Ok(n) => written += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 fn write_frame_blocking_with_deadline(
@@ -1030,6 +1351,7 @@ mod tests {
             name: String::from("vitali@mac"),
             cols: 120,
             rows: 40,
+            version: String::from(env!("CARGO_PKG_VERSION")),
         };
         let mut wire = encode_control_frame(&hello);
         wire.extend(encode_bytes_frame(b"ls\r"));
@@ -1141,6 +1463,7 @@ mod tests {
                 name: String::from(name),
                 cols,
                 rows,
+                version: String::from(env!("CARGO_PKG_VERSION")),
             }));
             c
         }
@@ -1188,8 +1511,12 @@ mod tests {
     const TEST_TOKEN: &str = "test-token";
 
     fn spawn_test_server(socket: PathBuf) -> std::thread::JoinHandle<i32> {
+        spawn_test_server_with(socket, vec![String::from("cat")])
+    }
+
+    fn spawn_test_server_with(socket: PathBuf, inner: Vec<String>) -> std::thread::JoinHandle<i32> {
         std::thread::spawn(move || {
-            serve_with_token(&socket, None, &[String::from("cat")], TEST_TOKEN).expect("serve")
+            serve_with_token(&socket, None, &inner, TEST_TOKEN).expect("serve")
         })
     }
 
@@ -1255,6 +1582,159 @@ mod tests {
         );
         assert_eq!(server.join().unwrap(), 0);
         assert!(!socket.exists(), "server must unlink its socket on exit");
+    }
+
+    /// #53 part 1 compat, old client -> new server: a pre-0.1.698 Hello
+    /// carries no version field and must keep parsing (serde `default`).
+    #[test]
+    fn a_versionless_hello_from_an_old_client_still_parses() {
+        let old = br#"{"t":"hello","name":"v@mac","cols":120,"rows":40}"#;
+        let parsed: Control = serde_json::from_slice(old).expect("old Hello parses");
+        match parsed {
+            Control::Hello { version, name, .. } => {
+                assert_eq!(version, "", "the missing field defaults to empty");
+                assert_eq!(name, "v@mac");
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    /// #53 part 1 compat, new server -> old client: the frame decoder must
+    /// skip a control variant it does not know (an even newer peer's, or
+    /// ServerHello reaching a pre-0.1.698 client) without poisoning the
+    /// stream for the frames that follow.
+    #[test]
+    fn an_unknown_control_variant_is_skipped_without_poisoning_the_stream() {
+        let mut wire = encode_frame(FRAME_CONTROL, br#"{"t":"from_the_future","x":1}"#);
+        wire.extend(encode_bytes_frame(b"still here"));
+        let mut reader = FrameReader::new();
+        let frames = reader.push(&wire);
+        assert_eq!(
+            frames,
+            vec![Frame::Bytes(b"still here".to_vec())],
+            "the unknown variant is dropped, the next frame survives"
+        );
+    }
+
+    /// #53 part 1: the server answers every Hello with its own version,
+    /// before any PTY bytes reach the client.
+    #[test]
+    fn the_server_answers_hello_with_its_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let mut c = TestClient::connect(&socket, "owner", 120, 40);
+        let frames = c.read_until(|f| matches!(f, Frame::Control(Control::ServerHello { .. })));
+        let version = frames.iter().find_map(|f| match f {
+            Frame::Control(Control::ServerHello { version }) => Some(version.clone()),
+            _ => None,
+        });
+        assert_eq!(version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// #53 part 1: the mismatch banner names both versions and the keys,
+    /// and the key mapping is continue/restart/detach with detach the
+    /// default for any other key.
+    #[test]
+    fn the_mismatch_banner_and_key_mapping_are_actionable() {
+        let banner = mismatch_banner(Some("0.1.638"), "0.1.698");
+        assert!(banner.contains("0.1.638") && banner.contains("0.1.698"));
+        assert!(banner.contains("[C]") && banner.contains("[R]"));
+        assert!(
+            !banner.replace("\r\n", "").contains('\n'),
+            "raw mode disables ONLCR: every newline must be CRLF or the \
+             banner staircases"
+        );
+        let old = mismatch_banner(None, "0.1.698");
+        assert!(
+            old.contains("reports no version"),
+            "a silent server is named as pre-version, not shown blank: {old}"
+        );
+        assert_eq!(mismatch_action(b'c'), MismatchAction::Continue);
+        assert_eq!(mismatch_action(b'C'), MismatchAction::Continue);
+        assert_eq!(mismatch_action(b'r'), MismatchAction::Restart);
+        assert_eq!(mismatch_action(b'R'), MismatchAction::Restart);
+        assert_eq!(mismatch_action(b'q'), MismatchAction::Detach);
+        assert_eq!(mismatch_action(0x1b), MismatchAction::Detach);
+    }
+
+    /// #53 part 2: an attach from a 0x0 PTY (`script`, headless CI) is a
+    /// pure observer — and with no sized client connected, `apply_winsize`
+    /// used to return before the repaint jiggle, so the inner croft never
+    /// received a Resize and the observer stared at a blank screen. The
+    /// jiggle must fire at the current size for EVERY accepted attach.
+    #[test]
+    fn an_observer_only_attach_still_jiggles_the_inner_pty() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        // An inner command that reports every WINCH it receives: the only
+        // observable proof the jiggle reached the PTY. The heartbeat dots
+        // let the test stage on the trap being REGISTERED — the first
+        // attach's jiggle races sh's startup (under suite load sh loses
+        // and the WINCH is eaten by the default action), so the assertion
+        // rides a SECOND attach, whose jiggle finds the trap live.
+        let server = spawn_test_server_with(
+            socket.clone(),
+            vec![
+                String::from("/bin/sh"),
+                String::from("-c"),
+                String::from("trap 'printf WINCHED' WINCH; while :; do printf .; sleep 0.05; done"),
+            ],
+        );
+        wait_alive(&socket);
+        let mut observer = TestClient::connect(&socket, "observer", 0, 0);
+        observer.read_until(|f| matches!(f, Frame::Bytes(b) if b.contains(&b'.')));
+        let second = TestClient::connect(&socket, "observer-two", 0, 0);
+        observer
+            .read_until(|f| matches!(f, Frame::Bytes(b) if b.windows(7).any(|w| w == b"WINCHED")));
+        drop(second);
+        drop(observer);
+        drop(server);
+    }
+
+    /// #53 part 3: a client that stops draining (kill -STOP, a wedged
+    /// terminal) filled its socket buffer, and the plain `write_all` in
+    /// `broadcast` then blocked the PTY pump forever while holding the
+    /// clients lock — every other client starved. The bounded write must
+    /// evict the ghost at the deadline and the survivors keep flowing.
+    #[test]
+    fn a_wedged_client_is_evicted_instead_of_freezing_the_pump() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let mut owner = TestClient::connect(&socket, "owner", 120, 40);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        // The ghost attaches and never reads again.
+        let ghost = TestClient::connect(&socket, "ghost", 80, 24);
+        let frames = owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        assert_eq!(roster(&frames).unwrap().len(), 2, "staging: ghost seated");
+        // Flood: cat echoes everything back through broadcast; the ghost's
+        // socket buffer fills and the write deadline must evict it rather
+        // than wedge the pump. The owner keeps draining throughout.
+        let chunk = vec![b'x'; 32 * 1024];
+        let mut evicted = false;
+        for _ in 0..64 {
+            owner.send(&encode_bytes_frame(&chunk));
+            let frames = owner.read_until(|f| {
+                matches!(f, Frame::Control(Control::Presence { .. }))
+                    || matches!(f, Frame::Bytes(_))
+            });
+            if frames
+                .iter()
+                .any(|f| matches!(f, Frame::Control(Control::Presence { .. })))
+                && roster(&frames).is_some_and(|ps| ps.len() == 1)
+            {
+                evicted = true;
+                break;
+            }
+        }
+        assert!(
+            evicted,
+            "the wedged ghost must be evicted and the roster shrink to the owner"
+        );
+        drop(ghost);
     }
 
     #[test]

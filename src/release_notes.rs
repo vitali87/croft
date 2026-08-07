@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "A file that changes on disk but cannot be re-read (replaced by a directory, permissions yanked, a PDF whose re-render dies) no longer fails silently: the tab keeps its last good view and the status line says the reload failed, instead of letting stale content read as current.",
+    summary: "Attaching to a persistent session can no longer strand you on a blank screen: the session handshake now carries versions both ways and a skewed (or pre-0.1.698) server shows a plain-text banner with continue / restart / detach choices; an attach from a size-less terminal still repaints the session; and a client that stops draining is evicted after five seconds instead of freezing every other participant.",
 }];
