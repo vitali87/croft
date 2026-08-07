@@ -59,17 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Updating croft on a remote machine is fast again. It had been shipping the entire local build directory, 176 GB of it, over a throttled link before compiling on the remote box, because the transfer skipped a folder named \"target\" while the real one is called \"target.noindex\".",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "A remote update now ships a prebuilt binary instead of compiling on your server. Bumping the Rust version had quietly dropped the cross-compiler targets, and the check meant to catch that asked the wrong toolchain, so it always reported everything was fine.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Continuous integration now builds croft for Linux x86-64, Linux ARM64 and Android on every change, alongside the lint and test suites, so a platform can no longer break without anyone noticing.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Fix,
+    summary: "Saving a file under a legacy encoding no longer silently destroys characters the encoding cannot represent. Such text used to be rewritten on disk as HTML references like &#26085; with no warning; croft now refuses the save, names the doomed characters, and only a deliberate second Cmd+S writes the substitutions.",
+}];
