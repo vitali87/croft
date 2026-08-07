@@ -21359,7 +21359,26 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
         &|o, g| o.editor.lines == g.editor.lines && o.editor.lines[0].contains("OWNER"),
     );
 
-    // No echo: with both sides converged and idle, the wire stays quiet.
+    // Settle: buffer convergence does not imply the WIRE is drained (#56).
+    // Typing sends caret frames besides the edits, every drained event —
+    // a caret included — reports redraw-worthy from poll_collab, and the
+    // relay thread can deliver a trailing caret after the convergence
+    // predicate already passed. Drain those, bounded so a genuine echo
+    // storm still reaches the silence check below and fails there.
+    let settle = Instant::now() + Duration::from_secs(5);
+    loop {
+        let owner_drained = owner.poll_collab();
+        let guest_drained = guest.poll_collab();
+        if !owner_drained && !guest_drained {
+            break;
+        }
+        assert!(
+            Instant::now() < settle,
+            "the wire never went quiet: an echo storm, not a trailing caret"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // No echo: with the wire drained and both sides idle, it stays quiet.
     let settled = owner.editor.lines.clone();
     for _ in 0..20 {
         assert!(!owner.poll_collab(), "owner must be quiescent");
