@@ -1732,7 +1732,7 @@ fn cargo_zigbuild_command(source: &Path, triple: &str, jobs: &str) -> Command {
 /// build, preserving the old fall-back behaviour rather than blocking install.
 fn sync_workspace_lock(source: &Path, log: impl Fn(String)) {
     match cross_tool_command("cargo")
-        .args(["update", "-p", "croft", "--offline"])
+        .args(["update", "-p", "croft-software", "--offline"])
         .current_dir(source)
         .output()
     {
