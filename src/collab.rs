@@ -1851,18 +1851,49 @@ mod tests {
     /// `ensure_relay` and `relay_serve` are attach-or-create: a live relay on
     /// the socket short-circuits both instead of being stolen from (a second
     /// bind would strand the first relay's clients mid-session).
+    ///
+    /// The invariant is asserted DIRECTLY — a fresh connect after both calls
+    /// must still land on THIS listener's accept queue (#30). The old proxy
+    /// assert (`!is_alive` after dropping the listener) claimed a global
+    /// property instead: that no process anywhere holds a listening fd for
+    /// the path. On macOS `bind` cannot set CLOEXEC atomically, so a
+    /// concurrent test thread's fork/spawn can inherit the listener fd in
+    /// that window and keep the socket connectable after the drop — a
+    /// hygiene accident of the parallel suite, not a steal, and the flake
+    /// this test was known for. Routing-through-accept is immune: an
+    /// inherited duplicate shares OUR queue, while a thief that rebound the
+    /// path would swallow the fresh connect and accept() would come up dry.
     #[test]
     fn a_live_relay_is_not_stolen_from() {
         use std::os::unix::net::UnixListener;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("c.collab.sock");
         let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
 
         ensure_relay(&socket).expect("alive socket short-circuits");
         relay_serve(&socket).expect("alive socket short-circuits");
-        // The original listener still owns the socket path.
-        drop(listener);
-        assert!(!crate::session::is_alive(&socket));
+
+        // Drain the probe connections the two calls queued on us, then
+        // prove a fresh connect still routes here: the path was not rebound.
+        while listener.accept().is_ok() {}
+        let _probe = std::os::unix::net::UnixStream::connect(&socket)
+            .expect("the listener still owns the path");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the fresh connect never reached this listener: the \
+                         socket path was rebound out from under it"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        }
     }
 
     /// Start a relay on a temp socket and connect a session to it in `role`.

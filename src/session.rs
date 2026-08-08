@@ -242,7 +242,20 @@ pub(crate) fn write_meta_preserving_created(socket: &Path, workspace: &Path) -> 
 // lsof/peer check if the session count ever grows large.
 #[cfg(unix)]
 pub(crate) fn is_alive(socket: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(_) => true,
+        // "Nothing is listening" and "the probe itself could not run" are
+        // different answers (#30): a box out of file descriptors must not
+        // read as a dead session — a false "dead" sends ensure_relay /
+        // attach_or_create down the spawn path against a live server.
+        // Resource exhaustion reports alive (the conservative side: worst
+        // case the caller attaches and gets a clean connect error), every
+        // true refusal reports dead.
+        Err(e) => matches!(
+            e.raw_os_error(),
+            Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::EAGAIN) | Some(libc::ENOMEM)
+        ),
+    }
 }
 
 #[cfg(not(unix))]
