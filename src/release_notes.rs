@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Session and relay liveness probes now distinguish a dead peer from a probe that could not run: a box out of file descriptors no longer reads as \"nothing listening\", which could send the attach and relay paths down a spawn against a live server.",
+    kind: NoteKind::Feature,
+    summary: "The package is now named croft-software (the crate name `croft` was already taken on crates.io by an unrelated project) in preparation for publishing to the registry; the installed binary and every command stay `croft`.",
 }];

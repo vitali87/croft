@@ -1724,7 +1724,7 @@ fn cargo_zigbuild_command(source: &Path, triple: &str, jobs: &str) -> Command {
 /// drifts exactly one patch behind. `cargo zigbuild --locked` then refuses to
 /// build, and the installer silently falls back to a minutes-long
 /// from-scratch `cargo install` *on the remote host* (the thing the fast path
-/// exists to avoid). `cargo update -p croft --offline` rewrites only croft's
+/// exists to avoid). `cargo update -p croft-software --offline` rewrites only croft's
 /// own version line - it touches no dependency, needs no network, and so keeps
 /// `--locked`'s real guarantee (a reproducible dependency graph) fully intact.
 ///
@@ -3561,7 +3561,7 @@ Host !blocked *.internal
 
         let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
         let lock_version = lock
-            .split("name = \"croft\"")
+            .split("name = \"croft-software\"")
             .nth(1)
             .and_then(|after| {
                 after.lines().find_map(|l| {
@@ -3574,7 +3574,7 @@ Host !blocked *.internal
 
         assert_eq!(
             lock_version, toml_version,
-            "Cargo.lock croft version {lock_version} drifted from Cargo.toml {toml_version}; run `cargo update -p croft`"
+            "Cargo.lock croft version {lock_version} drifted from Cargo.toml {toml_version}; run `cargo update -p croft-software`"
         );
     }
 }

@@ -1,12 +1,14 @@
 [package]
-name = "croft"
-version = "0.1.699"
+name = "croft-software"
+version = "0.1.700"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
 repository = "https://github.com/vitali87/croft"
 homepage = "https://croft.software"
 
+# The binary stays `croft` — the package is the suite name, the command is
+# the tool. `cargo install croft-software` puts `croft` on PATH.
 [[bin]]
 name = "croft"
 path = "src/main.rs"
