@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "The package is now named croft-software (the crate name `croft` was already taken on crates.io by an unrelated project) in preparation for publishing to the registry; the installed binary and every command stay `croft`.",
+    kind: NoteKind::Fix,
+    summary: "croft install-launcher no longer fails on every run: the plist cleanup deletes (keys osacompile never emits) are best-effort now, so the bundle gets signed and registered with Launch Services and Croft.app appears in Spotlight.",
 }];
