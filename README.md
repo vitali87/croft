@@ -46,6 +46,8 @@ Per-platform setup (Nerd Font, terminal keybindings, optional dependencies) live
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
+Then open a new terminal — or run `. "$HOME/.cargo/env"` in the current one — so `cargo` is on `PATH`.
+
 ## Install
 
 ```bash
