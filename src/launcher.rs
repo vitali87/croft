@@ -76,8 +76,6 @@ fn plist_edits() -> Vec<String> {
         // Our icon, not osacompile's applet.icns. CFBundleIconName points at
         // the generated Assets.car and would otherwise win.
         "Set :CFBundleIconFile croft",
-        "Delete :CFBundleIconName",
-        "Delete :CFBundleDocumentTypes",
         "Add :CFBundleDocumentTypes array",
         "Add :CFBundleDocumentTypes:0:CFBundleTypeName string \"Any File\"",
         "Add :CFBundleDocumentTypes:0:CFBundleTypeRole string Editor",
@@ -88,6 +86,20 @@ fn plist_edits() -> Vec<String> {
     .iter()
     .map(|s| (*s).to_string())
     .collect()
+}
+
+/// Cleanup deletes: "remove this key if present", not a requirement. PlistBuddy
+/// exits non-zero when `Delete` names an absent key, and `CFBundleIconName` is
+/// an asset-catalog key Xcode emits but `osacompile` never does — batched with
+/// the required edits it failed every install (#92). Each runs as its own
+/// invocation with the exit status ignored, before `plist_edits` — which is
+/// also the ordering `Delete :CFBundleDocumentTypes` needs, clearing the
+/// applet's legacy wildcard array before the edits rebuild it.
+fn plist_cleanup_deletes() -> Vec<String> {
+    ["Delete :CFBundleIconName", "Delete :CFBundleDocumentTypes"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 /// Where the bundle lives: system-wide `/Applications` (default) or per-user
@@ -170,6 +182,18 @@ pub fn install(app_dir: &Path, croft_bin: &str, open_dir: &str) -> Result<PathBu
     write_icon(&app.join("Contents/Resources/croft.icns")).context("building the launcher icon")?;
 
     let plist = app.join("Contents/Info.plist");
+    // stderr is silenced too: PlistBuddy prints "Delete: Entry ... Does Not
+    // Exist" for the expected-absent case, which reads as an error on a
+    // successful install.
+    for delete in plist_cleanup_deletes() {
+        let _ = Command::new("/usr/libexec/PlistBuddy")
+            .arg("-c")
+            .arg(delete)
+            .arg(&plist)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     let mut buddy = Command::new("/usr/libexec/PlistBuddy");
     for edit in plist_edits() {
         buddy.arg("-c").arg(edit);
@@ -287,6 +311,29 @@ mod tests {
             !s.contains("item 1 of theFiles"),
             "no file may be silently dropped: {s}"
         );
+    }
+
+    /// PlistBuddy exits non-zero when `Delete` names an absent key, and every
+    /// edit in a batched invocation shares that exit status. `CFBundleIconName`
+    /// is an Xcode asset-catalog key an `osacompile` applet never contains, so
+    /// a fatal batch carrying that delete failed on every single run (#92) —
+    /// after the plist was already written, but before codesign and lsregister,
+    /// leaving a stale-signed, unregistered bundle. The cleanup deletes are
+    /// "remove if present": they run as their own best-effort invocations and
+    /// the fatal batch must carry no `Delete` at all.
+    #[test]
+    fn cleanup_deletes_are_best_effort_and_never_in_the_fatal_batch() {
+        let edits = plist_edits();
+        assert!(
+            edits.iter().all(|e| !e.starts_with("Delete ")),
+            "a Delete on an absent key fails the whole fatal batch: {edits:?}"
+        );
+        let cleanup = plist_cleanup_deletes();
+        assert!(cleanup.contains(&"Delete :CFBundleIconName".to_string()));
+        // The wildcard document-types array must still be cleared before the
+        // fatal batch rebuilds it — install() runs every cleanup delete first.
+        assert!(cleanup.contains(&"Delete :CFBundleDocumentTypes".to_string()));
+        assert!(edits.contains(&"Add :CFBundleDocumentTypes array".to_string()));
     }
 
     #[test]
