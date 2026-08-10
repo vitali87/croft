@@ -51,10 +51,16 @@ Then open a new terminal â€” or run `. "$HOME/.cargo/env"` in the current one â€
 ## Install
 
 ```bash
+cargo install croft-software --locked
+```
+
+This compiles the latest [crates.io](https://crates.io/crates/croft-software) release into `~/.cargo/bin/croft`. Re-run to upgrade. To track the latest `main` instead:
+
+```bash
 cargo install --git https://github.com/vitali87/croft.git --locked
 ```
 
-This compiles croft from the latest `main` into `~/.cargo/bin/croft`. Re-run to upgrade. To build from source instead:
+Or to build from a source checkout:
 
 ```bash
 git clone https://github.com/vitali87/croft.git
