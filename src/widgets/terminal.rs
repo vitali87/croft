@@ -477,6 +477,13 @@ pub struct PtyTerminal {
     /// prompt is its own foreground process-group leader, so this is the
     /// value `foreground_is_shell` compares `tcgetpgrp(master)` against.
     shell_pid: Option<i32>,
+    /// Whether anything has ever been written toward the child's stdin
+    /// (keystrokes, pastes, seeds, mouse reports). While false, no
+    /// foreground application can have been launched in this pane, so a
+    /// foreground group that differs from the shell can only be the
+    /// shell's own rc startup — the state `cwd_seed_is_safe` treats as
+    /// still seedable (#94).
+    input_seen: bool,
     cols: u16,
     rows: u16,
     /// Shared with the `VoidListener` so `TextAreaSizeRequest` callbacks
@@ -1684,6 +1691,7 @@ impl PtyTerminal {
             reader_thread: Some(reader_thread),
             reader_shutdown: Some(shutdown_w),
             shell_pid,
+            input_seen: false,
             cols,
             rows,
             size_shared,
@@ -2849,6 +2857,7 @@ impl PtyTerminal {
 
     pub fn write_input(&mut self, data: &[u8]) {
         self.reset_scrollback();
+        self.input_seen = true;
         #[cfg(test)]
         self.written_for_test
             .lock()
@@ -2913,6 +2922,7 @@ impl PtyTerminal {
             let _ = w.write_all(&report);
             let _ = w.flush();
         }
+        self.input_seen = true;
         self.pty_dirty.store(true, Ordering::Release);
         true
     }
@@ -2956,6 +2966,22 @@ impl PtyTerminal {
             (Some(fg), Some(pid)) => fg == pid,
             _ => true,
         }
+    }
+
+    /// True when seeding a `cd` into the PTY cannot reach a user-facing
+    /// foreground application. Either the shell owns the foreground group
+    /// (`foreground_is_shell`), or the pane is still in its startup
+    /// window: nothing has ever been written toward the child's stdin and
+    /// shell integration has recorded no prompt mark, so a foreground
+    /// group that differs from the shell can only be the shell's own rc
+    /// startup. A seed written then is ordinary type-ahead — the bytes
+    /// wait in the tty input queue for the first prompt — because a pane
+    /// that has never received input cannot be running a launched app.
+    /// Without the carve-out, a Make Root landing inside that window
+    /// silently skipped the seed and left the shell behind the Explorer
+    /// (#94; under full-suite load the window stretches past the call).
+    pub fn cwd_seed_is_safe(&self) -> bool {
+        self.foreground_is_shell() || (!self.input_seen && self.marks.lock().unwrap().is_empty())
     }
 
     /// Scroll the visible viewport up by `n` rows into scrollback.
@@ -4673,6 +4699,61 @@ mod tests {
         assert!(
             !term.foreground_is_shell(),
             "while a foreground command owns the tty, the foreground group is the command not the shell, so a cd must not be injected"
+        );
+    }
+
+    /// Spawn a pane whose "shell" is a script holding the tty foreground
+    /// group with a job-control child — the rc-startup state the #94 flake
+    /// caught `change_workspace_root` in. Returns the pane after the child
+    /// has taken the foreground (bounded wait, asserted).
+    fn startup_owned_pane(tmp: &tempfile::TempDir) -> PtyTerminal {
+        let script = tmp.path().join("slow-startup.sh");
+        std::fs::write(&script, "#!/bin/bash\nset -m\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let term = PtyTerminal::new_running(script.to_str().unwrap(), &[], tmp.path()).unwrap();
+        let mut waited = 0u32;
+        while waited < 4000 && term.foreground_is_shell() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(
+            !term.foreground_is_shell(),
+            "precondition: the startup child must own the foreground group"
+        );
+        term
+    }
+
+    #[test]
+    fn cwd_seed_stays_safe_through_startup_until_a_prompt_mark_arrives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let term = startup_owned_pane(&tmp);
+        assert!(
+            term.cwd_seed_is_safe(),
+            "an untouched pane whose foreground group is shell startup must stay seedable: the seed queues as type-ahead for the first prompt"
+        );
+        // Once shell integration reports a prompt, startup is over — a
+        // non-shell foreground group is a real app from here on.
+        term.push_mark_for_test(crate::shell_integration::OscEvent::PromptStart, 0);
+        assert!(
+            !term.cwd_seed_is_safe(),
+            "after the first prompt mark, a non-shell foreground group must suppress the seed"
+        );
+    }
+
+    #[test]
+    fn cwd_seed_turns_unsafe_once_the_pane_has_received_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = startup_owned_pane(&tmp);
+        // Any input could have launched the app that owns the tty, so the
+        // startup carve-out must die with the first written byte.
+        term.write_input(b"q");
+        assert!(
+            !term.cwd_seed_is_safe(),
+            "after input has been written, a non-shell foreground group must suppress the seed"
         );
     }
 

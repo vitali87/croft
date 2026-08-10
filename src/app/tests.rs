@@ -7320,6 +7320,58 @@ fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
 }
 
 #[test]
+fn change_workspace_root_seeds_cd_while_shell_startup_owns_the_tty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target_dir = tmp.path().join("seeded");
+    std::fs::create_dir(&target_dir).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Reproduce the #94 window deterministically: a shell whose rc startup
+    // holds the tty's foreground process group before the first prompt.
+    // `set -m` turns job control on, so the foreground `sleep` gets its own
+    // process group and the tty — exactly the state an rc-startup child
+    // leaves the pane in under full-suite load.
+    let script = tmp.path().join("slow-startup.sh");
+    std::fs::write(&script, "#!/bin/bash\nset -m\nsleep 30\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    app.terminals[app.active_terminal] = crate::widgets::terminal::PtyTerminal::new_running(
+        script.to_str().unwrap(),
+        &[],
+        tmp.path(),
+    )
+    .unwrap();
+
+    let mut waited = 0u32;
+    while waited < 4000 && app.terminal_mut().foreground_is_shell() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    assert!(
+        !app.terminal_mut().foreground_is_shell(),
+        "precondition: the startup child must own the foreground group"
+    );
+
+    let _ = app.terminal_mut().take_dirty();
+    app.change_workspace_root(target_dir.clone());
+
+    assert!(
+        app.terminal_mut().take_dirty(),
+        "a Make Root during shell startup must still seed the cd: nothing has ever been \
+         written into the pane, so a non-shell foreground group can only be shell startup \
+         and the seed is type-ahead for the first prompt"
+    );
+    assert!(
+        !app.status.contains("terminal busy"),
+        "the startup window must not be reported as a busy terminal; status was: {}",
+        app.status
+    );
+}
+
+#[test]
 fn tree_context_menu_on_subfolder_offers_new_file_new_folder_then_cut_copy_rename_delete() {
     let tmp = tempfile::tempdir().unwrap();
     let d = tmp.path().join("sub");

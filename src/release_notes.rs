@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "croft install-launcher no longer fails on every run: the plist cleanup deletes (keys osacompile never emits) are best-effort now, so the bundle gets signed and registered with Launch Services and Croft.app appears in Spotlight.",
+    summary: "Make Root issued while a terminal pane's shell is still starting up no longer silently skips the cd seed: the command now queues as type-ahead for the first prompt, so the shell follows the Explorer instead of staying in the old directory.",
 }];

@@ -28190,7 +28190,11 @@ impl App {
         self.last_task = None;
         let mut shell_synced = true;
         if let Some(active) = self.terminals.get_mut(self.active_terminal) {
-            if active.foreground_is_shell() {
+            // cwd_seed_is_safe, not foreground_is_shell: a pane whose shell
+            // is still starting up (rc files own the tty, no input ever
+            // written, no prompt yet) must still get the seed — it queues as
+            // type-ahead for the first prompt (#94).
+            if active.cwd_seed_is_safe() {
                 active.change_cwd(&new_root);
             } else {
                 shell_synced = false;
