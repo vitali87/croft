@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Make Root issued while a terminal pane's shell is still starting up no longer silently skips the cd seed: the command now queues as type-ahead for the first prompt, so the shell follows the Explorer instead of staying in the old directory.",
+    summary: "This very panel no longer cuts its highlights off mid-sentence in small windows: the release-note card is sized before the logo, so the logo shrinks to its minimum before the note may clip.",
 }];
