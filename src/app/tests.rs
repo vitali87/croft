@@ -25492,10 +25492,73 @@ fn clicking_a_commit_graph_row_opens_the_commit_patch_tab() {
             .collect::<Vec<_>>()
     );
     let col = graph_rect.x + 6;
+    let short = app
+        .commit_graph
+        .commit_at(row)
+        .map(|c| c.short_hash.clone())
+        .expect("precondition established a commit at the click row");
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
     assert!(
         app.status.contains("Opened commit"),
         "clicking a commit row must open its patch tab; status: {:?}",
         app.status
+    );
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(Path::new(&format!("commit {short}"))),
+        "the active tab must be the clicked commit's patch"
+    );
+    let body = app.editor.lines.join("\n");
+    assert!(
+        body.contains("first commit") && body.contains("diff --git"),
+        "the patch tab must carry the commit message and its diff"
+    );
+}
+
+#[test]
+fn status_elision_never_fires_on_a_message_that_fits() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A git repo puts the branch segment in the bar, like any real session.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let _ = app.drain_git_responses();
+        if app.git.status().branch.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    app.status = String::from("Quick select: type a label to copy, UPPERCASE pastes, Esc cancels");
+    // 150 cols: prefix (with the branch segment) + message + right cluster
+    // total 149, so the message fits and must paint verbatim — elision may
+    // only fire when the arithmetic says the message truly cannot fit.
+    let backend = ratatui::backend::TestBackend::new(150, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let a = buf.area;
+    let last_row: String = (a.x..a.x + a.width)
+        .map(|x| buf[(x, a.y + a.height - 1)].symbol().to_string())
+        .collect();
+    assert!(
+        last_row.contains("type a label to copy"),
+        "a transient that fits beside the right cluster must paint verbatim, \
+         not elide; the bar showed: {last_row:?}"
     );
 }
