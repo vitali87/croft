@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "This very panel no longer cuts its highlights off mid-sentence in small windows: the release-note card is sized before the logo, so the logo shrinks first and the note always paints whole.",
+    summary: "This very panel no longer cuts its highlights off mid-sentence in small windows: the release-note card is sized before the logo, so the logo shrinks to its minimum before the note may clip.",
 }];
