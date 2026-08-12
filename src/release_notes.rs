@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "This very panel no longer cuts its highlights off mid-sentence in small windows: the release-note card is sized before the logo, so the logo shrinks to its minimum before the note may clip.",
+    summary: "Status-bar messages keep their point visible: \"Opened\", \"Renamed to\" and the rename prompt now show workspace-relative paths, and an over-long message elides its middle instead of losing its tail under the position readout.",
 }];
