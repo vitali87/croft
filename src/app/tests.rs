@@ -25428,3 +25428,74 @@ fn a_failed_external_reload_reports_in_the_status_line() {
         "the last good buffer survives the failed reload"
     );
 }
+
+#[test]
+fn clicking_a_commit_graph_row_opens_the_commit_patch_tab() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "one\n").unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "first commit"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The arming step of #103: render the DEFAULT Explorer sidebar once so
+    // its bottom sections (OPEN EDITORS / TIMELINE / DEPENDENCIES) record
+    // their hit rects — real sessions always do this before the user ever
+    // reaches Source Control. Stale copies of those rects must not shadow
+    // the COMMITS strip that paints in the same rows afterwards.
+    {
+        let backend = ratatui::backend::TestBackend::new(140, 44);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    }
+    app.set_sidebar_view(SidebarView::SourceControl);
+    // Let the git worker deliver status + graph, then render so every
+    // sidebar rect (including the COMMITS strip) records its hit area.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut graph_rect = Rect::default();
+    let mut row = 0u16;
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        let _ = app.drain_git_responses();
+        let _ = app.sync_explorer_panels();
+        let backend = ratatui::backend::TestBackend::new(140, 44);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        graph_rect = app.commit_graph.last_area;
+        // Border row, then the section header, then the first commit row.
+        row = graph_rect.y + 2;
+        if graph_rect.height > 1 && app.commit_graph.commit_at(row).is_some() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        ready,
+        "precondition: the COMMITS graph must render with a clickable row; rect {graph_rect:?}, \
+         inflight {:?}, probes {:?}",
+        app.graph_fetch_inflight,
+        (40u16..44)
+            .map(|y| app.commit_graph.commit_at(y).map(|c| c.short_hash.clone()))
+            .collect::<Vec<_>>()
+    );
+    let col = graph_rect.x + 6;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.status.contains("Opened commit"),
+        "clicking a commit row must open its patch tab; status: {:?}",
+        app.status
+    );
+}

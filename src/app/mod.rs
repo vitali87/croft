@@ -10809,6 +10809,29 @@ impl App {
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let size = frame.area();
         self.last_frame_area = size;
+        // Hit rects must describe the frame being painted, not the last
+        // frame that happened to include a section. A section that stops
+        // rendering (Explorer's OPEN EDITORS / TIMELINE / DEPENDENCIES /
+        // OUTLINE after a switch to Source Control) otherwise keeps its
+        // stale rect, and `handle_mouse`'s containment checks swallow every
+        // click the current view paints in those cells — the COMMITS graph
+        // sits exactly there and its clicks went dead (#103). Zero them all
+        // up front; each section's render re-records the live ones this
+        // frame (the OSK does the same for its collapsed band).
+        for rect in [
+            &mut self.open_editors.last_area,
+            &mut self.open_editors.last_scrollbar,
+            &mut self.timeline.last_area,
+            &mut self.timeline.last_scrollbar,
+            &mut self.dependencies.last_area,
+            &mut self.dependencies.last_scrollbar,
+            &mut self.outline.last_area,
+            &mut self.outline.last_scrollbar,
+            &mut self.commit_graph.last_area,
+            &mut self.commit_graph.last_scrollbar,
+        ] {
+            *rect = Rect::default();
+        }
         self.dress_host_accents();
         // Theme background, whole frame. croft's chrome (the sidebar panels,
         // explorer sections, activity bar, gaps) mostly paints `Color::Reset`
