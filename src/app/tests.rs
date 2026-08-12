@@ -7289,6 +7289,21 @@ fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
     std::fs::create_dir(&target_dir).unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
 
+    // Wait out shell startup first: while rc files run, a startup child can
+    // own the tty and `!foreground_is_shell` is true for the WRONG reason —
+    // the sleep below hasn't even executed, and the re-root races the shell
+    // reclaiming the tty at its first prompt (the #94 window, from the
+    // suppress side). A shell AT ITS PROMPT makes the later false reading
+    // unambiguous.
+    let mut waited = 0u32;
+    while waited < 4000 && !app.terminal_mut().foreground_is_shell() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    assert!(
+        app.terminal_mut().foreground_is_shell(),
+        "precondition: the shell must reach its prompt before the test starts"
+    );
     // Put the active terminal into a long-lived foreground command so its
     // foreground process group is the command, not the shell.
     app.terminal_mut().write_input(b"sleep 10\n");
@@ -25560,5 +25575,26 @@ fn status_elision_never_fires_on_a_message_that_fits() {
         last_row.contains("type a label to copy"),
         "a transient that fits beside the right cluster must paint verbatim, \
          not elide; the bar showed: {last_row:?}"
+    );
+}
+
+#[test]
+fn create_prompt_labels_speak_workspace_relative() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("src")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_create_prompt(CreateKind::File, tmp.path().join("src"));
+    let label = app.prompt.as_ref().unwrap().label.clone();
+    assert_eq!(
+        label, "New File in src",
+        "the prompt title's one job is naming the target directory; a deep \
+         absolute workspace path truncates it out of the popup (#105)"
+    );
+    app.prompt = None;
+    app.open_create_prompt(CreateKind::Folder, tmp.path().to_path_buf());
+    let label = app.prompt.as_ref().unwrap().label.clone();
+    assert_eq!(
+        label, "New Folder in .",
+        "the workspace root itself reads as '.'"
     );
 }
