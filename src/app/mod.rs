@@ -11797,6 +11797,27 @@ impl App {
             .map(|s| s.content.chars().count() as u16)
             .collect();
         let right_total: u16 = widths.iter().sum();
+        // The right cluster paints OVER the left paragraph, so an over-long
+        // transient loses exactly its tail — for "Opened <deep path>" that
+        // was the filename, the one informative part (#100). Middle-elide
+        // the transient (always the last span) into the room that survives.
+        if !self.status.is_empty() {
+            let left_fixed: u16 = spans
+                .iter()
+                .take(spans.len().saturating_sub(1))
+                .map(|s| s.content.chars().count() as u16)
+                .sum();
+            let avail = status_rect
+                .width
+                .saturating_sub(right_total)
+                .saturating_sub(left_fixed)
+                .saturating_sub(1);
+            if let Some(last) = spans.last_mut()
+                && last.content.chars().count() as u16 > avail
+            {
+                *last = Span::raw(elide_middle(&self.status, avail as usize));
+            }
+        }
 
         // Black theme: drop the navy status strip to a near-black seam (a hair
         // lighter than the #000000 editor so the bar still reads as distinct),
@@ -13488,7 +13509,9 @@ impl App {
         }
         // Arm the `Cmd+K` leader (VS Code's two-key chord prefix). The next
         // keystroke is interpreted by `handle_cmd_k_chord`, checked at the top
-        // of this fn. Cmd is SUPER on macOS, Ctrl on Linux/Termux.
+        // of this fn. Cmd is SUPER everywhere; Ctrl doubles as Cmd only on
+        // Termux — on desktop Linux a bare Ctrl+K stays the editor's
+        // kill-to-end-of-line (see `is_cmd_k_leader_key`).
         if is_cmd_k_leader_key(key) {
             self.cmd_k_leader = Some(std::time::Instant::now());
             return Ok(());
@@ -18817,10 +18840,10 @@ impl App {
         match self.editor.open_pinned(&path) {
             Ok(()) => {
                 self.focus_pane(Pane::Editor);
-                self.status = format!("Opened {}", path.display());
+                self.status = format!("Opened {}", self.status_path(&path));
             }
             Err(e) => {
-                self.status = format!("Open {} failed: {e}", path.display());
+                self.status = format!("Open {} failed: {e}", self.status_path(&path));
             }
         }
     }
@@ -18897,7 +18920,11 @@ impl App {
                 self.editor.cursor_col = match_col;
                 self.editor.scroll_col = 0;
                 self.editor.ensure_cursor_col_visible();
-                self.status = format!("Opened {} at line {}", hit.path.display(), hit.line_no);
+                self.status = format!(
+                    "Opened {} at line {}",
+                    self.status_path(&hit.path),
+                    hit.line_no
+                );
                 self.focus_pane(Pane::Editor);
             }
             Err(e) => {
@@ -22414,7 +22441,7 @@ impl App {
                             // sees where in the workspace the file lives.
                             self.tree.reveal_path(&path);
                             self.focus_pane(Pane::Editor);
-                            self.status = format!("Opened {}", path.display());
+                            self.status = format!("Opened {}", self.status_path(&path));
                         }
                         Err(e) => {
                             self.status = format!("Open failed: {e}");
@@ -30372,6 +30399,19 @@ impl App {
         });
     }
 
+    /// Workspace-relative rendering for status transients and prompt
+    /// labels: tabs and breadcrumbs already speak root-relative, and an
+    /// absolute path under a deep root pushed the one informative part —
+    /// the filename — off the visible end of the bar (#100). Paths outside
+    /// the root (`~/.ssh/config`, files opened by absolute path) keep
+    /// their absolute form.
+    fn status_path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.workspace_root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+
     fn open_rename_prompt(&mut self, path: PathBuf) {
         let parent = path
             .parent()
@@ -30381,7 +30421,7 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let label = format!("Rename {}", path.display());
+        let label = format!("Rename {}", self.status_path(&path));
         self.prompt = Some(Prompt {
             label,
             buffer: current,
@@ -30478,7 +30518,7 @@ impl App {
                 match crate::widgets::file_tree::rename_in(&parent, &old_path, &new_name) {
                     Ok(new_path) => {
                         self.prompt = None;
-                        self.status = format!("Renamed to {}", new_path.display());
+                        self.status = format!("Renamed to {}", self.status_path(&new_path));
                         if let Some(idx) = self.tree.index_of_dir(&parent) {
                             self.tree.refresh_children(idx);
                             if let Some(new_idx) =
@@ -30629,6 +30669,27 @@ fn mode_reassert_seq() -> Vec<u8> {
 /// too, mirroring VS Code's Linux keymap so the Super-only chords stay
 /// reachable. `termux` is threaded in explicitly to keep the decision pure
 /// and testable.
+/// Shrink `s` to at most `max` chars by cutting the middle, keeping roughly
+/// a third of the head and two thirds of the tail — for path-shaped
+/// messages the tail carries the filename, the part worth keeping. Never
+/// appends a trailing ellipsis (the cut is interior by construction).
+fn elide_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max < 3 {
+        return chars.iter().take(max).collect();
+    }
+    let keep = max - 1; // one cell for the ellipsis
+    let head = keep / 3;
+    let tail = keep - head;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('\u{2026}');
+    out.extend(&chars[chars.len() - tail..]);
+    out
+}
+
 fn cmd_active(mods: KeyModifiers, termux: bool) -> bool {
     mods.contains(KeyModifiers::SUPER) || (termux && mods.contains(KeyModifiers::CONTROL))
 }

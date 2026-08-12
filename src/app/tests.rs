@@ -17878,6 +17878,54 @@ fn welcome_logo_shrinks_before_the_release_note_card_clips() {
     );
 }
 
+#[test]
+fn status_transient_keeps_its_tail_when_longer_than_the_bar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A transient whose informative part is the tail, longer than the room
+    // left of the right cluster at 140 cols. The right cluster paints over
+    // the left paragraph, so an unelided message loses exactly its tail —
+    // for "Opened <deep absolute path>" that was the filename (#100).
+    let deep: String = "directory-segment/".repeat(7);
+    app.status = format!("Opened /{deep}main.rs");
+    let backend = ratatui::backend::TestBackend::new(140, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let a = buf.area;
+    let last_row: String = (a.x..a.x + a.width)
+        .map(|x| buf[(x, a.y + a.height - 1)].symbol().to_string())
+        .collect();
+    assert!(
+        last_row.contains("main.rs"),
+        "an over-long status transient must middle-elide so its tail stays \
+         visible; the bar showed: {last_row:?}"
+    );
+    assert!(
+        last_row.contains("Ln 1, Col 1"),
+        "the right cluster must still paint: {last_row:?}"
+    );
+}
+
+#[test]
+fn status_path_speaks_workspace_relative_inside_the_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    let inside = tmp.path().join("src").join("main.rs");
+    assert_eq!(
+        app.status_path(&inside),
+        format!("src{}main.rs", std::path::MAIN_SEPARATOR),
+        "paths under the workspace root must render root-relative, like tabs \
+         and breadcrumbs"
+    );
+    let outside = std::path::Path::new("/etc/hosts");
+    assert_eq!(
+        app.status_path(outside),
+        "/etc/hosts",
+        "paths outside the root keep their absolute form"
+    );
+}
+
 /// Render the app at 140x50 and clone the buffer for color probing.
 fn render_buf(app: &mut App) -> ratatui::buffer::Buffer {
     let backend = ratatui::backend::TestBackend::new(140, 50);
