@@ -3280,6 +3280,16 @@ fn welcome_note_row_height(note: &crate::release_notes::ReleaseNote, block_w: u1
     wrapped_welcome_note_summary(note, block_w).len().max(1) as u16
 }
 
+/// Width of the release-note card's content area for a card spanning
+/// `block_w` cells: one border cell plus a one-cell inset on each side.
+/// The height measure and the paint pass MUST both wrap through this —
+/// measuring 2 cells wider than the paint made the paint produce more
+/// wrapped lines than the card reserved rows for, and the overflow rows
+/// were silently dropped, ending the note mid-sentence (#99).
+fn welcome_card_inner_width(block_w: u16) -> u16 {
+    block_w.saturating_sub(4)
+}
+
 fn welcome_recents_height(notes: &[crate::release_notes::ReleaseNote], block_w: u16) -> u16 {
     if notes.is_empty() {
         return 0;
@@ -8853,11 +8863,9 @@ impl App {
         let block_left = area.x + area.width / 8;
         let block_right = area.x + area.width - area.width / 8;
         let block_w = block_right.saturating_sub(block_left);
-        // The gradient box's content area is 2 cells narrower (the box
-        // border itself).
-        let inner_w = block_w.saturating_sub(2);
         let has_recent_panel = self.welcome.has_recent_panel();
-        let recents_inner_h = welcome_recents_height(self.welcome.notes(), inner_w);
+        let recents_inner_h =
+            welcome_recents_height(self.welcome.notes(), welcome_card_inner_width(block_w));
         let tagline_h = 1u16;
         let footer_h = 1u16;
         // Gaps: blank row after logo, after tagline, after box.
@@ -8865,20 +8873,6 @@ impl App {
 
         let logo_max_w = (area.width as u32).saturating_sub(4) as u16;
         let logo_w_cells = logo_max_w.clamp(8, 48);
-        // Pick the logo height first, then size the recents box to fit
-        // whatever's left. Without this a tall commit list would extend the
-        // stack past the bottom of the welcome area and we'd panic painting
-        // into rows that don't exist (ratatui buffers are fixed-size).
-        let logo_h_cells = area
-            .height
-            .saturating_sub(tagline_h + footer_h + gaps_h)
-            .clamp(4, 14);
-        let used_above_box = logo_h_cells + 1 + tagline_h + 1; // logo, gap, tagline, gap
-        let used_below_box = 1 + footer_h; // gap, footer
-        let max_box_h = area
-            .height
-            .saturating_sub(used_above_box)
-            .saturating_sub(used_below_box);
         // Box content needs at least the 4-cell border+inset envelope to be
         // worth drawing.
         let desired_box_h = if has_recent_panel {
@@ -8886,6 +8880,24 @@ impl App {
         } else {
             0
         };
+        // Size the card first, then give the logo whatever remains (still
+        // capped to its 4..14 band, so the stack can never overrun the
+        // fixed-size ratatui buffer). The release note is the panel's
+        // information and the logo is decoration: in a height-starved
+        // welcome area (a 40-row window with the terminal panel open) the
+        // old logo-first order kept a full 14-row logo above a card that
+        // was clipped mid-sentence or dropped entirely (#99).
+        let logo_h_cells = area
+            .height
+            .saturating_sub(tagline_h + footer_h + gaps_h)
+            .saturating_sub(desired_box_h)
+            .clamp(4, 14);
+        let used_above_box = logo_h_cells + 1 + tagline_h + 1; // logo, gap, tagline, gap
+        let used_below_box = 1 + footer_h; // gap, footer
+        let max_box_h = area
+            .height
+            .saturating_sub(used_above_box)
+            .saturating_sub(used_below_box);
         let box_h = desired_box_h.min(max_box_h);
 
         let total_h = used_above_box + box_h + used_below_box;
@@ -9040,10 +9052,13 @@ impl App {
             };
             paint_gradient_box(frame.buffer_mut(), box_rect);
 
-            // Inner content area: 1-cell inset from each border.
+            // Inner content area: 1-cell inset from each border. The width
+            // comes from the same helper the height measure used, so the
+            // wrap below reproduces exactly the line count the card
+            // reserved rows for (#99).
             let inner_x = box_rect.x + 2;
             let inner_y = box_rect.y + 1;
-            let inner_w_actual = box_rect.width.saturating_sub(4);
+            let inner_w_actual = welcome_card_inner_width(box_rect.width);
 
             let row_style = Style::default().fg(Color::Rgb(0xc5, 0xcd, 0xd9));
 

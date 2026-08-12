@@ -17790,6 +17790,94 @@ fn dark_blue_theme_terminal_button_keeps_navy_chip() {
     assert_eq!(buf[(add.x + 1, add.y)].bg, navy);
 }
 
+/// A long fixed note for the welcome-card tests: RELEASE_NOTES is replaced
+/// every version bump, so pinning against the live note would let a future
+/// one-line note quietly gut these tests. The distinctive final word is the
+/// clip detector.
+fn long_test_note() -> Vec<crate::release_notes::ReleaseNote> {
+    vec![crate::release_notes::ReleaseNote {
+        kind: crate::release_notes::NoteKind::Fix,
+        summary: "A deliberately long highlight that wraps across several rows at \
+                  every sane width so the card's height measure and its paint pass \
+                  are both exercised, ending in a distinctive final token that no \
+                  other part of the interface paints: cardclip-endcap.",
+    }]
+}
+
+#[test]
+fn welcome_release_note_never_clips_its_final_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.welcome.set_test_notes(long_test_note());
+    // Give the card room: with the sidebar and panel up, narrow widths
+    // height-starve the welcome area and the card clamps legitimately —
+    // that clamp is not what this test pins. Full-window welcome isolates
+    // the wrap arithmetic.
+    app.show_tree = false;
+    app.show_terminal = false;
+    // Sweep widths: the card clips only where the measure-time wrap and the
+    // paint-time wrap disagree on the line count, which is width-dependent.
+    for width in (60u16..=180).step_by(2) {
+        let backend = ratatui::backend::TestBackend::new(width, 50);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let a = buf.area;
+        let text: String = (a.y..a.y + a.height)
+            .map(|y| {
+                (a.x..a.x + a.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Skip widths where the card itself is absent (too narrow for
+        // the welcome stack) — only a partially painted card is a bug.
+        if !text.contains("deliberately") {
+            continue;
+        }
+        assert!(
+            text.contains("cardclip-endcap."),
+            "at {width} cols the release-note card clips its final line \
+             (measure and paint must wrap at the same width)"
+        );
+    }
+}
+
+#[test]
+fn welcome_logo_shrinks_before_the_release_note_card_clips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.welcome.set_test_notes(long_test_note());
+    // Default layout — sidebar and panel visible — at a common window size.
+    // The welcome area is height-starved here, and the logo must yield rows
+    // (down to its 4-row minimum) before the card is allowed to clip: a
+    // full-height logo above a release note cut off mid-sentence is the
+    // wrong trade (#99, observed at 140x40).
+    let backend = ratatui::backend::TestBackend::new(140, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let a = buf.area;
+    let text: String = (a.y..a.y + a.height)
+        .map(|y| {
+            (a.x..a.x + a.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("deliberately"),
+        "precondition: the release-note card must paint at 140x40"
+    );
+    assert!(
+        text.contains("cardclip-endcap."),
+        "at 140x40 the card clips its final line while the logo still \
+         occupies its maximum height — the logo must shrink first"
+    );
+}
+
 /// Render the app at 140x50 and clone the buffer for color probing.
 fn render_buf(app: &mut App) -> ratatui::buffer::Buffer {
     let backend = ratatui::backend::TestBackend::new(140, 50);
