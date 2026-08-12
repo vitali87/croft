@@ -6667,7 +6667,9 @@ impl App {
             });
         }
         match self.open_at(&path, line as usize, col as usize) {
-            Ok(()) => self.status = format!("Jumped to {} line {}", path.display(), line + 1),
+            Ok(()) => {
+                self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1)
+            }
             Err(e) => self.status = format!("Go to definition failed: {e}"),
         }
     }
@@ -7010,7 +7012,7 @@ impl App {
         }
         // The restore is itself a new version worth keeping.
         self.record_history_snapshot(&file);
-        self.status = format!("Restored {}", file.display());
+        self.status = format!("Restored {}", self.status_path(&file));
     }
 
     /// Apply a `documentSymbol` reply to the OUTLINE panel, but only when its
@@ -8014,7 +8016,9 @@ impl App {
         };
         let line = loc.row;
         match self.open_at(&loc.path, loc.row, loc.col) {
-            Ok(()) => self.status = format!("Back to {} line {}", loc.path.display(), line + 1),
+            Ok(()) => {
+                self.status = format!("Back to {} line {}", self.status_path(&loc.path), line + 1)
+            }
             Err(e) => self.status = format!("Go back failed: {e}"),
         }
     }
@@ -16288,7 +16292,7 @@ impl App {
                 match crate::git::clone_into(&parent, &value) {
                     Ok(dest) => {
                         self.log_git("clone", &Ok(format!("into {}", dest.display())));
-                        self.status = format!("Cloned into {}", dest.display());
+                        self.status = format!("Cloned into {}", self.status_path(&dest));
                         self.change_workspace_root(dest);
                     }
                     Err(err) => {
@@ -21204,7 +21208,10 @@ impl App {
                 dest_dir.display()
             )
         } else {
-            format!("Imported {total} items into {}", dest_dir.display())
+            format!(
+                "Imported {total} items into {}",
+                self.status_path(&dest_dir)
+            )
         };
     }
 
@@ -22127,7 +22134,7 @@ impl App {
         let col0 = fr.column.map(|c| c as usize).unwrap_or(1).saturating_sub(1);
         match self.open_at(&abs, line0, col0) {
             Ok(()) => {
-                self.status = format!("{}:{}", abs.display(), fr.line);
+                self.status = format!("{}:{}", self.status_path(&abs), fr.line);
                 true
             }
             Err(_) => false,
@@ -29922,7 +29929,7 @@ impl App {
                 self.focus_pane(Pane::Editor);
                 self.sync_open_file_poll_mtime();
                 self.poke_cursor();
-                self.status = format!("{}:{}", j.path.display(), j.line);
+                self.status = format!("{}:{}", self.status_path(&j.path), j.line);
             }
             Err(err) => {
                 self.status = format!("Could not open {}: {err}", j.path.display());
@@ -30402,16 +30409,20 @@ impl App {
                 errors.join("; ")
             );
         } else if placed.len() == 1 {
-            self.status = format!("{verb} 1 item to {}", dest_dir.display());
+            self.status = format!("{verb} 1 item to {}", self.status_path(dest_dir));
         } else {
-            self.status = format!("{verb} {} items to {}", placed.len(), dest_dir.display());
+            self.status = format!(
+                "{verb} {} items to {}",
+                placed.len(),
+                self.status_path(dest_dir)
+            );
         }
     }
 
     fn open_create_prompt(&mut self, kind: CreateKind, target_dir: PathBuf) {
         let label = match kind {
-            CreateKind::File => format!("New File in {}", target_dir.display()),
-            CreateKind::Folder => format!("New Folder in {}", target_dir.display()),
+            CreateKind::File => format!("New File in {}", self.status_path(&target_dir)),
+            CreateKind::Folder => format!("New Folder in {}", self.status_path(&target_dir)),
         };
         self.prompt = Some(Prompt {
             label,
@@ -30429,10 +30440,12 @@ impl App {
     /// the root (`~/.ssh/config`, files opened by absolute path) keep
     /// their absolute form.
     fn status_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.workspace_root)
-            .unwrap_or(path)
-            .display()
-            .to_string()
+        let rel = path.strip_prefix(&self.workspace_root).unwrap_or(path);
+        if rel.as_os_str().is_empty() {
+            String::from(".")
+        } else {
+            rel.display().to_string()
+        }
     }
 
     fn open_rename_prompt(&mut self, path: PathBuf) {
@@ -30508,8 +30521,10 @@ impl App {
                     Ok(path) => {
                         self.prompt = None;
                         self.status = match create_kind {
-                            CreateKind::File => format!("Created file {}", path.display()),
-                            CreateKind::Folder => format!("Created folder {}", path.display()),
+                            CreateKind::File => format!("Created file {}", self.status_path(&path)),
+                            CreateKind::Folder => {
+                                format!("Created folder {}", self.status_path(&path))
+                            }
                         };
                         if let Some(idx) = self.tree.index_of_dir(&target_dir) {
                             self.tree.refresh_children(idx);

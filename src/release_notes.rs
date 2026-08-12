@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Clicking a commit in the Source Control COMMITS graph opens its patch again: after switching from the Explorer, the Explorer's invisible section rectangles were still swallowing clicks on the rows the graph paints in.",
+    summary: "Every prompt title and path status now speaks workspace-relative: New File / New Folder, Created, Jumped to, Back to, Restored, Imported and paste/move messages no longer bury the name that matters inside a deep absolute path.",
 }];
