@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Status-bar messages keep their point visible: \"Opened\", \"Renamed to\" and the rename prompt now show workspace-relative paths, and an over-long message elides its middle instead of losing its tail under the position readout.",
+    summary: "Clicking a commit in the Source Control COMMITS graph opens its patch again: after switching from the Explorer, the Explorer's invisible section rectangles were still swallowing clicks on the rows the graph paints in.",
 }];
