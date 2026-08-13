@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "The debugger gained a WATCH section: pin expressions from the palette or the panel's + row and they re-evaluate at every stop, changed values highlight, rejected ones read <not available>, and each row's \u{2715} removes it.",
+    summary: "Peek Definition arrived on Alt+F12: read a symbol's definition in an excerpt popup right at the caret — Enter converts it into the real jump, Esc dismisses, and unsaved edits in an open target file show as-is.",
 }];

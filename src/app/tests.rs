@@ -15647,9 +15647,10 @@ fn go_to_definition_key_is_f12_without_shift() {
         KeyCode::F(12),
         KeyModifiers::NONE
     )));
-    // Alt+F12 still means Definition (iTerm2 can fold a held Cmd onto the
-    // Meta/Alt bit, and Option+F12 is otherwise unused).
-    assert!(is_go_to_definition_key(key(
+    // Alt+F12 is Peek Definition now (#115): the fold-noise tolerance the
+    // plain jump used to extend to a stray ALT bit moved onto the peek,
+    // which is the strictly less disruptive consumer.
+    assert!(!is_go_to_definition_key(key(
         KeyCode::F(12),
         KeyModifiers::ALT
     )));
@@ -25885,4 +25886,113 @@ fn add_watch_via_the_palette_prompt_then_clear_all() {
     app.run_command(crate::widgets::command_palette::Command::DebugClearWatch);
     assert!(app.watch_exprs.is_empty() && app.watch_vals.is_empty());
     assert!(app.status.contains("Removed 1 watch expression"));
+}
+
+#[test]
+fn peek_excerpt_windows_clamp_to_the_file() {
+    let lines: Vec<String> = (1..=20).map(|i| format!("line-{i}")).collect();
+    let (start, ex) = peek_excerpt(&lines, 10, 4, 12);
+    assert_eq!(
+        (start, ex.len()),
+        (6, 12),
+        "centered window: 4 above, 7 below"
+    );
+    let (start, ex) = peek_excerpt(&lines, 1, 4, 12);
+    assert_eq!(start, 0, "top of file clamps the above-context");
+    assert_eq!(ex.len(), 12);
+    let (start, ex) = peek_excerpt(&lines, 19, 4, 12);
+    assert_eq!(
+        (start, ex.len()),
+        (8, 12),
+        "bottom of file pulls the window up to keep it full"
+    );
+    let short: Vec<String> = (1..=3).map(|i| format!("s{i}")).collect();
+    let (start, ex) = peek_excerpt(&short, 1, 4, 12);
+    assert_eq!((start, ex.len()), (0, 3), "short files return whole");
+    let (_, empty) = peek_excerpt(&[], 0, 4, 12);
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn peek_popup_shows_the_target_then_enter_jumps_and_esc_closes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tmp.path().join("lib.rs");
+    let body: String = (1..=30)
+        .map(|i| {
+            if i == 15 {
+                String::from("fn the_answer() -> u32 {\n")
+            } else {
+                format!("// filler {i}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&other, &body).unwrap();
+    let here = tmp.path().join("main.rs");
+    std::fs::write(&here, "fn main() { the_answer(); }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&here).unwrap();
+    app.focus_pane(Pane::Editor);
+
+    // The drain's consumer, driven directly (a live server is not needed to
+    // pin the popup contract).
+    app.open_peek_popup(other.clone(), 14, 3);
+    let popup = app.peek_popup.as_ref().expect("the peek popup must open");
+    let text = popup.lines.join("\n");
+    assert!(
+        text.starts_with("lib.rs:15"),
+        "header names the workspace-relative target; was {text:?}"
+    );
+    assert!(
+        text.contains("\u{25b6}15  fn the_answer"),
+        "the definition line is numbered and marked; was {text:?}"
+    );
+    assert!(text.contains("Enter jumps"), "the footer teaches the keys");
+
+    // Esc closes without moving.
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert!(app.peek_popup.is_none() && app.peek_target.is_none());
+    assert_eq!(app.editor.path.as_deref(), Some(here.as_path()));
+
+    // Enter jumps to the target and records it as a definition jump.
+    app.open_peek_popup(other.clone(), 14, 3);
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert!(app.peek_popup.is_none());
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(other.as_path()),
+        "Enter converts the peek into the real jump"
+    );
+    assert_eq!(app.editor.cursor_row, 14);
+
+    // Any other key closes the popup AND keeps its meaning.
+    app.editor.open_pinned(&here).unwrap();
+    app.open_peek_popup(other.clone(), 14, 3);
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Down,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert!(app.peek_popup.is_none(), "a plain key dismisses the glance");
+}
+
+#[test]
+fn f12_family_chords_route_alt_to_peek() {
+    let plain = crossterm::event::KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE);
+    let alt = crossterm::event::KeyEvent::new(KeyCode::F(12), KeyModifiers::ALT);
+    assert!(is_go_to_definition_key(plain) && !is_peek_definition_key(plain));
+    assert!(is_peek_definition_key(alt) && !is_go_to_definition_key(alt));
+    let shift_alt =
+        crossterm::event::KeyEvent::new(KeyCode::F(12), KeyModifiers::ALT | KeyModifiers::SHIFT);
+    assert!(
+        !is_peek_definition_key(shift_alt),
+        "peek requires ALT alone in the F12 family"
+    );
 }
