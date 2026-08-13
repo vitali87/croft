@@ -2919,10 +2919,11 @@ pub struct App {
     /// output scanned into PROBLEMS entries, keyed by resolved file path.
     build_diagnostics:
         std::collections::HashMap<PathBuf, Vec<crate::widgets::problems::ProblemItem>>,
-    /// Which files each terminal pane contributed, so a pane's next scanned
-    /// command replaces its previous run's diagnostics (VS Code clears a
-    /// task's problems when the task re-runs).
-    build_diag_files_by_pane: std::collections::HashMap<usize, Vec<PathBuf>>,
+    /// Which files each terminal pane contributed, keyed by the pane's
+    /// STABLE uid (Vec positions shift on close/insert/reorder), so a
+    /// pane's next scanned command replaces its previous run's diagnostics
+    /// (VS Code clears a task's problems when the task re-runs).
+    build_diag_files_by_pane: std::collections::HashMap<u64, Vec<PathBuf>>,
     /// True while the "Discard All Changes" confirmation modal is up.
     pub pending_discard_all: bool,
     /// Cached workspace file index. Built lazily on first Cmd+P and
@@ -6458,7 +6459,7 @@ impl App {
     /// against the command's cwd (falling back to the workspace root);
     /// resolution is lexical, no filesystem probe, so a path the tool
     /// printed oddly still gets a row even if navigation later misses.
-    fn apply_build_scan(&mut self, pane: usize, cwd: Option<&Path>, output: &str) -> bool {
+    fn apply_build_scan(&mut self, pane: u64, cwd: Option<&Path>, output: &str) -> bool {
         let diags = crate::build_matchers::scan(output);
         let had_old = self
             .build_diag_files_by_pane
@@ -22062,8 +22063,8 @@ impl App {
         let mut captured: Vec<crate::widgets::captures::CapturedLine> = Vec::new();
         // Finished-command outputs to run through the build matchers after
         // the immutable pane sweep (#119): (pane index, cwd, output).
-        let mut build_scans: Vec<(usize, Option<PathBuf>, String)> = Vec::new();
-        for (ti, t) in self.terminals.iter().enumerate() {
+        let mut build_scans: Vec<(u64, Option<PathBuf>, String)> = Vec::new();
+        for t in &self.terminals {
             // Keep every pane on the current trigger set, wherever it was
             // created (a ptr-eq no-op when already current).
             t.set_triggers(self.triggers.clone());
@@ -22093,7 +22094,7 @@ impl App {
             // Always drain so completions never pile up unseen.
             for f in t.drain_finished_commands() {
                 if !f.output.is_empty() {
-                    build_scans.push((ti, f.cwd.clone(), f.output.clone()));
+                    build_scans.push((t.uid(), f.cwd.clone(), f.output.clone()));
                 }
                 // Durable command history: every finished command with a
                 // known text is recorded (cwd, exit, duration, timestamp)
@@ -28862,6 +28863,10 @@ impl App {
         self.lsp_last_seen.clear();
         self.lsp_diagnostics.clear();
         self.lsp_progress.clear();
+        // Build diagnostics describe the OLD workspace's files; a re-root
+        // that kept them showed the previous project's errors forever.
+        self.build_diagnostics.clear();
+        self.build_diag_files_by_pane.clear();
         // Refresh the window/icon title: it was emitted once at startup from
         // the launch dir and never updated, so after a re-root it kept showing
         // the parent (e.g. "Documents") instead of the repo. OSC 0 is

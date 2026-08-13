@@ -168,14 +168,14 @@ impl ProblemsPanel {
         }
     }
 
-    /// Replace the grouped diagnostics, returning whether anything changed so
-    /// the caller only forces a redraw on a real update (never once per tick).
-    /// Drops collapse state for files that no longer have diagnostics.
     /// The current grouped projection (read-only; tests and counters).
     pub fn groups(&self) -> &[ProblemGroup] {
         &self.groups
     }
 
+    /// Replace the grouped diagnostics, returning whether anything changed so
+    /// the caller only forces a redraw on a real update (never once per tick).
+    /// Drops collapse state for files that no longer have diagnostics.
     pub fn set_groups(&mut self, groups: Vec<ProblemGroup>) -> bool {
         if self.groups == groups {
             return false;

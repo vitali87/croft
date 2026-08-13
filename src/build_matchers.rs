@@ -33,7 +33,7 @@ pub struct BuildDiag {
 
 fn severity(word: &str) -> DiagnosticSeverity {
     match word {
-        "error" => DiagnosticSeverity::Error,
+        "error" | "fatal error" => DiagnosticSeverity::Error,
         "warning" => DiagnosticSeverity::Warning,
         _ => DiagnosticSeverity::Information,
     }
@@ -232,6 +232,13 @@ mod tests {
         assert_eq!(out[0].file, "src/index.js");
         assert_eq!(out[0].message, "Unexpected console statement");
         assert_eq!(out[1].severity, DiagnosticSeverity::Warning);
+    }
+
+    #[test]
+    fn fatal_error_counts_as_an_error() {
+        let out = scan("bad.c:1:1: fatal error: 'nope.h' file not found\n");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].severity, DiagnosticSeverity::Error);
     }
 
     #[test]
