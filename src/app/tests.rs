@@ -25928,7 +25928,7 @@ fn peek_popup_shows_the_target_then_enter_jumps_and_esc_closes() {
         .collect();
     std::fs::write(&other, &body).unwrap();
     let here = tmp.path().join("main.rs");
-    std::fs::write(&here, "fn main() { the_answer(); }\n").unwrap();
+    std::fs::write(&here, "fn main() { the_answer(); }\n// next line\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open_pinned(&here).unwrap();
     app.focus_pane(Pane::Editor);
@@ -25974,6 +25974,7 @@ fn peek_popup_shows_the_target_then_enter_jumps_and_esc_closes() {
 
     // Any other key closes the popup AND keeps its meaning.
     app.editor.open_pinned(&here).unwrap();
+    app.editor.cursor_row = 0;
     app.open_peek_popup(other.clone(), 14, 3);
     app.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Down,
@@ -25981,6 +25982,10 @@ fn peek_popup_shows_the_target_then_enter_jumps_and_esc_closes() {
     ))
     .unwrap();
     assert!(app.peek_popup.is_none(), "a plain key dismisses the glance");
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "the dismissing key keeps its normal meaning — Down still moves"
+    );
 }
 
 #[test]

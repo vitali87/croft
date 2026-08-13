@@ -7131,8 +7131,10 @@ impl App {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
             };
+            let mut peek_replied = false;
             while let Some(result) = lsp.drain_definition() {
                 if Some(result.request_id) == self.peek_definition_request_id {
+                    peek_replied = true;
                     peek = result.target;
                     continue;
                 }
@@ -7140,6 +7142,12 @@ impl App {
                     continue;
                 }
                 target = result.target;
+            }
+            if peek_replied && peek.is_none() {
+                // The reply arrived empty: without this the "Peeking
+                // definition" status hung forever with no popup.
+                self.peek_definition_request_id = None;
+                self.status = String::from("No definition found");
             }
         }
         let mut changed = false;
@@ -7160,16 +7168,30 @@ impl App {
     /// The open buffer supplies the text when the target file is already open
     /// (unsaved edits visible); disk otherwise.
     fn open_peek_popup(&mut self, path: PathBuf, line: u32, col: u32) {
-        let lines: Vec<String> = if self.editor.path.as_deref() == Some(path.as_path()) {
-            self.editor.lines.clone()
-        } else {
-            match std::fs::read_to_string(&path) {
+        // Any open buffer wins over disk — the ACTIVE group's tabs plus
+        // every inactive split leaf's — so unsaved edits show wherever the
+        // target file happens to be open.
+        let open_buffer = self
+            .editor
+            .editors
+            .iter()
+            .chain(
+                self.editor_layout
+                    .inactive_leaf_tabs()
+                    .into_iter()
+                    .flat_map(|tabs| tabs.editors.iter()),
+            )
+            .find(|e| e.path.as_deref() == Some(path.as_path()))
+            .map(|e| e.lines.clone());
+        let lines: Vec<String> = match open_buffer {
+            Some(lines) => lines,
+            None => match std::fs::read_to_string(&path) {
                 Ok(text) => text.lines().map(|s| s.to_string()).collect(),
                 Err(e) => {
                     self.status = format!("Peek failed: {e}");
                     return;
                 }
-            }
+            },
         };
         let target = line as usize;
         let (start, excerpt) = peek_excerpt(&lines, target, 4, 12);
@@ -7181,7 +7203,10 @@ impl App {
             body.push(format!("{marker}{:>num_w$}  {text}", n + 1));
         }
         body.push(String::from("Enter jumps \u{00b7} Esc closes"));
-        let anchor = self.editor.cursor_screen_pos().unwrap_or((0, 0));
+        let anchor = self.editor.cursor_screen_pos().unwrap_or((
+            self.editor.last_full_area.x + 1,
+            self.editor.last_full_area.y + 1,
+        ));
         self.peek_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
             body.join("\n"),
             anchor,
@@ -13518,8 +13543,12 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Peek Definition popup: Enter converts to the real jump, Esc
         // closes, and any other key closes it and keeps its normal
-        // meaning — the popup is a glance, never a mode (#115).
-        if self.peek_popup.is_some() {
+        // meaning — the popup is a glance, never a mode (#115). Gated on
+        // Press/Repeat like every other modal (the app-wide filter runs
+        // just below), so a key RELEASE never dismisses or jumps.
+        if self.peek_popup.is_some()
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
             match key.code {
                 KeyCode::Enter => {
                     if let Some((path, line, col)) = self.peek_target.take() {
