@@ -8148,6 +8148,12 @@ impl Widget for &mut Editor {
                 self.paint_highlighted_line(buf, text_x, y, text_w, line as usize);
                 self.sticky_click_rows.push((y, line));
             }
+            // The band just overpainted those rows, so any [Accept …] span
+            // recorded there no longer matches what is on screen — a click
+            // on a sticky header must never resolve an unseen conflict.
+            let band_end = inner.y + sticky.len().min(max_rows) as u16;
+            self.merge_action_spans
+                .retain(|(y, _, _, _)| *y >= band_end);
         }
 
         if let Some(metrics) = scrollbar_metrics {
@@ -17242,6 +17248,43 @@ mod tests {
             !e.sticky_click_rows.iter().any(|&(y, _)| y == caret.1),
             "the sticky band painted over the caret's own row {}",
             caret.1
+        );
+    }
+
+    #[test]
+    fn sticky_band_erases_accept_spans_it_paints_over() {
+        // The band overpaints the topmost content rows AFTER the row loop
+        // records the [Accept …] spans; a span left under it would make a
+        // click on a visible scope header resolve an unseen conflict.
+        let mut e = editor_with(
+            "fn outer() {\n    a();\n<<<<<<< HEAD\n    ours();\n=======\n    theirs();\n>>>>>>> feature\n    b();\n}",
+        );
+        e.scroll = 2; // the conflict header is the viewport's top row
+        e.cursor_row = 7;
+        e.sticky_lines = vec![0];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 12,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        assert!(
+            !e.sticky_click_rows.is_empty(),
+            "precondition: the sticky band must have painted"
+        );
+        let band_rows: Vec<u16> = e.sticky_click_rows.iter().map(|&(y, _)| y).collect();
+        assert!(
+            !e.merge_action_spans
+                .iter()
+                .any(|(y, _, _, _)| band_rows.contains(y)),
+            "spans under the sticky band must be dropped; spans={:?} band={band_rows:?}",
+            e.merge_action_spans
+        );
+        assert!(
+            e.merge_action_spans.iter().all(|(_, _, row, _)| *row == 2),
+            "the header's spans below the band (if visible elsewhere) still target the real block"
         );
     }
 
