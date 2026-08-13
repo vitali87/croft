@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Peek Definition arrived on Alt+F12: read a symbol's definition in an excerpt popup right at the caret — Enter converts it into the real jump, Esc dismisses, and unsaved edits in an open target file show as-is.",
+    summary: "The Explorer gained sticky scroll: deep inside a big directory, the enclosing folders pin to the top of the tree so you always know where you are — click a pinned row to jump back up to it.",
 }];

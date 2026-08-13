@@ -29,6 +29,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
 | `Ctrl+Shift+x` / `Cmd+Shift+x` | Jump to Extensions |
 | `Ctrl+Shift+l` / `Cmd+Shift+l` | While on a remote, disconnect and return to the local croft at the directory you connected from |
+| Click a pinned row in the Explorer's sticky band | Scrolled deep in a directory, its ancestor rows pin to the top of the tree; clicking one selects that directory and scrolls it to the top (right-click opens its context menu) |
 | Click activity-bar icons | Switch between Explorer, Search, Source Control, Run and Debug, Remote, Extensions, and Testing |
 | Click the settings gear | Open settings → Color Theme picker (Croft Black / Croft Dark Blue plus ten editor-inspired dark themes: One Dark Pro, Dracula, Monokai, Nord, Gruvbox Dark, Tokyo Night, Catppuccin Mocha, Solarized Dark, GitHub Dark, Darcula) or Customize Layout |
 | Click the layout icons (top-right of the editor / welcome) | Toggle the primary side bar, toggle the panel, or open the **Customize Layout** popup |

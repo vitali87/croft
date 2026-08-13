@@ -41,6 +41,10 @@ pub struct FileTree {
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
+    /// The sticky band painted this frame: `(screen y, node index)` per
+    /// pinned ancestor row. Cleared at render start so the hit test always
+    /// describes the painted frame (#103's invariant).
+    sticky_rows: Vec<(u16, usize)>,
     pub anchor: usize,
     pub marked: BTreeSet<PathBuf>,
     /// While the user is mid-drag, the index of the directory row currently
@@ -88,6 +92,7 @@ impl FileTree {
             last_inner: Rect::default(),
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
+            sticky_rows: Vec::new(),
             anchor: 0,
             marked: BTreeSet::new(),
             drag_target: None,
@@ -521,6 +526,14 @@ impl FileTree {
     /// position uniformly.
     pub fn visible_indices(&self) -> Vec<usize> {
         (0..self.nodes.len()).collect()
+    }
+
+    /// Map a click on the sticky band to the pinned directory's node index.
+    pub fn sticky_row_at(&self, y: u16) -> Option<usize> {
+        self.sticky_rows
+            .iter()
+            .find(|&&(ry, _)| ry == y)
+            .map(|&(_, idx)| idx)
     }
 
     pub fn selected_path(&self) -> Option<&Path> {
@@ -1249,6 +1262,7 @@ impl Widget for &mut FileTree {
         self.header_views_btn = Rect::default();
         self.last_area = area;
         self.last_scrollbar = Rect::default();
+        self.sticky_rows.clear();
 
         // Paint the ⋯ button at the right end of the title border row. It is
         // always available (not focus-gated) so the view-toggle menu is one
@@ -1463,10 +1477,90 @@ impl Widget for &mut FileTree {
                 }
             }
         }
+        // Sticky band (#117): pin the off-screen ancestor directories of the
+        // top visible row, overpainting the topmost content rows — the
+        // editor sticky band's model, including its guard: never cover the
+        // selected row (the scroll clamp above keeps it on screen, so its
+        // band-relative row bounds the band's height).
+        if scroll_pos > 0 {
+            const STICKY_MAX: usize = 3;
+            let top_idx = visible[scroll_pos];
+            let chain = sticky_ancestors(&self.nodes, top_idx, STICKY_MAX);
+            let sel_row = sel_pos.saturating_sub(scroll_pos);
+            let band = chain
+                .len()
+                .min(sel_row)
+                .min(visible_height.saturating_sub(1));
+            let shown = &chain[chain.len() - band..];
+            let bg = self.theme.sticky_scroll_bg();
+            for (i, &aidx) in shown.iter().enumerate() {
+                let y = inner.y + i as u16;
+                for x in inner.x..inner.x + row_width {
+                    buf[(x, y)].set_symbol(" ");
+                    buf[(x, y)].set_style(Style::default().bg(bg));
+                }
+                let node = &self.nodes[aidx];
+                let name = node
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| node.path.display().to_string());
+                let name_fg = if self.is_ignored(&node.path) {
+                    self.theme.ignored_fg()
+                } else {
+                    Color::White
+                };
+                let spans = vec![
+                    Span::raw("  ".repeat(node.depth)),
+                    Span::styled(
+                        format!("{} ", icons::CHEVRON_OPEN),
+                        Style::default().fg(Color::Gray).bg(bg),
+                    ),
+                    Span::styled(
+                        format!("{} ", icons::FOLDER_OPEN.glyph),
+                        Style::default().fg(icons::FOLDER_OPEN.color).bg(bg),
+                    ),
+                    Span::styled(
+                        name,
+                        Style::default()
+                            .fg(name_fg)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                buf.set_line(inner.x, y, &Line::from(spans), row_width);
+                self.sticky_rows.push((y, aidx));
+            }
+        }
         if let Some(metrics) = scrollbar_metrics {
             scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
         }
     }
+}
+
+/// The ancestor directory chain of `top_idx`, outermost first, capped at
+/// `max` keeping the DEEPEST entries (the closest context matters most —
+/// VS Code's tree sticky truncates the outer levels the same way). An
+/// ancestor is the nearest earlier node with a strictly smaller depth,
+/// walked to the root; a top-level node has none.
+pub(crate) fn sticky_ancestors(nodes: &[Node], top_idx: usize, max: usize) -> Vec<usize> {
+    let Some(top) = nodes.get(top_idx) else {
+        return Vec::new();
+    };
+    let mut chain = Vec::new();
+    let mut want_depth = top.depth;
+    for i in (0..top_idx).rev() {
+        if want_depth == 0 {
+            break;
+        }
+        if nodes[i].depth < want_depth {
+            chain.push(i);
+            want_depth = nodes[i].depth;
+        }
+    }
+    chain.reverse(); // outermost first
+    let skip = chain.len().saturating_sub(max);
+    chain.split_off(skip)
 }
 
 #[cfg(test)]
@@ -2599,5 +2693,104 @@ mod tests {
         let all: Vec<usize> = (0..tree.nodes.len()).collect();
         // No filter open at all.
         assert_eq!(tree.visible_indices(), all);
+    }
+    fn deep_fixture() -> (TempDir, FileTree) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("outer/inner")).unwrap();
+        for i in 0..12 {
+            fs::write(root.join(format!("outer/inner/f{i:02}.rs")), "x\n").unwrap();
+        }
+        let mut tree = FileTree::new(root.to_path_buf());
+        // Expand outer, then inner, so the deep files are real rows.
+        let outer = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("outer"))
+            .unwrap();
+        tree.selected = outer;
+        tree.expand_selected();
+        let inner = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("inner"))
+            .unwrap();
+        tree.selected = inner;
+        tree.expand_selected();
+        (tmp, tree)
+    }
+
+    #[test]
+    fn sticky_ancestors_walk_outermost_first_and_cap_keeps_the_deepest() {
+        let (_tmp, tree) = deep_fixture();
+        let deep = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("f08.rs"))
+            .unwrap();
+        let chain = sticky_ancestors(&tree.nodes, deep, 3);
+        assert_eq!(chain.len(), 3, "root, outer, inner");
+        assert!(tree.nodes[chain[0]].depth < tree.nodes[chain[1]].depth);
+        assert!(tree.nodes[chain[2]].path.ends_with("inner"));
+        let capped = sticky_ancestors(&tree.nodes, deep, 2);
+        assert_eq!(capped.len(), 2);
+        assert!(
+            tree.nodes[capped[1]].path.ends_with("inner")
+                && tree.nodes[capped[0]].path.ends_with("outer"),
+            "the cap drops the OUTERMOST level, keeping the closest context"
+        );
+        assert!(
+            sticky_ancestors(&tree.nodes, 0, 3).is_empty(),
+            "the root row has no ancestors"
+        );
+    }
+
+    #[test]
+    fn sticky_band_pins_ancestors_and_maps_clicks_but_never_covers_the_selection() {
+        let (_tmp, mut tree) = deep_fixture();
+        let deep = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("f09.rs"))
+            .unwrap();
+        tree.selected = deep;
+        tree.scroll = deep.saturating_sub(3);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 34,
+            height: 8,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        assert!(
+            !tree.sticky_rows.is_empty(),
+            "scrolled deep inside inner/, the band must pin ancestors"
+        );
+        let (y, idx) = tree.sticky_rows[0];
+        assert!(tree.nodes[idx].is_dir, "only directories pin");
+        assert_eq!(tree.sticky_row_at(y), Some(idx));
+        let row: String = (area.x..area.x + area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect();
+        let name = tree.nodes[idx]
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            row.contains(&name),
+            "the pinned row shows the directory name; row {row:?}"
+        );
+
+        // Selection on the top visible row: the band must yield entirely.
+        tree.selected = tree.scroll;
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        assert!(
+            tree.sticky_rows.is_empty(),
+            "the band never covers the selected row"
+        );
     }
 }

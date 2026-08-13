@@ -26301,7 +26301,14 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::Explorer {
                     self.focus_pane(Pane::Tree);
-                    let node_idx = self.tree.node_at_y(m.row);
+                    // A right-click on the sticky band context-menus the
+                    // PINNED directory, not the covered row (#117): the band
+                    // hit wins the row resolution and the menu flow proceeds
+                    // for that node.
+                    let node_idx = self
+                        .tree
+                        .sticky_row_at(m.row)
+                        .or_else(|| self.tree.node_at_y(m.row));
                     if let Some(idx) = node_idx {
                         let path_clicked = self.tree.nodes[idx].path.clone();
                         let already_marked = self.tree.marked.contains(&path_clicked);
@@ -27236,6 +27243,16 @@ impl App {
                     // Dependencies) are stacked in the panel.
                     if rect_contains(self.tree.header_views_btn, m.column, m.row) {
                         self.open_explorer_views_menu();
+                        return;
+                    }
+                    // A left-click on the sticky band jumps: select the
+                    // pinned ancestor and scroll it to the top of the tree
+                    // (#117). Checked before the row map, which would answer
+                    // for the covered row.
+                    if let Some(idx) = self.tree.sticky_row_at(m.row) {
+                        self.tree.select_replace(idx);
+                        self.tree.scroll = idx;
+                        self.tree_click.clear();
                         return;
                     }
                     if let Some(idx) = self.tree.node_at_y(m.row) {
