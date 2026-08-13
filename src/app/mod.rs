@@ -8455,6 +8455,27 @@ impl App {
     /// The reply is handled in [`Self::drain_lsp_code_actions`].
     /// The Quick Fix picker for a merge conflict at the cursor: VS Code's
     /// three accept actions, applied locally with no LSP involvement.
+    /// F7 / Shift+F7: move the caret to the next / previous conflict header,
+    /// wrapping, and say which of how many the caret landed on.
+    fn jump_conflict(&mut self, backwards: bool) {
+        let blocks = self.editor.conflicts().to_vec();
+        let from = self.editor.cursor_row;
+        let hit = if backwards {
+            crate::merge::prev_conflict(&blocks, from)
+        } else {
+            crate::merge::next_conflict(&blocks, from)
+        };
+        let Some((idx, row)) = hit else {
+            return;
+        };
+        self.editor.clear_selection();
+        self.editor.cursor_row = row;
+        self.editor.cursor_col = 0;
+        self.editor.scroll_col = 0;
+        self.editor.ensure_cursor_col_visible();
+        self.status = format!("Conflict {} of {}", idx + 1, blocks.len());
+    }
+
     fn open_merge_conflict_picker(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let rows = vec![
@@ -8492,11 +8513,80 @@ impl App {
             self.status = String::from("No merge conflict at the cursor");
             return;
         }
-        self.status = String::from(match res {
+        let accepted = match res {
             crate::merge::Resolution::Current => "Accepted current change",
             crate::merge::Resolution::Incoming => "Accepted incoming change",
             crate::merge::Resolution::Both => "Accepted both changes",
-        });
+        };
+        self.status = if self.editor.conflicts().is_empty() {
+            format!(
+                "{accepted} — all conflicts resolved; \"Merge: Complete Merge\" stages the file"
+            )
+        } else {
+            format!("{accepted} — {} left", self.editor.conflicts().len())
+        };
+    }
+
+    /// VS Code's "Accept All Current / Incoming": resolve every block in the
+    /// buffer the same way, back to front so each replacement is one undo
+    /// step and earlier block indices stay valid.
+    fn resolve_all_merge(&mut self, res: crate::merge::Resolution) {
+        if !self.editor_is_text() {
+            self.status = String::from("Merge conflict actions need a text file");
+            return;
+        }
+        let total = self.editor.conflicts().len();
+        if total == 0 {
+            self.status = String::from("No merge conflicts in this file");
+            return;
+        }
+        while let Some(block) = self.editor.conflicts().last().copied() {
+            if !self.editor.resolve_conflict_at(block.ours_start, res) {
+                break;
+            }
+        }
+        let side = match res {
+            crate::merge::Resolution::Current => "current",
+            crate::merge::Resolution::Incoming => "incoming",
+            crate::merge::Resolution::Both => "both sides",
+        };
+        self.status = format!(
+            "Accepted {side} for {total} conflict{} — \"Merge: Complete Merge\" stages the file",
+            if total == 1 { "" } else { "s" }
+        );
+    }
+
+    /// VS Code's "Complete Merge": once every block is resolved, persist the
+    /// buffer and stage the file so it leaves MERGE CONFLICTS and rejoins the
+    /// ordinary commit flow. Refuses while conflicts remain.
+    fn complete_merge(&mut self) {
+        if !self.editor_is_text() {
+            self.status = String::from("Merge conflict actions need a text file");
+            return;
+        }
+        let left = self.editor.conflicts().len();
+        if left > 0 {
+            self.status = format!(
+                "{left} conflict{} still unresolved — F7 jumps to the next one",
+                if left == 1 { "" } else { "s" }
+            );
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file open");
+            return;
+        };
+        if self.editor.dirty {
+            self.save();
+        }
+        let rel = self.status_path(&path);
+        match crate::git::stage_path(&self.tree.root, &rel) {
+            Ok(()) => {
+                self.refresh_source_control();
+                self.status = format!("Merge complete: staged {rel}");
+            }
+            Err(e) => self.status = format!("Stage failed: {e}"),
+        }
     }
 
     fn start_code_action(&mut self) {
@@ -15570,6 +15660,31 @@ impl App {
         self.source_control.selected_change = Some(entry_idx);
         let abs = self.tree.root.join(&entry.path);
         let opened = match entry.kind {
+            // A conflicted entry opens the WORKING file — a HEAD diff is
+            // meaningless against a marker-filled tree — parked on the first
+            // conflict, with the status naming the whole guided flow.
+            ChangeKind::Conflicted => match self.editor.open_pinned(&abs) {
+                Ok(()) => {
+                    self.focus_pane(Pane::Editor);
+                    let n = self.editor.conflicts().len();
+                    if let Some(block) = self.editor.conflicts().first().copied() {
+                        self.editor.clear_selection();
+                        self.editor.cursor_row = block.ours_start;
+                        self.editor.cursor_col = 0;
+                        self.editor.scroll_col = 0;
+                        self.editor.ensure_cursor_col_visible();
+                    }
+                    self.status = format!(
+                        "{n} conflict{} — F7 jumps, Cmd+. accepts, \"Merge: Complete Merge\" stages",
+                        if n == 1 { "" } else { "s" }
+                    );
+                    true
+                }
+                Err(e) => {
+                    self.status = format!("Open failed: {e}");
+                    false
+                }
+            },
             ChangeKind::Modified | ChangeKind::StagedModified => {
                 match crate::git::read_file_at_head(&self.tree.root, &entry.path) {
                     Ok(head_text) => {
@@ -19159,6 +19274,14 @@ impl App {
         // Inline find bar (Cmd+F / Ctrl+F) eats every key while open.
         if self.editor_find.is_some() {
             self.handle_editor_find_key(key);
+            return;
+        }
+        // F7 / Shift+F7 in a buffer with merge conflicts: jump between the
+        // blocks, the same chord the diff view uses for its hunks (VS Code's
+        // "Go to Next/Previous Conflict"). Only claimed while conflicts
+        // exist, so F7 keeps its normal meaning everywhere else.
+        if matches!(key.code, KeyCode::F(7)) && !self.editor.conflicts().is_empty() {
+            self.jump_conflict(key.modifiers.contains(KeyModifiers::SHIFT));
             return;
         }
         if is_editor_find_key(key) {
@@ -23379,6 +23502,13 @@ impl App {
                 self.resolve_merge_at_cursor(crate::merge::Resolution::Incoming)
             }
             Cmd::MergeAcceptBoth => self.resolve_merge_at_cursor(crate::merge::Resolution::Both),
+            Cmd::MergeAcceptAllCurrent => self.resolve_all_merge(crate::merge::Resolution::Current),
+            Cmd::MergeAcceptAllIncoming => {
+                self.resolve_all_merge(crate::merge::Resolution::Incoming)
+            }
+            Cmd::MergeNextConflict => self.jump_conflict(false),
+            Cmd::MergePrevConflict => self.jump_conflict(true),
+            Cmd::MergeComplete => self.complete_merge(),
             Cmd::StageHunk => self.stage_hunk_at_caret(),
             Cmd::UnstageHunk => self.unstage_hunk_at_caret(),
             Cmd::RevertHunk => self.request_revert_hunk_at_caret(),
@@ -26090,6 +26220,29 @@ impl App {
                         self.trigger_definition_at(m.column, m.row);
                     }
                     return;
+                }
+                // Merge-conflict accept actions on a conflict header row —
+                // the [Accept …] spans the editor paints, VS Code's
+                // merge-conflict CodeLens clicks. Checked before every other
+                // editor click: the header row is marker text, so a caret
+                // placement there serves nobody. A stale span cannot
+                // mis-fire — `resolve_conflict_at` re-validates the row
+                // against the live conflict set.
+                if in_editor && self.editor.diff.is_none() {
+                    let hit = self
+                        .editor
+                        .merge_action_spans
+                        .iter()
+                        .find(|(y, xs, _, _)| *y == m.row && xs.contains(&m.column))
+                        .map(|(_, _, row, res)| (*row, *res));
+                    if let Some((row, res)) = hit {
+                        self.focus_pane(Pane::Editor);
+                        self.editor.clear_selection();
+                        self.editor.cursor_row = row;
+                        self.editor.cursor_col = 0;
+                        self.resolve_merge_at_cursor(res);
+                        return;
+                    }
                 }
                 if !in_editor {
                     self.editor_click.clear();

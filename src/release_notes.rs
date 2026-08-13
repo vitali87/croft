@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Every prompt title and path status now speaks workspace-relative: New File / New Folder, Created, Jumped to, Back to, Restored, Imported and paste/move messages no longer bury the name that matters inside a deep absolute path.",
+    kind: NoteKind::Feature,
+    summary: "Guided merge-conflict resolution: conflicted files open from MERGE CONFLICTS parked on their first block, F7 jumps between conflicts, each header row carries clickable Accept Current / Incoming / Both actions, and Merge: Complete Merge saves and stages the resolved file.",
 }];

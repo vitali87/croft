@@ -19663,7 +19663,12 @@ fn palette_merge_accept_incoming_resolves_at_cursor() {
     app.editor.cursor_row = 1;
     app.run_command(crate::widgets::command_palette::Command::MergeAcceptIncoming);
     assert_eq!(app.editor.lines, vec!["fn main() {", "    theirs();", "}"]);
-    assert_eq!(app.status, "Accepted incoming change");
+    // The last block resolving appends the Complete Merge pointer, so the
+    // next step of the flow is always one status read away (#107).
+    assert_eq!(
+        app.status,
+        "Accepted incoming change — all conflicts resolved; \"Merge: Complete Merge\" stages the file"
+    );
 }
 
 #[test]
@@ -25596,5 +25601,249 @@ fn create_prompt_labels_speak_workspace_relative() {
     assert_eq!(
         label, "New Folder in .",
         "the workspace root itself reads as '.'"
+    );
+}
+
+/// A repo with a real merge conflict in `shared.txt` (two blocks) produced
+/// by an actual `git merge`, plus a clean second file.
+fn conflicted_repo(tmp: &std::path::Path) {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(
+        tmp.join("shared.txt"),
+        "alpha\nbase-one\nm1\nm2\nm3\nm4\nm5\nbase-two\nomega\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.join("clean.txt"), "untouched\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    git(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        tmp.join("shared.txt"),
+        "alpha\nfeature-one\nm1\nm2\nm3\nm4\nm5\nfeature-two\nomega\n",
+    )
+    .unwrap();
+    git(&["commit", "-aqm", "feature edit"]);
+    git(&["checkout", "-q", "main"]);
+    std::fs::write(
+        tmp.join("shared.txt"),
+        "alpha\nmain-one\nm1\nm2\nm3\nm4\nm5\nmain-two\nomega\n",
+    )
+    .unwrap();
+    git(&["commit", "-aqm", "main edit"]);
+    let merge = git(&["merge", "feature"]);
+    assert!(
+        !merge.status.success(),
+        "the merge must conflict for these tests"
+    );
+}
+
+/// Wait for the git worker to deliver entries, then return the index of the
+/// conflicted `shared.txt` entry in the Source Control panel.
+fn wait_for_conflicted_entry(app: &mut App) -> usize {
+    app.set_sidebar_view(SidebarView::SourceControl);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let _ = app.drain_git_responses();
+        if let Some(idx) = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.kind == crate::git::ChangeKind::Conflicted)
+        {
+            return idx;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("the git worker never reported the conflicted entry");
+}
+
+#[test]
+fn scm_click_on_a_conflicted_entry_opens_the_file_at_its_first_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    assert_eq!(
+        app.editor.path.as_deref().map(|p| p.file_name().unwrap()),
+        Some(std::ffi::OsStr::new("shared.txt")),
+        "the conflicted file must open"
+    );
+    let first_header = app.editor.conflicts()[0].ours_start;
+    assert_eq!(
+        app.editor.cursor_row, first_header,
+        "the cursor must land on the first conflict header, not row 0"
+    );
+    assert!(
+        app.status.contains("2 conflicts"),
+        "the status must count the conflicts and name the flow; was {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn f7_cycles_conflicts_in_a_plain_editor_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("shared.txt"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    let headers: Vec<usize> = app
+        .editor
+        .conflicts()
+        .iter()
+        .map(|b| b.ours_start)
+        .collect();
+    assert_eq!(headers.len(), 2, "precondition: two conflict blocks");
+    app.editor.cursor_row = 0;
+    let f7 = |app: &mut App, shift: bool| {
+        let mut key = crossterm::event::KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE);
+        if shift {
+            key.modifiers = KeyModifiers::SHIFT;
+        }
+        app.handle_key(key).unwrap();
+    };
+    f7(&mut app, false);
+    assert_eq!(
+        app.editor.cursor_row, headers[0],
+        "first F7 reaches conflict 1"
+    );
+    assert!(
+        app.status.contains("Conflict 1 of 2"),
+        "status names the position; was {:?}",
+        app.status
+    );
+    f7(&mut app, false);
+    assert_eq!(
+        app.editor.cursor_row, headers[1],
+        "second F7 reaches conflict 2"
+    );
+    f7(&mut app, false);
+    assert_eq!(app.editor.cursor_row, headers[0], "F7 wraps to conflict 1");
+    f7(&mut app, true);
+    assert_eq!(
+        app.editor.cursor_row, headers[1],
+        "Shift+F7 walks backwards with wrap"
+    );
+}
+
+#[test]
+fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+
+    // Completing while conflicts remain must refuse.
+    app.complete_merge();
+    assert!(
+        app.status.contains("unresolved"),
+        "complete must refuse while blocks remain; was {:?}",
+        app.status
+    );
+
+    app.resolve_all_merge(crate::merge::Resolution::Incoming);
+    assert!(app.editor.conflicts().is_empty(), "every block resolved");
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "alpha\nfeature-one\nm1\nm2\nm3\nm4\nm5\nfeature-two\nomega",
+        "the buffer keeps only the incoming side of both blocks"
+    );
+
+    app.complete_merge();
+    assert!(
+        app.status.contains("Merge complete: staged shared.txt"),
+        "complete must save and stage; was {:?}",
+        app.status
+    );
+    let disk = std::fs::read_to_string(tmp.path().join("shared.txt")).unwrap();
+    assert!(
+        !disk.contains("<<<<<<<"),
+        "the resolved file must be on disk, marker-free"
+    );
+    let porcelain = std::process::Command::new("git")
+        .args(["-C", tmp.path().to_str().unwrap(), "status", "--porcelain"])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&porcelain.stdout).to_string();
+    let line = out
+        .lines()
+        .find(|l| l.contains("shared.txt"))
+        .expect("shared.txt still in status");
+    assert!(
+        line.starts_with("M "),
+        "after staging, shared.txt must be index-modified (M ), not unmerged; was {line:?}"
+    );
+}
+
+#[test]
+fn clicking_an_accept_action_on_the_header_row_resolves_that_block() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("shared.txt"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    let backend = ratatui::backend::TestBackend::new(160, 44);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let a = buf.area;
+    let text: String = (a.y..a.y + a.height)
+        .map(|y| {
+            (a.x..a.x + a.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("[Accept Current]") && text.contains("[Accept Incoming]"),
+        "the header row must carry the accept actions"
+    );
+    let span = app
+        .editor
+        .merge_action_spans
+        .iter()
+        .find(|(_, _, _, res)| *res == crate::merge::Resolution::Incoming)
+        .cloned()
+        .expect("an incoming action span must be recorded");
+    let before = app.editor.conflicts().len();
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        span.1.start,
+        span.0,
+    ));
+    assert_eq!(
+        app.editor.conflicts().len(),
+        before - 1,
+        "the clicked block must resolve; status: {:?}",
+        app.status
+    );
+    assert!(
+        app.editor.lines.contains(&String::from("feature-one")),
+        "the incoming side must be kept"
+    );
+    assert!(
+        app.status.contains("Accepted incoming change"),
+        "status must confirm; was {:?}",
+        app.status
     );
 }
