@@ -25847,3 +25847,42 @@ fn clicking_an_accept_action_on_the_header_row_resolves_that_block() {
         app.status
     );
 }
+
+#[test]
+fn add_watch_via_the_palette_prompt_then_clear_all() {
+    use crate::widgets::input_prompt::InputPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::DebugAddWatch);
+    let prompt = app
+        .input_prompt
+        .as_ref()
+        .expect("Debug: Add Watch Expression must open an input prompt");
+    assert_eq!(prompt.purpose, InputPurpose::AddWatch);
+    for c in "len(cart)".chars() {
+        app.input_prompt.as_mut().unwrap().push_char(c);
+    }
+    app.submit_input_prompt();
+    assert!(app.input_prompt.is_none(), "submitting closes the prompt");
+    assert_eq!(app.watch_exprs, vec!["len(cart)"]);
+    assert!(app.status.contains("Watching len(cart)"));
+
+    // Duplicates are refused silently, whitespace trimmed.
+    app.add_watch_expression(String::from("  len(cart)  "));
+    assert_eq!(app.watch_exprs.len(), 1, "no duplicate watches");
+
+    app.add_watch_expression(String::from("t"));
+    app.watch_vals
+        .insert(String::from("t"), (String::from("9.99"), true));
+    app.remove_watch_expression(0);
+    assert_eq!(
+        app.watch_exprs,
+        vec!["t"],
+        "removal is by display index, later rows keep their values"
+    );
+    assert!(app.watch_vals.contains_key("t"));
+
+    app.run_command(crate::widgets::command_palette::Command::DebugClearWatch);
+    assert!(app.watch_exprs.is_empty() && app.watch_vals.is_empty());
+    assert!(app.status.contains("Removed 1 watch expression"));
+}
