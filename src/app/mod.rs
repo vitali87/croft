@@ -14857,6 +14857,7 @@ impl App {
             Some(SessionPhase::Terminated) => {
                 self.editor.stop_line = None;
                 self.editor.unverified_breakpoints.clear();
+                self.reset_watch_runtime();
                 // Reply to the adapter's own `terminated`/`exited` with the
                 // graceful `disconnect` handshake before dropping it. js-debug
                 // only retires its detached watchdog on this handshake, never on
@@ -14991,7 +14992,7 @@ impl App {
                 title: String::from("WATCH"),
             },
         });
-        for expr in &self.watch_exprs {
+        for (widx, expr) in self.watch_exprs.iter().enumerate() {
             let (value, available, pending) = match self.watch_vals.get(expr) {
                 Some((v, ok)) => (v.clone(), *ok, false),
                 None => (String::new(), true, true),
@@ -15002,6 +15003,7 @@ impl App {
             rows.push(DebugRow {
                 indent: 1,
                 kind: DebugRowKind::Watch {
+                    index: widx,
                     expression: expr.clone(),
                     value,
                     available,
@@ -15037,7 +15039,11 @@ impl App {
                 .map(|(k, (v, _))| (k, v))
                 .collect();
         }
-        if let Some(session) = self.dap_session.as_mut() {
+        if let Some(session) = self
+            .dap_session
+            .as_mut()
+            .filter(|s| s.phase == crate::dap::session::SessionPhase::Stopped)
+        {
             for expr in &self.watch_exprs {
                 session.evaluate(expr, "watch");
             }
@@ -15048,11 +15054,20 @@ impl App {
     /// evaluate it immediately when a session is paused.
     fn add_watch_expression(&mut self, expr: String) {
         let expr = expr.trim().to_string();
-        if expr.is_empty() || self.watch_exprs.contains(&expr) {
+        if expr.is_empty() {
+            self.status = String::from("Enter an expression to watch");
+            return;
+        }
+        if self.watch_exprs.contains(&expr) {
+            self.status = format!("Already watching {expr}");
             return;
         }
         self.watch_exprs.push(expr.clone());
-        if let Some(session) = self.dap_session.as_mut() {
+        if let Some(session) = self
+            .dap_session
+            .as_mut()
+            .filter(|s| s.phase == crate::dap::session::SessionPhase::Stopped)
+        {
             session.evaluate(&expr, "watch");
         }
         self.status = format!("Watching {expr}");
@@ -15702,11 +15717,22 @@ impl App {
     }
 
     /// Shift+F5: stop debugging and tear the session down.
+    /// A session ended: the expressions survive (they usually make sense for
+    /// the next run too), but the values, the changed-value baseline, and the
+    /// baseline latch are that session's — left in place they made every
+    /// watch flash "changed" on a fresh session's first stop.
+    fn reset_watch_runtime(&mut self) {
+        self.watch_vals.clear();
+        self.watch_prev.clear();
+        self.watch_baseline_pending = false;
+    }
+
     pub fn debug_stop(&mut self) {
         if let Some(session) = self.dap_session.as_mut() {
             session.disconnect();
         }
         self.dap_session = None;
+        self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
         // reparented to init after the server dies. See the Terminated arm in
         // `poll_dap` and `crate::dap::reaper`.

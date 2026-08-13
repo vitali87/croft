@@ -112,6 +112,11 @@ pub enum DebugRowKind {
     /// from the previous stop; `pending` shows a placeholder until the
     /// evaluate response lands.
     Watch {
+        /// Index into the App's expression list — carried IN the row so the
+        /// remove `✕` maps to the right expression even when `debug_scroll`
+        /// has skipped earlier Watch rows (a render-order counter restarted
+        /// at the first VISIBLE row and removed the wrong one).
+        index: usize,
         expression: String,
         value: String,
         available: bool,
@@ -154,9 +159,6 @@ pub struct RunDebugPanel {
     /// Remove-`✕` hit cells for Watch rows painted this frame:
     /// `(y, x, nth watch row)`. Cleared at every tree render.
     watch_remove_rects: Vec<(u16, u16, usize)>,
-    /// Running index of Watch rows during a render, so the `✕` rects map
-    /// back to the app's expression order.
-    watch_row_seq: usize,
     pub debug_status: String,
     pub debug_rows: Vec<DebugRow>,
     pub debug_scroll: usize,
@@ -196,7 +198,6 @@ impl RunDebugPanel {
             last_button_area: Rect::default(),
             debug_active: false,
             watch_remove_rects: Vec::new(),
-            watch_row_seq: 0,
             debug_status: String::new(),
             debug_rows: Vec::new(),
             debug_scroll: 0,
@@ -255,7 +256,6 @@ impl RunDebugPanel {
     /// `last_debug_rows_shown` for click mapping.
     fn render_debug_tree(&mut self, inner: Rect, buf: &mut Buffer) {
         self.watch_remove_rects.clear();
-        self.watch_row_seq = 0;
         let right = inner.x + inner.width;
         let mut y = inner.y;
 
@@ -416,6 +416,7 @@ impl RunDebugPanel {
                     }
                 }
                 DebugRowKind::Watch {
+                    index,
                     expression,
                     value,
                     available,
@@ -468,10 +469,8 @@ impl RunDebugPanel {
                             "\u{2715}",
                             Style::default().fg(DBG_TYPE),
                         );
-                        self.watch_remove_rects
-                            .push((row_y, rx, self.watch_row_seq));
+                        self.watch_remove_rects.push((row_y, rx, *index));
                     }
-                    self.watch_row_seq += 1;
                 }
                 DebugRowKind::WatchAdd => {
                     let indent = (row.indent as u16) * 2;
@@ -1276,6 +1275,7 @@ mod tests {
             DebugRow {
                 indent: 1,
                 kind: DebugRowKind::Watch {
+                    index: 0,
                     expression: "t".into(),
                     value: "9.99".into(),
                     available: true,
@@ -1286,6 +1286,7 @@ mod tests {
             DebugRow {
                 indent: 1,
                 kind: DebugRowKind::Watch {
+                    index: 1,
                     expression: "self.missing".into(),
                     value: "NameError".into(),
                     available: false,
@@ -1296,6 +1297,7 @@ mod tests {
             DebugRow {
                 indent: 1,
                 kind: DebugRowKind::Watch {
+                    index: 2,
                     expression: "len(cart)".into(),
                     value: String::new(),
                     available: true,
@@ -1335,5 +1337,19 @@ mod tests {
         assert_eq!(idx, 1, "the second watch row maps to index 1");
         assert_eq!(panel.watch_remove_at(x, y), Some(1));
         assert_eq!(panel.watch_remove_at(x, y + 5), None);
+
+        // Scrolled: the header and the first watch row are skipped. The
+        // first VISIBLE watch row must still map to expression index 1 —
+        // a render-order counter restarted at 0 here and the ✕ removed
+        // the wrong expression (#113 review).
+        panel.debug_scroll = 2;
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let (y, x, idx) = panel.watch_remove_rects[0];
+        assert_eq!(
+            idx, 1,
+            "after scrolling past the first watch row, the first visible one keeps its true index"
+        );
+        assert_eq!(panel.watch_remove_at(x, y), Some(1));
     }
 }
