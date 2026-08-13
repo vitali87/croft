@@ -1448,6 +1448,10 @@ pub struct Editor {
     /// The `edit_seq` `conflicts` was computed at; `u64::MAX` forces the
     /// first scan.
     conflicts_seq: u64,
+    /// Clickable accept-action spans painted on conflict header rows this
+    /// frame: `(screen y, x range, header row, resolution)`. Cleared at
+    /// render start so the hit test always describes the painted frame.
+    pub merge_action_spans: Vec<(u16, std::ops::Range<u16>, usize, crate::merge::Resolution)>,
     /// Per-source-line git blame for the current file, index 0 = line 1. Set
     /// by the app off-thread once per (file, HEAD); `None` until fetched or
     /// when blame is disabled. Drives the GitLens-style current-line inline
@@ -1769,6 +1773,7 @@ impl Editor {
             git_marks: std::collections::HashMap::new(),
             git_marks_seq: u64::MAX,
             conflicts: Vec::new(),
+            merge_action_spans: Vec::new(),
             conflicts_seq: u64::MAX,
             blame_lines: None,
             blame_for: None,
@@ -2093,6 +2098,12 @@ impl Editor {
     /// against the zero hash (a working-tree edit) reads `Uncommitted changes`.
     pub fn current_line_blame_annotation(&self) -> Option<String> {
         if !self.blame_enabled {
+            return None;
+        }
+        // Inside a conflict block the annotation is noise (markers have no
+        // meaningful author) and on the header row it painted over the
+        // [Accept …] actions — the accept affordance wins.
+        if crate::merge::conflict_containing(&self.conflicts, self.cursor_row).is_some() {
             return None;
         }
         // A reused tab (the preview) switches path before the new fetch
@@ -7239,6 +7250,7 @@ impl Widget for &mut Editor {
         self.last_inner = inner;
         self.last_scrollbar = Rect::default();
         self.last_hscrollbar = Rect::default();
+        self.merge_action_spans.clear();
 
         let height = inner.height as usize;
         if height == 0 {
@@ -7796,6 +7808,43 @@ impl Widget for &mut Editor {
             if let Some(tint) = conflict_row_tint(&self.conflicts, line_idx) {
                 paint_full_row_bg(buf, text_x, y, row_width, tint);
             }
+            // Clickable accept actions on the conflict header row — VS Code's
+            // merge-conflict CodeLens, drawn after the marker text where the
+            // `<<<<<<<` line is otherwise dead space. Hit spans are recorded
+            // per frame (cleared at render start) so the rects always
+            // describe the painted frame (#103's invariant).
+            if let Some(block_idx) = self.conflicts.iter().position(|b| b.ours_start == line_idx) {
+                let block = self.conflicts[block_idx];
+                let marker_len = self
+                    .lines
+                    .get(line_idx)
+                    .map(|l| l.chars().count() as u16)
+                    .unwrap_or(0)
+                    .saturating_sub(row_start as u16);
+                let mut x = text_x + marker_len.min(row_width) + 2;
+                let actions: [(&str, crate::merge::Resolution); 3] = [
+                    ("[Accept Current]", crate::merge::Resolution::Current),
+                    ("[Accept Incoming]", crate::merge::Resolution::Incoming),
+                    ("[Accept Both]", crate::merge::Resolution::Both),
+                ];
+                for (label, res) in actions {
+                    let w = label.len() as u16;
+                    if x + w > text_x + row_width {
+                        break;
+                    }
+                    buf.set_string(
+                        x,
+                        y,
+                        label,
+                        Style::default()
+                            .fg(Color::Rgb(0x8a, 0xb4, 0xf8))
+                            .add_modifier(Modifier::UNDERLINED),
+                    );
+                    self.merge_action_spans
+                        .push((y, x..x + w, block.ours_start, res));
+                    x += w + 2;
+                }
+            }
 
             // LSP diagnostics: underline each problem span in its severity
             // colour, clipped to the visible row window. VS Code draws a wavy
@@ -8099,6 +8148,12 @@ impl Widget for &mut Editor {
                 self.paint_highlighted_line(buf, text_x, y, text_w, line as usize);
                 self.sticky_click_rows.push((y, line));
             }
+            // The band just overpainted those rows, so any [Accept …] span
+            // recorded there no longer matches what is on screen — a click
+            // on a sticky header must never resolve an unseen conflict.
+            let band_end = inner.y + sticky.len().min(max_rows) as u16;
+            self.merge_action_spans
+                .retain(|(y, _, _, _)| *y >= band_end);
         }
 
         if let Some(metrics) = scrollbar_metrics {
@@ -17193,6 +17248,43 @@ mod tests {
             !e.sticky_click_rows.iter().any(|&(y, _)| y == caret.1),
             "the sticky band painted over the caret's own row {}",
             caret.1
+        );
+    }
+
+    #[test]
+    fn sticky_band_erases_accept_spans_it_paints_over() {
+        // The band overpaints the topmost content rows AFTER the row loop
+        // records the [Accept …] spans; a span left under it would make a
+        // click on a visible scope header resolve an unseen conflict.
+        let mut e = editor_with(
+            "fn outer() {\n    a();\n<<<<<<< HEAD\n    ours();\n=======\n    theirs();\n>>>>>>> feature\n    b();\n}",
+        );
+        e.scroll = 2; // the conflict header is the viewport's top row
+        e.cursor_row = 7;
+        e.sticky_lines = vec![0];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 12,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        assert!(
+            !e.sticky_click_rows.is_empty(),
+            "precondition: the sticky band must have painted"
+        );
+        let band_rows: Vec<u16> = e.sticky_click_rows.iter().map(|&(y, _)| y).collect();
+        assert!(
+            !e.merge_action_spans
+                .iter()
+                .any(|(y, _, _, _)| band_rows.contains(y)),
+            "spans under the sticky band must be dropped; spans={:?} band={band_rows:?}",
+            e.merge_action_spans
+        );
+        assert!(
+            e.merge_action_spans.iter().all(|(_, _, row, _)| *row == 2),
+            "the header's spans below the band (if visible elsewhere) still target the real block"
         );
     }
 

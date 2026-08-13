@@ -138,6 +138,35 @@ pub fn resolution_lines(lines: &[String], block: &ConflictBlock, res: Resolution
     }
 }
 
+/// The next conflict strictly after `from_row`, wrapping to the first —
+/// `(index into blocks, header row)`. F7's jump order, VS Code's "Go to
+/// Next Conflict".
+pub fn next_conflict(blocks: &[ConflictBlock], from_row: usize) -> Option<(usize, usize)> {
+    if blocks.is_empty() {
+        return None;
+    }
+    blocks
+        .iter()
+        .enumerate()
+        .find(|(_, b)| b.ours_start > from_row)
+        .or(blocks.iter().enumerate().next())
+        .map(|(i, b)| (i, b.ours_start))
+}
+
+/// The previous conflict strictly before `from_row`, wrapping to the last.
+pub fn prev_conflict(blocks: &[ConflictBlock], from_row: usize) -> Option<(usize, usize)> {
+    if blocks.is_empty() {
+        return None;
+    }
+    blocks
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, b)| b.ours_start < from_row)
+        .or(blocks.iter().enumerate().next_back())
+        .map(|(i, b)| (i, b.ours_start))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +308,61 @@ mod tests {
             resolution_lines(&buf, &block, Resolution::Both),
             lines(&["ours", "theirs"])
         );
+    }
+}
+
+#[cfg(test)]
+mod nav_tests {
+    use super::*;
+
+    fn two_block_doc() -> Vec<String> {
+        [
+            "a",
+            "<<<<<<< HEAD",
+            "one",
+            "=======",
+            "uno",
+            ">>>>>>> feature",
+            "b",
+            "c",
+            "<<<<<<< HEAD",
+            "two",
+            "=======",
+            "dos",
+            ">>>>>>> feature",
+            "d",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn next_and_prev_wrap_across_the_document() {
+        let doc = two_block_doc();
+        let blocks = find_conflicts(&doc);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            next_conflict(&blocks, 0),
+            Some((0, 1)),
+            "from the top, F7 reaches the first conflict"
+        );
+        assert_eq!(
+            next_conflict(&blocks, 1),
+            Some((1, 8)),
+            "from block 0's header the next jump is block 1"
+        );
+        assert_eq!(
+            next_conflict(&blocks, 8),
+            Some((0, 1)),
+            "past the last block it wraps to the first"
+        );
+        assert_eq!(prev_conflict(&blocks, 8), Some((0, 1)));
+        assert_eq!(
+            prev_conflict(&blocks, 1),
+            Some((1, 8)),
+            "before the first block it wraps to the last"
+        );
+        assert_eq!(next_conflict(&[], 0), None);
     }
 }

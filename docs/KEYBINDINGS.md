@@ -245,7 +245,10 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences of the word under the cursor at once |
 | `Esc` | Clear the selection, or collapse multi-cursors back to one |
 | `Cmd`+`.` / `Ctrl`+`.` | Quick Fix: ask the language server for the code actions at the cursor (auto-import, fix-all, organize imports, refactors) and pick one from a menu; the diagnostics on the line ride along as context. One action with a deferred edit resolves and applies on pick (`codeAction/resolve`); also on the editor right-click menu and as Command Palette "Quick Fix"|
-| `Cmd`+`.` / `Ctrl`+`.` inside a merge conflict | Resolve Merge Conflict picker: Accept Current / Accept Incoming / Accept Both (also Command Palette "Merge Conflict: Accept Current / Incoming / Both"); conflict regions render with VS Code's green (current) / blue (incoming) tints |
+| `Cmd`+`.` / `Ctrl`+`.` inside a merge conflict | Resolve Merge Conflict picker: Accept Current / Accept Incoming / Accept Both (also Command Palette "Merge Conflict: Accept Current / Incoming / Both"); conflict regions render with VS Code's green (current) / blue (incoming) tints, and each conflict's header row carries clickable `[Accept Current] [Accept Incoming] [Accept Both]` actions |
+| `F7` / `Shift`+`F7` in a buffer with conflicts | Jump to the next / previous conflict, wrapping (the status counts "Conflict k of n"); clicking a MERGE CONFLICTS entry in Source Control opens the file parked on its first conflict |
+| Command Palette "Merge Conflict: Accept All Current / Incoming" | Resolve every block in the file one way |
+| Command Palette "Merge: Complete Merge (stage file)" | Once zero conflicts remain: save the buffer and stage the file, moving it from MERGE CONFLICTS into the ordinary staged flow; refuses while blocks are unresolved |
 | `F2` | Rename Symbol across every file it touches (open tabs edit in-memory and stay dirty) |
 | `F12` / `Ctrl`+click | Go to Definition (`Shift`+`Ctrl`+click navigates back); `Ctrl` because mouse reports carry no `Cmd` bit and `Option` belongs to multi-cursor |
 | `Ctrl`+`-` | Go Back: return to the location before the last navigation jump (the keyboard twin of `Shift`+`Ctrl`+click; also on the editor right-click menu and as Command Palette "Go Back") |
