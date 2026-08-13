@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "The Explorer gained sticky scroll: deep inside a big directory, the enclosing folders pin to the top of the tree so you always know where you are — click a pinned row to jump back up to it.",
+    summary: "Compiler errors now reach PROBLEMS: any command finishing in a terminal pane has its output scanned by built-in problem matchers (cargo, tsc, gcc/clang, python, eslint), the hits sit beside the LSP diagnostics, and a clean rebuild clears them.",
 }];

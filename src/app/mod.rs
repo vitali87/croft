@@ -2915,6 +2915,15 @@ pub struct App {
     /// Rolling log of git commands croft has run and their summaries, shown
     /// read-only by the "Show Git Output" action (VS Code's Git channel).
     pub git_output_log: Vec<String>,
+    /// Build diagnostics from the problem matchers (#119): finished-command
+    /// output scanned into PROBLEMS entries, keyed by resolved file path.
+    build_diagnostics:
+        std::collections::HashMap<PathBuf, Vec<crate::widgets::problems::ProblemItem>>,
+    /// Which files each terminal pane contributed, keyed by the pane's
+    /// STABLE uid (Vec positions shift on close/insert/reorder), so a
+    /// pane's next scanned command replaces its previous run's diagnostics
+    /// (VS Code clears a task's problems when the task re-runs).
+    build_diag_files_by_pane: std::collections::HashMap<u64, Vec<PathBuf>>,
     /// True while the "Discard All Changes" confirmation modal is up.
     pub pending_discard_all: bool,
     /// Cached workspace file index. Built lazily on first Cmd+P and
@@ -3825,6 +3834,8 @@ impl App {
             pair_spawn_override: None,
             collab_labels_visible: false,
             git_output_log: Vec::new(),
+            build_diagnostics: std::collections::HashMap::new(),
+            build_diag_files_by_pane: std::collections::HashMap::new(),
             pending_discard_all: false,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
@@ -6441,24 +6452,93 @@ impl App {
     /// diagnostics store. Returns whether the projection changed (so the caller
     /// can fold it into its redraw decision). Files are grouped, ordered by
     /// path; each group's diagnostics are ordered by position.
+    /// Scan one finished command's output through the build matchers and
+    /// install the results (#119). The pane's PREVIOUS contribution is
+    /// replaced wholesale — a rebuild that fixed everything clears its old
+    /// entries because the fresh scan is empty. Relative tool paths resolve
+    /// against the command's cwd (falling back to the workspace root);
+    /// resolution is lexical, no filesystem probe, so a path the tool
+    /// printed oddly still gets a row even if navigation later misses.
+    fn apply_build_scan(&mut self, pane: u64, cwd: Option<&Path>, output: &str) -> bool {
+        let diags = crate::build_matchers::scan(output);
+        let had_old = self
+            .build_diag_files_by_pane
+            .get(&pane)
+            .is_some_and(|v| !v.is_empty());
+        if diags.is_empty() && !had_old {
+            return false;
+        }
+        if let Some(files) = self.build_diag_files_by_pane.remove(&pane) {
+            for f in files {
+                self.build_diagnostics.remove(&f);
+            }
+        }
+        let base = cwd.unwrap_or(&self.workspace_root).to_path_buf();
+        let mut touched = Vec::new();
+        for d in diags {
+            let path = {
+                let p = Path::new(&d.file);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    base.join(p)
+                }
+            };
+            let entry = self.build_diagnostics.entry(path.clone()).or_default();
+            if entry.is_empty() {
+                touched.push(path);
+            }
+            entry.push(crate::widgets::problems::ProblemItem {
+                line: d.line,
+                col: d.col,
+                severity: d.severity,
+                message: d.message,
+                source: d.source.to_string(),
+            });
+        }
+        self.build_diag_files_by_pane.insert(pane, touched);
+        self.rebuild_problems();
+        true
+    }
+
+    fn clear_build_diagnostics(&mut self) {
+        let n: usize = self.build_diagnostics.values().map(Vec::len).sum();
+        self.build_diagnostics.clear();
+        self.build_diag_files_by_pane.clear();
+        self.rebuild_problems();
+        self.status = format!(
+            "Cleared {n} build diagnostic{}",
+            if n == 1 { "" } else { "s" }
+        );
+    }
+
     fn rebuild_problems(&mut self) -> bool {
         use crate::widgets::problems::{ProblemGroup, ProblemItem};
-        let mut paths: Vec<&PathBuf> = self.lsp_diagnostics.keys().collect();
+        let mut paths: Vec<&PathBuf> = self
+            .lsp_diagnostics
+            .keys()
+            .chain(self.build_diagnostics.keys())
+            .collect();
         paths.sort();
+        paths.dedup();
         let mut groups = Vec::new();
         for path in paths {
-            let by_server = &self.lsp_diagnostics[path];
             let mut items: Vec<ProblemItem> = Vec::new();
-            for (server, diags) in by_server {
-                for d in diags {
-                    items.push(ProblemItem {
-                        line: d.start_line,
-                        col: d.start_char,
-                        severity: d.severity,
-                        message: d.message.clone(),
-                        source: server.clone(),
-                    });
+            if let Some(by_server) = self.lsp_diagnostics.get(path) {
+                for (server, diags) in by_server {
+                    for d in diags {
+                        items.push(ProblemItem {
+                            line: d.start_line,
+                            col: d.start_char,
+                            severity: d.severity,
+                            message: d.message.clone(),
+                            source: server.clone(),
+                        });
+                    }
                 }
+            }
+            if let Some(build) = self.build_diagnostics.get(path) {
+                items.extend(build.iter().cloned());
             }
             if items.is_empty() {
                 continue;
@@ -21981,6 +22061,9 @@ impl App {
         let mut finished: Option<String> = None;
         let mut trigger_note: Option<String> = None;
         let mut captured: Vec<crate::widgets::captures::CapturedLine> = Vec::new();
+        // Finished-command outputs to run through the build matchers after
+        // the immutable pane sweep (#119): (pane index, cwd, output).
+        let mut build_scans: Vec<(u64, Option<PathBuf>, String)> = Vec::new();
         for t in &self.terminals {
             // Keep every pane on the current trigger set, wherever it was
             // created (a ptr-eq no-op when already current).
@@ -22010,6 +22093,9 @@ impl App {
             notes.extend(t.drain_notifications());
             // Always drain so completions never pile up unseen.
             for f in t.drain_finished_commands() {
+                if !f.output.is_empty() {
+                    build_scans.push((t.uid(), f.cwd.clone(), f.output.clone()));
+                }
                 // Durable command history: every finished command with a
                 // known text is recorded (cwd, exit, duration, timestamp)
                 // for the Ctrl+Shift+R cross-session search.
@@ -22043,9 +22129,13 @@ impl App {
                 ));
             }
         }
+        let mut build_changed = false;
+        for (pane, cwd, output) in build_scans {
+            build_changed |= self.apply_build_scan(pane, cwd.as_deref(), &output);
+        }
         // Captures collect silently (iTerm2's model: the panel is the
         // surface, not the status bar), but still trigger a redraw.
-        let had_captures = !captured.is_empty();
+        let had_captures = !captured.is_empty() || build_changed;
         for c in captured {
             self.captures.push(c);
         }
@@ -23804,6 +23894,7 @@ impl App {
             Cmd::MergeComplete => self.complete_merge(),
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
+            Cmd::ClearBuildDiagnostics => self.clear_build_diagnostics(),
             Cmd::DebugClearWatch => {
                 let n = self.watch_exprs.len();
                 self.watch_exprs.clear();
@@ -28772,6 +28863,10 @@ impl App {
         self.lsp_last_seen.clear();
         self.lsp_diagnostics.clear();
         self.lsp_progress.clear();
+        // Build diagnostics describe the OLD workspace's files; a re-root
+        // that kept them showed the previous project's errors forever.
+        self.build_diagnostics.clear();
+        self.build_diag_files_by_pane.clear();
         // Refresh the window/icon title: it was emitted once at startup from
         // the launch dir and never updated, so after a re-root it kept showing
         // the parent (e.g. "Documents") instead of the repo. OSC 0 is

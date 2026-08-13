@@ -477,6 +477,10 @@ pub struct PtyTerminal {
     /// prompt is its own foreground process-group leader, so this is the
     /// value `foreground_is_shell` compares `tcgetpgrp(master)` against.
     shell_pid: Option<i32>,
+    /// Process-wide stable identity for this pane, assigned at spawn. Vec
+    /// positions shift on close/insert/reorder; anything keying long-lived
+    /// state to a pane (the build-diagnostic ownership, #119) uses this.
+    uid: u64,
     /// Whether anything has ever been written toward the child's stdin
     /// (keystrokes, pastes, seeds, mouse reports). While false, no
     /// foreground application can have been launched in this pane, so a
@@ -684,7 +688,16 @@ pub struct FinishedCommand {
     /// 133;D mark, not read later at drain: an in-pane `ssh`/`exit` between
     /// the two would attribute the command to the wrong machine.
     pub host: Option<String>,
+    /// The command's output (the 133;C→133;D span), escape-free, captured at
+    /// the D mark while the rows are guaranteed still present. Capped to the
+    /// LAST [`FINISHED_OUTPUT_CAP_LINES`] lines — the tail keeps a compiler's
+    /// error summary; a build long enough to overflow the cap loses its
+    /// earliest lines. Feeds the build problem matchers (#119).
+    pub output: String,
 }
+
+/// Tail cap on [`FinishedCommand::output`].
+pub const FINISHED_OUTPUT_CAP_LINES: usize = 5000;
 
 /// A finished command derived from the OSC 133 marks: the grid line of the
 /// prompt it was typed at (current coords, negative = scrollback), its exit
@@ -1570,13 +1583,16 @@ impl PtyTerminal {
                                                 // shell's cwd travel with the
                                                 // completion so the durable
                                                 // history records context.
-                                                let cmd = {
+                                                let (cmd, output) = {
                                                     let now = clock_for_thread
                                                         .lock()
                                                         .unwrap()
                                                         .tick(&mut t);
                                                     let ms = marks_for_thread.lock().unwrap();
-                                                    last_command_input_text(&t, &ms, now)
+                                                    (
+                                                        last_command_input_text(&t, &ms, now),
+                                                        last_command_output_text(&t, &ms, now),
+                                                    )
                                                 };
                                                 let cwd = osc7_for_thread.lock().unwrap().clone();
                                                 let host =
@@ -1587,6 +1603,7 @@ impl PtyTerminal {
                                                     cmd,
                                                     cwd,
                                                     host,
+                                                    output,
                                                 });
                                             }
                                             dur
@@ -1691,6 +1708,10 @@ impl PtyTerminal {
             reader_thread: Some(reader_thread),
             reader_shutdown: Some(shutdown_w),
             shell_pid,
+            uid: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             input_seen: false,
             cols,
             rows,
@@ -2855,6 +2876,11 @@ impl PtyTerminal {
         extract_selection_text(&term, sr, sc as usize, er, ec as usize)
     }
 
+    /// The pane's stable identity (see the `uid` field).
+    pub fn uid(&self) -> u64 {
+        self.uid
+    }
+
     pub fn write_input(&mut self, data: &[u8]) {
         self.reset_scrollback();
         self.input_seen = true;
@@ -3212,6 +3238,47 @@ fn last_command_input_text(
         cl - 1,
         term.columns().saturating_sub(1),
     )
+}
+
+/// The finished command's OUTPUT: the rows between the newest `133;C` mark
+/// and the row the cursor sits on as its `133;D` arrives (exclusive — that
+/// row is the D mark's own). Escape-free (the grid never stores escapes),
+/// tail-capped at [`FINISHED_OUTPUT_CAP_LINES`].
+fn last_command_output_text(
+    term: &Term<VoidListener>,
+    marks: &[StoredMark],
+    clock_now: i64,
+) -> String {
+    use crate::shell_integration::OscEvent as E;
+    let Some(c) = marks
+        .iter()
+        .rev()
+        .find(|m| matches!(m.kind, E::CommandStart))
+    else {
+        return String::new();
+    };
+    // The C mark was recorded when the command STARTED: everything the
+    // command printed has scrolled the grid since, so its recorded line is
+    // re-based through the scroll clock exactly like the input extractor.
+    // The mark's own row is the FIRST output row — `133;C` is emitted right
+    // after the command's newline, before the program prints anything.
+    let start = c.line_rec - (clock_now - c.clock_rec) as i32;
+    // The cursor row is INCLUDED: `133;D` moves no cursor, so a diagnostic
+    // printed without a trailing newline leaves the mark ON that row — the
+    // old `- 1` dropped exactly the line the matchers needed. With a
+    // trailing newline the cursor row is a fresh blank, trimmed below.
+    let end = term.grid().cursor.point.line.0;
+    if end < start {
+        return String::new();
+    }
+    let text = extract_selection_text(term, start, 0, end, term.columns().saturating_sub(1));
+    let text = text.trim_end_matches('\n');
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() > FINISHED_OUTPUT_CAP_LINES {
+        lines[lines.len() - FINISHED_OUTPUT_CAP_LINES..].join("\n")
+    } else {
+        text.to_string()
+    }
 }
 
 /// Epoch millis → local wall-clock `HH:MM:SS` (libc localtime, the same
@@ -7668,5 +7735,58 @@ mod tests {
             "comments/blanks/non-paths skipped, basenames deduped"
         );
         assert_eq!(p[0].0, "/bin/zsh", "full path retained");
+    }
+    #[test]
+    fn finished_command_carries_its_output_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]133;A\\007$ \\033]133;B\\007make\\n\\033]133;C\\007'; printf 'main.c:7:3: error: boom\\nsecond line\\n'; printf '\\033]133;D;1\\007'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut finished = Vec::new();
+        while std::time::Instant::now() < deadline {
+            finished.extend(term.drain_finished_commands());
+            if !finished.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let f = finished
+            .first()
+            .expect("the 133;D must yield a FinishedCommand");
+        assert!(
+            f.output.contains("main.c:7:3: error: boom") && f.output.contains("second line"),
+            "the output block must ride the completion; got {:?}",
+            f.output
+        );
+    }
+
+    #[test]
+    fn finished_output_keeps_a_final_line_without_trailing_newline() {
+        // `133;D` moves no cursor: a diagnostic printed WITHOUT a trailing
+        // newline leaves the mark on that very row, and excluding the
+        // cursor row dropped exactly the line the matchers needed (#120
+        // review).
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]133;A\\007$ \\033]133;B\\007cc\\n\\033]133;C\\007'; printf 'lib.c:2:1: error: no newline here'; printf '\\033]133;D;1\\007'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut finished = Vec::new();
+        while std::time::Instant::now() < deadline {
+            finished.extend(term.drain_finished_commands());
+            if !finished.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let f = finished.first().expect("completion expected");
+        assert!(
+            f.output.contains("lib.c:2:1: error: no newline here"),
+            "the unterminated final row must be captured; got {:?}",
+            f.output
+        );
     }
 }
