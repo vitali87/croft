@@ -5288,8 +5288,25 @@ mod tests {
         let term =
             PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
                 .unwrap();
-        let lines = wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains("filler-39")));
-        let (_, top) = term.grid_lines();
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains("filler-39")));
+        // The script's tail (trailing newline, shell exit) can scroll another
+        // row or two AFTER filler-39 becomes visible. `lines` and `top` must
+        // come from ONE settled snapshot, or the row index and the grid top
+        // describe different moments and the compare is off by exactly the
+        // late scroll (#110). Settle = two consecutive identical reads.
+        let (lines, top) = {
+            let mut prev = term.grid_lines();
+            let mut waited = 0u32;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                let cur = term.grid_lines();
+                if cur == prev || waited >= 4000 {
+                    break cur;
+                }
+                prev = cur;
+                waited += 40;
+            }
+        };
         let content_row = lines
             .iter()
             .position(|l| l.contains("MARKED-PROMPT") && !l.contains("printf"))
@@ -5822,12 +5839,31 @@ mod tests {
         cmd.env("ZDOTDIR", &shim);
         cmd.env("CROFT_USER_ZDOTDIR", user_dir.path());
         let term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        // Two state-gated stages instead of one wall-clock guess: under full-
+        // suite load, interactive zsh startup alone can eat a fixed budget and
+        // the timeout measures the machine, not the shim (#109). First wait
+        // for the prompt mark (proof the precmd hook ran), THEN the OSC 7
+        // report — emitted by that same precmd — must follow almost at once.
+        let mut waited = 0u32;
+        while term.prompt_lines().is_empty() {
+            assert!(
+                waited < 20_000,
+                "zsh never emitted a prompt mark; grid: {:?}",
+                term.grid_lines().0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
         let mut waited = 0u32;
         let cwd = loop {
             if let Some(c) = term.shell_cwd() {
                 break c;
             }
-            assert!(waited < 8000, "zsh never reported a cwd");
+            assert!(
+                waited < 4000,
+                "the shim's precmd ran (prompt mark present) but never reported a cwd; grid: {:?}",
+                term.grid_lines().0
+            );
             std::thread::sleep(std::time::Duration::from_millis(40));
             waited += 40;
         };
