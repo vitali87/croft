@@ -26001,3 +26001,40 @@ fn f12_family_chords_route_alt_to_peek() {
         "peek requires ALT alone in the F12 family"
     );
 }
+
+#[test]
+fn build_scan_installs_problems_replaces_per_pane_and_merges_with_lsp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir(&cwd).unwrap();
+
+    let cargo_out = "error[E0308]: mismatched types\n  --> src/main.rs:12:5\n";
+    assert!(app.apply_build_scan(0, Some(&cwd), cargo_out));
+    let expected = cwd.join("src/main.rs");
+    let groups = app.problems.groups().to_vec();
+    let g = groups
+        .iter()
+        .find(|g| g.path == expected)
+        .expect("the resolved file must group in PROBLEMS");
+    assert_eq!(g.items.len(), 1);
+    assert_eq!(g.items[0].source, "rustc");
+    assert_eq!((g.items[0].line, g.items[0].col), (11, 4));
+
+    // A second pane contributes a different file; both coexist.
+    assert!(app.apply_build_scan(1, Some(&cwd), "main.c:7:3: error: boom\n"));
+    assert_eq!(app.problems.groups().len(), 2);
+
+    // Pane 0 rebuilds clean: its contribution clears, pane 1's stays.
+    assert!(app.apply_build_scan(0, Some(&cwd), "   Finished dev profile\n"));
+    let groups = app.problems.groups().to_vec();
+    assert_eq!(groups.len(), 1, "pane 0's fixed errors must vanish");
+    assert!(groups[0].path.ends_with("main.c"));
+
+    // Clean output from a pane with no history is a no-op.
+    assert!(!app.apply_build_scan(5, Some(&cwd), "all good\n"));
+
+    app.clear_build_diagnostics();
+    assert!(app.problems.groups().is_empty());
+    assert!(app.status.contains("Cleared 1 build diagnostic"));
+}
