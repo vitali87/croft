@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Guided merge-conflict resolution: conflicted files open from MERGE CONFLICTS parked on their first block, F7 jumps between conflicts, each header row carries clickable Accept Current / Incoming / Both actions, and Merge: Complete Merge saves and stages the resolved file.",
+    summary: "The debugger gained a WATCH section: pin expressions from the palette or the panel's + row and they re-evaluate at every stop, changed values highlight, rejected ones read <not available>, and each row's \u{2715} removes it.",
 }];

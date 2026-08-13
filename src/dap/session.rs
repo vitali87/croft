@@ -61,6 +61,9 @@ pub enum DapEvent {
         context: String,
         expression: String,
         result: String,
+        /// False when the adapter rejected the expression (`success: false`),
+        /// so a watch row can render `<not available>` instead of the error.
+        success: bool,
     },
 }
 
@@ -943,6 +946,7 @@ impl DapSession {
                     if let Some((context, expression)) =
                         req_seq.and_then(|s| self.pending_evals.remove(&s))
                     {
+                        let success = msg.get("success").and_then(Value::as_bool).unwrap_or(false);
                         let result = parse_evaluate_result(&msg).unwrap_or_else(|| {
                             msg.get("message")
                                 .and_then(Value::as_str)
@@ -953,6 +957,7 @@ impl DapSession {
                             context,
                             expression,
                             result,
+                            success,
                         });
                     }
                 }

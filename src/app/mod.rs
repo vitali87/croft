@@ -2747,6 +2747,19 @@ pub struct App {
     /// Variable `variablesReference`s the user has expanded in the Variables
     /// panel. Persisted across polls so re-fetched variables stay open.
     pub debug_expanded: std::collections::HashSet<i64>,
+    /// Debugger watch expressions (#112), in display order. Session-scoped.
+    pub watch_exprs: Vec<String>,
+    /// Latest evaluate result per expression: `(value, success)`.
+    pub watch_vals: std::collections::HashMap<String, (String, bool)>,
+    /// The previous stop's values, for the changed-value highlight.
+    watch_prev: std::collections::HashMap<String, String>,
+    /// Armed by every `Stopped` event, consumed by the first
+    /// `InspectionUpdated` that follows: the baseline rotates exactly once
+    /// per stop. `InspectionUpdated` also fires for frame switches and
+    /// variable expansions within the same stop, and rotating on those
+    /// clobbered the baseline with the stop's own values — the changed
+    /// highlight never fired (#112).
+    watch_baseline_pending: bool,
     /// Debug console log: program stdout/stderr (DAP output events) plus REPL
     /// echoes and results. Capped; the tail is shown in the Run & Debug panel.
     pub debug_console: Vec<String>,
@@ -3758,6 +3771,10 @@ impl App {
             dap_session: None,
             pending_test_debug: None,
             debug_expanded: std::collections::HashSet::new(),
+            watch_exprs: Vec::new(),
+            watch_vals: std::collections::HashMap::new(),
+            watch_prev: std::collections::HashMap::new(),
+            watch_baseline_pending: false,
             debug_console: Vec::new(),
             debug_ever_stopped: false,
             zoxide_jump: None,
@@ -14774,13 +14791,29 @@ impl App {
                     context,
                     expression,
                     result,
+                    ..
                 } if context == "repl" => {
                     self.debug_console_push(format!("❯ {expression}"));
                     self.debug_console_push(result);
                 }
+                DapEvent::Evaluated {
+                    context,
+                    expression,
+                    result,
+                    success,
+                } if context == "watch" => {
+                    self.watch_vals.insert(expression, (result, success));
+                }
+                // Fresh stack + frame selection just landed: this is the
+                // moment each watch expression re-evaluates against the new
+                // top frame (#112).
+                DapEvent::InspectionUpdated => {
+                    self.refresh_watches();
+                }
                 DapEvent::Stopped { reason, .. } => {
                     self.run_debug.feedback = Some(format!("Paused ({reason})"));
                     self.run_debug.feedback_is_error = false;
+                    self.watch_baseline_pending = true;
                 }
                 DapEvent::BreakpointsUpdated => {
                     // Mirror the adapter's unverified set into the editor so the
@@ -14824,6 +14857,7 @@ impl App {
             Some(SessionPhase::Terminated) => {
                 self.editor.stop_line = None;
                 self.editor.unverified_breakpoints.clear();
+                self.reset_watch_runtime();
                 // Reply to the adapter's own `terminated`/`exited` with the
                 // graceful `disconnect` handshake before dropping it. js-debug
                 // only retires its detached watchdog on this handshake, never on
@@ -14952,12 +14986,100 @@ impl App {
                 push_variable_rows(&mut rows, session, &self.debug_expanded, vars, 2);
             }
         }
+        rows.push(DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: String::from("WATCH"),
+            },
+        });
+        for (widx, expr) in self.watch_exprs.iter().enumerate() {
+            let (value, available, pending) = match self.watch_vals.get(expr) {
+                Some((v, ok)) => (v.clone(), *ok, false),
+                None => (String::new(), true, true),
+            };
+            let changed = available
+                && !pending
+                && self.watch_prev.get(expr).is_some_and(|prev| prev != &value);
+            rows.push(DebugRow {
+                indent: 1,
+                kind: DebugRowKind::Watch {
+                    index: widx,
+                    expression: expr.clone(),
+                    value,
+                    available,
+                    changed,
+                    pending,
+                },
+            });
+        }
+        rows.push(DebugRow {
+            indent: 1,
+            kind: DebugRowKind::WatchAdd,
+        });
         let status = self
             .run_debug
             .feedback
             .clone()
             .unwrap_or_else(|| String::from("Paused"));
         (true, status, rows)
+    }
+
+    /// Re-evaluate every watch expression against the current stop. The
+    /// current values become the previous stop's baseline first, so the
+    /// changed-value highlight compares stop-to-stop (#112).
+    fn refresh_watches(&mut self) {
+        if self.watch_exprs.is_empty() {
+            return;
+        }
+        if std::mem::take(&mut self.watch_baseline_pending) {
+            self.watch_prev = self
+                .watch_vals
+                .drain()
+                .filter(|(_, (_, ok))| *ok)
+                .map(|(k, (v, _))| (k, v))
+                .collect();
+        }
+        if let Some(session) = self
+            .dap_session
+            .as_mut()
+            .filter(|s| s.phase == crate::dap::session::SessionPhase::Stopped)
+        {
+            for expr in &self.watch_exprs {
+                session.evaluate(expr, "watch");
+            }
+        }
+    }
+
+    /// Append a watch expression (palette or the panel's add row) and
+    /// evaluate it immediately when a session is paused.
+    fn add_watch_expression(&mut self, expr: String) {
+        let expr = expr.trim().to_string();
+        if expr.is_empty() {
+            self.status = String::from("Enter an expression to watch");
+            return;
+        }
+        if self.watch_exprs.contains(&expr) {
+            self.status = format!("Already watching {expr}");
+            return;
+        }
+        self.watch_exprs.push(expr.clone());
+        if let Some(session) = self
+            .dap_session
+            .as_mut()
+            .filter(|s| s.phase == crate::dap::session::SessionPhase::Stopped)
+        {
+            session.evaluate(&expr, "watch");
+        }
+        self.status = format!("Watching {expr}");
+    }
+
+    fn remove_watch_expression(&mut self, idx: usize) {
+        if idx < self.watch_exprs.len() {
+            let expr = self.watch_exprs.remove(idx);
+            self.watch_vals.remove(&expr);
+            self.watch_prev.remove(&expr);
+            self.status = format!("Stopped watching {expr}");
+        }
     }
 
     /// Append a line to the debug console, capping the backlog so a chatty
@@ -15033,9 +15155,23 @@ impl App {
                     }
                 }
             }
+            DebugRowKind::WatchAdd => {
+                self.open_add_watch_prompt();
+            }
             _ => {}
         }
         self.refresh_debug_panel();
+    }
+
+    /// The "+ Add Expression" affordance (panel row or palette): a single-line
+    /// input popup, per croft's inputs-in-popups rule.
+    fn open_add_watch_prompt(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::AddWatch,
+            "Add Watch Expression",
+            "expression",
+        ));
     }
 
     /// The Run/Debug panel button action: debug compiled source (build + lldb),
@@ -15581,11 +15717,22 @@ impl App {
     }
 
     /// Shift+F5: stop debugging and tear the session down.
+    /// A session ended: the expressions survive (they usually make sense for
+    /// the next run too), but the values, the changed-value baseline, and the
+    /// baseline latch are that session's — left in place they made every
+    /// watch flash "changed" on a fresh session's first stop.
+    fn reset_watch_runtime(&mut self) {
+        self.watch_vals.clear();
+        self.watch_prev.clear();
+        self.watch_baseline_pending = false;
+    }
+
     pub fn debug_stop(&mut self) {
         if let Some(session) = self.dap_session.as_mut() {
             session.disconnect();
         }
         self.dap_session = None;
+        self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
         // reparented to init after the server dies. See the Terminated arm in
         // `poll_dap` and `crate::dap::reaper`.
@@ -16396,6 +16543,10 @@ impl App {
         };
         let purpose = prompt.purpose.clone();
         match purpose {
+            InputPurpose::AddWatch => {
+                self.close_input_prompt();
+                self.add_watch_expression(value);
+            }
             InputPurpose::CloneUrl => {
                 self.close_input_prompt();
                 let parent = self
@@ -23509,6 +23660,17 @@ impl App {
             Cmd::MergeNextConflict => self.jump_conflict(false),
             Cmd::MergePrevConflict => self.jump_conflict(true),
             Cmd::MergeComplete => self.complete_merge(),
+            Cmd::DebugAddWatch => self.open_add_watch_prompt(),
+            Cmd::DebugClearWatch => {
+                let n = self.watch_exprs.len();
+                self.watch_exprs.clear();
+                self.watch_vals.clear();
+                self.watch_prev.clear();
+                self.status = format!(
+                    "Removed {n} watch expression{}",
+                    if n == 1 { "" } else { "s" }
+                );
+            }
             Cmd::StageHunk => self.stage_hunk_at_caret(),
             Cmd::UnstageHunk => self.unstage_hunk_at_caret(),
             Cmd::RevertHunk => self.request_revert_hunk_at_caret(),
@@ -26794,7 +26956,10 @@ impl App {
                 if in_tree && self.sidebar_view == SidebarView::RunDebug {
                     self.focus_pane(Pane::Tree);
                     if self.run_debug.debug_active {
-                        if let Some(idx) = self.run_debug.debug_row_at(m.row) {
+                        if let Some(widx) = self.run_debug.watch_remove_at(m.column, m.row) {
+                            self.remove_watch_expression(widx);
+                            self.refresh_debug_panel();
+                        } else if let Some(idx) = self.run_debug.debug_row_at(m.row) {
                             self.debug_panel_click(idx);
                         }
                     } else if self.run_debug.click_button(m.column, m.row) {

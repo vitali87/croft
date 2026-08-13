@@ -33,6 +33,9 @@ pub enum InputPurpose {
         name: String,
     },
     CreateTag,
+    /// Add a debugger watch expression (#112): submitting appends it to the
+    /// App's watch list and re-evaluates at the current stop.
+    AddWatch,
     /// First-run consent to spawn an MCP sidecar: submitting confirms, then the
     /// command (`command_id`) proceeds to its argument prompt or runs.
     McpConsent {

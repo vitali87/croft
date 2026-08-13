@@ -107,6 +107,24 @@ pub enum DebugRowKind {
         value: String,
         type_name: String,
     },
+    /// A watch expression (#112). `available` false renders `<not available>`
+    /// (the adapter rejected it); `changed` highlights a value that differs
+    /// from the previous stop; `pending` shows a placeholder until the
+    /// evaluate response lands.
+    Watch {
+        /// Index into the App's expression list — carried IN the row so the
+        /// remove `✕` maps to the right expression even when `debug_scroll`
+        /// has skipped earlier Watch rows (a render-order counter restarted
+        /// at the first VISIBLE row and removed the wrong one).
+        index: usize,
+        expression: String,
+        value: String,
+        available: bool,
+        changed: bool,
+        pending: bool,
+    },
+    /// The trailing "+ Add Expression" affordance row of the WATCH section.
+    WatchAdd,
 }
 
 /// One rendered line of the paused-state debug tree. The app builds these from
@@ -138,6 +156,9 @@ pub struct RunDebugPanel {
     /// variables) and sets `debug_active`; the panel then renders the tree
     /// instead of the empty-state Run button.
     pub debug_active: bool,
+    /// Remove-`✕` hit cells for Watch rows painted this frame:
+    /// `(y, x, nth watch row)`. Cleared at every tree render.
+    watch_remove_rects: Vec<(u16, u16, usize)>,
     pub debug_status: String,
     pub debug_rows: Vec<DebugRow>,
     pub debug_scroll: usize,
@@ -176,6 +197,7 @@ impl RunDebugPanel {
             last_area: Rect::default(),
             last_button_area: Rect::default(),
             debug_active: false,
+            watch_remove_rects: Vec::new(),
             debug_status: String::new(),
             debug_rows: Vec::new(),
             debug_scroll: 0,
@@ -192,6 +214,16 @@ impl RunDebugPanel {
 
     /// Map a click at screen row `y` to the index of the debug row drawn there,
     /// or `None` if the click missed the rendered rows.
+    /// Map a click to the watch row whose remove `✕` sits at `(x, y)` —
+    /// returns the index into the ORDER the Watch rows were rendered in,
+    /// which the app maps back to its expression list.
+    pub fn watch_remove_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.watch_remove_rects
+            .iter()
+            .find(|&&(ry, rx, _)| ry == y && (x == rx || x == rx + 1))
+            .map(|&(_, _, idx)| idx)
+    }
+
     pub fn debug_row_at(&self, y: u16) -> Option<usize> {
         if !self.debug_active || self.last_debug_rows_shown == 0 || y < self.last_debug_row_y0 {
             return None;
@@ -223,6 +255,7 @@ impl RunDebugPanel {
     /// and a REPL bar pinned to the bottom. Records `last_debug_row_y0` /
     /// `last_debug_rows_shown` for click mapping.
     fn render_debug_tree(&mut self, inner: Rect, buf: &mut Buffer) {
+        self.watch_remove_rects.clear();
         let right = inner.x + inner.width;
         let mut y = inner.y;
 
@@ -381,6 +414,74 @@ impl RunDebugPanel {
                             Style::default().fg(DBG_TYPE).add_modifier(Modifier::ITALIC),
                         );
                     }
+                }
+                DebugRowKind::Watch {
+                    index,
+                    expression,
+                    value,
+                    available,
+                    changed,
+                    pending,
+                } => {
+                    let indent = (row.indent as u16) * 2;
+                    let mut x = inner.x + indent;
+                    // Text clips three cells early: the remove `\u{2715}` owns
+                    // the right edge, and a long value ran under it.
+                    let right = right.saturating_sub(3);
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        expression,
+                        Style::default().fg(DBG_NAME),
+                    );
+                    x = put(buf, x, row_y, right, " = ", Style::default().fg(DBG_EQ));
+                    let (text, style) = if *pending {
+                        ("\u{2026}", Style::default().fg(DBG_TYPE))
+                    } else if !*available {
+                        (
+                            "<not available>",
+                            Style::default().fg(DBG_TYPE).add_modifier(Modifier::ITALIC),
+                        )
+                    } else if *changed {
+                        (
+                            value.as_str(),
+                            Style::default()
+                                .fg(Color::Rgb(0xb6, 0xee, 0xc4))
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        (value.as_str(), Style::default().fg(value_color("")))
+                    };
+                    put(buf, x, row_y, right, text, style);
+                    // Per-row remove ✕ pinned at the right edge, recorded for
+                    // the click map (cleared at render start — hit rects
+                    // always describe the painted frame).
+                    let right = right + 3;
+                    if right > inner.x + 2 {
+                        let rx = right - 2;
+                        put(
+                            buf,
+                            rx,
+                            row_y,
+                            right,
+                            "\u{2715}",
+                            Style::default().fg(DBG_TYPE),
+                        );
+                        self.watch_remove_rects.push((row_y, rx, *index));
+                    }
+                }
+                DebugRowKind::WatchAdd => {
+                    let indent = (row.indent as u16) * 2;
+                    put(
+                        buf,
+                        inner.x + indent,
+                        row_y,
+                        right,
+                        "+ Add Expression",
+                        Style::default().fg(DBG_TYPE).add_modifier(Modifier::ITALIC),
+                    );
                 }
             }
             shown += 1;
@@ -1158,5 +1259,97 @@ mod tests {
             panel.last_button_area.height >= 3,
             "button must remain laid out when the panel collapses the icon block"
         );
+    }
+    #[test]
+    fn watch_section_renders_states_and_maps_remove_clicks() {
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused (breakpoint)");
+        panel.debug_rows = vec![
+            DebugRow {
+                indent: 0,
+                kind: DebugRowKind::Header {
+                    title: "WATCH".into(),
+                },
+            },
+            DebugRow {
+                indent: 1,
+                kind: DebugRowKind::Watch {
+                    index: 0,
+                    expression: "t".into(),
+                    value: "9.99".into(),
+                    available: true,
+                    changed: true,
+                    pending: false,
+                },
+            },
+            DebugRow {
+                indent: 1,
+                kind: DebugRowKind::Watch {
+                    index: 1,
+                    expression: "self.missing".into(),
+                    value: "NameError".into(),
+                    available: false,
+                    changed: false,
+                    pending: false,
+                },
+            },
+            DebugRow {
+                indent: 1,
+                kind: DebugRowKind::Watch {
+                    index: 2,
+                    expression: "len(cart)".into(),
+                    value: String::new(),
+                    available: true,
+                    changed: false,
+                    pending: true,
+                },
+            },
+            DebugRow {
+                indent: 1,
+                kind: DebugRowKind::WatchAdd,
+            },
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 44,
+            height: 20,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(dump.contains("WATCH"), "watch header:\n{dump}");
+        assert!(dump.contains("t = 9.99"), "watched value:\n{dump}");
+        assert!(
+            dump.contains("self.missing = <not available>"),
+            "a rejected expression must degrade, not show the adapter error:\n{dump}"
+        );
+        assert!(
+            !dump.contains("NameError"),
+            "the raw adapter error must not leak into the row:\n{dump}"
+        );
+        assert!(dump.contains("+ Add Expression"), "add affordance:\n{dump}");
+        // Every watch row recorded a remove ✕ at the right edge, mapped by
+        // render order.
+        assert_eq!(panel.watch_remove_rects.len(), 3);
+        let (y, x, idx) = panel.watch_remove_rects[1];
+        assert_eq!(idx, 1, "the second watch row maps to index 1");
+        assert_eq!(panel.watch_remove_at(x, y), Some(1));
+        assert_eq!(panel.watch_remove_at(x, y + 5), None);
+
+        // Scrolled: the header and the first watch row are skipped. The
+        // first VISIBLE watch row must still map to expression index 1 —
+        // a render-order counter restarted at 0 here and the ✕ removed
+        // the wrong expression (#113 review).
+        panel.debug_scroll = 2;
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let (y, x, idx) = panel.watch_remove_rects[0];
+        assert_eq!(
+            idx, 1,
+            "after scrolling past the first watch row, the first visible one keeps its true index"
+        );
+        assert_eq!(panel.watch_remove_at(x, y), Some(1));
     }
 }
