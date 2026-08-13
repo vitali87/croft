@@ -206,6 +206,25 @@ impl EditorLayout {
     }
 
     /// True when more than one group exists (the editor pane is split).
+    /// Every INACTIVE leaf's tabs (the active leaf's live hoisted in
+    /// `App::editor` and are not visited). Depth-first, stable order.
+    pub fn inactive_leaf_tabs(&self) -> Vec<&EditorTabs> {
+        fn walk<'a>(node: &'a LayoutNode, out: &mut Vec<&'a EditorTabs>) {
+            match node {
+                LayoutNode::Leaf(Some(tabs)) => out.push(tabs),
+                LayoutNode::Leaf(None) => {}
+                LayoutNode::Split { children, .. } => {
+                    for c in children {
+                        walk(&c.node, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, &mut out);
+        out
+    }
+
     pub fn is_split(&self) -> bool {
         self.leaf_count() > 1
     }

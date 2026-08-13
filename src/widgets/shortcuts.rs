@@ -492,6 +492,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_go_to_definition_key",
             },
             ShortcutEntry {
+                keys: "Opt+F12",
+                description: "Peek definition (Enter jumps, Esc closes)",
+                handler: "is_peek_definition_key",
+            },
+            ShortcutEntry {
                 keys: "Shift+F12",
                 description: "Go to references (project-wide)",
                 handler: "is_go_to_references_key",

@@ -253,6 +253,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `F2` | Rename Symbol across every file it touches (open tabs edit in-memory and stay dirty) |
 | `F12` / `Ctrl`+click | Go to Definition (`Shift`+`Ctrl`+click navigates back); `Ctrl` because mouse reports carry no `Cmd` bit and `Option` belongs to multi-cursor |
 | `Ctrl`+`-` | Go Back: return to the location before the last navigation jump (the keyboard twin of `Shift`+`Ctrl`+click; also on the editor right-click menu and as Command Palette "Go Back") |
+| `Alt`+`F12` | Peek Definition: an excerpt popup at the caret — header `path:line`, numbered lines, the definition marked `▶`; `Enter` converts to the real jump, `Esc` closes, any other key closes and keeps its meaning (also Command Palette "Peek Definition") |
 | `Shift`+`F12` | Go to References (project-wide; one use jumps, several open a picker) |
 | `Ctrl`+`Shift`+`F12` | Go to Declaration (where the server implements it; hidden for TypeScript) |
 | `Ctrl`+`F12` | Go to Type Definition |

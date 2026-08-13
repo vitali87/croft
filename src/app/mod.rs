@@ -2573,6 +2573,14 @@ pub struct App {
     /// OSC-1337 images composite above ratatui's text layer.
     ui_tooltip_area: Option<Rect>,
     definition_request_id: Option<u64>,
+    /// In-flight Peek Definition request (#115): same LSP request as the
+    /// jump, different consumer — the response opens the peek popup at the
+    /// caret instead of moving it.
+    peek_definition_request_id: Option<u64>,
+    /// The open peek popup, rendered beside `hover_popup` against the whole
+    /// frame; `peek_target` is where Enter jumps.
+    peek_popup: Option<crate::widgets::hover_popup::HoverPopup>,
+    peek_target: Option<(PathBuf, u32, u32)>,
     declaration_request_id: Option<u64>,
     type_definition_request_id: Option<u64>,
     /// The `(active file, last-seen LSP edit seq)` the OUTLINE was last synced
@@ -3844,6 +3852,9 @@ impl App {
             ui_tooltip_label: None,
             ui_tooltip_area: None,
             definition_request_id: None,
+            peek_definition_request_id: None,
+            peek_popup: None,
+            peek_target: None,
             outline_synced: None,
             declaration_request_id: None,
             type_definition_request_id: None,
@@ -7115,24 +7126,98 @@ impl App {
 
     pub fn drain_lsp_definition(&mut self) -> bool {
         let mut target = None;
+        let mut peek = None;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
             };
+            let mut peek_replied = false;
             while let Some(result) = lsp.drain_definition() {
+                if Some(result.request_id) == self.peek_definition_request_id {
+                    peek_replied = true;
+                    peek = result.target;
+                    continue;
+                }
                 if Some(result.request_id) != self.definition_request_id {
                     continue;
                 }
                 target = result.target;
             }
-        }
-        match target {
-            Some((path, line, col)) => {
-                self.go_to_definition(path, line, col);
-                true
+            if peek_replied && peek.is_none() {
+                // The reply arrived empty: without this the "Peeking
+                // definition" status hung forever with no popup.
+                self.peek_definition_request_id = None;
+                self.status = String::from("No definition found");
             }
-            None => false,
         }
+        let mut changed = false;
+        if let Some((path, line, col)) = peek {
+            self.peek_definition_request_id = None;
+            self.open_peek_popup(path, line, col);
+            changed = true;
+        }
+        if let Some((path, line, col)) = target {
+            self.go_to_definition(path, line, col);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Build and show the Peek Definition popup: a `path:line` header and a
+    /// numbered excerpt of the target region with the definition line marked.
+    /// The open buffer supplies the text when the target file is already open
+    /// (unsaved edits visible); disk otherwise.
+    fn open_peek_popup(&mut self, path: PathBuf, line: u32, col: u32) {
+        // Any open buffer wins over disk — the ACTIVE group's tabs plus
+        // every inactive split leaf's — so unsaved edits show wherever the
+        // target file happens to be open.
+        let open_buffer = self
+            .editor
+            .editors
+            .iter()
+            .chain(
+                self.editor_layout
+                    .inactive_leaf_tabs()
+                    .into_iter()
+                    .flat_map(|tabs| tabs.editors.iter()),
+            )
+            .find(|e| e.path.as_deref() == Some(path.as_path()))
+            .map(|e| e.lines.clone());
+        let lines: Vec<String> = match open_buffer {
+            Some(lines) => lines,
+            None => match std::fs::read_to_string(&path) {
+                Ok(text) => text.lines().map(|s| s.to_string()).collect(),
+                Err(e) => {
+                    self.status = format!("Peek failed: {e}");
+                    return;
+                }
+            },
+        };
+        let target = line as usize;
+        let (start, excerpt) = peek_excerpt(&lines, target, 4, 12);
+        let mut body = vec![format!("{}:{}", self.status_path(&path), target + 1)];
+        let num_w = (start + excerpt.len()).to_string().len();
+        for (i, text) in excerpt.iter().enumerate() {
+            let n = start + i;
+            let marker = if n == target { '\u{25b6}' } else { ' ' };
+            body.push(format!("{marker}{:>num_w$}  {text}", n + 1));
+        }
+        body.push(String::from("Enter jumps \u{00b7} Esc closes"));
+        let anchor = self.editor.cursor_screen_pos().unwrap_or((
+            self.editor.last_full_area.x + 1,
+            self.editor.last_full_area.y + 1,
+        ));
+        self.peek_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+            body.join("\n"),
+            anchor,
+        ));
+        self.peek_target = Some((path, line, col));
+        self.status = String::new();
+    }
+
+    fn close_peek_popup(&mut self) {
+        self.peek_popup = None;
+        self.peek_target = None;
     }
 
     pub fn drain_lsp_declaration(&mut self) -> bool {
@@ -8063,6 +8148,24 @@ impl App {
     /// Request the LSP definition of the symbol at the current cursor (buffer)
     /// position. Used by the editor right-click "Go to Definition" item, where
     /// the cursor has already been moved to the click point.
+    /// Alt+F12 / palette "Peek Definition": the definition request whose
+    /// response opens an excerpt popup instead of jumping (#115).
+    fn peek_definition_at_cursor(&mut self) {
+        let row = self.editor.cursor_row;
+        let col = self.editor.cursor_col;
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file open");
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            self.status = String::from("No language server for this file");
+            return;
+        };
+        let id = lsp.request_definition(path, row as u32, col as u32);
+        self.peek_definition_request_id = Some(id);
+        self.status = String::from("Peeking definition");
+    }
+
     fn request_definition_at_cursor(&mut self) {
         let row = self.editor.cursor_row;
         let col = self.editor.cursor_col;
@@ -12023,6 +12126,13 @@ impl App {
         // welcome screen skips the editor-tabs branch entirely, which used to
         // drop a terminal annotation's note without painting it at all.
         let hover_grad = self.popup_gradient();
+        if let Some(popup) = self.peek_popup.as_mut() {
+            popup.gradient = hover_grad;
+            let area = popup.area_for(frame.area());
+            if area.width > 0 && area.height > 0 {
+                frame.render_widget(&*popup, area);
+            }
+        }
         if let Some(popup) = self.hover_popup.as_mut() {
             popup.gradient = hover_grad;
             let area = popup.area_for(frame.area());
@@ -13431,6 +13541,29 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Peek Definition popup: Enter converts to the real jump, Esc
+        // closes, and any other key closes it and keeps its normal
+        // meaning — the popup is a glance, never a mode (#115). Gated on
+        // Press/Repeat like every other modal (the app-wide filter runs
+        // just below), so a key RELEASE never dismisses or jumps.
+        if self.peek_popup.is_some()
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
+            match key.code {
+                KeyCode::Enter => {
+                    if let Some((path, line, col)) = self.peek_target.take() {
+                        self.close_peek_popup();
+                        self.go_to_definition(path, line, col);
+                    }
+                    return Ok(());
+                }
+                KeyCode::Esc => {
+                    self.close_peek_popup();
+                    return Ok(());
+                }
+                _ => self.close_peek_popup(),
+            }
+        }
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return Ok(());
         }
@@ -19696,6 +19829,15 @@ impl App {
         // the VS Code F12-family bindings, also need a real text buffer. All are
         // no-ops on read-only diff / sheet / image tabs; the keystroke is still
         // swallowed so it never leaks into the buffer.
+        if is_peek_definition_key(key) {
+            if self.editor.diff.is_none()
+                && self.editor.sheet.is_none()
+                && self.editor.image.is_none()
+            {
+                self.peek_definition_at_cursor();
+            }
+            return;
+        }
         if is_go_to_definition_key(key) {
             if self.editor.diff.is_none()
                 && self.editor.sheet.is_none()
@@ -23661,6 +23803,7 @@ impl App {
             Cmd::MergePrevConflict => self.jump_conflict(true),
             Cmd::MergeComplete => self.complete_merge(),
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
+            Cmd::PeekDefinition => self.peek_definition_at_cursor(),
             Cmd::DebugClearWatch => {
                 let n = self.watch_exprs.len();
                 self.watch_exprs.clear();
@@ -31046,6 +31189,25 @@ fn elide_middle(s: &str, max: usize) -> String {
     out
 }
 
+/// The excerpt window for a Peek popup: up to `total` lines, at most
+/// `above` of them before `target`, clamped to the file. Returns the start
+/// line index and the excerpt slice (cloned).
+fn peek_excerpt(
+    lines: &[String],
+    target: usize,
+    above: usize,
+    total: usize,
+) -> (usize, Vec<String>) {
+    if lines.is_empty() {
+        return (0, Vec::new());
+    }
+    let target = target.min(lines.len() - 1);
+    let start = target.saturating_sub(above);
+    let end = (start + total).min(lines.len());
+    let start = end.saturating_sub(total).min(start);
+    (start, lines[start..end].to_vec())
+}
+
 fn cmd_active(mods: KeyModifiers, termux: bool) -> bool {
     mods.contains(KeyModifiers::SUPER) || (termux && mods.contains(KeyModifiers::CONTROL))
 }
@@ -32498,6 +32660,19 @@ fn is_delete_line_key(key: KeyEvent) -> bool {
 /// unused, so leaving Alt on Definition is harmless.)
 fn is_go_to_definition_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::F(12))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// Editor-pane Peek Definition: `Alt+F12`, VS Code's default (#115). This
+/// claims the ALT bit Definition used to tolerate as iTerm2 Cmd-fold noise —
+/// on those rare folded events the user now gets a peek popup instead of a
+/// jump, strictly less disruptive than the old mis-jump.
+fn is_peek_definition_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(12))
+        && key.modifiers.contains(KeyModifiers::ALT)
         && !key.modifiers.contains(KeyModifiers::SHIFT)
         && !key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SUPER)
