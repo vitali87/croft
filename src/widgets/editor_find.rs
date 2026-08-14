@@ -40,7 +40,10 @@ pub fn line_matches(line: &str, opts: SearchOpts, needle: &str) -> Vec<(usize, u
     let mut col_chars = 0usize;
     for (chunk, is_match) in split_for_highlight(line, needle, opts) {
         let chunk_chars = chunk.chars().count();
-        if is_match {
+        // Zero-width matches are invisible: nothing to paint, count, or
+        // step to — the find bar's layer skips them even though the split
+        // now reports them (the workspace replace preview needs them).
+        if is_match && chunk_chars > 0 {
             out.push((col_chars, chunk_chars));
         }
         col_chars = col_chars.saturating_add(chunk_chars);
@@ -268,7 +271,10 @@ pub fn replace_all_in_lines(
         // Byte offset of the current segment in `line`, for captures_at.
         let mut pos = 0usize;
         for (chunk, is_match) in &segs {
-            if !is_match {
+            if !is_match || chunk.is_empty() {
+                // Zero-width matches stay unreplaced in the find bar (the
+                // highlighter shows nothing there); the empty chunk still
+                // contributes no text.
                 new.push_str(chunk);
             } else {
                 total += 1;

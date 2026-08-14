@@ -26038,3 +26038,101 @@ fn build_scan_installs_problems_replaces_per_pane_and_merges_with_lsp() {
     assert!(app.problems.groups().is_empty());
     assert!(app.status.contains("Cleared 1 build diagnostic"));
 }
+
+#[test]
+fn replace_all_requires_confirmation_and_esc_cancels() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "beta one\nbeta two\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.search.root = tmp.path().to_path_buf();
+    app.search.query = String::from("beta");
+    app.search.replace = String::from("delta");
+    app.search.run_query();
+    assert_eq!(app.search.hits.len(), 2, "precondition: two hits");
+
+    // A still-streaming search refuses: hits arriving after confirmation
+    // would be silently missed.
+    app.search.complete = false;
+    app.run_search_replace_all();
+    assert!(app.pending_replace_all.is_none());
+    assert!(app.status.contains("still running"));
+
+    app.search.complete = true;
+    app.run_search_replace_all();
+    assert_eq!(
+        app.pending_replace_all,
+        Some((2, 1, 0)),
+        "Enter must raise the modal with counts, not write"
+    );
+    let disk = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert!(
+        disk.contains("beta"),
+        "nothing is written before confirmation"
+    );
+
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert!(app.pending_replace_all.is_none());
+    assert!(app.status.contains("cancelled"));
+    let disk = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert!(disk.contains("beta"), "Esc leaves the files alone");
+
+    app.run_search_replace_all();
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    let disk = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert_eq!(disk, "delta one\ndelta two\n", "Enter commits the rewrite");
+    assert!(app.status.contains("replaced 2 occurrence"));
+}
+
+#[test]
+fn replace_all_skips_files_open_with_unsaved_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let clean = tmp.path().join("clean.txt");
+    let dirty = tmp.path().join("dirty.txt");
+    std::fs::write(&clean, "beta here\n").unwrap();
+    std::fs::write(&dirty, "beta there\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&dirty).unwrap();
+    app.editor.insert_char('x'); // unsaved edit
+    assert!(app.editor.dirty);
+
+    app.search.root = tmp.path().to_path_buf();
+    app.search.query = String::from("beta");
+    app.search.replace = String::from("delta");
+    app.search.run_query();
+    app.search.complete = true;
+    app.run_search_replace_all();
+    assert_eq!(
+        app.pending_replace_all,
+        Some((1, 1, 1)),
+        "the modal counts exclude the dirty file and name the skip"
+    );
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&clean).unwrap(),
+        "delta here\n",
+        "the clean file is rewritten"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dirty).unwrap(),
+        "beta there\n",
+        "the dirty-open file is untouched on disk"
+    );
+    assert!(
+        app.status.contains("skipped dirty.txt") && app.status.contains("unsaved"),
+        "the skip is named; was {:?}",
+        app.status
+    );
+}
