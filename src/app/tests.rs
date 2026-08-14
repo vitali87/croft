@@ -26136,3 +26136,67 @@ fn replace_all_skips_files_open_with_unsaved_changes() {
         app.status
     );
 }
+
+#[test]
+fn drag_target_over_the_sticky_band_is_the_pinned_directory() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("outer/inner")).unwrap();
+    for i in 0..25 {
+        std::fs::write(tmp.path().join(format!("outer/inner/f{i:02}.rs")), "x\n").unwrap();
+    }
+    std::fs::write(tmp.path().join("loose.txt"), "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let outer = app
+        .tree
+        .nodes
+        .iter()
+        .position(|n| n.path.ends_with("outer"))
+        .unwrap();
+    app.tree.selected = outer;
+    app.tree.expand_selected();
+    let inner = app
+        .tree
+        .nodes
+        .iter()
+        .position(|n| n.path.ends_with("inner"))
+        .unwrap();
+    app.tree.selected = inner;
+    app.tree.expand_selected();
+    // Scroll deep so the band pins ancestors, selection far below.
+    let deep = app
+        .tree
+        .nodes
+        .iter()
+        .position(|n| n.path.ends_with("f20.rs"))
+        .unwrap();
+    app.tree.selected = deep;
+    app.tree.scroll = deep.saturating_sub(3);
+    let backend = ratatui::backend::TestBackend::new(120, 20);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let (band_y, pinned_idx) = {
+        let rows = app.tree.sticky_rows_for_test();
+        // The MIDDLE pinned row ("outer") is where the behaviors diverge:
+        // the outermost is the workspace root (dropping a root-level file
+        // into its own parent is correctly refused), and the deepest
+        // ("inner") coincides with the covered rows' parent, where the old
+        // sticky-blind resolution accidentally agreed.
+        assert!(rows.len() >= 3, "band must pin root/outer/inner here");
+        rows[1]
+    };
+    let loose = tmp.path().join("loose.txt");
+    let target = drag_target_index(&app.tree, band_y, std::slice::from_ref(&loose))
+        .expect("a pinned directory is a valid drop target");
+    assert_eq!(
+        target, pinned_idx,
+        "the drop target under the band is the PINNED directory, not the covered row"
+    );
+    let covered = app.tree.node_at_y(band_y);
+    assert_ne!(
+        covered,
+        Some(target),
+        "precondition: the band actually covers a different row there"
+    );
+    let _ = MouseEventKind::Down(MouseButton::Left); // silence unused import paths on some cfgs
+}

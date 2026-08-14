@@ -28036,8 +28036,12 @@ impl App {
                             // range-extend from the initial anchor — just like
                             // VS Code's drag-to-select.
                             if self.tree_drag.as_ref().is_none_or(|d| !d.armed)
+                                && self.tree.sticky_row_at(m.row).is_none()
                                 && let Some(idx) = self.tree.node_at_y(m.row)
                             {
+                                // Never extend the selection onto rows the
+                                // sticky band covers — they are invisible
+                                // under it (#126).
                                 self.tree.select(idx);
                             }
                         }
@@ -33279,7 +33283,10 @@ fn drag_target_index(
     y: u16,
     drag_paths: &[PathBuf],
 ) -> Option<usize> {
-    let idx = tree.node_at_y(y)?;
+    // The sticky band wins the row resolution: a drop on a pinned ancestor
+    // targets THAT directory, not whatever row the band covers (#126 — files
+    // used to land in the covered row's directory, silently).
+    let idx = tree.sticky_row_at(y).or_else(|| tree.node_at_y(y))?;
     let node = tree.nodes.get(idx)?;
     let dir_idx = if node.is_dir {
         idx

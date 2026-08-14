@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Workspace Replace All grew up: expanding the Replace row focuses it, every result previews the match crossed out with its replacement beside it, a confirmation counts occurrences and files before anything is rewritten, and files with unsaved changes are skipped by name.",
+    summary: "Dragging files onto the Explorer's pinned sticky rows now drops into the pinned directory itself — previously the drop silently targeted whatever row the band covered — and drag-selection no longer extends onto rows hidden under the band.",
 }];
