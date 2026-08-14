@@ -2183,7 +2183,15 @@ mod tests {
             "a healthy idle channel must not read as dead"
         );
         drop(peer); // the relay dies
-        let _ = session.poll(|_| None);
+        // The hangup is the KERNEL's to deliver: on a loaded box a single
+        // nonblocking poll can land before the EOF is readable and observe
+        // nothing (#125, twice on CI). Poll until the latch flips or a real
+        // deadline passes — the state-gated wait #109/#110 established.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !session.disconnected() && std::time::Instant::now() < deadline {
+            let _ = session.poll(|_| None);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
             session.disconnected(),
             "EOF from the relay must mark the session disconnected"
