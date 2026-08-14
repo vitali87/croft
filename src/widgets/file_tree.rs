@@ -528,6 +528,12 @@ impl FileTree {
         (0..self.nodes.len()).collect()
     }
 
+    /// Test-only view of the band painted this frame.
+    #[cfg(test)]
+    pub fn sticky_rows_for_test(&self) -> &[(u16, usize)] {
+        &self.sticky_rows
+    }
+
     /// Map a click on the sticky band to the pinned directory's node index.
     pub fn sticky_row_at(&self, y: u16) -> Option<usize> {
         self.sticky_rows
