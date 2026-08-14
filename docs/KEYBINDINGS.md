@@ -9,6 +9,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | Keys | Action |
 |------|--------|
 | `Ctrl+s` / `Cmd+s` | Save the open file |
+| Typing `(` `[` `{` or a quote | Auto-closing pairs: the pair inserts with the caret between (openers never before a word, quotes never after one); typing the closer steps over; a selection is surrounded; backspace inside an empty pair deletes both. Settings gear → "Auto Closing Pairs" toggles |
 | `Ctrl+q` | Quit |
 | `F1` | Open the shortcuts modal |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
