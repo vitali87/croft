@@ -26050,10 +26050,18 @@ fn replace_all_requires_confirmation_and_esc_cancels() {
     app.search.run_query();
     assert_eq!(app.search.hits.len(), 2, "precondition: two hits");
 
+    // A still-streaming search refuses: hits arriving after confirmation
+    // would be silently missed.
+    app.search.complete = false;
+    app.run_search_replace_all();
+    assert!(app.pending_replace_all.is_none());
+    assert!(app.status.contains("still running"));
+
+    app.search.complete = true;
     app.run_search_replace_all();
     assert_eq!(
         app.pending_replace_all,
-        Some((2, 1)),
+        Some((2, 1, 0)),
         "Enter must raise the modal with counts, not write"
     );
     let disk = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
@@ -26099,7 +26107,13 @@ fn replace_all_skips_files_open_with_unsaved_changes() {
     app.search.query = String::from("beta");
     app.search.replace = String::from("delta");
     app.search.run_query();
+    app.search.complete = true;
     app.run_search_replace_all();
+    assert_eq!(
+        app.pending_replace_all,
+        Some((1, 1, 1)),
+        "the modal counts exclude the dirty file and name the skip"
+    );
     app.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Enter,
         KeyModifiers::NONE,

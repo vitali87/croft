@@ -412,9 +412,14 @@ fn split_for_highlight_regex(line: &str, needle: &str, opts: SearchOpts) -> Vec<
         if m.start() > last {
             out.push((line[last..m.start()].to_string(), false));
         }
-        // Empty matches (`.*` against an empty position) would loop
-        // forever; advance past them.
+        // Zero-width matches (`\b`, `^`) still count as match positions —
+        // the replace preview inserts the expansion there, mirroring what
+        // `replace_in_text` writes — and `last` must advance regardless, or
+        // the text before the NEXT match re-emits and the row doubles
+        // ("foofoo" for `\b` on "foo"; #124 review).
         if m.end() == m.start() {
+            out.push((String::new(), true));
+            last = m.end();
             continue;
         }
         out.push((line[m.start()..m.end()].to_string(), true));
@@ -794,6 +799,10 @@ pub struct SearchPanel {
     /// Which input field currently receives typed characters. Tab cycles
     /// through the visible fields; clicking an input focuses it directly.
     pub field: SearchField,
+    /// True once the worker's `Done` for the CURRENT query has drained:
+    /// Replace All refuses while hits are still streaming, or files found
+    /// after confirmation would be silently missed (#124 review).
+    pub complete: bool,
     /// Selection range within the currently focused field's text.
     pub field_selection: Option<(usize, usize)>,
 
@@ -871,6 +880,7 @@ impl SearchPanel {
             replace_open: false,
             details_open: false,
             field: SearchField::Query,
+            complete: false,
             field_selection: None,
             chevron_x: 0,
             chevron_y: 0,
@@ -1256,7 +1266,7 @@ impl SearchPanel {
 
     /// Count what Replace All WOULD do — `(occurrences, files)` — without
     /// writing anything. Feeds the confirmation modal (#123).
-    pub fn count_replacements(&self) -> (usize, usize) {
+    pub fn count_replacements(&self, skip: &HashSet<PathBuf>) -> (usize, usize) {
         let needle = self.query.trim();
         if needle.is_empty() {
             return (0, 0);
@@ -1266,6 +1276,11 @@ impl SearchPanel {
         let mut files = 0usize;
         for hit in &self.hits {
             if !seen.insert(hit.path.clone()) {
+                continue;
+            }
+            if skip.contains(&hit.path) {
+                // The confirmed action will not touch these; counting them
+                // made the modal overpromise (#124 review).
                 continue;
             }
             let Ok(content) = std::fs::read_to_string(&hit.path) else {
@@ -3700,5 +3715,23 @@ mod tests {
         );
         panel.toggle_replace();
         assert_eq!(panel.field, SearchField::Query, "collapsing returns focus");
+    }
+    #[test]
+    fn zero_width_regex_matches_advance_and_mark_positions() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
+        let segs = split_for_highlight("foo", r"\b", opts);
+        // Two boundary positions, the text emitted exactly once between
+        // them — the old code re-emitted it and rows doubled ("foofoo").
+        assert_eq!(
+            segs,
+            vec![
+                (String::new(), true),
+                (String::from("foo"), false),
+                (String::new(), true),
+            ]
+        );
     }
 }
