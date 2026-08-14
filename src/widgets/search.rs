@@ -683,6 +683,25 @@ pub fn replace_in_text(
     Some((out, count))
 }
 
+/// Expand the replacement for ONE matched slice — regex capture references
+/// (`$1`, `${name}`) honoured in regex mode, verbatim otherwise. Drives the
+/// result rows' inline old→new preview (#123).
+pub fn expand_replacement(
+    matched: &str,
+    query: &str,
+    replacement: &str,
+    opts: SearchOpts,
+) -> String {
+    let Some(re) = build_replace_regex(query, opts) else {
+        return replacement.to_string();
+    };
+    if opts.use_regex {
+        re.replace(matched, replacement).into_owned()
+    } else {
+        replacement.to_string()
+    }
+}
+
 /// Replace every match in the file at `path` on disk, writing the result back
 /// only when at least one replacement was made. Returns the number of matches
 /// replaced, or `None` when the file can't be read, the pattern can't compile,
@@ -1096,7 +1115,12 @@ impl SearchPanel {
     /// falls back to the Query field.
     pub fn toggle_replace(&mut self) {
         self.replace_open = !self.replace_open;
-        if !self.replace_open && self.field == SearchField::Replace {
+        if self.replace_open {
+            // VS Code focuses the revealed input; leaving focus in the
+            // query made the next keystrokes silently extend the search
+            // (#123).
+            self.focus_field(SearchField::Replace);
+        } else if self.field == SearchField::Replace {
             self.focus_field(SearchField::Query);
         }
     }
@@ -1228,6 +1252,59 @@ impl SearchPanel {
             }
         }
         total
+    }
+
+    /// Count what Replace All WOULD do — `(occurrences, files)` — without
+    /// writing anything. Feeds the confirmation modal (#123).
+    pub fn count_replacements(&self) -> (usize, usize) {
+        let needle = self.query.trim();
+        if needle.is_empty() {
+            return (0, 0);
+        }
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut occurrences = 0usize;
+        let mut files = 0usize;
+        for hit in &self.hits {
+            if !seen.insert(hit.path.clone()) {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&hit.path) else {
+                continue;
+            };
+            if let Some((_, n)) = replace_in_text(&content, needle, &self.replace, self.opts)
+                && n > 0
+            {
+                occurrences += n;
+                files += 1;
+            }
+        }
+        (occurrences, files)
+    }
+
+    /// Replace All, skipping `skip` (files open with unsaved edits — a disk
+    /// write under a dirty buffer forces the tab into conflict divergence).
+    /// Returns `(occurrences replaced, the skipped hit files)`.
+    pub fn replace_all_skipping(&self, skip: &HashSet<PathBuf>) -> (usize, Vec<PathBuf>) {
+        let needle = self.query.trim();
+        if needle.is_empty() {
+            return (0, Vec::new());
+        }
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut total = 0usize;
+        let mut skipped = Vec::new();
+        for hit in &self.hits {
+            if !seen.insert(hit.path.clone()) {
+                continue;
+            }
+            if skip.contains(&hit.path) {
+                skipped.push(hit.path.clone());
+                continue;
+            }
+            if let Some(n) = replace_in_file(&hit.path, needle, &self.replace, self.opts) {
+                total += n;
+            }
+        }
+        (total, skipped)
     }
 
     /// Run the current query, store the results, and reset selection.
@@ -1733,7 +1810,7 @@ impl Widget for &mut SearchPanel {
                     fill_right: replace_fill_right,
                     lead_glyph: Some(&crate::icons::SEARCH_REPLACE.to_string()),
                     text: &self.replace,
-                    placeholder: "Replace",
+                    placeholder: "Replace (Tab switches)",
                     selection: if self.field == SearchField::Replace {
                         self.active_selection()
                     } else {
@@ -1977,7 +2054,28 @@ impl Widget for &mut SearchPanel {
                     Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
                 ),
             ];
+            // Inline replace preview (#123): while a replacement is typed,
+            // each match renders dim and crossed out with the expanded
+            // replacement (capture refs honoured) in green beside it — the
+            // bad-pattern catch before Replace All commits anything.
+            let preview = self.replace_open && !self.replace.is_empty();
             for (chunk, is_match) in split_for_highlight(&hit.line_text, needle, self.opts) {
+                if is_match && preview {
+                    let new_text = expand_replacement(&chunk, needle, &self.replace, self.opts);
+                    spans.push(Span::styled(
+                        chunk,
+                        Style::default()
+                            .fg(Color::Rgb(0x8b, 0x93, 0xa5))
+                            .add_modifier(Modifier::CROSSED_OUT),
+                    ));
+                    spans.push(Span::styled(
+                        new_text,
+                        Style::default()
+                            .fg(Color::Rgb(0xb6, 0xee, 0xc4))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    continue;
+                }
                 spans.push(Span::styled(
                     chunk,
                     if is_match {
@@ -3570,5 +3668,37 @@ mod tests {
             panel.results_start_offset, 5,
             "collapsed layout starts results at the 5-row offset"
         );
+    }
+    #[test]
+    fn expand_replacement_honours_capture_references_in_regex_mode() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            expand_replacement("beta_42", r"beta_(\d+)", "id-$1", opts),
+            "id-42",
+            "regex mode expands $1 against the matched slice"
+        );
+        let literal = SearchOpts::default();
+        assert_eq!(
+            expand_replacement("beta", "beta", "x$1y", literal),
+            "x$1y",
+            "literal mode inserts the replacement verbatim"
+        );
+    }
+
+    #[test]
+    fn toggling_replace_open_focuses_the_replace_input() {
+        let mut panel = SearchPanel::new(PathBuf::from("/tmp"));
+        assert_eq!(panel.field, SearchField::Query);
+        panel.toggle_replace();
+        assert_eq!(
+            panel.field,
+            SearchField::Replace,
+            "revealing the row must focus it — typing used to extend the query"
+        );
+        panel.toggle_replace();
+        assert_eq!(panel.field, SearchField::Query, "collapsing returns focus");
     }
 }

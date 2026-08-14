@@ -2929,6 +2929,9 @@ pub struct App {
     build_diag_files_by_pane: std::collections::HashMap<u64, Vec<PathBuf>>,
     /// True while the "Discard All Changes" confirmation modal is up.
     pub pending_discard_all: bool,
+    /// The Replace All confirmation (#123): `(occurrences, files)` counted
+    /// without writing; the modal shows them, Enter/Y commits, Esc cancels.
+    pending_replace_all: Option<(usize, usize)>,
     /// Cached workspace file index. Built lazily on first Cmd+P and
     /// shared across reopens so repeated invocations are instant.
     file_finder_index: Option<std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>>,
@@ -3841,6 +3844,7 @@ impl App {
             build_diagnostics: std::collections::HashMap::new(),
             build_diag_files_by_pane: std::collections::HashMap::new(),
             pending_discard_all: false,
+            pending_replace_all: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
             file_finder_index_dirty: false,
@@ -12233,6 +12237,7 @@ impl App {
         self.render_discard_confirm(frame);
         self.render_revert_hunk_confirm(frame);
         self.render_discard_all_confirm(frame);
+        self.render_replace_all_confirm(frame);
         self.render_broadcast_confirm(frame);
         // Terminal-pane inline image: sync after the panes have painted so
         // last_inner and the scroll offset are this frame's (all gating —
@@ -12715,6 +12720,55 @@ impl App {
 
     /// Confirmation modal for "Discard All Changes" — reverts every tracked
     /// edit to HEAD, so it gets the same red Y/N gate as a single discard.
+    /// The Replace All confirmation modal (#123): counts up front, commits
+    /// on Enter/Y, cancels on Esc/N — the discard-all popup's shape.
+    fn render_replace_all_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some((occurrences, files)) = self.pending_replace_all else {
+            return;
+        };
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let height: u16 = 7;
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        };
+        let warn = Color::Rgb(0xe7, 0xa7, 0x3c);
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .title(ratatui::text::Span::styled(
+                " REPLACE ALL? ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let lines = vec![
+            Line::from(format!(
+                "Replace {occurrences} occurrence(s) across {files} file(s) with \"{}\"?",
+                self.search.replace
+            )),
+            Line::from(""),
+            Line::from("Files are rewritten on disk; open files with unsaved changes are skipped."),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Enter / Y replaces \u{00b7} Esc cancels",
+                Style::default().fg(Color::Rgb(0x9a, 0xa4, 0xb8)),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
+    }
+
     fn render_discard_all_confirm(&self, frame: &mut ratatui::Frame) {
         if !self.pending_discard_all {
             return;
@@ -13725,6 +13779,18 @@ impl App {
             self.handle_list_picker_key(key);
             return Ok(());
         }
+        if self.pending_replace_all.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_pending_replace_all();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_replace_all();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         if self.pending_discard_all {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -14242,13 +14308,60 @@ impl App {
             self.status = String::from("Replace All: enter a search term first");
             return;
         }
-        let n = self.search.replace_all_on_disk();
-        if n == 0 {
+        // Count first, write only after the modal confirms: a workspace-wide
+        // disk rewrite is exactly what the confirm-destructive rule is for
+        // (#123 — Enter used to commit instantly).
+        let (occurrences, files) = self.search.count_replacements();
+        if occurrences == 0 {
             self.status = String::from("Replace All: nothing to replace");
-        } else {
-            self.status = format!("Replace All: replaced {n} occurrence(s)");
+            return;
         }
+        self.pending_replace_all = Some((occurrences, files));
+    }
+
+    /// The confirmed Replace All: writes every hit file EXCEPT ones open
+    /// with unsaved edits — a disk write under a dirty buffer forces that
+    /// tab into conflict divergence, so those are skipped and named.
+    fn confirm_pending_replace_all(&mut self) {
+        self.pending_replace_all = None;
+        let dirty: std::collections::HashSet<PathBuf> = self
+            .editor
+            .editors
+            .iter()
+            .chain(
+                self.editor_layout
+                    .inactive_leaf_tabs()
+                    .into_iter()
+                    .flat_map(|tabs| tabs.editors.iter()),
+            )
+            .filter(|e| e.dirty)
+            .filter_map(|e| e.path.clone())
+            .collect();
+        let (n, skipped) = self.search.replace_all_skipping(&dirty);
+        self.status = if skipped.is_empty() {
+            format!("Replace All: replaced {n} occurrence(s)")
+        } else {
+            let names: Vec<String> = skipped
+                .iter()
+                .take(2)
+                .map(|p| self.status_path(p))
+                .collect();
+            let more = skipped.len().saturating_sub(names.len());
+            let list = if more > 0 {
+                format!("{} and {more} more", names.join(", "))
+            } else {
+                names.join(", ")
+            };
+            format!(
+                "Replace All: replaced {n} occurrence(s); skipped {list} (unsaved changes — save first)"
+            )
+        };
         self.submit_search_query();
+    }
+
+    fn cancel_pending_replace_all(&mut self) {
+        self.pending_replace_all = None;
+        self.status = String::from("Replace All cancelled");
     }
 
     fn handle_remote_key(&mut self, key: KeyEvent) {

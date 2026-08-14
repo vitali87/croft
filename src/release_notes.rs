@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Brackets and quotes now auto-close as you type: the caret lands inside the pair, typing the closer steps over it, a selection gets surrounded, and backspace inside an empty pair removes both — toggleable in the settings gear.",
+    summary: "Workspace Replace All grew up: expanding the Replace row focuses it, every result previews the match crossed out with its replacement beside it, a confirmation counts occurrences and files before anything is rewritten, and files with unsaved changes are skipped by name.",
 }];
