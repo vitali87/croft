@@ -20204,12 +20204,12 @@ fn accepting_a_snippet_completion_expands_it_with_tab_stops() {
 fn settings_view_toggle_flips_the_setting_and_stays_open() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let before = app.format_on_save;
+    let before = app.auto_close_pairs;
     app.open_settings_view();
-    // The first row is "Format on Save"; confirming it flips the value.
+    // The first row is "Auto Closing Pairs"; confirming it flips the value.
     app.confirm_list_picker();
     assert_eq!(
-        app.format_on_save, !before,
+        app.auto_close_pairs, !before,
         "the toggle row flips the setting"
     );
     assert!(

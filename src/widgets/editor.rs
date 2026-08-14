@@ -1442,6 +1442,10 @@ pub struct Editor {
     /// The `edit_seq` `git_marks` was computed at; `u64::MAX` forces a first
     /// recompute once a baseline arrives.
     git_marks_seq: u64,
+    /// Auto-closing pairs (#121): typing an opener/quote inserts the pair,
+    /// closers type over, selections surround, and backspace eats an empty
+    /// pair. Synced from the app's persisted preference like `blame_enabled`.
+    pub auto_close_pairs: bool,
     /// Merge-conflict blocks in the buffer, lazily recomputed whenever
     /// `edit_seq` moves (same pattern as the git-gutter marks).
     conflicts: Vec<crate::merge::ConflictBlock>,
@@ -1772,6 +1776,7 @@ impl Editor {
             git_baseline_for: None,
             git_marks: std::collections::HashMap::new(),
             git_marks_seq: u64::MAX,
+            auto_close_pairs: true,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
             conflicts_seq: u64::MAX,
@@ -3395,6 +3400,9 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        if self.auto_close_pairs && self.insert_char_with_pairs(c) {
+            return;
+        }
         self.pin_on_edit();
         // Selection-replace counts as one logical edit (Replace), not two.
         // Coalesce subsequent typed chars onto the same step only when the
@@ -3417,6 +3425,85 @@ impl Editor {
         self.cursor_col += 1;
         self.mark_buffer_changed();
         self.recompute_highlights();
+    }
+
+    /// The auto-closing-pairs behaviors, returning true when the keystroke
+    /// was fully handled here (#121). VS Code's default semantics:
+    /// type-over for closers/quotes, selection surround for openers/quotes,
+    /// pair insertion guarded so a closer is never jammed into a following
+    /// word (and a quote never pairs against a preceding word character —
+    /// the apostrophe-in-a-word case).
+    fn insert_char_with_pairs(&mut self, c: char) -> bool {
+        let close = auto_close_partner(c);
+        let has_sel = self.selection.map(|s| s.has_area()).unwrap_or(false);
+        // Selection surround: openers and quotes wrap, closers fall through
+        // to the ordinary replace-selection insert.
+        if has_sel {
+            let Some(close) = close else {
+                return false;
+            };
+            if is_pair_closer(c) {
+                return false;
+            }
+            self.pin_on_edit();
+            self.push_undo(EditKind::Paste);
+            let ((sr, sc), (er, ec)) = self.selection.unwrap().normalised();
+            let close_byte = self.byte_index(er, ec);
+            self.lines[er].insert(close_byte, close);
+            let open_byte = self.byte_index(sr, sc);
+            self.lines[sr].insert(open_byte, c);
+            let inner_end = if sr == er { ec + 1 } else { ec };
+            self.selection = Some(EditorSelection {
+                anchor: (sr, sc + 1),
+                head: (er, inner_end),
+            });
+            self.cursor_row = er;
+            self.cursor_col = inner_end;
+            self.mark_buffer_changed();
+            self.recompute_highlights();
+            return true;
+        }
+        let next = self
+            .lines
+            .get(self.cursor_row)
+            .and_then(|l| l.chars().nth(self.cursor_col));
+        // Type-over: the exact closer/quote already sits at the caret.
+        if (is_pair_closer(c) || is_pair_quote(c)) && next == Some(c) {
+            self.cursor_col += 1;
+            self.ensure_cursor_col_visible();
+            return true;
+        }
+        let Some(close) = close else {
+            return false;
+        };
+        if is_pair_closer(c) {
+            return false;
+        }
+        // Opener guard: never before a word character. Quote guard: also
+        // never after a word character or the same quote.
+        let next_ok = next.is_none_or(|n| !n.is_alphanumeric() && n != '_' && n != c);
+        let prev = if self.cursor_col == 0 {
+            None
+        } else {
+            self.lines
+                .get(self.cursor_row)
+                .and_then(|l| l.chars().nth(self.cursor_col - 1))
+        };
+        let prev_ok =
+            !is_pair_quote(c) || prev.is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != c);
+        if !next_ok || !prev_ok {
+            return false;
+        }
+        self.pin_on_edit();
+        self.push_undo(EditKind::InsertChar);
+        let row = self.cursor_row;
+        let byte = self.byte_index(row, self.cursor_col);
+        self.lines[row].insert(byte, close);
+        self.lines[row].insert(byte, c);
+        self.cursor_col += 1;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        true
     }
 
     /// Apply LSP rename edits to this buffer in-memory as a single undo step,
@@ -3778,6 +3865,23 @@ impl Editor {
     pub fn backspace(&mut self) {
         self.pin_on_edit();
         self.push_undo(EditKind::Backspace);
+        // Between an empty auto-close pair, backspace eats both sides —
+        // typing `(` then backspace must round-trip to nothing (#121).
+        if self.auto_close_pairs
+            && !self.selection.map(|s| s.has_area()).unwrap_or(false)
+            && self.cursor_col > 0
+        {
+            let line = self.lines.get(self.cursor_row).cloned().unwrap_or_default();
+            let prev = line.chars().nth(self.cursor_col - 1);
+            let next = line.chars().nth(self.cursor_col);
+            if let (Some(p), Some(n)) = (prev, next)
+                && auto_close_partner(p) == Some(n)
+                && !is_pair_closer(p)
+            {
+                let byte = self.byte_index(self.cursor_row, self.cursor_col);
+                self.lines[self.cursor_row].remove(byte);
+            }
+        }
         self.backspace_raw();
         self.recompute_highlights();
     }
@@ -8629,6 +8733,29 @@ fn paint_bracket_match(
 /// diff3 base section and the `=======` separator sit on a neutral grey.
 /// Fixed dark tints, like the selection band: both bundled themes are dark,
 /// and the hues are semantic (green = yours, blue = theirs), not accents.
+/// VS Code's default auto-closing set: the partner a typed opener/quote
+/// pairs with, `None` for everything else (closers included — they only
+/// type over).
+fn auto_close_partner(c: char) -> Option<char> {
+    match c {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
+fn is_pair_closer(c: char) -> bool {
+    matches!(c, ')' | ']' | '}')
+}
+
+fn is_pair_quote(c: char) -> bool {
+    matches!(c, '"' | '\'' | '`')
+}
+
 fn conflict_row_tint(blocks: &[crate::merge::ConflictBlock], row: usize) -> Option<Color> {
     let block = blocks.iter().find(|b| b.contains(row))?;
     let ours_end = block.base_start.unwrap_or(block.sep);
@@ -18047,5 +18174,91 @@ mod tests {
             .map(|i| buf[(x1 + i, y1)].symbol().to_string())
             .collect();
         assert_eq!(shown, "bob", "tag falls back below on the top row");
+    }
+    // ---- Auto-closing pairs (#121) ----
+
+    #[test]
+    fn typing_an_opener_auto_closes_with_the_caret_between() {
+        let mut e = editor_with("fn main() ");
+        e.cursor_row = 0;
+        e.cursor_col = 10; // end of line
+        e.insert_char('{');
+        assert_eq!(e.lines[0], "fn main() {}");
+        assert_eq!(e.cursor_col, 11, "the caret sits between the pair");
+        // One undo removes BOTH characters.
+        e.undo();
+        assert_eq!(e.lines[0], "fn main() ");
+    }
+
+    #[test]
+    fn openers_do_not_auto_close_before_a_word_character() {
+        let mut e = editor_with("foo");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.insert_char('(');
+        assert_eq!(
+            e.lines[0], "(foo",
+            "no closer may be jammed into the following word"
+        );
+    }
+
+    #[test]
+    fn typing_the_closer_steps_over_instead_of_inserting() {
+        let mut e = editor_with("");
+        e.insert_char('(');
+        assert_eq!(e.lines[0], "()");
+        e.insert_char(')');
+        assert_eq!(e.lines[0], "()", "the closer types over, never doubles");
+        assert_eq!(e.cursor_col, 2);
+    }
+
+    #[test]
+    fn an_apostrophe_inside_a_word_stays_single() {
+        let mut e = editor_with("don");
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.insert_char('\'');
+        assert_eq!(e.lines[0], "don'", "no auto-pair after a word character");
+    }
+
+    #[test]
+    fn typing_a_bracket_with_a_selection_surrounds_it() {
+        let mut e = editor_with("abc def");
+        e.cursor_row = 0;
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (0, 3),
+        }); // "abc"
+        e.insert_char('(');
+        assert_eq!(e.lines[0], "(abc) def");
+        let sel = e
+            .selection
+            .expect("the selection survives, on the inner text");
+        let ((sr, sc), (er, ec)) = sel.normalised();
+        assert_eq!((sr, sc, er, ec), (0, 1, 0, 4));
+        e.undo();
+        assert_eq!(e.lines[0], "abc def", "surround is one undo step");
+    }
+
+    #[test]
+    fn backspace_between_an_empty_pair_deletes_both() {
+        let mut e = editor_with("");
+        e.insert_char('(');
+        assert_eq!(e.lines[0], "()");
+        e.backspace();
+        assert_eq!(e.lines[0], "", "the empty pair dies together");
+    }
+
+    #[test]
+    fn the_toggle_disables_every_pair_behavior() {
+        let mut e = editor_with("");
+        e.auto_close_pairs = false;
+        e.insert_char('(');
+        assert_eq!(e.lines[0], "(", "off means plain inserts");
+        e.insert_char(')');
+        assert_eq!(e.lines[0], "()");
+        e.cursor_col = 1;
+        e.backspace();
+        assert_eq!(e.lines[0], ")", "off means plain backspace");
     }
 }

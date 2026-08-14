@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.1.711"
+version = "0.1.712"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"

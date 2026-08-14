@@ -164,6 +164,10 @@ pub struct Prefs {
     /// config both mean "blame shown".
     #[serde(default)]
     pub disable_inline_blame: bool,
+    /// Auto-closing pairs (#121) are ON by default; this stores the opt-out
+    /// (a default-false field keeps old configs valid, like inline blame).
+    #[serde(default)]
+    pub disable_auto_close_pairs: bool,
     /// Opt-out for LSP inlay hints (inline type / parameter annotations),
     /// which are on by default like VS Code's `editor.inlayHints.enabled`.
     /// Stored as the disable flag so the derived `Default` and an older
@@ -299,6 +303,13 @@ pub fn save_layout(layout: LayoutPrefs) -> Result<()> {
 
 /// Persist the format-on-save choice, preserving other settings. Best-effort:
 /// a write failure is swallowed by the caller.
+pub fn save_auto_close_pairs(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.disable_auto_close_pairs = !enabled;
+    prefs.save(&path)
+}
+
 pub fn save_format_on_save(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Compiler errors now reach PROBLEMS: any command finishing in a terminal pane has its output scanned by built-in problem matchers (cargo, tsc, gcc/clang, python, eslint), the hits sit beside the LSP diagnostics, and a clean rebuild clears them.",
+    summary: "Brackets and quotes now auto-close as you type: the caret lands inside the pair, typing the closer steps over it, a selection gets surrounded, and backspace inside an empty pair removes both — toggleable in the settings gear.",
 }];

@@ -2040,6 +2040,9 @@ pub struct App {
     blame_fetched: Option<PathBuf>,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
+    /// Auto-closing pairs (#121), persisted; synced onto the active editor
+    /// beside the blame flag.
+    auto_close_pairs: bool,
     /// LSP inlay hints (inline type / parameter annotations), on by default
     /// like VS Code's `editor.inlayHints.enabled`; toggled from the palette
     /// and persisted as `disable_inlay_hints` in config.json.
@@ -3537,6 +3540,7 @@ impl App {
             blame_tx,
             blame_fetched: None,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
+            auto_close_pairs: !loaded_prefs.disable_auto_close_pairs,
             inlay_hints_enabled: !loaded_prefs.disable_inlay_hints,
             // Keep the suite off the user's real ~/.config/croft/history: a
             // per-process temp root in test builds, the real dir otherwise.
@@ -5680,6 +5684,7 @@ impl App {
     /// Gated on the pref so a subprocess never runs when blame is off.
     fn sync_blame(&mut self) {
         self.editor.blame_enabled = self.inline_blame_enabled;
+        self.editor.auto_close_pairs = self.auto_close_pairs;
         if !self.inline_blame_enabled {
             return;
         }
@@ -18338,6 +18343,7 @@ impl App {
             ListPurpose::Settings => {
                 match row.id.as_str() {
                     "toggle:format_on_save" => self.toggle_format_on_save(),
+                    "toggle:auto_close_pairs" => self.toggle_auto_close_pairs(),
                     "toggle:auto_save" => self.toggle_auto_save(),
                     "toggle:inline_blame" => self.toggle_inline_blame(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
@@ -18384,6 +18390,10 @@ impl App {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let on_off = |b: bool| if b { "on" } else { "off" };
         let rows = vec![
+            ListRow {
+                id: String::from("toggle:auto_close_pairs"),
+                label: format!("Auto Closing Pairs: {}", on_off(self.auto_close_pairs)),
+            },
             ListRow {
                 id: String::from("toggle:format_on_save"),
                 label: format!("Format on Save: {}", on_off(self.format_on_save)),
@@ -28392,6 +28402,16 @@ impl App {
         if !cfg!(test) {
             let _ = crate::prefs::save_inline_blame(self.inline_blame_enabled);
         }
+    }
+
+    fn toggle_auto_close_pairs(&mut self) {
+        self.auto_close_pairs = !self.auto_close_pairs;
+        self.editor.auto_close_pairs = self.auto_close_pairs;
+        let _ = crate::prefs::save_auto_close_pairs(self.auto_close_pairs);
+        self.status = format!(
+            "Auto Closing Pairs: {}",
+            if self.auto_close_pairs { "on" } else { "off" }
+        );
     }
 
     fn toggle_format_on_save(&mut self) {
