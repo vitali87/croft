@@ -1446,6 +1446,11 @@ pub struct Editor {
     /// closers type over, selections surround, and backspace eats an empty
     /// pair. Synced from the app's persisted preference like `blame_enabled`.
     pub auto_close_pairs: bool,
+    /// The caret position and `edit_seq` recorded by the LAST auto-close
+    /// insertion. Pair-backspace fires only while the caret still sits
+    /// there with no edits since — a pre-existing `()` in the file must
+    /// never lose both sides to one backspace (#122 review).
+    auto_pair_at: Option<(usize, usize, u64)>,
     /// Merge-conflict blocks in the buffer, lazily recomputed whenever
     /// `edit_seq` moves (same pattern as the git-gutter marks).
     conflicts: Vec<crate::merge::ConflictBlock>,
@@ -1777,6 +1782,7 @@ impl Editor {
             git_marks: std::collections::HashMap::new(),
             git_marks_seq: u64::MAX,
             auto_close_pairs: true,
+            auto_pair_at: None,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
             conflicts_seq: u64::MAX,
@@ -3434,6 +3440,9 @@ impl Editor {
     /// word (and a quote never pairs against a preceding word character —
     /// the apostrophe-in-a-word case).
     fn insert_char_with_pairs(&mut self, c: char) -> bool {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
         let close = auto_close_partner(c);
         let has_sel = self.selection.map(|s| s.has_area()).unwrap_or(false);
         // Selection surround: openers and quotes wrap, closers fall through
@@ -3503,6 +3512,7 @@ impl Editor {
         self.cursor_col += 1;
         self.mark_buffer_changed();
         self.recompute_highlights();
+        self.auto_pair_at = Some((self.cursor_row, self.cursor_col, self.edit_seq));
         true
     }
 
@@ -3867,9 +3877,13 @@ impl Editor {
         self.push_undo(EditKind::Backspace);
         // Between an empty auto-close pair, backspace eats both sides —
         // typing `(` then backspace must round-trip to nothing (#121).
+        // ONLY for the pair the last auto-close inserted, still untouched
+        // (position and edit_seq both match): a pre-existing `()` in the
+        // file keeps its closer (#122 review).
         if self.auto_close_pairs
             && !self.selection.map(|s| s.has_area()).unwrap_or(false)
             && self.cursor_col > 0
+            && self.auto_pair_at == Some((self.cursor_row, self.cursor_col, self.edit_seq))
         {
             let line = self.lines.get(self.cursor_row).cloned().unwrap_or_default();
             let prev = line.chars().nth(self.cursor_col - 1);
@@ -18247,6 +18261,28 @@ mod tests {
         assert_eq!(e.lines[0], "()");
         e.backspace();
         assert_eq!(e.lines[0], "", "the empty pair dies together");
+    }
+
+    #[test]
+    fn typing_an_opener_into_a_fresh_empty_buffer_never_panics() {
+        // Editor::new starts with NO lines at all; the pair path indexed
+        // lines[0] and panicked on the first keystroke of an untitled
+        // buffer (#122 review, Critical).
+        let mut e = Editor::new();
+        e.auto_close_pairs = true;
+        e.insert_char('(');
+        assert_eq!(e.lines[0], "()");
+    }
+
+    #[test]
+    fn backspace_keeps_the_closer_of_a_pre_existing_pair() {
+        // Only the pair the last auto-close inserted may die together; a
+        // `()` already in the file keeps its closer (#122 review).
+        let mut e = editor_with("()");
+        e.cursor_row = 0;
+        e.cursor_col = 1;
+        e.backspace();
+        assert_eq!(e.lines[0], ")", "the manual pair loses only one side");
     }
 
     #[test]

@@ -28407,7 +28407,9 @@ impl App {
     fn toggle_auto_close_pairs(&mut self) {
         self.auto_close_pairs = !self.auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
-        let _ = crate::prefs::save_auto_close_pairs(self.auto_close_pairs);
+        if !cfg!(test) {
+            let _ = crate::prefs::save_auto_close_pairs(self.auto_close_pairs);
+        }
         self.status = format!(
             "Auto Closing Pairs: {}",
             if self.auto_close_pairs { "on" } else { "off" }
