@@ -92,6 +92,10 @@ struct ClientState {
     // Begin carries the progress title; Report/End don't, so the title is
     // remembered per progress token to keep the status line meaningful.
     progress_titles: std::collections::HashMap<String, String>,
+    // The folder list this client answers `workspace/workspaceFolders`
+    // with — the same list initialize carried. A server that saw the
+    // workspaceFolders capability may re-query it at any time (LSP 3.6).
+    workspace_folders: Vec<WorkspaceFolder>,
 }
 
 /// Join a work-done progress title with its optional message and percentage
@@ -126,6 +130,7 @@ impl ClientState {
         inlay_refresh: Arc<AtomicBool>,
         diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
         progress_tx: std_mpsc::Sender<ProgressUpdate>,
+        workspace_folders: Vec<WorkspaceFolder>,
     ) -> Router<Self> {
         let mut router = Router::new(ClientState {
             name,
@@ -134,6 +139,7 @@ impl ClientState {
             diagnostics_tx,
             progress_tx,
             progress_titles: std::collections::HashMap::new(),
+            workspace_folders,
         });
         router
             .request::<SemanticTokensRefresh, _>(|this, _params| {
@@ -159,6 +165,14 @@ impl ClientState {
             // streaming `$/progress`. Acknowledge it so the progress flows;
             // declining with METHOD_NOT_FOUND would suppress the indexing UI.
             .request::<WorkDoneProgressCreate, _>(|_this, _params| std::future::ready(Ok(())))
+            // LSP 3.6 `workspace/workspaceFolders`: hand back the same
+            // folder list initialize carried. Declining this (the old
+            // unhandled_request fallback) told folder-aware servers the
+            // list was unavailable and legally degraded them to
+            // single-root behavior.
+            .request::<lsp_types::request::WorkspaceFoldersRequest, _>(|this, _params| {
+                std::future::ready(Ok(Some(this.workspace_folders.clone())))
+            })
             .notification::<Progress>(|this, params| {
                 let ProgressParamsValue::WorkDone(work) = params.value;
                 let key = progress_token_key(&params.token);
@@ -303,6 +317,14 @@ impl LspClient {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "root".to_string());
+        // One folder list serves both initialize and the router's
+        // `workspace/workspaceFolders` responder, so the two can never
+        // disagree about what the client claimed.
+        let workspace_folders = vec![WorkspaceFolder {
+            uri: workspace_uri,
+            name: workspace_name,
+        }];
+        let router_folders = workspace_folders.clone();
 
         let mut command = Command::new(&config.command);
         command.args(&config.args).current_dir(workspace_root);
@@ -344,6 +366,7 @@ impl LspClient {
                     inlay_refresh,
                     diagnostics_tx,
                     progress_tx,
+                    router_folders,
                 ))
         });
 
@@ -379,10 +402,7 @@ impl LspClient {
                 process_id: Some(std::process::id()),
                 capabilities: client_capabilities,
                 initialization_options: config.initialization_options.clone(),
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: workspace_uri,
-                    name: workspace_name,
-                }]),
+                workspace_folders: Some(workspace_folders),
                 ..InitializeParams::default()
             })
             .await
@@ -1003,6 +1023,7 @@ mod tests {
             inlay_flag,
             diag_tx,
             prog_tx,
+            Vec::new(),
         );
         let req: AnyRequest = serde_json::from_value(json!({
             "id": 1,
@@ -1034,6 +1055,7 @@ mod tests {
             flag.clone(),
             diag_tx,
             prog_tx,
+            Vec::new(),
         );
         let req: AnyRequest = serde_json::from_value(json!({
             "id": 1,
@@ -1108,6 +1130,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             diag_tx,
             prog_tx,
+            Vec::new(),
         );
         let notif: AnyNotification = serde_json::from_value(json!({
             "method": "pyright/beginProgress",
@@ -1134,6 +1157,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             diag_tx,
             prog_tx,
+            Vec::new(),
         );
         for method in ["foo/bar", "experimental/dap", "rust-analyzer/serverStatus"] {
             let notif: AnyNotification = serde_json::from_value(json!({
@@ -1146,6 +1170,46 @@ mod tests {
                 "router must absorb the vendor notification {method} instead of killing the mainloop with an Unhandled-notification routing error"
             );
         }
+    }
+
+    #[test]
+    fn workspace_folders_request_is_answered_not_declined() {
+        use async_lsp::AnyRequest;
+        use tower::Service;
+        // LSP 3.6 `workspace/workspaceFolders` is a SERVER->CLIENT request:
+        // a server that saw the workspaceFolders capability may re-query the
+        // folder list at any time. Declining it with MethodNotFound tells a
+        // folder-aware server the list is unavailable and legally degrades
+        // it to single-root behavior.
+        let sem_flag = Arc::new(AtomicBool::new(false));
+        let inlay_flag = Arc::new(AtomicBool::new(false));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut router = ClientState::router(
+            "rust-analyzer".into(),
+            sem_flag,
+            inlay_flag,
+            diag_tx,
+            prog_tx,
+            vec![WorkspaceFolder {
+                uri: Url::from_file_path("/tmp/ws").unwrap(),
+                name: "ws".into(),
+            }],
+        );
+        let req: AnyRequest = serde_json::from_value(json!({
+            "id": 1,
+            "method": "workspace/workspaceFolders",
+            "params": null
+        }))
+        .expect("AnyRequest deserialization");
+        let out = futures::executor::block_on(router.call(req));
+        let value = out
+            .expect("the client must answer workspace/workspaceFolders with its folder list, not decline it");
+        assert_eq!(
+            value,
+            json!([{ "uri": "file:///tmp/ws", "name": "ws" }]),
+            "the reply is the same folder list initialize carried"
+        );
     }
 
     fn server_on_path(cmd: &str) -> bool {
