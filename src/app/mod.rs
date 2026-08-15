@@ -29291,17 +29291,6 @@ impl App {
         }
     }
 
-    /// Re-root the workspace at `new_root`. Resets the file tree, updates
-    /// `workspace_root`, refreshes git status and the source-control
-    /// panel, and respawns the FS watcher off-thread (a recursive stat
-    /// walk on a multi-GB monorepo is the dominant cost - blocking the
-    /// UI thread for it is what froze the app on "Make root"). The
-    /// polling fallback in `drain_fs_events` keeps the tree fresh until
-    /// the watcher comes online via `try_install_pending_init`. Open
-    /// editor tabs are NOT closed - a path that escapes the new root
-    /// still resolves on disk and the user may want to keep it open.
-    /// Compare anchor / clipboard / marks are reset because they point
-    /// into the old workspace.
     /// Add `path` as another workspace root (multi-root, #147): the model
     /// grows, the Explorer gains the section, every root gets a watcher
     /// share, the Cmd+P index and workspace search span the new set, and
@@ -29357,7 +29346,7 @@ impl App {
             .roots
             .iter()
             .skip(1)
-            .map(|r| FsWatch::spawn_sharing(r, &self.tree, shares))
+            .map(|r| FsWatch::spawn_event_only(r, shares))
             .collect();
     }
 
@@ -29404,6 +29393,17 @@ impl App {
         }
     }
 
+    /// Re-root the workspace at `new_root`. Resets the file tree, updates
+    /// `workspace_root`, refreshes git status and the source-control
+    /// panel, and respawns the FS watcher off-thread (a recursive stat
+    /// walk on a multi-GB monorepo is the dominant cost - blocking the
+    /// UI thread for it is what froze the app on "Make root"). The
+    /// polling fallback in `drain_fs_events` keeps the tree fresh until
+    /// the watcher comes online via `try_install_pending_init`. Open
+    /// editor tabs are NOT closed - a path that escapes the new root
+    /// still resolves on disk and the user may want to keep it open.
+    /// Compare anchor / clipboard / marks are reset because they point
+    /// into the old workspace.
     pub fn change_workspace_root(&mut self, new_root: PathBuf) {
         let display = new_root.display().to_string();
         // The remembered task belongs to the old workspace; Rerun Last Task

@@ -1460,6 +1460,45 @@ async fn worker_loop(
                         state.prewarm_root(root.clone()).await;
                     }
                 }
+                // Retire clients whose project root lives under a REMOVED
+                // workspace root and serves no open document (#148 review):
+                // without this, repeated add/remove cycles accumulate live
+                // server processes and workspace-symbol fan-outs keep
+                // querying folders the user closed. A client still serving
+                // an open doc survives — the file became out-of-workspace,
+                // not closed.
+                let removed: Vec<PathBuf> = state
+                    .extra_roots
+                    .iter()
+                    .filter(|old_root| !roots.contains(old_root))
+                    .cloned()
+                    .collect();
+                if !removed.is_empty() {
+                    let doomed: Vec<ClientKey> = state
+                        .clients
+                        .keys()
+                        .filter(|(_, project_root)| {
+                            removed.iter().any(|r| project_root.starts_with(r))
+                                && !state.docs.values().any(|d| &d.project_root == project_root)
+                        })
+                        .cloned()
+                        .collect();
+                    for key in doomed {
+                        if let Some(clients) = state.clients.remove(&key) {
+                            for managed in clients {
+                                let mut client = managed.client.lock().await;
+                                // Graceful LSP shutdown+exit; the transport's
+                                // kill_on_drop reaps a server that ignores it.
+                                let _ = client.shutdown().await;
+                                log_file::log(&format!(
+                                    "lsp retire: {} for removed workspace folder {}",
+                                    managed.name,
+                                    key.1.display()
+                                ));
+                            }
+                        }
+                    }
+                }
                 state.extra_roots = roots;
             }
             Cmd::RequestSemanticTokens {

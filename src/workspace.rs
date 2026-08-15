@@ -97,6 +97,49 @@ impl WorkspaceRoots {
     }
 }
 
+/// Display labels for a root set, disambiguated: the folder name alone
+/// when unique; colliding names gain their parent (`api (work)` vs
+/// `api (archive)`), and a still-colliding pair falls back to the full
+/// path — so Quick Open / search prefixes never render two different
+/// roots identically (#148 review).
+pub fn root_display_labels(roots: &[PathBuf]) -> Vec<String> {
+    let names: Vec<String> = roots
+        .iter()
+        .map(|r| {
+            r.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| r.display().to_string())
+        })
+        .collect();
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if names.iter().filter(|n| *n == name).count() == 1 {
+                return name.clone();
+            }
+            let with_parent = |idx: usize| {
+                roots[idx]
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .map(|s| format!("{} ({})", names[idx], s.to_string_lossy()))
+            };
+            let mine = with_parent(i);
+            let unique = mine.as_ref().is_some_and(|label| {
+                names
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, n)| *j != i && *n == name)
+                    .all(|(j, _)| with_parent(j).as_ref() != Some(label))
+            });
+            match mine {
+                Some(label) if unique => label,
+                _ => roots[i].display().to_string(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +191,26 @@ mod tests {
         assert!(ws.remove(Path::new("/w/b")), "a secondary root removes");
         assert!(!ws.is_multi());
         assert_eq!(ws.primary(), Path::new("/w/a"));
+    }
+
+    #[test]
+    fn root_labels_disambiguate_same_named_folders() {
+        let roots = vec![
+            PathBuf::from("/work/api"),
+            PathBuf::from("/archive/api"),
+            PathBuf::from("/work/web"),
+        ];
+        assert_eq!(
+            root_display_labels(&roots),
+            vec!["api (work)", "api (archive)", "web"],
+            "colliding folder names gain their parent; unique ones stay bare"
+        );
+        let twins = vec![PathBuf::from("/x/api"), PathBuf::from("/y/x/api")];
+        let labels = root_display_labels(&twins);
+        assert_ne!(
+            labels[0], labels[1],
+            "labels are never identical: {labels:?}"
+        );
     }
 
     #[test]

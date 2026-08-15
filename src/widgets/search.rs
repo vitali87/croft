@@ -2070,10 +2070,9 @@ impl Widget for &mut SearchPanel {
                         .max_by_key(|r| r.components().count());
                     match owner {
                         Some(r) if self.roots.len() > 1 => {
-                            let name = r
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default();
+                            let idx = self.roots.iter().position(|x| x == r).unwrap_or(0);
+                            let name =
+                                crate::workspace::root_display_labels(&self.roots).swap_remove(idx);
                             format!(
                                 "{name}/{}",
                                 hit.path

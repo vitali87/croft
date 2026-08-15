@@ -95,6 +95,25 @@ impl FsWatch {
         }
     }
 
+    /// A SECONDARY root's watcher (#147): events only. The PRIMARY
+    /// instance owns the adaptive poll for the whole tree — its dir-mtime
+    /// snapshot walks every root's expanded rows, covering secondary
+    /// roots wherever their events fall past the caps — so an extra
+    /// instance snapshotting the tree again would only duplicate stat
+    /// work if its `poll` were ever called (#148 review).
+    pub fn spawn_event_only(root: &Path, shares: usize) -> Self {
+        Self {
+            _watcher: None,
+            rx: None,
+            init_rx: Some(Self::start_watcher_thread(root, shares)),
+            poll_last_check: Instant::now(),
+            poll_interval: FS_POLL_INTERVAL,
+            poll_dir_mtimes: BTreeMap::new(),
+            poll_open_files: BTreeMap::new(),
+            watch_root: root.to_path_buf(),
+        }
+    }
+
     pub fn rebind(&mut self, root: &Path, tree: &FileTree) {
         self.rebind_sharing(root, tree, 1)
     }
@@ -397,6 +416,14 @@ impl FsWatch {
             // coverage instead of nothing.
             const MAX_WATCHES: usize = 50_000;
             let max_watches = MAX_WATCHES / shares.max(1);
+            // A zero share (pathologically many roots) installs NOTHING:
+            // the loop below tests the cap only after a watch call, so
+            // entering it would grant every instance one descriptor past
+            // the shared budget (#148 review). The adaptive poll is the
+            // floor, exactly as for a boundary dir.
+            if max_watches == 0 {
+                return Ok((debouncer, rx));
+            }
             let mut stack = vec![root.to_path_buf()];
             let mut watched = 0usize;
             while let Some(dir) = stack.pop() {

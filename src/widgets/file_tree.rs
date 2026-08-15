@@ -175,7 +175,10 @@ impl FileTree {
             .map(|off| start + 1 + off)
             .unwrap_or(self.nodes.len());
         self.nodes.drain(start..end);
-        self.marked.retain(|p| !p.starts_with(path));
+        // Prune marks by VISIBILITY, not path prefix: a nested workspace
+        // root keeps its own depth-0 section when an ancestor root is
+        // removed, and its rows' marks must survive (#148 review).
+        self.prune_marks();
         self.selected = self.selected.min(self.nodes.len().saturating_sub(1));
         self.anchor = self.anchor.min(self.nodes.len().saturating_sub(1));
         self.scroll = self.scroll.min(self.nodes.len().saturating_sub(1));
@@ -1738,6 +1741,34 @@ mod tests {
         assert!(
             !tree.remove_root(second.path()),
             "removing again is a no-op"
+        );
+    }
+
+    #[test]
+    fn removing_an_ancestor_root_keeps_marks_in_a_surviving_nested_root_section() {
+        // A nested workspace root stays its own depth-0 section when its
+        // ancestor root is removed; pruning marks by path prefix wrongly
+        // swept the survivor's marks too (#148 review).
+        let (_tmp, second, mut tree) = two_root_fixture();
+        let nested = second.path().join("lib");
+        tree.add_root(nested.clone());
+        let util_idx = tree
+            .nodes
+            .iter()
+            .rposition(|n| n.path.ends_with("util.rs"))
+            .expect("the nested section lists its file");
+        tree.toggle_mark(util_idx);
+        let marked_path = tree.nodes[util_idx].path.clone();
+
+        assert!(tree.remove_root(second.path()));
+
+        assert!(
+            tree.root_paths().any(|r| r == nested),
+            "the nested root's own section survives"
+        );
+        assert!(
+            tree.marked.contains(&marked_path),
+            "the surviving section's marks survive with it"
         );
     }
 
