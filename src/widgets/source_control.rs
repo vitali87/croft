@@ -1638,6 +1638,7 @@ mod tests {
             head_oid: None,
             ignored: std::sync::Arc::default(),
             dirty: false,
+            repo_root: None,
         }
     }
 

@@ -5676,8 +5676,24 @@ impl App {
     /// without the cache one tick would shell out once per tab per group.
     /// ponytail: synchronous fetch on the tick. Move to the git worker thread
     /// if opening a file in a huge repo ever visibly hitches.
+    /// The repository toplevel owning the workspace, from the git worker's
+    /// last status reply — the only correct base for porcelain-derived
+    /// paths and `HEAD:<rel>` pathspecs, which git resolves against the
+    /// toplevel however `-C` is set (#139). Identical to the workspace
+    /// root whenever that root IS the toplevel; falls back to it outside
+    /// a repo (where the ops fail with their own message) and before the
+    /// first status reply lands.
+    fn scm_root(&self) -> PathBuf {
+        self.git
+            .status()
+            .repo_root
+            .clone()
+            .unwrap_or_else(|| self.tree.root.clone())
+    }
+
     fn sync_git_gutters(&mut self) {
-        let root = self.tree.root.clone();
+        // `HEAD:<rel>` pathspecs resolve against the toplevel (#139).
+        let root = self.scm_root();
         let mut fetched: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
             std::collections::HashMap::new();
         let groups =
@@ -16229,7 +16245,10 @@ impl App {
             return;
         };
         self.source_control.selected_change = Some(entry_idx);
-        let abs = self.tree.root.join(&entry.path);
+        // Porcelain paths are toplevel-relative (#139): join and HEAD-read
+        // against the repo root, never the workspace root.
+        let scm_root = self.scm_root();
+        let abs = scm_root.join(&entry.path);
         let opened = match entry.kind {
             // A conflicted entry opens the WORKING file — a HEAD diff is
             // meaningless against a marker-filled tree — parked on the first
@@ -16257,7 +16276,7 @@ impl App {
                 }
             },
             ChangeKind::Modified | ChangeKind::StagedModified => {
-                match crate::git::read_file_at_head(&self.tree.root, &entry.path) {
+                match crate::git::read_file_at_head(&scm_root, &entry.path) {
                     Ok(head_text) => {
                         let label = std::path::PathBuf::from(format!("{} (HEAD)", entry.path));
                         match self
@@ -16288,7 +16307,7 @@ impl App {
                 // blob as a one-sided unified diff so every removed
                 // line is visible in red, matching `git diff` output
                 // for a deletion.
-                match crate::git::read_file_at_head(&self.tree.root, &entry.path) {
+                match crate::git::read_file_at_head(&scm_root, &entry.path) {
                     Ok(head_text) => {
                         let label = std::path::PathBuf::from(&entry.path);
                         match self.editor.open_deleted_diff_with_text(&label, &head_text) {
@@ -16390,7 +16409,7 @@ impl App {
             self.status = String::from("Selection is already staged");
             return;
         }
-        match crate::git::stage_paths(&self.tree.root, &paths) {
+        match crate::git::stage_paths(&self.scm_root(), &paths) {
             Ok(()) => {
                 self.status = if paths.len() == 1 {
                     format!("Staged {}", paths[0])
@@ -16539,7 +16558,7 @@ impl App {
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
         };
-        match crate::git::unstage_path(&self.tree.root, &entry.path) {
+        match crate::git::unstage_path(&self.scm_root(), &entry.path) {
             Ok(()) => {
                 self.status = format!("Unstaged {}", entry.path);
                 self.git.bypass_debounce();
@@ -16600,12 +16619,12 @@ impl App {
     }
 
     pub fn stage_all_source_control(&mut self) {
-        let r = crate::git::stage_all(&self.tree.root);
+        let r = crate::git::stage_all(&self.scm_root());
         self.run_scm_op("add -A", r, "Staged all");
     }
 
     pub fn unstage_all_source_control(&mut self) {
-        let r = crate::git::unstage_all(&self.tree.root);
+        let r = crate::git::unstage_all(&self.scm_root());
         self.run_scm_op("reset HEAD", r, "Unstaged all");
     }
 
@@ -16624,7 +16643,7 @@ impl App {
             return;
         }
         self.pending_discard_all = false;
-        let r = crate::git::discard_all_tracked(&self.tree.root);
+        let r = crate::git::discard_all_tracked(&self.scm_root());
         self.run_scm_op("checkout -- .", r, "Discarded all changes");
     }
 
@@ -16655,7 +16674,7 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        if let Err(err) = crate::git::stage_all(&self.tree.root) {
+        if let Err(err) = crate::git::stage_all(&self.scm_root()) {
             self.run_scm_op("add -A", Err(err), "Stage all");
             return;
         }
@@ -18954,7 +18973,7 @@ impl App {
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
         };
-        match crate::git::stage_path(&self.tree.root, &entry.path) {
+        match crate::git::stage_path(&self.scm_root(), &entry.path) {
             Ok(()) => {
                 self.status = format!("Staged {}", entry.path);
                 self.git.bypass_debounce();
@@ -19007,7 +19026,7 @@ impl App {
         let Some((rel, patch)) = self.diff_hunk_patch_at_caret() else {
             return;
         };
-        match crate::git::apply_patch(&self.tree.root, &patch, true, false) {
+        match crate::git::apply_patch(&self.scm_root(), &patch, true, false) {
             Ok(_) => {
                 self.status = format!("Staged hunk in {rel}");
                 self.refresh_after_hunk_op();
@@ -19023,7 +19042,7 @@ impl App {
         let Some((rel, patch)) = self.diff_hunk_patch_at_caret() else {
             return;
         };
-        match crate::git::apply_patch(&self.tree.root, &patch, true, true) {
+        match crate::git::apply_patch(&self.scm_root(), &patch, true, true) {
             Ok(_) => {
                 self.status = format!("Unstaged hunk in {rel}");
                 self.refresh_after_hunk_op();
@@ -19043,7 +19062,7 @@ impl App {
         let Some(pr) = self.pending_revert_hunk.take() else {
             return;
         };
-        match crate::git::apply_patch(&self.tree.root, &pr.patch, false, true) {
+        match crate::git::apply_patch(&self.scm_root(), &pr.patch, false, true) {
             Ok(_) => {
                 self.status = format!("Reverted hunk in {}", pr.rel_path);
                 self.refresh_after_hunk_op();
@@ -19068,7 +19087,7 @@ impl App {
     /// unstage don't touch either side of the displayed diff, so only the
     /// revert path needs this.
     fn rebuild_open_scm_diff(&mut self, rel: &str) {
-        let root = self.tree.root.clone();
+        let root = self.scm_root();
         let (label, path, scroll) = {
             let Some(diff) = self.editor.diff.as_ref() else {
                 return;
@@ -19106,7 +19125,7 @@ impl App {
         let Some(pd) = self.pending_discard.take() else {
             return;
         };
-        match crate::git::discard_path(&self.tree.root, &pd.rel_path, pd.untracked) {
+        match crate::git::discard_path(&self.scm_root(), &pd.rel_path, pd.untracked) {
             Ok(()) => {
                 self.status = format!("Discarded {}", pd.rel_path);
                 self.git.bypass_debounce();
@@ -30875,10 +30894,16 @@ impl App {
     /// via `DiffData::jump_target`, then reuses the explorer's pinned-tab
     /// open so the diff tab is left intact beside the opened file.
     fn jump_to_diff_file_under_caret(&mut self) {
-        let root = self.tree.root.clone();
         let target = {
             let Some(diff) = self.editor.diff.as_ref() else {
                 return;
+            };
+            // A git-produced diff carries toplevel-relative `+++ b/` paths
+            // (#139); croft's own snapshot diffs stay workspace-anchored.
+            let root = if diff.left_is_git_head {
+                self.scm_root()
+            } else {
+                self.tree.root.clone()
             };
             let row = diff.caret_row().unwrap_or(diff.scroll);
             diff.jump_target(row, &root)
