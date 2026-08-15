@@ -2198,6 +2198,9 @@ pub struct App {
     /// change re-seeds the panel from that worker and re-requests its
     /// change list.
     active_scm_root: PathBuf,
+    /// The workspace root the Testing panel and worker are bound to —
+    /// follows the focused file's folder like the SCM surfaces (#151).
+    active_test_root: PathBuf,
     /// Per-workspace-root last-seen HEAD oid, for gutter-baseline and
     /// commit-graph invalidation per repository (#149).
     git_head_oids: std::collections::BTreeMap<PathBuf, Option<String>>,
@@ -3669,6 +3672,7 @@ impl App {
             fs_watch_extra: Vec::new(),
             git_extra: Vec::new(),
             active_scm_root: root.clone(),
+            active_test_root: root.clone(),
             git_head_oids: std::collections::BTreeMap::new(),
             git,
             cursor_blink: CursorBlink::new(),
@@ -5239,9 +5243,12 @@ impl App {
         // focused file (#149): on a switch, seed the panel from that
         // worker's cached status and re-request its change list — the
         // non-active workers' lists are discarded at their drains below.
-        let active = self.active_scm_workspace_root();
+        let active = self.active_workspace_root();
         if active != self.active_scm_root {
-            self.seed_active_scm(active);
+            self.seed_active_scm(active.clone());
+        }
+        if active != self.active_test_root {
+            self.rebind_test_root(active);
         }
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
@@ -5814,9 +5821,10 @@ impl App {
             .unwrap_or(ws)
     }
 
-    /// The workspace root whose repository the SCM surfaces follow: the
-    /// root owning the focused editor's file, else the primary (#149).
-    fn active_scm_workspace_root(&self) -> PathBuf {
+    /// The workspace root the focus-following surfaces resolve against:
+    /// the root owning the focused editor's file, else the primary
+    /// (#149 git, #151 testing/tasks/run).
+    fn active_workspace_root(&self) -> PathBuf {
         self.editor
             .path
             .as_deref()
@@ -15026,11 +15034,26 @@ impl App {
     /// runner still ran (and rebuilt) the workspace, and a disabled Python
     /// runner ran cargo in a directory with no Cargo.toml.
     fn testing_runner_available(&mut self) -> bool {
-        if crate::testing::worker::runner_for(&self.tree.root).is_some() {
+        if crate::testing::worker::runner_for(&self.active_test_root).is_some() {
             return true;
         }
         self.status = String::from(crate::testing::NO_RUNNER_STATUS);
         false
+    }
+
+    /// Rebind the Testing stack to `root` — the focused file's workspace
+    /// folder (#151). Exactly the re-root rebind: the worker's epoch drops
+    /// in-flight results for the old root, the panel resets (its tree
+    /// described another project), a pending debug build is dropped, and
+    /// the front-of-view panel re-discovers immediately.
+    fn rebind_test_root(&mut self, root: PathBuf) {
+        self.active_test_root = root.clone();
+        self.test_worker.set_root(root);
+        self.testing.reset();
+        self.pending_test_debug = None;
+        if self.sidebar_view == SidebarView::Testing {
+            self.discover_tests();
+        }
     }
 
     /// Kick off a full test run on the worker (no-op if a run/discovery is
@@ -15059,7 +15082,7 @@ impl App {
     /// a whole-workspace walk, so it runs on a background thread and the jump
     /// lands via the drain in [`Self::sync_explorer_panels`].
     fn jump_to_test_source(&mut self, name: String) {
-        let root = self.workspace_root().to_path_buf();
+        let root = self.active_test_root.clone();
         let tx = self.test_jump_tx.clone();
         self.status = format!("Locating test {name}");
         std::thread::spawn(move || {
@@ -15299,7 +15322,9 @@ impl App {
     /// error with no manifest, and `cargo test -- --list` compiles the test
     /// binary so we never auto-fire it per-keystroke.
     fn discover_tests(&mut self) {
-        if self.testing.is_busy() || crate::testing::worker::runner_for(&self.tree.root).is_none() {
+        if self.testing.is_busy()
+            || crate::testing::worker::runner_for(&self.active_test_root).is_none()
+        {
             return;
         }
         self.test_worker.discover();
@@ -15330,7 +15355,14 @@ impl App {
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if Self::run_spec_for(p, self.workspace_root()).is_some() {
+                if Self::run_spec_for(
+                    p,
+                    self.roots
+                        .owning_root(p)
+                        .unwrap_or_else(|| self.roots.primary()),
+                )
+                .is_some()
+                {
                     (true, false)
                 } else if crate::dap::registry::adapter_for_extension(&ext).is_some() {
                     (true, true)
@@ -15955,10 +15987,15 @@ impl App {
             .collect();
         let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
         let py_str = py.to_string_lossy().into_owned();
+        let debug_root = self
+            .roots
+            .owning_root(&path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
         match crate::dap::session::DapSession::launch(
             &py_str,
             &adapter_args,
-            self.workspace_root(),
+            &debug_root,
             &path,
             &py,
             breakpoints,
@@ -16008,10 +16045,15 @@ impl App {
             .iter()
             .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
             .collect();
+        let debug_root = self
+            .roots
+            .owning_root(path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
         match crate::dap::session::DapSession::launch_js(
             &node,
             &server,
-            self.workspace_root(),
+            &debug_root,
             path,
             breakpoints,
             false,
@@ -16432,7 +16474,12 @@ impl App {
             self.run_debug.feedback_is_error = true;
             return;
         };
-        let Some(spec) = Self::run_spec_for(&path, self.workspace_root()) else {
+        let run_root = self
+            .roots
+            .owning_root(&path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        let Some(spec) = Self::run_spec_for(&path, &run_root) else {
             self.run_debug.feedback = Some(format!(
                 "Don't know how to run {}",
                 path.file_name()
@@ -18934,7 +18981,7 @@ impl App {
     /// Tasks: Run Task — discover the workspace's tasks and open the
     /// picker over them.
     pub fn open_run_task_picker(&mut self) {
-        self.run_tasks = crate::tasks::discover_tasks(self.workspace_root());
+        self.run_tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
         let rows: Vec<crate::widgets::list_picker::ListRow> = self
             .run_tasks
             .iter()
@@ -18968,10 +19015,8 @@ impl App {
         // workspace: after a re-root the old pane's label still matches,
         // and running the new project's build there builds the old one.
         // An unknown cwd (android, remote) keeps today's reuse.
-        let root = self
-            .workspace_root()
-            .canonicalize()
-            .unwrap_or_else(|_| self.workspace_root().to_path_buf());
+        let active = self.active_workspace_root();
+        let root = active.canonicalize().unwrap_or(active);
         if let Some(idx) = self.terminals.iter().position(|t| {
             t.label() == pane_name
                 && t.foreground_is_shell()
@@ -18985,7 +19030,7 @@ impl App {
             self.status = format!("Running {}", task.label);
             return;
         }
-        match crate::widgets::terminal::PtyTerminal::new(self.workspace_root()) {
+        match crate::widgets::terminal::PtyTerminal::new(&self.active_workspace_root()) {
             Ok(mut term) => {
                 term.set_manual_name(Some(pane_name));
                 term.write_input(command.as_bytes());
@@ -19002,7 +19047,7 @@ impl App {
     /// for whatever the workspace is; fall back to the picker when no
     /// manifest declares one.
     pub fn run_build_task(&mut self) {
-        let tasks = crate::tasks::discover_tasks(self.workspace_root());
+        let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
         match crate::tasks::default_build_task(&tasks).cloned() {
             Some(task) => self.run_project_task(task),
             None => {
@@ -29695,6 +29740,7 @@ impl App {
         // by the drain's epoch tag (same idea as the commit graph's root tag).
         // With the Testing view in front, re-discover right away; otherwise the
         // now-empty panel discovers on its next open.
+        self.active_test_root = new_root.clone();
         self.test_worker.set_root(new_root.clone());
         self.testing.reset();
         // Drop any in-flight `cargo test --no-run`: the drain would refuse

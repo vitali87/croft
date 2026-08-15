@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Each workspace folder now has its own git awareness: the status-bar branch, Source Control panel, commits graph, gutter, blame, and timeline follow the repository of the file you are focused on, the Explorer dims git-ignored files across every folder, and repo operations address the right repository automatically.",
+    summary: "The test runner, tasks, and run/debug now follow the file you are focused on across workspace folders: the Testing panel rebinds to that folder's project, Tasks and the default build offer that folder's manifests and run in it, and run-active-file / debugging launch with the right working directory and Python environment.",
 }];

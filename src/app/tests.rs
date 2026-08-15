@@ -20775,6 +20775,87 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
 }
 
 #[test]
+fn focusing_a_secondary_roots_file_rebinds_the_test_runner_and_tasks() {
+    // #151: the runner gate and the worker resolved against the primary
+    // only — from a secondary folder's file, Run All refused with "no
+    // test runner" even when that folder is a cargo project.
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("plain");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir(&plain).unwrap();
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    std::fs::write(
+        proj.join("Cargo.toml"),
+        "[package]\nname = \"proj\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("src/main.rs"),
+        "fn main() {}\n#[test]\nfn proj_truth() {}\n",
+    )
+    .unwrap();
+    std::fs::write(proj.join("Makefile"), "build:\n\techo hi\n").unwrap();
+
+    let mut app = App::new(plain.clone()).unwrap();
+    app.add_workspace_folder(proj.clone());
+    let proj_canon = proj.canonicalize().unwrap();
+
+    // Primary focused: no runner, the gate refuses.
+    app.status.clear();
+    app.run_all_tests();
+    assert_eq!(app.status, crate::testing::NO_RUNNER_STATUS);
+
+    // Focus the cargo project's file: the follow tick rebinds the
+    // Testing stack and the gate passes.
+    app.editor
+        .open_pinned(&proj_canon.join("src/main.rs"))
+        .unwrap();
+    let _ = app.drain_git_responses();
+    assert_eq!(
+        app.active_test_root, proj_canon,
+        "the Testing stack follows"
+    );
+    app.status.clear();
+    app.run_all_tests();
+    assert_ne!(
+        app.status,
+        crate::testing::NO_RUNNER_STATUS,
+        "the secondary folder's cargo runner is found"
+    );
+
+    // The open-Testing-view path discovers against the active folder:
+    // this is the exact live sequence, and the discovery gate had its own
+    // primary-root check the entry-point gates didn't cover.
+    app.open_testing_view();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let _ = app.test_worker.drain(&mut app.testing);
+        if app
+            .testing
+            .cases_for_test()
+            .iter()
+            .any(|(name, _)| name.contains("proj_truth"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "discovery never returned the secondary project's tests; cases: {:?}",
+            app.testing.cases_for_test()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Tasks discover against the active folder too.
+    let tasks = crate::tasks::discover_tasks(&app.active_workspace_root());
+    assert!(
+        tasks.iter().any(|t| t.command.contains("make")),
+        "the secondary folder's Makefile tasks are offered: {:?}",
+        tasks.iter().map(|t| t.command.clone()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn focusing_a_secondary_roots_file_flips_source_control_to_its_repo() {
     // #149: git state was singular (one worker at the primary), so a
     // secondary root's repository was invisible — no branch, no panel
