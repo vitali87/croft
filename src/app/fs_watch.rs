@@ -66,26 +66,65 @@ pub struct FsWatch {
     /// not move its parent dir's mtime, so this stat is the only thing that can
     /// see it change. Bounded by the number of open tabs, once per poll tick.
     poll_open_files: BTreeMap<PathBuf, Option<(SystemTime, u64)>>,
+    /// The root this instance watches. Multi-root workspaces (#147) run
+    /// one `FsWatch` per workspace root, and `drain` must attribute each
+    /// event against ITS root — attributing against the shared tree's
+    /// primary root silently dropped every event from a secondary root.
+    watch_root: PathBuf,
 }
 
 impl FsWatch {
     pub fn spawn(root: &Path, tree: &FileTree) -> Self {
+        Self::spawn_sharing(root, tree, 1)
+    }
+
+    /// [`spawn`] with the per-OS watch caps divided by `shares` — the
+    /// number of workspace roots (#147). The caps exist to bound kernel
+    /// watch descriptors and stream setup per PROCESS, so N concurrent
+    /// instances must split one budget rather than multiply it.
+    pub fn spawn_sharing(root: &Path, tree: &FileTree, shares: usize) -> Self {
         Self {
             _watcher: None,
             rx: None,
-            init_rx: Some(Self::start_watcher_thread(root)),
+            init_rx: Some(Self::start_watcher_thread(root, shares)),
             poll_last_check: Instant::now(),
             poll_interval: FS_POLL_INTERVAL,
             poll_dir_mtimes: Self::snapshot_expanded_dir_mtimes(tree),
             poll_open_files: BTreeMap::new(),
+            watch_root: root.to_path_buf(),
+        }
+    }
+
+    /// A SECONDARY root's watcher (#147): events only. The PRIMARY
+    /// instance owns the adaptive poll for the whole tree — its dir-mtime
+    /// snapshot walks every root's expanded rows, covering secondary
+    /// roots wherever their events fall past the caps — so an extra
+    /// instance snapshotting the tree again would only duplicate stat
+    /// work if its `poll` were ever called (#148 review).
+    pub fn spawn_event_only(root: &Path, shares: usize) -> Self {
+        Self {
+            _watcher: None,
+            rx: None,
+            init_rx: Some(Self::start_watcher_thread(root, shares)),
+            poll_last_check: Instant::now(),
+            poll_interval: FS_POLL_INTERVAL,
+            poll_dir_mtimes: BTreeMap::new(),
+            poll_open_files: BTreeMap::new(),
+            watch_root: root.to_path_buf(),
         }
     }
 
     pub fn rebind(&mut self, root: &Path, tree: &FileTree) {
+        self.rebind_sharing(root, tree, 1)
+    }
+
+    /// [`rebind`] with the shared-budget divisor, like [`spawn_sharing`].
+    pub fn rebind_sharing(&mut self, root: &Path, tree: &FileTree, shares: usize) {
         offload_drop(self._watcher.take());
         self.rx = None;
-        self.init_rx = Some(Self::start_watcher_thread(root));
+        self.init_rx = Some(Self::start_watcher_thread(root, shares));
         self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
+        self.watch_root = root.to_path_buf();
     }
 
     pub fn disable(&mut self) {
@@ -142,13 +181,13 @@ impl FsWatch {
                     if mutates_content && editor.matches_open_path(path) {
                         out.touched_open_file = true;
                     }
-                    if let Some(dir) = affected_dir_for_event(path, &tree.root) {
+                    if let Some(dir) = affected_dir_for_event(path, &self.watch_root) {
                         affected.insert(dir);
-                    } else if path == &tree.root
+                    } else if path == &self.watch_root
                         || path.canonicalize().ok().as_deref()
-                            == tree.root.canonicalize().ok().as_deref()
+                            == self.watch_root.canonicalize().ok().as_deref()
                     {
-                        affected.insert(tree.root.clone());
+                        affected.insert(self.watch_root.clone());
                     }
                 }
             }
@@ -252,18 +291,23 @@ impl FsWatch {
         Some((modified, meta.len()))
     }
 
-    fn start_watcher_thread(root: &Path) -> Receiver<FsWatcherInit> {
+    fn start_watcher_thread(root: &Path, shares: usize) -> Receiver<FsWatcherInit> {
         let (init_tx, init_rx) = std::sync::mpsc::channel();
         let root = root.to_path_buf();
         std::thread::spawn(move || {
-            if let Ok(pair) = Self::spawn_watcher(&root) {
+            if let Ok(pair) = Self::spawn_watcher_sharing(&root, shares) {
                 let _ = init_tx.send(pair);
             }
         });
         init_rx
     }
 
+    #[cfg(test)]
     pub(super) fn spawn_watcher(root: &Path) -> Result<FsWatcherInit> {
+        Self::spawn_watcher_sharing(root, 1)
+    }
+
+    pub(super) fn spawn_watcher_sharing(root: &Path, shares: usize) -> Result<FsWatcherInit> {
         use notify::RecursiveMode;
         use notify_debouncer_full::new_debouncer;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -329,7 +373,7 @@ impl FsWatch {
             // repo is far under this, so its behaviour is unchanged; a tree that
             // exceeds it gets watches on the subtrees discovered before the cap
             // and the adaptive poll covers the rest.
-            let mut budget = WATCH_WALK_DIR_BUDGET;
+            let mut budget = WATCH_WALK_DIR_BUDGET / shares.max(1);
             if collect_macos_watch_targets(root, &mut targets, &mut budget) {
                 // Whole tree is noise-free (e.g. a small repo with no
                 // node_modules): one recursive watch covers it in a single
@@ -341,9 +385,10 @@ impl FsWatch {
             // the adaptive-backoff poll fallback cover the rest, rather than
             // spending forever in FSEventStreamCreate.
             const MAX_WATCHES: usize = 2_000;
-            if targets.len() > MAX_WATCHES {
+            let max_watches = MAX_WATCHES / shares.max(1);
+            if targets.len() > max_watches {
                 targets.sort_by_key(|(p, _)| p.components().count());
-                targets.truncate(MAX_WATCHES);
+                targets.truncate(max_watches);
             }
             // An empty target list here means `collect` returned `false`: the
             // root is a boundary that contains noise but has no noise-free
@@ -370,13 +415,22 @@ impl FsWatch {
             // a tree that still exceeds the limit installs with partial
             // coverage instead of nothing.
             const MAX_WATCHES: usize = 50_000;
+            let max_watches = MAX_WATCHES / shares.max(1);
+            // A zero share (pathologically many roots) installs NOTHING:
+            // the loop below tests the cap only after a watch call, so
+            // entering it would grant every instance one descriptor past
+            // the shared budget (#148 review). The adaptive poll is the
+            // floor, exactly as for a boundary dir.
+            if max_watches == 0 {
+                return Ok((debouncer, rx));
+            }
             let mut stack = vec![root.to_path_buf()];
             let mut watched = 0usize;
             while let Some(dir) = stack.pop() {
                 if debouncer.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
                     watched += 1;
                 }
-                if watched >= MAX_WATCHES {
+                if watched >= max_watches {
                     break;
                 }
                 let Ok(rd) = std::fs::read_dir(&dir) else {

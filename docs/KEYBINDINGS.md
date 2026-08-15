@@ -77,6 +77,8 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | Command Palette: `Editor: Toggle Bracket Pair Colorization` | Colour brackets by nesting depth, unmatched closers in red; strings and comments keep plain brackets (on by default, persisted, also in Settings) |
 | Command Palette: `View: Toggle Render Whitespace` | Cycle whitespace glyphs (`·` spaces, `→` tabs): selection (default — only inside selected text) → all → none; persisted, also in Settings |
 | Command Palette: `Debug: Toggle Inline Values` | While stopped, lines that mention a local — from the paused function's header through the stop — trail its current value (`name = value`), refreshed per stop and cleared on resume (on by default, persisted, also in Settings) |
+| Command Palette: `Workspaces: Add Folder to Workspace` | Open the fuzzy directory picker and add the chosen folder as another workspace root: the Explorer shows it as a section, Quick Open / search span it with folder-name prefixes, and its language servers start per folder. Also on any root row's context menu |
+| Command Palette: `Workspaces: Remove Folder from Workspace` | Drop the Explorer-selected secondary root folder from the workspace (the primary is the launch identity — use Make Root to change it). Also on a secondary root row's context menu |
 | Mouse wheel | Scroll the pane under the pointer |
 
 ### Customize Layout

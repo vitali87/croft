@@ -19,7 +19,16 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub rel: String,
     pub rel_lower: String,
+    /// Byte offset of the filename within `rel` (rendering's dir/file
+    /// split). `rel_lower` gets its own offset below: lowercasing can
+    /// change a component's byte length (e.g. `İ` → `i̇`), so one offset
+    /// cannot index both strings.
     pub filename_start: usize,
+    /// Byte offset of the filename within `rel_lower` — the scoring
+    /// string. Slicing `rel_lower` with the `rel` offset panicked on a
+    /// non-boundary whenever an earlier component's lowercase changed
+    /// byte length (#148 review).
+    pub filename_start_lower: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -206,7 +215,7 @@ impl FileFinder {
                 || BinaryHeap::<RankedSlot>::with_capacity(MAX_RESULTS + 1),
                 |mut heap, (idx, entry)| {
                     if let Some((tier, score)) =
-                        score_entry(&needle, &entry.rel_lower, entry.filename_start)
+                        score_entry(&needle, &entry.rel_lower, entry.filename_start_lower)
                     {
                         push_topk(
                             &mut heap,
@@ -516,6 +525,34 @@ pub fn build_file_index(root: &Path) -> Vec<FileEntry> {
     build_file_index_with_blocked(root, macos_blocked_paths())
 }
 
+/// The Quick Open index over EVERY workspace root (#147). One root is the
+/// plain per-root index; with more, each root's entries carry a
+/// `<root-name>/` prefix on `rel` — the VS Code multi-root label rule — so
+/// same-named files in different roots stay distinguishable and ranking
+/// never mixes two projects' bare paths. `filename_start` shifts with the
+/// prefix, keeping the filename-tier scoring anchored on the filename.
+pub fn build_multi_file_index(roots: &[PathBuf]) -> Vec<FileEntry> {
+    if roots.len() == 1 {
+        return build_file_index(&roots[0]);
+    }
+    let labels = crate::workspace::root_display_labels(roots);
+    let mut out = Vec::new();
+    for (root, label) in roots.iter().zip(&labels) {
+        let prefix = format!("{label}/");
+        for mut e in build_file_index(root) {
+            e.rel = format!("{prefix}{}", e.rel);
+            // Recompute BOTH offsets from the final strings: hand-shifting
+            // by prefix.len() poisoned rel_lower's offset whenever the
+            // label's lowercase changed byte length (#148 review).
+            e.rel_lower = e.rel.to_lowercase();
+            e.filename_start = e.rel.rfind('/').map(|i| i + 1).unwrap_or(0);
+            e.filename_start_lower = e.rel_lower.rfind('/').map(|i| i + 1).unwrap_or(0);
+            out.push(e);
+        }
+    }
+    out
+}
+
 /// [`build_file_index`] with the blocked-path set injected, so tests drive
 /// the macOS exclusion rules against a fake home without mutating `$HOME`.
 fn build_file_index_with_blocked(root: &Path, blocked: Vec<PathBuf>) -> Vec<FileEntry> {
@@ -568,12 +605,14 @@ fn build_file_index_with_blocked(root: &Path, blocked: Vec<PathBuf>) -> Vec<File
             }
             let rel_lower = rel.to_lowercase();
             let filename_start = rel.rfind('/').map(|i| i + 1).unwrap_or(0);
+            let filename_start_lower = rel_lower.rfind('/').map(|i| i + 1).unwrap_or(0);
             if let Ok(mut g) = collected.lock() {
                 g.push(FileEntry {
                     path,
                     rel,
                     rel_lower,
                     filename_start,
+                    filename_start_lower,
                 });
             }
             WalkState::Continue
@@ -773,14 +812,117 @@ fn split_dir_file(rel: &str, filename_start: usize) -> (&str, &str) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn multi_root_index_survives_root_names_whose_lowercase_changes_byte_length() {
+        // `İ` (U+0130) lowercases to `i` + U+0307 — one byte LONGER — so a
+        // hand-shifted shared offset lands mid-char in rel_lower and
+        // scoring panics on the slice (#148 review). Both offsets are now
+        // computed per string.
+        let a = tempfile::tempdir().unwrap();
+        let root_i = a.path().join("İİ");
+        let root_b = a.path().join("beta");
+        std::fs::create_dir(&root_i).unwrap();
+        std::fs::create_dir(&root_b).unwrap();
+        std::fs::write(
+            root_i.join("main.rs"),
+            "x
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root_b.join("main.rs"),
+            "y
+",
+        )
+        .unwrap();
+        let idx = build_multi_file_index(&[root_i, root_b]);
+        let turkish = idx
+            .iter()
+            .find(|e| e.rel.starts_with("İİ/"))
+            .expect("the entry keeps its root label");
+        assert_eq!(&turkish.rel[turkish.filename_start..], "main.rs");
+        assert_eq!(
+            &turkish.rel_lower[turkish.filename_start_lower..],
+            "main.rs",
+            "the scoring string slices at ITS own offset"
+        );
+        assert_eq!(
+            score_entry("main.rs", &turkish.rel_lower, turkish.filename_start_lower)
+                .map(|(t, _)| t),
+            Some(MatchTier::ExactFilename),
+            "filename-tier scoring works through the unicode root label"
+        );
+    }
+
+    #[test]
+    fn multi_root_index_disambiguates_same_named_roots() {
+        let outer = tempfile::tempdir().unwrap();
+        let work = outer.path().join("work").join("api");
+        let archive = outer.path().join("archive").join("api");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::write(
+            work.join("main.rs"),
+            "a
+",
+        )
+        .unwrap();
+        std::fs::write(
+            archive.join("main.rs"),
+            "b
+",
+        )
+        .unwrap();
+        let idx = build_multi_file_index(&[work, archive]);
+        let rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+        assert!(
+            rels.contains(&"api (work)/main.rs") && rels.contains(&"api (archive)/main.rs"),
+            "same-named roots label with their parents: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn multi_root_index_prefixes_rels_with_the_root_name_and_keeps_filename_scoring() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let a_root = a.path().join("alpha");
+        let b_root = b.path().join("beta");
+        std::fs::create_dir(&a_root).unwrap();
+        std::fs::create_dir(&b_root).unwrap();
+        // The SAME relative path in both roots: the multi-root prefix is
+        // the only thing keeping the two rows distinguishable.
+        std::fs::write(a_root.join("main.rs"), "a\n").unwrap();
+        std::fs::write(b_root.join("main.rs"), "b\n").unwrap();
+
+        let idx = build_multi_file_index(&[a_root.clone(), b_root.clone()]);
+        let rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+        assert!(rels.contains(&"alpha/main.rs"), "rels: {rels:?}");
+        assert!(rels.contains(&"beta/main.rs"), "rels: {rels:?}");
+        for e in &idx {
+            assert_eq!(
+                &e.rel[e.filename_start..],
+                "main.rs",
+                "filename_start must shift with the prefix so filename-tier scoring holds"
+            );
+            assert!(e.path.is_absolute() && e.path.ends_with("main.rs"));
+        }
+
+        // One root: the plain index, no prefixes.
+        let single = build_multi_file_index(&[a_root]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].rel, "main.rs");
+    }
+
     fn entry(rel: &str) -> FileEntry {
         let rel_lower = rel.to_lowercase();
         let filename_start = rel.rfind('/').map(|i| i + 1).unwrap_or(0);
+        let filename_start_lower = rel_lower.rfind('/').map(|i| i + 1).unwrap_or(0);
         FileEntry {
             path: PathBuf::from(rel),
             rel: rel.to_string(),
             rel_lower,
             filename_start,
+            filename_start_lower,
         }
     }
 

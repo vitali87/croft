@@ -152,6 +152,39 @@ impl FileTree {
         self.load_children(idx);
     }
 
+    /// Remove a non-primary root section (Remove Folder from Workspace,
+    /// #147): the depth-0 row for `path` and its whole flattened subtree
+    /// (every following row until the next depth-0 row) leave the list.
+    /// The PRIMARY root (row 0) is refused — that is `set_root`'s job.
+    /// Selection, anchor, and scroll clamp back into range; marks under
+    /// the removed root are dropped. Returns whether a section was removed.
+    pub fn remove_root(&mut self, path: &Path) -> bool {
+        let Some(start) = self
+            .nodes
+            .iter()
+            .position(|n| n.depth == 0 && n.path == path)
+        else {
+            return false;
+        };
+        if start == 0 {
+            return false;
+        }
+        let end = self.nodes[start + 1..]
+            .iter()
+            .position(|n| n.depth == 0)
+            .map(|off| start + 1 + off)
+            .unwrap_or(self.nodes.len());
+        self.nodes.drain(start..end);
+        // Prune marks by VISIBILITY, not path prefix: a nested workspace
+        // root keeps its own depth-0 section when an ancestor root is
+        // removed, and its rows' marks must survive (#148 review).
+        self.prune_marks();
+        self.selected = self.selected.min(self.nodes.len().saturating_sub(1));
+        self.anchor = self.anchor.min(self.nodes.len().saturating_sub(1));
+        self.scroll = self.scroll.min(self.nodes.len().saturating_sub(1));
+        true
+    }
+
     /// Every workspace root in display order: the depth-0 section rows.
     /// The first is always the primary root.
     pub fn root_paths(&self) -> impl Iterator<Item = &Path> {
@@ -1680,6 +1713,63 @@ mod tests {
         let mut tree = tree;
         tree.add_root(second.path().to_path_buf());
         assert_eq!(tree.nodes.len(), count);
+    }
+
+    #[test]
+    fn remove_root_drops_the_section_and_its_subtree_but_refuses_the_primary() {
+        let (tmp, second, mut tree) = two_root_fixture();
+        assert!(
+            !tree.remove_root(tmp.path()),
+            "the primary root is never removable through remove_root"
+        );
+        let before = tree.nodes.len();
+        assert!(tree.remove_root(second.path()));
+        assert!(
+            tree.nodes.len() < before,
+            "the section row and its subtree leave the list"
+        );
+        assert!(
+            !tree.nodes.iter().any(|n| n.path.starts_with(second.path())),
+            "no row under the removed root survives"
+        );
+        assert_eq!(
+            tree.root_paths().collect::<Vec<_>>(),
+            vec![tmp.path()],
+            "back to a single-root tree"
+        );
+        assert!(tree.selected < tree.nodes.len(), "selection clamps");
+        assert!(
+            !tree.remove_root(second.path()),
+            "removing again is a no-op"
+        );
+    }
+
+    #[test]
+    fn removing_an_ancestor_root_keeps_marks_in_a_surviving_nested_root_section() {
+        // A nested workspace root stays its own depth-0 section when its
+        // ancestor root is removed; pruning marks by path prefix wrongly
+        // swept the survivor's marks too (#148 review).
+        let (_tmp, second, mut tree) = two_root_fixture();
+        let nested = second.path().join("lib");
+        tree.add_root(nested.clone());
+        let util_idx = tree
+            .nodes
+            .iter()
+            .rposition(|n| n.path.ends_with("util.rs"))
+            .expect("the nested section lists its file");
+        tree.toggle_mark(util_idx);
+        let marked_path = tree.nodes[util_idx].path.clone();
+
+        assert!(tree.remove_root(second.path()));
+
+        assert!(
+            tree.root_paths().any(|r| r == nested),
+            "the nested root's own section survives"
+        );
+        assert!(
+            tree.marked.contains(&marked_path),
+            "the surviving section's marks survive with it"
+        );
     }
 
     #[test]
