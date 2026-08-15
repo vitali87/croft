@@ -14789,6 +14789,41 @@ mod tests {
     }
 
     #[test]
+    fn cursor_screen_pos_wrap_zero_width_column_rejects_out_of_pane_cells() {
+        // A pane narrow enough leaves a zero-width wrap column, where
+        // wrap_segments degenerates to one whole-line segment: a caret deep
+        // in the line would compute a cell far past the pane's right edge
+        // (across the scrollbar column and beyond). The right-edge clamp
+        // must reject it, not paint it. With any nonzero column width the
+        // segments are capped at that width, so this degenerate layout is
+        // the only way an accepted caret can reach the clamp.
+        let mut e = editor_with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        e.wrap_override = Some(true);
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 5,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let (_, start, end) = e.text_row(0).expect("a text row");
+        assert_eq!(
+            (start, end),
+            (0, 40),
+            "expected the zero-width degenerate one-segment layout"
+        );
+        e.cursor_row = 0;
+        e.cursor_col = 20;
+        assert_eq!(
+            e.cursor_screen_pos(),
+            None,
+            "a caret cell past the pane edge must not be painted"
+        );
+    }
+
+    #[test]
     fn cursor_screen_pos_returns_none_when_scrolled_off() {
         let mut e = editor_with_lines(50);
         e.last_inner = Rect {
