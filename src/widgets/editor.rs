@@ -8401,12 +8401,20 @@ impl Editor {
                             || (self.cursor_col == *end
                                 && *end == self.line_char_len(*line))))
             })?;
-            let (_, start, end) = self.text_row(idx)?;
+            let (_, start, _) = self.text_row(idx)?;
+            // The caret is valid on every cell of the segment AND one past
+            // its last cell (end of line / blank line — where the user is
+            // about to type). Bail only when the cell would fall outside the
+            // text column: past the pane edge or onto the vertical scrollbar.
             let visible_col = self.cursor_col - start;
-            if end == start || visible_col >= end - start {
+            let x = text_x as usize + visible_col;
+            let right = (self.last_inner.x + self.last_inner.width)
+                .saturating_sub(u16::from(self.last_scrollbar.width > 0))
+                as usize;
+            if x >= right {
                 return None;
             }
-            return Some((text_x + visible_col as u16, self.last_inner.y + idx as u16));
+            return Some((x as u16, self.last_inner.y + idx as u16));
         }
         // Non-wrap: one row per line, horizontally scrolled by `scroll_col`;
         // comment boxes shift the rows below them, so map through the
@@ -14694,6 +14702,90 @@ mod tests {
         // text_x = inner.x + gutter + 1 = 5 + 2 + 1 = 8
         // cy = inner.y + (cursor_row - scroll) = 7 + 1 = 8
         assert_eq!(e.cursor_screen_pos(), Some((8 + 3, 8)));
+    }
+
+    #[test]
+    fn cursor_screen_pos_wrap_shows_caret_on_blank_line() {
+        // Regression: in soft-wrap mode (the Markdown default) the caret
+        // vanished on an empty line — the row's segment is (start 0, end 0)
+        // and the old guard bailed on `end == start`, so the user typed
+        // blind on every blank line.
+        let mut e = editor_with("hello\n\nworld");
+        e.wrap_override = Some(true);
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(
+            e.cursor_screen_pos(),
+            Some((text_x, e.last_inner.y + 1)),
+            "the caret must be visible on a blank line in wrap mode"
+        );
+    }
+
+    #[test]
+    fn cursor_screen_pos_wrap_shows_caret_at_end_of_line() {
+        // Regression: typing at the end of a line in wrap mode hid the
+        // caret — `cursor_col == end == line length` is accepted by the
+        // row matcher but was then rejected by the old
+        // `visible_col >= end - start` guard.
+        let mut e = editor_with("hello\nworld");
+        e.wrap_override = Some(true);
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        e.cursor_row = 0;
+        e.cursor_col = 5;
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(
+            e.cursor_screen_pos(),
+            Some((text_x + 5, e.last_inner.y)),
+            "the caret must be visible one past the last character in wrap mode"
+        );
+    }
+
+    #[test]
+    fn cursor_screen_pos_wrap_boundary_still_maps_to_next_row_start() {
+        // A caret on a wrap boundary belongs to the NEXT visual row's first
+        // cell, never one past the previous row's last cell.
+        let mut e = editor_with("aaaa bbbb cccc dddd eeee ffff gggg hhhh");
+        e.wrap_override = Some(true);
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        // Find the second visual row's start and put the caret exactly there
+        // (the first row's `end`).
+        let Some((_, start, _)) = e.text_row(1) else {
+            panic!("expected a wrapped second row");
+        };
+        e.cursor_row = 0;
+        e.cursor_col = start;
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(
+            e.cursor_screen_pos(),
+            Some((text_x, e.last_inner.y + 1)),
+            "a wrap-boundary caret must land on the next row's first cell"
+        );
     }
 
     #[test]
