@@ -10088,6 +10088,28 @@ fn toggle_indent_guides_command_flips_every_editor_via_the_frame_sync() {
 }
 
 #[test]
+fn toggle_bracket_colors_command_flips_every_editor_via_the_frame_sync() {
+    let mut app = editor_app_with_lines(&["fn a(x: u8) {}"]);
+    assert!(
+        app.bracket_colors_enabled,
+        "bracket colorization is on by default (VS Code default since 1.67)"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleBracketColors);
+    assert!(!app.bracket_colors_enabled, "the command turns it off");
+    app.editor
+        .open_text_buffer(std::path::Path::new("later.rs"), "g(1)")
+        .unwrap();
+    app.sync_focus_flags();
+    assert!(
+        app.editor.editors.iter().all(|e| !e.show_bracket_colors),
+        "the frame sync disables the tab opened after the toggle too"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleBracketColors);
+    app.sync_focus_flags();
+    assert!(app.editor.editors.iter().all(|e| e.show_bracket_colors));
+}
+
+#[test]
 fn editor_cmd_gg_jumps_to_top_of_file() {
     let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
     app.editor.cursor_row = 3;

@@ -394,6 +394,29 @@ impl Theme {
         self.blend_over_bg((0x9a, 0x9a, 0x9a), 0.35)
     }
 
+    /// Depth-cycled foregrounds for bracket-pair colorization (VS Code
+    /// `editorBracketHighlight.foreground1..3`). The dark defaults are VS
+    /// Code's gold / orchid / blue; a light-background theme gets VS Code
+    /// Light's blue / green / brown, picked by the background's luminance so
+    /// manifest themes inherit a legible set either way.
+    pub fn bracket_pair_color(self, depth: usize) -> Color {
+        let (r, g, b) = self.bg;
+        let luma = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+        let cycle: [(u8, u8, u8); 3] = if luma > 128.0 {
+            [(0x04, 0x31, 0xfa), (0x31, 0x93, 0x31), (0x7b, 0x38, 0x14)]
+        } else {
+            [(0xff, 0xd7, 0x00), (0xda, 0x70, 0xd6), (0x17, 0x9f, 0xff)]
+        };
+        let (cr, cg, cb) = cycle[depth % cycle.len()];
+        Color::Rgb(cr, cg, cb)
+    }
+
+    /// Foreground of an unmatched closing bracket (VS Code
+    /// `editorBracketHighlight.unexpectedBracket.foreground`).
+    pub fn bracket_unexpected_fg(self) -> Color {
+        Color::Rgb(0xff, 0x12, 0x12)
+    }
+
     /// Foreground of an indentation guide (VS Code
     /// `editorIndentGuide.background1`, #404040 on the dark default): a grey
     /// blended over each theme's background so it stays a whisper above the

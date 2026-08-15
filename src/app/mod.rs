@@ -2043,6 +2043,9 @@ pub struct App {
     /// Indentation guides (#129), VS Code `editor.guides.indentation`: on by
     /// default, pushed to every editor by the per-frame focus sync.
     indent_guides_enabled: bool,
+    /// Bracket-pair colorization (#131): on by default, pushed to every
+    /// editor by the per-frame focus sync like the indent guides.
+    bracket_colors_enabled: bool,
     /// Auto-closing pairs (#121), persisted; synced onto the active editor
     /// beside the blame flag.
     auto_close_pairs: bool,
@@ -3548,6 +3551,7 @@ impl App {
             blame_fetched: None,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
+            bracket_colors_enabled: !loaded_prefs.disable_bracket_colors,
             auto_close_pairs: !loaded_prefs.disable_auto_close_pairs,
             inlay_hints_enabled: !loaded_prefs.disable_inlay_hints,
             // Keep the suite off the user's real ~/.config/croft/history: a
@@ -10641,6 +10645,7 @@ impl App {
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
             ed.show_indent_guides = self.indent_guides_enabled;
+            ed.show_bracket_colors = self.bracket_colors_enabled;
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
@@ -10649,6 +10654,7 @@ impl App {
                 ed.pdf_viewer_enabled = pdf_on;
                 ed.csv_viewer_enabled = csv_on;
                 ed.show_indent_guides = self.indent_guides_enabled;
+                ed.show_bracket_colors = self.bracket_colors_enabled;
             }
         }
         self.tree.focus_gradient = gradient;
@@ -18508,6 +18514,7 @@ impl App {
                     "toggle:auto_save" => self.toggle_auto_save(),
                     "toggle:inline_blame" => self.toggle_inline_blame(),
                     "toggle:indent_guides" => self.toggle_indent_guides(),
+                    "toggle:bracket_colors" => self.toggle_bracket_colors(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
                     "cmd:color_theme" => {
@@ -18573,6 +18580,13 @@ impl App {
                 label: format!(
                     "Editor: Indent Guides: {}",
                     on_off(self.indent_guides_enabled)
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:bracket_colors"),
+                label: format!(
+                    "Editor: Bracket Pair Colorization: {}",
+                    on_off(self.bracket_colors_enabled)
                 ),
             },
             ListRow {
@@ -24051,6 +24065,7 @@ impl App {
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
             Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
+            Cmd::ToggleBracketColors => self.toggle_bracket_colors(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
@@ -28576,6 +28591,22 @@ impl App {
         if !cfg!(test) {
             let _ = crate::prefs::save_inline_blame(self.inline_blame_enabled);
         }
+    }
+
+    fn toggle_bracket_colors(&mut self) {
+        self.bracket_colors_enabled = !self.bracket_colors_enabled;
+        self.editor.show_bracket_colors = self.bracket_colors_enabled;
+        if !cfg!(test) {
+            let _ = crate::prefs::save_bracket_colors(self.bracket_colors_enabled);
+        }
+        self.status = format!(
+            "Bracket Pair Colorization: {}",
+            if self.bracket_colors_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        );
     }
 
     fn toggle_indent_guides(&mut self) {

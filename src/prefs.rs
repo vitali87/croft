@@ -168,6 +168,12 @@ pub struct Prefs {
     /// (a default-false field keeps old configs valid, like inline blame).
     #[serde(default)]
     pub disable_auto_close_pairs: bool,
+    /// Opt-out for bracket-pair colorization (#131), on by default like VS
+    /// Code's `editor.bracketPairColorization.enabled` (default since 1.67).
+    /// Stored as the disable flag so the derived `Default` and an older
+    /// config both mean "brackets coloured".
+    #[serde(default)]
+    pub disable_bracket_colors: bool,
     /// Opt-out for indentation guides (#129), which are on by default like
     /// VS Code's `editor.guides.indentation`. Stored as the disable flag so
     /// the derived `Default` and an older config both mean "guides shown".
@@ -353,6 +359,14 @@ pub fn save_inline_blame(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disable_inline_blame = !enabled;
+    prefs.save(&path)
+}
+
+/// Persist the bracket-pair colorization toggle (stored as its disable flag).
+pub fn save_bracket_colors(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.disable_bracket_colors = !enabled;
     prefs.save(&path)
 }
 

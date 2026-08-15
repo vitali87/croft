@@ -740,6 +740,20 @@ pub fn highlight_text(
     text: &[u8],
     line_starts: &[usize],
 ) -> Vec<Vec<HiSpan>> {
+    highlight_text_with_protected(registry, kind, text, line_starts).0
+}
+
+/// [`highlight_text`] plus the absolute byte ranges the grammar captured as
+/// strings or comments, merged and ascending. Bracket-pair colorization skips
+/// brackets inside them: a `{` in a string literal or a `)` in a comment is
+/// prose, not structure. The innermost capture decides, so the code inside a
+/// template-string interpolation still participates.
+pub fn highlight_text_with_protected(
+    registry: &mut LangRegistry,
+    kind: LangKind,
+    text: &[u8],
+    line_starts: &[usize],
+) -> (Vec<Vec<HiSpan>>, Vec<(usize, usize)>) {
     // Snapshot the palette once per pass: the write happens only on a theme
     // switch, and one read beats a lock round-trip per token.
     let palette = *SYNTAX.read().unwrap();
@@ -754,16 +768,17 @@ fn highlight_text_with_palette(
     text: &[u8],
     line_starts: &[usize],
     palette: &SyntaxPalette,
-) -> Vec<Vec<HiSpan>> {
+) -> (Vec<Vec<HiSpan>>, Vec<(usize, usize)>) {
     let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); line_starts.len()];
+    let mut protected: Vec<(usize, usize)> = Vec::new();
     let cfg = match registry.get(kind) {
         Some(c) => c,
-        None => return per_line,
+        None => return (per_line, protected),
     };
     let mut hl = Highlighter::new();
     let events = match hl.highlight(cfg.as_ref(), text, None, |_| None) {
         Ok(e) => e,
-        Err(_) => return per_line,
+        Err(_) => return (per_line, protected),
     };
 
     let mut stack: Vec<usize> = Vec::new();
@@ -774,11 +789,19 @@ fn highlight_text_with_palette(
                 stack.pop();
             }
             Ok(HighlightEvent::Source { start, end }) => {
+                let name = match stack.last() {
+                    Some(idx) => HIGHLIGHT_NAMES.get(*idx).copied().unwrap_or(""),
+                    None => "",
+                };
+                if name.starts_with("string") || name.starts_with("comment") {
+                    match protected.last_mut() {
+                        // Events arrive in source order; merge touching runs.
+                        Some(last) if last.1 >= start => last.1 = last.1.max(end),
+                        _ => protected.push((start, end)),
+                    }
+                }
                 let style = match stack.last() {
-                    Some(idx) => palette_style_for_name(
-                        palette,
-                        HIGHLIGHT_NAMES.get(*idx).copied().unwrap_or(""),
-                    ),
+                    Some(_) => palette_style_for_name(palette, name),
                     // Uncaptured source takes the palette's default fg, same
                     // as the `variable`/`punctuation` arm — never a literal.
                     None => palette_style_for_name(palette, ""),
@@ -788,7 +811,7 @@ fn highlight_text_with_palette(
             Err(_) => {}
         }
     }
-    per_line
+    (per_line, protected)
 }
 
 fn project_range(
@@ -1797,7 +1820,8 @@ def f() -> Config:\n\
             src.as_bytes(),
             &ls,
             &gruvbox_ish,
-        );
+        )
+        .0;
         let slate = Some(rgb(0xc0, 0xc5, 0xce));
         let cream = Some(rgb(0xeb, 0xdb, 0xb2));
         assert!(
