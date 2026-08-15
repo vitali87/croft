@@ -20766,6 +20766,57 @@ fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_
 }
 
 #[test]
+fn restoring_a_workspaces_layout_drops_pane_bound_state_from_the_outgoing_panel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let session_path = tmp.path().join("sessions.json");
+    crate::terminal_session::save_for_root(
+        &session_path,
+        &b.display().to_string(),
+        crate::terminal_session::SessionRecord {
+            panes: vec![
+                crate::terminal_session::PaneRecord {
+                    cwd: b.display().to_string(),
+                    name: None,
+                },
+                crate::terminal_session::PaneRecord {
+                    cwd: b.display().to_string(),
+                    name: Some(String::from("srv")),
+                },
+            ],
+            active: 0,
+        },
+    );
+
+    let mut app = App::new(a.clone()).unwrap();
+    app.terminal_session_path = session_path;
+    // Park an undo-close entry (the split writes no input into pane 0, so
+    // the panel stays pristine) and open copy mode on the surviving pane:
+    // both are bound to the OUTGOING panel and keyed by pane index, which
+    // the restored panel's identical indexes would wrongly satisfy.
+    app.split_terminal().unwrap();
+    assert!(app.close_terminal_at(1));
+    assert!(!app.closed_terminals.is_empty());
+    app.open_terminal_copy_mode();
+    assert!(app.terminal_copy_mode.is_some());
+
+    app.change_workspace_root(b.clone());
+
+    assert_eq!(app.terminals.len(), 2, "precondition: the restore ran");
+    assert!(
+        app.terminal_copy_mode.is_none(),
+        "copy mode was bound to a replaced pane; its coordinates mean nothing on the restored grid"
+    );
+    assert!(
+        app.closed_terminals.is_empty(),
+        "undo-close must not resurrect a PTY from the outgoing workspace into the restored panel"
+    );
+}
+
+#[test]
 fn change_workspace_root_keeps_live_panes_when_the_terminal_was_touched() {
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("a");

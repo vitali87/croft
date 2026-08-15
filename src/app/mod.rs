@@ -10008,6 +10008,17 @@ impl App {
         if terms.is_empty() {
             return;
         }
+        // The restored panes are brand-new PtyTerminals, but everything
+        // bound to a pane of the OUTGOING panel is keyed by pane index —
+        // copy mode, find, quick-select — which an identical index in the
+        // restored panel would wrongly satisfy, applying stale grid
+        // coordinates to a grid that never produced them. The undo-close
+        // park would likewise resurrect an outgoing workspace's PTY into
+        // the restored panel. Drop them all before the swap.
+        self.close_terminal_copy_mode();
+        self.close_terminal_find();
+        self.close_terminal_quick_select();
+        self.closed_terminals.clear();
         self.terminals = terms;
         self.active_terminal = rec.active.min(self.terminals.len() - 1);
         self.sync_focus_flags();

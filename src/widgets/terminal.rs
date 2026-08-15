@@ -494,6 +494,11 @@ pub struct PtyTerminal {
     /// no input byte was ever written to it, so `is_pristine` must
     /// never mistake it for a replaceable startup default.
     run_pane: bool,
+    /// Latches true the first time a non-blank manual name is set and
+    /// never clears: a pane the user named is user state even after the
+    /// name is cleared back, so `is_pristine` reads this latch rather
+    /// than the live `manual_name` (which a blank rename empties).
+    manual_name_seen: bool,
     cols: u16,
     rows: u16,
     /// Shared with the `VoidListener` so `TextAreaSizeRequest` callbacks
@@ -1720,6 +1725,7 @@ impl PtyTerminal {
             },
             input_seen: false,
             run_pane: script_mode,
+            manual_name_seen: false,
             cols,
             rows,
             size_shared,
@@ -1972,6 +1978,9 @@ impl PtyTerminal {
     /// Set or clear the user's manual pane name (a blank name clears it).
     pub fn set_manual_name(&mut self, name: Option<String>) {
         self.manual_name = name.filter(|n| !n.trim().is_empty());
+        if self.manual_name.is_some() {
+            self.manual_name_seen = true;
+        }
     }
 
     pub fn take_dirty(&self) -> bool {
@@ -3026,7 +3035,7 @@ impl PtyTerminal {
     /// input (a keystroke, a paste, a seeded `cd`) or a rename clears
     /// this permanently.
     pub fn is_pristine(&self) -> bool {
-        !self.run_pane && !self.input_seen && self.manual_name.is_none()
+        !self.run_pane && !self.input_seen && !self.manual_name_seen
     }
 
     /// Scroll the visible viewport up by `n` rows into scrollback.
@@ -5117,6 +5126,11 @@ mod tests {
         assert!(
             !named.is_pristine(),
             "a manual name is user state; the pane must not be replaceable"
+        );
+        named.set_manual_name(None);
+        assert!(
+            !named.is_pristine(),
+            "a rename latches: clearing the name back must not make the pane replaceable"
         );
 
         let run = PtyTerminal::new_running(
