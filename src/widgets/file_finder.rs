@@ -516,6 +516,34 @@ pub fn build_file_index(root: &Path) -> Vec<FileEntry> {
     build_file_index_with_blocked(root, macos_blocked_paths())
 }
 
+/// The Quick Open index over EVERY workspace root (#147). One root is the
+/// plain per-root index; with more, each root's entries carry a
+/// `<root-name>/` prefix on `rel` — the VS Code multi-root label rule — so
+/// same-named files in different roots stay distinguishable and ranking
+/// never mixes two projects' bare paths. `filename_start` shifts with the
+/// prefix, keeping the filename-tier scoring anchored on the filename.
+pub fn build_multi_file_index(roots: &[PathBuf]) -> Vec<FileEntry> {
+    if roots.len() == 1 {
+        return build_file_index(&roots[0]);
+    }
+    let mut out = Vec::new();
+    for root in roots {
+        let name = root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root.display().to_string());
+        let prefix = format!("{name}/");
+        let prefix_lower = prefix.to_lowercase();
+        for mut e in build_file_index(root) {
+            e.filename_start += prefix.len();
+            e.rel = format!("{prefix}{}", e.rel);
+            e.rel_lower = format!("{prefix_lower}{}", e.rel_lower);
+            out.push(e);
+        }
+    }
+    out
+}
+
 /// [`build_file_index`] with the blocked-path set injected, so tests drive
 /// the macOS exclusion rules against a fake home without mutating `$HOME`.
 fn build_file_index_with_blocked(root: &Path, blocked: Vec<PathBuf>) -> Vec<FileEntry> {
@@ -772,6 +800,38 @@ fn split_dir_file(rel: &str, filename_start: usize) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_root_index_prefixes_rels_with_the_root_name_and_keeps_filename_scoring() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let a_root = a.path().join("alpha");
+        let b_root = b.path().join("beta");
+        std::fs::create_dir(&a_root).unwrap();
+        std::fs::create_dir(&b_root).unwrap();
+        // The SAME relative path in both roots: the multi-root prefix is
+        // the only thing keeping the two rows distinguishable.
+        std::fs::write(a_root.join("main.rs"), "a\n").unwrap();
+        std::fs::write(b_root.join("main.rs"), "b\n").unwrap();
+
+        let idx = build_multi_file_index(&[a_root.clone(), b_root.clone()]);
+        let rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+        assert!(rels.contains(&"alpha/main.rs"), "rels: {rels:?}");
+        assert!(rels.contains(&"beta/main.rs"), "rels: {rels:?}");
+        for e in &idx {
+            assert_eq!(
+                &e.rel[e.filename_start..],
+                "main.rs",
+                "filename_start must shift with the prefix so filename-tier scoring holds"
+            );
+            assert!(e.path.is_absolute() && e.path.ends_with("main.rs"));
+        }
+
+        // One root: the plain index, no prefixes.
+        let single = build_multi_file_index(&[a_root]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].rel, "main.rs");
+    }
 
     fn entry(rel: &str) -> FileEntry {
         let rel_lower = rel.to_lowercase();

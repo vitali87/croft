@@ -61,6 +61,40 @@ impl WorkspaceRoots {
     pub fn replace_primary(&mut self, root: PathBuf) {
         self.roots = vec![root];
     }
+
+    /// Append `root` to the folder set (Add Folder to Workspace, #147).
+    /// A root already present is a no-op; returns whether the set grew.
+    pub fn add(&mut self, root: PathBuf) -> bool {
+        if self.roots.contains(&root) {
+            return false;
+        }
+        self.roots.push(root);
+        true
+    }
+
+    /// Drop `root` from the set (Remove Folder from Workspace, #147).
+    /// The PRIMARY root is refused — it is the launch identity everything
+    /// session-shaped is keyed on; changing it is `replace_primary`'s
+    /// job (a re-root), never a removal. Returns whether the set shrank.
+    pub fn remove(&mut self, root: &Path) -> bool {
+        if self.primary() == root {
+            return false;
+        }
+        let before = self.roots.len();
+        self.roots.retain(|r| r != root);
+        self.roots.len() < before
+    }
+
+    /// Every root in user order; the first is always the primary.
+    pub fn iter(&self) -> impl Iterator<Item = &Path> {
+        self.roots.iter().map(PathBuf::as_path)
+    }
+
+    /// More than one folder: the point where the multi-root label rule
+    /// (root-name prefixes) and per-root fan-outs engage.
+    pub fn is_multi(&self) -> bool {
+        self.roots.len() > 1
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +129,25 @@ mod tests {
         // Prefix matching is component-wise, never textual: /w/repo2 is
         // not inside /w/repo.
         assert_eq!(ws.owning_root(Path::new("/w/repo2/x.rs")), None);
+    }
+
+    #[test]
+    fn add_grows_the_set_once_and_remove_refuses_the_primary() {
+        let mut ws = WorkspaceRoots::single(PathBuf::from("/w/a"));
+        assert!(ws.add(PathBuf::from("/w/b")), "a new folder grows the set");
+        assert!(!ws.add(PathBuf::from("/w/b")), "adding it again is a no-op");
+        assert!(ws.is_multi());
+        assert_eq!(
+            ws.iter().collect::<Vec<_>>(),
+            vec![Path::new("/w/a"), Path::new("/w/b")]
+        );
+        assert!(
+            !ws.remove(Path::new("/w/a")),
+            "the primary root is the launch identity; removal is refused"
+        );
+        assert!(ws.remove(Path::new("/w/b")), "a secondary root removes");
+        assert!(!ws.is_multi());
+        assert_eq!(ws.primary(), Path::new("/w/a"));
     }
 
     #[test]

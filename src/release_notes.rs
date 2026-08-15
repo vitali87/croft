@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Multi-root groundwork, part two: the Explorer tree can now hold several root folders as top-level sections — Collapse All, reveal, delete guards, and git-ignore dimming all understand every root. Nothing changes with a single folder; the Add Folder command arrives next.",
+    summary: "Multi-root workspaces arrive: \"Workspaces: Add Folder to Workspace\" opens the fuzzy directory picker and adds the chosen folder beside the current one — the Explorer shows both as sections, Quick Open and workspace search span every folder with folder-name prefixes, language servers root themselves per folder, and the window title gains the (Workspace) marker. Remove a folder from its section row's context menu.",
 }];

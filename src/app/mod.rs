@@ -885,6 +885,11 @@ enum MenuAction {
     /// files can't be roots. Used to dive into a nested git repo without
     /// relaunching croft.
     MakeRoot(PathBuf),
+    /// Add another folder to the workspace (multi-root, #147): opens the
+    /// fuzzy directory picker in add-folder mode.
+    AddWorkspaceFolder,
+    /// Drop a SECONDARY workspace root from the folder set (#147).
+    RemoveWorkspaceFolder(PathBuf),
     /// Copy the absolute path of the right-clicked editor tab to the system
     /// clipboard (VS Code's "Copy Path"). Available wherever the tab is backed
     /// by a real on-disk path, local or remote.
@@ -1151,6 +1156,8 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::Paste(_) => Some("⌘V"),
         MenuAction::Rename(_) => Some("⌘R"),
         MenuAction::MakeRoot(_) => Some("⌘/"),
+        MenuAction::AddWorkspaceFolder => None,
+        MenuAction::RemoveWorkspaceFolder(_) => None,
         MenuAction::RevealInFinder(_) => Some("⌥⌘R"),
         MenuAction::CopyTabPath(_) => Some("⌥⌘C"),
         MenuAction::CopyTabRelativePath(_) => Some("⌥⇧⌘C"),
@@ -1543,6 +1550,22 @@ fn build_tree_context_menu_items(
             String::from("New Folder"),
             MenuAction::Create(CreateKind::Folder),
         ));
+        // Root section rows (multi-root, #147): grow the folder set from
+        // any root row; drop a SECONDARY root from its own row. The
+        // primary is the launch identity — Make Root changes it, never a
+        // removal.
+        if let Some(n) = node.filter(|n| n.depth == 0) {
+            items.push((
+                String::from("Add Folder to Workspace"),
+                MenuAction::AddWorkspaceFolder,
+            ));
+            if n.path != root {
+                items.push((
+                    String::from("Remove Folder from Workspace"),
+                    MenuAction::RemoveWorkspaceFolder(n.path.clone()),
+                ));
+            }
+        }
         if clipboard.is_some() {
             items.push((
                 String::from("Paste"),
@@ -2160,6 +2183,11 @@ pub struct App {
     context_menu: Option<ContextMenu>,
     prompt: Option<Prompt>,
     fs_watch: FsWatch,
+    /// One extra watcher per SECONDARY workspace root (#147), sharing the
+    /// primary's watch-cap budget. The primary `fs_watch` also owns the
+    /// adaptive poll (its dir-mtime snapshot walks the whole tree, all
+    /// roots included) and the open-file stats; extras are event-only.
+    fs_watch_extra: Vec<FsWatch>,
     git: GitWorker,
     cursor_blink: CursorBlink,
     editor_click: ClickTracker,
@@ -2796,6 +2824,9 @@ pub struct App {
     /// only from the Explorer pane, so it never collides with the editor's
     /// Cmd+Z undo.
     pub zoxide_jump: Option<crate::widgets::zoxide_jump::ZoxideJump>,
+    /// True while the zoxide popup is picking a folder to ADD to the
+    /// workspace (#147) rather than re-rooting; reset on close.
+    pub zoxide_add_folder: bool,
     pub branch_picker: Option<crate::widgets::branch_picker::BranchPicker>,
     /// Why the branch picker is open, so its Enter dispatches the right
     /// verb (checkout vs merge vs rebase vs delete vs create-from base).
@@ -3623,6 +3654,7 @@ impl App {
             context_menu: None,
             prompt: None,
             fs_watch,
+            fs_watch_extra: Vec::new(),
             git,
             cursor_blink: CursorBlink::new(),
             editor_click: ClickTracker::default(),
@@ -3823,6 +3855,7 @@ impl App {
             debug_console: Vec::new(),
             debug_ever_stopped: false,
             zoxide_jump: None,
+            zoxide_add_folder: false,
             branch_picker: None,
             branch_purpose: BranchPurpose::Checkout,
             scm_menu: crate::widgets::scm_menu::ScmMenuState::default(),
@@ -5161,6 +5194,11 @@ impl App {
     /// tick (so the caller redraws). Cheap no-op once both are installed.
     pub fn try_install_pending_init(&mut self) -> bool {
         let mut changed = self.fs_watch.try_install_watcher();
+        for w in &mut self.fs_watch_extra {
+            if w.try_install_watcher() {
+                changed = true;
+            }
+        }
         if self.drain_git_responses() {
             changed = true;
         }
@@ -6855,7 +6893,14 @@ impl App {
             return Vec::new();
         }
         let mut crumbs = Vec::new();
-        let rel = path.strip_prefix(self.workspace_root()).unwrap_or(path);
+        // Strip against the OWNING root (#147): a secondary-root file
+        // crumbs from its own root (folder-relative, like status_path),
+        // never the primary — which yielded the full absolute chain.
+        let rel = self
+            .roots
+            .owning_root(path)
+            .and_then(|r| path.strip_prefix(r).ok())
+            .unwrap_or(path);
         for comp in rel.components() {
             if let std::path::Component::Normal(os) = comp {
                 crumbs.push(Crumb {
@@ -9115,7 +9160,14 @@ impl App {
 
     fn drain_fs_events(&mut self) -> bool {
         let init_changed = self.try_install_pending_init();
-        let drain = self.fs_watch.drain(&mut self.tree, &self.editor);
+        let mut drain = self.fs_watch.drain(&mut self.tree, &self.editor);
+        for w in &mut self.fs_watch_extra {
+            let d = w.drain(&mut self.tree, &self.editor);
+            drain.got_any |= d.got_any;
+            drain.touched_open_file |= d.touched_open_file;
+            drain.dirs_changed |= d.dirs_changed;
+            drain.finder_relevant |= d.finder_relevant;
+        }
         if drain.dirs_changed {
             self.refresh_git_status_debounced();
             if drain.finder_relevant {
@@ -23166,9 +23218,9 @@ impl App {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::widgets::file_finder::FileEntry>>();
-        let root = self.workspace_root().to_path_buf();
+        let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
         std::thread::spawn(move || {
-            let entries = crate::widgets::file_finder::build_file_index(&root);
+            let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
             let _ = tx.send(entries);
         });
         self.file_finder_index_rx = Some(rx);
@@ -23186,7 +23238,8 @@ impl App {
         // rather than open an empty finder; this only fires when
         // Cmd+P is pressed within the first few hundred ms of launch.
         if self.file_finder_index.is_none() {
-            let entries = crate::widgets::file_finder::build_file_index(self.workspace_root());
+            let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+            let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
             self.file_finder_index = Some(std::sync::Arc::new(entries));
             self.file_finder_index_rx = None;
         }
@@ -24229,6 +24282,24 @@ impl App {
             Cmd::ShowExplorer => self.set_sidebar_view(SidebarView::Explorer),
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
             Cmd::ShowSourceControl => self.set_sidebar_view(SidebarView::SourceControl),
+            Cmd::AddWorkspaceFolder => self.open_add_folder_picker(),
+            Cmd::RemoveWorkspaceFolder => {
+                // Operates on the Explorer's selected row when it is a
+                // SECONDARY root section; anything else gets the hint.
+                let target = self
+                    .tree
+                    .nodes
+                    .get(self.tree.selected)
+                    .filter(|n| n.depth == 0 && n.path != self.tree.root)
+                    .map(|n| n.path.clone());
+                match target {
+                    Some(p) => self.remove_workspace_folder(p),
+                    None => {
+                        self.status =
+                            String::from("Select a secondary root folder in the Explorer first");
+                    }
+                }
+            }
             Cmd::ShowRunDebug => self.set_sidebar_view(SidebarView::RunDebug),
             Cmd::ShowRemote => self.set_sidebar_view(SidebarView::Remote),
             Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
@@ -24385,6 +24456,7 @@ impl App {
     }
 
     fn close_zoxide_jump(&mut self) {
+        self.zoxide_add_folder = false;
         if self.zoxide_jump.take().is_some() {
             self.overlays.zoxide_jump_clear.request();
             self.overlays.activity.mark_dirty();
@@ -24438,8 +24510,13 @@ impl App {
             (KeyCode::Enter, _) => {
                 let path = jump.selected_path().map(|p| p.to_path_buf());
                 if let Some(path) = path {
+                    let add = self.zoxide_add_folder;
                     self.close_zoxide_jump();
-                    self.change_workspace_root(path);
+                    if add {
+                        self.add_workspace_folder(path);
+                    } else {
+                        self.change_workspace_root(path);
+                    }
                 }
             }
             (KeyCode::Up, _) => jump.select_prev(),
@@ -29225,6 +29302,108 @@ impl App {
     /// still resolves on disk and the user may want to keep it open.
     /// Compare anchor / clipboard / marks are reset because they point
     /// into the old workspace.
+    /// Add `path` as another workspace root (multi-root, #147): the model
+    /// grows, the Explorer gains the section, every root gets a watcher
+    /// share, the Cmd+P index and workspace search span the new set, and
+    /// the LSP layer widens its project-root bound (servers for the new
+    /// root spawn per (language, project root) exactly like a fresh
+    /// workspace's — croft's per-project server model needs no
+    /// didChangeWorkspaceFolders, since no running server's folder set
+    /// changes). Session/collab identity deliberately stays keyed on the
+    /// PRIMARY root: adding a folder never changes what the window IS.
+    pub fn add_workspace_folder(&mut self, path: PathBuf) {
+        let path = path.canonicalize().unwrap_or(path);
+        if !path.is_dir() {
+            self.status = format!("Not a folder: {}", path.display());
+            return;
+        }
+        if !self.roots.add(path.clone()) {
+            self.status = String::from("Folder is already in the workspace");
+            return;
+        }
+        self.tree.add_root(path.clone());
+        self.rebind_workspace_watchers();
+        self.sync_workspace_fanout();
+        self.refresh_workspace_title();
+        self.status = format!("Added folder: {}", path.display());
+    }
+
+    /// Remove a SECONDARY workspace root (#147). The primary is refused —
+    /// it is the launch identity; changing it is Make Root's job. Open
+    /// tabs under the removed root stay open (they become plain
+    /// out-of-workspace files, VS Code behavior).
+    pub fn remove_workspace_folder(&mut self, path: PathBuf) {
+        if !self.roots.remove(&path) {
+            self.status = String::from(
+                "The primary workspace folder cannot be removed (use Make Root to change it)",
+            );
+            return;
+        }
+        self.tree.remove_root(&path);
+        self.rebind_workspace_watchers();
+        self.sync_workspace_fanout();
+        self.refresh_workspace_title();
+        self.status = format!("Removed folder: {}", path.display());
+    }
+
+    /// (Re)spawn one watcher per workspace root, splitting the per-OS
+    /// watch caps across them (#147): the caps bound kernel resources per
+    /// PROCESS, so N roots share one budget rather than multiplying it.
+    fn rebind_workspace_watchers(&mut self) {
+        let shares = self.roots.iter().count();
+        let primary = self.workspace_root().to_path_buf();
+        self.fs_watch.rebind_sharing(&primary, &self.tree, shares);
+        self.fs_watch_extra = self
+            .roots
+            .iter()
+            .skip(1)
+            .map(|r| FsWatch::spawn_sharing(r, &self.tree, shares))
+            .collect();
+    }
+
+    /// Push the current root set into the per-root fan-outs that are not
+    /// watcher-shaped: the Cmd+P index, the search worker + panel, and
+    /// the LSP project-root bound.
+    fn sync_workspace_fanout(&mut self) {
+        self.file_finder_index = None;
+        self.file_finder = None;
+        self.kick_file_finder_index_rebuild();
+        let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+        let _ = self
+            .search_query_tx
+            .send(SearchRequest::SetRoots(roots.clone()));
+        self.search.roots = roots.clone();
+        if let Some(lsp) = &self.lsp {
+            lsp.set_extra_roots(roots.into_iter().skip(1).collect());
+        }
+    }
+
+    /// Re-emit the OSC window title for the current folder set: the
+    /// primary root's name, with VS Code's " (Workspace)" marker while
+    /// more than one folder is open (#147).
+    fn refresh_workspace_title(&mut self) {
+        use std::io::Write;
+        let mut title = build_title(self.workspace_root());
+        if self.roots.is_multi() {
+            title.push_str(" (Workspace)");
+        }
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&set_title_seq(&title));
+        let _ = out.flush();
+    }
+
+    /// Open the fuzzy directory picker in add-folder mode (#147): the
+    /// same zoxide-backed popup as Cmd+Z, with Enter adding the chosen
+    /// directory as a workspace root instead of re-rooting.
+    fn open_add_folder_picker(&mut self) {
+        self.zoxide_add_folder = true;
+        self.open_zoxide_jump();
+        if self.zoxide_jump.is_some() {
+            self.status =
+                String::from("Add Folder to Workspace: pick a directory — Enter adds, Esc cancels");
+        }
+    }
+
     pub fn change_workspace_root(&mut self, new_root: PathBuf) {
         let display = new_root.display().to_string();
         // The remembered task belongs to the old workspace; Rerun Last Task
@@ -29299,6 +29478,9 @@ impl App {
         self.tree_clipboard = None;
         self.compare_anchor = None;
         self.fs_watch.rebind(&new_root, &self.tree);
+        // A re-root collapses the workspace to one folder: the secondary
+        // watchers go with their roots (#147).
+        self.fs_watch_extra.clear();
         self.git.bypass_debounce();
         // Rebind the worker's root before any query, otherwise the next
         // Status / Changes request runs against the stale root captured
@@ -29339,6 +29521,7 @@ impl App {
             .search_query_tx
             .send(SearchRequest::SetRoot(new_root.clone()));
         self.search.root = new_root.clone();
+        self.search.roots = vec![new_root.clone()];
         self.search.hits.clear();
         self.search.selected = 0;
         self.search.scroll = 0;
@@ -29549,6 +29732,8 @@ impl App {
                 self.compare_anchor = Some(path);
                 self.status = format!("Selected {label} for compare");
             }
+            MenuAction::AddWorkspaceFolder => self.open_add_folder_picker(),
+            MenuAction::RemoveWorkspaceFolder(path) => self.remove_workspace_folder(path),
             MenuAction::MakeRoot(folder) => {
                 self.change_workspace_root(folder);
             }

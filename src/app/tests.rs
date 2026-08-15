@@ -20775,6 +20775,71 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
 }
 
 #[test]
+fn add_and_remove_workspace_folder_fan_out_across_tree_index_and_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("alpha");
+    let b = tmp.path().join("beta");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    std::fs::write(a.join("main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(b.join("util.rs"), "pub fn u() {}\n").unwrap();
+    let mut app = App::new(a.clone()).unwrap();
+
+    app.add_workspace_folder(b.clone());
+
+    let b_canon = b.canonicalize().unwrap();
+    assert!(app.roots.is_multi(), "the model grew");
+    assert!(
+        app.tree.root_paths().any(|r| r == b_canon),
+        "the Explorer gained the section"
+    );
+    assert_eq!(app.search.roots.len(), 2, "the search panel spans both");
+    assert_eq!(
+        app.fs_watch_extra.len(),
+        1,
+        "the added root gets its own watcher share"
+    );
+    // The Cmd+P index rebuild runs on a walker thread: poll it in, then
+    // both roots' files must appear under root-name prefixes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        app.try_install_pending_init();
+        if let Some(idx) = app.file_finder_index.as_ref() {
+            let rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+            if rels.contains(&"alpha/main.rs") && rels.contains(&"beta/util.rs") {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the multi-root Cmd+P index never landed; entries: {:?}",
+            app.file_finder_index
+                .as_ref()
+                .map(|i| i.iter().map(|e| e.rel.clone()).collect::<Vec<_>>())
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // Adding it again is a no-op with an explanation.
+    app.add_workspace_folder(b.clone());
+    assert_eq!(app.status, "Folder is already in the workspace");
+
+    // The primary is not removable; the secondary is, and everything
+    // collapses back to single-root.
+    let a_canon = a.canonicalize().unwrap();
+    app.remove_workspace_folder(a_canon);
+    assert!(app.roots.is_multi(), "removing the primary is refused");
+    app.remove_workspace_folder(b_canon.clone());
+    assert!(!app.roots.is_multi());
+    assert!(
+        !app.tree.root_paths().any(|r| r == b_canon),
+        "the section left the Explorer"
+    );
+    assert_eq!(app.search.roots.len(), 1);
+    assert!(app.fs_watch_extra.is_empty());
+}
+
+#[test]
 fn delete_filters_workspace_roots_out_of_a_mixed_selection() {
     // #146 review: the context menu forwards a mixed multi-selection
     // wholesale into MenuAction::Delete, and Select All marks the root

@@ -486,6 +486,12 @@ enum Cmd {
     /// rust-analyzer's cold indexing then overlaps with the user browsing
     /// the tree instead of starting at the first `.rs` open.
     PrewarmWorkspace,
+    /// Replace the secondary workspace-root set (multi-root, #147): widens
+    /// the project-root bound for future opens and prewarms roots that are
+    /// new, so an added folder's servers start like a fresh workspace's.
+    SetExtraRoots {
+        roots: Vec<PathBuf>,
+    },
     RequestSemanticTokens {
         path: PathBuf,
         seq: u64,
@@ -809,6 +815,16 @@ impl LspManager {
             return;
         }
         let _ = self.cmd_tx.send(Cmd::PrewarmWorkspace);
+    }
+
+    /// Replace the secondary workspace-root set (multi-root, #147). Inert
+    /// under `cfg(test)` like `prewarm_workspace`, for the same reason:
+    /// test-built Apps must never spawn real servers.
+    pub fn set_extra_roots(&self, roots: Vec<PathBuf>) {
+        if cfg!(test) {
+            return;
+        }
+        let _ = self.cmd_tx.send(Cmd::SetExtraRoots { roots });
     }
 
     pub fn change_doc(&self, path: PathBuf, text: String) {
@@ -1355,6 +1371,12 @@ type ClientKey = (Language, PathBuf);
 
 struct WorkerState {
     workspace_root: PathBuf,
+    /// Secondary workspace roots (multi-root, #147). Servers stay one
+    /// instance per (language, project root); these only widen the bound
+    /// `project_root_for` walks within, so a file under a secondary root
+    /// spawns its servers AT that root instead of falling back to the
+    /// primary — the per-root-instance model every server supports.
+    extra_roots: Vec<PathBuf>,
     registry: ServerRegistry,
     clients: HashMap<ClientKey, Vec<ManagedClient>>,
     docs: HashMap<PathBuf, DocState>,
@@ -1413,6 +1435,7 @@ async fn worker_loop(
 ) {
     let mut state = WorkerState {
         workspace_root,
+        extra_roots: Vec::new(),
         registry,
         clients: HashMap::new(),
         docs: HashMap::new(),
@@ -1431,6 +1454,14 @@ async fn worker_loop(
             }
             Cmd::OpenDoc { path, text } => state.open_doc(path, text).await,
             Cmd::PrewarmWorkspace => state.prewarm_workspace().await,
+            Cmd::SetExtraRoots { roots } => {
+                for root in &roots {
+                    if !state.extra_roots.contains(root) {
+                        state.prewarm_root(root.clone()).await;
+                    }
+                }
+                state.extra_roots = roots;
+            }
             Cmd::RequestSemanticTokens {
                 path,
                 seq,
@@ -1829,14 +1860,22 @@ impl WorkerState {
     /// root marker is evident in the workspace root — exactly what the
     /// first `open_doc` of that language would do, minus the document.
     async fn prewarm_workspace(&mut self) {
-        let root = self.workspace_root.clone();
+        self.prewarm_root(self.workspace_root.clone()).await;
+    }
+
+    /// Prewarm one root: spawn the servers for every language whose
+    /// marker sits at that root. Startup runs it on the primary; adding a
+    /// workspace folder (#147) runs it on the new root so its servers
+    /// come up like a fresh workspace's.
+    async fn prewarm_root(&mut self, root: PathBuf) {
         for lang in crate::lsp::languages::languages_evident_in(&root) {
             let clients = self.ensure_clients(lang, &root).await;
             if !clients.is_empty() {
                 log_file::log(&format!(
-                    "lsp prewarm: {} server(s) up for {}",
+                    "lsp prewarm: {} server(s) up for {} at {}",
                     clients.len(),
-                    lang.lsp_id()
+                    lang.lsp_id(),
+                    root.display()
                 ));
             }
         }
@@ -1846,7 +1885,8 @@ impl WorkerState {
         let Some(lang) = path_to_language(&path) else {
             return;
         };
-        let project_root = project_root_for(&path, lang, &self.workspace_root);
+        let project_root =
+            project_root_for_roots(&path, lang, &self.workspace_root, &self.extra_roots);
         let clients = self.ensure_clients(lang, &project_root).await;
         if clients.is_empty() {
             return;
@@ -4185,23 +4225,46 @@ fn manifest_names(lang: Language) -> &'static [&'static str] {
 /// the workspace root when none is found, so a plain single-project workspace
 /// behaves exactly as before.
 fn project_root_for(path: &Path, lang: Language, workspace_root: &Path) -> PathBuf {
+    project_root_within(path, lang, workspace_root)
+}
+
+/// [`project_root_for`] with the multi-root bound (#147): the walk stays
+/// inside the workspace root OWNING the file (longest prefix over all
+/// roots), and the fallback is that owning root — so a file under a
+/// secondary root roots its servers there, never at the primary. A file
+/// outside every root keeps the historical primary-root fallback.
+fn project_root_for_roots(
+    path: &Path,
+    lang: Language,
+    primary: &Path,
+    extra_roots: &[PathBuf],
+) -> PathBuf {
+    let owner = std::iter::once(primary)
+        .chain(extra_roots.iter().map(PathBuf::as_path))
+        .filter(|r| path.starts_with(r))
+        .max_by_key(|r| r.components().count())
+        .unwrap_or(primary);
+    project_root_within(path, lang, owner)
+}
+
+fn project_root_within(path: &Path, lang: Language, bound: &Path) -> PathBuf {
     let manifests = manifest_names(lang);
     if !manifests.is_empty() {
         let mut dir = path.parent();
         while let Some(d) = dir {
-            if !d.starts_with(workspace_root) {
+            if !d.starts_with(bound) {
                 break;
             }
             if manifests.iter().any(|m| d.join(m).exists()) {
                 return d.to_path_buf();
             }
-            if d == workspace_root {
+            if d == bound {
                 break;
             }
             dir = d.parent();
         }
     }
-    workspace_root.to_path_buf()
+    bound.to_path_buf()
 }
 
 /// Walk `$PATH` looking for an executable file named `cmd`. Avoids
@@ -5467,6 +5530,7 @@ mod tests {
         let (fmt_tx, fmt_rx) = std_mpsc::channel();
         let mut state = WorkerState {
             workspace_root: root.clone(),
+            extra_roots: Vec::new(),
             registry: ServerRegistry::new(),
             clients: HashMap::new(),
             docs: HashMap::new(),
@@ -5575,6 +5639,7 @@ while True:
         let (prog_tx, _prog_rx) = std_mpsc::channel();
         let mut state = WorkerState {
             workspace_root: root.clone(),
+            extra_roots: Vec::new(),
             registry,
             clients: HashMap::new(),
             docs: HashMap::new(),
@@ -5691,6 +5756,7 @@ while True:
         let (prog_tx, _prog_rx) = std_mpsc::channel();
         let mut state = WorkerState {
             workspace_root: root.clone(),
+            extra_roots: Vec::new(),
             registry,
             clients: HashMap::new(),
             docs: HashMap::new(),
@@ -5869,6 +5935,7 @@ while True:
         let (prog_tx, _prog_rx) = std_mpsc::channel();
         let mut state = WorkerState {
             workspace_root: root.clone(),
+            extra_roots: Vec::new(),
             registry,
             clients: HashMap::new(),
             docs: HashMap::new(),
@@ -6111,6 +6178,7 @@ while True:
         let (prog_tx, _prog_rx) = std_mpsc::channel();
         let mut state = WorkerState {
             workspace_root: root.clone(),
+            extra_roots: Vec::new(),
             registry,
             clients: HashMap::new(),
             docs: HashMap::new(),

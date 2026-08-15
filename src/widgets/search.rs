@@ -457,6 +457,9 @@ pub enum SearchEvent {
 pub enum SearchRequest {
     Query(String, SearchOpts),
     SetRoot(PathBuf),
+    /// Replace the whole root set (multi-root workspaces, #147): the scan
+    /// walks every root, so hits come from all workspace folders.
+    SetRoots(Vec<PathBuf>),
     /// Snapshot of files open in unsaved (dirty) editors as `(path, content)`
     /// where `content` is the buffer's current text. The worker searches these
     /// in-memory copies and skips their stale disk versions, so an unsaved edit
@@ -488,10 +491,11 @@ const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(20
 /// so the receiver always sees a balanced event stream. The thread exits
 /// cleanly when the channel closes.
 pub fn search_worker_loop(
-    mut root: PathBuf,
+    root: PathBuf,
     rx: std::sync::mpsc::Receiver<SearchRequest>,
     tx: std::sync::mpsc::Sender<SearchEvent>,
 ) {
+    let mut roots: Vec<PathBuf> = vec![root];
     use std::sync::mpsc::RecvTimeoutError;
     let mut current: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> = None;
     // Latest snapshot of unsaved editor buffers, refreshed by SetDirtyBuffers.
@@ -510,9 +514,14 @@ pub fn search_worker_loop(
         // and do not debounce: apply and wait for the next message.
         match latest {
             SearchRequest::SetRoot(new_root) => {
-                root = new_root;
+                roots = vec![new_root];
                 continue;
             }
+            SearchRequest::SetRoots(new_roots) if !new_roots.is_empty() => {
+                roots = new_roots;
+                continue;
+            }
+            SearchRequest::SetRoots(_) => continue,
             SearchRequest::SetDirtyBuffers(buffers) => {
                 dirty = buffers;
                 continue;
@@ -529,7 +538,11 @@ pub fn search_worker_loop(
         // the state without displacing the pending query.
         loop {
             match rx.recv_timeout(SEARCH_DEBOUNCE) {
-                Ok(SearchRequest::SetRoot(new_root)) => root = new_root,
+                Ok(SearchRequest::SetRoot(new_root)) => roots = vec![new_root],
+                Ok(SearchRequest::SetRoots(new_roots)) if !new_roots.is_empty() => {
+                    roots = new_roots
+                }
+                Ok(SearchRequest::SetRoots(_)) => {}
                 Ok(SearchRequest::SetDirtyBuffers(buffers)) => dirty = buffers,
                 Ok(SearchRequest::SetFilter(include, exclude)) => {
                     filter = PathFilter::new(&include, &exclude)
@@ -551,7 +564,7 @@ pub fn search_worker_loop(
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_for_thread = cancel.clone();
         let tx_for_thread = tx.clone();
-        let root_for_thread = root.clone();
+        let roots_for_thread = roots.clone();
         let query_for_thread = query.clone();
         let dirty_for_thread = dirty.clone();
         let filter_for_thread = filter.clone();
@@ -568,9 +581,15 @@ pub fn search_worker_loop(
                 if let Ok(canon) = path.canonicalize() {
                     skip.insert(canon);
                 }
-                if !filter_for_thread.is_empty()
-                    && !filter_for_thread.allows(&root_for_thread, path)
-                {
+                // Filter globs are root-relative: judge against the root
+                // that owns the buffer's path (the first containing one;
+                // roots rarely nest and the glob answer matches VS Code's
+                // folder-relative include semantics either way).
+                let owner = roots_for_thread
+                    .iter()
+                    .find(|r| path.starts_with(r))
+                    .unwrap_or(&roots_for_thread[0]);
+                if !filter_for_thread.is_empty() && !filter_for_thread.allows(owner, path) {
                     continue;
                 }
                 collect_matches_in_text(path, content, &query_for_thread, opts, &mut buf_hits);
@@ -578,17 +597,27 @@ pub fn search_worker_loop(
             if !buf_hits.is_empty() {
                 let _ = tx_for_emit.send(SearchEvent::Hits(q_for_emit.clone(), opts, buf_hits));
             }
-            search_workspace_streaming_filtered(
-                &root_for_thread,
-                &query_for_thread,
-                opts,
-                &cancel_for_thread,
-                &skip,
-                &filter_for_thread,
-                move |batch| {
-                    let _ = tx_for_emit.send(SearchEvent::Hits(q_for_emit.clone(), opts, batch));
-                },
-            );
+            // Every workspace root in order: one balanced Hits stream, one
+            // Done after the last root (#147).
+            for scan_root in &roots_for_thread {
+                if cancel_for_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let tx_for_root = tx_for_emit.clone();
+                let q_for_root = q_for_emit.clone();
+                search_workspace_streaming_filtered(
+                    scan_root,
+                    &query_for_thread,
+                    opts,
+                    &cancel_for_thread,
+                    &skip,
+                    &filter_for_thread,
+                    move |batch| {
+                        let _ =
+                            tx_for_root.send(SearchEvent::Hits(q_for_root.clone(), opts, batch));
+                    },
+                );
+            }
             let _ = tx_for_thread.send(SearchEvent::Done(query_for_thread, opts));
         });
         current = Some((handle, cancel));
@@ -763,6 +792,10 @@ pub struct SearchPanel {
     pub last_inner: Rect,
     pub last_area: Rect,
     pub root: PathBuf,
+    /// Every workspace root (#147); `root` stays the primary. Display
+    /// strips a hit against its OWNING root, prefixed with the root's
+    /// name when more than one folder is open.
+    pub roots: Vec<PathBuf>,
     pub opts: SearchOpts,
     /// Per-toggle absolute screen column captured by the most recent render.
     /// Used by `App::handle_mouse` to map clicks on `Aa`, `ab`, `.*` into
@@ -853,6 +886,7 @@ pub enum SearchField {
 impl SearchPanel {
     pub fn new(root: PathBuf) -> Self {
         Self {
+            roots: vec![root.clone()],
             query: String::new(),
             hits: Vec::new(),
             selected: 0,
@@ -2029,11 +2063,33 @@ impl Widget for &mut SearchPanel {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| {
-                    hit.path
-                        .strip_prefix(&self.root)
-                        .unwrap_or(hit.path.as_path())
-                        .display()
-                        .to_string()
+                    let owner = self
+                        .roots
+                        .iter()
+                        .filter(|r| hit.path.starts_with(r))
+                        .max_by_key(|r| r.components().count());
+                    match owner {
+                        Some(r) if self.roots.len() > 1 => {
+                            let name = r
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            format!(
+                                "{name}/{}",
+                                hit.path
+                                    .strip_prefix(r)
+                                    .unwrap_or(hit.path.as_path())
+                                    .display()
+                            )
+                        }
+                        Some(r) => hit
+                            .path
+                            .strip_prefix(r)
+                            .unwrap_or(hit.path.as_path())
+                            .display()
+                            .to_string(),
+                        None => hit.path.display().to_string(),
+                    }
                 });
             // Black theme: selected result row matches the Explorer's
             // white-on-dark-teal selection; Croft Dark keeps black-on-blue.
