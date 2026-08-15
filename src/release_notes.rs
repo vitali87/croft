@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "The blinking caret no longer disappears on blank lines or at the end of a line in soft-wrap mode (Markdown), so you can always see where you are typing.",
+    kind: NoteKind::Feature,
+    summary: "The editor now draws indentation guides at every indent level, with the guide of the block containing the cursor highlighted, and they run through blank lines inside a block. Toggle with \"View: Toggle Indent Guides\" or in Settings.",
 }];

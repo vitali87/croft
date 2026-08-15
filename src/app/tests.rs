@@ -10049,6 +10049,25 @@ fn toggle_inline_blame_command_flips_the_editor_flag_and_pref() {
 }
 
 #[test]
+fn toggle_indent_guides_command_flips_every_editor_via_the_frame_sync() {
+    let mut app = editor_app_with_lines(&["fn a() {", "    x();", "}"]);
+    assert!(
+        app.indent_guides_enabled,
+        "indent guides are on by default (VS Code editor.guides.indentation)"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleIndentGuides);
+    assert!(!app.indent_guides_enabled, "the command turns them off");
+    // The per-frame focus sync pushes the flag onto every editor in every
+    // group, so tabs opened after the toggle can never resurrect guides.
+    app.sync_focus_flags();
+    assert!(app.editor.editors.iter().all(|e| !e.show_indent_guides));
+    app.run_command(crate::widgets::command_palette::Command::ToggleIndentGuides);
+    assert!(app.indent_guides_enabled);
+    app.sync_focus_flags();
+    assert!(app.editor.editors.iter().all(|e| e.show_indent_guides));
+}
+
+#[test]
 fn editor_cmd_gg_jumps_to_top_of_file() {
     let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
     app.editor.cursor_row = 3;

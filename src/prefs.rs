@@ -168,6 +168,11 @@ pub struct Prefs {
     /// (a default-false field keeps old configs valid, like inline blame).
     #[serde(default)]
     pub disable_auto_close_pairs: bool,
+    /// Opt-out for indentation guides (#129), which are on by default like
+    /// VS Code's `editor.guides.indentation`. Stored as the disable flag so
+    /// the derived `Default` and an older config both mean "guides shown".
+    #[serde(default)]
+    pub disable_indent_guides: bool,
     /// Opt-out for LSP inlay hints (inline type / parameter annotations),
     /// which are on by default like VS Code's `editor.inlayHints.enabled`.
     /// Stored as the disable flag so the derived `Default` and an older
@@ -348,6 +353,14 @@ pub fn save_inline_blame(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disable_inline_blame = !enabled;
+    prefs.save(&path)
+}
+
+/// Persist the indentation-guides toggle (stored as its disable flag).
+pub fn save_indent_guides(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.disable_indent_guides = !enabled;
     prefs.save(&path)
 }
 

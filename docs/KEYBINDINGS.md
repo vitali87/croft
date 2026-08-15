@@ -73,6 +73,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `Cmd+L` | Toggle the code fold at the cursor: collapse the enclosing indented block (function, loop, struct) to its header line, or re-expand it |
 | `Cmd+K` `Cmd+0` | Fold All: collapse every foldable block in the buffer |
 | `Cmd+K` `Cmd+J` | Unfold All: expand every collapsed block |
+| Command Palette: `View: Toggle Indent Guides` | Show/hide the editor's indentation guides (vertical lines at each indent level, the cursor's block highlighted; on by default, persisted, also in Settings) |
 | Mouse wheel | Scroll the pane under the pointer |
 
 ### Customize Layout
