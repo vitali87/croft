@@ -20846,6 +20846,38 @@ fn focusing_a_secondary_roots_file_rebinds_the_test_runner_and_tasks() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
+    // Drain the discovery's Finished before running: breaking out on the
+    // first case leaves the panel busy, and run_all_tests refuses while a
+    // discovery is in flight.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while app.testing.is_busy() {
+        let _ = app.test_worker.drain(&mut app.testing);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "discovery never reported Finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // And a full RUN executes in that folder: the case must go green,
+    // which only happens if cargo built and ran the secondary project.
+    app.run_all_tests();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let _ = app.test_worker.drain(&mut app.testing);
+        if app.testing.cases_for_test().iter().any(|(name, status)| {
+            name.contains("proj_truth") && *status == crate::testing::model::TestStatus::Passed
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the secondary project's test never passed; cases: {:?}",
+            app.testing.cases_for_test()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
     // Tasks discover against the active folder too.
     let tasks = crate::tasks::discover_tasks(&app.active_workspace_root());
     assert!(
