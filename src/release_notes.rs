@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Debugger inline values: while stepping, lines that mention a local — from the stopped function's header through the stop — show its current value right after the code (name = value), refreshed on every stop. Toggle with \"Debug: Toggle Inline Values\" or in Settings.",
+    kind: NoteKind::Fix,
+    summary: "Re-rooting the workspace (Make Root, the zoxide jump) now saves the outgoing workspace's terminal pane layout under its own entry and, when the panel is still the untouched startup default, restores the incoming workspace's saved layout; panes you have used are never replaced.",
 }];
