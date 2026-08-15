@@ -1117,9 +1117,85 @@ impl DapSession {
     }
 }
 
+/// The `(name, value)` pairs inline values draw from (#135): every variable
+/// of the "Locals"-named scopes, or of the first scope when no scope carries
+/// that name (adapters differ — debugpy says "Locals", js-debug "Local").
+/// Pure over already-fetched data; no adapter round-trip.
+pub fn inline_locals(
+    scopes: &[Scope],
+    variables: &std::collections::BTreeMap<i64, Vec<Variable>>,
+) -> Vec<(String, String)> {
+    let local_refs: Vec<i64> = scopes
+        .iter()
+        .filter(|s| s.name.to_lowercase().contains("local"))
+        .map(|s| s.variables_ref)
+        .collect();
+    let refs: Vec<i64> = if local_refs.is_empty() {
+        scopes
+            .first()
+            .map(|s| s.variables_ref)
+            .into_iter()
+            .collect()
+    } else {
+        local_refs
+    };
+    refs.iter()
+        .filter_map(|r| variables.get(r))
+        .flatten()
+        .map(|v| (v.name.clone(), v.value.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_locals_prefer_local_scopes_and_fall_back_to_the_first() {
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert(
+            1,
+            vec![Variable {
+                name: String::from("g"),
+                value: String::from("0"),
+                type_name: String::new(),
+                variables_ref: 0,
+            }],
+        );
+        vars.insert(
+            2,
+            vec![Variable {
+                name: String::from("x"),
+                value: String::from("1"),
+                type_name: String::new(),
+                variables_ref: 0,
+            }],
+        );
+        let scopes = vec![
+            Scope {
+                name: String::from("Globals"),
+                variables_ref: 1,
+            },
+            Scope {
+                name: String::from("Locals"),
+                variables_ref: 2,
+            },
+        ];
+        assert_eq!(
+            inline_locals(&scopes, &vars),
+            vec![(String::from("x"), String::from("1"))],
+            "a Locals scope excludes globals"
+        );
+        let unnamed = vec![Scope {
+            name: String::from("Registers"),
+            variables_ref: 1,
+        }];
+        assert_eq!(
+            inline_locals(&unnamed, &vars),
+            vec![(String::from("g"), String::from("0"))],
+            "no local-named scope falls back to the first"
+        );
+    }
 
     #[test]
     fn classifies_stopped_event_with_thread_and_reason() {
