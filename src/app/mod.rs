@@ -2107,7 +2107,9 @@ pub struct App {
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
     perf: PerfHud,
-    workspace_root: PathBuf,
+    /// The workspace's root-folder set (#143). One entry today; the
+    /// multi-root slices grow it. Read the primary via `workspace_root()`.
+    roots: crate::workspace::WorkspaceRoots,
     sidebar_view: SidebarView,
     sidebar_areas: SidebarAreas,
     /// Active IDE color theme. Drives every explicit-background surface
@@ -3585,7 +3587,7 @@ impl App {
             terminals: vec![term],
             active_terminal: 0,
             perf: PerfHud::default(),
-            workspace_root: root.clone(),
+            roots: crate::workspace::WorkspaceRoots::single(root.clone()),
             sidebar_view: SidebarView::Explorer,
             sidebar_areas: SidebarAreas::default(),
             // Read the persisted theme from the real config only outside tests;
@@ -5683,6 +5685,12 @@ impl App {
     /// root whenever that root IS the toplevel; falls back to it outside
     /// a repo (where the ops fail with their own message) and before the
     /// first status reply lands.
+    /// The primary workspace root — what `workspace_root` the field meant
+    /// before the set model (#143). Single-root semantics throughout.
+    pub fn workspace_root(&self) -> &Path {
+        self.roots.primary()
+    }
+
     fn scm_root(&self) -> PathBuf {
         self.git
             .status()
@@ -6523,7 +6531,7 @@ impl App {
                 self.build_diagnostics.remove(&f);
             }
         }
-        let base = cwd.unwrap_or(&self.workspace_root).to_path_buf();
+        let base = cwd.unwrap_or(self.workspace_root()).to_path_buf();
         let mut touched = Vec::new();
         for d in diags {
             let path = {
@@ -6599,7 +6607,7 @@ impl App {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let rel_dir = path
-                .strip_prefix(&self.workspace_root)
+                .strip_prefix(self.workspace_root())
                 .unwrap_or(path)
                 .parent()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -6847,7 +6855,7 @@ impl App {
             return Vec::new();
         }
         let mut crumbs = Vec::new();
-        let rel = path.strip_prefix(&self.workspace_root).unwrap_or(path);
+        let rel = path.strip_prefix(self.workspace_root()).unwrap_or(path);
         for comp in rel.components() {
             if let std::path::Component::Normal(os) = comp {
                 crumbs.push(Crumb {
@@ -7005,7 +7013,7 @@ impl App {
         // A background test-source lookup landed: jump or say it missed. A
         // reply from before an Explorer re-root names the old root; drop it.
         while let Ok((root, name, hit)) = self.test_jump_rx.try_recv() {
-            if root != self.workspace_root {
+            if root != self.workspace_root() {
                 continue;
             }
             match hit {
@@ -7739,7 +7747,7 @@ impl App {
                     MenuAction::OpenCustomizeLayout,
                 ),
             ],
-            self.workspace_root.clone(),
+            self.workspace_root().to_path_buf(),
         ));
         // The gear renders "active" while its menu is open; re-emit it so the
         // pressed-state PNG replaces the idle one.
@@ -7875,7 +7883,7 @@ impl App {
             selected,
             open_submenu: None,
             submenu_selected: 0,
-            target_dir: self.workspace_root.clone(),
+            target_dir: self.workspace_root().to_path_buf(),
         });
         self.overlays.activity.mark_dirty();
     }
@@ -7978,7 +7986,7 @@ impl App {
             selected,
             open_submenu: None,
             submenu_selected: 0,
-            target_dir: self.workspace_root.clone(),
+            target_dir: self.workspace_root().to_path_buf(),
         });
         self.overlays.activity.mark_dirty();
     }
@@ -8037,7 +8045,7 @@ impl App {
         self.context_menu = Some(ContextMenu::flat(
             origin,
             items,
-            self.workspace_root.clone(),
+            self.workspace_root().to_path_buf(),
         ));
     }
 
@@ -9955,7 +9963,7 @@ impl App {
                     .and_then(cwd_of_pid)
                     .filter(|p| p.is_dir())
             })
-            .unwrap_or_else(|| self.workspace_root.clone())
+            .unwrap_or_else(|| self.workspace_root().to_path_buf())
     }
 
     /// Insert `term` just after the active pane, make it active, and reveal the
@@ -9975,7 +9983,7 @@ impl App {
     /// the per-workspace session store. Called on structural changes and at
     /// quit; the default single-pane layout prunes the record instead.
     pub fn save_terminal_session(&mut self) {
-        let root = self.workspace_root.display().to_string();
+        let root = self.workspace_root().display().to_string();
         let panes = self
             .terminals
             .iter()
@@ -9984,7 +9992,7 @@ impl App {
                     .local_shell_cwd()
                     .filter(|p| p.is_dir())
                     .or_else(|| t.pid().and_then(cwd_of_pid).filter(|p| p.is_dir()))
-                    .unwrap_or_else(|| self.workspace_root.clone())
+                    .unwrap_or_else(|| self.workspace_root().to_path_buf())
                     .display()
                     .to_string(),
                 name: t.manual_name().map(str::to_string),
@@ -10005,7 +10013,7 @@ impl App {
     /// pane whose shell fails to spawn is skipped.
     pub fn restore_terminal_session(&mut self) {
         let map = crate::terminal_session::load(&self.terminal_session_path);
-        let Some(rec) = map.get(&self.workspace_root.display().to_string()) else {
+        let Some(rec) = map.get(&self.workspace_root().display().to_string()) else {
             return;
         };
         let mut terms = Vec::new();
@@ -10014,7 +10022,7 @@ impl App {
             let dir = if dir.is_dir() {
                 dir
             } else {
-                self.workspace_root.clone()
+                self.workspace_root().to_path_buf()
             };
             if let Ok(mut t) = PtyTerminal::new(&dir) {
                 t.set_manual_name(p.name.clone());
@@ -14825,7 +14833,7 @@ impl App {
     /// a whole-workspace walk, so it runs on a background thread and the jump
     /// lands via the drain in [`Self::sync_explorer_panels`].
     fn jump_to_test_source(&mut self, name: String) {
-        let root = self.workspace_root.clone();
+        let root = self.workspace_root().to_path_buf();
         let tx = self.test_jump_tx.clone();
         self.status = format!("Locating test {name}");
         std::thread::spawn(move || {
@@ -15096,7 +15104,7 @@ impl App {
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if Self::run_spec_for(p, &self.workspace_root).is_some() {
+                if Self::run_spec_for(p, self.workspace_root()).is_some() {
                     (true, false)
                 } else if crate::dap::registry::adapter_for_extension(&ext).is_some() {
                     (true, true)
@@ -15724,7 +15732,7 @@ impl App {
         match crate::dap::session::DapSession::launch(
             &py_str,
             &adapter_args,
-            &self.workspace_root,
+            self.workspace_root(),
             &path,
             &py,
             breakpoints,
@@ -15777,7 +15785,7 @@ impl App {
         match crate::dap::session::DapSession::launch_js(
             &node,
             &server,
-            &self.workspace_root,
+            self.workspace_root(),
             path,
             breakpoints,
             false,
@@ -15843,7 +15851,7 @@ impl App {
             .collect();
         let cwd = label_path
             .parent()
-            .unwrap_or(&self.workspace_root)
+            .unwrap_or(self.workspace_root())
             .to_path_buf();
         match crate::dap::session::DapSession::launch_with(
             &adapter,
@@ -16198,7 +16206,7 @@ impl App {
             self.run_debug.feedback_is_error = true;
             return;
         };
-        let Some(spec) = Self::run_spec_for(&path, &self.workspace_root) else {
+        let Some(spec) = Self::run_spec_for(&path, self.workspace_root()) else {
             self.run_debug.feedback = Some(format!(
                 "Don't know how to run {}",
                 path.file_name()
@@ -18700,7 +18708,7 @@ impl App {
     /// Tasks: Run Task — discover the workspace's tasks and open the
     /// picker over them.
     pub fn open_run_task_picker(&mut self) {
-        self.run_tasks = crate::tasks::discover_tasks(&self.workspace_root);
+        self.run_tasks = crate::tasks::discover_tasks(self.workspace_root());
         let rows: Vec<crate::widgets::list_picker::ListRow> = self
             .run_tasks
             .iter()
@@ -18735,9 +18743,9 @@ impl App {
         // and running the new project's build there builds the old one.
         // An unknown cwd (android, remote) keeps today's reuse.
         let root = self
-            .workspace_root
+            .workspace_root()
             .canonicalize()
-            .unwrap_or_else(|_| self.workspace_root.clone());
+            .unwrap_or_else(|_| self.workspace_root().to_path_buf());
         if let Some(idx) = self.terminals.iter().position(|t| {
             t.label() == pane_name
                 && t.foreground_is_shell()
@@ -18751,7 +18759,7 @@ impl App {
             self.status = format!("Running {}", task.label);
             return;
         }
-        match crate::widgets::terminal::PtyTerminal::new(&self.workspace_root) {
+        match crate::widgets::terminal::PtyTerminal::new(self.workspace_root()) {
             Ok(mut term) => {
                 term.set_manual_name(Some(pane_name));
                 term.write_input(command.as_bytes());
@@ -18768,7 +18776,7 @@ impl App {
     /// for whatever the workspace is; fall back to the picker when no
     /// manifest declares one.
     pub fn run_build_task(&mut self) {
-        let tasks = crate::tasks::discover_tasks(&self.workspace_root);
+        let tasks = crate::tasks::discover_tasks(self.workspace_root());
         match crate::tasks::default_build_task(&tasks).cloned() {
             Some(task) => self.run_project_task(task),
             None => {
@@ -19458,7 +19466,7 @@ impl App {
             });
         }
         crate::session_state::SessionState {
-            workspace_root: self.workspace_root.clone(),
+            workspace_root: self.workspace_root().to_path_buf(),
             tabs,
             active_tab,
             sidebar_view: sidebar_view_label(self.sidebar_view).to_string(),
@@ -22883,12 +22891,12 @@ impl App {
                 .pid()
                 .and_then(cwd_of_pid)
                 .filter(|p| p.is_dir())
-                .unwrap_or_else(|| self.workspace_root.clone());
+                .unwrap_or_else(|| self.workspace_root().to_path_buf());
             let joined = cwd.join(&path);
             if joined.is_file() {
                 joined
             } else {
-                self.workspace_root.join(&path)
+                self.workspace_root().join(&path)
             }
         };
         if !abs.is_file() {
@@ -23158,7 +23166,7 @@ impl App {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::widgets::file_finder::FileEntry>>();
-        let root = self.workspace_root.clone();
+        let root = self.workspace_root().to_path_buf();
         std::thread::spawn(move || {
             let entries = crate::widgets::file_finder::build_file_index(&root);
             let _ = tx.send(entries);
@@ -23178,7 +23186,7 @@ impl App {
         // rather than open an empty finder; this only fires when
         // Cmd+P is pressed within the first few hundred ms of launch.
         if self.file_finder_index.is_none() {
-            let entries = crate::widgets::file_finder::build_file_index(&self.workspace_root);
+            let entries = crate::widgets::file_finder::build_file_index(self.workspace_root());
             self.file_finder_index = Some(std::sync::Arc::new(entries));
             self.file_finder_index_rx = None;
         }
@@ -23908,7 +23916,7 @@ impl App {
             }
         };
         let (program, args) = plan.command_line();
-        match PtyTerminal::new_running(&program, &args, &self.workspace_root) {
+        match PtyTerminal::new_running(&program, &args, self.workspace_root()) {
             Ok(term) => {
                 let slot = self.active_terminal + 1;
                 self.terminals.insert(slot, term);
@@ -24015,7 +24023,7 @@ impl App {
         self.mcp_started = Some(std::time::Instant::now());
         self.mcp_busy_label = Some(label.clone());
         self.status = label.clone();
-        let cwd = self.workspace_root.clone();
+        let cwd = self.workspace_root().to_path_buf();
         let version = env!("CARGO_PKG_VERSION").to_string();
         let _ = std::thread::Builder::new()
             .name("mcp-cmd".into())
@@ -24030,7 +24038,7 @@ impl App {
     /// of writing a bare filename to croft's working directory.
     fn scratch_buffer_path(&self, name: &str) -> PathBuf {
         let safe = name.replace(['/', '\\'], "-");
-        self.workspace_root.join(safe)
+        self.workspace_root().join(safe)
     }
 
     /// Drain a completed MCP command: render its text into a scratch buffer on
@@ -29242,7 +29250,7 @@ impl App {
                 shell_synced = false;
             }
         }
-        self.workspace_root = new_root.clone();
+        self.roots.replace_primary(new_root.clone());
         // A panel the user never touched — the startup default, one unnamed
         // shell with no input ever typed and no launched program — is swapped
         // for the incoming workspace's saved layout, the same restore startup
@@ -29910,7 +29918,7 @@ impl App {
     /// the workspace) fall back to the absolute path so the clipboard never
     /// holds a misleading `../../` walk or an empty string.
     fn copy_relative_path_to_clipboard(&mut self, path: PathBuf) {
-        let text = relative_clipboard_text(&path, &self.workspace_root);
+        let text = relative_clipboard_text(&path, self.workspace_root());
         self.status = if copy_to_clipboard(&text) {
             format!("Copied relative path: {text}")
         } else {
@@ -31428,7 +31436,14 @@ impl App {
     /// the root (`~/.ssh/config`, files opened by absolute path) keep
     /// their absolute form.
     fn status_path(&self, path: &Path) -> String {
-        let rel = path.strip_prefix(&self.workspace_root).unwrap_or(path);
+        // Folder-relative via the OWNING root (#143): identical to a plain
+        // primary-root strip while the set holds one entry, and already the
+        // multi-root label rule once it holds more.
+        let rel = self
+            .roots
+            .owning_root(path)
+            .and_then(|r| path.strip_prefix(r).ok())
+            .unwrap_or(path);
         if rel.as_os_str().is_empty() {
             String::from(".")
         } else {
@@ -34700,7 +34715,7 @@ pub fn run(
         let _ = state.save(&session_path);
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(reexec_binary_path());
-        cmd.arg(&app.workspace_root)
+        cmd.arg(app.workspace_root())
             .arg("--restore-session")
             .arg(&session_path);
         let err = CommandExt::exec(&mut cmd);
