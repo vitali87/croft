@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Dragging files onto the Explorer's pinned sticky rows now drops into the pinned directory itself — previously the drop silently targeted whatever row the band covered — and drag-selection no longer extends onto rows hidden under the band.",
+    kind: NoteKind::Fix,
+    summary: "The blinking caret no longer disappears on blank lines or at the end of a line in soft-wrap mode (Markdown), so you can always see where you are typing.",
 }];
