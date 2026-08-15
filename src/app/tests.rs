@@ -20775,6 +20775,46 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
 }
 
 #[test]
+fn delete_filters_workspace_roots_out_of_a_mixed_selection() {
+    // #146 review: the context menu forwards a mixed multi-selection
+    // wholesale into MenuAction::Delete, and Select All marks the root
+    // rows too — so the batch path must refuse root rows at the
+    // delete_paths choke point, not rely on the per-node guard.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    std::fs::write(a.join("f.txt"), "x\n").unwrap();
+    let mut app = App::new(a.clone()).unwrap();
+    app.tree.add_root(b.clone());
+
+    // Mixed batch: a real file plus BOTH root rows (what Select All +
+    // right-click Delete assembles).
+    app.delete_paths(vec![a.join("f.txt"), a.clone(), b.clone()]);
+    let prompt = app.input_prompt.as_ref().expect("the confirm opens");
+    match &prompt.purpose {
+        crate::widgets::input_prompt::InputPurpose::TreeDelete { paths } => {
+            assert_eq!(
+                paths,
+                &vec![a.join("f.txt")],
+                "both workspace roots are filtered; only the file survives to the confirm"
+            );
+        }
+        other => panic!("wrong prompt purpose: {other:?}"),
+    }
+    app.input_prompt = None;
+
+    // A batch of ONLY roots opens no prompt at all.
+    app.delete_paths(vec![a.clone(), b.clone()]);
+    assert!(
+        app.input_prompt.is_none(),
+        "a roots-only batch is refused outright"
+    );
+    assert_eq!(app.status, "Workspace roots cannot be deleted");
+}
+
+#[test]
 fn change_workspace_root_saves_the_outgoing_workspaces_terminal_layout() {
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("a");

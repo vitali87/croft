@@ -31144,19 +31144,11 @@ impl App {
     }
 
     /// Trash every entry in the tree's current action set (the multi-
-    /// selection if non-empty, otherwise just the focused row). Refuses the
-    /// workspace root, even if some other path in the set succeeds.
+    /// selection if non-empty, otherwise just the focused row). Workspace
+    /// root rows are filtered by `delete_paths` — the shared choke point —
+    /// even if some other path in the set proceeds.
     fn delete_selection(&mut self) {
-        let paths: Vec<PathBuf> = self
-            .tree
-            .action_paths()
-            .into_iter()
-            .filter(|p| {
-                let canon_root = self.tree.root.canonicalize().ok();
-                let canon_p = p.canonicalize().ok();
-                p != &self.tree.root && canon_root != canon_p
-            })
-            .collect();
+        let paths = self.tree.action_paths();
         if paths.is_empty() {
             return;
         }
@@ -31164,8 +31156,29 @@ impl App {
     }
 
     fn delete_paths(&mut self, paths: Vec<PathBuf>) {
+        // No workspace root row is ever a delete target, whichever flow
+        // assembled the set: the context menu forwards a mixed multi-
+        // selection wholesale, and Select All marks the root rows too, so
+        // the per-node `delete_target_for` guard alone cannot protect a
+        // root riding along in the batch. Filter here — the one choke
+        // point every delete flow funnels through — with the same
+        // canonicalized comparison the old primary-root guard used, so a
+        // root reached through a symlinked path is still refused.
+        let canon_roots: Vec<PathBuf> = self
+            .tree
+            .root_paths()
+            .filter_map(|r| r.canonicalize().ok())
+            .collect();
+        let is_root = |p: &PathBuf| {
+            self.tree.root_paths().any(|r| r == p)
+                || p.canonicalize()
+                    .ok()
+                    .is_some_and(|cp| canon_roots.contains(&cp))
+        };
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|p| !is_root(p)).collect();
         let total = paths.len();
         if total == 0 {
+            self.status = String::from("Workspace roots cannot be deleted");
             return;
         }
         // Confirm before trashing — Delete (or the context menu's Delete) must

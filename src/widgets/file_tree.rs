@@ -130,6 +130,52 @@ impl FileTree {
         self.load_children(0);
     }
 
+    /// Append `path` as an additional workspace root (multi-root Phase 1b,
+    /// #145): a new depth-0 section row at the end of the flattened list,
+    /// expanded and loaded like the primary root. `self.root` stays the
+    /// PRIMARY root — the launch identity — and `set_root` still collapses
+    /// the tree back to a single root (a re-root changes what the window
+    /// is, not the folder list). A path already present as a root is
+    /// ignored rather than duplicated.
+    pub fn add_root(&mut self, path: PathBuf) {
+        if self.root_paths().any(|r| r == path) {
+            return;
+        }
+        self.nodes.push(Node {
+            path,
+            depth: 0,
+            is_dir: true,
+            expanded: true,
+            loaded: false,
+        });
+        let idx = self.nodes.len() - 1;
+        self.load_children(idx);
+    }
+
+    /// Every workspace root in display order: the depth-0 section rows.
+    /// The first is always the primary root.
+    pub fn root_paths(&self) -> impl Iterator<Item = &Path> {
+        self.nodes
+            .iter()
+            .filter(|n| n.depth == 0)
+            .map(|n| n.path.as_path())
+    }
+
+    /// The root owning `path`, by longest prefix over the tree's own root
+    /// rows — the same resolution rule as `WorkspaceRoots::owning_root`,
+    /// local so the widget stays app-independent.
+    fn owning_root(&self, path: &Path) -> Option<&Path> {
+        self.root_paths()
+            .filter(|r| path.starts_with(r))
+            .max_by_key(|r| r.components().count())
+    }
+
+    /// True when `path` names one of the workspace root rows: the ignored-set
+    /// ancestor walk and the guards that protect root rows stop here.
+    fn is_root_path(&self, path: &Path) -> bool {
+        self.root_paths().any(|r| r == path)
+    }
+
     /// True when `path` is git-ignored: either listed in the ignored set
     /// itself or a descendant of an ignored directory (the set stores a
     /// fully-ignored dir as one collapsed entry). Walks ancestors up to the
@@ -143,7 +189,9 @@ impl FileTree {
             if self.ignored.contains(p) {
                 return true;
             }
-            if p == self.root {
+            // Stop at whichever workspace root owns the path (#145): the
+            // walk must never escape a root into its parent directories.
+            if self.is_root_path(p) {
                 return false;
             }
             match p.parent() {
@@ -510,7 +558,10 @@ impl FileTree {
             if idx >= self.nodes.len() {
                 continue;
             }
-            if self.nodes[idx].is_dir && self.nodes[idx].expanded {
+            // Every ROOT section row stays expanded — with multiple
+            // workspace roots (#145) they are all "the workspace root"
+            // the action's name spares, not just index 0.
+            if self.nodes[idx].depth > 0 && self.nodes[idx].is_dir && self.nodes[idx].expanded {
                 self.collapse(idx);
             }
         }
@@ -555,10 +606,15 @@ impl FileTree {
     /// `explorer.autoReveal` behaviour — picking a deeply-nested file pops
     /// open every parent and parks the cursor on the row.
     pub fn reveal_path(&mut self, target: &Path) -> bool {
-        let Ok(rel) = target.strip_prefix(&self.root) else {
+        // The OWNING root (longest prefix, #145): a target under a second
+        // root walks down from that root, not the primary.
+        let Some(owner) = self.owning_root(target).map(Path::to_path_buf) else {
             return false;
         };
-        let mut current_path = self.root.clone();
+        let Ok(rel) = target.strip_prefix(&owner) else {
+            return false;
+        };
+        let mut current_path = owner;
         for component in rel.components() {
             current_path.push(component.as_os_str());
             let is_last = current_path == target;
@@ -765,7 +821,9 @@ pub fn create_file_in(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
 /// returns `None` if `node` is None (i.e. right-click on empty tree space).
 pub fn delete_target_for(node: Option<&Node>, root: &Path) -> Option<PathBuf> {
     let n = node?;
-    if n.path == root {
+    // Depth 0 is the root-row marker: with multiple workspace roots
+    // (#145) every section row is protected, not just the primary.
+    if n.depth == 0 || n.path == root {
         return None;
     }
     let canon_root = root.canonicalize().ok();
@@ -1584,6 +1642,121 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "pub fn x() {}\n").unwrap();
         let tree = FileTree::new(root.to_path_buf());
         (tmp, tree)
+    }
+
+    /// Two-root fixture: the primary from `fixture()` plus a second root
+    /// holding `lib/util.rs`, appended via `add_root`.
+    fn two_root_fixture() -> (TempDir, TempDir, FileTree) {
+        let (tmp, mut tree) = fixture();
+        let second = TempDir::new().unwrap();
+        fs::create_dir(second.path().join("lib")).unwrap();
+        fs::write(second.path().join("lib/util.rs"), "pub fn u() {}\n").unwrap();
+        fs::write(second.path().join("Cargo.toml"), "[package]\n").unwrap();
+        tree.add_root(second.path().to_path_buf());
+        (tmp, second, tree)
+    }
+
+    #[test]
+    fn add_root_appends_a_loaded_depth_zero_section_and_keeps_the_primary() {
+        let (tmp, second, tree) = two_root_fixture();
+        assert_eq!(tree.root, tmp.path(), "the primary root is unchanged");
+        let roots: Vec<_> = tree.root_paths().collect();
+        assert_eq!(roots, vec![tmp.path(), second.path()]);
+        let second_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.path == second.path())
+            .expect("the second root is a row");
+        assert_eq!(tree.nodes[second_idx].depth, 0);
+        assert!(tree.nodes[second_idx].expanded);
+        assert!(
+            tree.nodes[second_idx + 1..]
+                .iter()
+                .any(|n| n.path.ends_with("lib")),
+            "the second root's children load beneath it"
+        );
+        // Idempotent: adding an existing root is a no-op, not a duplicate.
+        let count = tree.nodes.len();
+        let mut tree = tree;
+        tree.add_root(second.path().to_path_buf());
+        assert_eq!(tree.nodes.len(), count);
+    }
+
+    #[test]
+    fn collapse_all_keeps_every_root_section_expanded() {
+        let (_tmp, second, mut tree) = two_root_fixture();
+        // Expand a subfolder in each root first.
+        let src_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("src"))
+            .unwrap();
+        tree.selected = src_idx;
+        tree.expand_selected();
+        let lib_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("lib"))
+            .unwrap();
+        tree.selected = lib_idx;
+        tree.expand_selected();
+
+        tree.collapse_all();
+
+        let second_root = tree
+            .nodes
+            .iter()
+            .find(|n| n.path == second.path())
+            .expect("the second root row survives Collapse All");
+        assert!(
+            second_root.expanded,
+            "every ROOT section stays expanded, exactly like the primary"
+        );
+        assert!(
+            tree.nodes
+                .iter()
+                .filter(|n| n.depth > 0)
+                .all(|n| !(n.is_dir && n.expanded)),
+            "all non-root folders collapse"
+        );
+    }
+
+    #[test]
+    fn reveal_path_resolves_through_the_owning_root() {
+        let (_tmp, second, mut tree) = two_root_fixture();
+        let target = second.path().join("lib/util.rs");
+        assert!(
+            tree.reveal_path(&target),
+            "a file under the SECOND root must be revealable"
+        );
+        assert_eq!(tree.nodes[tree.selected].path, target);
+    }
+
+    #[test]
+    fn delete_guard_refuses_every_root_row() {
+        let (_tmp, second, tree) = two_root_fixture();
+        let second_node = tree.nodes.iter().find(|n| n.path == second.path());
+        assert_eq!(
+            delete_target_for(second_node, &tree.root),
+            None,
+            "a workspace root row is never a delete target, whichever root it is"
+        );
+    }
+
+    #[test]
+    fn ignored_walk_stops_at_the_owning_root() {
+        let (_tmp, second, mut tree) = two_root_fixture();
+        // Only the SECOND root's parent dir is in the ignored set — a state
+        // that cannot legitimately mark anything INSIDE that root ignored,
+        // because the ancestor walk must stop at the owning root before
+        // reaching outside it.
+        let mut set = std::collections::HashSet::new();
+        set.insert(second.path().parent().unwrap().to_path_buf());
+        tree.ignored = std::sync::Arc::new(set);
+        assert!(
+            !tree.is_ignored(&second.path().join("lib/util.rs")),
+            "the ancestor walk must stop at the owning root, never escaping into its parents"
+        );
     }
 
     #[test]
