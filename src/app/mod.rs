@@ -30901,11 +30901,7 @@ impl App {
             // A git-produced diff carries toplevel-relative `+++ b/` paths
             // (#139); croft's own snapshot diffs stay workspace-anchored.
             let root = if diff.left_is_git_head {
-                self.git
-                    .status()
-                    .repo_root
-                    .clone()
-                    .unwrap_or_else(|| self.tree.root.clone())
+                self.scm_root()
             } else {
                 self.tree.root.clone()
             };

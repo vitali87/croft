@@ -8797,22 +8797,28 @@ fn source_control_stages_a_toplevel_entry_from_a_subdir_workspace() {
         vec!["config", "user.email", "a@b"],
         vec!["config", "user.name", "a"],
     ] {
-        let _ = std::process::Command::new("git")
+        let ok = std::process::Command::new("git")
             .args(["-C"])
             .arg(&repo)
             .args(&args)
-            .status();
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git setup step failed: {args:?}");
     }
     std::fs::write(repo.join("seed.txt"), "one\ntwo\n").unwrap();
     let sub = repo.join("crates").join("foo");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(sub.join("keep.txt"), "x\n").unwrap();
     for args in [vec!["add", "."], vec!["commit", "-qm", "init"]] {
-        let _ = std::process::Command::new("git")
+        let ok = std::process::Command::new("git")
             .args(["-C"])
             .arg(&repo)
             .args(&args)
-            .status();
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git setup step failed: {args:?}");
     }
     // A tracked TOPLEVEL file goes dirty while the workspace opens the
     // subdirectory two levels down.
@@ -8851,6 +8857,7 @@ fn source_control_stages_a_toplevel_entry_from_a_subdir_workspace() {
         .args(["diff", "--cached", "--name-only"])
         .output()
         .unwrap();
+    assert!(staged.status.success(), "git diff --cached failed");
     assert!(
         String::from_utf8_lossy(&staged.stdout).contains("seed.txt"),
         "staging from the panel must address the file by its toplevel-relative path; \
