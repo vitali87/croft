@@ -168,6 +168,11 @@ pub struct Prefs {
     /// (a default-false field keeps old configs valid, like inline blame).
     #[serde(default)]
     pub disable_auto_close_pairs: bool,
+    /// Opt-out for debugger inline values (#135), on by default like VS
+    /// Code's `debug.inlineValues: "auto"`. Stored as the disable flag so
+    /// the derived `Default` and an older config both mean "values shown".
+    #[serde(default)]
+    pub disable_inline_values: bool,
     /// Whitespace rendering mode (#133): "selection" (VS Code's default,
     /// also what the empty string an older config deserializes to means),
     /// "all", or "none". Parsed by `WhitespaceMode::from_pref`.
@@ -364,6 +369,14 @@ pub fn save_inline_blame(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disable_inline_blame = !enabled;
+    prefs.save(&path)
+}
+
+/// Persist the debugger inline-values toggle (stored as its disable flag).
+pub fn save_inline_values(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.disable_inline_values = !enabled;
     prefs.save(&path)
 }
 

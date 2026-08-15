@@ -2049,6 +2049,9 @@ pub struct App {
     /// Whitespace rendering mode (#133), frame-synced to every editor;
     /// "selection" by default, the palette command cycles it.
     whitespace_mode: crate::widgets::editor::WhitespaceMode,
+    /// Debugger inline values (#135): on by default; rebuilt on every
+    /// `InspectionUpdated`, cleared wherever the stop arrow clears.
+    inline_values_enabled: bool,
     /// Auto-closing pairs (#121), persisted; synced onto the active editor
     /// beside the blame flag.
     auto_close_pairs: bool,
@@ -3558,6 +3561,7 @@ impl App {
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
             ),
+            inline_values_enabled: !loaded_prefs.disable_inline_values,
             auto_close_pairs: !loaded_prefs.disable_auto_close_pairs,
             inlay_hints_enabled: !loaded_prefs.disable_inlay_hints,
             // Keep the suite off the user's real ~/.config/croft/history: a
@@ -15202,6 +15206,8 @@ impl App {
                 // top frame (#112).
                 DapEvent::InspectionUpdated => {
                     self.refresh_watches();
+                    self.refresh_inline_values();
+                    changed = true;
                 }
                 DapEvent::Stopped { reason, .. } => {
                     self.run_debug.feedback = Some(format!("Paused ({reason})"));
@@ -15244,6 +15250,11 @@ impl App {
                     && self.editor.stop_line.as_ref() != Some(&loc)
                 {
                     self.editor.stop_line = Some(loc);
+                    // A re-stop at the same location can re-arm the arrow
+                    // without a fresh InspectionUpdated on this tick; rebuild
+                    // the trailers here too so arrow and values never split
+                    // (#136 review). Idempotent over already-fetched data.
+                    self.refresh_inline_values();
                     changed = true;
                 }
             }
@@ -15251,6 +15262,7 @@ impl App {
                 self.editor.stop_line = None;
                 self.editor.unverified_breakpoints.clear();
                 self.reset_watch_runtime();
+                self.clear_inline_values();
                 // Reply to the adapter's own `terminated`/`exited` with the
                 // graceful `disconnect` handshake before dropping it. js-debug
                 // only retires its detached watchdog on this handshake, never on
@@ -15277,6 +15289,11 @@ impl App {
             }
             _ => {
                 if self.editor.stop_line.take().is_some() {
+                    // The trailers clear wherever the stop arrow clears
+                    // (#136 review): this arm catches every phase change the
+                    // four explicit resume sites don't, guarded the same way
+                    // so ordinary Running ticks pay nothing.
+                    self.clear_inline_values();
                     changed = true;
                 }
             }
@@ -15611,6 +15628,7 @@ impl App {
             if session.phase == SessionPhase::Stopped {
                 session.continue_execution();
                 self.editor.stop_line = None;
+                self.clear_inline_values();
             }
             return;
         }
@@ -16065,6 +16083,7 @@ impl App {
         if let Some(session) = self.dap_session.as_mut() {
             session.step(command);
             self.editor.stop_line = None;
+            self.clear_inline_values();
         }
     }
 
@@ -16134,6 +16153,7 @@ impl App {
         ));
         self.editor.stop_line = None;
         self.editor.unverified_breakpoints.clear();
+        self.clear_inline_values();
         self.status = String::from("Debug session stopped");
         // Clear the paused-state feedback ("Paused (breakpoint)") so the
         // empty-state panel doesn't keep showing it under the Run button.
@@ -18524,6 +18544,7 @@ impl App {
                     "toggle:indent_guides" => self.toggle_indent_guides(),
                     "toggle:bracket_colors" => self.toggle_bracket_colors(),
                     "toggle:render_whitespace" => self.toggle_render_whitespace(),
+                    "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
                     "cmd:color_theme" => {
@@ -18603,6 +18624,13 @@ impl App {
                 label: format!(
                     "Editor: Render Whitespace: {}",
                     self.whitespace_mode.label()
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:inline_values"),
+                label: format!(
+                    "Debugger: Inline Values: {}",
+                    on_off(self.inline_values_enabled)
                 ),
             },
             ListRow {
@@ -24083,6 +24111,7 @@ impl App {
             Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
             Cmd::ToggleBracketColors => self.toggle_bracket_colors(),
             Cmd::ToggleRenderWhitespace => self.toggle_render_whitespace(),
+            Cmd::ToggleInlineValues => self.toggle_inline_values(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
@@ -28617,6 +28646,71 @@ impl App {
             let _ = crate::prefs::save_render_whitespace(self.whitespace_mode.pref_id());
         }
         self.status = format!("Render Whitespace: {}", self.whitespace_mode.label());
+    }
+
+    /// Rebuild the inline-value trailers (#135) from the current stop's
+    /// already-fetched VARIABLES data, on every editor showing the stopped
+    /// file (inactive split groups render too).
+    fn refresh_inline_values(&mut self) {
+        use crate::dap::session::SessionPhase;
+        if !self.inline_values_enabled {
+            return;
+        }
+        let Some(session) = self.dap_session.as_ref() else {
+            return;
+        };
+        if session.phase != SessionPhase::Stopped {
+            return;
+        }
+        let Some((path, line)) = session.current_location.clone() else {
+            return;
+        };
+        let locals = crate::dap::session::inline_locals(&session.scopes, &session.variables);
+        for ed in self.editor.editors.iter_mut() {
+            if ed.path.as_deref() == Some(path.as_path()) {
+                ed.set_inline_values_from_locals(line, &locals);
+            }
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                if ed.path.as_deref() == Some(path.as_path()) {
+                    ed.set_inline_values_from_locals(line, &locals);
+                }
+            }
+        }
+    }
+
+    /// Drop every inline-value trailer, in every editor of every group —
+    /// called wherever the stop arrow clears (resume, step, terminate).
+    fn clear_inline_values(&mut self) {
+        for ed in self.editor.editors.iter_mut() {
+            ed.inline_values.clear();
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                ed.inline_values.clear();
+            }
+        }
+    }
+
+    fn toggle_inline_values(&mut self) {
+        self.inline_values_enabled = !self.inline_values_enabled;
+        if self.inline_values_enabled {
+            self.refresh_inline_values();
+        } else {
+            self.clear_inline_values();
+        }
+        if !cfg!(test) {
+            let _ = crate::prefs::save_inline_values(self.inline_values_enabled);
+        }
+        self.status = format!(
+            "Debug Inline Values: {}",
+            if self.inline_values_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        );
     }
 
     fn toggle_bracket_colors(&mut self) {

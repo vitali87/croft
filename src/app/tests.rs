@@ -10144,6 +10144,29 @@ fn toggle_render_whitespace_cycles_modes_across_every_editor() {
 }
 
 #[test]
+fn toggle_inline_values_clears_trailers_on_disable() {
+    let mut app = editor_app_with_lines(&["def f():", "    x = 1"]);
+    assert!(
+        app.inline_values_enabled,
+        "inline values are on by default (VS Code debug.inlineValues: auto)"
+    );
+    // Simulate a stop having populated trailers, then disable: every editor
+    // must drop them immediately, not on the next stop.
+    app.editor.inline_values.insert(1, String::from("x = 1"));
+    app.run_command(crate::widgets::command_palette::Command::ToggleInlineValues);
+    assert!(!app.inline_values_enabled);
+    assert!(
+        app.editor
+            .editors
+            .iter()
+            .all(|e| e.inline_values.is_empty()),
+        "disabling clears the trailers in every editor"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleInlineValues);
+    assert!(app.inline_values_enabled, "round trip");
+}
+
+#[test]
 fn editor_cmd_gg_jumps_to_top_of_file() {
     let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
     app.editor.cursor_row = 3;

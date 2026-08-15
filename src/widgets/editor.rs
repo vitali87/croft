@@ -1649,6 +1649,11 @@ pub struct Editor {
     bracket_colors: Vec<Vec<(usize, u8)>>,
     /// Whitespace glyph rendering (#133); app-synced from prefs.
     pub whitespace_mode: WhitespaceMode,
+    /// Debugger inline values (#135, VS Code `debug.inlineValues`): 0-based
+    /// line → composed "name = value" trailer, rebuilt by the app on every
+    /// stop from the VARIABLES data and cleared on resume/step/terminate.
+    /// Painted like the blame trailer; the cursor-line blame yields to it.
+    pub inline_values: std::collections::BTreeMap<usize, String>,
     /// Per-tab override for soft-wrap (VS Code "View: Toggle Word Wrap",
     /// Alt+Z). `None` means follow the language default (`wrap_enabled`
     /// wraps Markdown only); `Some(true)`/`Some(false)` force it on/off for
@@ -1852,6 +1857,7 @@ impl Editor {
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
             whitespace_mode: WhitespaceMode::default(),
+            inline_values: std::collections::BTreeMap::new(),
             wrap_override: None,
             highlights: Vec::new(),
             semantic_overlay: Vec::new(),
@@ -2798,6 +2804,11 @@ impl Editor {
             self.folded.clear();
             self.hidden_ranges.clear();
             self.fold_epoch_lines = 0;
+            // Inline-value trailers are line numbers into the OLD file too
+            // (#136 review): a reused preview tab must not dress the incoming
+            // file in the previous one's debug state. The same-path reload
+            // keeps them — the next stop rebuilds them anyway.
+            self.inline_values.clear();
         } else if !self.folded.is_empty() {
             // The retained headers were measured against text that has just
             // been replaced. Re-measure their spans, or a reload that keeps the
@@ -4374,6 +4385,80 @@ impl Editor {
     /// Whether `line` heads a collapsible region.
     pub fn is_foldable(&self, line: usize) -> bool {
         self.fold_range(line).is_some()
+    }
+
+    /// The OUTERMOST fold header whose region covers `line` — the function's
+    /// `def`/`fn` line rather than the nearest `if`/`for` block that
+    /// [`Self::enclosing_fold_header`] stops at. Climbs header-by-header;
+    /// each step strictly decreases the line, so it terminates.
+    fn outermost_enclosing_header(&self, line: usize) -> Option<usize> {
+        let mut head = self.enclosing_fold_header(line)?;
+        loop {
+            let above = (0..head)
+                .rev()
+                .find(|&h| matches!(self.fold_range(h), Some((_, end)) if head <= end));
+            match above {
+                Some(a) => head = a,
+                None => return Some(head),
+            }
+        }
+    }
+
+    /// Rebuild the debugger inline-value trailers (#135) for a stop at
+    /// 1-based `stop_line`. Each line from the enclosing function's header
+    /// down to the stop that mentions a local as a whole identifier gets a
+    /// "name = value" list, first-mention order, capped per line; long
+    /// values elide in the middle. Lines past the execution point stay bare
+    /// — their state doesn't exist yet, which is VS Code's rule too.
+    pub fn set_inline_values_from_locals(&mut self, stop_line: usize, locals: &[(String, String)]) {
+        const MAX_ENTRIES_PER_LINE: usize = 4;
+        const MAX_VALUE_CHARS: usize = 40;
+        const MAX_SPAN_LINES: usize = 200;
+        self.inline_values.clear();
+        if locals.is_empty() || stop_line == 0 || self.lines.is_empty() {
+            return;
+        }
+        let stop = (stop_line - 1).min(self.lines.len() - 1);
+        let from = self
+            .outermost_enclosing_header(stop)
+            .unwrap_or(stop)
+            .max(stop.saturating_sub(MAX_SPAN_LINES));
+        for li in from..=stop {
+            let line = self.lines[li].clone();
+            let mut parts: Vec<String> = Vec::new();
+            for token in identifier_tokens(&line) {
+                if parts.len() >= MAX_ENTRIES_PER_LINE {
+                    break;
+                }
+                let Some((name, value)) = locals.iter().find(|(n, _)| n == token) else {
+                    continue;
+                };
+                if parts
+                    .iter()
+                    .any(|p| p.starts_with(name.as_str()) && p[name.len()..].starts_with(" = "))
+                {
+                    continue;
+                }
+                let shown: String = if value.chars().count() > MAX_VALUE_CHARS {
+                    let head: String = value.chars().take(MAX_VALUE_CHARS / 2).collect();
+                    let tail: String = value
+                        .chars()
+                        .rev()
+                        .take(MAX_VALUE_CHARS / 2 - 1)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    format!("{head}\u{2026}{tail}")
+                } else {
+                    value.clone()
+                };
+                parts.push(format!("{name} = {shown}"));
+            }
+            if !parts.is_empty() {
+                self.inline_values.insert(li, parts.join(", "));
+            }
+        }
     }
 
     /// Column distance between indentation guides: the indent width for
@@ -7167,6 +7252,29 @@ impl WhitespaceMode {
     }
 }
 
+/// The whole-identifier tokens of `line`, in order: maximal
+/// `[A-Za-z_][A-Za-z0-9_]*` runs, so an inline-value lookup for `x` can
+/// never match the `x` inside `max` (#135).
+fn identifier_tokens(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, ch) in line.char_indices() {
+        let is_ident = ch == '_' || ch.is_ascii_alphanumeric();
+        match (start, is_ident) {
+            (None, true) if ch == '_' || ch.is_ascii_alphabetic() => start = Some(i),
+            (Some(s), false) => {
+                out.push(&line[s..i]);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push(&line[s..]);
+    }
+    out
+}
+
 /// Colour-index marker for an unmatched closing bracket (painted red).
 const UNEXPECTED_BRACKET: u8 = u8::MAX;
 /// Plain-text buffers above this size skip bracket colorization: a
@@ -8495,7 +8603,32 @@ impl Widget for &mut Editor {
             if self.focused
                 && line_idx == self.cursor_row
                 && row_end >= line_len
+                && !self.inline_values.contains_key(&line_idx)
                 && let Some(note) = self.current_line_blame_annotation()
+            {
+                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let start_x = text_x + text_cols as u16 + 2;
+                let right = inner.x + inner.width;
+                if start_x < right {
+                    let avail = (right - start_x) as usize;
+                    let shown: String = note.chars().take(avail).collect();
+                    buf.set_string(
+                        start_x,
+                        y,
+                        &shown,
+                        Style::default()
+                            .fg(self.theme.ignored_fg())
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                }
+            }
+
+            // Debugger inline values (#135): the "name = value" trailer for a
+            // stopped session, on the line's last visual segment like the
+            // blame above (which yields to it on the cursor line — while
+            // stepping, state beats history). Clipped to the pane edge.
+            if row_end >= line_len
+                && let Some(note) = self.inline_values.get(&line_idx)
             {
                 let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
                 let start_x = text_x + text_cols as u16 + 2;
@@ -18536,6 +18669,125 @@ mod tests {
         let y0 = e.last_inner.y;
         assert_eq!(buf[(text_x + 1, y0)].symbol(), "\u{b7}");
         assert_eq!(buf[(text_x + 1, y0 + 1)].symbol(), "\u{b7}");
+    }
+
+    // ---- Debugger inline values (#135) ----
+
+    fn locals(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn inline_values_annotate_function_lines_up_to_the_stop_only() {
+        let mut e = editor_with("def f():\n    x = 1\n    y = x + 1\n    print(x, y)\n\nz = 9");
+        // Stopped ON line 3 (1-based): `y = x + 1` is about to run.
+        e.set_inline_values_from_locals(3, &locals(&[("x", "1"), ("y", "2")]));
+        assert_eq!(e.inline_values.get(&1).map(String::as_str), Some("x = 1"));
+        assert_eq!(
+            e.inline_values.get(&2).map(String::as_str),
+            Some("y = 2, x = 1"),
+            "first-mention order on the stop line"
+        );
+        assert!(
+            !e.inline_values.contains_key(&3),
+            "lines past the execution point stay bare"
+        );
+        assert!(!e.inline_values.contains_key(&5), "outside the function");
+    }
+
+    #[test]
+    fn inline_values_span_the_whole_function_from_a_nested_block_stop() {
+        let mut e =
+            editor_with("def f():\n    x = 1\n    if True:\n        y = 2\n        print(x, y)");
+        // Stopped on the print, inside the `if` block: the scan must climb to
+        // `def f():`, not stop at `if True:` (#136 review).
+        e.set_inline_values_from_locals(5, &locals(&[("x", "1"), ("y", "2")]));
+        assert_eq!(
+            e.inline_values.get(&1).map(String::as_str),
+            Some("x = 1"),
+            "a line above the nested block still annotates"
+        );
+        assert_eq!(
+            e.inline_values.get(&4).map(String::as_str),
+            Some("x = 1, y = 2")
+        );
+    }
+
+    #[test]
+    fn inline_values_clear_when_a_reused_tab_opens_a_different_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.py");
+        let b = dir.path().join("b.py");
+        std::fs::write(&a, "x = 1\n").unwrap();
+        std::fs::write(&b, "y = 2\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&a).unwrap();
+        e.inline_values.insert(0, String::from("x = 1"));
+        e.open(&b).unwrap();
+        assert!(
+            e.inline_values.is_empty(),
+            "a different file must not inherit the old file's trailers"
+        );
+    }
+
+    #[test]
+    fn inline_values_match_whole_identifiers_only() {
+        let mut e = editor_with("def f():\n    max = 9\n    q = max");
+        e.set_inline_values_from_locals(3, &locals(&[("x", "1"), ("q", "7")]));
+        assert!(
+            !e.inline_values.contains_key(&1),
+            "`x` must not match inside `max`"
+        );
+        assert_eq!(e.inline_values.get(&2).map(String::as_str), Some("q = 7"));
+    }
+
+    #[test]
+    fn inline_values_elide_long_values_in_the_middle() {
+        let mut e = editor_with("def f():\n    x = 1");
+        let long = "a".repeat(60);
+        e.set_inline_values_from_locals(2, &locals(&[("x", &long)]));
+        let note = e.inline_values.get(&1).unwrap();
+        assert!(note.contains('\u{2026}'), "middle ellipsis: {note}");
+        assert!(note.chars().count() < 60, "elided: {note}");
+    }
+
+    #[test]
+    fn inline_values_clear_when_locals_are_empty() {
+        let mut e = editor_with("def f():\n    x = 1");
+        e.set_inline_values_from_locals(2, &locals(&[("x", "1")]));
+        assert!(!e.inline_values.is_empty());
+        e.set_inline_values_from_locals(2, &[]);
+        assert!(e.inline_values.is_empty());
+    }
+
+    #[test]
+    fn render_paints_inline_value_trailer_after_the_line_end() {
+        let mut e = editor_with("x = 1\ny = 2");
+        e.inline_values.insert(0, String::from("x = 1"));
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        // line 0 is 5 chars wide; the trailer starts 2 cells past it.
+        let start = text_x + 5 + 2;
+        assert_eq!(buf[(start, y0)].symbol(), "x");
+        assert_eq!(buf[(start, y0)].fg, e.theme.ignored_fg());
+        assert_eq!(buf[(start + 2, y0)].symbol(), "=");
+        assert_eq!(
+            buf[(text_x + 5 + 2, y0 + 1)].symbol(),
+            " ",
+            "an unannotated line gets no trailer"
+        );
+    }
+
+    #[test]
+    fn identifier_tokens_split_on_word_boundaries() {
+        assert_eq!(
+            identifier_tokens("print(x, _y2) + max"),
+            vec!["print", "x", "_y2", "max"]
+        );
     }
 
     // ---- Select to Bracket (editor.action.selectToBracket) ----

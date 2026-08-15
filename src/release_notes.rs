@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Render whitespace: selected text now shows its spaces as · and tabs as → (VS Code's default behaviour); \"View: Toggle Render Whitespace\" cycles selection / all / none, persisted in Settings.",
+    summary: "Debugger inline values: while stepping, lines that mention a local — from the stopped function's header through the stop — show its current value right after the code (name = value), refreshed on every stop. Toggle with \"Debug: Toggle Inline Values\" or in Settings.",
 }];
