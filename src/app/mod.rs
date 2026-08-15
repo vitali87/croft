@@ -15250,6 +15250,11 @@ impl App {
                     && self.editor.stop_line.as_ref() != Some(&loc)
                 {
                     self.editor.stop_line = Some(loc);
+                    // A re-stop at the same location can re-arm the arrow
+                    // without a fresh InspectionUpdated on this tick; rebuild
+                    // the trailers here too so arrow and values never split
+                    // (#136 review). Idempotent over already-fetched data.
+                    self.refresh_inline_values();
                     changed = true;
                 }
             }
@@ -15284,6 +15289,11 @@ impl App {
             }
             _ => {
                 if self.editor.stop_line.take().is_some() {
+                    // The trailers clear wherever the stop arrow clears
+                    // (#136 review): this arm catches every phase change the
+                    // four explicit resume sites don't, guarded the same way
+                    // so ordinary Running ticks pay nothing.
+                    self.clear_inline_values();
                     changed = true;
                 }
             }

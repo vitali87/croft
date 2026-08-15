@@ -2804,6 +2804,11 @@ impl Editor {
             self.folded.clear();
             self.hidden_ranges.clear();
             self.fold_epoch_lines = 0;
+            // Inline-value trailers are line numbers into the OLD file too
+            // (#136 review): a reused preview tab must not dress the incoming
+            // file in the previous one's debug state. The same-path reload
+            // keeps them — the next stop rebuilds them anyway.
+            self.inline_values.clear();
         } else if !self.folded.is_empty() {
             // The retained headers were measured against text that has just
             // been replaced. Re-measure their spans, or a reload that keeps the
@@ -4382,6 +4387,23 @@ impl Editor {
         self.fold_range(line).is_some()
     }
 
+    /// The OUTERMOST fold header whose region covers `line` — the function's
+    /// `def`/`fn` line rather than the nearest `if`/`for` block that
+    /// [`Self::enclosing_fold_header`] stops at. Climbs header-by-header;
+    /// each step strictly decreases the line, so it terminates.
+    fn outermost_enclosing_header(&self, line: usize) -> Option<usize> {
+        let mut head = self.enclosing_fold_header(line)?;
+        loop {
+            let above = (0..head)
+                .rev()
+                .find(|&h| matches!(self.fold_range(h), Some((_, end)) if head <= end));
+            match above {
+                Some(a) => head = a,
+                None => return Some(head),
+            }
+        }
+    }
+
     /// Rebuild the debugger inline-value trailers (#135) for a stop at
     /// 1-based `stop_line`. Each line from the enclosing function's header
     /// down to the stop that mentions a local as a whole identifier gets a
@@ -4398,7 +4420,7 @@ impl Editor {
         }
         let stop = (stop_line - 1).min(self.lines.len() - 1);
         let from = self
-            .enclosing_fold_header(stop)
+            .outermost_enclosing_header(stop)
             .unwrap_or(stop)
             .max(stop.saturating_sub(MAX_SPAN_LINES));
         for li in from..=stop {
@@ -18674,6 +18696,41 @@ mod tests {
             "lines past the execution point stay bare"
         );
         assert!(!e.inline_values.contains_key(&5), "outside the function");
+    }
+
+    #[test]
+    fn inline_values_span_the_whole_function_from_a_nested_block_stop() {
+        let mut e =
+            editor_with("def f():\n    x = 1\n    if True:\n        y = 2\n        print(x, y)");
+        // Stopped on the print, inside the `if` block: the scan must climb to
+        // `def f():`, not stop at `if True:` (#136 review).
+        e.set_inline_values_from_locals(5, &locals(&[("x", "1"), ("y", "2")]));
+        assert_eq!(
+            e.inline_values.get(&1).map(String::as_str),
+            Some("x = 1"),
+            "a line above the nested block still annotates"
+        );
+        assert_eq!(
+            e.inline_values.get(&4).map(String::as_str),
+            Some("x = 1, y = 2")
+        );
+    }
+
+    #[test]
+    fn inline_values_clear_when_a_reused_tab_opens_a_different_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.py");
+        let b = dir.path().join("b.py");
+        std::fs::write(&a, "x = 1\n").unwrap();
+        std::fs::write(&b, "y = 2\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&a).unwrap();
+        e.inline_values.insert(0, String::from("x = 1"));
+        e.open(&b).unwrap();
+        assert!(
+            e.inline_values.is_empty(),
+            "a different file must not inherit the old file's trailers"
+        );
     }
 
     #[test]
