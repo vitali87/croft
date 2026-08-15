@@ -394,6 +394,21 @@ impl Theme {
         self.blend_over_bg((0x9a, 0x9a, 0x9a), 0.35)
     }
 
+    /// Foreground of an indentation guide (VS Code
+    /// `editorIndentGuide.background1`, #404040 on the dark default): a grey
+    /// blended over each theme's background so it stays a whisper above the
+    /// editor surface on dark and light themes alike.
+    pub fn indent_guide(self) -> Color {
+        self.blend_over_bg((0x88, 0x88, 0x88), 0.38)
+    }
+
+    /// Foreground of the active indentation guide — the guide of the block
+    /// containing the cursor (VS Code `editorIndentGuide.activeBackground1`,
+    /// #707070 on the dark default). Same grey, blended stronger.
+    pub fn indent_guide_active(self) -> Color {
+        self.blend_over_bg((0x88, 0x88, 0x88), 0.80)
+    }
+
     /// Background tint under read occurrences of the symbol at the caret
     /// (VS Code `editor.wordHighlightBackground`, #575757 at 72% alpha),
     /// blended over each theme's background.

@@ -1636,6 +1636,10 @@ pub struct Editor {
     /// Whether the file on disk began with a byte-order mark. `decode` strips
     /// it, so without remembering it every save silently dropped it.
     bom: bool,
+    /// Indentation guides (VS Code `editor.guides.indentation`): dim vertical
+    /// lines at each indent level in a line's leading whitespace, with the
+    /// cursor's block highlighted. App-synced from prefs; on by default.
+    pub show_indent_guides: bool,
     /// Per-tab override for soft-wrap (VS Code "View: Toggle Word Wrap",
     /// Alt+Z). `None` means follow the language default (`wrap_enabled`
     /// wraps Markdown only); `Some(true)`/`Some(false)` force it on/off for
@@ -1835,6 +1839,7 @@ impl Editor {
             eol: LineEnding::Lf,
             encoding: encoding_rs::UTF_8,
             bom: false,
+            show_indent_guides: true,
             wrap_override: None,
             highlights: Vec::new(),
             semantic_overlay: Vec::new(),
@@ -4340,6 +4345,87 @@ impl Editor {
     /// Whether `line` heads a collapsible region.
     pub fn is_foldable(&self, line: usize) -> bool {
         self.fold_range(line).is_some()
+    }
+
+    /// Column distance between indentation guides: the indent width for
+    /// space-indented buffers, one column for tab indentation (a leading tab
+    /// occupies a single cell, so each tab is one nesting level).
+    fn guide_step(&self) -> usize {
+        let s = self.indent_style();
+        if s.use_spaces {
+            s.width.max(1) as usize
+        } else {
+            1
+        }
+    }
+
+    /// Indent width `line` contributes to guide painting. A non-blank line is
+    /// its own leading-whitespace width; a blank line borrows the minimum of
+    /// its nearest non-blank neighbours, so guides run through gaps inside a
+    /// block but stop between top-level blocks (VS Code's rule). The
+    /// neighbour scans are capped: past a 200-blank-line gap guides simply
+    /// stop, which keeps the per-row render cost bounded.
+    fn guide_indent_width(&self, line: usize) -> usize {
+        const BLANK_SCAN_CAP: usize = 200;
+        if let Some(w) = self.indent_width(line) {
+            return w;
+        }
+        let above = (0..line)
+            .rev()
+            .take(BLANK_SCAN_CAP)
+            .find_map(|i| self.indent_width(i))
+            .unwrap_or(0);
+        let below = (line + 1..self.lines.len())
+            .take(BLANK_SCAN_CAP)
+            .find_map(|i| self.indent_width(i))
+            .unwrap_or(0);
+        above.min(below)
+    }
+
+    /// The active indentation guide (VS Code
+    /// `editor.guides.highlightActiveIndentation`): the innermost guide of the
+    /// block containing the cursor, as `(guide column, first line, last line)`
+    /// inclusive. A line whose next non-blank neighbour is deeper is a block
+    /// header and activates the guide of the body it opens. `None` at top
+    /// level. The block walk is capped so a pathological single block can't
+    /// make a frame scan the whole file.
+    fn active_indent_guide(&self) -> Option<(usize, usize, usize)> {
+        const BLOCK_WALK_CAP: usize = 5_000;
+        let step = self.guide_step();
+        let cr = self.cursor_row.min(self.lines.len().saturating_sub(1));
+        let own = self
+            .indent_width(cr)
+            .unwrap_or_else(|| self.guide_indent_width(cr));
+        let below = (cr + 1..self.lines.len())
+            .take(BLOCK_WALK_CAP)
+            .find_map(|i| self.indent_width(i))
+            .unwrap_or(0);
+        let target = own.max(below);
+        if target == 0 {
+            return None;
+        }
+        // The innermost guide of a block indented `target`: the last guide
+        // column strictly below it.
+        let col = (target - 1) / step * step;
+        // Anchor on a row that actually draws the guide: the cursor row for a
+        // body line, the first body row for a header.
+        let anchor = if own > col { cr } else { cr + 1 };
+        if anchor >= self.lines.len() || self.guide_indent_width(anchor) <= col {
+            return None;
+        }
+        let mut lo = anchor;
+        while lo > 0 && anchor - (lo - 1) <= BLOCK_WALK_CAP && self.guide_indent_width(lo - 1) > col
+        {
+            lo -= 1;
+        }
+        let mut hi = anchor;
+        while hi + 1 < self.lines.len()
+            && (hi + 1) - anchor <= BLOCK_WALK_CAP
+            && self.guide_indent_width(hi + 1) > col
+        {
+            hi += 1;
+        }
+        Some((col, lo, hi))
     }
 
     /// The nearest foldable header at or above `line` whose region contains
@@ -7671,6 +7757,15 @@ impl Widget for &mut Editor {
         } else {
             None
         };
+        // Indentation guides: the cursor block's active guide (focused editor
+        // only) and the paint colours, resolved once per frame — the active
+        // walk is O(block), not per-row work.
+        let guide_step = self.guide_step();
+        let active_guide = (self.show_indent_guides && self.focused)
+            .then(|| self.active_indent_guide())
+            .flatten();
+        let guide_fg = self.theme.indent_guide();
+        let guide_active_fg = self.theme.indent_guide_active();
 
         for (row_idx, vis_row) in visual_rows.iter().enumerate() {
             let y = inner.y + row_idx as u16;
@@ -7918,6 +8013,40 @@ impl Widget for &mut Editor {
                     out.extend(inlay_text_segment(raw, &merged, from, row_end));
                 }
                 buf.set_line(text_x, y, &Line::from(out), row_width);
+            }
+
+            // Indentation guides (VS Code `editor.guides.indentation`): a dim
+            // │ at each indent-unit column of the line's leading whitespace,
+            // with the cursor block's guide highlighted. Painted into blank
+            // cells only, right after the text, so text always wins and the
+            // overlays below (selection band, conflict tints) lay their
+            // backgrounds over the glyph. A wrap continuation row carries no
+            // leading whitespace, so only a line's first segment draws guides;
+            // in the flat path `row_start` is the horizontal scroll and
+            // translates the columns like every other painter here.
+            if self.show_indent_guides && (!wrap || row_start == 0) {
+                for c in (0..self.guide_indent_width(line_idx)).step_by(guide_step) {
+                    if c < row_start {
+                        continue;
+                    }
+                    let col = (c + ex(c) - row_start) as u16;
+                    if col >= row_width {
+                        break;
+                    }
+                    let cell = &mut buf[(text_x + col, y)];
+                    if cell.symbol() != " " {
+                        continue;
+                    }
+                    let fg = match active_guide {
+                        Some((ac, lo, hi)) if ac == c && (lo..=hi).contains(&line_idx) => {
+                            guide_active_fg
+                        }
+                        _ => guide_fg,
+                    };
+                    cell.set_symbol("\u{2502}");
+                    let style = cell.style().fg(fg);
+                    cell.set_style(style);
+                }
             }
 
             // Merge-conflict region tints (VS Code's current/incoming
@@ -17834,6 +17963,154 @@ mod tests {
             bm,
             "a non-bracket cell is not highlighted"
         );
+    }
+
+    // ---- Indentation guides (editor.guides.indentation) ----
+
+    fn guide_buf(e: &mut Editor, w: u16, h: u16) -> Buffer {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        let mut buf = Buffer::empty(area);
+        (e as &mut Editor).render(area, &mut buf);
+        buf
+    }
+
+    #[test]
+    fn render_paints_indent_guides_at_each_indent_level() {
+        let mut e = editor_with("fn main() {\n    if x {\n        y();\n    }\n}");
+        let buf = guide_buf(&mut e, 40, 8);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        let g = e.theme.indent_guide();
+        assert_eq!(buf[(text_x, y0 + 1)].symbol(), "\u{2502}", "level-1 guide");
+        assert_eq!(buf[(text_x, y0 + 1)].fg, g);
+        assert_eq!(
+            buf[(text_x, y0 + 2)].symbol(),
+            "\u{2502}",
+            "level-1 guide, row 2"
+        );
+        assert_eq!(
+            buf[(text_x + 4, y0 + 2)].symbol(),
+            "\u{2502}",
+            "level-2 guide"
+        );
+        assert_eq!(buf[(text_x + 4, y0 + 2)].fg, g);
+        assert_eq!(
+            buf[(text_x, y0)].symbol(),
+            "f",
+            "a top-level line gets no guide and keeps its text"
+        );
+        assert_eq!(
+            buf[(text_x + 4, y0 + 1)].symbol(),
+            "i",
+            "guides never overwrite text"
+        );
+    }
+
+    #[test]
+    fn indent_guides_continue_through_blank_lines_inside_a_block_only() {
+        let mut e = editor_with("def f():\n    a = 1\n\n    b = 2\n\ndef g():\n    pass");
+        let buf = guide_buf(&mut e, 40, 9);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(
+            buf[(text_x, y0 + 2)].symbol(),
+            "\u{2502}",
+            "a blank line inside a block continues the guide"
+        );
+        assert_eq!(
+            buf[(text_x, y0 + 4)].symbol(),
+            " ",
+            "a blank line between top-level blocks shows no guide"
+        );
+    }
+
+    #[test]
+    fn active_indent_guide_highlights_the_cursor_block_only() {
+        let mut e = editor_with("fn a() {\n    x();\n}\nfn b() {\n    y();\n}");
+        e.focused = true;
+        e.cursor_row = 4;
+        e.cursor_col = 4;
+        let buf = guide_buf(&mut e, 40, 8);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(
+            buf[(text_x, y0 + 4)].fg,
+            e.theme.indent_guide_active(),
+            "the cursor's block guide is highlighted"
+        );
+        assert_eq!(
+            buf[(text_x, y0 + 1)].fg,
+            e.theme.indent_guide(),
+            "the other block's guide stays dim"
+        );
+    }
+
+    #[test]
+    fn header_line_activates_the_guide_of_the_block_it_opens() {
+        let mut e = editor_with("fn a() {\n    x();\n    y();\n}");
+        e.focused = true;
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        let buf = guide_buf(&mut e, 40, 8);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(buf[(text_x, y0 + 1)].fg, e.theme.indent_guide_active());
+        assert_eq!(buf[(text_x, y0 + 2)].fg, e.theme.indent_guide_active());
+    }
+
+    #[test]
+    fn indent_guides_toggle_off_paints_plain_whitespace() {
+        let mut e = editor_with("fn main() {\n    if x {\n        y();\n    }\n}");
+        e.show_indent_guides = false;
+        let buf = guide_buf(&mut e, 40, 8);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(buf[(text_x, y0 + 1)].symbol(), " ");
+        assert_eq!(buf[(text_x + 4, y0 + 2)].symbol(), " ");
+    }
+
+    #[test]
+    fn indent_guides_honour_horizontal_scroll() {
+        let mut e = editor_with(
+            "fn main() {\n    if x {\n        y(); // padding so the pane really scrolls\n    }\n}",
+        );
+        e.scroll_col = 4;
+        let buf = guide_buf(&mut e, 40, 8);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(
+            buf[(text_x, y0 + 2)].symbol(),
+            "\u{2502}",
+            "the level-2 guide shifts left with the scroll"
+        );
+        assert_eq!(
+            buf[(text_x, y0 + 1)].symbol(),
+            "i",
+            "the scrolled-off level-1 guide leaves the text alone"
+        );
+    }
+
+    #[test]
+    fn guide_indent_width_resolves_blank_lines_from_neighbours() {
+        let e = editor_with("def f():\n    a = 1\n\n    b = 2\n\ndef g():\n    pass");
+        assert_eq!(e.guide_indent_width(2), 4, "blank inside a block");
+        assert_eq!(e.guide_indent_width(4), 0, "blank between blocks");
+    }
+
+    #[test]
+    fn active_indent_guide_spans_the_enclosing_block() {
+        let mut e = editor_with("fn a() {\n    x();\n}\nfn b() {\n    y();\n    z();\n}");
+        e.cursor_row = 4;
+        assert_eq!(e.active_indent_guide(), Some((0, 4, 5)));
+        e.cursor_row = 0; // header activates the body it opens
+        assert_eq!(e.active_indent_guide(), Some((0, 1, 1)));
+        e.cursor_row = 2; // "}" is top-level: no active guide
+        assert_eq!(e.active_indent_guide(), None);
     }
 
     // ---- Select to Bracket (editor.action.selectToBracket) ----

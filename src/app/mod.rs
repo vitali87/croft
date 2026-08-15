@@ -2040,6 +2040,9 @@ pub struct App {
     blame_fetched: Option<PathBuf>,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
+    /// Indentation guides (#129), VS Code `editor.guides.indentation`: on by
+    /// default, pushed to every editor by the per-frame focus sync.
+    indent_guides_enabled: bool,
     /// Auto-closing pairs (#121), persisted; synced onto the active editor
     /// beside the blame flag.
     auto_close_pairs: bool,
@@ -3544,6 +3547,7 @@ impl App {
             blame_tx,
             blame_fetched: None,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
+            indent_guides_enabled: !loaded_prefs.disable_indent_guides,
             auto_close_pairs: !loaded_prefs.disable_auto_close_pairs,
             inlay_hints_enabled: !loaded_prefs.disable_inlay_hints,
             // Keep the suite off the user's real ~/.config/croft/history: a
@@ -10636,6 +10640,7 @@ impl App {
             ed.theme = self.theme;
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
+            ed.show_indent_guides = self.indent_guides_enabled;
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
@@ -10643,6 +10648,7 @@ impl App {
                 ed.theme = self.theme;
                 ed.pdf_viewer_enabled = pdf_on;
                 ed.csv_viewer_enabled = csv_on;
+                ed.show_indent_guides = self.indent_guides_enabled;
             }
         }
         self.tree.focus_gradient = gradient;
@@ -18501,6 +18507,7 @@ impl App {
                     "toggle:auto_close_pairs" => self.toggle_auto_close_pairs(),
                     "toggle:auto_save" => self.toggle_auto_save(),
                     "toggle:inline_blame" => self.toggle_inline_blame(),
+                    "toggle:indent_guides" => self.toggle_indent_guides(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
                     "cmd:color_theme" => {
@@ -18560,6 +18567,13 @@ impl App {
             ListRow {
                 id: String::from("toggle:inline_blame"),
                 label: format!("Git: Inline Blame: {}", on_off(self.inline_blame_enabled)),
+            },
+            ListRow {
+                id: String::from("toggle:indent_guides"),
+                label: format!(
+                    "Editor: Indent Guides: {}",
+                    on_off(self.indent_guides_enabled)
+                ),
             },
             ListRow {
                 id: String::from("toggle:inlay_hints"),
@@ -24036,6 +24050,7 @@ impl App {
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
+            Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
@@ -28561,6 +28576,22 @@ impl App {
         if !cfg!(test) {
             let _ = crate::prefs::save_inline_blame(self.inline_blame_enabled);
         }
+    }
+
+    fn toggle_indent_guides(&mut self) {
+        self.indent_guides_enabled = !self.indent_guides_enabled;
+        self.editor.show_indent_guides = self.indent_guides_enabled;
+        if !cfg!(test) {
+            let _ = crate::prefs::save_indent_guides(self.indent_guides_enabled);
+        }
+        self.status = format!(
+            "Indent Guides: {}",
+            if self.indent_guides_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        );
     }
 
     fn toggle_auto_close_pairs(&mut self) {

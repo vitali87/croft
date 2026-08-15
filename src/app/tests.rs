@@ -10049,6 +10049,45 @@ fn toggle_inline_blame_command_flips_the_editor_flag_and_pref() {
 }
 
 #[test]
+fn toggle_indent_guides_command_flips_every_editor_via_the_frame_sync() {
+    let mut app = editor_app_with_lines(&["fn a() {", "    x();", "}"]);
+    assert!(
+        app.indent_guides_enabled,
+        "indent guides are on by default (VS Code editor.guides.indentation)"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleIndentGuides);
+    assert!(!app.indent_guides_enabled, "the command turns them off");
+    // The per-frame focus sync pushes the flag onto every editor in every
+    // group, so tabs opened after the toggle can never resurrect guides.
+    app.sync_focus_flags();
+    assert!(app.editor.editors.iter().all(|e| !e.show_indent_guides));
+    // A tab opened AFTER the toggle starts on the constructor default (true)
+    // and must be brought in line by the next frame's sync.
+    app.editor
+        .open_text_buffer(std::path::Path::new("later.rs"), "fn x() {\n    y();\n}")
+        .unwrap();
+    assert!(
+        app.editor.show_indent_guides,
+        "a fresh tab starts on the default, proving the sync below does the work"
+    );
+    app.sync_focus_flags();
+    assert!(
+        app.editor.editors.iter().all(|e| !e.show_indent_guides),
+        "the frame sync disables guides on the tab opened after the toggle"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleIndentGuides);
+    assert!(app.indent_guides_enabled);
+    app.editor
+        .open_text_buffer(std::path::Path::new("even-later.rs"), "fn z() {}")
+        .unwrap();
+    app.sync_focus_flags();
+    assert!(
+        app.editor.editors.iter().all(|e| e.show_indent_guides),
+        "re-enabling reaches tabs opened before and after the toggle"
+    );
+}
+
+#[test]
 fn editor_cmd_gg_jumps_to_top_of_file() {
     let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
     app.editor.cursor_row = 3;
