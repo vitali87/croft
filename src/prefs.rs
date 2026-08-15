@@ -168,6 +168,11 @@ pub struct Prefs {
     /// (a default-false field keeps old configs valid, like inline blame).
     #[serde(default)]
     pub disable_auto_close_pairs: bool,
+    /// Whitespace rendering mode (#133): "selection" (VS Code's default,
+    /// also what the empty string an older config deserializes to means),
+    /// "all", or "none". Parsed by `WhitespaceMode::from_pref`.
+    #[serde(default)]
+    pub render_whitespace: String,
     /// Opt-out for bracket-pair colorization (#131), on by default like VS
     /// Code's `editor.bracketPairColorization.enabled` (default since 1.67).
     /// Stored as the disable flag so the derived `Default` and an older
@@ -359,6 +364,14 @@ pub fn save_inline_blame(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disable_inline_blame = !enabled;
+    prefs.save(&path)
+}
+
+/// Persist the whitespace rendering mode ("selection" / "all" / "none").
+pub fn save_render_whitespace(mode: &str) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.render_whitespace = mode.to_string();
     prefs.save(&path)
 }
 

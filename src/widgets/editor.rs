@@ -1647,6 +1647,8 @@ pub struct Editor {
     /// never per frame. App-synced from prefs; on by default.
     pub show_bracket_colors: bool,
     bracket_colors: Vec<Vec<(usize, u8)>>,
+    /// Whitespace glyph rendering (#133); app-synced from prefs.
+    pub whitespace_mode: WhitespaceMode,
     /// Per-tab override for soft-wrap (VS Code "View: Toggle Word Wrap",
     /// Alt+Z). `None` means follow the language default (`wrap_enabled`
     /// wraps Markdown only); `Some(true)`/`Some(false)` force it on/off for
@@ -1849,6 +1851,7 @@ impl Editor {
             show_indent_guides: true,
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
+            whitespace_mode: WhitespaceMode::default(),
             wrap_override: None,
             highlights: Vec::new(),
             semantic_overlay: Vec::new(),
@@ -7113,6 +7116,57 @@ fn title_case(s: &str) -> String {
     out
 }
 
+/// Whitespace rendering (#133, VS Code `editor.renderWhitespace`): which
+/// spaces/tabs paint a visible glyph (`·` / `→`). `Selection` — VS Code's
+/// default — shows them only inside selected text; `All` across the whole
+/// buffer; `None` never. The palette command cycles Selection → All → None.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WhitespaceMode {
+    None,
+    #[default]
+    Selection,
+    All,
+}
+
+impl WhitespaceMode {
+    /// The persisted config id (`render_whitespace` in config.json).
+    pub fn pref_id(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Selection => "selection",
+            Self::All => "all",
+        }
+    }
+
+    /// Parse the persisted id; anything unrecognised (including the empty
+    /// string an older config deserializes to) is the VS Code default.
+    pub fn from_pref(id: &str) -> Self {
+        match id {
+            "none" => Self::None,
+            "all" => Self::All,
+            _ => Self::Selection,
+        }
+    }
+
+    /// Settings/status label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Selection => "selection",
+            Self::All => "all",
+        }
+    }
+
+    /// The palette toggle's cycle order (VS Code default first).
+    pub fn next(self) -> Self {
+        match self {
+            Self::Selection => Self::All,
+            Self::All => Self::None,
+            Self::None => Self::Selection,
+        }
+    }
+}
+
 /// Colour-index marker for an unmatched closing bracket (painted red).
 const UNEXPECTED_BRACKET: u8 = u8::MAX;
 /// Plain-text buffers above this size skip bracket colorization: a
@@ -8165,6 +8219,66 @@ impl Widget for &mut Editor {
                     cell.set_symbol("\u{2502}");
                     let style = cell.style().fg(fg);
                     cell.set_style(style);
+                }
+            }
+
+            // Render whitespace (#133): swap space/tab cells to `·`/`→` in a
+            // dim theme colour — across the whole row in All mode, inside the
+            // primary and secondary-caret selections in Selection mode (the
+            // VS Code default). Painted after the indent guides so the glyph
+            // wins the cell: it reports a real character where the guide only
+            // decorates, and the selection band below touches backgrounds
+            // only, so the glyph rides the band like text does.
+            if self.whitespace_mode != WhitespaceMode::None {
+                let ws_fg = self.theme.whitespace_fg();
+                let mut ws_spans: Vec<(usize, usize)> = Vec::new();
+                match self.whitespace_mode {
+                    WhitespaceMode::All => ws_spans.push((0, line_len)),
+                    WhitespaceMode::Selection => {
+                        if let Some(((sr, sc), (er, ec))) = sel_norm
+                            && line_idx >= sr
+                            && line_idx <= er
+                        {
+                            let s = if line_idx == sr { sc } else { 0 };
+                            let e = if line_idx == er { ec } else { line_len };
+                            if e > s {
+                                ws_spans.push((s, e));
+                            }
+                        }
+                        for caret in &self.carets {
+                            let ((cr0, cc0), (cr1, cc1)) = caret.normalised();
+                            if line_idx >= cr0 && line_idx <= cr1 {
+                                let s = if line_idx == cr0 { cc0 } else { 0 };
+                                let e = if line_idx == cr1 { cc1 } else { line_len };
+                                if e > s {
+                                    ws_spans.push((s, e));
+                                }
+                            }
+                        }
+                    }
+                    WhitespaceMode::None => {}
+                }
+                for (s, e) in ws_spans {
+                    let from = s.max(row_start);
+                    let to = e.min(row_end).min(line_len);
+                    if to <= from {
+                        continue;
+                    }
+                    for (ci, ch) in raw.chars().enumerate().skip(from).take(to - from) {
+                        let glyph = match ch {
+                            ' ' => "\u{b7}",
+                            '\t' => "\u{2192}",
+                            _ => continue,
+                        };
+                        let col = (ci + ex(ci) - row_start) as u16;
+                        if col >= row_width {
+                            break;
+                        }
+                        let cell = &mut buf[(text_x + col, y)];
+                        cell.set_symbol(glyph);
+                        let style = cell.style().fg(ws_fg);
+                        cell.set_style(style);
+                    }
                 }
             }
 
@@ -18357,6 +18471,71 @@ mod tests {
             buf[(text_x + 1, e.last_inner.y)].fg,
             e.theme.bracket_pair_color(0)
         );
+    }
+
+    // ---- Render whitespace (#133) ----
+
+    #[test]
+    fn selection_mode_paints_whitespace_glyphs_only_inside_the_selection() {
+        let mut e = editor_with("a b c d");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 3),
+            head: (0, 6),
+        });
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(buf[(text_x + 3, y0)].symbol(), "\u{b7}", "selected space");
+        assert_eq!(buf[(text_x + 3, y0)].fg, e.theme.whitespace_fg());
+        assert_eq!(buf[(text_x + 5, y0)].symbol(), "\u{b7}");
+        assert_eq!(
+            buf[(text_x + 1, y0)].symbol(),
+            " ",
+            "an unselected space stays invisible"
+        );
+        assert_eq!(buf[(text_x + 4, y0)].symbol(), "c", "text is untouched");
+    }
+
+    #[test]
+    fn all_mode_paints_every_space_and_tab() {
+        let mut e = editor_with("a b\n\tc");
+        e.whitespace_mode = WhitespaceMode::All;
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(buf[(text_x + 1, y0)].symbol(), "\u{b7}");
+        assert_eq!(
+            buf[(text_x, y0 + 1)].symbol(),
+            "\u{2192}",
+            "a tab renders as an arrow"
+        );
+    }
+
+    #[test]
+    fn none_mode_paints_no_whitespace_glyphs_even_selected() {
+        let mut e = editor_with("a b");
+        e.whitespace_mode = WhitespaceMode::None;
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (0, 3),
+        });
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(buf[(text_x + 1, e.last_inner.y)].symbol(), " ");
+    }
+
+    #[test]
+    fn selection_mode_covers_every_line_of_a_multiline_selection() {
+        let mut e = editor_with("a b\nc d");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 3),
+        });
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(buf[(text_x + 1, y0)].symbol(), "\u{b7}");
+        assert_eq!(buf[(text_x + 1, y0 + 1)].symbol(), "\u{b7}");
     }
 
     // ---- Select to Bracket (editor.action.selectToBracket) ----
