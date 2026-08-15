@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Groundwork for multi-root workspaces: the workspace's folder set is now a first-class model (one folder today) with a primary root and per-file owning-root resolution — behavior is unchanged, and the Add Folder capabilities build on this.",
+    summary: "Multi-root groundwork, part two: the Explorer tree can now hold several root folders as top-level sections — Collapse All, reveal, delete guards, and git-ignore dimming all understand every root. Nothing changes with a single folder; the Add Folder command arrives next.",
 }];
