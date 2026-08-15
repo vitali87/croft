@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Multi-root workspaces arrive: \"Workspaces: Add Folder to Workspace\" opens the fuzzy directory picker and adds the chosen folder beside the current one — the Explorer shows both as sections, Quick Open and workspace search span every folder with folder-name prefixes, language servers root themselves per folder, and the window title gains the (Workspace) marker. Remove a folder from its section row's context menu.",
+    summary: "Each workspace folder now has its own git awareness: the status-bar branch, Source Control panel, commits graph, gutter, blame, and timeline follow the repository of the file you are focused on, the Explorer dims git-ignored files across every folder, and repo operations address the right repository automatically.",
 }];

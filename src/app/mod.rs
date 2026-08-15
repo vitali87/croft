@@ -2188,6 +2188,19 @@ pub struct App {
     /// adaptive poll (its dir-mtime snapshot walks the whole tree, all
     /// roots included) and the open-file stats; extras are event-only.
     fs_watch_extra: Vec<FsWatch>,
+    /// One git worker per SECONDARY workspace root (#149), keyed by the
+    /// root path. `git` stays the primary's worker. Each discovers its
+    /// own repo toplevel; replies are root-scoped by construction.
+    git_extra: Vec<(PathBuf, GitWorker)>,
+    /// The workspace root whose repository the Source Control panel and
+    /// the status line follow: the root owning the focused editor's
+    /// file, falling back to the primary. Recomputed each drain tick; a
+    /// change re-seeds the panel from that worker and re-requests its
+    /// change list.
+    active_scm_root: PathBuf,
+    /// Per-workspace-root last-seen HEAD oid, for gutter-baseline and
+    /// commit-graph invalidation per repository (#149).
+    git_head_oids: std::collections::BTreeMap<PathBuf, Option<String>>,
     git: GitWorker,
     cursor_blink: CursorBlink,
     editor_click: ClickTracker,
@@ -2392,7 +2405,6 @@ pub struct App {
     /// Last HEAD oid the git-gutter baselines were synced against. When the
     /// git worker reports a different oid (commit, checkout, pull), the cached
     /// per-tab HEAD snapshots are invalidated so the gutter refetches.
-    git_gutter_head_oid: Option<String>,
     /// True after the user has chosen "Always for this session" on the
     /// local-browser confirmation. Subsequent link clicks dispatch to
     /// the relay silently.
@@ -3655,6 +3667,9 @@ impl App {
             prompt: None,
             fs_watch,
             fs_watch_extra: Vec::new(),
+            git_extra: Vec::new(),
+            active_scm_root: root.clone(),
+            git_head_oids: std::collections::BTreeMap::new(),
             git,
             cursor_blink: CursorBlink::new(),
             editor_click: ClickTracker::default(),
@@ -3716,7 +3731,6 @@ impl App {
             pending_terminal_warning: false,
             commit_menu_open: false,
             default_branch_label: None,
-            git_gutter_head_oid: None,
             trust_local_browser: false,
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
@@ -5045,8 +5059,11 @@ impl App {
     /// spawning a `git` process on every keystroke.  Called after the file
     /// watcher reports any changes.
     fn refresh_git_status_debounced(&mut self) {
-        self.git
-            .request_status_debounced(self.sidebar_view == SidebarView::SourceControl);
+        let want_changes = self.sidebar_view == SidebarView::SourceControl;
+        self.git.request_status_debounced(want_changes);
+        for (_, w) in &mut self.git_extra {
+            w.request_status_debounced(want_changes);
+        }
     }
 
     fn sync_open_file_poll_mtime(&mut self) {
@@ -5218,43 +5235,102 @@ impl App {
     /// non-blocking try_recv. Called from `try_install_pending_init`,
     /// which already runs every tick.
     pub fn drain_git_responses(&mut self) -> bool {
+        // The SCM surfaces follow the repository of the root owning the
+        // focused file (#149): on a switch, seed the panel from that
+        // worker's cached status and re-request its change list — the
+        // non-active workers' lists are discarded at their drains below.
+        let active = self.active_scm_workspace_root();
+        if active != self.active_scm_root {
+            self.seed_active_scm(active);
+        }
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
-        self.git.flush_pending();
-        let changed = self.git.drain(&mut self.source_control);
-        if changed && self.git.status().in_repo && self.default_branch_label.is_none() {
-            self.default_branch_label = crate::git::default_branch(&self.tree.root).ok();
-        }
-        // HEAD moved (commit, checkout, pull): every cached git-gutter baseline
-        // is now stale. Clear the per-tab marker so `sync_git_gutters` refetches
-        // the committed snapshot and the bars reflect the new HEAD.
-        if changed {
-            let oid = self.git.status().head_oid.clone();
-            if oid != self.git_gutter_head_oid {
-                self.git_gutter_head_oid = oid;
-                // HEAD moved: the COMMITS graph gained (or lost) commits.
-                self.refresh_commit_graph();
-                // Every group, not just the focused one: inactive split
-                // panes render their editors too, so a baseline left at the
-                // old HEAD keeps painting bars on lines that are now clean.
+        let mut changed = false;
+        let primary_root = self.roots.primary().to_path_buf();
+        let mut worker_roots: Vec<PathBuf> = vec![primary_root];
+        worker_roots.extend(self.git_extra.iter().map(|(r, _)| r.clone()));
+        for ws_root in worker_roots {
+            let is_active = ws_root == self.active_scm_root;
+            // Split the borrows: the panel is only handed to the active
+            // repo's worker.
+            let panel = &mut self.source_control;
+            let w = match self.git_extra.iter_mut().find(|(r, _)| *r == ws_root) {
+                Some((_, w)) => w,
+                None => &mut self.git,
+            };
+            w.flush_pending();
+            let this_changed = w.drain_into(is_active.then_some(panel));
+            if !this_changed {
+                continue;
+            }
+            changed = true;
+            let status = w.status().clone();
+            if is_active && status.in_repo && self.default_branch_label.is_none() {
+                self.default_branch_label = crate::git::default_branch(&self.active_scm_root).ok();
+            }
+            // HEAD moved in THIS repo (commit, checkout, pull): the cached
+            // gutter baselines for ITS files are stale, as is blame; the
+            // COMMITS graph refetches only for the active repo.
+            let oid = status.head_oid.clone();
+            if self.git_head_oids.get(&ws_root) != Some(&oid) {
+                self.git_head_oids.insert(ws_root.clone(), oid);
+                if is_active {
+                    self.refresh_commit_graph();
+                }
                 for group in std::iter::once(&mut self.editor)
                     .chain(self.editor_layout.inactive_groups_mut())
                 {
                     for ed in &mut group.editors {
-                        ed.git_baseline_for = None;
+                        let owned = ed
+                            .path
+                            .as_deref()
+                            .and_then(|p| self.roots.owning_root(p))
+                            .is_some_and(|r| r == ws_root);
+                        if owned {
+                            ed.git_baseline_for = None;
+                        }
                     }
                 }
-                // Blame is dated against HEAD too; force a refetch so the
-                // annotation reflects the new commit.
                 self.blame_fetched = None;
             }
+        }
+        if changed {
             self.refresh_scm_change_badge();
-            // Keep the Explorer's greyed-out ignored rows in step with the
-            // refreshed status (a .gitignore edit rides the same debounced
-            // refresh that landed here). Arc clone: no set copy.
-            self.tree.ignored = self.git.status().ignored.clone();
+            // The Explorer dims git-ignored rows across EVERY root: each
+            // worker's set is cwd-scoped to its root already, so the union
+            // is exact. Single-root keeps the Arc clone (no set copy).
+            if self.git_extra.is_empty() {
+                self.tree.ignored = self.git.status().ignored.clone();
+            } else {
+                let mut union: std::collections::HashSet<PathBuf> =
+                    self.git.status().ignored.as_ref().clone();
+                for (_, w) in &self.git_extra {
+                    union.extend(w.status().ignored.iter().cloned());
+                }
+                self.tree.ignored = std::sync::Arc::new(union);
+            }
         }
         changed
+    }
+
+    /// Point the SCM surfaces at `active`'s repository: seed the panel
+    /// from its worker's cached status, drop the outgoing repo's change
+    /// list (rendering another repository's entries under this branch
+    /// header would be wrong; the fresh list lands one worker roundtrip
+    /// later), re-request it past the debounce, and refetch the COMMITS
+    /// graph. Shared by the focus-follow switch and the remove-folder
+    /// fallback (#150 review: assigning the field directly left the
+    /// removed repo's panel on screen, since the switch-detect saw no
+    /// difference).
+    fn seed_active_scm(&mut self, active: PathBuf) {
+        self.active_scm_root = active.clone();
+        self.default_branch_label = None;
+        let w = self.git_worker_for_root_mut(&active);
+        w.bypass_debounce();
+        w.request_status_and_changes();
+        let status = self.git_worker_for_root(&active).status().clone();
+        self.source_control.set_status(status, Vec::new());
+        self.refresh_commit_graph();
     }
 
     /// Rebuild the cached source-control change-count badge after the change
@@ -5263,7 +5339,7 @@ impl App {
     /// images) it only tracks the count for the dirty check; that path draws a
     /// text badge directly in `render_activity_bar`.
     fn refresh_scm_change_badge(&mut self) {
-        let count = if self.git.status().in_repo {
+        let count = if self.scm_worker().status().in_repo {
             self.source_control.changes_count()
         } else {
             0
@@ -5730,16 +5806,83 @@ impl App {
     }
 
     fn scm_root(&self) -> PathBuf {
-        self.git
+        let ws = self.active_scm_root.clone();
+        self.git_worker_for_root(&ws)
             .status()
             .repo_root
             .clone()
-            .unwrap_or_else(|| self.tree.root.clone())
+            .unwrap_or(ws)
+    }
+
+    /// The workspace root whose repository the SCM surfaces follow: the
+    /// root owning the focused editor's file, else the primary (#149).
+    fn active_scm_workspace_root(&self) -> PathBuf {
+        self.editor
+            .path
+            .as_deref()
+            .and_then(|p| self.roots.owning_root(p))
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf()
+    }
+
+    /// The git worker for a workspace root: the primary's, or the
+    /// matching secondary's (#149).
+    fn git_worker_for_root(&self, ws_root: &Path) -> &GitWorker {
+        self.git_extra
+            .iter()
+            .find(|(r, _)| r == ws_root)
+            .map(|(_, w)| w)
+            .unwrap_or(&self.git)
+    }
+
+    fn git_worker_for_root_mut(&mut self, ws_root: &Path) -> &mut GitWorker {
+        match self.git_extra.iter().position(|(r, _)| r == ws_root) {
+            Some(i) => &mut self.git_extra[i].1,
+            None => &mut self.git,
+        }
+    }
+
+    /// The active repository's worker — what `self.git` meant while
+    /// there was one root (#149).
+    fn scm_worker(&self) -> &GitWorker {
+        self.git_worker_for_root(&self.active_scm_root)
+    }
+
+    /// Let the ACTIVE repo's next debounced refresh through immediately —
+    /// every Source Control mutation runs against the active repo (#149).
+    fn active_git_bypass_debounce(&mut self) {
+        let ws = self.active_scm_root.clone();
+        self.git_worker_for_root_mut(&ws).bypass_debounce();
     }
 
     fn sync_git_gutters(&mut self) {
-        // `HEAD:<rel>` pathspecs resolve against the toplevel (#139).
-        let root = self.scm_root();
+        // `HEAD:<rel>` pathspecs resolve against the toplevel (#139), and
+        // each file resolves against the repo of ITS owning workspace
+        // root (#149). Precompute (workspace root → repo toplevel) so the
+        // editor loop below borrows nothing else off self.
+        let repo_bases: Vec<(PathBuf, PathBuf)> = self
+            .roots
+            .iter()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|ws| {
+                let repo = self
+                    .git_worker_for_root(&ws)
+                    .status()
+                    .repo_root
+                    .clone()
+                    .unwrap_or_else(|| ws.clone());
+                (ws, repo)
+            })
+            .collect();
+        let repo_for = |path: &Path| -> Option<PathBuf> {
+            repo_bases
+                .iter()
+                .filter(|(ws, _)| path.starts_with(ws))
+                .max_by_key(|(ws, _)| ws.components().count())
+                .map(|(_, repo)| repo.clone())
+        };
         let mut fetched: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
             std::collections::HashMap::new();
         let groups =
@@ -5757,6 +5900,7 @@ impl App {
             let head = fetched
                 .entry(path.clone())
                 .or_insert_with(|| {
+                    let root = repo_for(&path)?;
                     path.strip_prefix(&root)
                         .ok()
                         .and_then(|rel| rel.to_str())
@@ -5787,7 +5931,14 @@ impl App {
             return;
         }
         self.blame_fetched = Some(path.clone());
-        let root = self.tree.root.clone();
+        // Pair `-C` and the pathspec with the OWNING workspace root
+        // (#149): a secondary root's file blames within its own repo;
+        // the cwd-relative pathspec stays consistent by construction.
+        let root = self
+            .roots
+            .owning_root(&path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
         let Some(rel) = path
             .strip_prefix(&root)
             .ok()
@@ -7022,11 +7173,16 @@ impl App {
                         self.timeline_fetched = Some(path.clone());
                         self.timeline.begin_loading(path.clone());
                         changed = true;
+                        let timeline_root = self
+                            .roots
+                            .owning_root(&path)
+                            .unwrap_or_else(|| self.roots.primary())
+                            .to_path_buf();
                         let rel = path
-                            .strip_prefix(&self.tree.root)
+                            .strip_prefix(&timeline_root)
                             .ok()
                             .map(|r| r.to_string_lossy().into_owned());
-                        let root = self.tree.root.clone();
+                        let root = timeline_root;
                         let tx = self.timeline_tx.clone();
                         let history_root = self.history_root.clone();
                         let abs = path.clone();
@@ -7086,7 +7242,7 @@ impl App {
         // Drain any COMMITS graph replies; ignore one for a since-left root.
         while let Ok((root, rows)) = self.graph_rx.try_recv() {
             self.graph_fetch_inflight = false;
-            if root == self.tree.root {
+            if root == self.active_scm_root {
                 self.commit_graph.set_rows(rows);
                 changed = true;
             }
@@ -7188,7 +7344,14 @@ impl App {
             return;
         }
         // A git commit row: no snapshot to restore.
-        match crate::git::show_commit_file_diff(&self.tree.root, &hash, &rel) {
+        let timeline_root = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| self.roots.owning_root(p))
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        match crate::git::show_commit_file_diff(&timeline_root, &hash, &rel) {
             Ok(raw) => {
                 let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
                 if let Err(e) = self.editor.open_git_diff_side_by_side(&label, &raw) {
@@ -8883,7 +9046,12 @@ impl App {
             self.save();
         }
         let rel = self.status_path(&path);
-        match crate::git::stage_path(&self.tree.root, &rel) {
+        let merge_root = self
+            .roots
+            .owning_root(&path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        match crate::git::stage_path(&merge_root, &rel) {
             Ok(()) => {
                 self.refresh_source_control();
                 self.status = format!("Merge complete: staged {rel}");
@@ -9782,7 +9950,7 @@ impl App {
                 source_control_active,
                 source_control_hovered,
             );
-            let scm_count = if self.git.status().in_repo {
+            let scm_count = if self.scm_worker().status().in_repo {
                 self.source_control.changes_count()
             } else {
                 0
@@ -12043,6 +12211,9 @@ impl App {
             }
         }
 
+        // Owned snapshot: the spans borrow the status, and borrowing it
+        // through scm_worker() would pin all of &self for the whole render.
+        let scm_status = self.scm_worker().status().clone();
         let mut spans: Vec<Span> = Vec::with_capacity(20);
         spans.extend(brand_spans());
         if let Some(span) = self.perf.status_span() {
@@ -12116,7 +12287,7 @@ impl App {
             ));
             spans.push(Span::raw(" "));
         }
-        spans.extend(git_status_spans(self.git.status()));
+        spans.extend(git_status_spans(&scm_status));
         spans.push(Span::raw("  "));
         // Persistent orange badge for a remote session with no dtach: it can't
         // survive a transport drop, so flag it for the whole session (rendered
@@ -14633,7 +14804,9 @@ impl App {
         // the branch sync counts (`↑1` / `↓N`) and dirty flag refresh too —
         // a commit changes those without changing the file list. Still off
         // the UI thread, so no synchronous `git status` stall.
-        self.git.request_status_and_changes();
+        let ws = self.active_scm_root.clone();
+        self.git_worker_for_root_mut(&ws)
+            .request_status_and_changes();
         self.refresh_commit_graph();
     }
 
@@ -14652,7 +14825,8 @@ impl App {
             return;
         }
         self.graph_fetch_inflight = true;
-        let root = self.tree.root.clone();
+        // The COMMITS section follows the active repo (#149).
+        let root = self.active_scm_root.clone();
         let tx = self.graph_tx.clone();
         std::thread::spawn(move || {
             let commits = crate::git::commit_graph(&root, 400);
@@ -14664,7 +14838,7 @@ impl App {
     /// Open a commit's full patch (header, message, diffstat, diff) in a
     /// read-only scratch tab — the graph's click-through, tig's enter key.
     fn open_commit_patch(&mut self, hash: &str, short_hash: &str) {
-        match crate::git::show_commit(&self.tree.root, hash) {
+        match crate::git::show_commit(&self.scm_root(), hash) {
             Ok(text) => {
                 let label = format!("commit {short_hash}");
                 match self.editor.open_text_buffer(Path::new(&label), &text) {
@@ -16427,7 +16601,7 @@ impl App {
                     "Initialized empty Git repository in {}",
                     self.tree.root.display()
                 );
-                self.git.bypass_debounce();
+                self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
@@ -16483,7 +16657,7 @@ impl App {
                 self.source_control.commit_feedback_is_error = true;
             }
         }
-        self.git.bypass_debounce();
+        self.active_git_bypass_debounce();
         self.refresh_git_status_debounced();
         self.refresh_source_control();
     }
@@ -16493,7 +16667,7 @@ impl App {
     /// "Push" item so users can ship already-committed work without
     /// having to type a no-op commit message first.
     pub fn push_source_control(&mut self) {
-        match crate::git::push_current_branch(&self.tree.root) {
+        match crate::git::push_current_branch(&self.scm_root()) {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
                     "pushed".to_string()
@@ -16509,14 +16683,14 @@ impl App {
                 self.status = format!("Push failed: {err}");
             }
         }
-        self.git.bypass_debounce();
+        self.active_git_bypass_debounce();
         self.refresh_git_status_debounced();
     }
 
     /// Pull the current branch from its upstream. Sibling of
     /// `push_source_control`, reached from the commit dropdown's "Pull".
     pub fn pull_source_control(&mut self) {
-        match crate::git::pull_current_branch(&self.tree.root) {
+        match crate::git::pull_current_branch(&self.scm_root()) {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
                     "pulled".to_string()
@@ -16532,7 +16706,7 @@ impl App {
                 self.status = format!("Pull failed: {err}");
             }
         }
-        self.git.bypass_debounce();
+        self.active_git_bypass_debounce();
         self.refresh_git_status_debounced();
         self.refresh_source_control();
     }
@@ -16541,19 +16715,19 @@ impl App {
     /// pull short-circuits (we never push on top of an unmerged tree); a
     /// successful pull followed by a failed push reports both halves.
     pub fn sync_source_control(&mut self) {
-        let pull_summary = match crate::git::pull_current_branch(&self.tree.root) {
+        let pull_summary = match crate::git::pull_current_branch(&self.scm_root()) {
             Ok(s) => s,
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("sync: pull failed: {err}"));
                 self.source_control.commit_feedback_is_error = true;
                 self.status = format!("Sync failed on pull: {err}");
-                self.git.bypass_debounce();
+                self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
                 return;
             }
         };
-        match crate::git::push_current_branch(&self.tree.root) {
+        match crate::git::push_current_branch(&self.scm_root()) {
             Ok(push_summary) => {
                 self.source_control.commit_feedback = Some(format!(
                     "synced (pulled: {pull_summary} | pushed: {push_summary})"
@@ -16567,7 +16741,7 @@ impl App {
                 self.status = format!("Sync: pull ok; push failed: {err}");
             }
         }
-        self.git.bypass_debounce();
+        self.active_git_bypass_debounce();
         self.refresh_git_status_debounced();
         self.refresh_source_control();
     }
@@ -16575,7 +16749,7 @@ impl App {
     /// Stash the working tree (`git stash push`). Reached from the commit
     /// dropdown's "Stash" item.
     pub fn stash_source_control(&mut self) {
-        match crate::git::stash_push(&self.tree.root) {
+        match crate::git::stash_push(&self.scm_root()) {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(format!("stashed: {summary}"));
                 self.source_control.commit_feedback_is_error = false;
@@ -16587,7 +16761,7 @@ impl App {
                 self.status = format!("Stash failed: {err}");
             }
         }
-        self.git.bypass_debounce();
+        self.active_git_bypass_debounce();
         self.refresh_git_status_debounced();
         self.refresh_source_control();
     }
@@ -16595,7 +16769,7 @@ impl App {
     /// Restore the most recent stash (`git stash pop`). A pop conflict is
     /// surfaced verbatim so the user can resolve it.
     pub fn stash_pop_source_control(&mut self) {
-        match crate::git::stash_pop(&self.tree.root) {
+        match crate::git::stash_pop(&self.scm_root()) {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(format!("popped: {summary}"));
                 self.source_control.commit_feedback_is_error = false;
@@ -16607,7 +16781,7 @@ impl App {
                 self.status = format!("Stash pop failed: {err}");
             }
         }
-        self.git.bypass_debounce();
+        self.active_git_bypass_debounce();
         self.refresh_git_status_debounced();
         self.refresh_source_control();
     }
@@ -16621,7 +16795,7 @@ impl App {
         match crate::git::unstage_path(&self.scm_root(), &entry.path) {
             Ok(()) => {
                 self.status = format!("Unstaged {}", entry.path);
-                self.git.bypass_debounce();
+                self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
@@ -16673,7 +16847,7 @@ impl App {
                 self.status = format!("{ok_prefix} failed: {err}");
             }
         }
-        self.git.bypass_debounce();
+        self.active_git_bypass_debounce();
         self.refresh_git_status_debounced();
         self.refresh_source_control();
     }
@@ -16723,7 +16897,7 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        let r = crate::git::commit_staged(&self.tree.root, &message);
+        let r = crate::git::commit_staged(&self.scm_root(), &message);
         if r.is_ok() {
             self.source_control.clear_message();
         }
@@ -16738,7 +16912,7 @@ impl App {
             self.run_scm_op("add -A", Err(err), "Stage all");
             return;
         }
-        let r = crate::git::commit_staged(&self.tree.root, &message);
+        let r = crate::git::commit_staged(&self.scm_root(), &message);
         if r.is_ok() {
             self.source_control.clear_message();
         }
@@ -16750,9 +16924,9 @@ impl App {
         // rewrites it — matching VS Code's amend.
         let message = self.source_control.message.trim().to_string();
         let r = if message.is_empty() {
-            crate::git::commit_amend_no_edit(&self.tree.root)
+            crate::git::commit_amend_no_edit(&self.scm_root())
         } else {
-            crate::git::commit_amend(&self.tree.root, &message)
+            crate::git::commit_amend(&self.scm_root(), &message)
         };
         if r.is_ok() {
             self.source_control.clear_message();
@@ -16764,7 +16938,7 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        let commit = crate::git::commit_all_tracked(&self.tree.root, &message);
+        let commit = crate::git::commit_all_tracked(&self.scm_root(), &message);
         self.log_git("commit -am", &commit);
         if let Err(err) = commit {
             self.source_control.commit_feedback = Some(err.clone());
@@ -16783,7 +16957,7 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         };
-        let r = crate::git::publish_branch(&self.tree.root, &branch);
+        let r = crate::git::publish_branch(&self.scm_root(), &branch);
         self.run_scm_op("push -u origin", r, "Published");
     }
 
@@ -16873,7 +17047,7 @@ impl App {
             )),
             ScmAction::CheckoutTo => self.open_branch_picker_for(BranchPurpose::Checkout),
             ScmAction::Fetch => {
-                let r = crate::git::fetch_all(&self.tree.root);
+                let r = crate::git::fetch_all(&self.scm_root());
                 self.run_scm_op("fetch --all --prune", r, "Fetched");
             }
             ScmAction::ShowGitOutput => self.show_git_output(),
@@ -16888,12 +17062,12 @@ impl App {
             ScmAction::DiscardAll => self.request_discard_all_source_control(),
             ScmAction::Sync => self.sync_source_control(),
             ScmAction::PullRebase => {
-                let r = crate::git::pull_rebase(&self.tree.root);
+                let r = crate::git::pull_rebase(&self.scm_root());
                 self.run_scm_op("pull --rebase", r, "Pulled (rebase)");
             }
             ScmAction::PushTo => self.open_push_to_remote_picker(),
             ScmAction::PushForce => {
-                let r = crate::git::push_force(&self.tree.root);
+                let r = crate::git::push_force(&self.scm_root());
                 self.run_scm_op("push --force-with-lease", r, "Force-pushed");
             }
             ScmAction::PublishBranch => self.publish_branch_source_control(),
@@ -16926,11 +17100,11 @@ impl App {
             ScmAction::RemoveRemote => self.open_remote_picker(ListPurpose::RemoveRemote),
             ScmAction::Stash => self.stash_source_control(),
             ScmAction::StashIncludeUntracked => {
-                let r = crate::git::stash_push_untracked(&self.tree.root);
+                let r = crate::git::stash_push_untracked(&self.scm_root());
                 self.run_scm_op("stash push -u", r, "Stashed (incl. untracked)");
             }
             ScmAction::StashStaged => {
-                let r = crate::git::stash_push_staged(&self.tree.root);
+                let r = crate::git::stash_push_staged(&self.scm_root());
                 self.run_scm_op("stash push --staged", r, "Stashed staged");
             }
             ScmAction::ApplyStash => self.open_stash_picker(ListPurpose::StashApply),
@@ -16948,7 +17122,7 @@ impl App {
 
     fn open_stash_picker(&mut self, purpose: crate::widgets::list_picker::ListPurpose) {
         use crate::widgets::list_picker::{ListPicker, ListRow};
-        let rows: Vec<ListRow> = match crate::git::list_stashes(&self.tree.root) {
+        let rows: Vec<ListRow> = match crate::git::list_stashes(&self.scm_root()) {
             Ok(stashes) => stashes
                 .into_iter()
                 .map(|s| ListRow {
@@ -16974,7 +17148,7 @@ impl App {
 
     fn open_tag_picker(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
-        let rows: Vec<ListRow> = match crate::git::list_tags(&self.tree.root) {
+        let rows: Vec<ListRow> = match crate::git::list_tags(&self.scm_root()) {
             Ok(tags) => tags
                 .into_iter()
                 .map(|t| ListRow {
@@ -16995,7 +17169,7 @@ impl App {
 
     fn open_remote_picker(&mut self, purpose: crate::widgets::list_picker::ListPurpose) {
         use crate::widgets::list_picker::{ListPicker, ListRow};
-        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.tree.root) {
+        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.scm_root()) {
             Ok(remotes) => remotes
                 .into_iter()
                 .map(|r| ListRow {
@@ -17016,7 +17190,7 @@ impl App {
 
     fn open_push_to_remote_picker(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
-        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.tree.root) {
+        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.scm_root()) {
             Ok(remotes) => remotes
                 .into_iter()
                 .map(|r| ListRow {
@@ -17074,12 +17248,12 @@ impl App {
             }
             InputPurpose::RenameBranch => {
                 self.close_input_prompt();
-                let r = crate::git::rename_branch(&self.tree.root, &value);
+                let r = crate::git::rename_branch(&self.scm_root(), &value);
                 self.run_scm_op("branch -m", r, "Renamed branch");
             }
             InputPurpose::CreateBranchFrom { base } => {
                 self.close_input_prompt();
-                let r = crate::git::create_branch_from(&self.tree.root, &value, &base);
+                let r = crate::git::create_branch_from(&self.scm_root(), &value, &base);
                 self.run_scm_op("switch -c (from)", r, "Created branch");
             }
             InputPurpose::AddRemoteName => {
@@ -17093,12 +17267,12 @@ impl App {
             }
             InputPurpose::AddRemoteUrl { name } => {
                 self.close_input_prompt();
-                let r = crate::git::add_remote(&self.tree.root, &name, &value);
+                let r = crate::git::add_remote(&self.scm_root(), &name, &value);
                 self.run_scm_op("remote add", r, "Added remote");
             }
             InputPurpose::CreateTag => {
                 self.close_input_prompt();
-                let r = crate::git::create_tag(&self.tree.root, &value);
+                let r = crate::git::create_tag(&self.scm_root(), &value);
                 self.run_scm_op("tag", r, "Created tag");
             }
             InputPurpose::McpConsent { command_id } => {
@@ -18573,27 +18747,27 @@ impl App {
         let index = row.id.parse::<usize>().unwrap_or(0);
         match purpose {
             ListPurpose::StashApply => {
-                let r = crate::git::stash_apply(&self.tree.root, index);
+                let r = crate::git::stash_apply(&self.scm_root(), index);
                 self.run_scm_op("stash apply", r, "Applied stash");
             }
             ListPurpose::StashPop => {
-                let r = crate::git::stash_pop_at(&self.tree.root, index);
+                let r = crate::git::stash_pop_at(&self.scm_root(), index);
                 self.run_scm_op("stash pop", r, "Popped stash");
             }
             ListPurpose::StashDrop => {
-                let r = crate::git::stash_drop(&self.tree.root, index);
+                let r = crate::git::stash_drop(&self.scm_root(), index);
                 self.run_scm_op("stash drop", r, "Dropped stash");
             }
             ListPurpose::RemoveRemote => {
-                let r = crate::git::remove_remote(&self.tree.root, &row.id);
+                let r = crate::git::remove_remote(&self.scm_root(), &row.id);
                 self.run_scm_op("remote remove", r, "Removed remote");
             }
             ListPurpose::DeleteTag => {
-                let r = crate::git::delete_tag(&self.tree.root, &row.id);
+                let r = crate::git::delete_tag(&self.scm_root(), &row.id);
                 self.run_scm_op("tag -d", r, "Deleted tag");
             }
             ListPurpose::PushToRemote => {
-                let r = crate::git::push_to_remote(&self.tree.root, &row.id);
+                let r = crate::git::push_to_remote(&self.scm_root(), &row.id);
                 self.run_scm_op("push", r, "Pushed");
             }
             ListPurpose::MergeConflict => {
@@ -18875,7 +19049,7 @@ impl App {
                     return;
                 };
                 self.close_branch_picker();
-                let r = crate::git::delete_branch(&self.tree.root, &name);
+                let r = crate::git::delete_branch(&self.scm_root(), &name);
                 self.run_scm_op("branch -d", r, "Deleted branch");
             }
             BranchPurpose::Merge => {
@@ -18883,7 +19057,7 @@ impl App {
                     return;
                 };
                 self.close_branch_picker();
-                let r = crate::git::merge_branch(&self.tree.root, &name);
+                let r = crate::git::merge_branch(&self.scm_root(), &name);
                 self.run_scm_op("merge", r, "Merged");
             }
             BranchPurpose::Rebase => {
@@ -18891,7 +19065,7 @@ impl App {
                     return;
                 };
                 self.close_branch_picker();
-                let r = crate::git::rebase_branch(&self.tree.root, &name);
+                let r = crate::git::rebase_branch(&self.scm_root(), &name);
                 self.run_scm_op("rebase", r, "Rebased");
             }
         }
@@ -18902,7 +19076,7 @@ impl App {
     /// the dropdown, click View Staged Changes, and the editor tab pops up
     /// with every `+`/`-` line of the staged hunks highlighted.
     pub fn view_staged_diff_source_control(&mut self) {
-        let raw = match crate::git::diff_staged(&self.tree.root) {
+        let raw = match crate::git::diff_staged(&self.scm_root()) {
             Ok(r) => r,
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
@@ -18929,7 +19103,7 @@ impl App {
     /// surfaces in the commit-feedback line so the user can fix the
     /// upstream-HEAD config instead of getting a silent no-op.
     pub fn view_default_branch_diff_source_control(&mut self) {
-        let branch = match crate::git::default_branch(&self.tree.root) {
+        let branch = match crate::git::default_branch(&self.scm_root()) {
             Ok(b) => b,
             Err(err) => {
                 self.source_control.commit_feedback = Some(err.clone());
@@ -18938,7 +19112,7 @@ impl App {
                 return;
             }
         };
-        let raw = match crate::git::diff_against_branch(&self.tree.root, &branch) {
+        let raw = match crate::git::diff_against_branch(&self.scm_root(), &branch) {
             Ok(r) => r,
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
@@ -18967,7 +19141,7 @@ impl App {
     /// `HEAD~1`; that error surfaces in the commit-feedback line rather
     /// than as a silent no-op.
     pub fn view_previous_commit_diff_source_control(&mut self) {
-        let raw = match crate::git::diff_previous_commit(&self.tree.root) {
+        let raw = match crate::git::diff_previous_commit(&self.scm_root()) {
             Ok(r) => r,
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
@@ -18995,7 +19169,7 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
-        let commit_summary = match crate::git::commit_all_tracked(&self.tree.root, &message) {
+        let commit_summary = match crate::git::commit_all_tracked(&self.scm_root(), &message) {
             Ok(s) => s,
             Err(err) => {
                 self.source_control.commit_feedback = Some(err.clone());
@@ -19006,7 +19180,7 @@ impl App {
         };
         self.source_control.clear_message();
         self.status = format!("Committed: {commit_summary}");
-        match crate::git::push_current_branch(&self.tree.root) {
+        match crate::git::push_current_branch(&self.scm_root()) {
             Ok(push_summary) => {
                 let combined = if push_summary.is_empty() {
                     commit_summary
@@ -19024,7 +19198,7 @@ impl App {
                 self.status = format!("Commit ok; push failed: {err}");
             }
         }
-        self.git.bypass_debounce();
+        self.active_git_bypass_debounce();
         self.refresh_git_status_debounced();
         self.refresh_source_control();
     }
@@ -19036,7 +19210,7 @@ impl App {
         match crate::git::stage_path(&self.scm_root(), &entry.path) {
             Ok(()) => {
                 self.status = format!("Staged {}", entry.path);
-                self.git.bypass_debounce();
+                self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
@@ -19137,7 +19311,7 @@ impl App {
     }
 
     fn refresh_after_hunk_op(&mut self) {
-        self.git.bypass_debounce();
+        self.active_git_bypass_debounce();
         self.refresh_git_status_debounced();
         self.refresh_source_control();
     }
@@ -19188,7 +19362,7 @@ impl App {
         match crate::git::discard_path(&self.scm_root(), &pd.rel_path, pd.untracked) {
             Ok(()) => {
                 self.status = format!("Discarded {}", pd.rel_path);
-                self.git.bypass_debounce();
+                self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
@@ -19234,13 +19408,13 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
-        match crate::git::commit_all_tracked(&self.tree.root, &message) {
+        match crate::git::commit_all_tracked(&self.scm_root(), &message) {
             Ok(summary) => {
                 self.source_control.clear_message();
                 self.source_control.commit_feedback = Some(summary.clone());
                 self.source_control.commit_feedback_is_error = false;
                 self.status = format!("Committed: {summary}");
-                self.git.bypass_debounce();
+                self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
@@ -24637,7 +24811,7 @@ impl App {
             return;
         }
         self.commit_menu_open = false;
-        match crate::git::list_branches(&self.tree.root) {
+        match crate::git::list_branches(&self.scm_root()) {
             Ok(branches) => {
                 let n = branches.len();
                 self.branch_picker =
@@ -24673,11 +24847,11 @@ impl App {
         use crate::widgets::branch_picker::BranchAction;
         let (result, verb) = match &action {
             BranchAction::Checkout(name) => (
-                crate::git::checkout_branch(&self.tree.root, name),
+                crate::git::checkout_branch(&self.scm_root(), name),
                 "Switched to",
             ),
             BranchAction::Create(name) => {
-                (crate::git::create_branch(&self.tree.root, name), "Created")
+                (crate::git::create_branch(&self.scm_root(), name), "Created")
             }
         };
         match result {
@@ -24686,7 +24860,7 @@ impl App {
                 self.source_control.commit_feedback = Some(summary.clone());
                 self.source_control.commit_feedback_is_error = false;
                 self.status = format!("{verb}: {summary}");
-                self.git.bypass_debounce();
+                self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
@@ -29311,6 +29485,8 @@ impl App {
             return;
         }
         self.tree.add_root(path.clone());
+        self.git_extra
+            .push((path.clone(), GitWorker::spawn(path.clone())));
         self.rebind_workspace_watchers();
         self.sync_workspace_fanout();
         self.refresh_workspace_title();
@@ -29329,6 +29505,15 @@ impl App {
             return;
         }
         self.tree.remove_root(&path);
+        self.git_extra.retain(|(r, _)| r != &path);
+        self.git_head_oids.remove(&path);
+        if self.active_scm_root == path {
+            // The panel was following the removed folder's repo: seed the
+            // primary's immediately — assigning the field alone left the
+            // removed repository on screen (#150 review).
+            let primary = self.roots.primary().to_path_buf();
+            self.seed_active_scm(primary);
+        }
         self.rebind_workspace_watchers();
         self.sync_workspace_fanout();
         self.refresh_workspace_title();
@@ -29481,6 +29666,12 @@ impl App {
         // A re-root collapses the workspace to one folder: the secondary
         // watchers go with their roots (#147).
         self.fs_watch_extra.clear();
+        // A re-root collapses the git side too (#149): the secondary
+        // workers drop with their roots, the active repo IS the new
+        // primary, and the per-repo HEAD markers restart.
+        self.git_extra.clear();
+        self.active_scm_root = new_root.clone();
+        self.git_head_oids.clear();
         self.git.bypass_debounce();
         // Rebind the worker's root before any query, otherwise the next
         // Status / Changes request runs against the stale root captured

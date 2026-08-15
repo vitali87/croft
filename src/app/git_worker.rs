@@ -93,20 +93,30 @@ impl GitWorker {
             .unwrap_or_else(Instant::now);
     }
 
-    pub fn drain(&mut self, source_control: &mut SourceControlPanel) -> bool {
+    /// Drain replies, refreshing the cached status; `panel` is `None` for
+    /// a worker whose repository the Source Control panel is NOT showing
+    /// (multi-root, #149) — its change lists are discarded (the panel
+    /// re-requests them when its repo becomes active) while the status
+    /// still lands for the status line, gutter invalidation, and the
+    /// ignored union.
+    pub fn drain_into(&mut self, mut panel: Option<&mut SourceControlPanel>) -> bool {
         let mut changed = false;
         loop {
             match self.response_rx.try_recv() {
                 Ok(GitResponse::Status(s)) => {
                     if self.status != s {
                         self.status = s.clone();
-                        source_control.status = s;
+                        if let Some(p) = panel.as_deref_mut() {
+                            p.status = s;
+                        }
                         changed = true;
                     }
                 }
                 Ok(GitResponse::StatusAndChanges(s, entries)) => {
                     self.status = s.clone();
-                    source_control.set_status(s, entries);
+                    if let Some(p) = panel.as_deref_mut() {
+                        p.set_status(s, entries);
+                    }
                     changed = true;
                 }
                 Err(_) => break,
