@@ -52,6 +52,7 @@ mod update_watch;
 mod vim;
 mod voice;
 mod widgets;
+mod workspace;
 mod zoxide;
 
 use anyhow::Result;

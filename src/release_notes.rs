@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Language servers now see the full workspace-folder contract: croft declares the workspaceFolders capability and answers the server's workspace/workspaceFolders query with its folder list, so folder-aware servers (rust-analyzer, gopls, ruff, ty) stop legally ignoring the folder set croft sends at startup.",
+    kind: NoteKind::Feature,
+    summary: "Groundwork for multi-root workspaces: the workspace's folder set is now a first-class model (one folder today) with a primary root and per-file owning-root resolution — behavior is unchanged, and the Add Folder capabilities build on this.",
 }];

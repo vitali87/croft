@@ -7081,7 +7081,7 @@ fn cmd_shift_slash_on_a_file_changes_workspace_root_to_the_file_s_parent_dir() {
         handled,
         "Cmd+Shift+/ must be handled by the Explorer dispatcher"
     );
-    assert_eq!(app.workspace_root, inner);
+    assert_eq!(app.workspace_root(), inner);
     assert_eq!(app.tree.root, inner);
 }
 
@@ -7199,7 +7199,7 @@ fn cmd_shift_slash_on_a_folder_changes_workspace_root_to_that_folder_s_parent() 
     let handled = app.handle_explorer_shortcut(key(KeyCode::Char('?'), KeyModifiers::SUPER));
 
     assert!(handled);
-    assert_eq!(app.workspace_root, mid);
+    assert_eq!(app.workspace_root(), mid);
     assert_eq!(app.tree.root, mid);
 }
 
@@ -7219,7 +7219,7 @@ fn cmd_shift_slash_on_the_tree_root_walks_up_one_filesystem_level() {
     ));
 
     assert!(handled);
-    assert_eq!(app.workspace_root, tmp.path());
+    assert_eq!(app.workspace_root(), tmp.path());
     assert_eq!(app.tree.root, tmp.path());
 }
 
@@ -7256,7 +7256,7 @@ fn dispatch_make_root_changes_tree_root_and_workspace_root() {
     app.dispatch_menu_action(MenuAction::MakeRoot(project.clone()), project.clone());
     assert_ne!(app.tree.root, original_root);
     assert_eq!(app.tree.root, project);
-    assert_eq!(app.workspace_root, project);
+    assert_eq!(app.workspace_root(), project);
     // The tree's root node must reflect the new path.
     assert_eq!(app.tree.nodes[0].path, project);
 }
@@ -7281,7 +7281,8 @@ fn change_workspace_root_writes_cd_into_active_terminal_pty() {
         "change_workspace_root must seed the active terminal's PTY with a cd command so the shell follows the Explorer; nothing was written"
     );
     assert_eq!(
-        app.workspace_root, target_dir,
+        app.workspace_root(),
+        target_dir,
         "workspace_root must still flip to the new path"
     );
 }
@@ -7333,7 +7334,8 @@ fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
         app.status
     );
     assert_eq!(
-        app.workspace_root, target_dir,
+        app.workspace_root(),
+        target_dir,
         "the Explorer root must still flip even when the shell cannot be synced"
     );
 }
