@@ -4106,6 +4106,7 @@ fn git_status_spans_clean_branch_is_green() {
         behind: 0,
         head_oid: None,
         ignored: std::sync::Arc::default(),
+        repo_root: None,
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -4128,6 +4129,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         behind: 0,
         head_oid: None,
         ignored: std::sync::Arc::default(),
+        repo_root: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -4153,6 +4155,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         behind: 0,
         head_oid: None,
         ignored: std::sync::Arc::default(),
+        repo_root: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -4170,6 +4173,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         behind: 1,
         head_oid: None,
         ignored: std::sync::Arc::default(),
+        repo_root: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -8776,6 +8780,81 @@ fn search_visible_routes_cmd_v_to_terminal_not_search_when_terminal_focused() {
     assert_eq!(
         app.search.query, "",
         "Cmd+V must paste into the focused terminal, not leak into the search query"
+    );
+}
+
+#[test]
+fn source_control_stages_a_toplevel_entry_from_a_subdir_workspace() {
+    // #139: porcelain paths are toplevel-relative, but every Source
+    // Control operation ran `git -C <workspace_root>` with them as
+    // cwd-relative pathspecs. A workspace rooted in a repo SUBDIR could
+    // not stage anything living outside that subdir.
+    let outer = tempfile::tempdir().unwrap();
+    let repo = outer.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "a@b"],
+        vec!["config", "user.name", "a"],
+    ] {
+        let _ = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(&args)
+            .status();
+    }
+    std::fs::write(repo.join("seed.txt"), "one\ntwo\n").unwrap();
+    let sub = repo.join("crates").join("foo");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("keep.txt"), "x\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-qm", "init"]] {
+        let _ = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(&args)
+            .status();
+    }
+    // A tracked TOPLEVEL file goes dirty while the workspace opens the
+    // subdirectory two levels down.
+    std::fs::write(repo.join("seed.txt"), "one\ntwo\nthree\n").unwrap();
+
+    let mut app = App::new(sub.clone()).unwrap();
+    app.refresh_source_control();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut entry_idx = None;
+    while std::time::Instant::now() < deadline {
+        let _ = app.drain_git_responses();
+        if let Some(i) = app
+            .source_control
+            .entries
+            .iter()
+            .position(|e| e.path == "seed.txt")
+        {
+            entry_idx = Some(i);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let entry_idx = entry_idx
+        .expect("the panel lists the toplevel-relative porcelain entry from a subdir workspace");
+    assert_eq!(
+        app.scm_root().canonicalize().unwrap(),
+        repo.canonicalize().unwrap(),
+        "the discovered repo root rides the status reply"
+    );
+
+    app.stage_source_control_entry(entry_idx);
+
+    let staged = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(&repo)
+        .args(["diff", "--cached", "--name-only"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).contains("seed.txt"),
+        "staging from the panel must address the file by its toplevel-relative path; \
+         `git -C <subdir> add seed.txt` matches nothing"
     );
 }
 

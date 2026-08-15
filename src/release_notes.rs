@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Re-rooting the workspace (Make Root, the zoxide jump) now saves the outgoing workspace's terminal pane layout under its own entry and, when the panel is still the untouched startup default, restores the incoming workspace's saved layout; panes you have used are never replaced.",
+    summary: "Source Control now works from a workspace rooted inside a repo subdirectory: croft discovers the repository toplevel, so staging, discarding, HEAD diffs, gutter baselines, untracked line counts, and opening changed files all resolve their repo-relative paths correctly instead of against the workspace root.",
 }];

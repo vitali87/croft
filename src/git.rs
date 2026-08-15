@@ -26,12 +26,22 @@ pub struct GitStatus {
     /// resolved by walking ancestors, never enumerated. Arc: the status is
     /// cloned per consumer each refresh and the set can be large.
     pub ignored: Arc<HashSet<PathBuf>>,
+    /// The repository toplevel containing the workspace root, or `None`
+    /// outside a repo. Porcelain and numstat paths are TOPLEVEL-relative,
+    /// so every consumer that joins a repo-relative path or names one on a
+    /// git command line must resolve against this, never the workspace
+    /// root — the two coincide only when the workspace root IS the
+    /// toplevel (#139).
+    pub repo_root: Option<PathBuf>,
 }
 
 pub fn query(root: &Path) -> GitStatus {
-    if !is_git_repo(root) {
+    // One probe answers both questions is_git_repo asked: exit status is
+    // repo membership, stdout is the toplevel every repo-relative path
+    // must resolve against.
+    let Some(repo_root) = repo_toplevel(root) else {
         return GitStatus::default();
-    }
+    };
     let branch = run_git(root, &["symbolic-ref", "--short", "HEAD"])
         .ok()
         .and_then(parse_branch);
@@ -64,6 +74,7 @@ pub fn query(root: &Path) -> GitStatus {
         behind,
         head_oid,
         ignored: Arc::new(query_ignored(root)),
+        repo_root: Some(repo_root),
     }
 }
 
@@ -176,16 +187,16 @@ fn git_raw(root: &Path, args: &[&str], stdin_data: Option<&[u8]>) -> Option<Vec<
     Some(out?.stdout)
 }
 
-fn is_git_repo(path: &Path) -> bool {
-    let path_str = match path.to_str() {
-        Some(s) => s,
-        None => return false,
-    };
-    Command::new("git")
-        .args(["-C", path_str, "rev-parse", "--is-inside-work-tree"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// The toplevel of the repository containing `dir`, or `None` outside a
+/// repo. This is the ONLY correct base for porcelain/numstat paths and
+/// for rev pathspecs (`HEAD:<rel>`), which git resolves against the
+/// toplevel regardless of `-C`; command-line pathspecs are cwd-relative,
+/// so mutations that name a repo-relative path must run `-C` here too.
+pub fn repo_toplevel(dir: &Path) -> Option<PathBuf> {
+    run_git(dir, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
 }
 
 fn run_git(path: &Path, args: &[&str]) -> std::io::Result<String> {
@@ -526,9 +537,12 @@ pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
 /// fixed-width porcelain v1 format (a line like ` M README.md` becomes
 /// `M README.md` after `.trim()`, shifting the status code by one column).
 pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
-    if !is_git_repo(root) {
+    // Porcelain and numstat paths are TOPLEVEL-relative whatever `-C`
+    // names, so any filesystem read of an entry must join the toplevel,
+    // not the workspace root (#139).
+    let Some(toplevel) = repo_toplevel(root) else {
         return Vec::new();
-    }
+    };
     let path_str = match root.to_str() {
         Some(s) => s,
         None => return Vec::new(),
@@ -560,7 +574,7 @@ pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
     }
     for entry in &mut entries {
         if matches!(entry.kind, ChangeKind::Untracked) {
-            entry.additions = count_lines_in_file(root, &entry.path);
+            entry.additions = count_lines_in_file(&toplevel, &entry.path);
         }
     }
     entries
@@ -2567,6 +2581,62 @@ mod tests {
             .arg(p)
             .args(["commit", "-m", "init", "--quiet"])
             .status();
+    }
+
+    #[test]
+    fn repo_toplevel_resolves_from_a_subdirectory_and_refuses_outside_a_repo() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let sub = p.join("crates").join("foo");
+        std::fs::create_dir_all(&sub).unwrap();
+        let top = repo_toplevel(&sub).expect("a repo subdirectory resolves to its toplevel");
+        assert_eq!(
+            top.canonicalize().unwrap(),
+            p.canonicalize().unwrap(),
+            "the toplevel is the repo root, not the subdirectory"
+        );
+        let outside = TempDir::new().unwrap();
+        assert_eq!(
+            repo_toplevel(outside.path()),
+            None,
+            "outside a repo there is no toplevel"
+        );
+    }
+
+    #[test]
+    fn query_from_a_subdir_carries_the_repo_root_and_counts_untracked_lines() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let sub = p.join("crates").join("foo");
+        std::fs::create_dir_all(&sub).unwrap();
+        // An untracked file at the TOPLEVEL: porcelain reports it
+        // toplevel-relative, so a join against the subdir workspace root
+        // reads a nonexistent path and silently counts 0 lines.
+        std::fs::write(p.join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+
+        let status = query(&sub);
+        assert!(status.in_repo, "a subdir of a repo is inside the repo");
+        assert_eq!(
+            status
+                .repo_root
+                .as_ref()
+                .expect("the status carries the discovered toplevel")
+                .canonicalize()
+                .unwrap(),
+            p.canonicalize().unwrap(),
+        );
+
+        let entries = query_changes(&sub);
+        let notes = entries
+            .iter()
+            .find(|e| e.path == "notes.txt")
+            .expect("porcelain reports the toplevel file from a subdir workspace");
+        assert_eq!(
+            notes.additions, 3,
+            "untracked line counts must join the porcelain path against the TOPLEVEL"
+        );
     }
 
     #[test]
