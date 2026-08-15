@@ -20687,6 +20687,133 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
 }
 
 #[test]
+fn change_workspace_root_saves_the_outgoing_workspaces_terminal_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let mut app = App::new(a.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    // Name the pane directly (the rename UI would flush a save itself, and
+    // this test must prove the RE-ROOT saves): a named pane is a
+    // non-trivial layout the store keeps.
+    app.terminals[0].set_manual_name(Some(String::from("srv")));
+    assert!(
+        !app.terminal_session_path.exists(),
+        "precondition: nothing has saved the session yet"
+    );
+
+    app.change_workspace_root(b.clone());
+
+    let map = crate::terminal_session::load(&app.terminal_session_path);
+    let rec = map.get(&a.display().to_string()).expect(
+        "re-rooting away must persist the outgoing workspace's pane layout under ITS key; \
+         the layout was silently discarded",
+    );
+    assert_eq!(
+        rec.panes[0].name.as_deref(),
+        Some("srv"),
+        "the saved record carries the outgoing panes"
+    );
+    assert!(
+        !map.contains_key(&b.display().to_string()),
+        "nothing may be filed under the incoming root's key by the re-root itself"
+    );
+}
+
+#[test]
+fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_is_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    let b_sub = b.join("sub");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    std::fs::create_dir(&b_sub).unwrap();
+    let session_path = tmp.path().join("sessions.json");
+    crate::terminal_session::save_for_root(
+        &session_path,
+        &b.display().to_string(),
+        crate::terminal_session::SessionRecord {
+            panes: vec![
+                crate::terminal_session::PaneRecord {
+                    cwd: b.display().to_string(),
+                    name: None,
+                },
+                crate::terminal_session::PaneRecord {
+                    cwd: b_sub.display().to_string(),
+                    name: Some(String::from("srv")),
+                },
+            ],
+            active: 1,
+        },
+    );
+
+    let mut app = App::new(a.clone()).unwrap();
+    app.terminal_session_path = session_path;
+    // The default pane is untouched: no input, no name, no launched
+    // program — exactly the startup state restore replaces at launch.
+    app.change_workspace_root(b.clone());
+
+    assert_eq!(
+        app.terminals.len(),
+        2,
+        "re-rooting an untouched panel must bring back the incoming workspace's saved layout"
+    );
+    assert_eq!(app.terminals[1].label(), "srv", "names come back with it");
+    assert_eq!(app.active_terminal, 1, "focus lands on the recorded pane");
+}
+
+#[test]
+fn change_workspace_root_keeps_live_panes_when_the_terminal_was_touched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let session_path = tmp.path().join("sessions.json");
+    crate::terminal_session::save_for_root(
+        &session_path,
+        &b.display().to_string(),
+        crate::terminal_session::SessionRecord {
+            panes: vec![
+                crate::terminal_session::PaneRecord {
+                    cwd: b.display().to_string(),
+                    name: None,
+                },
+                crate::terminal_session::PaneRecord {
+                    cwd: b.display().to_string(),
+                    name: Some(String::from("srv")),
+                },
+            ],
+            active: 0,
+        },
+    );
+
+    let mut app = App::new(a.clone()).unwrap();
+    app.terminal_session_path = session_path;
+    // Any input byte marks the pane as the user's: its shell (history,
+    // scrollback, possibly a job) must survive the re-root untouched even
+    // though the incoming workspace has a saved layout.
+    app.terminal_mut().write_input(b"echo touched\n");
+    let uid = app.terminals[0].uid();
+
+    app.change_workspace_root(b.clone());
+
+    assert_eq!(
+        app.terminals.len(),
+        1,
+        "a touched panel is never replaced by the incoming workspace's saved layout"
+    );
+    assert_eq!(
+        app.terminals[0].uid(),
+        uid,
+        "the surviving pane is the same live shell, not a respawn"
+    );
+}
+
+#[test]
 fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

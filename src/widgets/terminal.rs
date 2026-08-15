@@ -488,6 +488,12 @@ pub struct PtyTerminal {
     /// shell's own rc startup — the state `cwd_seed_is_safe` treats as
     /// still seedable (#94).
     input_seen: bool,
+    /// True for a `new_running` pane: the child is a launched program
+    /// (a task, run-active-file, a debug attach), not an interactive
+    /// shell. Such a pane is doing work the user asked for even though
+    /// no input byte was ever written to it, so `is_pristine` must
+    /// never mistake it for a replaceable startup default.
+    run_pane: bool,
     cols: u16,
     rows: u16,
     /// Shared with the `VoidListener` so `TextAreaSizeRequest` callbacks
@@ -1713,6 +1719,7 @@ impl PtyTerminal {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
             input_seen: false,
+            run_pane: script_mode,
             cols,
             rows,
             size_shared,
@@ -3008,6 +3015,18 @@ impl PtyTerminal {
     /// (#94; under full-suite load the window stretches past the call).
     pub fn cwd_seed_is_safe(&self) -> bool {
         self.foreground_is_shell() || (!self.input_seen && self.marks.lock().unwrap().is_empty())
+    }
+
+    /// True while the pane is exactly as croft created it: an interactive
+    /// shell (never a `new_running` program pane, whose child is doing
+    /// launched work with no input byte ever written) that has received
+    /// no input and carries no manual name — nothing the user could miss
+    /// if the pane were replaced. The re-root restore (#137) may swap
+    /// only such panes for the incoming workspace's saved layout; any
+    /// input (a keystroke, a paste, a seeded `cd`) or a rename clears
+    /// this permanently.
+    pub fn is_pristine(&self) -> bool {
+        !self.run_pane && !self.input_seen && self.manual_name.is_none()
     }
 
     /// Scroll the visible viewport up by `n` rows into scrollback.
@@ -5076,6 +5095,39 @@ mod tests {
         assert!(
             term.peek_dirty(),
             "direct-spawned /bin/echo must produce output without any write_input"
+        );
+    }
+
+    #[test]
+    fn pristine_covers_only_an_untouched_interactive_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut shell = PtyTerminal::new(tmp.path()).unwrap();
+        assert!(
+            shell.is_pristine(),
+            "a freshly spawned shell with no input and no name is pristine"
+        );
+        shell.write_input(b"echo touched\n");
+        assert!(
+            !shell.is_pristine(),
+            "any input byte permanently clears pristineness"
+        );
+
+        let mut named = PtyTerminal::new(tmp.path()).unwrap();
+        named.set_manual_name(Some(String::from("srv")));
+        assert!(
+            !named.is_pristine(),
+            "a manual name is user state; the pane must not be replaceable"
+        );
+
+        let run = PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from("sleep 1")],
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(
+            !run.is_pristine(),
+            "a launched-program pane is doing user work despite having seen no input"
         );
     }
 

@@ -29192,6 +29192,14 @@ impl App {
         // The remembered task belongs to the old workspace; Rerun Last Task
         // must rediscover, not rerun the old project's command here.
         self.last_task = None;
+        // Read the panel's untouched-ness BEFORE the cd seed below: the seed
+        // is an input write, which clears it. Then persist the outgoing
+        // workspace's pane layout under ITS key while `workspace_root` still
+        // names it — every save after the swap keys on the new root, which
+        // both discarded this layout on re-root and filed the old panes
+        // under the new workspace's entry (#137).
+        let panel_pristine = self.terminals.len() == 1 && self.terminals[0].is_pristine();
+        self.save_terminal_session();
         let mut shell_synced = true;
         if let Some(active) = self.terminals.get_mut(self.active_terminal) {
             // cwd_seed_is_safe, not foreground_is_shell: a pane whose shell
@@ -29205,6 +29213,14 @@ impl App {
             }
         }
         self.workspace_root = new_root.clone();
+        // A panel the user never touched — the startup default, one unnamed
+        // shell with no input ever typed and no launched program — is swapped
+        // for the incoming workspace's saved layout, the same restore startup
+        // runs. A panel with any user state instead survives the re-root
+        // as-is: navigation must never destroy live shells.
+        if panel_pristine {
+            self.restore_terminal_session();
+        }
         // Rebind the LSP servers to the new root. The manager captured its
         // workspace folder once, at App::new, from croft's launch directory -
         // and the Croft.app launcher hardcodes that to ~/Documents. Re-rooting
