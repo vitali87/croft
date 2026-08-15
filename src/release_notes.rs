@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Source Control now works from a workspace rooted inside a repo subdirectory: croft discovers the repository toplevel, so staging, discarding, HEAD diffs, gutter baselines, untracked line counts, and opening changed files all resolve their repo-relative paths correctly instead of against the workspace root.",
+    summary: "Language servers now see the full workspace-folder contract: croft declares the workspaceFolders capability and answers the server's workspace/workspaceFolders query with its folder list, so folder-aware servers (rust-analyzer, gopls, ruff, ty) stop legally ignoring the folder set croft sends at startup.",
 }];
