@@ -20775,6 +20775,85 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
 }
 
 #[test]
+fn focusing_a_secondary_roots_file_flips_source_control_to_its_repo() {
+    // #149: git state was singular (one worker at the primary), so a
+    // secondary root's repository was invisible — no branch, no panel
+    // entries, no scm_root for its operations.
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("plain");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&plain).unwrap();
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "trunk"],
+        vec!["config", "user.email", "a@b"],
+        vec!["config", "user.name", "a"],
+    ] {
+        let ok = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(&args)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git setup step failed: {args:?}");
+    }
+    std::fs::write(repo.join("seed.txt"), "one\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-qm", "init"]] {
+        let ok = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(&args)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git setup step failed: {args:?}");
+    }
+    std::fs::write(repo.join("seed.txt"), "one\ntwo\n").unwrap();
+
+    // Primary is NOT a repo; the repo joins as a secondary folder.
+    let mut app = App::new(plain.clone()).unwrap();
+    app.add_workspace_folder(repo.clone());
+    let repo_canon = repo.canonicalize().unwrap();
+
+    // Focus the secondary root's file: the SCM surfaces must follow.
+    app.editor
+        .open_pinned(&repo_canon.join("seed.txt"))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut flipped = false;
+    while std::time::Instant::now() < deadline {
+        let _ = app.drain_git_responses();
+        if app.source_control.status.branch.as_deref() == Some("trunk")
+            && app
+                .source_control
+                .entries
+                .iter()
+                .any(|e| e.path == "seed.txt")
+        {
+            flipped = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        flipped,
+        "the panel must show the secondary root's repo (branch + changes); saw {:?} / {:?}",
+        app.source_control.status.branch,
+        app.source_control
+            .entries
+            .iter()
+            .map(|e| e.path.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        app.scm_root().canonicalize().unwrap(),
+        repo_canon,
+        "panel operations address the active repo's toplevel"
+    );
+}
+
+#[test]
 fn add_and_remove_workspace_folder_fan_out_across_tree_index_and_search() {
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("alpha");
