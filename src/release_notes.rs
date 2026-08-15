@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "The editor now draws indentation guides at every indent level, with the guide of the block containing the cursor highlighted, and they run through blank lines inside a block. Toggle with \"View: Toggle Indent Guides\" or in Settings.",
+    summary: "Bracket pair colorization: brackets now colour by nesting depth (gold, orchid, blue — like VS Code), unmatched closers paint red, and brackets inside strings or comments stay plain. Toggle with \"Editor: Toggle Bracket Pair Colorization\" or in Settings.",
 }];

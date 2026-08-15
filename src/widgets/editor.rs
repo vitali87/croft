@@ -11,8 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::highlight::{
-    HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens, highlight_text,
-    lang_for_extension,
+    HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens, lang_for_extension,
 };
 use crate::widgets::scrollbar;
 
@@ -1640,6 +1639,14 @@ pub struct Editor {
     /// lines at each indent level in a line's leading whitespace, with the
     /// cursor's block highlighted. App-synced from prefs; on by default.
     pub show_indent_guides: bool,
+    /// Bracket-pair colorization (#131, VS Code on-by-default since 1.67):
+    /// per-line `(char column, colour index)` pairs for every `()[]{}` outside
+    /// strings and comments, colour cycling by nesting depth
+    /// (`UNEXPECTED_BRACKET` marks an unmatched closer). Rebuilt with the
+    /// syntax spans in `recompute_highlights` — one linear scan per edit,
+    /// never per frame. App-synced from prefs; on by default.
+    pub show_bracket_colors: bool,
+    bracket_colors: Vec<Vec<(usize, u8)>>,
     /// Per-tab override for soft-wrap (VS Code "View: Toggle Word Wrap",
     /// Alt+Z). `None` means follow the language default (`wrap_enabled`
     /// wraps Markdown only); `Some(true)`/`Some(false)` force it on/off for
@@ -1840,6 +1847,8 @@ impl Editor {
             encoding: encoding_rs::UTF_8,
             bom: false,
             show_indent_guides: true,
+            show_bracket_colors: true,
+            bracket_colors: Vec::new(),
             wrap_override: None,
             highlights: Vec::new(),
             semantic_overlay: Vec::new(),
@@ -3083,10 +3092,20 @@ impl Editor {
                 let text = self.lines.join("\n");
                 let bytes = text.as_bytes();
                 let line_starts = compute_line_starts(bytes);
-                self.highlights = highlight_text(&mut self.registry, kind, bytes, &line_starts);
+                let (spans, protected) = crate::highlight::highlight_text_with_protected(
+                    &mut self.registry,
+                    kind,
+                    bytes,
+                    &line_starts,
+                );
+                self.highlights = spans;
+                self.bracket_colors = scan_bracket_colors(&self.lines, &protected);
             }
             None => {
                 self.highlights = vec![Vec::new(); self.lines.len()];
+                // No grammar means no string/comment knowledge; brackets in
+                // plain text still colorize (VS Code does the same).
+                self.bracket_colors = scan_bracket_colors(&self.lines, &[]);
             }
         }
         self.recompute_semantic_overlay();
@@ -7087,6 +7106,62 @@ fn title_case(s: &str) -> String {
     out
 }
 
+/// Colour-index marker for an unmatched closing bracket (painted red).
+const UNEXPECTED_BRACKET: u8 = u8::MAX;
+/// Nesting-depth colours cycle through this many entries (VS Code's default
+/// themes define three `editorBracketHighlight` foregrounds).
+const BRACKET_COLOR_CYCLE: usize = 3;
+
+/// Bracket-pair colorization scan: per line, the `(char column, colour
+/// index)` of every `()[]{}` outside `protected` (absolute byte ranges of
+/// strings and comments, ascending — the grammar's view from
+/// `highlight_text_with_protected`). One shared depth counter across the
+/// three bracket kinds (VS Code's default pool); an opener colours at its own
+/// depth, a matching closer at the opener's depth, and a closer that matches
+/// nothing — or not the innermost open bracket — marks `UNEXPECTED_BRACKET`
+/// while leaving the stack alone, so `(]` reddens the `]` and a later `)`
+/// still pairs with the `(`.
+fn scan_bracket_colors(lines: &[String], protected: &[(usize, usize)]) -> Vec<Vec<(usize, u8)>> {
+    let mut out = vec![Vec::new(); lines.len()];
+    let mut stack: Vec<char> = Vec::new();
+    let mut abs = 0usize;
+    let mut pi = 0usize;
+    for (li, line) in lines.iter().enumerate() {
+        for (ci, ch) in line.chars().enumerate() {
+            let b = abs;
+            abs += ch.len_utf8();
+            while pi < protected.len() && protected[pi].1 <= b {
+                pi += 1;
+            }
+            if pi < protected.len() && protected[pi].0 <= b {
+                continue;
+            }
+            match ch {
+                '(' | '[' | '{' => {
+                    out[li].push((ci, (stack.len() % BRACKET_COLOR_CYCLE) as u8));
+                    stack.push(ch);
+                }
+                ')' | ']' | '}' => {
+                    let want = match ch {
+                        ')' => '(',
+                        ']' => '[',
+                        _ => '{',
+                    };
+                    if stack.last() == Some(&want) {
+                        stack.pop();
+                        out[li].push((ci, (stack.len() % BRACKET_COLOR_CYCLE) as u8));
+                    } else {
+                        out[li].push((ci, UNEXPECTED_BRACKET));
+                    }
+                }
+                _ => {}
+            }
+        }
+        abs += 1; // the '\n' separator between joined lines
+    }
+    out
+}
+
 fn indent_unit_for(lang: Option<LangKind>) -> &'static str {
     match lang {
         Some(LangKind::Yaml) => "  ",
@@ -8013,6 +8088,37 @@ impl Widget for &mut Editor {
                     out.extend(inlay_text_segment(raw, &merged, from, row_end));
                 }
                 buf.set_line(text_x, y, &Line::from(out), row_width);
+            }
+
+            // Bracket-pair colorization (#131): recolour each bracket cell by
+            // its nesting depth (red for an unmatched closer). A foreground
+            // override on the already-painted glyph, so selection / search /
+            // occurrence layers below still lay their backgrounds over it —
+            // and the find layer, painted later, wins outright like it does
+            // over syntax colours. Columns translate through inlay cells and
+            // the row window like every painter; wrap continuation segments
+            // participate (brackets live anywhere in the line, unlike the
+            // leading-whitespace guides).
+            if self.show_bracket_colors
+                && let Some(cols) = self.bracket_colors.get(line_idx)
+            {
+                for &(c, ci) in cols {
+                    if c < row_start {
+                        continue;
+                    }
+                    let col = (c + ex(c) - row_start) as u16;
+                    if col >= row_width {
+                        break;
+                    }
+                    let fg = if ci == UNEXPECTED_BRACKET {
+                        self.theme.bracket_unexpected_fg()
+                    } else {
+                        self.theme.bracket_pair_color(usize::from(ci))
+                    };
+                    let cell = &mut buf[(text_x + col, y)];
+                    let style = cell.style().fg(fg);
+                    cell.set_style(style);
+                }
             }
 
             // Indentation guides (VS Code `editor.guides.indentation`): a dim
@@ -18111,6 +18217,114 @@ mod tests {
         assert_eq!(e.active_indent_guide(), Some((0, 1, 1)));
         e.cursor_row = 2; // "}" is top-level: no active guide
         assert_eq!(e.active_indent_guide(), None);
+    }
+
+    // ---- Bracket-pair colorization (#131) ----
+
+    #[test]
+    fn scan_colors_brackets_by_shared_nesting_depth() {
+        let lines = vec![String::from("a(b[c{d}e]f)g")];
+        let out = scan_bracket_colors(&lines, &[]);
+        assert_eq!(
+            out[0],
+            vec![(1, 0), (3, 1), (5, 2), (7, 2), (9, 1), (11, 0)],
+            "openers colour at their depth, closers at their opener's depth"
+        );
+    }
+
+    #[test]
+    fn scan_marks_unmatched_and_mismatched_closers_unexpected() {
+        let lines = vec![String::from("x)"), String::from("(]y)")];
+        let out = scan_bracket_colors(&lines, &[]);
+        assert_eq!(out[0], vec![(1, UNEXPECTED_BRACKET)], "no opener at all");
+        assert_eq!(
+            out[1],
+            vec![(0, 0), (1, UNEXPECTED_BRACKET), (3, 0)],
+            "a mismatched closer reddens without consuming the open bracket"
+        );
+    }
+
+    #[test]
+    fn scan_skips_brackets_inside_protected_ranges() {
+        // "s(" with the '(' at byte 1 protected: only line 2's bracket shows.
+        let lines = vec![String::from("s("), String::from("f()")];
+        let out = scan_bracket_colors(&lines, &[(1, 2)]);
+        assert!(out[0].is_empty(), "the protected '(' does not participate");
+        assert_eq!(out[1], vec![(1, 0), (2, 0)]);
+    }
+
+    #[test]
+    fn scan_depth_cycles_past_the_palette() {
+        let lines = vec![String::from("([{(x)}])")];
+        let out = scan_bracket_colors(&lines, &[]);
+        assert_eq!(
+            out[0][3],
+            (3, 0),
+            "depth 3 wraps back to the first cycle colour"
+        );
+    }
+
+    #[test]
+    fn recompute_highlights_skips_brackets_in_rust_strings_and_comments() {
+        let mut e = editor_with("let s = \"(prose)\";\nf(1); // (note)\n");
+        e.set_language(Some(LangKind::Rust));
+        assert!(
+            e.bracket_colors[0].is_empty(),
+            "string-literal brackets are prose: {:?}",
+            e.bracket_colors[0]
+        );
+        assert_eq!(
+            e.bracket_colors[1],
+            vec![(1, 0), (3, 0)],
+            "code brackets colour; comment brackets do not: {:?}",
+            e.bracket_colors[1]
+        );
+    }
+
+    #[test]
+    fn render_colors_brackets_by_nesting_depth() {
+        let mut e = editor_with("a(b[c{d}e]f)g");
+        e.recompute_highlights();
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        for (col, depth) in [(1u16, 0), (3, 1), (5, 2), (7, 2), (9, 1), (11, 0)] {
+            assert_eq!(
+                buf[(text_x + col, y0)].fg,
+                e.theme.bracket_pair_color(depth),
+                "bracket at col {col} wears depth-{depth} colour"
+            );
+        }
+        assert_ne!(
+            buf[(text_x + 2, y0)].fg,
+            e.theme.bracket_pair_color(0),
+            "non-bracket text keeps its syntax colour"
+        );
+    }
+
+    #[test]
+    fn render_paints_unmatched_closer_red() {
+        let mut e = editor_with("x)");
+        e.recompute_highlights();
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(
+            buf[(text_x + 1, e.last_inner.y)].fg,
+            e.theme.bracket_unexpected_fg()
+        );
+    }
+
+    #[test]
+    fn render_bracket_colors_toggle_off_keeps_syntax_color() {
+        let mut e = editor_with("a(b)c");
+        e.recompute_highlights();
+        e.show_bracket_colors = false;
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_ne!(
+            buf[(text_x + 1, e.last_inner.y)].fg,
+            e.theme.bracket_pair_color(0)
+        );
     }
 
     // ---- Select to Bracket (editor.action.selectToBracket) ----
