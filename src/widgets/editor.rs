@@ -3104,8 +3104,15 @@ impl Editor {
             None => {
                 self.highlights = vec![Vec::new(); self.lines.len()];
                 // No grammar means no string/comment knowledge; brackets in
-                // plain text still colorize (VS Code does the same).
-                self.bracket_colors = scan_bracket_colors(&self.lines, &[]);
+                // plain text still colorize (VS Code does the same) — unless
+                // the buffer is big enough that the per-edit scan would make
+                // typing in a large log pay for every character.
+                let bytes: usize = self.lines.iter().map(String::len).sum();
+                self.bracket_colors = if bytes > BRACKET_SCAN_MAX_BYTES {
+                    Vec::new()
+                } else {
+                    scan_bracket_colors(&self.lines, &[])
+                };
             }
         }
         self.recompute_semantic_overlay();
@@ -7108,6 +7115,12 @@ fn title_case(s: &str) -> String {
 
 /// Colour-index marker for an unmatched closing bracket (painted red).
 const UNEXPECTED_BRACKET: u8 = u8::MAX;
+/// Plain-text buffers above this size skip bracket colorization: a
+/// no-grammar file has no tree-sitter pass absorbing a per-edit full scan,
+/// so typing in a large log must not pay O(total chars) per keystroke.
+/// Grammar-backed buffers are not gated here — re-highlighting already
+/// rescans the document per edit, which bounds what ever reaches this scan.
+const BRACKET_SCAN_MAX_BYTES: usize = 1_000_000;
 /// Nesting-depth colours cycle through this many entries (VS Code's default
 /// themes define three `editorBracketHighlight` foregrounds).
 const BRACKET_COLOR_CYCLE: usize = 3;
@@ -18279,6 +18292,25 @@ mod tests {
             "code brackets colour; comment brackets do not: {:?}",
             e.bracket_colors[1]
         );
+    }
+
+    #[test]
+    fn plain_text_bracket_scan_is_gated_by_buffer_size() {
+        // A no-grammar buffer has no tree-sitter pass absorbing a per-edit
+        // full scan, so an oversized one must skip bracket colorization
+        // entirely (typing in an 8MB log must stay O(lines), not O(chars)).
+        let big_line = "x".repeat(64 * 1024);
+        let mut e = editor_with("");
+        e.lines = vec![big_line; (BRACKET_SCAN_MAX_BYTES / (64 * 1024)) + 2];
+        e.lines.push(String::from("f()"));
+        e.recompute_highlights();
+        assert!(
+            e.bracket_colors.iter().all(Vec::is_empty),
+            "an oversized plain-text buffer opts out of the scan"
+        );
+        let mut small = editor_with("f()");
+        small.recompute_highlights();
+        assert_eq!(small.bracket_colors[0], vec![(1, 0), (2, 0)]);
     }
 
     #[test]
