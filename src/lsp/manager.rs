@@ -4144,6 +4144,13 @@ fn build_client_capabilities() -> ClientCapabilities {
             semantic_tokens: Some(SemanticTokensWorkspaceClientCapabilities {
                 refresh_support: Some(true),
             }),
+            // Without this declaration a server may legally IGNORE the
+            // `workspace_folders` array in initialize (LSP 3.6): the
+            // capability is what tells folder-aware servers (rust-analyzer,
+            // gopls, ruff, ty) the client can answer
+            // `workspace/workspaceFolders` and will send
+            // `didChangeWorkspaceFolders` when the set changes.
+            workspace_folders: Some(true),
             ..Default::default()
         }),
         // Declare `window.workDoneProgress` so servers stream `$/progress`
@@ -4544,6 +4551,21 @@ mod tests {
         let caps = build_client_capabilities();
         let window = caps.window.expect("window capabilities must be set");
         assert_eq!(window.work_done_progress, Some(true));
+    }
+
+    #[test]
+    fn client_capabilities_advertise_workspace_folders() {
+        // Per LSP 3.6+, a server may IGNORE the `workspace_folders` array in
+        // initialize unless the client declares `workspace.workspaceFolders`;
+        // without it, folder-aware servers (rust-analyzer, gopls, ruff, ty)
+        // legally fall back to single-root behavior.
+        let caps = build_client_capabilities();
+        let ws = caps.workspace.expect("workspace capabilities must be set");
+        assert_eq!(
+            ws.workspace_folders,
+            Some(true),
+            "the workspaceFolders capability gates every folder-aware server feature"
+        );
     }
 
     fn def_range(line: u32, ch: u32) -> lsp_types::Range {
