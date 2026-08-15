@@ -20851,6 +20851,24 @@ fn focusing_a_secondary_roots_file_flips_source_control_to_its_repo() {
         repo_canon,
         "panel operations address the active repo's toplevel"
     );
+
+    // The mutation path must hit the SAME repository the panel shows
+    // (#150 review: staging addressed the active repo while commit still
+    // ran against the primary — stage in B, commit in A).
+    app.stage_all_source_control();
+    app.source_control.message = String::from("from the panel");
+    app.commit_staged_source_control();
+    let log = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(&repo)
+        .args(["log", "--oneline"])
+        .output()
+        .unwrap();
+    assert!(log.status.success());
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("from the panel"),
+        "the commit lands in the ACTIVE repo, the one the panel shows"
+    );
 }
 
 #[test]

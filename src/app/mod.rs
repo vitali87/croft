@@ -5241,19 +5241,11 @@ impl App {
         // non-active workers' lists are discarded at their drains below.
         let active = self.active_scm_workspace_root();
         if active != self.active_scm_root {
-            self.active_scm_root = active.clone();
-            self.default_branch_label = None;
-            let w = self.git_worker_for_root_mut(&active);
-            w.bypass_debounce();
-            w.request_status_and_changes();
-            let status = self.git_worker_for_root(&active).status().clone();
-            self.source_control.set_status(status, Vec::new());
-            self.refresh_commit_graph();
+            self.seed_active_scm(active);
         }
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
         let mut changed = false;
-        let mut any_ignored_changed = false;
         let primary_root = self.roots.primary().to_path_buf();
         let mut worker_roots: Vec<PathBuf> = vec![primary_root];
         worker_roots.extend(self.git_extra.iter().map(|(r, _)| r.clone()));
@@ -5272,7 +5264,6 @@ impl App {
                 continue;
             }
             changed = true;
-            any_ignored_changed = true;
             let status = w.status().clone();
             if is_active && status.in_repo && self.default_branch_label.is_none() {
                 self.default_branch_label = crate::git::default_branch(&self.active_scm_root).ok();
@@ -5305,8 +5296,6 @@ impl App {
         }
         if changed {
             self.refresh_scm_change_badge();
-        }
-        if any_ignored_changed {
             // The Explorer dims git-ignored rows across EVERY root: each
             // worker's set is cwd-scoped to its root already, so the union
             // is exact. Single-root keeps the Arc clone (no set copy).
@@ -5322,6 +5311,26 @@ impl App {
             }
         }
         changed
+    }
+
+    /// Point the SCM surfaces at `active`'s repository: seed the panel
+    /// from its worker's cached status, drop the outgoing repo's change
+    /// list (rendering another repository's entries under this branch
+    /// header would be wrong; the fresh list lands one worker roundtrip
+    /// later), re-request it past the debounce, and refetch the COMMITS
+    /// graph. Shared by the focus-follow switch and the remove-folder
+    /// fallback (#150 review: assigning the field directly left the
+    /// removed repo's panel on screen, since the switch-detect saw no
+    /// difference).
+    fn seed_active_scm(&mut self, active: PathBuf) {
+        self.active_scm_root = active.clone();
+        self.default_branch_label = None;
+        let w = self.git_worker_for_root_mut(&active);
+        w.bypass_debounce();
+        w.request_status_and_changes();
+        let status = self.git_worker_for_root(&active).status().clone();
+        self.source_control.set_status(status, Vec::new());
+        self.refresh_commit_graph();
     }
 
     /// Rebuild the cached source-control change-count badge after the change
@@ -7335,7 +7344,14 @@ impl App {
             return;
         }
         // A git commit row: no snapshot to restore.
-        match crate::git::show_commit_file_diff(&self.tree.root, &hash, &rel) {
+        let timeline_root = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| self.roots.owning_root(p))
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        match crate::git::show_commit_file_diff(&timeline_root, &hash, &rel) {
             Ok(raw) => {
                 let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
                 if let Err(e) = self.editor.open_git_diff_side_by_side(&label, &raw) {
@@ -9030,7 +9046,12 @@ impl App {
             self.save();
         }
         let rel = self.status_path(&path);
-        match crate::git::stage_path(&self.tree.root, &rel) {
+        let merge_root = self
+            .roots
+            .owning_root(&path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        match crate::git::stage_path(&merge_root, &rel) {
             Ok(()) => {
                 self.refresh_source_control();
                 self.status = format!("Merge complete: staged {rel}");
@@ -14817,7 +14838,7 @@ impl App {
     /// Open a commit's full patch (header, message, diffstat, diff) in a
     /// read-only scratch tab — the graph's click-through, tig's enter key.
     fn open_commit_patch(&mut self, hash: &str, short_hash: &str) {
-        match crate::git::show_commit(&self.tree.root, hash) {
+        match crate::git::show_commit(&self.scm_root(), hash) {
             Ok(text) => {
                 let label = format!("commit {short_hash}");
                 match self.editor.open_text_buffer(Path::new(&label), &text) {
@@ -16646,7 +16667,7 @@ impl App {
     /// "Push" item so users can ship already-committed work without
     /// having to type a no-op commit message first.
     pub fn push_source_control(&mut self) {
-        match crate::git::push_current_branch(&self.tree.root) {
+        match crate::git::push_current_branch(&self.scm_root()) {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
                     "pushed".to_string()
@@ -16669,7 +16690,7 @@ impl App {
     /// Pull the current branch from its upstream. Sibling of
     /// `push_source_control`, reached from the commit dropdown's "Pull".
     pub fn pull_source_control(&mut self) {
-        match crate::git::pull_current_branch(&self.tree.root) {
+        match crate::git::pull_current_branch(&self.scm_root()) {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
                     "pulled".to_string()
@@ -16694,7 +16715,7 @@ impl App {
     /// pull short-circuits (we never push on top of an unmerged tree); a
     /// successful pull followed by a failed push reports both halves.
     pub fn sync_source_control(&mut self) {
-        let pull_summary = match crate::git::pull_current_branch(&self.tree.root) {
+        let pull_summary = match crate::git::pull_current_branch(&self.scm_root()) {
             Ok(s) => s,
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("sync: pull failed: {err}"));
@@ -16706,7 +16727,7 @@ impl App {
                 return;
             }
         };
-        match crate::git::push_current_branch(&self.tree.root) {
+        match crate::git::push_current_branch(&self.scm_root()) {
             Ok(push_summary) => {
                 self.source_control.commit_feedback = Some(format!(
                     "synced (pulled: {pull_summary} | pushed: {push_summary})"
@@ -16728,7 +16749,7 @@ impl App {
     /// Stash the working tree (`git stash push`). Reached from the commit
     /// dropdown's "Stash" item.
     pub fn stash_source_control(&mut self) {
-        match crate::git::stash_push(&self.tree.root) {
+        match crate::git::stash_push(&self.scm_root()) {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(format!("stashed: {summary}"));
                 self.source_control.commit_feedback_is_error = false;
@@ -16748,7 +16769,7 @@ impl App {
     /// Restore the most recent stash (`git stash pop`). A pop conflict is
     /// surfaced verbatim so the user can resolve it.
     pub fn stash_pop_source_control(&mut self) {
-        match crate::git::stash_pop(&self.tree.root) {
+        match crate::git::stash_pop(&self.scm_root()) {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(format!("popped: {summary}"));
                 self.source_control.commit_feedback_is_error = false;
@@ -16876,7 +16897,7 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        let r = crate::git::commit_staged(&self.tree.root, &message);
+        let r = crate::git::commit_staged(&self.scm_root(), &message);
         if r.is_ok() {
             self.source_control.clear_message();
         }
@@ -16891,7 +16912,7 @@ impl App {
             self.run_scm_op("add -A", Err(err), "Stage all");
             return;
         }
-        let r = crate::git::commit_staged(&self.tree.root, &message);
+        let r = crate::git::commit_staged(&self.scm_root(), &message);
         if r.is_ok() {
             self.source_control.clear_message();
         }
@@ -16903,9 +16924,9 @@ impl App {
         // rewrites it — matching VS Code's amend.
         let message = self.source_control.message.trim().to_string();
         let r = if message.is_empty() {
-            crate::git::commit_amend_no_edit(&self.tree.root)
+            crate::git::commit_amend_no_edit(&self.scm_root())
         } else {
-            crate::git::commit_amend(&self.tree.root, &message)
+            crate::git::commit_amend(&self.scm_root(), &message)
         };
         if r.is_ok() {
             self.source_control.clear_message();
@@ -16917,7 +16938,7 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        let commit = crate::git::commit_all_tracked(&self.tree.root, &message);
+        let commit = crate::git::commit_all_tracked(&self.scm_root(), &message);
         self.log_git("commit -am", &commit);
         if let Err(err) = commit {
             self.source_control.commit_feedback = Some(err.clone());
@@ -16936,7 +16957,7 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         };
-        let r = crate::git::publish_branch(&self.tree.root, &branch);
+        let r = crate::git::publish_branch(&self.scm_root(), &branch);
         self.run_scm_op("push -u origin", r, "Published");
     }
 
@@ -17026,7 +17047,7 @@ impl App {
             )),
             ScmAction::CheckoutTo => self.open_branch_picker_for(BranchPurpose::Checkout),
             ScmAction::Fetch => {
-                let r = crate::git::fetch_all(&self.tree.root);
+                let r = crate::git::fetch_all(&self.scm_root());
                 self.run_scm_op("fetch --all --prune", r, "Fetched");
             }
             ScmAction::ShowGitOutput => self.show_git_output(),
@@ -17041,12 +17062,12 @@ impl App {
             ScmAction::DiscardAll => self.request_discard_all_source_control(),
             ScmAction::Sync => self.sync_source_control(),
             ScmAction::PullRebase => {
-                let r = crate::git::pull_rebase(&self.tree.root);
+                let r = crate::git::pull_rebase(&self.scm_root());
                 self.run_scm_op("pull --rebase", r, "Pulled (rebase)");
             }
             ScmAction::PushTo => self.open_push_to_remote_picker(),
             ScmAction::PushForce => {
-                let r = crate::git::push_force(&self.tree.root);
+                let r = crate::git::push_force(&self.scm_root());
                 self.run_scm_op("push --force-with-lease", r, "Force-pushed");
             }
             ScmAction::PublishBranch => self.publish_branch_source_control(),
@@ -17079,11 +17100,11 @@ impl App {
             ScmAction::RemoveRemote => self.open_remote_picker(ListPurpose::RemoveRemote),
             ScmAction::Stash => self.stash_source_control(),
             ScmAction::StashIncludeUntracked => {
-                let r = crate::git::stash_push_untracked(&self.tree.root);
+                let r = crate::git::stash_push_untracked(&self.scm_root());
                 self.run_scm_op("stash push -u", r, "Stashed (incl. untracked)");
             }
             ScmAction::StashStaged => {
-                let r = crate::git::stash_push_staged(&self.tree.root);
+                let r = crate::git::stash_push_staged(&self.scm_root());
                 self.run_scm_op("stash push --staged", r, "Stashed staged");
             }
             ScmAction::ApplyStash => self.open_stash_picker(ListPurpose::StashApply),
@@ -17101,7 +17122,7 @@ impl App {
 
     fn open_stash_picker(&mut self, purpose: crate::widgets::list_picker::ListPurpose) {
         use crate::widgets::list_picker::{ListPicker, ListRow};
-        let rows: Vec<ListRow> = match crate::git::list_stashes(&self.tree.root) {
+        let rows: Vec<ListRow> = match crate::git::list_stashes(&self.scm_root()) {
             Ok(stashes) => stashes
                 .into_iter()
                 .map(|s| ListRow {
@@ -17127,7 +17148,7 @@ impl App {
 
     fn open_tag_picker(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
-        let rows: Vec<ListRow> = match crate::git::list_tags(&self.tree.root) {
+        let rows: Vec<ListRow> = match crate::git::list_tags(&self.scm_root()) {
             Ok(tags) => tags
                 .into_iter()
                 .map(|t| ListRow {
@@ -17148,7 +17169,7 @@ impl App {
 
     fn open_remote_picker(&mut self, purpose: crate::widgets::list_picker::ListPurpose) {
         use crate::widgets::list_picker::{ListPicker, ListRow};
-        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.tree.root) {
+        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.scm_root()) {
             Ok(remotes) => remotes
                 .into_iter()
                 .map(|r| ListRow {
@@ -17169,7 +17190,7 @@ impl App {
 
     fn open_push_to_remote_picker(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
-        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.tree.root) {
+        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.scm_root()) {
             Ok(remotes) => remotes
                 .into_iter()
                 .map(|r| ListRow {
@@ -17227,12 +17248,12 @@ impl App {
             }
             InputPurpose::RenameBranch => {
                 self.close_input_prompt();
-                let r = crate::git::rename_branch(&self.tree.root, &value);
+                let r = crate::git::rename_branch(&self.scm_root(), &value);
                 self.run_scm_op("branch -m", r, "Renamed branch");
             }
             InputPurpose::CreateBranchFrom { base } => {
                 self.close_input_prompt();
-                let r = crate::git::create_branch_from(&self.tree.root, &value, &base);
+                let r = crate::git::create_branch_from(&self.scm_root(), &value, &base);
                 self.run_scm_op("switch -c (from)", r, "Created branch");
             }
             InputPurpose::AddRemoteName => {
@@ -17246,12 +17267,12 @@ impl App {
             }
             InputPurpose::AddRemoteUrl { name } => {
                 self.close_input_prompt();
-                let r = crate::git::add_remote(&self.tree.root, &name, &value);
+                let r = crate::git::add_remote(&self.scm_root(), &name, &value);
                 self.run_scm_op("remote add", r, "Added remote");
             }
             InputPurpose::CreateTag => {
                 self.close_input_prompt();
-                let r = crate::git::create_tag(&self.tree.root, &value);
+                let r = crate::git::create_tag(&self.scm_root(), &value);
                 self.run_scm_op("tag", r, "Created tag");
             }
             InputPurpose::McpConsent { command_id } => {
@@ -18726,27 +18747,27 @@ impl App {
         let index = row.id.parse::<usize>().unwrap_or(0);
         match purpose {
             ListPurpose::StashApply => {
-                let r = crate::git::stash_apply(&self.tree.root, index);
+                let r = crate::git::stash_apply(&self.scm_root(), index);
                 self.run_scm_op("stash apply", r, "Applied stash");
             }
             ListPurpose::StashPop => {
-                let r = crate::git::stash_pop_at(&self.tree.root, index);
+                let r = crate::git::stash_pop_at(&self.scm_root(), index);
                 self.run_scm_op("stash pop", r, "Popped stash");
             }
             ListPurpose::StashDrop => {
-                let r = crate::git::stash_drop(&self.tree.root, index);
+                let r = crate::git::stash_drop(&self.scm_root(), index);
                 self.run_scm_op("stash drop", r, "Dropped stash");
             }
             ListPurpose::RemoveRemote => {
-                let r = crate::git::remove_remote(&self.tree.root, &row.id);
+                let r = crate::git::remove_remote(&self.scm_root(), &row.id);
                 self.run_scm_op("remote remove", r, "Removed remote");
             }
             ListPurpose::DeleteTag => {
-                let r = crate::git::delete_tag(&self.tree.root, &row.id);
+                let r = crate::git::delete_tag(&self.scm_root(), &row.id);
                 self.run_scm_op("tag -d", r, "Deleted tag");
             }
             ListPurpose::PushToRemote => {
-                let r = crate::git::push_to_remote(&self.tree.root, &row.id);
+                let r = crate::git::push_to_remote(&self.scm_root(), &row.id);
                 self.run_scm_op("push", r, "Pushed");
             }
             ListPurpose::MergeConflict => {
@@ -19028,7 +19049,7 @@ impl App {
                     return;
                 };
                 self.close_branch_picker();
-                let r = crate::git::delete_branch(&self.tree.root, &name);
+                let r = crate::git::delete_branch(&self.scm_root(), &name);
                 self.run_scm_op("branch -d", r, "Deleted branch");
             }
             BranchPurpose::Merge => {
@@ -19036,7 +19057,7 @@ impl App {
                     return;
                 };
                 self.close_branch_picker();
-                let r = crate::git::merge_branch(&self.tree.root, &name);
+                let r = crate::git::merge_branch(&self.scm_root(), &name);
                 self.run_scm_op("merge", r, "Merged");
             }
             BranchPurpose::Rebase => {
@@ -19044,7 +19065,7 @@ impl App {
                     return;
                 };
                 self.close_branch_picker();
-                let r = crate::git::rebase_branch(&self.tree.root, &name);
+                let r = crate::git::rebase_branch(&self.scm_root(), &name);
                 self.run_scm_op("rebase", r, "Rebased");
             }
         }
@@ -19055,7 +19076,7 @@ impl App {
     /// the dropdown, click View Staged Changes, and the editor tab pops up
     /// with every `+`/`-` line of the staged hunks highlighted.
     pub fn view_staged_diff_source_control(&mut self) {
-        let raw = match crate::git::diff_staged(&self.tree.root) {
+        let raw = match crate::git::diff_staged(&self.scm_root()) {
             Ok(r) => r,
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
@@ -19082,7 +19103,7 @@ impl App {
     /// surfaces in the commit-feedback line so the user can fix the
     /// upstream-HEAD config instead of getting a silent no-op.
     pub fn view_default_branch_diff_source_control(&mut self) {
-        let branch = match crate::git::default_branch(&self.tree.root) {
+        let branch = match crate::git::default_branch(&self.scm_root()) {
             Ok(b) => b,
             Err(err) => {
                 self.source_control.commit_feedback = Some(err.clone());
@@ -19091,7 +19112,7 @@ impl App {
                 return;
             }
         };
-        let raw = match crate::git::diff_against_branch(&self.tree.root, &branch) {
+        let raw = match crate::git::diff_against_branch(&self.scm_root(), &branch) {
             Ok(r) => r,
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
@@ -19120,7 +19141,7 @@ impl App {
     /// `HEAD~1`; that error surfaces in the commit-feedback line rather
     /// than as a silent no-op.
     pub fn view_previous_commit_diff_source_control(&mut self) {
-        let raw = match crate::git::diff_previous_commit(&self.tree.root) {
+        let raw = match crate::git::diff_previous_commit(&self.scm_root()) {
             Ok(r) => r,
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
@@ -19148,7 +19169,7 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
-        let commit_summary = match crate::git::commit_all_tracked(&self.tree.root, &message) {
+        let commit_summary = match crate::git::commit_all_tracked(&self.scm_root(), &message) {
             Ok(s) => s,
             Err(err) => {
                 self.source_control.commit_feedback = Some(err.clone());
@@ -19159,7 +19180,7 @@ impl App {
         };
         self.source_control.clear_message();
         self.status = format!("Committed: {commit_summary}");
-        match crate::git::push_current_branch(&self.tree.root) {
+        match crate::git::push_current_branch(&self.scm_root()) {
             Ok(push_summary) => {
                 let combined = if push_summary.is_empty() {
                     commit_summary
@@ -19387,7 +19408,7 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
-        match crate::git::commit_all_tracked(&self.tree.root, &message) {
+        match crate::git::commit_all_tracked(&self.scm_root(), &message) {
             Ok(summary) => {
                 self.source_control.clear_message();
                 self.source_control.commit_feedback = Some(summary.clone());
@@ -24790,7 +24811,7 @@ impl App {
             return;
         }
         self.commit_menu_open = false;
-        match crate::git::list_branches(&self.tree.root) {
+        match crate::git::list_branches(&self.scm_root()) {
             Ok(branches) => {
                 let n = branches.len();
                 self.branch_picker =
@@ -24826,11 +24847,11 @@ impl App {
         use crate::widgets::branch_picker::BranchAction;
         let (result, verb) = match &action {
             BranchAction::Checkout(name) => (
-                crate::git::checkout_branch(&self.tree.root, name),
+                crate::git::checkout_branch(&self.scm_root(), name),
                 "Switched to",
             ),
             BranchAction::Create(name) => {
-                (crate::git::create_branch(&self.tree.root, name), "Created")
+                (crate::git::create_branch(&self.scm_root(), name), "Created")
             }
         };
         match result {
@@ -29487,9 +29508,11 @@ impl App {
         self.git_extra.retain(|(r, _)| r != &path);
         self.git_head_oids.remove(&path);
         if self.active_scm_root == path {
-            // The panel was following the removed folder's repo: fall
-            // back to the primary; the next drain tick re-seeds it.
-            self.active_scm_root = self.roots.primary().to_path_buf();
+            // The panel was following the removed folder's repo: seed the
+            // primary's immediately — assigning the field alone left the
+            // removed repository on screen (#150 review).
+            let primary = self.roots.primary().to_path_buf();
+            self.seed_active_scm(primary);
         }
         self.rebind_workspace_watchers();
         self.sync_workspace_fanout();
