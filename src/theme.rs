@@ -417,6 +417,13 @@ impl Theme {
         Color::Rgb(0xff, 0x12, 0x12)
     }
 
+    /// Foreground of rendered whitespace glyphs (VS Code
+    /// `editorWhitespace.foreground`): dimmer than the indent guides so an
+    /// "all" render stays readable, blended over each theme's background.
+    pub fn whitespace_fg(self) -> Color {
+        self.blend_over_bg((0x96, 0x96, 0x96), 0.30)
+    }
+
     /// Foreground of an indentation guide (VS Code
     /// `editorIndentGuide.background1`, #404040 on the dark default): a grey
     /// blended over each theme's background so it stays a whisper above the

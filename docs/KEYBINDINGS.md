@@ -75,6 +75,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `Cmd+J` | Unfold All: expand every collapsed block |
 | Command Palette: `View: Toggle Indent Guides` | Show/hide the editor's indentation guides (vertical lines at each indent level, the cursor's block highlighted; on by default, persisted, also in Settings) |
 | Command Palette: `Editor: Toggle Bracket Pair Colorization` | Colour brackets by nesting depth, unmatched closers in red; strings and comments keep plain brackets (on by default, persisted, also in Settings) |
+| Command Palette: `View: Toggle Render Whitespace` | Cycle whitespace glyphs (`·` spaces, `→` tabs): selection (default — only inside selected text) → all → none; persisted, also in Settings |
 | Mouse wheel | Scroll the pane under the pointer |
 
 ### Customize Layout
