@@ -10061,10 +10061,30 @@ fn toggle_indent_guides_command_flips_every_editor_via_the_frame_sync() {
     // group, so tabs opened after the toggle can never resurrect guides.
     app.sync_focus_flags();
     assert!(app.editor.editors.iter().all(|e| !e.show_indent_guides));
+    // A tab opened AFTER the toggle starts on the constructor default (true)
+    // and must be brought in line by the next frame's sync.
+    app.editor
+        .open_text_buffer(std::path::Path::new("later.rs"), "fn x() {\n    y();\n}")
+        .unwrap();
+    assert!(
+        app.editor.show_indent_guides,
+        "a fresh tab starts on the default, proving the sync below does the work"
+    );
+    app.sync_focus_flags();
+    assert!(
+        app.editor.editors.iter().all(|e| !e.show_indent_guides),
+        "the frame sync disables guides on the tab opened after the toggle"
+    );
     app.run_command(crate::widgets::command_palette::Command::ToggleIndentGuides);
     assert!(app.indent_guides_enabled);
+    app.editor
+        .open_text_buffer(std::path::Path::new("even-later.rs"), "fn z() {}")
+        .unwrap();
     app.sync_focus_flags();
-    assert!(app.editor.editors.iter().all(|e| e.show_indent_guides));
+    assert!(
+        app.editor.editors.iter().all(|e| e.show_indent_guides),
+        "re-enabling reaches tabs opened before and after the toggle"
+    );
 }
 
 #[test]
