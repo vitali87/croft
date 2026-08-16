@@ -234,6 +234,74 @@ where
     std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
 
+/// Parse a VS Code-compatible `.code-workspace` file (#163): tolerant of
+/// `//` comments (the keybindings.json treatment), `folders[].path`
+/// resolved against the file's directory, `name` and `settings`/`launch`/
+/// `tasks` sections ignored (croft's settings are global). Returns the
+/// resolved folder list in file order; empty folders is an error — a
+/// workspace names at least one folder.
+pub fn parse_workspace_file(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let stripped = crate::keymap::strip_line_comments(&raw);
+    let v: serde_json::Value =
+        serde_json::from_str(&stripped).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let folders = v
+        .get("folders")
+        .and_then(|f| f.as_array())
+        .ok_or_else(|| format!("{}: no folders array", path.display()))?;
+    let mut out = Vec::new();
+    for f in folders {
+        let Some(p) = f.get("path").and_then(|p| p.as_str()) else {
+            continue;
+        };
+        let p = Path::new(p);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base.join(p)
+        };
+        out.push(abs.canonicalize().unwrap_or(abs));
+    }
+    if out.is_empty() {
+        return Err(format!("{}: no folders", path.display()));
+    }
+    Ok(out)
+}
+
+/// Write the folder set as a `.code-workspace` (#163): paths relative to
+/// the file's directory where possible — VS Code's recommendation, so the
+/// file survives being moved with its folders — absolute otherwise.
+pub fn write_workspace_file(path: &Path, folders: &[PathBuf]) -> Result<(), String> {
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let entries: Vec<serde_json::Value> = folders
+        .iter()
+        .map(|f| {
+            let rel = f
+                .strip_prefix(&base_canon)
+                .ok()
+                .or_else(|| f.strip_prefix(base).ok());
+            let shown = match rel {
+                Some(r) if !r.as_os_str().is_empty() => r.display().to_string(),
+                _ => f.display().to_string(),
+            };
+            serde_json::json!({ "path": shown })
+        })
+        .collect();
+    let doc = serde_json::json!({ "folders": entries });
+    let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// True when `path` names a VS Code workspace file.
+pub fn is_workspace_file(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "code-workspace")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +353,50 @@ mod tests {
         assert!(ws.remove(Path::new("/w/b")), "a secondary root removes");
         assert!(!ws.is_multi());
         assert_eq!(ws.primary(), Path::new("/w/a"));
+    }
+
+    #[test]
+    fn workspace_file_round_trips_with_relative_paths_and_tolerates_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("alpha");
+        let b = tmp.path().join("beta");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let file = tmp.path().join("proj.code-workspace");
+        write_workspace_file(&file, &[a.clone(), b.clone()]).unwrap();
+        let raw = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            raw.contains("\"alpha\"") && raw.contains("\"beta\""),
+            "folders under the file's dir are written RELATIVE: {raw}"
+        );
+        let parsed = parse_workspace_file(&file).unwrap();
+        assert_eq!(
+            parsed,
+            vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()]
+        );
+
+        // Comments and absolute paths parse too; order is preserved.
+        let commented = tmp.path().join("c.code-workspace");
+        std::fs::write(
+            &commented,
+            format!(
+                "{{\n  // the arrangement\n  \"folders\": [\n    {{ \"path\": \"{}\" }},\n    {{ \"path\": \"alpha\" }}\n  ]\n}}\n",
+                b.display()
+            ),
+        )
+        .unwrap();
+        let parsed = parse_workspace_file(&commented).unwrap();
+        assert_eq!(
+            parsed,
+            vec![b.canonicalize().unwrap(), a.canonicalize().unwrap()]
+        );
+
+        // Malformed: a real error, never an empty default.
+        let bad = tmp.path().join("bad.code-workspace");
+        std::fs::write(&bad, "{ nope").unwrap();
+        assert!(parse_workspace_file(&bad).is_err());
+        assert!(is_workspace_file(&bad));
+        assert!(!is_workspace_file(Path::new("x.rs")));
     }
 
     #[test]

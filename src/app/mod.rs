@@ -2208,6 +2208,10 @@ pub struct App {
     /// The workspace root the Testing panel and worker are bound to —
     /// follows the focused file's folder like the SCM surfaces (#151).
     active_test_root: PathBuf,
+    /// Folder set from an explicitly opened `.code-workspace` (#163):
+    /// consumed by `change_workspace_root` INSTEAD of the automatic
+    /// per-primary restore, so the file defines the arrangement exactly.
+    pending_workspace_folders: Option<Vec<PathBuf>>,
     /// Per-workspace-root last-seen HEAD oid, for gutter-baseline and
     /// commit-graph invalidation per repository (#149).
     git_head_oids: std::collections::BTreeMap<PathBuf, Option<String>>,
@@ -3689,6 +3693,7 @@ impl App {
             scm_pin: None,
             scm_follow_root: root.clone(),
             active_test_root: root.clone(),
+            pending_workspace_folders: None,
             git_head_oids: std::collections::BTreeMap::new(),
             git,
             cursor_blink: CursorBlink::new(),
@@ -17372,6 +17377,21 @@ impl App {
                 self.close_input_prompt();
                 self.add_watch_expression(value);
             }
+            InputPurpose::SaveWorkspaceAs => {
+                let dest = PathBuf::from(value.trim());
+                let folders: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+                match crate::workspace::write_workspace_file(&dest, &folders) {
+                    Ok(()) => {
+                        self.status = format!(
+                            "Saved workspace ({} folder{}): {}",
+                            folders.len(),
+                            if folders.len() == 1 { "" } else { "s" },
+                            dest.display()
+                        );
+                    }
+                    Err(e) => self.status = format!("Save workspace: {e}"),
+                }
+            }
             InputPurpose::CloneUrl => {
                 self.close_input_prompt();
                 let parent = self
@@ -24609,6 +24629,34 @@ impl App {
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
             Cmd::ShowSourceControl => self.set_sidebar_view(SidebarView::SourceControl),
             Cmd::AddWorkspaceFolder => self.open_add_folder_picker(),
+            Cmd::SaveWorkspaceAs => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                let suggestion = {
+                    let name = self
+                        .workspace_root()
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| String::from("workspace"));
+                    self.workspace_root()
+                        .join(format!("{name}.code-workspace"))
+                        .display()
+                        .to_string()
+                };
+                self.open_input_prompt(
+                    InputPrompt::new(
+                        InputPurpose::SaveWorkspaceAs,
+                        String::from("Save Workspace As"),
+                        "Enter to save · Esc to cancel",
+                    )
+                    .with_value(&suggestion),
+                );
+            }
+            Cmd::OpenWorkspaceFromFile => match self.editor.path.clone() {
+                Some(p) if crate::workspace::is_workspace_file(&p) => self.open_workspace_file(&p),
+                _ => {
+                    self.status = String::from("Open a .code-workspace file in the editor first");
+                }
+            },
             Cmd::RemoveWorkspaceFolder => {
                 // Operates on the Explorer's selected row when it is a
                 // SECONDARY root section; anything else gets the hint.
@@ -29771,6 +29819,21 @@ impl App {
         self.roots.iter().count() - before
     }
 
+    /// Apply a `.code-workspace` file (#163): re-root to its first folder
+    /// and install its folder set exactly (the pending set suppresses the
+    /// automatic store restore for this re-root).
+    fn open_workspace_file(&mut self, path: &Path) {
+        match crate::workspace::parse_workspace_file(path) {
+            Ok(folders) => {
+                let mut it = folders.into_iter();
+                let primary = it.next().expect("parse guarantees a folder");
+                self.pending_workspace_folders = Some(it.collect());
+                self.change_workspace_root(primary);
+            }
+            Err(e) => self.status = format!("Workspace file: {e}"),
+        }
+    }
+
     /// Open the fuzzy directory picker in add-folder mode (#147): the
     /// same zoxide-backed popup as Cmd+Z, with Enter adding the chosen
     /// directory as a workspace root instead of re-rooting.
@@ -29966,7 +30029,16 @@ impl App {
         // The new primary's saved folder set comes back with it (#153),
         // the same way its terminal layout does: re-rooting into a
         // workspace restores that workspace's arrangement.
-        let restored = self.restore_workspace_folders();
+        let restored = match self.pending_workspace_folders.take() {
+            Some(folders) => {
+                let before = self.roots.iter().count();
+                for folder in folders {
+                    self.add_workspace_folder(folder);
+                }
+                self.roots.iter().count() - before
+            }
+            None => self.restore_workspace_folders(),
+        };
         let folders_note = if restored > 0 {
             format!(
                 " (+{restored} workspace folder{})",
@@ -35139,6 +35211,7 @@ pub fn run(
     restore_session: Option<PathBuf>,
     open_file: Option<PathBuf>,
     zen: bool,
+    workspace_folders: Vec<PathBuf>,
 ) -> Result<()> {
     // zoxide is a hard dependency of the Cmd+Z jump popup. Probe for it
     // and install it in the background if missing, off the launch path so
@@ -35164,9 +35237,17 @@ pub fn run(
     // Resurrect this workspace's terminal panel from the last session
     // (pane layout, cwds, names, focus) before the first frame paints.
     app.restore_terminal_session();
-    let restored_folders = app.restore_workspace_folders();
-    if restored_folders > 0 {
-        app.status = format!("Restored {restored_folders} workspace folder(s)");
+    // A launch from a .code-workspace file (#163) defines the folder set
+    // exactly; otherwise the automatic per-primary store restores.
+    if workspace_folders.is_empty() {
+        let restored_folders = app.restore_workspace_folders();
+        if restored_folders > 0 {
+            app.status = format!("Restored {restored_folders} workspace folder(s)");
+        }
+    } else {
+        for folder in workspace_folders {
+            app.add_workspace_folder(folder);
+        }
     }
     // Restore the tabs / layout carried across a self-update re-exec, then
     // delete the handoff file so a later normal launch starts clean.
@@ -35342,7 +35423,9 @@ pub fn run(
         };
         restore_host_terminal_state();
         match launch_result? {
-            crate::remote::RemoteOutcome::ReturnToLocal => return run(root, None, None, false),
+            crate::remote::RemoteOutcome::ReturnToLocal => {
+                return run(root, None, None, false, Vec::new());
+            }
             crate::remote::RemoteOutcome::Exited => return Ok(()),
         }
     }
