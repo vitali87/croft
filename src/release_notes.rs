@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Workspace folder sets now survive restarts: the folders you add live in a per-workspace record, restored whenever you reopen (or Make Root into) that workspace — folders deleted on disk drop out of the record instead of coming back broken.",
+    kind: NoteKind::Fix,
+    summary: "The terminal-session store can no longer lose your other workspaces' saved pane layouts: an existing store file that cannot be read or parsed refuses updates (with the failure shown beside the action's status) instead of being silently replaced, concurrent windows serialize their saves, and writes land atomically.",
 }];

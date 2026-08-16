@@ -21217,7 +21217,8 @@ fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_
             ],
             active: 1,
         },
-    );
+    )
+    .unwrap();
 
     let mut app = App::new(a.clone()).unwrap();
     app.terminal_session_path = session_path;
@@ -21258,7 +21259,8 @@ fn restoring_a_workspaces_layout_drops_pane_bound_state_from_the_outgoing_panel(
             ],
             active: 0,
         },
-    );
+    )
+    .unwrap();
 
     let mut app = App::new(a.clone()).unwrap();
     app.terminal_session_path = session_path;
@@ -21309,7 +21311,8 @@ fn change_workspace_root_keeps_live_panes_when_the_terminal_was_touched() {
             ],
             active: 0,
         },
-    );
+    )
+    .unwrap();
 
     let mut app = App::new(a.clone()).unwrap();
     app.terminal_session_path = session_path;

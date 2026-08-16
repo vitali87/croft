@@ -61,33 +61,74 @@ pub fn path() -> PathBuf {
     crate::prefs::config_dir().join("terminal_sessions.json")
 }
 
-/// Load the whole map, tolerantly: unreadable or unparsable files are an
-/// empty map, never an error.
+/// Load the whole map for READING: a missing file is an empty map (the
+/// normal first-run state); any other failure also reads empty, since a
+/// read-only consumer can do nothing better.
 pub fn load(path: &Path) -> HashMap<String, SessionRecord> {
-    let raw = std::fs::read_to_string(path).unwrap_or_default();
-    serde_json::from_str(&raw).unwrap_or_default()
+    load_checked(path).unwrap_or_default()
+}
+
+/// Load for WRITING: a missing file is `Ok(empty)`, but an unreadable or
+/// unparsable one is an error — the read-modify-write in [`save_for_root`]
+/// must never treat a corrupt store as empty and silently replace every
+/// other workspace's saved layout with just the current one (#157, the
+/// workspace-folder store's #156 hazard verbatim).
+fn load_checked(path: &Path) -> Result<HashMap<String, SessionRecord>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
 /// Read-modify-write one workspace's record; a trivial record removes the
-/// key instead.
-pub fn save_for_root(path: &Path, root: &str, record: SessionRecord) {
-    let mut map = load(path);
-    if record.is_trivial(root) {
-        map.remove(root);
-    } else {
-        map.insert(root.to_string(), record);
-    }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(path, json);
-    }
+/// key instead. Runs under [`crate::workspace::update_json_store`]'s
+/// exclusive lock (#157/#158): refuses a store that exists but cannot be
+/// read or parsed, writes atomically through a unique temp file, and
+/// serializes against concurrent croft windows.
+pub fn save_for_root(path: &Path, root: &str, record: SessionRecord) -> Result<(), String> {
+    crate::workspace::update_json_store::<SessionRecord, _>(path, |map| {
+        if record.is_trivial(root) {
+            map.remove(root);
+        } else {
+            map.insert(root.to_string(), record.clone());
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_corrupt_store_is_refused_not_replaced() {
+        // #157: treating a corrupt store as empty and writing over it
+        // silently discarded every other workspace's saved layout.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("sessions.json");
+        std::fs::write(&store, "{ not valid json").unwrap();
+        let record = SessionRecord {
+            panes: vec![PaneRecord {
+                cwd: String::from("/w/a/sub"),
+                name: Some(String::from("srv")),
+            }],
+            active: 0,
+        };
+        assert!(
+            save_for_root(&store, "/w/a", record.clone()).is_err(),
+            "a corrupt store must refuse the update"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&store).unwrap(),
+            "{ not valid json",
+            "the corrupt bytes stay untouched"
+        );
+        assert!(load(&store).is_empty(), "read-only loads degrade to empty");
+        let fresh = tmp.path().join("fresh.json");
+        save_for_root(&fresh, "/w/a", record).unwrap();
+        assert_eq!(load(&fresh).get("/w/a").map(|r| r.panes.len()), Some(1));
+    }
 
     #[test]
     fn save_round_trips_and_trivial_records_prune() {
@@ -106,7 +147,7 @@ mod tests {
             ],
             active: 1,
         };
-        save_for_root(&p, "/repo", rec.clone());
+        save_for_root(&p, "/repo", rec.clone()).unwrap();
         let map = load(&p);
         assert_eq!(map.get("/repo"), Some(&rec));
 
@@ -121,7 +162,8 @@ mod tests {
                 }],
                 active: 0,
             },
-        );
+        )
+        .unwrap();
         assert!(!load(&p).contains_key("/repo"));
 
         // Corrupt files load as empty, never panic.

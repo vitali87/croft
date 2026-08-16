@@ -2742,6 +2742,11 @@ pub struct App {
     /// Where the terminal-session snapshot lives
     /// (`terminal_sessions.json`); a field so tests point it at a tempdir.
     pub terminal_session_path: PathBuf,
+    /// The most recent terminal-session persistence failure, latched by
+    /// `save_terminal_session` and cleared by a later success; composed
+    /// into structural-change statuses by `terminal_status` so a corrupt
+    /// store is never silently ignored (#157/#158).
+    terminal_store_error: Option<String>,
     /// The persisted folder-set store (#153); a field so tests redirect it.
     pub workspace_folders_path: PathBuf,
     /// A pane reorder is pending a session write. `move_terminal` runs once
@@ -3838,6 +3843,7 @@ impl App {
             }),
             command_history_popup: None,
             terminal_session_dirty: false,
+            terminal_store_error: None,
             terminal_session_path: if cfg!(test) {
                 std::env::temp_dir().join(format!(
                     "croft-test-terminal-sessions-{}.json",
@@ -10220,6 +10226,16 @@ impl App {
     /// Snapshot the terminal panel (pane order, cwds, names, focus) into
     /// the per-workspace session store. Called on structural changes and at
     /// quit; the default single-pane layout prunes the record instead.
+    /// Set a structural-change status, keeping any latched session-store
+    /// failure visible beside it (#158 review: plain assignments right
+    /// after a failed save silently hid the persistence error).
+    fn terminal_status(&mut self, msg: String) {
+        self.status = match &self.terminal_store_error {
+            Some(e) => format!("{msg} — session not saved: {e}"),
+            None => msg,
+        };
+    }
+
     pub fn save_terminal_session(&mut self) {
         let root = self.workspace_root().display().to_string();
         let panes = self
@@ -10240,7 +10256,14 @@ impl App {
             panes,
             active: self.active_terminal,
         };
-        crate::terminal_session::save_for_root(&self.terminal_session_path, &root, record);
+        // A corrupt store is refused, never replaced (#157). The error is
+        // LATCHED, not just put in the status line: the structural-change
+        // call sites set their own success statuses right after this
+        // returns, which silently clobbered a transient message (#158
+        // review) — terminal_status() re-attaches it to whatever they say.
+        self.terminal_store_error =
+            crate::terminal_session::save_for_root(&self.terminal_session_path, &root, record)
+                .err();
     }
 
     /// Resurrect this workspace's terminal panel from the session store:
@@ -10521,7 +10544,7 @@ impl App {
     pub fn toggle_terminal_pane_maximize(&mut self) {
         if self.terminal_pane_maximized {
             self.terminal_pane_maximized = false;
-            self.status = String::from("Restored terminal split");
+            self.terminal_status(String::from("Restored terminal split"));
         } else if self.terminals.len() > 1 {
             self.terminal_pane_maximized = true;
             self.status = String::from("Maximized terminal");
@@ -10700,7 +10723,8 @@ impl App {
         self.focus_pane(Pane::Terminal);
         self.sync_focus_flags();
         self.save_terminal_session();
-        self.status = format!("Restored terminal {}", self.terminals[idx].label());
+        let msg = format!("Restored terminal {}", self.terminals[idx].label());
+        self.terminal_status(msg);
     }
 
     /// Drop parked closed panes whose grace window lapsed (their Drop kills
@@ -14352,7 +14376,10 @@ impl App {
         if is_terminal_split_key(key) {
             match self.split_terminal() {
                 Ok(()) => {
-                    self.status = format!("Split terminal: {} active", self.terminals.len());
+                    self.terminal_status(format!(
+                        "Split terminal: {} active",
+                        self.terminals.len()
+                    ));
                 }
                 Err(e) => {
                     self.status = format!("Split terminal failed: {e}");
@@ -21806,7 +21833,10 @@ impl App {
         if is_terminal_split_key(key) {
             match self.split_terminal() {
                 Ok(()) => {
-                    self.status = format!("Split terminal: {} active", self.terminals.len());
+                    self.terminal_status(format!(
+                        "Split terminal: {} active",
+                        self.terminals.len()
+                    ));
                 }
                 Err(e) => {
                     self.status = format!("Split terminal failed: {e}");
@@ -21818,7 +21848,10 @@ impl App {
         // only one is left).
         if is_terminal_close_key(key) {
             if self.close_active_terminal() {
-                self.status = format!("Closed terminal: {} remaining", self.terminals.len());
+                self.terminal_status(format!(
+                    "Closed terminal: {} remaining",
+                    self.terminals.len()
+                ));
             } else {
                 self.status = String::from("Cannot close the last terminal; press Ctrl+J to hide");
             }
@@ -24542,7 +24575,10 @@ impl App {
             Cmd::ToggleMinimap => self.toggle_minimap(),
             Cmd::NewTerminal => match self.split_terminal() {
                 Ok(()) => {
-                    self.status = format!("Split terminal: {} active", self.terminals.len());
+                    self.terminal_status(format!(
+                        "Split terminal: {} active",
+                        self.terminals.len()
+                    ));
                 }
                 Err(e) => {
                     self.status = format!("Split terminal failed: {e}");
