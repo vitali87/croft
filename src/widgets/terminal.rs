@@ -4440,9 +4440,17 @@ mod tests {
                 let tb = term
                     .row_time(top + b as i32)
                     .expect("the second line must be stamped");
+                // The stamps are taken when the reader PARSES each
+                // chunk, so a late pickup of the first line compresses
+                // the measured gap below the writer's 400ms sleep
+                // (#170, the #154 family). 150ms still proves the rows
+                // were stamped separately and in order, while the
+                // compression a loaded scheduler can produce stays
+                // under it only by fully coalescing — which the two
+                // separate echos with a sleep between them cannot.
                 assert!(
-                    tb.saturating_sub(ta) >= 300,
-                    "stamps must reflect the 400ms gap between the lines, got {}ms",
+                    tb.saturating_sub(ta) >= 150,
+                    "stamps must reflect a real gap between the lines, got {}ms",
                     tb.saturating_sub(ta)
                 );
                 break;

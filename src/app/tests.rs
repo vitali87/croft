@@ -7317,7 +7317,12 @@ fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
     );
     // Put the active terminal into a long-lived foreground command so its
     // foreground process group is the command, not the shell.
-    app.terminal_mut().write_input(b"sleep 10\n");
+    // 60s, not 10 (#169): under a loaded suite this test thread can be
+    // descheduled >10s between the busy precondition and the re-root —
+    // the sleep then exits and the shell GENUINELY reclaims the tty, so
+    // the seed was correct and the assert wrong. Pane Drop kills the
+    // shell tree, so nothing outlives the test.
+    app.terminal_mut().write_input(b"sleep 60\n");
     let mut waited = 0u32;
     while waited < 4000 && app.terminal_mut().foreground_is_shell() {
         std::thread::sleep(std::time::Duration::from_millis(20));
