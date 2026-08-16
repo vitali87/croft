@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Source Control grows a REPOSITORIES overview when several workspace folders are open: every folder's repository with its branch and change count, click to switch the panel to it (focus-follow resumes when you move to another folder's file), and the activity-bar badge now counts changes across all repositories.",
+    summary: "VS Code-compatible workspace files: open a .code-workspace from the command line (croft project.code-workspace) or from the editor via \"Workspaces: Open Workspace from File\", and save the current folder arrangement with \"Workspaces: Save Workspace As\" — folder paths written relative to the file so it travels with your project.",
 }];
