@@ -10240,7 +10240,14 @@ impl App {
             panes,
             active: self.active_terminal,
         };
-        crate::terminal_session::save_for_root(&self.terminal_session_path, &root, record);
+        if let Err(e) =
+            crate::terminal_session::save_for_root(&self.terminal_session_path, &root, record)
+        {
+            // A corrupt store is refused, never replaced (#157): the
+            // layout works this session, it just won't persist until the
+            // store is repaired or removed.
+            self.status = format!("Terminal session not saved: {e}");
+        }
     }
 
     /// Resurrect this workspace's terminal panel from the session store:
