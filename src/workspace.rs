@@ -140,6 +140,39 @@ pub fn root_display_labels(roots: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+/// The persisted folder-set store (#153): `~/.config/croft/
+/// workspace_folders.json`, a map from the PRIMARY root's display path to
+/// its secondary folders — the `terminal_session.rs` model exactly. An
+/// empty list prunes its key, so plain single-folder workspaces never
+/// grow the file.
+pub fn folders_store_path() -> PathBuf {
+    crate::prefs::config_dir().join("workspace_folders.json")
+}
+
+/// Load the whole map, tolerantly: unreadable or unparsable files are an
+/// empty map, never an error.
+pub fn load_folders(path: &Path) -> std::collections::HashMap<String, Vec<PathBuf>> {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Read-modify-write one primary root's secondary-folder list; an empty
+/// list removes the key.
+pub fn save_folders_for_root(path: &Path, primary: &str, folders: Vec<PathBuf>) {
+    let mut map = load_folders(path);
+    if folders.is_empty() {
+        map.remove(primary);
+    } else {
+        map.insert(primary.to_string(), folders);
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
