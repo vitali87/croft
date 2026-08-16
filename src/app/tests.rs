@@ -20652,35 +20652,49 @@ fn finished_commands_land_in_durable_history_and_the_popup_types_them() {
     // 1s of "runtime" → D;0), then a read so the popup's Enter-typed
     // bytes are observable through the shell.
     let script = "printf '\\033]133;A\\007$ \\033]133;B\\007kubectl get pods\\n\\033]133;C\\007'; sleep 1; printf 'out\\n\\033]133;D;0\\007'; read x; echo typed-$x; sleep 30";
-    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
-        "/bin/sh",
-        &[String::from("-c"), String::from(script)],
-        tmp.path(),
-    )
-    .unwrap();
-    let mut waited = 0u32;
-    while app.command_history.is_empty() {
-        app.drain_terminal_bells();
-        assert!(waited < 8000, "finished command never reached the store");
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        waited += 40;
-    }
-    let e = app.command_history.entries[0].clone();
-    assert_eq!(
-        e.cmd, "kubectl get pods",
-        "the typed text travels with the completion"
-    );
-    assert_eq!(e.exit, Some(0));
     // The marks are stamped when the reader thread PARSES them, not when
-    // the child wrote them, so under suite load a late pickup of the
-    // pre-sleep chunk shrinks the measured gap (#65). The floor at half
-    // the sleep keeps a wrong-span measurement red while giving scheduler
-    // skew ~10x the largest undershoot ever observed (~55ms).
-    assert!(
-        e.dur_ms >= 500,
-        "duration must cover the C→D gap, got {}",
-        e.dur_ms
-    );
+    // the child wrote them. Under suite load a late pickup shrinks the
+    // measured gap (#65), and in the extreme the reader is descheduled
+    // across the WHOLE sleep: both marks then coalesce into one read and
+    // the arrival-time measurement honestly collapses to ~0 (#154) — the
+    // true gap is unrecoverable from coalesced bytes. So the C→D floor is
+    // asserted per attempt, retrying the collapse class a bounded number
+    // of times: a real wrong-span bug fails every attempt deterministically,
+    // while three consecutive full-second deschedules do not happen.
+    let mut entry = None;
+    for attempt in 0..3 {
+        app.command_history.entries.clear();
+        app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from(script)],
+            tmp.path(),
+        )
+        .unwrap();
+        let mut waited = 0u32;
+        while app.command_history.is_empty() {
+            app.drain_terminal_bells();
+            assert!(waited < 8000, "finished command never reached the store");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        let e = app.command_history.entries[0].clone();
+        assert_eq!(
+            e.cmd, "kubectl get pods",
+            "the typed text travels with the completion"
+        );
+        assert_eq!(e.exit, Some(0));
+        if e.dur_ms >= 500 {
+            entry = Some(e);
+            break;
+        }
+        assert!(
+            attempt < 2,
+            "duration must cover the C→D gap on some attempt; every run measured under 500ms (last: {})",
+            e.dur_ms
+        );
+    }
+    let e = entry.expect("an attempt produced a full-gap measurement");
+    let _ = e;
 
     // The popup searches the store and Enter types the pick at the prompt.
     app.focus_pane(Pane::Terminal);
