@@ -987,12 +987,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_workspace_opens_a_code_workspace_file_as_a_folder_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("alpha");
+        let b = dir.path().join("beta");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let file = dir.path().join("p.code-workspace");
+        crate::workspace::write_workspace_file(&file, &[a.clone(), b.clone()]).unwrap();
+        let (root, open, folders) = resolve_workspace(&file, None).unwrap();
+        assert_eq!(root, a.canonicalize().unwrap(), "first folder is primary");
+        assert_eq!(open, None, "a workspace file is not an open-file");
+        assert_eq!(folders, vec![b.canonicalize().unwrap()]);
+
+        // A malformed workspace file is a launch error, not a text open.
+        let bad = dir.path().join("bad.code-workspace");
+        std::fs::write(&bad, "{ nope").unwrap();
+        assert!(resolve_workspace(&bad, None).is_err());
+    }
+
+    #[test]
     fn explicit_open_file_wins_over_the_derived_one() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.tex");
         std::fs::write(&file, "hi").unwrap();
         let other = dir.path().join("b.rs");
-        let (root, open) = resolve_workspace(&file, Some(other.clone())).unwrap();
+        let (root, open, _) = resolve_workspace(&file, Some(other.clone())).unwrap();
         assert_eq!(root, dir.path().canonicalize().unwrap());
         assert_eq!(open, Some(other));
     }

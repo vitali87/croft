@@ -20793,6 +20793,73 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
 }
 
 #[test]
+fn opening_a_workspace_file_installs_its_exact_folder_set() {
+    // #163: an explicitly opened .code-workspace defines the arrangement
+    // exactly — the automatic per-primary store is not merged in.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("alpha");
+    let b = tmp.path().join("beta");
+    let c = tmp.path().join("gamma");
+    for d in [&a, &b, &c] {
+        std::fs::create_dir(d).unwrap();
+    }
+    let file = tmp.path().join("proj.code-workspace");
+    crate::workspace::write_workspace_file(&file, &[b.clone(), c.clone()]).unwrap();
+
+    let mut app = App::new(a.clone()).unwrap();
+    // Poison the auto-store for primary B with a DIFFERENT folder: the
+    // file must win, so alpha never joins.
+    let b_canon = b.canonicalize().unwrap();
+    crate::workspace::save_folders_for_root(
+        &app.workspace_folders_path.clone(),
+        &b_canon.display().to_string(),
+        vec![a.clone()],
+    )
+    .unwrap();
+
+    app.open_workspace_file(&file);
+
+    let roots: Vec<PathBuf> = app.roots.iter().map(Path::to_path_buf).collect();
+    assert_eq!(
+        app.workspace_root(),
+        b_canon,
+        "first folder becomes primary"
+    );
+    assert!(
+        roots.contains(&c.canonicalize().unwrap()),
+        "the file's second folder joins: {roots:?}"
+    );
+    assert!(
+        !roots.contains(&a.canonicalize().unwrap()),
+        "the auto-store's folder does NOT merge in: {roots:?}"
+    );
+
+    // Save Workspace As round-trips the live set through the prompt path.
+    let dest = tmp.path().join("saved.code-workspace");
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    app.open_input_prompt(
+        InputPrompt::new(
+            InputPurpose::SaveWorkspaceAs,
+            String::from("Save Workspace As"),
+            "",
+        )
+        .with_value(dest.display().to_string()),
+    );
+    app.submit_input_prompt();
+    let saved = crate::workspace::parse_workspace_file(&dest).unwrap();
+    assert_eq!(saved, roots, "the saved file names the live folder set");
+
+    // A malformed file refuses with the error in the status.
+    let bad = tmp.path().join("bad.code-workspace");
+    std::fs::write(&bad, "{ nope").unwrap();
+    let before: Vec<PathBuf> = app.roots.iter().map(Path::to_path_buf).collect();
+    app.open_workspace_file(&bad);
+    assert!(app.status.starts_with("Workspace file:"), "{}", app.status);
+    let after: Vec<PathBuf> = app.roots.iter().map(Path::to_path_buf).collect();
+    assert_eq!(before, after, "a bad file changes nothing");
+}
+
+#[test]
 fn workspace_folder_set_persists_across_sessions_and_reroots() {
     // #153: the folder set lived only in memory — reopening the same
     // workspace came back single-folder.

@@ -277,17 +277,7 @@ pub fn write_workspace_file(path: &Path, folders: &[PathBuf]) -> Result<(), Stri
     let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
     let entries: Vec<serde_json::Value> = folders
         .iter()
-        .map(|f| {
-            let rel = f
-                .strip_prefix(&base_canon)
-                .ok()
-                .or_else(|| f.strip_prefix(base).ok());
-            let shown = match rel {
-                Some(r) if !r.as_os_str().is_empty() => r.display().to_string(),
-                _ => f.display().to_string(),
-            };
-            serde_json::json!({ "path": shown })
-        })
+        .map(|f| serde_json::json!({ "path": relative_or_absolute(&base_canon, f) }))
         .collect();
     let doc = serde_json::json!({ "folders": entries });
     let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
@@ -295,6 +285,37 @@ pub fn write_workspace_file(path: &Path, folders: &[PathBuf]) -> Result<(), Stri
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
     std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// `target` relative to `base` with `..` steps where they help (the
+/// file's own directory becomes `.`), or the absolute path when the two
+/// share no useful prefix (different mount points, or a walk that would
+/// be all `..`): VS Code's recommendation is relative folders so a
+/// workspace file survives moving with its folders.
+fn relative_or_absolute(base: &Path, target: &Path) -> String {
+    let base: Vec<_> = base.components().collect();
+    let tgt: Vec<_> = target.components().collect();
+    let common = base
+        .iter()
+        .zip(tgt.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    if common <= 1 {
+        // Only the root (or nothing) shared: relative would be noise.
+        return target.display().to_string();
+    }
+    let ups = base.len() - common;
+    let mut out = PathBuf::new();
+    for _ in 0..ups {
+        out.push("..");
+    }
+    for c in &tgt[common..] {
+        out.push(c.as_os_str());
+    }
+    if out.as_os_str().is_empty() {
+        return String::from(".");
+    }
+    out.display().to_string()
 }
 
 /// True when `path` names a VS Code workspace file.
@@ -372,6 +393,22 @@ mod tests {
         let parsed = parse_workspace_file(&file).unwrap();
         assert_eq!(
             parsed,
+            vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()]
+        );
+
+        // A file INSIDE a folder still relativizes: itself as `.`, the
+        // sibling through `..` — VS Code's shareable shape.
+        let inside = a.join("self.code-workspace");
+        write_workspace_file(
+            &inside,
+            &[a.canonicalize().unwrap(), b.canonicalize().unwrap()],
+        )
+        .unwrap();
+        let raw2 = std::fs::read_to_string(&inside).unwrap();
+        assert!(raw2.contains("\".\""), "own dir is '.': {raw2}");
+        assert!(raw2.contains("../beta"), "sibling uses ..: {raw2}");
+        assert_eq!(
+            parse_workspace_file(&inside).unwrap(),
             vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()]
         );
 
