@@ -2198,6 +2198,13 @@ pub struct App {
     /// change re-seeds the panel from that worker and re-requests its
     /// change list.
     active_scm_root: PathBuf,
+    /// A repositories-overview click pins the panel to that folder's repo
+    /// (#161); the pin clears when the FOCUS-derived folder changes, so
+    /// the panel resumes following the file the user works in.
+    scm_pin: Option<PathBuf>,
+    /// The last focus-derived folder, for detecting the change that
+    /// releases `scm_pin`.
+    scm_follow_root: PathBuf,
     /// The workspace root the Testing panel and worker are bound to —
     /// follows the focused file's folder like the SCM surfaces (#151).
     active_test_root: PathBuf,
@@ -3679,6 +3686,8 @@ impl App {
             fs_watch_extra: Vec::new(),
             git_extra: Vec::new(),
             active_scm_root: root.clone(),
+            scm_pin: None,
+            scm_follow_root: root.clone(),
             active_test_root: root.clone(),
             git_head_oids: std::collections::BTreeMap::new(),
             git,
@@ -5259,12 +5268,19 @@ impl App {
         // focused file (#149): on a switch, seed the panel from that
         // worker's cached status and re-request its change list — the
         // non-active workers' lists are discarded at their drains below.
-        let active = self.active_workspace_root();
-        if active != self.active_scm_root {
-            self.seed_active_scm(active.clone());
+        let follow = self.active_workspace_root();
+        if follow != self.scm_follow_root {
+            // The user moved focus across folders: the panel resumes
+            // following, releasing any overview pin (#161).
+            self.scm_follow_root = follow.clone();
+            self.scm_pin = None;
         }
-        if active != self.active_test_root {
-            self.rebind_test_root(active);
+        let active = self.scm_pin.clone().unwrap_or_else(|| follow.clone());
+        if active != self.active_scm_root {
+            self.seed_active_scm(active);
+        }
+        if follow != self.active_test_root {
+            self.rebind_test_root(follow);
         }
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
@@ -5362,11 +5378,13 @@ impl App {
     /// images) it only tracks the count for the dirty check; that path draws a
     /// text badge directly in `render_activity_bar`.
     fn refresh_scm_change_badge(&mut self) {
-        let count = if self.scm_worker().status().in_repo {
-            self.source_control.changes_count()
-        } else {
-            0
-        };
+        // Across EVERY folder's repository (#161): work pending in a
+        // background folder must never be invisible. Single-folder, the
+        // sum is exactly the active repo's porcelain count.
+        let count: usize = std::iter::once(&self.git)
+            .chain(self.git_extra.iter().map(|(_, w)| w))
+            .map(|w| w.status().changed_count)
+            .sum();
         if !self.overlays.activity.has_images() {
             self.scm_change_badge = None;
             if count != self.scm_change_badge_count {
@@ -10972,6 +10990,31 @@ impl App {
         self.search.theme = self.theme;
         self.source_control.focus_gradient = gradient;
         self.source_control.theme = self.theme;
+        // The multi-root repositories overview (#161): per-frame rows from
+        // the per-folder workers; empty (section hidden) with one folder.
+        self.source_control.repositories = if self.roots.is_multi() {
+            let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+            let labels = crate::workspace::root_display_labels(&roots);
+            roots
+                .iter()
+                .zip(labels)
+                .filter_map(|(ws, label)| {
+                    let status = self.git_worker_for_root(ws).status();
+                    if !status.in_repo {
+                        return None;
+                    }
+                    Some(crate::widgets::source_control::RepoRow {
+                        label,
+                        branch: status.branch.clone(),
+                        changes: status.changed_count,
+                        active: *ws == self.active_scm_root,
+                        workspace_root: ws.clone(),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.run_debug.focus_gradient = gradient;
         let explorer_focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
@@ -27748,6 +27791,13 @@ impl App {
                         {
                             self.open_commit_patch(&hash, &short);
                         }
+                        return;
+                    }
+                    if let Some(root) = self.source_control.click_repository(m.column, m.row) {
+                        // Pin the panel to the clicked repository (#161);
+                        // the next cross-folder focus releases it.
+                        self.scm_pin = Some(root.clone());
+                        self.seed_active_scm(root);
                         return;
                     }
                     if self.source_control.click_more(m.column, m.row) {

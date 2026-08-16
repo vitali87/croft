@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "A momentary failure to sample the terminal's foreground process can no longer make croft treat a busy pane as idle: the check retries and then fails safe, so a workspace re-root never types a cd into a running application, and task panes are never reused mid-command.",
+    kind: NoteKind::Feature,
+    summary: "Source Control grows a REPOSITORIES overview when several workspace folders are open: every folder's repository with its branch and change count, click to switch the panel to it (focus-follow resumes when you move to another folder's file), and the activity-bar badge now counts changes across all repositories.",
 }];

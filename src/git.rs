@@ -33,6 +33,11 @@ pub struct GitStatus {
     /// root — the two coincide only when the workspace root IS the
     /// toplevel (#139).
     pub repo_root: Option<PathBuf>,
+    /// Number of changed entries `git status --porcelain` reported —
+    /// available for EVERY workspace folder's worker, unlike the panel's
+    /// entry list which only the active repo fetches (#161: the
+    /// repositories overview and the cross-repo badge read this).
+    pub changed_count: usize,
 }
 
 pub fn query(root: &Path) -> GitStatus {
@@ -54,6 +59,7 @@ pub fn query(root: &Path) -> GitStatus {
     };
     let porcelain = run_git(root, &["status", "--porcelain"]).unwrap_or_default();
     let dirty = parse_porcelain_dirty(&porcelain);
+    let changed_count = porcelain.lines().filter(|l| !l.trim().is_empty()).count();
     let (ahead, behind) = match run_git(
         root,
         &["rev-list", "--left-right", "--count", "HEAD...@{u}"],
@@ -75,6 +81,7 @@ pub fn query(root: &Path) -> GitStatus {
         head_oid,
         ignored: Arc::new(query_ignored(root)),
         repo_root: Some(repo_root),
+        changed_count,
     }
 }
 
