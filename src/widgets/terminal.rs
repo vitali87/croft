@@ -4423,39 +4423,57 @@ mod tests {
 
     #[test]
     fn row_times_record_when_each_line_arrived() {
+        // Deterministic (#170): a loaded scheduler can hold the reader
+        // past the writer's sleep, coalescing both echoes into ONE read
+        // that stamp_chunk marks with a single now_ms — so no real-PTY
+        // timing assertion can pin per-chunk stamps. Drive the stamping
+        // path directly instead, one chunk per arrival.
+        let (_tmp, t) = quiet_pty();
+        let mut prev = 0i64;
+        feed_pty(&t, b"first-marker\r\n");
+        t.stamp_chunk_for_test(&mut prev, 1000);
+        feed_pty(&t, b"second-marker\r\n");
+        t.stamp_chunk_for_test(&mut prev, 1400);
+        let (lines, top) = t.grid_lines();
+        let a = lines
+            .iter()
+            .position(|l| l.starts_with("first-marker"))
+            .expect("first line on the grid");
+        let b = lines
+            .iter()
+            .position(|l| l.starts_with("second-marker"))
+            .expect("second line on the grid");
+        let ta = t
+            .row_time(top + a as i32)
+            .expect("the first line must be stamped");
+        let tb = t
+            .row_time(top + b as i32)
+            .expect("the second line must be stamped");
+        assert_eq!(ta, 1000, "first row keeps its own chunk's arrival time");
+        assert_eq!(tb, 1400, "second row gets the later chunk's arrival time");
+    }
+
+    #[test]
+    fn reader_thread_stamps_arriving_rows() {
+        // End-to-end: the real reader loop must feed stamp_chunk. Only
+        // presence and ordering are asserted — any gap assertion races
+        // the scheduler (#170).
         let tmp = tempfile::tempdir().unwrap();
-        let script = "a=first; echo ${a}-marker; sleep 0.4; b=second; echo ${b}-marker; sleep 30";
+        let script = "a=first; echo ${a}-marker; sleep 30";
         let term =
             PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
                 .unwrap();
         let mut waited = 0u32;
         loop {
             let (lines, top) = term.grid_lines();
-            let a = lines.iter().position(|l| l.starts_with("first-marker"));
-            let b = lines.iter().position(|l| l.starts_with("second-marker"));
-            if let (Some(a), Some(b)) = (a, b) {
-                let ta = term
-                    .row_time(top + a as i32)
-                    .expect("the first line must be stamped");
-                let tb = term
-                    .row_time(top + b as i32)
-                    .expect("the second line must be stamped");
-                // The stamps are taken when the reader PARSES each
-                // chunk, so a late pickup of the first line compresses
-                // the measured gap below the writer's 400ms sleep
-                // (#170, the #154 family). 150ms still proves the rows
-                // were stamped separately and in order, while the
-                // compression a loaded scheduler can produce stays
-                // under it only by fully coalescing — which the two
-                // separate echos with a sleep between them cannot.
+            if let Some(a) = lines.iter().position(|l| l.starts_with("first-marker")) {
                 assert!(
-                    tb.saturating_sub(ta) >= 150,
-                    "stamps must reflect a real gap between the lines, got {}ms",
-                    tb.saturating_sub(ta)
+                    term.row_time(top + a as i32).is_some(),
+                    "the reader thread must stamp rows it delivers"
                 );
                 break;
             }
-            assert!(waited < 8000, "markers never arrived");
+            assert!(waited < 8000, "marker never arrived");
             std::thread::sleep(std::time::Duration::from_millis(20));
             waited += 20;
         }
