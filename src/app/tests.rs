@@ -20830,7 +20830,8 @@ fn workspace_folder_set_persists_across_sessions_and_reroots() {
         &store,
         &b_canon.display().to_string(),
         vec![a.clone()],
-    );
+    )
+    .unwrap();
     app3.change_workspace_root(b_canon.clone());
     let roots: Vec<PathBuf> = app3.roots.iter().map(Path::to_path_buf).collect();
     assert!(
