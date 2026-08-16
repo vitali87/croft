@@ -3006,9 +3006,10 @@ impl PtyTerminal {
     pub fn foreground_is_shell(&self) -> bool {
         match (self.master.process_group_leader(), self.shell_pid) {
             (Some(fg), Some(pid)) => fg == pid,
-            (None, Some(_)) if self.input_seen => {
+            _ if self.input_seen => {
                 // A pane that has received input CAN be running a launched
-                // app, so a failed tcgetpgrp sample must not read as
+                // app, so an UNRESOLVABLE sample (failed tcgetpgrp, or a
+                // spawn that never reported a shell pid) must not read as
                 // "shell owns it" — under scheduler load the sample
                 // transiently fails while a foreground command runs, and
                 // the old blanket `true` let a cd seed reach that app
