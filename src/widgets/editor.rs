@@ -9479,6 +9479,17 @@ impl EditorTabs {
         self.editors.get(idx).and_then(|e| e.path.clone())
     }
 
+    /// The strip's display titles, disambiguated (#167); index-aligned
+    /// with `iter_tabs` so projections (OPEN EDITORS) match the strip.
+    pub fn tab_display_labels(&self) -> Vec<String> {
+        disambiguated_tab_labels(&self.editors)
+    }
+
+    #[cfg(test)]
+    pub fn tab_strip_y_for_test(&self) -> u16 {
+        self.tab_strip_y
+    }
+
     pub fn iter_tabs(&self) -> impl Iterator<Item = &Editor> {
         self.editors.iter()
     }
@@ -10355,9 +10366,13 @@ impl Widget for &mut EditorTabs {
         }
         let active_tab_bg = theme.tab_active_bg();
         let pointer = self.hover_pointer;
+        let display_labels = disambiguated_tab_labels(&self.editors);
         for (i, ed) in self.editors.iter().enumerate() {
-            let label_text = tab_label(ed);
-            let label_chars = label_text.chars().count() as u16;
+            let label_text = display_labels[i].clone();
+            // Display CELLS, not chars (#168 review): a CJK file or
+            // directory name is double-width, and a char count shifted
+            // the close button and hit ranges left of the painted text.
+            let label_chars = Span::raw(label_text.as_str()).width() as u16;
             let pad: u16 = 1;
             let close_pad: u16 = 2;
             let width = label_chars
@@ -10499,6 +10514,89 @@ impl EditorTabs {
             .find(|&&(x, w, _)| col >= x && col < x + w)
             .and_then(|&(_, _, target)| target)
     }
+}
+
+/// Tab titles for a strip, with VS Code's labelFormat disambiguation
+/// (#167): colliding file names gain the SHORTEST distinguishing
+/// trailing directory context (`main.rs — alpha` beside
+/// `main.rs — beta`; deeper only when the parents collide too), and
+/// unique titles stay bare. Diff/preview tabs keep their own labels.
+pub(crate) fn disambiguated_tab_labels(editors: &[Editor]) -> Vec<String> {
+    let base: Vec<String> = editors.iter().map(tab_label).collect();
+    let mut out = base.clone();
+    // Group by FILE NAME, not the rendered label: decorations (the dirty
+    // dot) are part of the base string, and keying on it let a dirty tab
+    // escape its collision group.
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, e) in editors.iter().enumerate() {
+        if e.diff.is_none()
+            && let Some(name) = e.path.as_deref().and_then(|p| p.file_name())
+        {
+            groups
+                .entry(name.to_string_lossy().into_owned())
+                .or_default()
+                .push(i);
+        }
+    }
+    for idxs in groups.into_values() {
+        if idxs.len() < 2 {
+            continue;
+        }
+        // Walk as deep as the longest parent in the group: two DISTINCT
+        // paths sharing a filename must differ somewhere in their
+        // parents, so the full-parent suffixes are always distinct — a
+        // fixed cap could leave deep-shared tails identical (#168
+        // review).
+        let max_depth = idxs
+            .iter()
+            .filter_map(|&i| editors[i].path.as_deref())
+            .filter_map(|p| p.parent())
+            .map(|p| p.components().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        for depth in 1..=max_depth {
+            let sufs: Vec<String> = idxs
+                .iter()
+                .map(|&i| {
+                    dir_suffix(
+                        editors[i]
+                            .path
+                            .as_deref()
+                            .unwrap_or(std::path::Path::new("")),
+                        depth,
+                    )
+                })
+                .collect();
+            let mut seen = std::collections::HashSet::new();
+            let all_unique = sufs.iter().all(|s| seen.insert(s.clone()));
+            if all_unique || depth == max_depth {
+                for (k, &i) in idxs.iter().enumerate() {
+                    if !sufs[k].is_empty() {
+                        out[i] = format!("{} — {}", base[i], sufs[k]);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The last `depth` directory components of `path`'s parent, joined
+/// with `/` — the trailing context the disambiguated label shows.
+fn dir_suffix(path: &std::path::Path, depth: usize) -> String {
+    let Some(parent) = path.parent() else {
+        return String::new();
+    };
+    let comps: Vec<String> = parent
+        .components()
+        .rev()
+        .take(depth)
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    comps.into_iter().rev().collect::<Vec<_>>().join("/")
 }
 
 fn tab_label(e: &Editor) -> String {
@@ -17351,6 +17449,99 @@ mod tests {
         assert_eq!(t.tab_count(), 1, "blank initial tab must be reused");
         assert_eq!(t.preview_index(), Some(0));
         assert_eq!(t.path.as_deref(), Some(f.path()));
+    }
+
+    #[test]
+    fn tab_labels_disambiguate_colliding_names_with_the_shortest_dir_context() {
+        // #167, VS Code labelFormat: colliding basenames gain the shortest
+        // distinguishing trailing directory; unique names stay bare.
+        let tmp = tempfile::tempdir().unwrap();
+        for d in ["alpha", "beta", "a/x", "b/x"] {
+            std::fs::create_dir_all(tmp.path().join(d)).unwrap();
+        }
+        for f in [
+            "alpha/main.rs",
+            "beta/main.rs",
+            "solo.rs",
+            "a/x/mod.rs",
+            "b/x/mod.rs",
+        ] {
+            std::fs::write(tmp.path().join(f), "x\n").unwrap();
+        }
+        let mut tabs = EditorTabs::new();
+        for f in [
+            "alpha/main.rs",
+            "beta/main.rs",
+            "solo.rs",
+            "a/x/mod.rs",
+            "b/x/mod.rs",
+        ] {
+            tabs.open_pinned(&tmp.path().join(f)).unwrap();
+        }
+        let labels = tabs.tab_display_labels();
+        assert_eq!(labels[0], "main.rs — alpha");
+        assert_eq!(labels[1], "main.rs — beta");
+        assert_eq!(labels[2], "solo.rs", "a unique name stays bare");
+        // Parents collide (`x` vs `x`), so the suffix walks one level up.
+        assert_eq!(labels[3], "mod.rs — a/x");
+        assert_eq!(labels[4], "mod.rs — b/x");
+    }
+
+    #[test]
+    fn tab_labels_disambiguate_deep_shared_tails_and_measure_wide_names_in_cells() {
+        // #168 review: a fixed depth cap left paths sharing a deep tail
+        // identical, and char-count width shifted hit ranges for wide
+        // (CJK) names.
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = "d01/d02/d03/d04/d05/d06/d07/d08/d09/d10/d11/d12/d13/d14/d15/d16/d17";
+        let a = tmp.path().join("alpha").join(deep);
+        let b = tmp.path().join("beta").join(deep);
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("main.rs"), "a\n").unwrap();
+        std::fs::write(b.join("main.rs"), "b\n").unwrap();
+        let wide = tmp.path().join("日本語");
+        std::fs::create_dir_all(&wide).unwrap();
+        std::fs::write(wide.join("main.rs"), "w\n").unwrap();
+
+        let mut tabs = EditorTabs::new();
+        tabs.open_pinned(&a.join("main.rs")).unwrap();
+        tabs.open_pinned(&b.join("main.rs")).unwrap();
+        tabs.open_pinned(&wide.join("main.rs")).unwrap();
+        let labels = tabs.tab_display_labels();
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            labels.iter().all(|l| seen.insert(l.clone())),
+            "every colliding tab gets a distinct title, however deep the shared tail: {labels:?}"
+        );
+        assert!(
+            labels[2].contains("日本語"),
+            "the wide dir name suffixes too: {labels:?}"
+        );
+        // The strip measures in display cells: a render must place the
+        // close glyph inside each tab's recorded range (frame truth).
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 600,
+            height: 20,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        use ratatui::widgets::Widget;
+        (&mut tabs).render(area, &mut buf);
+        let ranges: Vec<(u16, u16)> = tabs.tab_screen_ranges.clone();
+        for (i, (x, w)) in ranges.iter().enumerate() {
+            if *w == 0 {
+                continue;
+            }
+            let row: String = (*x..*x + *w)
+                .map(|cx| buf[(cx, tabs.tab_strip_y_for_test())].symbol().to_string())
+                .collect();
+            assert!(
+                row.contains('✕'),
+                "tab {i}'s close glyph must sit inside its hit range; range painted: {row:?}"
+            );
+        }
     }
 
     #[test]

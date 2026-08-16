@@ -21134,6 +21134,40 @@ fn repositories_overview_lists_every_folder_and_a_pin_overrides_the_follow() {
 }
 
 #[test]
+fn tab_strip_renders_disambiguated_titles_for_colliding_names() {
+    // #167 end-to-end: two same-named files from different folders must
+    // paint distinguishable tab titles in the real strip.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("alpha");
+    let b = tmp.path().join("beta");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    std::fs::write(a.join("main.rs"), "a\n").unwrap();
+    std::fs::write(b.join("main.rs"), "b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The QUICK OPEN path (preview tab, pinned by an edit, then a second
+    // preview) — the live gesture, which must disambiguate exactly like
+    // two pinned opens.
+    app.editor.open_preview(&a.join("main.rs")).unwrap();
+    app.editor.insert_char('x');
+    app.editor.open_preview(&b.join("main.rs")).unwrap();
+    assert_eq!(app.editor.iter_tabs().count(), 2, "two tabs");
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let strip_y = app.editor.tab_strip_y_for_test();
+    let row: String = (0..buf.area.width)
+        .map(|x| buf[(x, strip_y)].symbol().to_string())
+        .collect();
+    assert!(
+        row.contains("main.rs — alpha") && row.contains("main.rs — beta"),
+        "the strip paints the disambiguated titles: {row}"
+    );
+}
+
+#[test]
 fn clicking_a_repositories_overview_row_switches_the_panel() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();

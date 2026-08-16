@@ -7239,6 +7239,9 @@ impl App {
 
         // --- OPEN EDITORS: a pure projection of the focused group's tabs. ---
         let active = self.editor.active_index();
+        // Same disambiguated titles as the tab strip (#167), so the two
+        // views never name one file two ways.
+        let labels = self.editor.tab_display_labels();
         let items: Vec<OpenEditorItem> = self
             .editor
             .iter_tabs()
@@ -7246,9 +7249,9 @@ impl App {
             .filter_map(|(i, ed)| {
                 ed.path.as_ref().map(|p| OpenEditorItem {
                     path: p.clone(),
-                    name: p
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
+                    name: labels
+                        .get(i)
+                        .cloned()
                         .unwrap_or_else(|| p.display().to_string()),
                     dirty: ed.dirty,
                     active: i == active,
