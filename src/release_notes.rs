@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "The terminal-session store can no longer lose your other workspaces' saved pane layouts: an existing store file that cannot be read or parsed refuses updates (with the failure shown beside the action's status) instead of being silently replaced, concurrent windows serialize their saves, and writes land atomically.",
+    summary: "A momentary failure to sample the terminal's foreground process can no longer make croft treat a busy pane as idle: the check retries and then fails safe, so a workspace re-root never types a cd into a running application, and task panes are never reused mid-command.",
 }];
