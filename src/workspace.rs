@@ -140,6 +140,62 @@ pub fn root_display_labels(roots: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+/// The persisted folder-set store (#153): `~/.config/croft/
+/// workspace_folders.json`, a map from the PRIMARY root's display path to
+/// its secondary folders — the `terminal_session.rs` model exactly. An
+/// empty list prunes its key, so plain single-folder workspaces never
+/// grow the file.
+pub fn folders_store_path() -> PathBuf {
+    crate::prefs::config_dir().join("workspace_folders.json")
+}
+
+/// Load the whole map for READING: a missing file is an empty map (the
+/// normal first-run state); any other failure also reads empty, since a
+/// read-only consumer can do nothing better.
+pub fn load_folders(path: &Path) -> std::collections::HashMap<String, Vec<PathBuf>> {
+    load_folders_checked(path).unwrap_or_default()
+}
+
+/// Load for WRITING: a missing file is `Ok(empty)`, but an unreadable or
+/// unparsable one is an error — the read-modify-write in
+/// [`save_folders_for_root`] must never treat a corrupt store as empty
+/// and silently replace every other workspace's saved arrangement with
+/// just the current one (#156 review).
+fn load_folders_checked(
+    path: &Path,
+) -> Result<std::collections::HashMap<String, Vec<PathBuf>>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+/// Read-modify-write one primary root's secondary-folder list; an empty
+/// list removes the key. Refuses to touch a store it cannot parse, and
+/// writes through a sibling temp file renamed into place so an
+/// interrupted write can never leave truncated JSON behind.
+pub fn save_folders_for_root(
+    path: &Path,
+    primary: &str,
+    folders: Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut map = load_folders_checked(path)?;
+    if folders.is_empty() {
+        map.remove(primary);
+    } else {
+        map.insert(primary.to_string(), folders);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +247,32 @@ mod tests {
         assert!(ws.remove(Path::new("/w/b")), "a secondary root removes");
         assert!(!ws.is_multi());
         assert_eq!(ws.primary(), Path::new("/w/a"));
+    }
+
+    #[test]
+    fn a_corrupt_folders_store_is_refused_not_replaced() {
+        // #156 review: treating a corrupt store as empty and writing over
+        // it silently discarded EVERY other workspace's arrangement.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("folders.json");
+        std::fs::write(&store, "{ not valid json").unwrap();
+        let err = save_folders_for_root(&store, "/w/a", vec![PathBuf::from("/w/b")]);
+        assert!(err.is_err(), "a corrupt store must refuse the update");
+        assert_eq!(
+            std::fs::read_to_string(&store).unwrap(),
+            "{ not valid json",
+            "the corrupt bytes stay untouched for the user to inspect"
+        );
+        // A read-only load degrades to empty rather than erroring.
+        assert!(load_folders(&store).is_empty());
+        // And a MISSING file is the normal first-run state: the save
+        // proceeds and round-trips.
+        let fresh = tmp.path().join("fresh.json");
+        save_folders_for_root(&fresh, "/w/a", vec![PathBuf::from("/w/b")]).unwrap();
+        assert_eq!(
+            load_folders(&fresh).get("/w/a"),
+            Some(&vec![PathBuf::from("/w/b")])
+        );
     }
 
     #[test]

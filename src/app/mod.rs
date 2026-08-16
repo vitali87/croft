@@ -2742,6 +2742,8 @@ pub struct App {
     /// Where the terminal-session snapshot lives
     /// (`terminal_sessions.json`); a field so tests point it at a tempdir.
     pub terminal_session_path: PathBuf,
+    /// The persisted folder-set store (#153); a field so tests redirect it.
+    pub workspace_folders_path: PathBuf,
     /// A pane reorder is pending a session write. `move_terminal` runs once
     /// per motion report during a drag, and the write is a full
     /// read-modify-write of the session file plus a cwd syscall per pane, so
@@ -3843,6 +3845,14 @@ impl App {
                 ))
             } else {
                 crate::terminal_session::path()
+            },
+            workspace_folders_path: if cfg!(test) {
+                std::env::temp_dir().join(format!(
+                    "croft-test-workspace-folders-{}.json",
+                    std::process::id()
+                ))
+            } else {
+                crate::workspace::folders_store_path()
             },
             terminal_copy_mode: None,
             triggers: std::sync::Arc::new(crate::triggers::TriggerSet::load(
@@ -29535,6 +29545,7 @@ impl App {
         self.rebind_workspace_watchers();
         self.sync_workspace_fanout();
         self.refresh_workspace_title();
+        self.save_workspace_folders();
         self.status = format!("Added folder: {}", path.display());
     }
 
@@ -29562,6 +29573,7 @@ impl App {
         self.rebind_workspace_watchers();
         self.sync_workspace_fanout();
         self.refresh_workspace_title();
+        self.save_workspace_folders();
         self.status = format!("Removed folder: {}", path.display());
     }
 
@@ -29609,6 +29621,47 @@ impl App {
         let mut out = std::io::stdout();
         let _ = out.write_all(&set_title_seq(&title));
         let _ = out.flush();
+    }
+
+    /// Persist the current secondary-folder list under the primary
+    /// root's key (#153) — the terminal-session model: an empty list
+    /// prunes the key.
+    fn save_workspace_folders(&mut self) {
+        let primary = self.roots.primary().display().to_string();
+        let folders: Vec<PathBuf> = self.roots.iter().skip(1).map(Path::to_path_buf).collect();
+        if let Err(e) =
+            crate::workspace::save_folders_for_root(&self.workspace_folders_path, &primary, folders)
+        {
+            // A corrupt store is refused, never replaced (#156 review):
+            // the arrangement still works this session, it just won't
+            // persist until the store is repaired or removed.
+            self.status = format!("Workspace folders not saved: {e}");
+        }
+    }
+
+    /// Restore the saved folder set for the current primary root (#153):
+    /// each surviving folder re-joins through the normal add fan-out; a
+    /// folder that no longer exists on disk is dropped from the record
+    /// rather than restored.
+    pub fn restore_workspace_folders(&mut self) -> usize {
+        let map = crate::workspace::load_folders(&self.workspace_folders_path);
+        let primary = self.roots.primary().display().to_string();
+        let Some(saved) = map.get(&primary).cloned() else {
+            return 0;
+        };
+        let before = self.roots.iter().count();
+        for folder in saved {
+            if folder.is_dir() {
+                self.add_workspace_folder(folder);
+            }
+        }
+        // Rewrites the record from what actually restored, dropping
+        // vanished folders (and pruning the key if none survived).
+        self.save_workspace_folders();
+        // The caller composes the user-facing message: setting status
+        // here was immediately overwritten on the re-root path (#156
+        // review).
+        self.roots.iter().count() - before
     }
 
     /// Open the fuzzy directory picker in add-folder mode (#147): the
@@ -29803,10 +29856,22 @@ impl App {
         // same-named file under the new root would wear a departed peer's
         // caret. The live session repopulates its own on the next poll.
         self.collab_carets.clear();
-        self.status = if shell_synced {
-            format!("Workspace root: {display}")
+        // The new primary's saved folder set comes back with it (#153),
+        // the same way its terminal layout does: re-rooting into a
+        // workspace restores that workspace's arrangement.
+        let restored = self.restore_workspace_folders();
+        let folders_note = if restored > 0 {
+            format!(
+                " (+{restored} workspace folder{})",
+                if restored == 1 { "" } else { "s" }
+            )
         } else {
-            format!("Workspace root: {display} (terminal busy; shell not moved)")
+            String::new()
+        };
+        self.status = if shell_synced {
+            format!("Workspace root: {display}{folders_note}")
+        } else {
+            format!("Workspace root: {display}{folders_note} (terminal busy; shell not moved)")
         };
     }
 
@@ -34992,6 +35057,10 @@ pub fn run(
     // Resurrect this workspace's terminal panel from the last session
     // (pane layout, cwds, names, focus) before the first frame paints.
     app.restore_terminal_session();
+    let restored_folders = app.restore_workspace_folders();
+    if restored_folders > 0 {
+        app.status = format!("Restored {restored_folders} workspace folder(s)");
+    }
     // Restore the tabs / layout carried across a self-update re-exec, then
     // delete the handoff file so a later normal launch starts clean.
     if let Some(session_path) = restore_session.as_ref() {

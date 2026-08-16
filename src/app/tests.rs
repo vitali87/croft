@@ -20775,6 +20775,72 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
 }
 
 #[test]
+fn workspace_folder_set_persists_across_sessions_and_reroots() {
+    // #153: the folder set lived only in memory — reopening the same
+    // workspace came back single-folder.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    let c = tmp.path().join("c");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    std::fs::create_dir(&c).unwrap();
+    let store = tmp.path().join("folders.json");
+
+    let mut app = App::new(a.clone()).unwrap();
+    app.workspace_folders_path = store.clone();
+    app.add_workspace_folder(b.clone());
+    app.add_workspace_folder(c.clone());
+
+    // A fresh session on the same primary restores the arrangement.
+    let mut app2 = App::new(a.clone()).unwrap();
+    app2.workspace_folders_path = store.clone();
+    app2.restore_workspace_folders();
+    let b_canon = b.canonicalize().unwrap();
+    let c_canon = c.canonicalize().unwrap();
+    let roots: Vec<PathBuf> = app2.roots.iter().map(Path::to_path_buf).collect();
+    assert!(
+        roots.contains(&b_canon) && roots.contains(&c_canon),
+        "both folders come back: {roots:?}"
+    );
+
+    // A vanished folder is dropped from the record, not restored.
+    std::fs::remove_dir_all(&c).unwrap();
+    let mut app3 = App::new(a.clone()).unwrap();
+    app3.workspace_folders_path = store.clone();
+    app3.restore_workspace_folders();
+    let roots: Vec<PathBuf> = app3.roots.iter().map(Path::to_path_buf).collect();
+    assert!(roots.contains(&b_canon) && !roots.contains(&c_canon));
+    let map = crate::workspace::load_folders(&store);
+    assert_eq!(
+        map.get(&a.display().to_string()),
+        Some(&vec![b_canon.clone()]),
+        "the record rewrites to what survived"
+    );
+
+    // Removing the last secondary folder prunes the key.
+    app3.remove_workspace_folder(b_canon.clone());
+    assert!(
+        !crate::workspace::load_folders(&store).contains_key(&a.display().to_string()),
+        "a single-folder workspace never lingers in the store"
+    );
+
+    // Re-rooting into a workspace with a saved set restores it.
+    crate::workspace::save_folders_for_root(
+        &store,
+        &b_canon.display().to_string(),
+        vec![a.clone()],
+    )
+    .unwrap();
+    app3.change_workspace_root(b_canon.clone());
+    let roots: Vec<PathBuf> = app3.roots.iter().map(Path::to_path_buf).collect();
+    assert!(
+        roots.contains(&a.canonicalize().unwrap()),
+        "the new primary's saved folders come back with the re-root: {roots:?}"
+    );
+}
+
+#[test]
 fn focusing_a_secondary_roots_file_rebinds_the_test_runner_and_tasks() {
     // #151: the runner gate and the worker resolved against the primary
     // only — from a secondary folder's file, Run All refused with "no
