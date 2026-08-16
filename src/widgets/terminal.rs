@@ -3006,6 +3006,26 @@ impl PtyTerminal {
     pub fn foreground_is_shell(&self) -> bool {
         match (self.master.process_group_leader(), self.shell_pid) {
             (Some(fg), Some(pid)) => fg == pid,
+            _ if self.input_seen => {
+                // A pane that has received input CAN be running a launched
+                // app, so an UNRESOLVABLE sample (failed tcgetpgrp, or a
+                // spawn that never reported a shell pid) must not read as
+                // "shell owns it" — under scheduler load the sample
+                // transiently fails while a foreground command runs, and
+                // the old blanket `true` let a cd seed reach that app
+                // (#155). Retry once (the failure window is brief), then
+                // answer FALSE: every consumer fails safe on false (seed
+                // suppressed, task pane not reused, no prompt arrows).
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                match (self.master.process_group_leader(), self.shell_pid) {
+                    (Some(fg), Some(pid)) => fg == pid,
+                    _ => false,
+                }
+            }
+            // Startup window: no input has ever been written, so nothing
+            // user-facing can own the tty yet — a missing group is the
+            // shell's own rc still claiming it, and a seed queues as
+            // type-ahead (#94).
             _ => true,
         }
     }
