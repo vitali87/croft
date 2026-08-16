@@ -4808,13 +4808,15 @@ fn cmd_clicking_a_non_web_hyperlink_refuses_instead_of_opening() {
                 .map(|c| (r, c))
         })
     };
+    // 8s like the suite's other shell-startup waits (#165): a 5s cap
+    // missed under full parallel load while dozens of test shells spawn.
     let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(5000) && linked_cell(&app).is_none()
+    while started.elapsed() < std::time::Duration::from_millis(8000) && linked_cell(&app).is_none()
     {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     term.draw(|f| app.render(f)).unwrap();
-    let (row_idx, col) = linked_cell(&app).expect("shell must print the linked text within 5s");
+    let (row_idx, col) = linked_cell(&app).expect("shell must print the linked text within 8s");
 
     let inner = app.terminal().last_inner;
     app.handle_mouse(crossterm::event::MouseEvent {
