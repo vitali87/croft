@@ -119,6 +119,18 @@ impl CommitMenuItem {
     }
 }
 
+/// One row of the multi-root REPOSITORIES overview (#161): a workspace
+/// folder that is a git repository, as the App's per-folder workers see
+/// it each frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoRow {
+    pub label: String,
+    pub branch: Option<String>,
+    pub changes: usize,
+    pub active: bool,
+    pub workspace_root: std::path::PathBuf,
+}
+
 pub struct SourceControlPanel {
     pub focused: bool,
     /// True under the Black theme: overpaint the focused outer border with the
@@ -137,6 +149,14 @@ pub struct SourceControlPanel {
     pub message_scroll: usize,
     pub status: GitStatus,
     pub entries: Vec<ChangeEntry>,
+    /// The multi-root repositories overview (#161), pushed by the App per
+    /// frame from its per-folder git workers. Length below two hides the
+    /// section (single-folder panels render exactly as before).
+    pub repositories: Vec<RepoRow>,
+    /// Frame-truth hit rects for the overview rows (cleared and
+    /// re-recorded every render, #103): click switches the panel to that
+    /// repository.
+    pub repo_row_areas: Vec<(Rect, std::path::PathBuf)>,
     pub last_area: Rect,
     pub last_inner: Rect,
     pub last_input_area: Rect,
@@ -216,6 +236,8 @@ impl SourceControlPanel {
             message_scroll: 0,
             status: GitStatus::default(),
             entries: Vec::new(),
+            repositories: Vec::new(),
+            repo_row_areas: Vec::new(),
             last_area: Rect::default(),
             last_inner: Rect::default(),
             last_input_area: Rect::default(),
@@ -529,6 +551,92 @@ impl SourceControlPanel {
     /// Paint the "No repository detected" empty-state card. `inner` is the
     /// panel's inner rect (border already drawn); the SOURCE CONTROL header
     /// sits on `inner.y` so the card starts two rows below.
+    /// Paint the multi-root REPOSITORIES overview (#161) starting at `y`,
+    /// returning the y below it (unchanged when hidden). One row per
+    /// repository: label, branch (dim), change count (right-aligned),
+    /// the ACTIVE repository's row on the selection background.
+    fn render_repositories_section(&mut self, inner: Rect, y: u16, buf: &mut Buffer) -> u16 {
+        if self.repositories.len() < 2 {
+            return y;
+        }
+        let bottom = inner.y + inner.height;
+        let mut y = y;
+        if y >= bottom {
+            return y;
+        }
+        buf.set_stringn(
+            inner.x + 1,
+            y,
+            "REPOSITORIES",
+            inner.width.saturating_sub(1) as usize,
+            Style::default()
+                .fg(Color::Rgb(0x8a, 0x92, 0xa4))
+                .add_modifier(Modifier::BOLD),
+        );
+        y += 1;
+        for row in &self.repositories {
+            if y >= bottom {
+                break;
+            }
+            let rect = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            };
+            let hover_bg =
+                crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, self.focus_gradient);
+            let (bg, fg) = if row.active {
+                (self.theme.selection(), Color::White)
+            } else if let Some(h) = hover_bg {
+                (h, Color::Gray)
+            } else {
+                (Color::Reset, Color::Gray)
+            };
+            for x in rect.x..rect.x + rect.width {
+                buf[(x, y)].set_bg(bg);
+            }
+            let branch = row.branch.as_deref().unwrap_or("—");
+            let left = format!(" {}  {branch}", row.label);
+            buf.set_stringn(
+                rect.x,
+                y,
+                &left,
+                rect.width as usize,
+                Style::default().bg(bg).fg(fg).add_modifier(if row.active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            );
+            if row.changes > 0 {
+                let count = row.changes.to_string();
+                let cx = (rect.x + rect.width).saturating_sub(count.len() as u16 + 1);
+                if cx > rect.x + left.len() as u16 {
+                    buf.set_string(
+                        cx,
+                        y,
+                        &count,
+                        Style::default().bg(bg).fg(Color::Rgb(0xe0, 0x9a, 0x4e)),
+                    );
+                }
+            }
+            self.repo_row_areas.push((rect, row.workspace_root.clone()));
+            y += 1;
+        }
+        // One blank spacer so the branch row does not crowd the section.
+        y = (y + 1).min(bottom);
+        y
+    }
+
+    /// Map a click to the repositories-overview row it landed on (#161).
+    pub fn click_repository(&self, x: u16, y: u16) -> Option<std::path::PathBuf> {
+        self.repo_row_areas
+            .iter()
+            .find(|(r, _)| x >= r.x && x < r.x + r.width && y == r.y)
+            .map(|(_, root)| root.clone())
+    }
+
     fn render_no_repo_empty_state(&mut self, inner: Rect, buf: &mut Buffer) {
         if inner.height < 4 || inner.width < 8 {
             return;
@@ -920,6 +1028,9 @@ impl Widget for &mut SourceControlPanel {
         self.header_refresh_btn = Rect::default();
         self.last_branch_area = Rect::default();
         self.header_more_btn = Rect::default();
+        // Frame-truth (#103): a zero-sized frame must not leave last
+        // frame's repository rows clickable.
+        self.repo_row_areas.clear();
 
         if inner.height == 0 || inner.width == 0 {
             return;
@@ -990,6 +1101,10 @@ impl Widget for &mut SourceControlPanel {
             self.last_init_repo_button_area = Rect::default();
             self.last_hero_area = Rect::default();
             self.render_no_repo_empty_state(inner, buf);
+            // With several folders open, the OTHER folders' repositories
+            // stay reachable from the empty state too (#161): the
+            // overview paints over the card's top rows.
+            self.render_repositories_section(inner, inner.y + 2, buf);
             return;
         }
         // Repo path: hero is only for the empty state.
@@ -997,6 +1112,7 @@ impl Widget for &mut SourceControlPanel {
 
         // Row 2: branch row — a green branch glyph plus the branch name.
         let mut y = inner.y + 2;
+        y = self.render_repositories_section(inner, y, buf);
         if y >= inner.y + inner.height {
             return;
         }
@@ -1639,6 +1755,7 @@ mod tests {
             ignored: std::sync::Arc::default(),
             dirty: false,
             repo_root: None,
+            changed_count: 0,
         }
     }
 
@@ -2362,6 +2479,47 @@ mod tests {
                 ratatui::widgets::Widget::render(&mut p, area, &mut buf);
             }
         }
+    }
+
+    #[test]
+    fn repositories_overview_renders_rows_and_maps_clicks() {
+        let mut p = SourceControlPanel::new();
+        p.status = dummy_status_with_branch("trunk");
+        p.repositories = vec![
+            RepoRow {
+                label: String::from("gitb"),
+                branch: Some(String::from("trunk")),
+                changes: 1,
+                active: true,
+                workspace_root: std::path::PathBuf::from("/w/gitb"),
+            },
+            RepoRow {
+                label: String::from("gitc"),
+                branch: Some(String::from("dev")),
+                changes: 1,
+                active: false,
+                workspace_root: std::path::PathBuf::from("/w/gitc"),
+            },
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 34,
+            height: 20,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(dump.contains("REPOSITORIES"), "{dump}");
+        assert!(dump.contains("gitb") && dump.contains("gitc"), "{dump}");
+        let (rect, root) = p.repo_row_areas[1].clone();
+        assert_eq!(root, std::path::PathBuf::from("/w/gitc"));
+        assert_eq!(
+            p.click_repository(rect.x + 2, rect.y),
+            Some(std::path::PathBuf::from("/w/gitc")),
+            "a click inside the second row maps to its folder"
+        );
+        assert_eq!(p.click_repository(rect.x + 2, rect.y + 10), None);
     }
 
     #[test]

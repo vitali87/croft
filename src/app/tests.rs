@@ -4107,6 +4107,7 @@ fn git_status_spans_clean_branch_is_green() {
         head_oid: None,
         ignored: std::sync::Arc::default(),
         repo_root: None,
+        changed_count: 0,
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -4130,6 +4131,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         head_oid: None,
         ignored: std::sync::Arc::default(),
         repo_root: None,
+        changed_count: 0,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -4156,6 +4158,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         head_oid: None,
         ignored: std::sync::Arc::default(),
         repo_root: None,
+        changed_count: 0,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -4174,6 +4177,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         head_oid: None,
         ignored: std::sync::Arc::default(),
         repo_root: None,
+        changed_count: 0,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -20965,6 +20969,164 @@ fn focusing_a_secondary_roots_file_rebinds_the_test_runner_and_tasks() {
         "the secondary folder's Makefile tasks are offered: {:?}",
         tasks.iter().map(|t| t.command.clone()).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn repositories_overview_lists_every_folder_and_a_pin_overrides_the_follow() {
+    // #161: with several folders open, the panel shows a REPOSITORIES
+    // overview and a clicked row pins the panel until focus crosses
+    // folders again.
+    let tmp = tempfile::tempdir().unwrap();
+    let mk_repo = |name: &str, branch: &str| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", branch],
+            vec!["config", "user.email", "a@b"],
+            vec!["config", "user.name", "a"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["-C"])
+                    .arg(&dir)
+                    .args(&args)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false),
+                "git setup failed: {args:?}"
+            );
+        }
+        std::fs::write(dir.join("f.txt"), "x\n").unwrap();
+        dir
+    };
+    let a = mk_repo("repa", "main");
+    let b = mk_repo("repb", "trunk");
+
+    let mut app = App::new(a.clone()).unwrap();
+    app.add_workspace_folder(b.clone());
+    let b_canon = b.canonicalize().unwrap();
+
+    // Both workers report their repos; the per-frame sync builds the rows.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let _ = app.drain_git_responses();
+        app.sync_focus_flags();
+        let rows = &app.source_control.repositories;
+        if rows.len() == 2
+            && rows.iter().any(|r| r.branch.as_deref() == Some("main"))
+            && rows.iter().any(|r| r.branch.as_deref() == Some("trunk"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "overview rows never filled: {:?}",
+            rows
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.source_control
+            .repositories
+            .iter()
+            .all(|r| r.changes >= 1),
+        "EVERY repository's untracked file shows in its change count: {:?}",
+        app.source_control.repositories
+    );
+
+    // Anchor the focus in folder A first, then pin B: the pin wins for
+    // as long as the focus stays inside A (further A files included).
+    let a_canon = a.canonicalize().unwrap();
+    app.editor.open_pinned(&a.join("f.txt")).unwrap();
+    let _ = app.drain_git_responses();
+    assert_eq!(app.active_scm_root, a_canon);
+    app.scm_pin = Some(b_canon.clone());
+    let _ = app.drain_git_responses();
+    assert_eq!(
+        app.active_scm_root, b_canon,
+        "the pin wins while focus stays put"
+    );
+
+    // CROSSING folders with the focus releases the pin: land in B (the
+    // follow now agrees with the pinned repo), then back to A — the
+    // panel follows again.
+    app.editor.open_pinned(&b_canon.join("f.txt")).unwrap();
+    let _ = app.drain_git_responses();
+    assert!(
+        app.scm_pin.is_none(),
+        "the cross-folder focus released the pin"
+    );
+    app.editor.open_pinned(&a.join("f.txt")).unwrap();
+    let _ = app.drain_git_responses();
+    assert_eq!(
+        app.active_scm_root, a_canon,
+        "after release the panel follows the focus again"
+    );
+}
+
+#[test]
+fn clicking_a_repositories_overview_row_switches_the_panel() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mk_repo = |name: &str, branch: &str| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", branch],
+            vec!["config", "user.email", "a@b"],
+            vec!["config", "user.name", "a"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["-C"])
+                    .arg(&dir)
+                    .args(&args)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false),
+            );
+        }
+        std::fs::write(dir.join("f.txt"), "x\n").unwrap();
+        dir
+    };
+    let a = mk_repo("repa", "main");
+    let b = mk_repo("repb", "trunk");
+    let mut app = App::new(a.clone()).unwrap();
+    app.add_workspace_folder(b.clone());
+    let b_canon = b.canonicalize().unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let _ = app.drain_git_responses();
+        app.sync_focus_flags();
+        term.draw(|frame| app.render(frame)).unwrap();
+        if app.source_control.repo_row_areas.len() == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "overview rows never rendered; rows: {:?}",
+            app.source_control.repositories
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (rect, root) = app.source_control.repo_row_areas[1].clone();
+    assert_eq!(root, b_canon);
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        rect.x + 2,
+        rect.y,
+    ));
+    let _ = app.drain_git_responses();
+    assert_eq!(
+        app.active_scm_root, b_canon,
+        "the click pins the panel to the second repository"
+    );
+    assert_eq!(app.scm_pin.as_deref(), Some(b_canon.as_path()));
 }
 
 #[test]
