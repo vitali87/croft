@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "The terminal-session store can no longer lose your other workspaces' saved pane layouts: a store file that fails to parse refuses updates instead of being silently replaced, and writes land atomically so an interrupted save cannot corrupt it.",
+    summary: "The terminal-session store can no longer lose your other workspaces' saved pane layouts: an existing store file that cannot be read or parsed refuses updates (with the failure shown beside the action's status) instead of being silently replaced, concurrent windows serialize their saves, and writes land atomically.",
 }];

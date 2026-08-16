@@ -173,25 +173,63 @@ fn load_folders_checked(
 }
 
 /// Read-modify-write one primary root's secondary-folder list; an empty
-/// list removes the key. Refuses to touch a store it cannot parse, and
-/// writes through a sibling temp file renamed into place so an
-/// interrupted write can never leave truncated JSON behind.
+/// list removes the key. Runs under [`update_json_store`]'s exclusive
+/// lock: refuses a store it cannot parse and writes atomically.
 pub fn save_folders_for_root(
     path: &Path,
     primary: &str,
     folders: Vec<PathBuf>,
 ) -> Result<(), String> {
-    let mut map = load_folders_checked(path)?;
-    if folders.is_empty() {
-        map.remove(primary);
-    } else {
-        map.insert(primary.to_string(), folders);
-    }
+    update_json_store::<Vec<PathBuf>, _>(path, |map| {
+        if folders.is_empty() {
+            map.remove(primary);
+        } else {
+            map.insert(primary.to_string(), folders.clone());
+        }
+    })
+}
+
+/// The shared read-modify-write for croft's per-workspace JSON stores
+/// (`workspace_folders.json`, `terminal_sessions.json`): the whole
+/// load→mutate→rename transaction holds an exclusive lock on a sibling
+/// `.lock` file, so two croft windows saving concurrently serialize
+/// instead of overwriting each other's keys (#158 review); the write
+/// lands through a per-process-unique temp file renamed into place; a
+/// store that exists but cannot be read or parsed refuses the update
+/// and keeps its bytes, while a missing store is the normal first run.
+pub(crate) fn update_json_store<V, F>(path: &Path, mutate: F) -> Result<(), String>
+where
+    V: serde::Serialize + serde::de::DeserializeOwned,
+    F: FnOnce(&mut std::collections::HashMap<String, V>),
+{
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
+    let lock_path = path.with_extension("lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("open {}: {e}", lock_path.display()))?;
+    lock.lock()
+        .map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
+    // Held to end of scope; unlock on drop covers every early return.
+    let mut map: std::collections::HashMap<String, V> = match std::fs::read_to_string(path) {
+        Ok(raw) => {
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    mutate(&mut map);
     let json = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
@@ -247,6 +285,33 @@ mod tests {
         assert!(ws.remove(Path::new("/w/b")), "a secondary root removes");
         assert!(!ws.is_multi());
         assert_eq!(ws.primary(), Path::new("/w/a"));
+    }
+
+    #[test]
+    fn concurrent_saves_serialize_instead_of_overwriting_each_other() {
+        // #158 review: without the lock, two writers could each load the
+        // pre-update map and the second rename would discard the first
+        // writer's key.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("folders.json");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    save_folders_for_root(
+                        &store,
+                        &format!("/w/root{i}"),
+                        vec![PathBuf::from(format!("/w/extra{i}"))],
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let map = load_folders(&store);
+        assert_eq!(map.len(), 8, "every writer's key survives: {map:?}");
     }
 
     #[test]

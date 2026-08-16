@@ -83,23 +83,18 @@ fn load_checked(path: &Path) -> Result<HashMap<String, SessionRecord>, String> {
 }
 
 /// Read-modify-write one workspace's record; a trivial record removes the
-/// key instead. Refuses to touch a store it cannot parse, and writes
-/// through a sibling temp file renamed into place so an interrupted write
-/// can never leave truncated JSON behind (#157).
+/// key instead. Runs under [`crate::workspace::update_json_store`]'s
+/// exclusive lock (#157/#158): refuses a store that exists but cannot be
+/// read or parsed, writes atomically through a unique temp file, and
+/// serializes against concurrent croft windows.
 pub fn save_for_root(path: &Path, root: &str, record: SessionRecord) -> Result<(), String> {
-    let mut map = load_checked(path)?;
-    if record.is_trivial(root) {
-        map.remove(root);
-    } else {
-        map.insert(root.to_string(), record);
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    }
-    let json = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
+    crate::workspace::update_json_store::<SessionRecord, _>(path, |map| {
+        if record.is_trivial(root) {
+            map.remove(root);
+        } else {
+            map.insert(root.to_string(), record.clone());
+        }
+    })
 }
 
 #[cfg(test)]
