@@ -23,6 +23,9 @@ use ratatui::{
 /// step needs (e.g. the base ref a new branch forks from).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputPurpose {
+    /// Save the current folder set as a VS Code-compatible workspace
+    /// file (#163): the typed value is the destination path.
+    SaveWorkspaceAs,
     CloneUrl,
     RenameBranch,
     CreateBranchFrom {

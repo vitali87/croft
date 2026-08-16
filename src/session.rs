@@ -325,7 +325,7 @@ pub fn attach(path: Option<PathBuf>, solo: bool) -> Result<()> {
             std::env::set_var("CROFT_COLLAB_SOCKET", &collab);
             std::env::set_var("CROFT_COLLAB_ROLE", "guest");
         }
-        return crate::app::run(workspace, None, None, false);
+        return crate::app::run(workspace, None, None, false, Vec::new());
     }
 
     let croft = std::env::current_exe().context("resolving croft binary path")?;

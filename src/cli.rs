@@ -267,7 +267,7 @@ impl Cli {
                 match crate::remote::launch_croft(&host, path.as_deref(), solo)? {
                     crate::remote::RemoteOutcome::ReturnToLocal => {
                         let cwd = std::env::current_dir().context("resolving workspace path")?;
-                        crate::app::run(cwd, None, None, false)
+                        crate::app::run(cwd, None, None, false, Vec::new())
                     }
                     crate::remote::RemoteOutcome::Exited => Ok(()),
                 }
@@ -448,8 +448,8 @@ impl Cli {
                 let path = self
                     .path
                     .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-                let (path, open_file) = resolve_workspace(&path, self.open_file)?;
-                crate::app::run(path, self.restore_session, open_file, self.zen)
+                let (path, open_file, folders) = resolve_workspace(&path, self.open_file)?;
+                crate::app::run(path, self.restore_session, open_file, self.zen, folders)
             }
         }
     }
@@ -764,16 +764,26 @@ fn setup_ghostty(yes: bool) -> Result<()> {
 fn resolve_workspace(
     path: &Path,
     open_file: Option<PathBuf>,
-) -> Result<(PathBuf, Option<PathBuf>)> {
+) -> Result<(PathBuf, Option<PathBuf>, Vec<PathBuf>)> {
     let path = path.canonicalize().context("resolving workspace path")?;
     if path.is_dir() {
-        return Ok((path, open_file));
+        return Ok((path, open_file, Vec::new()));
+    }
+    // A VS Code-compatible workspace file (#163): the first folder is the
+    // primary root, the rest join as workspace folders — the file defines
+    // the set exactly, so the automatic per-primary store is not merged.
+    if crate::workspace::is_workspace_file(&path) {
+        let folders = crate::workspace::parse_workspace_file(&path)
+            .map_err(|e| anyhow::anyhow!("workspace file: {e}"))?;
+        let mut it = folders.into_iter();
+        let primary = it.next().expect("parse guarantees at least one folder");
+        return Ok((primary, open_file, it.collect()));
     }
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?
         .to_path_buf();
-    Ok((parent, open_file.or(Some(path))))
+    Ok((parent, open_file.or(Some(path)), Vec::new()))
 }
 
 fn install_launcher(path: Option<PathBuf>, user: bool, yes: bool) -> Result<()> {
@@ -963,7 +973,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("pitch_deck.tex");
         std::fs::write(&file, "hi").unwrap();
-        let (root, open) = resolve_workspace(&file, None).unwrap();
+        let (root, open, _) = resolve_workspace(&file, None).unwrap();
         assert_eq!(root, dir.path().canonicalize().unwrap());
         assert_eq!(open, Some(file.canonicalize().unwrap()));
     }
@@ -971,9 +981,29 @@ mod tests {
     #[test]
     fn directory_path_stays_the_workspace_root() {
         let dir = tempfile::tempdir().unwrap();
-        let (root, open) = resolve_workspace(dir.path(), None).unwrap();
+        let (root, open, _) = resolve_workspace(dir.path(), None).unwrap();
         assert_eq!(root, dir.path().canonicalize().unwrap());
         assert_eq!(open, None);
+    }
+
+    #[test]
+    fn resolve_workspace_opens_a_code_workspace_file_as_a_folder_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("alpha");
+        let b = dir.path().join("beta");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let file = dir.path().join("p.code-workspace");
+        crate::workspace::write_workspace_file(&file, &[a.clone(), b.clone()]).unwrap();
+        let (root, open, folders) = resolve_workspace(&file, None).unwrap();
+        assert_eq!(root, a.canonicalize().unwrap(), "first folder is primary");
+        assert_eq!(open, None, "a workspace file is not an open-file");
+        assert_eq!(folders, vec![b.canonicalize().unwrap()]);
+
+        // A malformed workspace file is a launch error, not a text open.
+        let bad = dir.path().join("bad.code-workspace");
+        std::fs::write(&bad, "{ nope").unwrap();
+        assert!(resolve_workspace(&bad, None).is_err());
     }
 
     #[test]
@@ -982,7 +1012,7 @@ mod tests {
         let file = dir.path().join("a.tex");
         std::fs::write(&file, "hi").unwrap();
         let other = dir.path().join("b.rs");
-        let (root, open) = resolve_workspace(&file, Some(other.clone())).unwrap();
+        let (root, open, _) = resolve_workspace(&file, Some(other.clone())).unwrap();
         assert_eq!(root, dir.path().canonicalize().unwrap());
         assert_eq!(open, Some(other));
     }
