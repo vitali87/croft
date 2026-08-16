@@ -17378,6 +17378,7 @@ impl App {
                 self.add_watch_expression(value);
             }
             InputPurpose::SaveWorkspaceAs => {
+                self.close_input_prompt();
                 let dest = PathBuf::from(value.trim());
                 let folders: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
                 match crate::workspace::write_workspace_file(&dest, &folders) {
@@ -29827,6 +29828,13 @@ impl App {
             Ok(folders) => {
                 let mut it = folders.into_iter();
                 let primary = it.next().expect("parse guarantees a folder");
+                if !primary.is_dir() {
+                    // Refuse before touching the workspace: re-rooting
+                    // into a vanished folder would strand the window
+                    // (#164 review).
+                    self.status = format!("Workspace file: missing folder {}", primary.display());
+                    return;
+                }
                 self.pending_workspace_folders = Some(it.collect());
                 self.change_workspace_root(primary);
             }

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "VS Code-compatible workspace files: open a .code-workspace from the command line (croft project.code-workspace) or from the editor via \"Workspaces: Open Workspace from File\", and save the current folder arrangement with \"Workspaces: Save Workspace As\" — folder paths written relative to the file so it travels with your project.",
+    summary: "VS Code-compatible workspace files: open a .code-workspace from the command line (croft project.code-workspace) or from the editor via \"Workspaces: Open Workspace from File\", and save the current folder arrangement with \"Workspaces: Save Workspace As\" — folder paths written relative to the file where possible, so it travels with your project.",
 }];

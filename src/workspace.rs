@@ -242,7 +242,7 @@ where
 /// workspace names at least one folder.
 pub fn parse_workspace_file(path: &Path) -> Result<Vec<PathBuf>, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let stripped = crate::keymap::strip_line_comments(&raw);
+    let stripped = strip_jsonc(&raw);
     let v: serde_json::Value =
         serde_json::from_str(&stripped).map_err(|e| format!("parse {}: {e}", path.display()))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
@@ -252,9 +252,13 @@ pub fn parse_workspace_file(path: &Path) -> Result<Vec<PathBuf>, String> {
         .ok_or_else(|| format!("{}: no folders array", path.display()))?;
     let mut out = Vec::new();
     for f in folders {
-        let Some(p) = f.get("path").and_then(|p| p.as_str()) else {
-            continue;
-        };
+        // An entry without a string `path` is a malformed FILE, not a
+        // skippable row: silently dropping it would open a partial
+        // workspace that looks complete (#164 review).
+        let p = f
+            .get("path")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| format!("{}: folder entry without a path", path.display()))?;
         let p = Path::new(p);
         let abs = if p.is_absolute() {
             p.to_path_buf()
@@ -267,6 +271,87 @@ pub fn parse_workspace_file(path: &Path) -> Result<Vec<PathBuf>, String> {
         return Err(format!("{}: no folders", path.display()));
     }
     Ok(out)
+}
+
+/// Strip VS Code's JSONC extras so serde can parse: `//` and `/* */`
+/// comments outside strings, and trailing commas before `]`/`}` (#164
+/// review — `.code-workspace` files legitimately carry all three).
+fn strip_jsonc(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut in_str = false;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_str {
+            out.push(c);
+            if c == '\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                out.push(c);
+                i += 1;
+            }
+            '/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            ',' => {
+                // Trailing comma: swallow it when the next non-space,
+                // non-comment token closes the container.
+                let mut j = i + 1;
+                loop {
+                    while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                        j += 1;
+                    }
+                    if j + 1 < bytes.len() && bytes[j] == b'/' && bytes[j + 1] == b'/' {
+                        while j < bytes.len() && bytes[j] != b'\n' {
+                            j += 1;
+                        }
+                        continue;
+                    }
+                    if j + 1 < bytes.len() && bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                        j += 2;
+                        while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                            j += 1;
+                        }
+                        j = (j + 2).min(bytes.len());
+                        continue;
+                    }
+                    break;
+                }
+                if j < bytes.len() && (bytes[j] == b']' || bytes[j] == b'}') {
+                    i += 1; // drop the comma; the closer re-processes
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Write the folder set as a `.code-workspace` (#163): paths relative to
@@ -434,6 +519,30 @@ mod tests {
         assert!(parse_workspace_file(&bad).is_err());
         assert!(is_workspace_file(&bad));
         assert!(!is_workspace_file(Path::new("x.rs")));
+
+        // VS Code JSONC: block comments and trailing commas parse (#164
+        // review), and an entry without a string path REJECTS the file
+        // rather than opening a partial workspace.
+        let jsonc = tmp.path().join("jsonc.code-workspace");
+        std::fs::write(
+            &jsonc,
+            "{\n  /* block\n     comment */\n  \"folders\": [\n    { \"path\": \"alpha\" }, // tail\n    { \"path\": \"beta\" },\n  ],\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_workspace_file(&jsonc).unwrap(),
+            vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()]
+        );
+        let mixed = tmp.path().join("mixed.code-workspace");
+        std::fs::write(
+            &mixed,
+            "{ \"folders\": [ { \"path\": \"alpha\" }, { \"name\": \"nope\" } ] }",
+        )
+        .unwrap();
+        assert!(
+            parse_workspace_file(&mixed).is_err(),
+            "an entry without a path rejects the whole file"
+        );
     }
 
     #[test]
