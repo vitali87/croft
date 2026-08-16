@@ -21029,8 +21029,9 @@ fn repositories_overview_lists_every_folder_and_a_pin_overrides_the_follow() {
         app.source_control
             .repositories
             .iter()
-            .any(|r| r.changes >= 1),
-        "the untracked file shows in a row's change count"
+            .all(|r| r.changes >= 1),
+        "EVERY repository's untracked file shows in its change count: {:?}",
+        app.source_control.repositories
     );
 
     // Anchor the focus in folder A first, then pin B: the pin wins for

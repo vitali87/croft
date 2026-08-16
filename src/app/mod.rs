@@ -5275,6 +5275,16 @@ impl App {
             self.scm_follow_root = follow.clone();
             self.scm_pin = None;
         }
+        // A pin naming a folder that has since left the workspace would
+        // re-seed a dead root forever (#162 review): drop it here so the
+        // guard holds whichever path removed the folder.
+        if self
+            .scm_pin
+            .as_ref()
+            .is_some_and(|p| !self.roots.iter().any(|r| r == p))
+        {
+            self.scm_pin = None;
+        }
         let active = self.scm_pin.clone().unwrap_or_else(|| follow.clone());
         if active != self.active_scm_root {
             self.seed_active_scm(active);
@@ -5335,6 +5345,10 @@ impl App {
         }
         if changed {
             self.refresh_scm_change_badge();
+            // The overview rows track the same drains that feed the badge
+            // (#162 review: sync_focus_flags runs on focus TRANSITIONS,
+            // not per tick, so background-repo updates lagged).
+            self.refresh_scm_repositories();
             // The Explorer dims git-ignored rows across EVERY root: each
             // worker's set is cwd-scoped to its root already, so the union
             // is exact. Single-root keeps the Arc clone (no set copy).
@@ -5369,6 +5383,7 @@ impl App {
         w.request_status_and_changes();
         let status = self.git_worker_for_root(&active).status().clone();
         self.source_control.set_status(status, Vec::new());
+        self.refresh_scm_repositories();
         self.refresh_commit_graph();
     }
 
@@ -5888,6 +5903,36 @@ impl App {
     /// there was one root (#149).
     fn scm_worker(&self) -> &GitWorker {
         self.git_worker_for_root(&self.active_scm_root)
+    }
+
+    /// Rebuild the multi-root repositories overview rows (#161) from the
+    /// per-folder workers: called from the git drain (fresh statuses),
+    /// the focus sync, and the seed (active-highlight moves with a row
+    /// click). Empty — section hidden — with one folder.
+    fn refresh_scm_repositories(&mut self) {
+        self.source_control.repositories = if self.roots.is_multi() {
+            let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+            let labels = crate::workspace::root_display_labels(&roots);
+            roots
+                .iter()
+                .zip(labels)
+                .filter_map(|(ws, label)| {
+                    let status = self.git_worker_for_root(ws).status();
+                    if !status.in_repo {
+                        return None;
+                    }
+                    Some(crate::widgets::source_control::RepoRow {
+                        label,
+                        branch: status.branch.clone(),
+                        changes: status.changed_count,
+                        active: *ws == self.active_scm_root,
+                        workspace_root: ws.clone(),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
     }
 
     /// Let the ACTIVE repo's next debounced refresh through immediately —
@@ -10990,31 +11035,7 @@ impl App {
         self.search.theme = self.theme;
         self.source_control.focus_gradient = gradient;
         self.source_control.theme = self.theme;
-        // The multi-root repositories overview (#161): per-frame rows from
-        // the per-folder workers; empty (section hidden) with one folder.
-        self.source_control.repositories = if self.roots.is_multi() {
-            let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
-            let labels = crate::workspace::root_display_labels(&roots);
-            roots
-                .iter()
-                .zip(labels)
-                .filter_map(|(ws, label)| {
-                    let status = self.git_worker_for_root(ws).status();
-                    if !status.in_repo {
-                        return None;
-                    }
-                    Some(crate::widgets::source_control::RepoRow {
-                        label,
-                        branch: status.branch.clone(),
-                        changes: status.changed_count,
-                        active: *ws == self.active_scm_root,
-                        workspace_root: ws.clone(),
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        self.refresh_scm_repositories();
         self.run_debug.focus_gradient = gradient;
         let explorer_focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;

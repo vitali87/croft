@@ -564,10 +564,11 @@ impl SourceControlPanel {
         if y >= bottom {
             return y;
         }
-        buf.set_string(
+        buf.set_stringn(
             inner.x + 1,
             y,
             "REPOSITORIES",
+            inner.width.saturating_sub(1) as usize,
             Style::default()
                 .fg(Color::Rgb(0x8a, 0x92, 0xa4))
                 .add_modifier(Modifier::BOLD),
@@ -1027,6 +1028,9 @@ impl Widget for &mut SourceControlPanel {
         self.header_refresh_btn = Rect::default();
         self.last_branch_area = Rect::default();
         self.header_more_btn = Rect::default();
+        // Frame-truth (#103): a zero-sized frame must not leave last
+        // frame's repository rows clickable.
+        self.repo_row_areas.clear();
 
         if inner.height == 0 || inner.width == 0 {
             return;
@@ -1093,7 +1097,6 @@ impl Widget for &mut SourceControlPanel {
         // (Initialize Repository) and secondary (Open Folder) buttons,
         // plus a "Learn more about Git" help link. Mirrors the reference
         // design the user supplied.
-        self.repo_row_areas.clear();
         if !self.status.in_repo {
             self.last_init_repo_button_area = Rect::default();
             self.last_hero_area = Rect::default();
