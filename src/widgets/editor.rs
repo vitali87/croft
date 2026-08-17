@@ -185,9 +185,16 @@ fn render_hex(
     // Zero-size guard AFTER the layout reset below would leave stale hit
     // rects; clear them first (the #103 frame-truth invariant).
     view.layout = crate::hex::HexLayout::default();
-    if inner.height < 3 || inner.width < 24 {
+    if inner.height == 0 || inner.width == 0 {
         return;
     }
+    let offw = view.offset_digits() as u16;
+    // Narrowest workable layout: lead + offset + gap + 8 hex cells
+    // (3/byte minus the trailing space) + gap + 8 ascii cells. Below it
+    // the per-cell clip would paint offsets with no bytes — a half-drawn
+    // grid — so a too-narrow split shows a deliberate empty state (the
+    // clamped header only) instead.
+    let need8 = 1 + offw + 2 + (8 * 3 - 1) + 2 + 8;
     let name = path
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
@@ -203,8 +210,10 @@ fn render_hex(
             .bg(Color::Rgb(0x09, 0x4d, 0x77))
             .add_modifier(Modifier::BOLD),
     );
+    if inner.height < 3 || inner.width < need8 {
+        return;
+    }
 
-    let offw = view.offset_digits() as u16;
     // lead + offset + gap + hex cells (3/byte minus the trailing space)
     // + mid-group gap + gap + ascii gutter
     let need16 = 1 + offw + 2 + (16 * 3 - 1) + 1 + 2 + 16;
@@ -3054,6 +3063,15 @@ impl Editor {
             generation: next_image_generation(),
             pdf: None,
         });
+        // A diff view is superseded like every other kind: `open`'s text
+        // tail clears it, but the preview openers return before reaching
+        // that tail, and the render's arrow-rect clearing sits after the
+        // preview arms' early returns — so a diff tab reopened as a
+        // preview kept its label, caret, and CLICKABLE hunk arrows
+        // (#187 review). Clear the state and the frame-truth rects here.
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
         self.sheet = None;
         self.hex = None;
         self.status = format!("Opened image {}", path.display());
@@ -3084,6 +3102,15 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
+        // A diff view is superseded like every other kind: `open`'s text
+        // tail clears it, but the preview openers return before reaching
+        // that tail, and the render's arrow-rect clearing sits after the
+        // preview arms' early returns — so a diff tab reopened as a
+        // preview kept its label, caret, and CLICKABLE hunk arrows
+        // (#187 review). Clear the state and the frame-truth rects here.
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
         self.image = None;
         self.hex = None;
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
@@ -3147,6 +3174,15 @@ impl Editor {
                 links: None,
             }),
         });
+        // A diff view is superseded like every other kind: `open`'s text
+        // tail clears it, but the preview openers return before reaching
+        // that tail, and the render's arrow-rect clearing sits after the
+        // preview arms' early returns — so a diff tab reopened as a
+        // preview kept its label, caret, and CLICKABLE hunk arrows
+        // (#187 review). Clear the state and the frame-truth rects here.
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
         self.sheet = None;
         self.hex = None;
         self.status = format!("Opened PDF {}", path.display());
@@ -3203,6 +3239,15 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
+        // A diff view is superseded like every other kind: `open`'s text
+        // tail clears it, but the preview openers return before reaching
+        // that tail, and the render's arrow-rect clearing sits after the
+        // preview arms' early returns — so a diff tab reopened as a
+        // preview kept its label, caret, and CLICKABLE hunk arrows
+        // (#187 review). Clear the state and the frame-truth rects here.
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
         self.image = None;
         self.sheet = None;
         self.markdown_preview = None;
@@ -11684,6 +11729,87 @@ mod tests {
             view.hit_test(l.hex_x, l.data_top - 1),
             None,
             "header misses"
+        );
+    }
+
+    #[test]
+    fn preview_openers_supersede_a_diff_view_and_its_arrow_rects() {
+        // #187 review: only `open`'s TEXT tail cleared `diff`, and the
+        // preview arms return before the render's arrow-rect clearing —
+        // a diff tab reopened as a preview kept its "left ↔ right"
+        // label, its caret, and clickable hunk arrows.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("blob.bin");
+        std::fs::write(&bin, b"\x00\x01\x02").unwrap();
+        let mut e = Editor::new();
+        e.diff = Some(crate::widgets::diff::DiffData::build(
+            std::path::PathBuf::from("left.txt"),
+            std::path::PathBuf::from("right.txt"),
+            vec![String::from("a")],
+            vec![String::from("b")],
+        ));
+        e.diff_prev_arrow = Rect {
+            x: 1,
+            y: 1,
+            width: 3,
+            height: 1,
+        };
+        e.diff_next_arrow = e.diff_prev_arrow;
+        e.open(&bin).unwrap();
+        assert!(e.hex.is_some());
+        assert!(e.diff.is_none(), "the diff view is superseded");
+        assert_eq!(e.diff_prev_arrow, Rect::default(), "stale hit rect cleared");
+        assert_eq!(e.diff_next_arrow, Rect::default());
+
+        let png = tmp.path().join("pic.png");
+        image::RgbaImage::new(2, 2).save(&png).unwrap();
+        let mut e = Editor::new();
+        e.diff = Some(crate::widgets::diff::DiffData::build(
+            std::path::PathBuf::from("left.txt"),
+            std::path::PathBuf::from("right.txt"),
+            vec![String::from("a")],
+            vec![String::from("b")],
+        ));
+        e.open(&png).unwrap();
+        assert!(e.image.is_some());
+        assert!(e.diff.is_none(), "image opener supersedes the diff too");
+    }
+
+    #[test]
+    fn hex_render_narrower_than_the_8_byte_layout_paints_no_half_grid() {
+        // #187 review: between the old 24-col floor and the 8-byte
+        // layout's real need, the per-cell clip painted offsets with no
+        // bytes. The empty state is the clamped header alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blob.bin");
+        std::fs::write(&p, vec![0u8; 64]).unwrap();
+        let mut ed = Editor::new();
+        ed.open(&p).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 34, // inner 32: >= 24, < the 44 the 8-byte layout needs
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+        let mut all = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                all.push_str(buf[(x, y)].symbol());
+            }
+            all.push('\n');
+        }
+        assert!(all.contains("HEX"), "header still names the tab: {all}");
+        assert!(
+            !all.contains("00000000"),
+            "no offset column without bytes to go with it: {all}"
+        );
+        assert!(!all.contains("00 "), "no lone byte cells: {all}");
+        let view = ed.hex.as_ref().unwrap();
+        assert_eq!(
+            view.layout.data_rows, 0,
+            "empty state publishes no hit-test rows"
         );
     }
 

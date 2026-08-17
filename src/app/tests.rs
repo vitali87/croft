@@ -7334,13 +7334,18 @@ fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
     // with rc ruled out above it can only be the sleep. The fail-closed
     // retry inside `foreground_is_shell` can answer false on an
     // UNRESOLVED sample, so poll the strict accessor, not the policy one.
+    // Retain the loop's own sample for the assert: re-sampling could see
+    // a transient `None` (a failed tcgetpgrp) after the loop already
+    // observed the confirmed reading.
     let mut waited = 0u32;
-    while waited < 4000 && app.terminal_mut().foreground_resolved_for_test() != Some(false) {
+    let mut foreground = app.terminal_mut().foreground_resolved_for_test();
+    while waited < 4000 && foreground != Some(false) {
         std::thread::sleep(std::time::Duration::from_millis(20));
         waited += 20;
+        foreground = app.terminal_mut().foreground_resolved_for_test();
     }
     assert_eq!(
-        app.terminal_mut().foreground_resolved_for_test(),
+        foreground,
         Some(false),
         "precondition: the terminal must be running a foreground command"
     );
