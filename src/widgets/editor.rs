@@ -2870,13 +2870,29 @@ impl Editor {
     pub fn open(&mut self, path: &Path) -> Result<()> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if extension_is_image(ext) {
-            return self.open_image(path);
+            // A DECODE failure means the extension lied (#174): fall
+            // through to content routing instead of failing the open.
+            // Filesystem errors stay errors — the file may not exist.
+            match self.open_image(path) {
+                Err(e) if e.to_string().starts_with("Could not decode image") => {}
+                other => return other,
+            }
         }
         if extension_is_pdf(ext) && self.pdf_viewer_enabled {
             return self.open_pdf(path);
         }
         if crate::sheet::extension_is_sheet(ext) && self.csv_viewer_enabled {
-            return self.open_sheet(path);
+            // Same fall-through for a workbook/CSV that does not parse
+            // as its extension claims (#174) — but ONLY for parse
+            // failures. A SIZE refusal ("too large") is a deliberate
+            // cap, and rerouting it into the text path would silently
+            // bypass the guard the cap exists to enforce (#188 review).
+            match self.open_sheet(path) {
+                Err(e)
+                    if e.to_string().starts_with("Spreadsheet open failed")
+                        && !e.to_string().contains("too large") => {}
+                other => return other,
+            }
         }
         let meta = std::fs::metadata(path)?;
         if meta.len() > MAX_FILE_BYTES {
@@ -2892,6 +2908,42 @@ impl Editor {
             anyhow::bail!("File too large ({} bytes)", meta.len());
         }
         let bytes = std::fs::read(path)?;
+        // Content routing (#174): the extension gave no answer, or lied
+        // and fell through above. Try the sniffed kind's viewer; any
+        // failure falls back to the text/binary path below, whose hex
+        // fallback guarantees the open never dead-ends. The
+        // `!extension_*` guards keep a route that already failed by
+        // extension from being retried against the same bytes.
+        match crate::magic::sniff(&bytes) {
+            Some(m) if m.is_image() && !extension_is_image(ext) => {
+                if self.open_image(path).is_ok() {
+                    return Ok(());
+                }
+            }
+            Some(crate::magic::Magic::Pdf) if !extension_is_pdf(ext) && self.pdf_viewer_enabled => {
+                if self.open_pdf(path).is_ok() {
+                    return Ok(());
+                }
+            }
+            // A zip container is an xlsx candidate (the only zip-backed
+            // format croft renders today); a plain archive fails the
+            // parse and falls through. Only the `.xlsx` extension is
+            // excluded — that exact route already ran and failed above;
+            // a workbook wearing `.csv` (or any other sheet extension)
+            // failed a DIFFERENT parser, so the xlsx retry is genuinely
+            // new information (#188 review).
+            Some(crate::magic::Magic::Zip)
+                if !ext.eq_ignore_ascii_case("xlsx") && self.csv_viewer_enabled =>
+            {
+                if let Ok(view) =
+                    crate::sheet::open_sheet_with_kind(path, crate::sheet::SheetKind::Xlsx)
+                {
+                    self.install_sheet_view(path, view);
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
         // Decode with the file's BOM-declared encoding if it has one, else
         // UTF-8. A later "Reopen with Encoding" overrides this.
         let sniffed = encoding_rs::Encoding::for_bom(&bytes);
@@ -3081,6 +3133,14 @@ impl Editor {
     fn open_sheet(&mut self, path: &Path) -> Result<()> {
         let view = crate::sheet::open_sheet(path)
             .map_err(|e| anyhow::anyhow!("Spreadsheet open failed: {e}"))?;
+        self.install_sheet_view(path, view);
+        Ok(())
+    }
+
+    /// The state swap half of a sheet open, shared with the content
+    /// router (#174), which fetches the view by sniffed kind instead of
+    /// by extension.
+    fn install_sheet_view(&mut self, path: &Path, view: crate::sheet::SheetView) {
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
@@ -3115,7 +3175,6 @@ impl Editor {
         self.hex = None;
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
-        Ok(())
     }
 
     fn open_pdf(&mut self, path: &Path) -> Result<()> {
@@ -11730,6 +11789,190 @@ mod tests {
             None,
             "header misses"
         );
+    }
+
+    /// Smallest xlsx calamine accepts: the four structural parts plus one
+    /// worksheet, stored uncompressed. Used by the content-routing tests.
+    fn write_minimal_xlsx(p: &Path) {
+        use std::io::Write as _;
+        let f = std::fs::File::create(p).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let parts: &[(&str, &str)] = &[
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>hello</t></is></c><c r="B1"><v>42</v></c></row></sheetData>
+</worksheet>"#,
+            ),
+        ];
+        for (name, body) in parts {
+            z.start_file(*name, opts).unwrap();
+            z.write_all(body.as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+    }
+
+    #[test]
+    fn extensionless_png_routes_to_the_image_preview_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let png = tmp.path().join("pic.png");
+        image::RgbaImage::new(2, 2).save(&png).unwrap();
+        let bare = tmp.path().join("logo");
+        std::fs::copy(&png, &bare).unwrap();
+        let mut e = Editor::new();
+        e.open(&bare).unwrap();
+        assert!(
+            e.image.is_some(),
+            "content routing must recognise the PNG without an extension"
+        );
+        assert!(e.hex.is_none());
+    }
+
+    #[test]
+    fn misnamed_image_extension_falls_through_to_the_real_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Plain text wearing .png: the decode failure must fall through
+        // to the text editor, not fail the whole open.
+        let fake = tmp.path().join("notes.png");
+        std::fs::write(&fake, "just words\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&fake).unwrap();
+        assert!(e.image.is_none());
+        assert_eq!(e.lines, vec!["just words".to_string()]);
+
+        // Binary garbage wearing .png: decode fails, content is binary,
+        // the hex fallback catches it — never a dead-end.
+        let junk = tmp.path().join("junk.png");
+        std::fs::write(&junk, b"\x00\x01\x02\x03garbage").unwrap();
+        let mut e = Editor::new();
+        e.open(&junk).unwrap();
+        assert!(e.hex.is_some(), "misnamed binary lands in hex");
+    }
+
+    #[test]
+    fn extensionless_workbook_routes_to_the_sheet_viewer_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("report");
+        write_minimal_xlsx(&bare);
+        let mut e = Editor::new();
+        e.open(&bare).unwrap();
+        let sheet = e
+            .sheet
+            .as_ref()
+            .expect("zip content routed to the sheet viewer");
+        assert_eq!(sheet.kind, crate::sheet::SheetKind::Xlsx);
+        let data = &sheet.sheets[0];
+        let all: String = data
+            .headers
+            .iter()
+            .chain(data.rows.iter().flatten())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(all.contains("hello") && all.contains("42"), "cells: {all}");
+    }
+
+    #[test]
+    fn oversized_csv_keeps_its_size_refusal_instead_of_silently_opening() {
+        // #188 review: the parse-failure fallthrough must not swallow
+        // the sheet viewer's SIZE refusal — pre-#174 an over-cap CSV
+        // errored loudly, and rerouting it into the text/binary path
+        // silently bypassed the cap.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.csv");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(26 * 1024 * 1024).unwrap(); // sparse: over the 25MB cap
+        drop(f);
+        let mut e = Editor::new();
+        let err = e.open(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("too large"),
+            "size refusal must surface: {err}"
+        );
+        assert!(e.sheet.is_none() && e.hex.is_none());
+    }
+
+    #[test]
+    fn workbook_misnamed_as_csv_still_reaches_the_sheet_viewer() {
+        // #188 review: a real xlsx wearing .csv fails the CSV parse and
+        // falls through; the zip retry guard must only skip the ONE
+        // route that already ran (.xlsx), not every sheet extension.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("data.csv");
+        write_minimal_xlsx(&p);
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        let sheet = e.sheet.as_ref().expect("zip content retried as xlsx");
+        assert_eq!(sheet.kind, crate::sheet::SheetKind::Xlsx);
+    }
+
+    #[test]
+    fn extensionless_pdf_and_plain_zip_never_dead_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A real-enough PDF head: whether poppler is installed decides
+        // pdf-vs-hex, but the open must SUCCEED either way.
+        let pdf = tmp.path().join("doc");
+        std::fs::write(
+            &pdf,
+            b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n\x00",
+        )
+        .unwrap();
+        let mut e = Editor::new();
+        e.open(&pdf).unwrap();
+        assert!(
+            e.image.as_ref().is_some_and(|i| i.pdf.is_some()) || e.hex.is_some(),
+            "a sniffed PDF opens in the reader or falls to hex, never errors"
+        );
+
+        // A zip that is NOT a workbook: the xlsx attempt fails, the hex
+        // fallback catches it.
+        let plain = tmp.path().join("bundle");
+        let f = std::fs::File::create(&plain).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        use std::io::Write as _;
+        z.start_file("readme.txt", opts).unwrap();
+        z.write_all(b"inside").unwrap();
+        z.finish().unwrap();
+        let mut e = Editor::new();
+        e.open(&plain).unwrap();
+        assert!(e.hex.is_some(), "non-workbook zip lands in hex");
+        assert!(e.sheet.is_none());
     }
 
     #[test]
