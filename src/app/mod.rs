@@ -24687,6 +24687,9 @@ impl App {
                     self.status = String::from("Save or revert the buffer before reopening as hex");
                 }
                 Some(p) => {
+                    // The explicit hex choice supersedes a lingering
+                    // Reopen-as-Text override.
+                    self.editor.force_text = false;
                     if let Err(e) = self.editor.open_hex(&p) {
                         self.status = format!("Reopen as hex: {e}");
                     }
@@ -24694,22 +24697,48 @@ impl App {
                 None => self.status = String::from("No file in the active tab"),
             },
             Cmd::ReopenAsText => match self.editor.path.clone() {
-                Some(_) if self.editor.hex.is_none() => {
-                    self.status = String::from("The active tab is not a hex view");
+                Some(_) if !self.editor.has_non_text_view() => {
+                    self.status = String::from("The active tab is already a text view");
                 }
-                Some(p) => match self.editor.open(&p) {
-                    // `open` re-runs the normal routing: a file that
-                    // fails the text heuristic comes straight back here.
-                    Ok(()) if self.editor.hex.is_some() => {
-                        self.status =
-                            String::from("Still binary by content - staying in the hex view");
+                Some(p) => {
+                    // Per-tab override (#175): skip every preview route —
+                    // an SVG lands in its XML source, a hex tab in the
+                    // text heuristic (whose binary verdict routes back to
+                    // hex, reported honestly). Sticks across FS-sync
+                    // reloads; cleared by opening a different file.
+                    self.editor.force_text = true;
+                    match self.editor.open(&p) {
+                        Ok(()) if self.editor.hex.is_some() => {
+                            self.status =
+                                String::from("Still binary by content - staying in the hex view");
+                        }
+                        Ok(()) => {}
+                        Err(e) => self.status = format!("Reopen as text: {e}"),
                     }
-                    Ok(()) => {}
-                    Err(e) => self.status = format!("Reopen as text: {e}"),
-                },
+                }
                 None => self.status = String::from("No file in the active tab"),
             },
             Cmd::HexFindNext => self.hex_find_next(),
+            Cmd::ReopenAsPreview => match self.editor.path.clone() {
+                Some(_) if self.editor.dirty => {
+                    self.status =
+                        String::from("Save or revert the buffer before reopening the preview");
+                }
+                Some(p) => {
+                    // Undo a Reopen-as-Text: normal routing decides the
+                    // view again (SVG raster, image, sheet, hex).
+                    self.editor.force_text = false;
+                    match self.editor.open(&p) {
+                        Ok(()) if !self.editor.has_non_text_view() => {
+                            self.status =
+                                String::from("No preview for this file type; showing the text");
+                        }
+                        Ok(()) => {}
+                        Err(e) => self.status = format!("Reopen as preview: {e}"),
+                    }
+                }
+                None => self.status = String::from("No file in the active tab"),
+            },
             Cmd::RemoveWorkspaceFolder => {
                 // Operates on the Explorer's selected row when it is a
                 // SECONDARY root section; anything else gets the hint.

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Files are now recognised by their CONTENT, not just their extension: an extensionless PNG opens as an image, a renamed workbook opens in the sheet viewer, a sniffed PDF opens in the reader, and a misnamed file (text wearing .png, a CSV wearing .xlsx) falls through to what it really is instead of failing - with the hex viewer catching everything unrecognised.",
+    summary: "SVG files now open as a rendered preview - shapes, text (system fonts), and embedded images rasterised through resvg into the inline-image pipeline - and \"File: Reopen as Text\" gives any preview tab its raw source per tab: an SVG's XML stays editable, the choice sticks across external-change reloads, and a broken SVG falls straight through to its source instead of erroring.",
 }];

@@ -44,6 +44,7 @@ mod session_state;
 mod sheet;
 mod shell_integration;
 mod snippets;
+mod svg;
 mod tasks;
 mod terminal_session;
 mod termux;

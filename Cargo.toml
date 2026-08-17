@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.1.735"
+version = "0.1.736"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -98,13 +98,21 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # overlay's pixels into sixel's <=256 palette registers; avoids pulling a whole
 # SIMD/proc-macro sixel crate for what are mostly two-colour codicons.
 color_quant = "1.1"
-# SVG rasteriser for the activity-bar codicons. Rendered once at startup at the
-# exact icon pixel size, so the glyphs stay crisp at any cell size and we never
-# ship (or decode) a heavyweight raster source for a 4×2-cell icon. resvg
-# re-exports `usvg` and `tiny_skia`, so it is the only direct dep needed.
-# default-features = false drops text/system-font/raster-image support: the
-# codicons are pure `<path>` glyphs, so this trims fontdb/rustybuzz entirely.
-resvg = { version = "0.47", default-features = false }
+# SVG rasteriser for the activity-bar codicons AND the editor's SVG file
+# preview (#175). resvg re-exports `usvg` and `tiny_skia`, so it is the only
+# direct dep needed. The codicons are pure `<path>` glyphs and never touch a
+# font, but real-world SVG FILES carry <text> and embedded <image>, so the
+# preview needs text + system-fonts (fontdb/rustybuzz) and raster-image
+# (gif/jpeg/png decoding for <image> hrefs). The fontdb is built lazily on
+# the FIRST file preview (src/svg.rs), so the startup critical path
+# (init_graphics baking icons) never pays for font enumeration.
+resvg = { version = "0.47", default-features = false, features = [
+    "text",
+    "system-fonts",
+    "raster-images",
+    "gif",
+    "image-webp",
+] }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 # The local-model navigator transport only (src/pair/local.rs). Version 3's
 # phased timeouts check the remaining budget before EVERY socket read, so one
