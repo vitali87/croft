@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "SVG files now open as a rendered preview - shapes, text (system fonts), and embedded images rasterised through resvg into the inline-image pipeline - and \"File: Reopen as Text\" gives any preview tab its raw source per tab: an SVG's XML stays editable, the choice sticks across external-change reloads, and a broken SVG falls straight through to its source instead of erroring.",
+    summary: "The hex viewer is now a hex EDITOR: overwrite bytes by typing hex digits in the grid or characters in the ASCII gutter (Tab switches panes), with amber-tinted pending edits, undo/redo (Cmd+Z / Cmd+Shift+Z), per-byte revert (Delete), and Cmd+S writing the changed bytes in place - a two-byte fix to a multi-gigabyte file writes two bytes. Read-only files refuse edits up front, and external changes get the same conflict guard as text tabs.",
 }];

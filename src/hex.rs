@@ -62,6 +62,21 @@ pub struct HexView {
     /// Last submitted find query, for "find next".
     pub last_find: Option<Vec<u8>>,
     pub layout: HexLayout,
+    /// Overwrite-mode edits not yet written to disk (#173): offset →
+    /// replacement byte, sparse over the windowed reader so a
+    /// multi-gigabyte file carries kilobytes of state. No inserts or
+    /// deletes — offsets never shift.
+    pub edits: std::collections::BTreeMap<u64, u8>,
+    /// The half-typed high nibble at the cursor in the hex pane.
+    pub pending_nibble: Option<u8>,
+    /// Which pane receives typed input: the hex grid (false) or the
+    /// ASCII gutter (true). Tab toggles.
+    pub ascii_focus: bool,
+    /// Filesystem write permission, probed at open/refresh: typing into
+    /// a read-only file refuses up front instead of failing at save.
+    pub read_only: bool,
+    undo: Vec<(u64, Option<u8>)>,
+    redo: Vec<(u64, Option<u8>)>,
     window_start: u64,
     window: Vec<u8>,
     handle: File,
@@ -70,7 +85,9 @@ pub struct HexView {
 impl HexView {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let handle = File::open(path)?;
-        let file_len = handle.metadata()?.len();
+        let meta = handle.metadata()?;
+        let file_len = meta.len();
+        let read_only = meta.permissions().readonly();
         let mut view = Self {
             file_len,
             top_row: 0,
@@ -79,6 +96,12 @@ impl HexView {
             bytes_per_row: MAX_BYTES_PER_ROW,
             last_find: None,
             layout: HexLayout::default(),
+            edits: std::collections::BTreeMap::new(),
+            pending_nibble: None,
+            ascii_focus: false,
+            read_only,
+            undo: Vec::new(),
+            redo: Vec::new(),
             window_start: 0,
             window: Vec::new(),
             handle,
@@ -214,13 +237,22 @@ impl HexView {
     /// replaced by rename (the common atomic-write) is followed.
     pub fn refresh_from_disk(&mut self, path: &Path) -> std::io::Result<()> {
         self.handle = File::open(path)?;
-        self.file_len = self.handle.metadata()?.len();
+        let meta = self.handle.metadata()?;
+        self.file_len = meta.len();
+        self.read_only = meta.permissions().readonly();
         self.window.clear();
         self.window_start = 0;
         self.cursor = self.cursor.min(self.file_len.saturating_sub(1));
         if let Some(a) = self.sel_anchor {
             self.sel_anchor = Some(a.min(self.file_len.saturating_sub(1)));
         }
+        // The sweep only reloads a CLEAN tab, but belt-and-braces: a
+        // reload means disk changed, and pending overwrites measured
+        // against the old bytes must not survive onto the new ones.
+        self.edits.clear();
+        self.undo.clear();
+        self.redo.clear();
+        self.pending_nibble = None;
         self.fill_window(self.cursor)?;
         Ok(())
     }
@@ -289,6 +321,127 @@ impl HexView {
         Ok(FindOutcome::NotFound)
     }
 
+    /// The byte the user SEES at `off`: a pending edit wins over the
+    /// disk window.
+    pub fn effective_byte(&self, off: u64) -> Option<u8> {
+        self.edits.get(&off).copied().or_else(|| self.byte(off))
+    }
+
+    /// True when unwritten edits exist — the tab's dirty state.
+    pub fn has_edits(&self) -> bool {
+        !self.edits.is_empty()
+    }
+
+    /// Record an overwrite at `off` (undoable; a new edit clears the
+    /// redo branch, text-editor style). Offsets past EOF are ignored —
+    /// overwrite mode never grows the file.
+    pub fn apply_edit(&mut self, off: u64, b: u8) {
+        if off >= self.file_len {
+            return;
+        }
+        self.undo.push((off, self.edits.get(&off).copied()));
+        self.redo.clear();
+        self.edits.insert(off, b);
+    }
+
+    /// Discard every pending edit and the whole undo history — the
+    /// "Revert" half of a conflict resolution, called BEFORE the reload
+    /// so the refresh guard in `open_hex` lets the reload through.
+    pub fn discard_edits(&mut self) {
+        self.edits.clear();
+        self.undo.clear();
+        self.redo.clear();
+        self.pending_nibble = None;
+    }
+
+    /// Drop the pending edit at `off` (Delete: revert one byte to disk).
+    pub fn revert_edit(&mut self, off: u64) {
+        if let Some(prev) = self.edits.remove(&off) {
+            self.undo.push((off, Some(prev)));
+            self.redo.clear();
+        }
+    }
+
+    pub fn undo_edit(&mut self) -> bool {
+        let Some((off, prev)) = self.undo.pop() else {
+            return false;
+        };
+        let current = self.edits.get(&off).copied();
+        match prev {
+            Some(b) => {
+                self.edits.insert(off, b);
+            }
+            None => {
+                self.edits.remove(&off);
+            }
+        }
+        self.redo.push((off, current));
+        true
+    }
+
+    pub fn redo_edit(&mut self) -> bool {
+        let Some((off, value)) = self.redo.pop() else {
+            return false;
+        };
+        let current = self.edits.get(&off).copied();
+        match value {
+            Some(b) => {
+                self.edits.insert(off, b);
+            }
+            None => {
+                self.edits.remove(&off);
+            }
+        }
+        self.undo.push((off, current));
+        true
+    }
+
+    /// Feed one typed hex digit at the cursor. Two digits complete a
+    /// byte (high nibble first, the universal hex-editor convention),
+    /// which is applied and reported so the caller advances the cursor.
+    pub fn type_hex_digit(&mut self, digit: u8) -> bool {
+        match self.pending_nibble.take() {
+            Some(hi) => {
+                self.apply_edit(self.cursor, (hi << 4) | digit);
+                true
+            }
+            None => {
+                self.pending_nibble = Some(digit);
+                false
+            }
+        }
+    }
+
+    /// Write every pending edit into the file IN PLACE (the hex-editor
+    /// semantic: an atomic-rename would mean copying a possibly
+    /// multi-gigabyte file for a two-byte change), clear the edit state,
+    /// and refresh the window so the view reads what disk now holds.
+    /// Returns how many bytes were written.
+    pub fn save_edits(&mut self, path: &Path) -> std::io::Result<usize> {
+        use std::io::Write as _;
+        if self.edits.is_empty() {
+            return Ok(0);
+        }
+        let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+        let mut written = 0usize;
+        for (&off, &b) in self.edits.iter() {
+            f.seek(SeekFrom::Start(off))?;
+            f.write_all(&[b])?;
+            written += 1;
+        }
+        f.flush()?;
+        drop(f);
+        self.edits.clear();
+        self.undo.clear();
+        self.redo.clear();
+        self.pending_nibble = None;
+        // Re-read through the ORIGINAL handle's window so the view shows
+        // disk truth (the write went through a second handle).
+        let refill = self.window_start;
+        self.fill_window(refill)?;
+        Ok(written)
+    }
+
     /// Map a screen cell to the byte offset it paints, using the last
     /// frame's layout (frame truth). Both the hex grid and the ASCII
     /// gutter are live click targets; cells past EOF miss.
@@ -320,18 +473,33 @@ impl HexView {
     }
 
     /// Status-bar segment: cursor offset (hex + decimal), selection
-    /// length when one exists, and the file size.
+    /// length when one exists, the file size, the active input pane,
+    /// and the unsaved-edit / read-only state.
     pub fn status_line(&self) -> String {
         let sel = match self.selection() {
             Some((a, b)) if b > a => format!("  ·  {} bytes selected", b - a),
             _ => String::new(),
         };
+        let pane = if self.ascii_focus {
+            "  ·  text input (Tab: hex)"
+        } else {
+            "  ·  hex input (Tab: text)"
+        };
+        let dirty = if self.read_only {
+            String::from("  ·  read-only")
+        } else if !self.edits.is_empty() {
+            format!("  ·  {} unsaved (Cmd+S)", self.edits.len())
+        } else {
+            String::new()
+        };
         format!(
-            "0x{:0w$X} ({}){}  ·  {} bytes",
+            "0x{:0w$X} ({}){}  ·  {} bytes{}{}",
             self.cursor,
             self.cursor,
             sel,
             self.file_len,
+            pane,
+            dirty,
             w = self.offset_digits(),
         )
     }
@@ -349,6 +517,74 @@ mod tests {
         f.write_all(bytes).unwrap();
         drop(f);
         (tmp, HexView::open(&p).unwrap())
+    }
+
+    #[test]
+    fn edits_overlay_disk_bytes_and_undo_redo_walk_the_history() {
+        let (_t, mut v) = view_over(&[10, 20, 30, 40]);
+        assert_eq!(v.effective_byte(1), Some(20));
+        v.apply_edit(1, 99);
+        v.apply_edit(1, 77);
+        assert_eq!(v.effective_byte(1), Some(77), "latest edit wins");
+        assert!(v.has_edits());
+        assert!(v.undo_edit());
+        assert_eq!(
+            v.effective_byte(1),
+            Some(99),
+            "undo steps to the prior edit"
+        );
+        assert!(v.undo_edit());
+        assert_eq!(v.effective_byte(1), Some(20), "second undo restores disk");
+        assert!(!v.has_edits());
+        assert!(!v.undo_edit(), "history exhausted");
+        assert!(v.redo_edit());
+        assert_eq!(v.effective_byte(1), Some(99));
+        v.apply_edit(2, 5);
+        assert!(!v.redo_edit(), "a new edit clears the redo branch");
+        v.revert_edit(2);
+        assert_eq!(
+            v.effective_byte(2),
+            Some(30),
+            "revert drops the pending byte"
+        );
+        assert!(v.undo_edit());
+        assert_eq!(v.effective_byte(2), Some(5), "revert itself is undoable");
+    }
+
+    #[test]
+    fn overwrite_mode_never_grows_the_file() {
+        let (_t, mut v) = view_over(&[1, 2, 3]);
+        v.apply_edit(3, 9);
+        v.apply_edit(100, 9);
+        assert!(!v.has_edits(), "past-EOF edits are refused");
+    }
+
+    #[test]
+    fn hex_digit_typing_pairs_nibbles_high_first() {
+        let (_t, mut v) = view_over(&[0u8; 8]);
+        assert!(!v.type_hex_digit(0x4), "first nibble only latches");
+        assert_eq!(v.pending_nibble, Some(0x4));
+        assert!(v.type_hex_digit(0x1), "second nibble completes the byte");
+        assert_eq!(v.effective_byte(0), Some(0x41));
+        assert_eq!(v.pending_nibble, None);
+    }
+
+    #[test]
+    fn save_edits_writes_in_place_and_the_view_reads_disk_truth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blob.bin");
+        std::fs::write(&p, vec![0u8; 64]).unwrap();
+        let mut v = HexView::open(&p).unwrap();
+        v.apply_edit(0, 0xAA);
+        v.apply_edit(63, 0xBB);
+        let written = v.save_edits(&p).unwrap();
+        assert_eq!(written, 2);
+        assert!(!v.has_edits());
+        let disk = std::fs::read(&p).unwrap();
+        assert_eq!(disk[0], 0xAA);
+        assert_eq!(disk[63], 0xBB);
+        assert_eq!(disk.len(), 64, "in-place: length untouched");
+        assert_eq!(v.byte(0), Some(0xAA), "window refreshed from disk");
     }
 
     #[test]

@@ -7294,6 +7294,68 @@ fn change_workspace_root_writes_cd_into_active_terminal_pty() {
 }
 
 #[test]
+fn hex_typing_edits_bytes_and_cmd_s_writes_them_in_place() {
+    // #173 end-to-end: hex-pane nibble typing, Tab to the ASCII pane,
+    // dirty tracking, undo, and the byte save path (never the text
+    // choke point, which #185 makes refuse preview tabs).
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("blob.bin");
+    std::fs::write(&p, vec![0u8; 16]).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.hex.is_some());
+
+    // "4" then "1" completes 0x41 at offset 0 and advances the cursor.
+    app.handle_hex_key(key(KeyCode::Char('4'), KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.hex.as_ref().unwrap().pending_nibble,
+        Some(4),
+        "first nibble latches"
+    );
+    app.handle_hex_key(key(KeyCode::Char('1'), KeyModifiers::NONE));
+    let v = app.editor.hex.as_ref().unwrap();
+    assert_eq!(v.effective_byte(0), Some(0x41));
+    assert_eq!(v.cursor, 1, "completed byte advances");
+    assert!(app.editor.dirty, "pending edits mark the tab dirty");
+
+    // Tab switches panes; a typed character lands as its byte.
+    app.handle_hex_key(key(KeyCode::Tab, KeyModifiers::NONE));
+    app.handle_hex_key(key(KeyCode::Char('Z'), KeyModifiers::NONE));
+    let v = app.editor.hex.as_ref().unwrap();
+    assert_eq!(v.effective_byte(1), Some(b'Z'));
+    assert_eq!(v.cursor, 2);
+
+    // Undo removes the last byte; redo restores it.
+    app.handle_hex_key(key(KeyCode::Char('z'), KeyModifiers::SUPER));
+    assert_eq!(
+        app.editor.hex.as_ref().unwrap().effective_byte(1),
+        Some(0),
+        "undo reverts to the disk byte"
+    );
+    app.handle_hex_key(key(
+        KeyCode::Char('z'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(
+        app.editor.hex.as_ref().unwrap().effective_byte(1),
+        Some(b'Z')
+    );
+
+    // Cmd+S writes the bytes in place and cleans the tab.
+    app.save();
+    assert!(!app.editor.dirty);
+    let disk = std::fs::read(&p).unwrap();
+    assert_eq!(disk[0], 0x41);
+    assert_eq!(disk[1], b'Z');
+    assert_eq!(disk.len(), 16, "in-place write, length untouched");
+    assert!(
+        app.status.starts_with("Wrote 2 bytes"),
+        "status reports the write: {}",
+        app.status
+    );
+}
+
+#[test]
 fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
     let tmp = tempfile::tempdir().unwrap();
     let target_dir = tmp.path().join("seeded");

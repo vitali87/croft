@@ -338,7 +338,12 @@ Binary files open here automatically instead of erroring; the file is read in wi
 | `Home` / `End` | Start / end of the row; with `Cmd`/`Ctrl`: start / end of the file |
 | `Cmd+F` (`Ctrl+F`) | Find bytes: hex pairs (`de ad be ef`) or literal text |
 | `F3` | Find next match (wraps; selects the match) |
-| `Esc` | Clear the selection |
+| `0-9 a-f` (hex grid) / any character (ASCII gutter) | Overwrite the byte under the cursor; two hex digits complete a byte and advance. Pending edits tint amber until saved |
+| `Tab` | Switch typing between the hex grid and the ASCII gutter |
+| `Cmd+Z` / `Cmd+Shift+Z` | Undo / redo byte edits |
+| `Delete` | Revert the byte under the cursor to its on-disk value |
+| `Cmd+S` | Write the changed bytes in place (never rewrites the whole file); refuses once if the file changed on disk, twice overwrites |
+| `Esc` | Clear the selection and any half-typed nibble |
 | Click / drag (hex grid or ASCII gutter) | Park the cursor / select a byte range |
 | Wheel | Scroll three rows |
 
