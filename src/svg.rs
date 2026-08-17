@@ -53,7 +53,7 @@ fn fontdb() -> &'static resvg::usvg::fontdb::Database {
 /// property, not a defect to assert on.
 #[cfg(test)]
 pub fn has_fonts() -> bool {
-    !fontdb().faces().next().is_none()
+    fontdb().faces().next().is_some()
 }
 
 /// Rasterise `svg` to PNG bytes. The output preserves the source aspect

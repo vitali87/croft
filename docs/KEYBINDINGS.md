@@ -330,10 +330,6 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 
 Binary files open here automatically instead of erroring; the file is read in windows, so any size opens instantly. `File: Reopen as Text` switches back when the content is text.
 
-**SVG (`.svg`)**
-
-Opens as a rendered preview (shapes, text via system fonts, embedded images). `File: Reopen as Text` switches the tab to the editable XML source — the choice sticks for that tab, external edits refresh whichever view the tab shows, and an SVG that fails to parse opens as its source directly.
-
 | Keys | Action |
 |------|--------|
 | `←` / `→` | Previous / next byte (`Shift` extends the selection) |
@@ -345,6 +341,10 @@ Opens as a rendered preview (shapes, text via system fonts, embedded images). `F
 | `Esc` | Clear the selection |
 | Click / drag (hex grid or ASCII gutter) | Park the cursor / select a byte range |
 | Wheel | Scroll three rows |
+
+**SVG (`.svg`)**
+
+Opens as a rendered preview (shapes, text via system fonts, embedded images). `File: Reopen as Text` switches the tab to the editable XML source — the choice sticks for that tab, external edits refresh whichever view the tab shows, and an SVG that fails to parse opens as its source directly.
 
 ## Run & Debug
 
