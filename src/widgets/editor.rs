@@ -1894,6 +1894,13 @@ pub struct Editor {
     /// target. Mutually exclusive with the text path and the other
     /// preview kinds; windowed IO, so the file is never loaded whole.
     pub hex: Option<crate::hex::HexView>,
+    /// Per-tab "Reopen as Text" override (#175): when set, `open` skips
+    /// every preview route (extension and sniffed alike) and lands in
+    /// the text editor — an SVG's XML source, a workbook's bytes (which
+    /// the binary heuristic then sends to hex). It STICKS across
+    /// same-path reloads, so the FS-sync sweep cannot flip the tab back
+    /// to a preview, and clears when the tab opens a different file.
+    pub force_text: bool,
     /// Hit-test rect for the "previous change" arrow painted in the diff
     /// header. Empty when the tab isn't a diff or the header was clipped.
     /// `App` consults this on left-click to jump to the previous hunk.
@@ -2027,6 +2034,7 @@ impl Editor {
             sheet: None,
             diff: None,
             hex: None,
+            force_text: false,
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
             disk_stamp: None,
@@ -2869,29 +2877,42 @@ impl Editor {
 
     pub fn open(&mut self, path: &Path) -> Result<()> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if extension_is_image(ext) {
-            // A DECODE failure means the extension lied (#174): fall
-            // through to content routing instead of failing the open.
-            // Filesystem errors stay errors — the file may not exist.
-            match self.open_image(path) {
-                Err(e) if e.to_string().starts_with("Could not decode image") => {}
-                other => return other,
+        // The Reopen-as-Text override is PER TAB and per file: a path
+        // change is a different document, which routes normally again.
+        if self.path.as_deref() != Some(path) {
+            self.force_text = false;
+        }
+        if !self.force_text {
+            if extension_is_image(ext) {
+                // A DECODE failure means the extension lied (#174): fall
+                // through to content routing instead of failing the open.
+                // Filesystem errors stay errors — the file may not exist.
+                match self.open_image(path) {
+                    Err(e) if e.to_string().starts_with("Could not decode image") => {}
+                    other => return other,
+                }
             }
-        }
-        if extension_is_pdf(ext) && self.pdf_viewer_enabled {
-            return self.open_pdf(path);
-        }
-        if crate::sheet::extension_is_sheet(ext) && self.csv_viewer_enabled {
-            // Same fall-through for a workbook/CSV that does not parse
-            // as its extension claims (#174) — but ONLY for parse
-            // failures. A SIZE refusal ("too large") is a deliberate
-            // cap, and rerouting it into the text path would silently
-            // bypass the guard the cap exists to enforce (#188 review).
-            match self.open_sheet(path) {
-                Err(e)
-                    if e.to_string().starts_with("Spreadsheet open failed")
-                        && !e.to_string().contains("too large") => {}
-                other => return other,
+            // SVG renders through resvg into the image pipeline (#175); a
+            // parse failure falls through to the XML source in the text
+            // editor.
+            if ext.eq_ignore_ascii_case("svg") && self.open_svg(path).is_ok() {
+                return Ok(());
+            }
+            if extension_is_pdf(ext) && self.pdf_viewer_enabled {
+                return self.open_pdf(path);
+            }
+            if crate::sheet::extension_is_sheet(ext) && self.csv_viewer_enabled {
+                // Same fall-through for a workbook/CSV that does not parse
+                // as its extension claims (#174) — but ONLY for parse
+                // failures. A SIZE refusal ("too large") is a deliberate
+                // cap, and rerouting it into the text path would silently
+                // bypass the guard the cap exists to enforce (#188 review).
+                match self.open_sheet(path) {
+                    Err(e)
+                        if e.to_string().starts_with("Spreadsheet open failed")
+                            && !e.to_string().contains("too large") => {}
+                    other => return other,
+                }
             }
         }
         let meta = std::fs::metadata(path)?;
@@ -2914,7 +2935,10 @@ impl Editor {
         // fallback guarantees the open never dead-ends. The
         // `!extension_*` guards keep a route that already failed by
         // extension from being retried against the same bytes.
-        match crate::magic::sniff(&bytes) {
+        match (!self.force_text)
+            .then(|| crate::magic::sniff(&bytes))
+            .flatten()
+        {
             Some(m) if m.is_image() && !extension_is_image(ext) => {
                 if self.open_image(path).is_ok() {
                     return Ok(());
@@ -3134,6 +3158,63 @@ impl Editor {
         let view = crate::sheet::open_sheet(path)
             .map_err(|e| anyhow::anyhow!("Spreadsheet open failed: {e}"))?;
         self.install_sheet_view(path, view);
+        Ok(())
+    }
+
+    /// Rendered SVG preview (#175): rasterise through resvg at a fixed
+    /// quality (the PDF philosophy — one raster per open, no re-render
+    /// on pane resize) and hand the PNG to the standard image pipeline.
+    fn open_svg(&mut self, path: &Path) -> Result<()> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > crate::svg::MAX_SVG_BYTES {
+            anyhow::bail!("SVG too large ({} bytes)", meta.len());
+        }
+        let src = std::fs::read(path)?;
+        let (png, pixel_w, pixel_h) =
+            crate::svg::rasterize(&src).map_err(|e| anyhow::anyhow!("SVG render failed: {e}"))?;
+        self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
+        // A whole-buffer swap: whatever the previous contents could not be
+        // encoded as is no longer this tab's problem.
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
+        self.lines = vec![String::new()];
+        // A whole-buffer swap like every other opener: caches memoised on
+        // edit_seq (conflicts, git marks) must not survive into this tab.
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.lang = None;
+        self.scroll = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty = false;
+        self.selection = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit_kind = None;
+        self.highlights = vec![Vec::new()];
+        // A diff view is superseded like every other kind: `open`'s text
+        // tail clears it, but the preview openers return before reaching
+        // that tail, and the render's arrow-rect clearing sits after the
+        // preview arms' early returns — so a diff tab reopened as a
+        // preview kept its label, caret, and CLICKABLE hunk arrows
+        // (#187 review). Clear the state and the frame-truth rects here.
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
+        self.sheet = None;
+        self.hex = None;
+        self.markdown_preview = None;
+        self.image = Some(ImageView {
+            bytes: png,
+            format_label: String::from("SVG"),
+            pixel_w,
+            pixel_h,
+            byte_size: meta.len(),
+            generation: next_image_generation(),
+            pdf: None,
+        });
+        self.status = format!("Opened SVG {}", path.display());
         Ok(())
     }
 
@@ -11844,6 +11925,66 @@ mod tests {
             z.write_all(body.as_bytes()).unwrap();
         }
         z.finish().unwrap();
+    }
+
+    #[test]
+    fn svg_opens_as_a_rendered_preview_and_reopen_as_text_edits_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("logo.svg");
+        std::fs::write(
+            &p,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50">
+<rect width="100" height="50" fill="#3366ff"/></svg>"##,
+        )
+        .unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        let img = e.image.as_ref().expect("svg opens rendered");
+        assert_eq!(img.format_label, "SVG");
+        assert!(img.pixel_w > 0 && img.pixel_h > 0);
+        assert!(
+            image::load_from_memory(&img.bytes).is_ok(),
+            "the overlay pipeline gets a decodable raster"
+        );
+
+        // Reopen as Text: the per-tab override lands in the XML source
+        // and STICKS across the same-path reload behind FS sync.
+        e.force_text = true;
+        e.open(&p).unwrap();
+        assert!(e.image.is_none());
+        assert!(e.lines[0].contains("<svg"), "editing the source");
+        e.open(&p).unwrap();
+        assert!(
+            e.image.is_none(),
+            "the override survives a same-path reload (FS sync)"
+        );
+        // Reopen as Preview: clearing the override routes normally
+        // again (the command's dispatch does exactly this).
+        e.force_text = false;
+        e.open(&p).unwrap();
+        assert!(
+            e.image.is_some(),
+            "clearing the override restores the render"
+        );
+        // A DIFFERENT file drops the override: routing is per tab, not
+        // per session.
+        e.force_text = true;
+        e.open(&p).unwrap();
+        let q = tmp.path().join("other.svg");
+        std::fs::copy(&p, &q).unwrap();
+        e.open(&q).unwrap();
+        assert!(e.image.is_some(), "a path change resets force_text");
+    }
+
+    #[test]
+    fn broken_svg_falls_through_to_the_text_editor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("broken.svg");
+        std::fs::write(&p, "this is not xml").unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        assert!(e.image.is_none());
+        assert_eq!(e.lines, vec!["this is not xml".to_string()]);
     }
 
     #[test]
