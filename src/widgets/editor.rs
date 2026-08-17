@@ -2883,9 +2883,14 @@ impl Editor {
         }
         if crate::sheet::extension_is_sheet(ext) && self.csv_viewer_enabled {
             // Same fall-through for a workbook/CSV that does not parse
-            // as its extension claims (#174).
+            // as its extension claims (#174) — but ONLY for parse
+            // failures. A SIZE refusal ("too large") is a deliberate
+            // cap, and rerouting it into the text path would silently
+            // bypass the guard the cap exists to enforce (#188 review).
             match self.open_sheet(path) {
-                Err(e) if e.to_string().starts_with("Spreadsheet open failed") => {}
+                Err(e)
+                    if e.to_string().starts_with("Spreadsheet open failed")
+                        && !e.to_string().contains("too large") => {}
                 other => return other,
             }
         }
@@ -2922,9 +2927,13 @@ impl Editor {
             }
             // A zip container is an xlsx candidate (the only zip-backed
             // format croft renders today); a plain archive fails the
-            // parse and falls through.
+            // parse and falls through. Only the `.xlsx` extension is
+            // excluded — that exact route already ran and failed above;
+            // a workbook wearing `.csv` (or any other sheet extension)
+            // failed a DIFFERENT parser, so the xlsx retry is genuinely
+            // new information (#188 review).
             Some(crate::magic::Magic::Zip)
-                if !crate::sheet::extension_is_sheet(ext) && self.csv_viewer_enabled =>
+                if !ext.eq_ignore_ascii_case("xlsx") && self.csv_viewer_enabled =>
             {
                 if let Ok(view) =
                     crate::sheet::open_sheet_with_kind(path, crate::sheet::SheetKind::Xlsx)
@@ -11895,6 +11904,40 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         assert!(all.contains("hello") && all.contains("42"), "cells: {all}");
+    }
+
+    #[test]
+    fn oversized_csv_keeps_its_size_refusal_instead_of_silently_opening() {
+        // #188 review: the parse-failure fallthrough must not swallow
+        // the sheet viewer's SIZE refusal — pre-#174 an over-cap CSV
+        // errored loudly, and rerouting it into the text/binary path
+        // silently bypassed the cap.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.csv");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(26 * 1024 * 1024).unwrap(); // sparse: over the 25MB cap
+        drop(f);
+        let mut e = Editor::new();
+        let err = e.open(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("too large"),
+            "size refusal must surface: {err}"
+        );
+        assert!(e.sheet.is_none() && e.hex.is_none());
+    }
+
+    #[test]
+    fn workbook_misnamed_as_csv_still_reaches_the_sheet_viewer() {
+        // #188 review: a real xlsx wearing .csv fails the CSV parse and
+        // falls through; the zip retry guard must only skip the ONE
+        // route that already ran (.xlsx), not every sheet extension.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("data.csv");
+        write_minimal_xlsx(&p);
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        let sheet = e.sheet.as_ref().expect("zip content retried as xlsx");
+        assert_eq!(sheet.kind, crate::sheet::SheetKind::Xlsx);
     }
 
     #[test]
