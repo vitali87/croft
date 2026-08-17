@@ -23,6 +23,11 @@ use ratatui::{
 /// step needs (e.g. the base ref a new branch forks from).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputPurpose {
+    /// Find in a hex tab (#172): the typed value is hex byte pairs
+    /// ("de ad be ef") or, when it does not parse as hex, literal ASCII.
+    /// Submitting stores the query on the view and jumps to the first
+    /// match at or after the cursor; F3 repeats it.
+    HexFind,
     /// Save the current folder set as a VS Code-compatible workspace
     /// file (#163): the typed value is the destination path.
     SaveWorkspaceAs,

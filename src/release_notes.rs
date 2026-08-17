@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Editor tabs now tell same-named files apart: when two open tabs share a file name, each gains the shortest distinguishing directory (main.rs — alpha beside main.rs — beta, deeper only when parents collide too), in the tab strip and OPEN EDITORS alike; unique names stay as they were.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Binary files now open in a built-in hex viewer instead of failing with \"Binary file\": offsets, hex bytes, and an ASCII gutter, with cursor + selection, byte/text find (Cmd+F, F3 for next), mouse support, and windowed reads so even multi-gigabyte files open instantly. \"File: Reopen as Hex\" works on any file; \"File: Reopen as Text\" switches back.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Cmd+S on an image, PDF, or spreadsheet preview tab used to truncate the previewed file to zero bytes; saves on preview tabs are now refused at the write choke point and the file is left untouched.",
+    },
+];

@@ -326,6 +326,22 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 | Wheel down / up over the grid | Pan three rows |
 | `Tab` / `Shift+Tab` | Switch worksheet |
 
+**Hex viewer (any binary file; `File: Reopen as Hex` for the rest)**
+
+Binary files open here automatically instead of erroring; the file is read in windows, so any size opens instantly. `File: Reopen as Text` switches back when the content is text.
+
+| Keys | Action |
+|------|--------|
+| `←` / `→` | Previous / next byte (`Shift` extends the selection) |
+| `↑` / `↓` | One row up / down (`Shift` extends) |
+| `PageUp` / `PageDown` | One viewport up / down (`Shift` extends) |
+| `Home` / `End` | Start / end of the row; with `Cmd`/`Ctrl`: start / end of the file |
+| `Cmd+F` (`Ctrl+F`) | Find bytes: hex pairs (`de ad be ef`) or literal text |
+| `F3` | Find next match (wraps; selects the match) |
+| `Esc` | Clear the selection |
+| Click / drag (hex grid or ASCII gutter) | Park the cursor / select a byte range |
+| Wheel | Scroll three rows |
+
 ## Run & Debug
 
 Real breakpoint debugging over the Debug Adapter Protocol. Python is the verified adapter (debugpy, CPython 3.14+; croft provisions a private `~/.croft/debug-venv` with debugpy on first use, with no fallback to older interpreters). JavaScript / TypeScript run under Node via **vscode-js-debug** (the same engine VS Code, Zed and nvim use): croft auto-downloads the pinned `js-debug` server to `~/.croft/js-debug` on first use and talks to it over TCP, spawning the parent + child sessions js-debug requires; `node` must be on `PATH`, and TypeScript binds through source maps. Rust / C / C++ route to `lldb-dap` (binary built on launch; breakpoint binding additionally needs a permitted macOS `debugserver`). The lldb adapter is resolved from the Xcode Command Line Tools on macOS or from `PATH` elsewhere, matching the versioned names LLVM ships (`lldb-dap`, `lldb-dap-18`, legacy `lldb-vscode`); on Linux install it with the LLVM package (e.g. `apt install lldb`).

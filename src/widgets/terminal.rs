@@ -3046,6 +3046,20 @@ impl PtyTerminal {
         self.foreground_is_shell() || (!self.input_seen && self.marks.lock().unwrap().is_empty())
     }
 
+    /// Test-only: the RESOLVED foreground sample — `Some(fg == shell)`
+    /// when both sides are known, `None` otherwise. `foreground_is_shell`
+    /// folds policy fallbacks (the startup carve-out, the fail-closed
+    /// retry) into its answer, so a test precondition polling it can be
+    /// satisfied by a fallback and race the state it believes it proved
+    /// (#186); gate preconditions on `Some(..)` instead.
+    #[cfg(test)]
+    pub fn foreground_resolved_for_test(&self) -> Option<bool> {
+        match (self.master.process_group_leader(), self.shell_pid) {
+            (Some(fg), Some(pid)) => Some(fg == pid),
+            _ => None,
+        }
+    }
+
     /// True while the pane is exactly as croft created it: an interactive
     /// shell (never a `new_running` program pane, whose child is doing
     /// launched work with no input byte ever written) that has received

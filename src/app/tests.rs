@@ -7300,36 +7300,48 @@ fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
     std::fs::create_dir(&target_dir).unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
 
-    // Wait out shell startup first: while rc files run, a startup child can
-    // own the tty and `!foreground_is_shell` is true for the WRONG reason —
-    // the sleep below hasn't even executed, and the re-root races the shell
-    // reclaiming the tty at its first prompt (the #94 window, from the
-    // suppress side). A shell AT ITS PROMPT makes the later false reading
-    // unambiguous.
-    let mut waited = 0u32;
-    while waited < 4000 && !app.terminal_mut().foreground_is_shell() {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
-    assert!(
-        app.terminal_mut().foreground_is_shell(),
-        "precondition: the shell must reach its prompt before the test starts"
-    );
-    // Put the active terminal into a long-lived foreground command so its
-    // foreground process group is the command, not the shell.
+    // Put the active terminal into a long-lived foreground command.
     // 60s, not 10 (#169): under a loaded suite this test thread can be
     // descheduled >10s between the busy precondition and the re-root —
     // the sleep then exits and the shell GENUINELY reclaims the tty, so
     // the seed was correct and the assert wrong. Pane Drop kills the
     // shell tree, so nothing outlives the test.
-    app.terminal_mut().write_input(b"sleep 60\n");
+    //
+    // Proving the sleep is REALLY the foreground command needs more than
+    // pgrp samples (#186): rc-startup children also own the tty, so a
+    // resolved non-shell reading can be rc — the input above then sits as
+    // type-ahead and the re-root races the first prompt. The marker's
+    // OUTPUT is the proof: quote-split so the echoed command line cannot
+    // match, it can only be printed by the shell's MAIN loop executing
+    // the line — rc is done, and the very next resolved non-shell sample
+    // can only be the sleep.
+    app.terminal_mut()
+        .write_input(b"echo GO''-MARKER; sleep 60\n");
     let mut waited = 0u32;
-    while waited < 4000 && app.terminal_mut().foreground_is_shell() {
+    loop {
+        let (lines, _) = app.terminal_mut().grid_lines();
+        if lines
+            .iter()
+            .any(|l| l.contains("GO-MARKER") && !l.contains("echo"))
+        {
+            break;
+        }
+        assert!(waited < 8000, "marker output never arrived");
         std::thread::sleep(std::time::Duration::from_millis(20));
         waited += 20;
     }
-    assert!(
-        !app.terminal_mut().foreground_is_shell(),
+    // `Some(false)` is a kernel-confirmed foreign foreground group, and
+    // with rc ruled out above it can only be the sleep. The fail-closed
+    // retry inside `foreground_is_shell` can answer false on an
+    // UNRESOLVED sample, so poll the strict accessor, not the policy one.
+    let mut waited = 0u32;
+    while waited < 4000 && app.terminal_mut().foreground_resolved_for_test() != Some(false) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    assert_eq!(
+        app.terminal_mut().foreground_resolved_for_test(),
+        Some(false),
         "precondition: the terminal must be running a foreground command"
     );
 
