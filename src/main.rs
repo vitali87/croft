@@ -11,6 +11,7 @@ mod ghostty;
 mod git;
 mod gradient;
 mod gui_path;
+mod hex;
 mod highlight;
 mod history;
 mod icons;

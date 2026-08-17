@@ -162,6 +162,146 @@ fn render_image_placeholder(
     );
 }
 
+/// Paint a hex tab (#172): header row, `offset  hex  |ascii|` body rows,
+/// and a status row with the cursor offset. Mutates the view: the window
+/// is refilled around the viewport, and the chosen bytes-per-row plus the
+/// frame's layout are written back for navigation and mouse hit-testing
+/// (frame truth, the `last_wrap_rows` pattern).
+fn render_hex(
+    view: &mut crate::hex::HexView,
+    path: Option<&Path>,
+    inner: Rect,
+    buf: &mut Buffer,
+    bg: Color,
+    theme: crate::theme::Theme,
+) {
+    let bg_style = Style::default().bg(bg);
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            buf[(x, y)].set_style(bg_style);
+            buf[(x, y)].set_symbol(" ");
+        }
+    }
+    // Zero-size guard AFTER the layout reset below would leave stale hit
+    // rects; clear them first (the #103 frame-truth invariant).
+    view.layout = crate::hex::HexLayout::default();
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let offw = view.offset_digits() as u16;
+    // Narrowest workable layout: lead + offset + gap + 8 hex cells
+    // (3/byte minus the trailing space) + gap + 8 ascii cells. Below it
+    // the per-cell clip would paint offsets with no bytes — a half-drawn
+    // grid — so a too-narrow split shows a deliberate empty state (the
+    // clamped header only) instead.
+    let need8 = 1 + offw + 2 + (8 * 3 - 1) + 2 + 8;
+    let name = path
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("(unnamed)"));
+    let header = format!(" {} · HEX · {} bytes ", name, view.file_len);
+    buf.set_stringn(
+        inner.x,
+        inner.y,
+        &header,
+        inner.width as usize,
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(0x09, 0x4d, 0x77))
+            .add_modifier(Modifier::BOLD),
+    );
+    if inner.height < 3 || inner.width < need8 {
+        return;
+    }
+
+    // lead + offset + gap + hex cells (3/byte minus the trailing space)
+    // + mid-group gap + gap + ascii gutter
+    let need16 = 1 + offw + 2 + (16 * 3 - 1) + 1 + 2 + 16;
+    let bpr: u64 = if inner.width >= need16 { 16 } else { 8 };
+    view.bytes_per_row = bpr;
+
+    let data_top = inner.y + 1;
+    let data_rows = inner.height - 2; // header + status row
+    // Clamp the scroll to the new geometry and make the span resident
+    // (a delta of zero only clamps + refills).
+    view.scroll_by(0, data_rows as usize);
+
+    let hex_x = inner.x + 1 + offw + 2;
+    let mid_gap: u16 = if bpr == 16 { 1 } else { 0 };
+    let ascii_x = hex_x + (bpr as u16) * 3 - 1 + mid_gap + 2;
+    view.layout = crate::hex::HexLayout {
+        data_top,
+        data_rows,
+        hex_x,
+        ascii_x,
+    };
+
+    let sel = view.selection();
+    let dim = Style::default().fg(Color::DarkGray).bg(bg);
+    for r in 0..data_rows {
+        let row = view.top_row + r as u64;
+        if row >= view.total_rows() {
+            break;
+        }
+        let y = data_top + r;
+        let base = row * bpr;
+        buf.set_string(
+            inner.x + 1,
+            y,
+            format!("{base:0w$X}", w = offw as usize),
+            dim,
+        );
+        for i in 0..bpr {
+            let off = base + i;
+            if off >= view.file_len {
+                break;
+            }
+            let x = hex_x + (i as u16) * 3 + if i >= 8 { mid_gap } else { 0 };
+            let ax = ascii_x + i as u16;
+            if ax >= inner.x + inner.width || x + 1 >= inner.x + inner.width {
+                break;
+            }
+            let (hex_s, ascii_ch, byte_dim) = match view.byte(off) {
+                Some(v) => (
+                    format!("{v:02X}"),
+                    if (0x20..0x7f).contains(&v) {
+                        (v as char).to_string()
+                    } else {
+                        String::from("·")
+                    },
+                    v == 0,
+                ),
+                // Not resident (an IO error mid-scroll): an honest blank,
+                // never a stale byte.
+                None => (String::from("··"), String::from("·"), true),
+            };
+            let selected = sel.map(|(a, b)| off >= a && off < b).unwrap_or(false);
+            let is_cursor = off == view.cursor;
+            let style = if is_cursor {
+                Style::default().fg(Color::Black).bg(theme.accent())
+            } else if selected {
+                Style::default().fg(Color::White).bg(theme.selection())
+            } else if byte_dim {
+                dim
+            } else {
+                Style::default().fg(Color::Gray).bg(bg)
+            };
+            buf.set_string(x, y, &hex_s, style);
+            buf.set_string(ax, y, &ascii_ch, style);
+        }
+    }
+    let status = format!(" {} ", view.status_line());
+    buf.set_stringn(
+        inner.x,
+        inner.y + inner.height - 1,
+        &status,
+        inner.width as usize,
+        Style::default()
+            .fg(Color::Gray)
+            .bg(Color::Rgb(0x07, 0x33, 0x55)),
+    );
+}
+
 fn render_sheet(
     view: &crate::sheet::SheetView,
     path: Option<&Path>,
@@ -1749,6 +1889,11 @@ pub struct Editor {
     /// path, `image`, and `sheet` — when set the renderer paints two
     /// columns based on `diff.rows` and ignores `lines`.
     pub diff: Option<crate::widgets::diff::DiffData>,
+    /// Read-only hex viewer (#172): the routing fallback for every file
+    /// the text heuristic rejects, and the explicit "Reopen as Hex"
+    /// target. Mutually exclusive with the text path and the other
+    /// preview kinds; windowed IO, so the file is never loaded whole.
+    pub hex: Option<crate::hex::HexView>,
     /// Hit-test rect for the "previous change" arrow painted in the diff
     /// header. Empty when the tab isn't a diff or the header was clipped.
     /// `App` consults this on left-click to jump to the previous hunk.
@@ -1881,6 +2026,7 @@ impl Editor {
             pdf_restore_page: None,
             sheet: None,
             diff: None,
+            hex: None,
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
             disk_stamp: None,
@@ -2734,6 +2880,15 @@ impl Editor {
         }
         let meta = std::fs::metadata(path)?;
         if meta.len() > MAX_FILE_BYTES {
+            // Sniff only the head: the hex viewer reads windows on
+            // demand and never loads the file whole, so an over-limit
+            // BINARY file opens fine (#172). Only text — which the
+            // editor genuinely must hold in memory — keeps the guard.
+            let head = read_file_head(path)?;
+            let head_bom_text = encoding_rs::Encoding::for_bom(&head).is_some();
+            if !head_bom_text && is_binary(&head) {
+                return self.open_hex(path);
+            }
             anyhow::bail!("File too large ({} bytes)", meta.len());
         }
         let bytes = std::fs::read(path)?;
@@ -2748,7 +2903,9 @@ impl Editor {
         // settles the question the heuristic is only guessing at.
         let bom_declares_text = enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE;
         if !bom_declares_text && is_binary(&bytes) {
-            anyhow::bail!("Binary file");
+            // Never a dead-end: binary files open in the hex viewer
+            // instead of failing with "Binary file" (#172).
+            return self.open_hex(path);
         }
         let changed_file = self.path.as_deref() != Some(path);
         // `open` is also the same-path reload behind the FS-sync sweep and
@@ -2828,6 +2985,7 @@ impl Editor {
         self.image = None;
         self.sheet = None;
         self.markdown_preview = None;
+        self.hex = None;
         // A real file supersedes any diff view this editor was showing —
         // without this a restore-then-reload keeps rendering the stale diff.
         self.diff = None;
@@ -2905,7 +3063,17 @@ impl Editor {
             generation: next_image_generation(),
             pdf: None,
         });
+        // A diff view is superseded like every other kind: `open`'s text
+        // tail clears it, but the preview openers return before reaching
+        // that tail, and the render's arrow-rect clearing sits after the
+        // preview arms' early returns — so a diff tab reopened as a
+        // preview kept its label, caret, and CLICKABLE hunk arrows
+        // (#187 review). Clear the state and the frame-truth rects here.
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
         self.sheet = None;
+        self.hex = None;
         self.status = format!("Opened image {}", path.display());
         Ok(())
     }
@@ -2934,7 +3102,17 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
+        // A diff view is superseded like every other kind: `open`'s text
+        // tail clears it, but the preview openers return before reaching
+        // that tail, and the render's arrow-rect clearing sits after the
+        // preview arms' early returns — so a diff tab reopened as a
+        // preview kept its label, caret, and CLICKABLE hunk arrows
+        // (#187 review). Clear the state and the frame-truth rects here.
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
         self.image = None;
+        self.hex = None;
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
         Ok(())
@@ -2996,8 +3174,85 @@ impl Editor {
                 links: None,
             }),
         });
+        // A diff view is superseded like every other kind: `open`'s text
+        // tail clears it, but the preview openers return before reaching
+        // that tail, and the render's arrow-rect clearing sits after the
+        // preview arms' early returns — so a diff tab reopened as a
+        // preview kept its label, caret, and CLICKABLE hunk arrows
+        // (#187 review). Clear the state and the frame-truth rects here.
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
         self.sheet = None;
+        self.hex = None;
         self.status = format!("Opened PDF {}", path.display());
+        Ok(())
+    }
+
+    /// True when this tab shows any non-text view: a diff, sheet,
+    /// image/PDF, or hex tab. Text-only affordances (save, LSP sync,
+    /// vim, merge commands, encoding, markdown preview) refuse on it.
+    /// Every preview kind the format epic (#184) adds joins HERE, so the
+    /// twenty-odd guard sites never enumerate kinds again.
+    pub fn has_non_text_view(&self) -> bool {
+        self.diff.is_some() || self.sheet.is_some() || self.image.is_some() || self.hex.is_some()
+    }
+
+    /// Open `path` in the read-only hex viewer (#172): the routing
+    /// fallback for files the text heuristic rejects, and the target of
+    /// the explicit "Reopen as Hex" command. `pub` for that command's
+    /// dispatch; extension routing never needs to call it directly.
+    pub fn open_hex(&mut self, path: &Path) -> Result<()> {
+        // `open` is also the same-path reload behind the FS-sync sweep:
+        // refresh the existing view in place so the reader keeps their
+        // offset through an external rewrite (the PDF restore-page
+        // precedent, without the second-render window).
+        if self.path.as_deref() == Some(path)
+            && let Some(view) = self.hex.as_mut()
+        {
+            view.refresh_from_disk(path)
+                .map_err(|e| anyhow::anyhow!("Hex reload failed: {e}"))?;
+            self.disk_stamp = Self::disk_stamp_of(path);
+            self.disk_conflict = false;
+            return Ok(());
+        }
+        let view =
+            crate::hex::HexView::open(path).map_err(|e| anyhow::anyhow!("Hex open failed: {e}"))?;
+        self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
+        // A whole-buffer swap: whatever the previous contents could not be
+        // encoded as is no longer this tab's problem.
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
+        self.lines = vec![String::new()];
+        // A whole-buffer swap like every other opener: caches memoised on
+        // edit_seq (conflicts, git marks) must not survive into this tab.
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.lang = None;
+        self.scroll = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty = false;
+        self.selection = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit_kind = None;
+        self.highlights = vec![Vec::new()];
+        // A diff view is superseded like every other kind: `open`'s text
+        // tail clears it, but the preview openers return before reaching
+        // that tail, and the render's arrow-rect clearing sits after the
+        // preview arms' early returns — so a diff tab reopened as a
+        // preview kept its label, caret, and CLICKABLE hunk arrows
+        // (#187 review). Clear the state and the frame-truth rects here.
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
+        self.image = None;
+        self.sheet = None;
+        self.markdown_preview = None;
+        self.hex = Some(view);
+        self.status = format!("Opened {} in the hex viewer", path.display());
         Ok(())
     }
 
@@ -5030,6 +5285,14 @@ impl Editor {
     }
 
     fn write_buffer_to_disk(&mut self) -> Result<SaveOutcome> {
+        // Preview tabs (image/PDF, sheet, diff, hex) hold the whole-
+        // buffer-swap PLACEHOLDER in `lines`, not the file's content:
+        // serialising it truncated the previewed file to nothing (#185).
+        // Guarded here — the declared single choke point — so no save
+        // path (explicit, force, auto, format-on-save) can route around.
+        if self.has_non_text_view() {
+            anyhow::bail!("This tab is a read-only preview; nothing to save");
+        }
         let path = self
             .path
             .as_ref()
@@ -7471,6 +7734,25 @@ fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Optio
     )
 }
 
+/// First 4 KiB of a file (or all of it when shorter): the sample both the
+/// BOM sniff and [`is_binary`] need, read without loading the whole file
+/// so the over-limit routing in `open` stays O(1) in file size.
+fn read_file_head(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut head = vec![0u8; 4096];
+    let mut f = std::fs::File::open(path)?;
+    let mut filled = 0;
+    while filled < head.len() {
+        let n = f.read(&mut head[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    head.truncate(filled);
+    Ok(head)
+}
+
 fn is_binary(data: &[u8]) -> bool {
     let sample = &data[..data.len().min(4096)];
     if sample.contains(&0) {
@@ -7724,6 +8006,10 @@ impl Widget for &mut Editor {
         }
         if let Some(view) = self.sheet.as_ref() {
             render_sheet(view, self.path.as_deref(), inner, buf, cbg);
+            return;
+        }
+        if let Some(view) = self.hex.as_mut() {
+            render_hex(view, self.path.as_deref(), inner, buf, cbg, self.theme);
             return;
         }
         if self.markdown_preview.is_some() {
@@ -11260,10 +11546,310 @@ mod tests {
     }
 
     #[test]
+    fn save_on_a_preview_tab_never_touches_the_file() {
+        // #185: the save choke point used to serialise the placeholder
+        // text buffer over the previewed file, truncating a PNG to zero
+        // bytes. Every preview kind must refuse at the choke point so no
+        // caller (explicit save, force save, auto save, format-on-save)
+        // can route around the guard.
+        let tmp = tempfile::tempdir().unwrap();
+
+        let png = tmp.path().join("pic.png");
+        image::RgbaImage::new(2, 2).save(&png).unwrap();
+        let png_bytes = std::fs::read(&png).unwrap();
+        let mut e = Editor::new();
+        e.open(&png).unwrap();
+        assert!(e.image.is_some());
+        assert!(e.save_to_disk().is_err(), "image tab save must refuse");
+        assert!(e.save_to_disk_force().is_err(), "force save too");
+        assert_eq!(std::fs::read(&png).unwrap(), png_bytes, "file intact");
+
+        let bin = tmp.path().join("blob.bin");
+        std::fs::write(&bin, b"\x00\x01\x02\x03").unwrap();
+        let mut e = Editor::new();
+        e.open(&bin).unwrap();
+        assert!(e.hex.is_some());
+        assert!(e.save_to_disk().is_err(), "hex tab save must refuse");
+        assert_eq!(std::fs::read(&bin).unwrap(), b"\x00\x01\x02\x03");
+
+        let csv = tmp.path().join("t.csv");
+        std::fs::write(&csv, "a,b\n1,2\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&csv).unwrap();
+        assert!(e.sheet.is_some());
+        assert!(e.save_to_disk().is_err(), "sheet tab save must refuse");
+        assert_eq!(std::fs::read(&csv).unwrap(), b"a,b\n1,2\n");
+    }
+    #[test]
     fn is_binary_detects_nul() {
         assert!(is_binary(b"hello\0world"));
         assert!(!is_binary(b"hello world"));
         assert!(!is_binary(b""));
+    }
+
+    #[test]
+    fn binary_file_opens_in_the_hex_viewer_instead_of_erroring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blob.bin");
+        std::fs::write(&p, b"\x00\x01\x02payload\xff\xfe").unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        assert!(e.hex.is_some(), "binary files land in the hex viewer");
+        assert_eq!(
+            e.lines,
+            vec![String::new()],
+            "the whole-buffer-swap convention: one empty line, like image/sheet tabs"
+        );
+        assert_eq!(e.path.as_deref(), Some(p.as_path()));
+        assert!(!e.dirty, "hex tabs are read-only");
+    }
+
+    #[test]
+    fn oversized_binary_opens_in_hex_but_oversized_text_still_errors() {
+        // Only the head is sniffed, so the hex route must not read the
+        // whole file — an over-limit BINARY opens fine (windowed IO),
+        // while an over-limit TEXT file keeps the too-large error (the
+        // text editor genuinely would have to load it whole).
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("huge.bin");
+        let f = std::fs::File::create(&bin).unwrap();
+        f.set_len(MAX_FILE_BYTES + 5).unwrap(); // sparse: leading NULs = binary
+        drop(f);
+        let mut e = Editor::new();
+        e.open(&bin).unwrap();
+        assert!(e.hex.is_some(), "an over-limit binary opens in hex");
+
+        let txt = tmp.path().join("huge.log");
+        let f = std::fs::File::create(&txt).unwrap();
+        use std::io::Write as _;
+        let mut w = std::io::BufWriter::new(f);
+        w.write_all(&vec![b'a'; 8192]).unwrap();
+        drop(w);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&txt)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 5)
+            .unwrap();
+        let mut e2 = Editor::new();
+        let err = e2.open(&txt).unwrap_err().to_string();
+        assert!(
+            err.contains("too large"),
+            "text keeps the size guard: {err}"
+        );
+    }
+
+    #[test]
+    fn hex_tab_renders_offsets_hex_bytes_ascii_and_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blob.bin");
+        let mut data = b"MZ\x90\x00".to_vec();
+        data.extend_from_slice(b"Hello!\x00\xde\xad\xbe\xef");
+        std::fs::write(&p, &data).unwrap();
+        let mut ed = Editor::new();
+        ed.open(&p).unwrap();
+        assert!(ed.hex.is_some());
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 92,
+            height: 12,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+        let mut rows = Vec::new();
+        for y in 0..area.height {
+            let mut line = String::new();
+            for x in 0..area.width {
+                line.push_str(buf[(x, y)].symbol());
+            }
+            rows.push(line);
+        }
+        let all = rows.join("\n");
+        assert!(all.contains("blob.bin"), "header names the file: {all}");
+        assert!(all.contains("00000000"), "offset column paints: {all}");
+        assert!(
+            all.contains("4D 5A 90 00"),
+            "hex bytes paint uppercase: {all}"
+        );
+        assert!(
+            all.contains("MZ·"),
+            "ascii gutter: printables verbatim, non-printables as ·: {all}"
+        );
+        assert!(
+            all.contains("0x00000000"),
+            "status row shows the cursor offset: {all}"
+        );
+        let view = ed.hex.as_ref().unwrap();
+        assert_eq!(view.bytes_per_row, 16, "a 92-col pane fits 16 bytes/row");
+        assert!(
+            view.layout.data_rows > 0,
+            "layout written back for mouse hit-testing"
+        );
+    }
+
+    #[test]
+    fn hex_mouse_hit_test_round_trips_through_the_painted_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blob.bin");
+        // 60 bytes: the last 16-byte row is PARTIAL, so its tail cells
+        // genuinely sit past EOF.
+        std::fs::write(&p, (0u8..60).collect::<Vec<_>>()).unwrap();
+        let mut ed = Editor::new();
+        ed.open(&p).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 92,
+            height: 12,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+        let view = ed.hex.as_ref().unwrap();
+        let l = view.layout;
+        // Row 1 (second data row), byte 3: base 16 + 3 = 19.
+        let y = l.data_top + 1;
+        assert_eq!(view.hit_test(l.hex_x + 3 * 3, y), Some(19), "hex cell");
+        assert_eq!(view.hit_test(l.ascii_x + 3, y), Some(19), "ascii cell");
+        // Byte 10 sits past the 8-byte group gap in the hex grid.
+        assert_eq!(
+            view.hit_test(l.hex_x + 10 * 3 + 1, y),
+            Some(26),
+            "post-gap hex cell accounts for the group divider"
+        );
+        // Cells past EOF, the offset gutter, and the header all miss.
+        let last_row_y = l.data_top + 3;
+        assert_eq!(
+            view.hit_test(l.ascii_x + 15, last_row_y),
+            None,
+            "past EOF misses"
+        );
+        assert_eq!(view.hit_test(area.x + 1, y), None, "offset gutter misses");
+        assert_eq!(
+            view.hit_test(l.hex_x, l.data_top - 1),
+            None,
+            "header misses"
+        );
+    }
+
+    #[test]
+    fn preview_openers_supersede_a_diff_view_and_its_arrow_rects() {
+        // #187 review: only `open`'s TEXT tail cleared `diff`, and the
+        // preview arms return before the render's arrow-rect clearing —
+        // a diff tab reopened as a preview kept its "left ↔ right"
+        // label, its caret, and clickable hunk arrows.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("blob.bin");
+        std::fs::write(&bin, b"\x00\x01\x02").unwrap();
+        let mut e = Editor::new();
+        e.diff = Some(crate::widgets::diff::DiffData::build(
+            std::path::PathBuf::from("left.txt"),
+            std::path::PathBuf::from("right.txt"),
+            vec![String::from("a")],
+            vec![String::from("b")],
+        ));
+        e.diff_prev_arrow = Rect {
+            x: 1,
+            y: 1,
+            width: 3,
+            height: 1,
+        };
+        e.diff_next_arrow = e.diff_prev_arrow;
+        e.open(&bin).unwrap();
+        assert!(e.hex.is_some());
+        assert!(e.diff.is_none(), "the diff view is superseded");
+        assert_eq!(e.diff_prev_arrow, Rect::default(), "stale hit rect cleared");
+        assert_eq!(e.diff_next_arrow, Rect::default());
+
+        let png = tmp.path().join("pic.png");
+        image::RgbaImage::new(2, 2).save(&png).unwrap();
+        let mut e = Editor::new();
+        e.diff = Some(crate::widgets::diff::DiffData::build(
+            std::path::PathBuf::from("left.txt"),
+            std::path::PathBuf::from("right.txt"),
+            vec![String::from("a")],
+            vec![String::from("b")],
+        ));
+        e.open(&png).unwrap();
+        assert!(e.image.is_some());
+        assert!(e.diff.is_none(), "image opener supersedes the diff too");
+    }
+
+    #[test]
+    fn hex_render_narrower_than_the_8_byte_layout_paints_no_half_grid() {
+        // #187 review: between the old 24-col floor and the 8-byte
+        // layout's real need, the per-cell clip painted offsets with no
+        // bytes. The empty state is the clamped header alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blob.bin");
+        std::fs::write(&p, vec![0u8; 64]).unwrap();
+        let mut ed = Editor::new();
+        ed.open(&p).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 34, // inner 32: >= 24, < the 44 the 8-byte layout needs
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+        let mut all = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                all.push_str(buf[(x, y)].symbol());
+            }
+            all.push('\n');
+        }
+        assert!(all.contains("HEX"), "header still names the tab: {all}");
+        assert!(
+            !all.contains("00000000"),
+            "no offset column without bytes to go with it: {all}"
+        );
+        assert!(!all.contains("00 "), "no lone byte cells: {all}");
+        let view = ed.hex.as_ref().unwrap();
+        assert_eq!(
+            view.layout.data_rows, 0,
+            "empty state publishes no hit-test rows"
+        );
+    }
+
+    #[test]
+    fn hex_render_drops_to_8_bytes_per_row_in_a_narrow_pane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blob.bin");
+        std::fs::write(&p, vec![0x00u8; 64]).unwrap();
+        let mut ed = Editor::new();
+        ed.open(&p).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+        assert_eq!(ed.hex.as_ref().unwrap().bytes_per_row, 8);
+    }
+
+    #[test]
+    fn hex_view_swaps_away_cleanly_when_a_text_file_reopens() {
+        // The same tab object is reused across opens (the sheet/image
+        // precedent): a hex tab navigated away to a text file must drop
+        // the hex state, and vice versa.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("blob.bin");
+        std::fs::write(&bin, b"\x00\x01\x02").unwrap();
+        let txt = tmp.path().join("notes.txt");
+        std::fs::write(&txt, "hello\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&bin).unwrap();
+        assert!(e.hex.is_some());
+        e.open(&txt).unwrap();
+        assert!(e.hex.is_none(), "text reopen drops the hex state");
+        assert_eq!(e.lines, vec!["hello".to_string()]);
+        e.open(&bin).unwrap();
+        assert!(e.hex.is_some(), "and back again");
+        assert_eq!(e.lines, vec![String::new()]);
     }
 
     fn diag(
@@ -14142,12 +14728,17 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_binary_files() {
+    fn open_routes_binary_files_to_hex_not_text() {
+        // The pre-#172 contract was a "Binary file" ERROR; the new one is
+        // that binary content never lands in the text path — it routes to
+        // the hex viewer, and no text state is populated.
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(b"\x00\x01\x02binary garbage").unwrap();
         let mut e = Editor::new();
-        let err = e.open(tmp.path()).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("binary"));
+        e.open(tmp.path()).unwrap();
+        assert!(e.hex.is_some(), "binary routes to hex");
+        assert!(!e.dirty);
+        assert_eq!(e.lines, vec![String::new()], "text path untouched");
     }
 
     #[test]

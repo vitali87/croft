@@ -5737,7 +5737,7 @@ impl App {
         // `crate::lsp::semantic_cache`.
         let mut cache_hits: Vec<(PathBuf, std::sync::Arc<Vec<String>>, Vec<u32>)> = Vec::new();
         for tab in self.editor.iter_tabs() {
-            if tab.image.is_some() || tab.sheet.is_some() || tab.diff.is_some() {
+            if tab.has_non_text_view() {
                 continue;
             }
             let Some(path) = tab.path.as_ref() else {
@@ -6158,8 +6158,7 @@ impl App {
     }
 
     pub fn trigger_completion(&mut self) {
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return;
         }
         let Some(path) = self.editor.path.clone() else {
@@ -6176,8 +6175,7 @@ impl App {
 
     /// Ask the server for parameter hints at the caret (typing `(` or `,`).
     pub fn trigger_signature_help(&mut self) {
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return;
         }
         let Some(path) = self.editor.path.clone() else {
@@ -6550,8 +6548,7 @@ impl App {
         if self.completion_popup.is_some() {
             return;
         }
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return;
         }
         let Some((col, row)) = self.hover.cell() else {
@@ -7131,8 +7128,7 @@ impl App {
         let Some(path) = self.editor.path.as_deref() else {
             return Vec::new();
         };
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return Vec::new();
         }
         let mut crumbs = Vec::new();
@@ -7176,8 +7172,7 @@ impl App {
         let Some(path) = self.editor.path.as_deref() else {
             return Vec::new();
         };
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return Vec::new();
         }
         if self.outline.path() != Some(path) {
@@ -8567,8 +8562,7 @@ impl App {
     }
 
     fn trigger_definition_at(&mut self, col: u16, row: u16) {
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return;
         }
         let Some((line, c)) = self.editor.buffer_pos_at(col, row) else {
@@ -8796,8 +8790,7 @@ impl App {
     /// match of the word under the cursor in the current file as multi-cursor
     /// carets so the next keystrokes edit them all at once.
     fn start_change_all_occurrences(&mut self) {
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return;
         }
         let n = self.editor.select_all_occurrences_of_word_at_cursor();
@@ -8811,8 +8804,7 @@ impl App {
     /// VS Code "Add Selection to Next Find Match" (`Cmd+D`): select the word
     /// under the cursor, then grow the multi-cursor one occurrence per press.
     fn start_select_next_occurrence(&mut self) {
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return;
         }
         let n = self.editor.select_next_occurrence();
@@ -8828,8 +8820,7 @@ impl App {
     /// clipboard. Replaces the old `Cmd+d d` convenience, whose leader now
     /// belongs to Add Selection to Next Match.
     fn delete_current_line(&mut self) {
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return;
         }
         let yanked = self.editor.delete_caret_lines();
@@ -8843,8 +8834,7 @@ impl App {
     /// VS Code "Rename Symbol" (F2): prompt for a new name pre-filled with the
     /// identifier under the cursor; committing fires an LSP `rename` request.
     fn start_rename_symbol(&mut self) {
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return;
         }
         let Some(path) = self.editor.path.clone() else {
@@ -8943,8 +8933,7 @@ impl App {
     /// reformat the active buffer. No-op on read-only diff / sheet / image
     /// tabs. The reply is applied in [`drain_lsp_format`].
     fn start_format_document(&mut self) {
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return;
         }
         let Some(path) = self.editor.path.clone() else {
@@ -9156,8 +9145,7 @@ impl App {
     }
 
     fn start_code_action(&mut self) {
-        if self.editor.diff.is_some() || self.editor.sheet.is_some() || self.editor.image.is_some()
-        {
+        if self.editor.has_non_text_view() {
             return;
         }
         // A merge conflict at the cursor takes the Quick Fix over LSP code
@@ -15975,6 +15963,20 @@ impl App {
         self.refresh_debug_panel();
     }
 
+    /// Cmd+F on a hex tab (#172): a single-line input popup, per croft's
+    /// inputs-in-popups rule. Hex byte pairs or literal ASCII.
+    fn open_hex_find_prompt(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        if self.editor.hex.is_none() {
+            return;
+        }
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::HexFind,
+            "Find in Hex",
+            "hex bytes (de ad be ef) or text",
+        ));
+    }
+
     /// The "+ Add Expression" affordance (panel row or palette): a single-line
     /// input popup, per croft's inputs-in-popups rule.
     fn open_add_watch_prompt(&mut self) {
@@ -17380,6 +17382,25 @@ impl App {
                 self.close_input_prompt();
                 self.add_watch_expression(value);
             }
+            InputPurpose::HexFind => {
+                self.close_input_prompt();
+                match crate::hex::HexView::parse_find_query(&value) {
+                    Some(needle) => {
+                        let from = match self.editor.hex.as_mut() {
+                            Some(view) => {
+                                view.last_find = Some(needle);
+                                // The submit searches from the cursor
+                                // INCLUSIVE so a match under it is
+                                // found; F3 then steps past it.
+                                view.cursor
+                            }
+                            None => return,
+                        };
+                        self.hex_find_run(from);
+                    }
+                    None => self.status = String::from("Hex find: empty query"),
+                }
+            }
             InputPurpose::SaveWorkspaceAs => {
                 self.close_input_prompt();
                 let dest = PathBuf::from(value.trim());
@@ -18423,7 +18444,7 @@ impl App {
             let mut files: Vec<String> = Vec::new();
             let mut collect = |editors: &[crate::widgets::editor::Editor]| {
                 for ed in editors {
-                    if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+                    if ed.has_non_text_view() {
                         continue;
                     }
                     if let Some(file) = ed.path.as_ref().and_then(|p| collab_file_key(&root, p)) {
@@ -18453,7 +18474,7 @@ impl App {
         // and revert every peer; the attach pass below seeds it instead.
         let mut extract = |editors: &mut [crate::widgets::editor::Editor]| {
             for ed in editors.iter_mut() {
-                if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+                if ed.has_non_text_view() {
                     continue;
                 }
                 let Some(file) = ed.path.as_ref().and_then(|p| collab_file_key(&root, p)) else {
@@ -18570,7 +18591,7 @@ impl App {
             for ed in editors.iter_mut() {
                 // Diff/image/sheet tabs can carry a shared file's path, but
                 // their `lines` are not documents: never seed or mark them.
-                if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+                if ed.has_non_text_view() {
                     continue;
                 }
                 let Some(file) = ed.path.as_ref().and_then(|p| collab_file_key(&root, p)) else {
@@ -18704,11 +18725,7 @@ impl App {
     /// by construction and would revert siblings still holding session
     /// text.
     fn mirror_offline_siblings(&mut self) -> bool {
-        if self.editor.collab_doc_gen == 0
-            || self.editor.diff.is_some()
-            || self.editor.image.is_some()
-            || self.editor.sheet.is_some()
-        {
+        if self.editor.collab_doc_gen == 0 || self.editor.has_non_text_view() {
             return false;
         }
         let Some(path) = self.editor.path.clone() else {
@@ -18720,7 +18737,7 @@ impl App {
         let lines = self.editor.lines.clone();
         let mut changed = false;
         let mut mirror = |ed: &mut crate::widgets::editor::Editor| {
-            if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+            if ed.has_non_text_view() {
                 return;
             }
             if ed.path.as_deref() != Some(path.as_path()) || ed.lines == lines {
@@ -18801,7 +18818,7 @@ impl App {
         // updates while the spans spliced into a buffer that is not a
         // document.
         let apply = |ed: &mut crate::widgets::editor::Editor| {
-            if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+            if ed.has_non_text_view() {
                 return;
             }
             if ed.collab_doc_gen == 0 {
@@ -18855,7 +18872,7 @@ impl App {
         let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
         let mut kept = None;
         let mut finish = |ed: &mut crate::widgets::editor::Editor| {
-            if ed.diff.is_some() || ed.image.is_some() || ed.sheet.is_some() {
+            if ed.has_non_text_view() {
                 return;
             }
             if ed.collab_doc_gen != 0 && ed.lines != lines {
@@ -19837,7 +19854,7 @@ impl App {
         for (idx, ed) in self.editor.editors.iter().enumerate() {
             // Only plain text file tabs survive a re-exec; diff / sheet /
             // image tabs are derived views with no path to reopen from.
-            if ed.diff.is_some() || ed.sheet.is_some() || ed.image.is_some() {
+            if ed.has_non_text_view() {
                 continue;
             }
             let Some(path) = ed.path.clone() else {
@@ -20285,10 +20302,7 @@ impl App {
     /// read-only diff / spreadsheet / image preview), so text-editing chords
     /// know whether to act.
     fn editor_is_text(&self) -> bool {
-        self.editor.diff.is_none()
-            && self.editor.sheet.is_none()
-            && self.editor.image.is_none()
-            && self.editor.markdown_preview.is_none()
+        !self.editor.has_non_text_view() && self.editor.markdown_preview.is_none()
     }
 
     /// Markdown: Toggle Preview — flips the active tab between source and the
@@ -20687,6 +20701,10 @@ impl App {
         }
         if self.editor.sheet.is_some() {
             self.handle_sheet_key(key);
+            return;
+        }
+        if self.editor.hex.is_some() {
+            self.handle_hex_key(key);
             return;
         }
         // Image preview tabs are read-only. PDF tabs page with every
@@ -24661,6 +24679,37 @@ impl App {
                     self.status = String::from("Open a .code-workspace file in the editor first");
                 }
             },
+            Cmd::ReopenAsHex => match self.editor.path.clone() {
+                // A dirty buffer's edits exist only in memory; the hex
+                // view reads DISK, so switching would silently show (and
+                // strand) stale bytes.
+                Some(_) if self.editor.dirty => {
+                    self.status = String::from("Save or revert the buffer before reopening as hex");
+                }
+                Some(p) => {
+                    if let Err(e) = self.editor.open_hex(&p) {
+                        self.status = format!("Reopen as hex: {e}");
+                    }
+                }
+                None => self.status = String::from("No file in the active tab"),
+            },
+            Cmd::ReopenAsText => match self.editor.path.clone() {
+                Some(_) if self.editor.hex.is_none() => {
+                    self.status = String::from("The active tab is not a hex view");
+                }
+                Some(p) => match self.editor.open(&p) {
+                    // `open` re-runs the normal routing: a file that
+                    // fails the text heuristic comes straight back here.
+                    Ok(()) if self.editor.hex.is_some() => {
+                        self.status =
+                            String::from("Still binary by content - staying in the hex view");
+                    }
+                    Ok(()) => {}
+                    Err(e) => self.status = format!("Reopen as text: {e}"),
+                },
+                None => self.status = String::from("No file in the active tab"),
+            },
+            Cmd::HexFindNext => self.hex_find_next(),
             Cmd::RemoveWorkspaceFolder => {
                 // Operates on the Explorer's selected row when it is a
                 // SECONDARY root section; anything else gets the hint.
@@ -25310,6 +25359,12 @@ impl App {
     }
 
     fn open_editor_find(&mut self) {
+        // A hex tab's find is the byte-query popup, not the text bar
+        // (#172): route there whether the chord or the palette got here.
+        if self.editor.hex.is_some() {
+            self.open_hex_find_prompt();
+            return;
+        }
         if self.editor_find.is_some() {
             return;
         }
@@ -28239,6 +28294,18 @@ impl App {
                     // pane only, so anchoring one in the editor drops any
                     // leftover terminal selection (issue #23).
                     self.terminal_mut().clear_selection();
+                    // Hex tab (#172): a click on a byte cell — hex grid or
+                    // ASCII gutter — parks the cursor there; Shift extends
+                    // the selection; a drag from here extends it live.
+                    if let Some(view) = self.editor.hex.as_mut() {
+                        let rows = (view.layout.data_rows as usize).max(1);
+                        if let Some(off) = view.hit_test(m.column, m.row) {
+                            let select = m.modifiers.contains(KeyModifiers::SHIFT);
+                            view.set_cursor(off, select, rows);
+                        }
+                        self.poke_cursor();
+                        return;
+                    }
                     // PDF preview: a plain click activates the link under the
                     // pointer — an external URL opens in the browser, an
                     // internal target flips to its page — matching every
@@ -28588,6 +28655,14 @@ impl App {
                         self.poke_cursor();
                         return;
                     }
+                    if let Some(view) = self.editor.hex.as_mut() {
+                        let rows = (view.layout.data_rows as usize).max(1);
+                        if let Some(off) = view.hit_test(m.column, m.row) {
+                            view.set_cursor(off, true, rows);
+                        }
+                        self.poke_cursor();
+                        return;
+                    }
                     if self.editor.box_selecting() {
                         self.editor.box_drag_to_screen(m.column, m.row);
                         self.poke_cursor();
@@ -28817,6 +28892,9 @@ impl App {
                         diff.scroll_down_by(3);
                     } else if self.editor.pdf_page().is_some() {
                         self.wheel_pdf_page(1);
+                    } else if let Some(view) = self.editor.hex.as_mut() {
+                        let rows = (view.layout.data_rows as usize).max(1);
+                        view.scroll_by(3, rows);
                     } else {
                         self.editor.scroll_down(3);
                     }
@@ -28886,6 +28964,9 @@ impl App {
                         diff.scroll_up_by(3);
                     } else if self.editor.pdf_page().is_some() {
                         self.wheel_pdf_page(-1);
+                    } else if let Some(view) = self.editor.hex.as_mut() {
+                        let rows = (view.layout.data_rows as usize).max(1);
+                        view.scroll_by(-3, rows);
                     } else {
                         self.editor.scroll_up(3);
                     }
@@ -29285,6 +29366,14 @@ impl App {
     }
 
     fn save(&mut self) {
+        // A preview tab has nothing to save (and #185: letting the write
+        // proceed truncated the previewed file). Friendly no-op here; the
+        // choke-point guard in `write_buffer_to_disk` backstops every
+        // other path.
+        if self.editor.has_non_text_view() {
+            self.status = String::from("Nothing to save: this tab is a read-only preview");
+            return;
+        }
         // Guests in a collab session never write shared files: the owner is
         // the single writer, so the FS watcher and history snapshots see one
         // author. The guest's edits already flowed to the owner as ops.
@@ -31735,6 +31824,90 @@ impl App {
                 sheet.current_sheet = (current + total_sheets - 1) % total_sheets;
             }
             _ => {}
+        }
+    }
+
+    /// Hex-tab navigation (#172): cursor movement over bytes, Shift
+    /// extending the selection, F3 repeating the last find. The viewport
+    /// row count comes from the last painted frame's layout (frame
+    /// truth), so PageUp/PageDown match what the user sees.
+    fn handle_hex_key(&mut self, key: KeyEvent) {
+        // Cmd/Ctrl+F never reaches here — `is_editor_find_key` routes to
+        // `open_editor_find` earlier in the dispatch, which forwards hex
+        // tabs to the byte-query popup.
+        let Some(view) = self.editor.hex.as_mut() else {
+            return;
+        };
+        let rows = (view.layout.data_rows as usize).max(1);
+        let bpr = view.bytes_per_row as i64;
+        let select = key.modifiers.contains(KeyModifiers::SHIFT);
+        let jump = key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER);
+        match key.code {
+            KeyCode::Left => view.move_cursor(-1, select, rows),
+            KeyCode::Right => view.move_cursor(1, select, rows),
+            KeyCode::Up => view.move_cursor(-bpr, select, rows),
+            KeyCode::Down => view.move_cursor(bpr, select, rows),
+            KeyCode::PageUp => view.move_cursor(-bpr * rows as i64, select, rows),
+            KeyCode::PageDown => view.move_cursor(bpr * rows as i64, select, rows),
+            KeyCode::Home if jump => view.set_cursor(0, select, rows),
+            KeyCode::End if jump => view.set_cursor(u64::MAX, select, rows),
+            KeyCode::Home => {
+                let row_start = view.cursor - view.cursor % view.bytes_per_row;
+                view.set_cursor(row_start, select, rows);
+            }
+            KeyCode::End => {
+                let row_end =
+                    view.cursor - view.cursor % view.bytes_per_row + (view.bytes_per_row - 1);
+                view.set_cursor(row_end, select, rows);
+            }
+            KeyCode::Esc => view.sel_anchor = None,
+            KeyCode::F(3) => self.hex_find_next(),
+            _ => {}
+        }
+    }
+
+    /// F3 / "Hex: Find Next": repeat the stored query from just past the
+    /// cursor. The query itself is set by the find prompt
+    /// (`InputPurpose::HexFind`), whose submit searches cursor-INCLUSIVE
+    /// via `hex_find_run` directly.
+    fn hex_find_next(&mut self) {
+        let Some(view) = self.editor.hex.as_ref() else {
+            return;
+        };
+        if view.last_find.is_none() {
+            self.status = String::from("Hex: no find query yet (Cmd+F)");
+            return;
+        }
+        self.hex_find_run(view.cursor.saturating_add(1));
+    }
+
+    /// Run the hex tab's stored find query from `from` (wrapping),
+    /// selecting the match and reporting the outcome in the status line.
+    fn hex_find_run(&mut self, from: u64) {
+        let Some(view) = self.editor.hex.as_mut() else {
+            return;
+        };
+        let Some(needle) = view.last_find.clone() else {
+            return;
+        };
+        let rows = (view.layout.data_rows as usize).max(1);
+        match view.find_forward(&needle, from) {
+            Ok(crate::hex::FindOutcome::Found(off)) => {
+                view.set_cursor(off, false, rows);
+                view.sel_anchor = Some(off + needle.len() as u64 - 1);
+                self.status = format!("Found at 0x{off:X}");
+            }
+            Ok(crate::hex::FindOutcome::NotFound) => {
+                self.status = String::from("Not found");
+            }
+            Ok(crate::hex::FindOutcome::Capped) => {
+                self.status = format!(
+                    "Not found in the first {} MB scanned",
+                    crate::hex::FIND_SCAN_CAP / (1024 * 1024)
+                );
+            }
+            Err(e) => self.status = format!("Hex find failed: {e}"),
         }
     }
 
