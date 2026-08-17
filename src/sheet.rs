@@ -85,6 +85,12 @@ pub fn open_sheet(path: &Path) -> std::io::Result<SheetView> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let kind = sheet_kind_from_ext(ext)
         .ok_or_else(|| std::io::Error::other("unsupported sheet extension"))?;
+    open_sheet_with_kind(path, kind)
+}
+
+/// Open with an explicit kind, bypassing the extension: the content
+/// router (#174) lands extensionless / misnamed workbooks here.
+pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<SheetView> {
     let meta = std::fs::metadata(path)?;
     match kind {
         SheetKind::Csv | SheetKind::Tsv => {
@@ -116,7 +122,7 @@ pub fn open_sheet(path: &Path) -> std::io::Result<SheetView> {
                     meta.len()
                 )));
             }
-            let sheets = read_calamine_workbook(path)
+            let sheets = read_calamine_workbook(path, kind)
                 .map_err(|e| std::io::Error::other(format!("workbook open: {e}")))?;
             if sheets.is_empty() {
                 return Err(std::io::Error::other("workbook has no sheets"));
@@ -196,9 +202,21 @@ fn display_width(s: &str) -> u16 {
     s.chars().count().min(u16::MAX as usize) as u16
 }
 
-fn read_calamine_workbook(path: &Path) -> Result<Vec<SheetData>, calamine::Error> {
+fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>, calamine::Error> {
     use calamine::{Data, Reader};
-    let mut workbook: calamine::Sheets<_> = calamine::open_workbook_auto(path)?;
+    // `open_workbook_auto` resolves the reader from the file EXTENSION,
+    // so a content-routed file without one (#174) needs the explicit
+    // reader for its sniffed kind.
+    let mut workbook: calamine::Sheets<_> = match calamine::open_workbook_auto(path) {
+        Ok(w) => w,
+        Err(auto_err) => match kind {
+            SheetKind::Xlsx => calamine::Sheets::Xlsx(calamine::open_workbook(path)?),
+            SheetKind::Xls => calamine::Sheets::Xls(calamine::open_workbook(path)?),
+            SheetKind::Ods => calamine::Sheets::Ods(calamine::open_workbook(path)?),
+            SheetKind::Xlsb => calamine::Sheets::Xlsb(calamine::open_workbook(path)?),
+            SheetKind::Csv | SheetKind::Tsv => return Err(auto_err),
+        },
+    };
     let sheet_names = workbook.sheet_names();
     let mut out: Vec<SheetData> = Vec::with_capacity(sheet_names.len());
     for name in sheet_names {

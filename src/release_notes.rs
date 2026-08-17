@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Feature,
-        summary: "Binary files now open in a built-in hex viewer instead of failing with \"Binary file\": offsets, hex bytes, and an ASCII gutter, with cursor + selection, byte/text find (Cmd+F, F3 for next), mouse support, and windowed reads so even multi-gigabyte files open instantly. \"File: Reopen as Hex\" works on any file; \"File: Reopen as Text\" switches back.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Cmd+S on an image, PDF, or spreadsheet preview tab used to truncate the previewed file to zero bytes; saves on preview tabs are now refused at the write choke point and the file is left untouched.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Feature,
+    summary: "Files are now recognised by their CONTENT, not just their extension: an extensionless PNG opens as an image, a renamed workbook opens in the sheet viewer, a sniffed PDF opens in the reader, and a misnamed file (text wearing .png, a CSV wearing .xlsx) falls through to what it really is instead of failing - with the hex viewer catching everything unrecognised.",
+}];
