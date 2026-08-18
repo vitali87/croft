@@ -3085,6 +3085,19 @@ pub struct TerminalImageLayout {
     pub pane: usize,
 }
 
+/// Markdown-preview inline image placement (#176): geometry plus the
+/// bake identity (path + mtime), so an externally rewritten picture
+/// re-bakes and a pure scroll reuses the payload.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkdownImageLayout {
+    pub cell_x: u16,
+    pub cell_y: u16,
+    pub cell_w: u16,
+    pub cell_h: u16,
+    pub path: PathBuf,
+    pub mtime_ms: u128,
+}
+
 /// Which edge of the editor pane the minimap strip sits on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MinimapSide {
@@ -12639,6 +12652,7 @@ impl App {
         // last_inner and the scroll offset are this frame's (all gating —
         // hidden panel, alt screen, off-screen anchor — is inside).
         self.update_terminal_image_overlay();
+        self.update_markdown_image_overlay();
         self.render_editor_find(frame);
         self.render_terminal_find(frame);
         self.render_file_finder(frame);
@@ -31325,6 +31339,158 @@ impl App {
         self.overlays.terminal_image.disable();
     }
 
+    fn disable_markdown_image(&mut self) {
+        self.overlays.markdown_image.disable();
+    }
+
+    /// See [`Self::consume_editor_image_clear`]; the markdown twin.
+    pub fn consume_markdown_image_clear(&mut self) -> bool {
+        self.overlays.markdown_image.consume_clear()
+    }
+
+    pub fn mark_markdown_image_displayed(&mut self) {
+        self.overlays.markdown_image.mark_displayed();
+    }
+
+    /// The markdown-preview image escape to flush this frame; same modal
+    /// gate as the terminal pane picture.
+    pub fn markdown_image_payload(&self) -> Option<(&str, &MarkdownImageLayout)> {
+        if self.shortcuts_modal.is_some()
+            || self.file_finder.is_some()
+            || self.command_palette.is_some()
+            || self.go_to_symbol.is_some()
+            || self.workspace_symbols.is_some()
+            || self.process_picker.is_some()
+            || self.zoxide_jump.is_some()
+            || self.command_history_popup.is_some()
+            || self.branch_picker.is_some()
+            || self.input_prompt.is_some()
+            || self.list_picker.is_some()
+        {
+            return None;
+        }
+        self.overlays.markdown_image.payload()
+    }
+
+    /// Bake/refresh the markdown preview's inline image (#176): the
+    /// TOPMOST reserved block whose anchor row is on screen paints; a
+    /// bake is keyed on (path, mtime, fitted cells) and a pure scroll
+    /// reuses the payload (the terminal-pane picture's contract).
+    fn update_markdown_image_overlay(&mut self) {
+        if !self.inline_images_enabled() {
+            self.disable_markdown_image();
+            return;
+        }
+        let Some((cw_px, ch_px)) = self.cell_pixel else {
+            return;
+        };
+        let Some(md) = self.editor.markdown_preview.as_ref() else {
+            self.disable_markdown_image();
+            return;
+        };
+        let area = md.last_area;
+        let viewport_rows = self.editor.last_inner.height;
+        if area.width < 6 || viewport_rows < 3 || md.images.is_empty() {
+            self.disable_markdown_image();
+            return;
+        }
+        let scroll = md.scroll as usize;
+        let Some((img, anchor_row)) = md
+            .images
+            .iter()
+            .zip(md.anchor_rows.iter())
+            .find(|&(_, &row)| row >= scroll && row - scroll < viewport_rows as usize)
+            .map(|(i, &r)| (i.clone(), r))
+        else {
+            self.disable_markdown_image();
+            return;
+        };
+        let Ok(meta) = std::fs::metadata(&img.path) else {
+            self.disable_markdown_image();
+            return;
+        };
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let Ok((px_w, px_h)) = image::image_dimensions(&img.path) else {
+            self.disable_markdown_image();
+            return;
+        };
+        let vp = (anchor_row - scroll) as u16;
+        let want_w = (px_w.div_ceil(cw_px)).max(1) as f32;
+        let want_h = (px_h.div_ceil(ch_px)).max(1) as f32;
+        let max_w = area.width.saturating_sub(2) as f32;
+        let max_h = (img.rows.min(viewport_rows.saturating_sub(vp))).max(1) as f32;
+        let scale = (max_w / want_w).min(max_h / want_h).min(1.0);
+        let cell_w = ((want_w * scale) as u16).max(1);
+        let cell_h = ((want_h * scale) as u16).max(1);
+        let desired = MarkdownImageLayout {
+            cell_x: area.x,
+            cell_y: area.y + vp,
+            cell_w,
+            cell_h,
+            path: img.path.clone(),
+            mtime_ms,
+        };
+        if self.context_menu_covers_rect(Rect {
+            x: desired.cell_x,
+            y: desired.cell_y,
+            width: desired.cell_w,
+            height: desired.cell_h,
+        }) {
+            self.overlays.markdown_image.request_clear_if_displayed();
+            self.overlays.markdown_image.invalidate_layout();
+            return;
+        }
+        if self.overlays.markdown_image.layout_matches(&desired) {
+            return;
+        }
+        let reusable = self.overlays.markdown_image.has_image()
+            && self.overlays.markdown_image.layout().is_some_and(|l| {
+                l.path == desired.path
+                    && l.mtime_ms == desired.mtime_ms
+                    && l.cell_w == desired.cell_w
+                    && l.cell_h == desired.cell_h
+            });
+        self.overlays.markdown_image.request_clear_if_displayed();
+        if reusable {
+            self.overlays.markdown_image.set_layout(desired);
+            return;
+        }
+        let Ok(bytes) = std::fs::read(&img.path) else {
+            self.disable_markdown_image();
+            return;
+        };
+        let bg = self.theme_bg_pixel();
+        let baked = crate::iterm2_inline::fit_image_auto(
+            &bytes,
+            cell_w as u32 * cw_px,
+            cell_h as u32 * ch_px,
+            bg,
+        );
+        if let Ok(baked) = baked
+            && let Some(raw) = crate::iterm2_inline::build_inline_image_z(
+                self.inline_protocol,
+                &baked,
+                cell_w,
+                cell_h,
+                true,
+                crate::iterm2_inline::KITTY_ID_MARKDOWN,
+                crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
+            )
+        {
+            let osc = crate::iterm2_inline::maybe_tmux_wrap(
+                self.inline_protocol,
+                crate::iterm2_inline::detect_tmux(),
+                raw,
+            );
+            self.overlays.markdown_image.set(osc, desired);
+        }
+    }
+
     /// See [`Self::consume_editor_image_clear`]; the terminal-image twin.
     pub fn consume_terminal_image_clear(&mut self) -> bool {
         self.overlays.terminal_image.consume_clear()
@@ -36324,6 +36490,7 @@ fn consume_any_image_clear(app: &mut App) -> bool {
         app.consume_welcome_image_clear(),
         app.consume_editor_image_clear(),
         app.consume_terminal_image_clear(),
+        app.consume_markdown_image_clear(),
         app.consume_run_debug_image_clear(),
         app.consume_problems_badge_image_clear(),
         app.consume_no_repo_hero_image_clear(),
@@ -36668,6 +36835,22 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 }
                 let _ = out.flush();
                 app.mark_terminal_image_displayed();
+            }
+            // Markdown-preview inline image (#176): same bake-once /
+            // emit-each-frame overlay, anchored at its reserved rows.
+            if let Some((osc, layout)) = app.markdown_image_payload() {
+                use std::io::Write;
+                let mut out = stdout();
+                let cursor_on = app.cursor_should_be_visible();
+                let _ = write!(out, "\x1b[?25l\x1b[s");
+                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
+                let _ = out.write_all(osc.as_bytes());
+                let _ = write!(out, "\x1b[u");
+                if cursor_on {
+                    let _ = write!(out, "\x1b[?25h");
+                }
+                let _ = out.flush();
+                app.mark_markdown_image_displayed();
             }
             // Editor minimap: same bake-once / emit-each-frame overlay, painted
             // after ratatui's diff so the raster lands on the strip cells.

@@ -30,6 +30,13 @@ pub struct MarkdownPreview {
     /// Local images resolved at build (#176): each owns a run of blank
     /// reserved lines in `lines` that the app's overlay paints into.
     pub images: Vec<MdImage>,
+    /// Frame truth, written by the editor's render: each image's anchor
+    /// as a VISUAL row in the wrapped paragraph (same order as
+    /// `images`), the (built_seq, wrap width) the mapping was computed
+    /// for, and the text area the paragraph painted into.
+    pub anchor_rows: Vec<usize>,
+    pub wrap_key: (u64, u16),
+    pub last_area: ratatui::layout::Rect,
 }
 
 /// One local image block in a rendered preview (#176).

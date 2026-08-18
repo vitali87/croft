@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "xlsx workbooks are now editable in the sheet grid: cells edit exactly like CSV (typing replaces, Enter/F2 in place, click to select then click to edit), and Cmd+S writes ONLY the touched cells back through a real xlsx writer - styles, column widths, other sheets, and untouched formulas all survive the round trip. A formula cell is never silently destroyed: the first save holds it back and names it, the second Cmd+S consents to replacing it with your literal.",
+    summary: "The Markdown preview (Cmd+Shift+V) now renders LOCAL images inline: pictures referenced by relative or absolute paths paint as real inline images (Kitty, iTerm2, or sixel) in an aspect-sized block at their place in the document, scrolling with the text and re-rendering when the picture changes on disk. Remote URLs and missing files keep the labelled placeholder - the preview never fetches from the network.",
 }];

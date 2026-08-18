@@ -966,6 +966,9 @@ pub const KITTY_ID_PROBLEMS_BADGE: u32 = KITTY_ID_BASE + 24;
 /// shared +19 with the SCM badge, whose 2s keepalive and the picture's
 /// per-frame re-emit then evicted each other's placement in turn.
 pub const KITTY_ID_TERMINAL: u32 = KITTY_ID_BASE + 25;
+/// The active editor's markdown-preview inline image (#176): the topmost
+/// visible reserved block's picture.
+pub const KITTY_ID_MARKDOWN: u32 = KITTY_ID_BASE + 26;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it
@@ -1027,6 +1030,7 @@ mod tests {
             ("LAYOUT_CUSTOMIZE", KITTY_ID_LAYOUT_CUSTOMIZE),
             ("MINIMAP", KITTY_ID_MINIMAP),
             ("TERMINAL", KITTY_ID_TERMINAL),
+            ("MARKDOWN", KITTY_ID_MARKDOWN),
             ("SCM_BADGE", KITTY_ID_SCM_BADGE),
             ("EXPLORER_BADGE", KITTY_ID_EXPLORER_BADGE),
             ("REMOTE_BADGE", KITTY_ID_REMOTE_BADGE),

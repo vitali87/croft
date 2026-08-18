@@ -168,6 +168,48 @@ fn persistence_advisory_only_for_nonpersistent_remote_sessions() {
 }
 
 #[test]
+fn markdown_preview_computes_image_anchor_frame_truth() {
+    // #176: the preview render must publish each image's wrapped visual
+    // row and the paragraph's text area, which the overlay driver
+    // consumes.
+    let tmp = tempfile::tempdir().unwrap();
+    image::RgbaImage::new(100, 50)
+        .save(tmp.path().join("pic.png"))
+        .unwrap();
+    std::fs::write(
+        tmp.path().join("doc.md"),
+        "# Title\n\nintro text\n\n![p](pic.png)\n\ntail",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&tmp.path().join("doc.md")).unwrap();
+    assert!(app.editor.toggle_markdown_preview());
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let md = app.editor.markdown_preview.as_ref().unwrap();
+    assert_eq!(md.images.len(), 1);
+    assert_eq!(md.anchor_rows.len(), 1);
+    assert!(
+        md.anchor_rows[0] >= 3,
+        "the anchor sits below the heading and intro: {}",
+        md.anchor_rows[0]
+    );
+    assert!(md.last_area.width > 0, "frame-truth area published");
+    // The reserved rows are blank in the paint: no placeholder glyph.
+    let mut all = String::new();
+    for y in 0..30 {
+        for x in 0..100 {
+            all.push_str(term.backend().buffer()[(x, y)].symbol());
+        }
+    }
+    assert!(
+        !all.contains("(pic.png)"),
+        "no labelled placeholder for a local image"
+    );
+}
+
+#[test]
 fn terminal_warning_renders_inside_a_narrow_frame_without_panicking() {
     // #192: the modal's width clamp had a lower bound of 50, so any
     // terminal narrower than that produced a rect wider than the buffer
