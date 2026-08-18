@@ -1,4 +1,5 @@
 mod app;
+mod archive;
 mod build_matchers;
 mod cli;
 mod clipboard;

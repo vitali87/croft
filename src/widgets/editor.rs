@@ -328,6 +328,95 @@ fn render_hex(
     );
 }
 
+/// Paint an archive browser tab (#179): header, member rows (selected
+/// highlighted, sizes right-aligned), and a hint row. Frame truth for
+/// the row band is written back for mouse hit-testing.
+fn render_archive(
+    view: &mut crate::archive::ArchiveView,
+    path: Option<&Path>,
+    inner: Rect,
+    buf: &mut Buffer,
+    bg: Color,
+    theme: crate::theme::Theme,
+) {
+    let bg_style = Style::default().bg(bg);
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            buf[(x, y)].set_style(bg_style);
+            buf[(x, y)].set_symbol(" ");
+        }
+    }
+    view.rows_top = 0;
+    view.rows_visible = 0;
+    if inner.height < 4 || inner.width < 20 {
+        return;
+    }
+    let name = path
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("(archive)"));
+    let header = format!(
+        " {} · {} · {} members · {} bytes ",
+        name,
+        view.kind.label(),
+        view.entries.len(),
+        view.source_byte_size
+    );
+    buf.set_stringn(
+        inner.x,
+        inner.y,
+        &header,
+        inner.width as usize,
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(0x09, 0x4d, 0x77))
+            .add_modifier(Modifier::BOLD),
+    );
+    let rows_top = inner.y + 1;
+    let rows = inner.height - 2;
+    view.rows_top = rows_top;
+    view.rows_visible = rows;
+    // Keep the selection visible.
+    if view.selected < view.scroll {
+        view.scroll = view.selected;
+    } else if view.selected >= view.scroll + rows as usize {
+        view.scroll = view.selected + 1 - rows as usize;
+    }
+    for r in 0..rows as usize {
+        let idx = view.scroll + r;
+        let Some(entry) = view.entries.get(idx) else {
+            break;
+        };
+        let y = rows_top + r as u16;
+        let marker = if entry.dir { "▸ " } else { "  " };
+        let size = if entry.dir {
+            String::new()
+        } else {
+            format!("{} ", entry.size)
+        };
+        let style = if idx == view.selected {
+            Style::default().fg(Color::Black).bg(theme.accent())
+        } else if entry.dir {
+            Style::default().fg(Color::DarkGray).bg(bg)
+        } else {
+            Style::default().fg(Color::Gray).bg(bg)
+        };
+        let name_w = (inner.width as usize).saturating_sub(size.len() + 3);
+        let line = format!(" {marker}{:<name_w$}{size}", entry.path, name_w = name_w);
+        buf.set_stringn(inner.x, y, &line, inner.width as usize, style);
+    }
+    let hint = " Enter: open member · E: extract member to a folder ";
+    buf.set_stringn(
+        inner.x,
+        inner.y + inner.height - 1,
+        hint,
+        inner.width as usize,
+        Style::default()
+            .fg(Color::Gray)
+            .bg(Color::Rgb(0x07, 0x33, 0x55)),
+    );
+}
+
 fn render_sheet(
     view: &mut crate::sheet::SheetView,
     path: Option<&Path>,
@@ -1970,6 +2059,10 @@ pub struct Editor {
     /// target. Mutually exclusive with the text path and the other
     /// preview kinds; windowed IO, so the file is never loaded whole.
     pub hex: Option<crate::hex::HexView>,
+    /// Archive browser (#179): the member list of a zip/jar/whl/tar
+    /// archive; Enter extracts one member to scratch and opens it
+    /// through the normal dispatch. Read-only.
+    pub archive: Option<crate::archive::ArchiveView>,
     /// Per-tab "Reopen as Text" override (#175): when set, `open` skips
     /// every preview route (extension and sniffed alike) and lands in
     /// the text editor — an SVG's XML source, a workbook's bytes (which
@@ -2110,6 +2203,7 @@ impl Editor {
             sheet: None,
             diff: None,
             hex: None,
+            archive: None,
             force_text: false,
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
@@ -2959,6 +3053,13 @@ impl Editor {
             self.force_text = false;
         }
         if !self.force_text {
+            // A corrupt archive falls through to content routing and,
+            // ultimately, the hex fallback.
+            if let Some(kind) = crate::archive::kind_from_ext(path)
+                && self.open_archive(path, kind).is_ok()
+            {
+                return Ok(());
+            }
             if extension_is_image(ext) {
                 // A DECODE failure means the extension lied (#174): fall
                 // through to content routing instead of failing the open.
@@ -3044,15 +3145,37 @@ impl Editor {
             // a workbook wearing `.csv` (or any other sheet extension)
             // failed a DIFFERENT parser, so the xlsx retry is genuinely
             // new information (#188 review).
-            Some(crate::magic::Magic::Zip)
-                if !ext.eq_ignore_ascii_case("xlsx") && self.csv_viewer_enabled =>
-            {
-                if let Ok(view) =
-                    crate::sheet::open_sheet_with_kind(path, crate::sheet::SheetKind::Xlsx)
+            Some(crate::magic::Magic::Zip) => {
+                if !ext.eq_ignore_ascii_case("xlsx")
+                    && self.csv_viewer_enabled
+                    && let Ok(view) =
+                        crate::sheet::open_sheet_with_kind(path, crate::sheet::SheetKind::Xlsx)
                 {
                     self.install_sheet_view(path, view);
                     return Ok(());
                 }
+                // Not a workbook: browse it as the archive it is (#179).
+                if self
+                    .open_archive(path, crate::archive::ArchiveKind::Zip)
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+            // The remaining container kinds browse too when they parse.
+            Some(crate::magic::Magic::Gzip)
+                if self
+                    .open_archive(path, crate::archive::ArchiveKind::TarGz)
+                    .is_ok() =>
+            {
+                return Ok(());
+            }
+            Some(crate::magic::Magic::Tar)
+                if self
+                    .open_archive(path, crate::archive::ArchiveKind::Tar)
+                    .is_ok() =>
+            {
+                return Ok(());
             }
             _ => {}
         }
@@ -3150,6 +3273,7 @@ impl Editor {
         self.sheet = None;
         self.markdown_preview = None;
         self.hex = None;
+        self.archive = None;
         // A real file supersedes any diff view this editor was showing —
         // without this a restore-then-reload keeps rendering the stale diff.
         self.diff = None;
@@ -3238,6 +3362,7 @@ impl Editor {
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
         self.hex = None;
+        self.archive = None;
         self.status = format!("Opened image {}", path.display());
         Ok(())
     }
@@ -3246,6 +3371,40 @@ impl Editor {
         let view = crate::sheet::open_sheet(path)
             .map_err(|e| anyhow::anyhow!("Spreadsheet open failed: {e}"))?;
         self.install_sheet_view(path, view);
+        Ok(())
+    }
+
+    /// Archive browser (#179): list the members read-only; Enter
+    /// extracts one to scratch and reopens it through the dispatch.
+    fn open_archive(&mut self, path: &Path, kind: crate::archive::ArchiveKind) -> Result<()> {
+        let view = crate::archive::list(path, kind)
+            .map_err(|e| anyhow::anyhow!("Archive open failed: {e}"))?;
+        self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
+        self.lines = vec![String::new()];
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.lang = None;
+        self.scroll = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty = false;
+        self.selection = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit_kind = None;
+        self.highlights = vec![Vec::new()];
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
+        self.image = None;
+        self.sheet = None;
+        self.hex = None;
+        self.markdown_preview = None;
+        self.archive = Some(view);
+        self.status = format!("Opened archive {}", path.display());
         Ok(())
     }
 
@@ -3292,6 +3451,7 @@ impl Editor {
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
         self.hex = None;
+        self.archive = None;
         self.markdown_preview = None;
         self.image = Some(ImageView {
             bytes: png,
@@ -3342,6 +3502,7 @@ impl Editor {
         self.diff_next_arrow = Rect::default();
         self.image = None;
         self.hex = None;
+        self.archive = None;
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
     }
@@ -3413,6 +3574,7 @@ impl Editor {
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
         self.hex = None;
+        self.archive = None;
         self.status = format!("Opened PDF {}", path.display());
         Ok(())
     }
@@ -3423,7 +3585,11 @@ impl Editor {
     /// Every preview kind the format epic (#184) adds joins HERE, so the
     /// twenty-odd guard sites never enumerate kinds again.
     pub fn has_non_text_view(&self) -> bool {
-        self.diff.is_some() || self.sheet.is_some() || self.image.is_some() || self.hex.is_some()
+        self.diff.is_some()
+            || self.sheet.is_some()
+            || self.image.is_some()
+            || self.hex.is_some()
+            || self.archive.is_some()
     }
 
     /// Open `path` in the read-only hex viewer (#172): the routing
@@ -3486,6 +3652,7 @@ impl Editor {
         self.image = None;
         self.sheet = None;
         self.markdown_preview = None;
+        self.archive = None;
         self.hex = Some(view);
         self.status = format!("Opened {} in the hex viewer", path.display());
         Ok(())
@@ -8411,6 +8578,10 @@ impl Widget for &mut Editor {
             render_sheet(view, self.path.as_deref(), inner, buf, cbg, self.theme);
             return;
         }
+        if let Some(view) = self.archive.as_mut() {
+            render_archive(view, self.path.as_deref(), inner, buf, cbg, self.theme);
+            return;
+        }
         if let Some(view) = self.hex.as_mut() {
             render_hex(view, self.path.as_deref(), inner, buf, cbg, self.theme);
             return;
@@ -12405,8 +12576,11 @@ mod tests {
         z.finish().unwrap();
         let mut e = Editor::new();
         e.open(&plain).unwrap();
-        assert!(e.hex.is_some(), "non-workbook zip lands in hex");
-        assert!(e.sheet.is_none());
+        assert!(
+            e.archive.is_some(),
+            "a non-workbook zip lands in the archive browser (#179)"
+        );
+        assert!(e.sheet.is_none() && e.hex.is_none());
     }
 
     #[test]

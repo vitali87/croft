@@ -355,6 +355,15 @@ Binary files open here automatically instead of erroring; the file is read in wi
 | Click / drag (hex grid or ASCII gutter) | Park the cursor / select a byte range |
 | Wheel | Scroll three rows |
 
+**Archive browser (`.zip`, `.jar`, `.whl`, `.tar`, `.tar.gz`, `.tgz`; misnamed containers detected by content)**
+
+| Keys | Action |
+|------|--------|
+| `↑` / `↓` / `PageUp` / `PageDown` / `Home` / `End` | Move the member selection |
+| `Enter` | Extract the selected member to a scratch copy and open it with its real viewer |
+| `E` | Extract the selected member to a folder you pick |
+| Click a member | Select it; a second click opens it |
+
 **SVG (`.svg`)**
 
 Opens as a rendered preview (shapes, text via system fonts, embedded images). `File: Reopen as Text` switches the tab to the editable XML source — the choice sticks for that tab, external edits refresh whichever view the tab shows, and an SVG that fails to parse opens as its source directly.

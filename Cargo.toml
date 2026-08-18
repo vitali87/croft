@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.1.740"
+version = "0.1.741"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -157,6 +157,10 @@ umya-spreadsheet = { version = "3.1", default-features = false }
 # direct deps adds no new version to the lock. zip needs only `deflate` (the
 # standard GitHub-release compression); its heavier default codecs are dropped.
 flate2 = "1"
+# Tar walking for the archive browser (#179): list members and extract
+# one on demand (tar/tar.gz/tgz); zip rides the existing zip crate.
+# 0.4.46 verified current on crates.io 2026-08-18.
+tar = "0.4"
 zip = { version = "7", default-features = false, features = ["deflate"] }
 # Read-only TOML parser for the Explorer DEPENDENCIES view: extracts the
 # dependency list from `pyproject.toml` (PEP 621 `[project].dependencies` or
