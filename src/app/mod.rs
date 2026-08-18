@@ -32371,7 +32371,9 @@ impl App {
             self.status = String::from("Directories only group members; open a file");
             return;
         }
-        let dest = std::env::temp_dir().join("croft-archive-members");
+        // Session-unique (#198 review): a shared path let another croft
+        // instance overwrite a member between extraction and open.
+        let dest = std::env::temp_dir().join(format!("croft-archive-{}", std::process::id()));
         match crate::archive::extract_member(&path, kind, &member, &dest) {
             Ok(extracted) => {
                 if let Err(e) = self.open_at(&extracted, 0, 0) {
@@ -32386,15 +32388,21 @@ impl App {
 
     fn open_archive_extract_prompt(&mut self) {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-        let Some(member) = self
+        let Some((member, dir)) = self
             .editor
             .archive
             .as_ref()
             .and_then(|v| v.entries.get(v.selected))
-            .map(|e| e.path.clone())
+            .map(|e| (e.path.clone(), e.dir))
         else {
             return;
         };
+        if dir {
+            // extract_member extracts ONE member, not a subtree (#198
+            // review): the prompt would fail or write an empty folder.
+            self.status = String::from("Directories only group members; extract a file");
+            return;
+        }
         let suggestion = self.workspace_root().display().to_string();
         self.open_input_prompt(
             InputPrompt::new(

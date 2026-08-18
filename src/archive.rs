@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 /// in-memory/editor paths, so an unbounded entry could balloon.
 pub const MEMBER_CAP: u64 = 100 * 1024 * 1024;
 
+/// Listing cap for tar-family archives (#198 review): walking tar
+/// headers must read THROUGH every payload (and a GzDecoder is not
+/// seekable), so listing cost is proportional to the archive - unlike
+/// zip's central directory. Larger files fall to the hex viewer.
+pub const TAR_LIST_CAP: u64 = 100 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArchiveKind {
     Zip,
@@ -83,6 +89,12 @@ pub fn list(path: &Path, kind: ArchiveKind) -> std::io::Result<ArchiveView> {
             }
         }
         ArchiveKind::Tar | ArchiveKind::TarGz => {
+            if meta.len() > TAR_LIST_CAP {
+                return Err(std::io::Error::other(format!(
+                    "tar archive too large to list ({} bytes)",
+                    meta.len()
+                )));
+            }
             let f = std::fs::File::open(path)?;
             let read: Box<dyn std::io::Read> = if kind == ArchiveKind::TarGz {
                 Box::new(flate2::read::GzDecoder::new(f))
@@ -163,11 +175,26 @@ pub fn extract_member(
 }
 
 fn write_out(dest: &Path, read: &mut dyn std::io::Read) -> std::io::Result<()> {
+    write_out_capped(dest, read, MEMBER_CAP)
+}
+
+/// Copy at most `cap` bytes; a stream that keeps going past it (a
+/// member whose DECLARED size lied - deflate does not bound its output
+/// to the metadata, #198 review) fails and the partial file is removed.
+fn write_out_capped(dest: &Path, read: &mut dyn std::io::Read, cap: u64) -> std::io::Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut out = std::fs::File::create(dest)?;
-    std::io::copy(read, &mut out)?;
+    let mut limited = std::io::Read::take(read, cap + 1);
+    let copied = std::io::copy(&mut limited, &mut out)?;
+    if copied > cap {
+        drop(out);
+        let _ = std::fs::remove_file(dest);
+        return Err(std::io::Error::other(
+            "member stream exceeded the size cap; partial output removed",
+        ));
+    }
     Ok(())
 }
 
@@ -285,6 +312,30 @@ mod tests {
         assert!(contained_join(d, "a/../../evil").is_none());
         assert!(contained_join(d, "/etc/passwd").is_none());
         assert!(contained_join(d, ".").is_none(), "no file at all");
+    }
+
+    #[test]
+    fn write_out_caps_the_actual_stream_not_the_declared_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("x.bin");
+        let mut endless = std::io::repeat(7u8);
+        let err = write_out_capped(&dest, &mut endless, 1024).unwrap_err();
+        assert!(err.to_string().contains("size cap"));
+        assert!(!dest.exists(), "partial output removed");
+        let mut small = &b"ok"[..];
+        write_out_capped(&dest, &mut small, 1024).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn oversized_tar_refuses_to_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.tar");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(TAR_LIST_CAP + 1).unwrap();
+        drop(f);
+        let err = list(&p, ArchiveKind::Tar).unwrap_err();
+        assert!(err.to_string().contains("too large to list"));
     }
 
     #[test]
