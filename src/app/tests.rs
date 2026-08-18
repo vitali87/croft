@@ -7341,8 +7341,11 @@ fn hex_typing_edits_bytes_and_cmd_s_writes_them_in_place() {
         Some(b'Z')
     );
 
-    // Cmd+S writes the bytes in place and cleans the tab.
-    app.save();
+    // Cmd+S through the REAL key dispatch writes the bytes in place
+    // and cleans the tab (#191 review: app.save() directly would keep
+    // passing if the chord routing broke).
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
     assert!(!app.editor.dirty);
     let disk = std::fs::read(&p).unwrap();
     assert_eq!(disk[0], 0x41);

@@ -3441,6 +3441,13 @@ impl Editor {
         if self.hex.is_none() {
             anyhow::bail!("Not a hex tab");
         }
+        // Nothing pending: touch NOTHING (#191 review). Re-anchoring the
+        // disk stamp here would claim sync with an external change the
+        // window never read, and the FS sweep would then skip the reload.
+        if self.hex.as_ref().is_some_and(|v| !v.has_edits()) {
+            self.status = String::from("No pending byte edits");
+            return Ok(SaveOutcome::Saved);
+        }
         if !force && self.disk_changed_externally() {
             self.disk_conflict = true;
             return Ok(SaveOutcome::DiskConflict);

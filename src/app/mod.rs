@@ -29138,6 +29138,13 @@ impl App {
         let due = |e: &crate::widgets::editor::Editor| {
             e.dirty
                 && e.path.is_some()
+                // Preview-kind edits (hex bytes, sheet cells) are
+                // EXPLICIT-save only: an automatic write mid-edit could
+                // land a half-updated byte sequence, and the serialising
+                // kinds normalise quoting the user did not ask to touch.
+                // (They also never set last_edit_at, so this guard makes
+                // an implicit exclusion structural - #191 review.)
+                && !e.has_non_text_view()
                 && !e.disk_conflict
                 // A latched encoding refusal: only an explicit Cmd+S can
                 // consent to the lossy write, so retrying here would just
@@ -29411,6 +29418,11 @@ impl App {
             match self.editor.hex_save(force) {
                 Ok(SaveOutcome::Saved) => {
                     self.status = self.editor.status.clone();
+                    // Local history captures the new bytes like every
+                    // other successful save path (#191 review).
+                    if let Some(path) = self.editor.path.clone() {
+                        self.record_history_snapshot(&path);
+                    }
                 }
                 Ok(SaveOutcome::DiskConflict) => {
                     self.force_save_armed = true;
