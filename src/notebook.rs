@@ -29,6 +29,80 @@ pub fn looks_like_notebook(text: &str) -> bool {
         .is_some_and(|v| v.get("cells").is_some_and(|c| c.is_array()))
 }
 
+/// Parse SGR-colored output text into styled spans (#199 review): the
+/// 16 basic/bright foregrounds map through the theme's ANSI palette,
+/// bold is honored, reset returns to `base`; every other escape
+/// (unsupported CSI, OSC) is stripped. One Line per text line.
+fn ansi_lines(text: &str, base: Style, theme: Theme, indent: &str) -> Vec<Line<'static>> {
+    let ansi = theme.ansi();
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(indent.to_string())];
+        let mut cur = String::new();
+        let mut style = base;
+        let mut chars = raw.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\u{1b}' {
+                cur.push(c);
+                continue;
+            }
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    let mut params = String::new();
+                    let mut fin = ' ';
+                    for t in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&t) {
+                            fin = t;
+                            break;
+                        }
+                        params.push(t);
+                    }
+                    if fin == 'm' {
+                        if !cur.is_empty() {
+                            spans.push(Span::styled(std::mem::take(&mut cur), style));
+                        }
+                        for p in params.split(';') {
+                            match p.parse::<u8>().unwrap_or(0) {
+                                0 => style = base,
+                                1 => style = style.add_modifier(Modifier::BOLD),
+                                n @ 30..=37 => {
+                                    let (r, g, b) = ansi[(n - 30) as usize];
+                                    style = style.fg(Color::Rgb(r, g, b));
+                                }
+                                n @ 90..=97 => {
+                                    let (r, g, b) = ansi[(n - 90 + 8) as usize];
+                                    style = style.fg(Color::Rgb(r, g, b));
+                                }
+                                39 => style = style.fg(base.fg.unwrap_or(Color::Reset)),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(t) = chars.next() {
+                        if t == '\u{7}' {
+                            break;
+                        }
+                        if t == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !cur.is_empty() {
+            spans.push(Span::styled(cur, style));
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
 /// Strip ANSI escape sequences (CSI and OSC) from output text.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -63,6 +137,36 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+/// Write a scratch image with no-follow semantics (#199 review): the
+/// hash-named file is reused only when it already exists as a REGULAR
+/// file; otherwise it is created with create_new, so a planted symlink
+/// at a predicted name is refused, never followed. On unix the scratch
+/// dir is created owner-only.
+fn write_scratch_no_follow(scratch: &Path, path: &Path, bytes: &[u8]) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => return true,
+        Ok(_) => return false,
+        Err(_) => {}
+    }
+    if std::fs::create_dir_all(scratch).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(scratch, std::fs::Permissions::from_mode(0o700));
+    }
+    use std::io::Write as _;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    else {
+        return false;
+    };
+    f.write_all(bytes).is_ok()
 }
 
 /// Join a notebook "multiline string" (either a JSON string or a list
@@ -133,7 +237,7 @@ pub fn render(
                     .into_iter()
                     .flatten()
                 {
-                    render_output(output, scratch, &mut lines, &mut images, dim);
+                    render_output(output, scratch, &mut lines, &mut images, dim, theme);
                 }
                 lines.push(Line::default());
             }
@@ -149,6 +253,7 @@ fn render_output(
     lines: &mut Vec<Line<'static>>,
     images: &mut Vec<MdImage>,
     dim: Style,
+    theme: Theme,
 ) {
     let otype = output
         .get("output_type")
@@ -156,10 +261,8 @@ fn render_output(
         .unwrap_or("");
     match otype {
         "stream" => {
-            let text = strip_ansi(&output.get("text").map(joined).unwrap_or_default());
-            for l in text.lines() {
-                lines.push(Line::from(Span::styled(format!("  {l}"), dim)));
-            }
+            let text = output.get("text").map(joined).unwrap_or_default();
+            lines.extend(ansi_lines(&text, dim, theme, "  "));
         }
         "error" => {
             let err = Style::default().fg(ERR);
@@ -169,33 +272,36 @@ fn render_output(
                 .into_iter()
                 .flatten()
             {
-                let clean = strip_ansi(tl.as_str().unwrap_or(""));
-                for l in clean.lines() {
-                    lines.push(Line::from(Span::styled(format!("  {l}"), err)));
-                }
+                lines.extend(ansi_lines(tl.as_str().unwrap_or(""), err, theme, "  "));
             }
         }
         "execute_result" | "display_data" => {
-            if let Some(b64) = output
-                .get("data")
-                .and_then(|d| d.get("image/png"))
-                .map(joined)
-                .filter(|s| !s.is_empty())
-            {
+            let picture = [("image/png", "png"), ("image/jpeg", "jpg")]
+                .iter()
+                .find_map(|(mime, ext)| {
+                    output
+                        .get("data")
+                        .and_then(|d| d.get(*mime))
+                        .map(joined)
+                        .filter(|s| !s.is_empty())
+                        .map(|b64| (b64, *ext))
+                });
+            if let Some((b64, ext)) = picture {
                 use base64::Engine as _;
                 let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(compact)
-                    && let Ok((px_w, px_h)) =
-                        image::load_from_memory(&bytes).map(|i| (i.width(), i.height()))
+                    && let Ok(Some((px_w, px_h))) =
+                        image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
+                            .with_guessed_format()
+                            .map(|r| r.into_dimensions().ok())
+                    && (px_w as u64) * (px_h as u64) <= 64_000_000
                 {
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     use std::hash::{Hash as _, Hasher as _};
                     bytes.hash(&mut hasher);
-                    let name = format!("nb-{:016x}.png", hasher.finish());
+                    let name = format!("nb-{:016x}.{ext}", hasher.finish());
                     let path = scratch.join(name);
-                    let ok = path.is_file()
-                        || (std::fs::create_dir_all(scratch).is_ok()
-                            && std::fs::write(&path, &bytes).is_ok());
+                    let ok = write_scratch_no_follow(scratch, &path, &bytes);
                     if ok {
                         let rows = ((px_h as f32 / px_w.max(1) as f32) * 72.0 / 2.0)
                             .round()

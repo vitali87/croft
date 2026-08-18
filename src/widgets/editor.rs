@@ -3887,10 +3887,14 @@ impl Editor {
                 .as_ref()
                 .map(|m| m.scroll)
                 .unwrap_or(0);
-            if self.build_notebook_preview()
-                && let Some(md) = self.markdown_preview.as_mut()
-            {
-                md.scroll = scroll;
+            if self.build_notebook_preview() {
+                if let Some(md) = self.markdown_preview.as_mut() {
+                    md.scroll = scroll;
+                }
+            } else {
+                // Same fallback as the stale path (#199 review): an
+                // invalid document drops to the raw text.
+                self.markdown_preview = None;
             }
         } else if self.markdown_preview.is_some() {
             // The image-aware builder (#196 review): the plain one left
@@ -9712,15 +9716,21 @@ impl Editor {
         let is_nb = self.markdown_preview.as_ref().is_some_and(|md| md.notebook);
         if stale && is_nb {
             // Notebook rebuild (#180): keep the scroll, refresh the rest.
+            // A JSON made invalid by the edit clears the preview and
+            // falls back to the raw text (#199 review) - retaining the
+            // stale render would repaint and re-fail every frame.
             let scroll = self
                 .markdown_preview
                 .as_ref()
                 .map(|m| m.scroll)
                 .unwrap_or(0);
-            if self.build_notebook_preview()
-                && let Some(md) = self.markdown_preview.as_mut()
-            {
-                md.scroll = scroll;
+            if self.build_notebook_preview() {
+                if let Some(md) = self.markdown_preview.as_mut() {
+                    md.scroll = scroll;
+                }
+            } else {
+                self.markdown_preview = None;
+                return;
             }
         } else if stale {
             // The image-aware builder (#176): the plain one here left the
