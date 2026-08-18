@@ -17,6 +17,30 @@ pub const MEMBER_CAP: u64 = 100 * 1024 * 1024;
 /// zip's central directory. Larger files fall to the hex viewer.
 pub const TAR_LIST_CAP: u64 = 100 * 1024 * 1024;
 
+/// A reader that fails once more than `remaining` bytes have been
+/// pulled through it (#198 review): the compressed size of a tar.gz
+/// says nothing about the DECODED bytes a listing walk must read.
+struct CappedRead<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for CappedRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::other(
+                "archive expands past the listing cap",
+            ));
+        }
+        let take = buf
+            .len()
+            .min(self.remaining.min(usize::MAX as u64) as usize);
+        let n = self.inner.read(&mut buf[..take])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArchiveKind {
     Zip,
@@ -97,7 +121,12 @@ pub fn list(path: &Path, kind: ArchiveKind) -> std::io::Result<ArchiveView> {
             }
             let f = std::fs::File::open(path)?;
             let read: Box<dyn std::io::Read> = if kind == ArchiveKind::TarGz {
-                Box::new(flate2::read::GzDecoder::new(f))
+                // Cap the DECODED bytes too: a small .tar.gz can expand
+                // far past the source-size gate above (#198 review).
+                Box::new(CappedRead {
+                    inner: flate2::read::GzDecoder::new(f),
+                    remaining: TAR_LIST_CAP,
+                })
             } else {
                 Box::new(f)
             };
@@ -137,6 +166,8 @@ pub fn extract_member(
 ) -> std::io::Result<PathBuf> {
     let dest = contained_join(dest_dir, member)
         .ok_or_else(|| std::io::Error::other(format!("refusing unsafe member path: {member}")))?;
+    std::fs::create_dir_all(dest_dir)?;
+    prepare_no_follow(dest_dir, &dest)?;
     match kind {
         ArchiveKind::Zip => {
             let f = std::fs::File::open(path)?;
@@ -178,14 +209,56 @@ fn write_out(dest: &Path, read: &mut dyn std::io::Read) -> std::io::Result<()> {
     write_out_capped(dest, read, MEMBER_CAP)
 }
 
+/// Create the intermediate directories of `dest` below `root`,
+/// REFUSING any component that exists as a symlink (#198 review:
+/// create_dir_all + File::create follow existing links, so a planted
+/// `dest/nested -> /elsewhere` redirected the write outside the root).
+/// The leaf is created with create_new after removing only a REGULAR
+/// file, so an existing symlink leaf is refused too.
+fn prepare_no_follow(root: &Path, dest: &Path) -> std::io::Result<()> {
+    let rel = dest.strip_prefix(root).map_err(std::io::Error::other)?;
+    let mut cur = root.to_path_buf();
+    let parts: Vec<_> = rel.components().collect();
+    for c in &parts[..parts.len().saturating_sub(1)] {
+        cur.push(c);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to traverse a symlink inside the extraction root: {}",
+                    cur.display()
+                )));
+            }
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                return Err(std::io::Error::other(format!(
+                    "a member path component is a file: {}",
+                    cur.display()
+                )));
+            }
+            Err(_) => std::fs::create_dir(&cur)?,
+        }
+    }
+    match std::fs::symlink_metadata(dest) {
+        Ok(m) if m.file_type().is_symlink() => Err(std::io::Error::other(
+            "refusing to overwrite a symlink at the extraction target",
+        )),
+        Ok(m) if m.is_file() => {
+            std::fs::remove_file(dest)?;
+            Ok(())
+        }
+        Ok(_) => Err(std::io::Error::other("extraction target is a directory")),
+        Err(_) => Ok(()),
+    }
+}
+
 /// Copy at most `cap` bytes; a stream that keeps going past it (a
 /// member whose DECLARED size lied - deflate does not bound its output
 /// to the metadata, #198 review) fails and the partial file is removed.
 fn write_out_capped(dest: &Path, read: &mut dyn std::io::Read, cap: u64) -> std::io::Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut out = std::fs::File::create(dest)?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
     let mut limited = std::io::Read::take(read, cap + 1);
     let copied = std::io::copy(&mut limited, &mut out)?;
     if copied > cap {
@@ -336,6 +409,54 @@ mod tests {
         drop(f);
         let err = list(&p, ArchiveKind::Tar).unwrap_err();
         assert!(err.to_string().contains("too large to list"));
+    }
+
+    #[test]
+    fn targz_expanding_past_the_cap_is_refused_at_list() {
+        // A tiny compressed file whose DECODED stream blows the cap.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("bomb.tar.gz");
+        let f = std::fs::File::create(&p).unwrap();
+        let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        let mut t = tar::Builder::new(gz);
+        let zeros = vec![0u8; (TAR_LIST_CAP / 4) as usize];
+        for i in 0..5 {
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_size(zeros.len() as u64);
+            hdr.set_cksum();
+            t.append_data(&mut hdr, format!("z{i}.bin"), &zeros[..])
+                .unwrap();
+        }
+        t.into_inner().unwrap().finish().unwrap();
+        assert!(
+            std::fs::metadata(&p).unwrap().len() < TAR_LIST_CAP,
+            "the compressed file itself is small"
+        );
+        let err = list(&p, ArchiveKind::TarGz).unwrap_err();
+        assert!(err.to_string().contains("listing cap"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_refuses_symlinked_components_and_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zp = tmp.path().join("a.zip");
+        make_zip(&zp);
+        let dest = tmp.path().join("out");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // dest/docs -> outside: the member docs/readme.txt must refuse.
+        std::os::unix::fs::symlink(&outside, dest.join("docs")).unwrap();
+        let err = extract_member(&zp, ArchiveKind::Zip, "docs/readme.txt", &dest).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!outside.join("readme.txt").exists(), "nothing escaped");
+        // A symlink LEAF is refused too.
+        std::fs::remove_file(dest.join("docs")).unwrap();
+        std::os::unix::fs::symlink(outside.join("evil.txt"), dest.join("evil.txt")).unwrap();
+        let err = extract_member(&zp, ArchiveKind::Zip, "evil.txt", &dest).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!outside.join("evil.txt").exists());
     }
 
     #[test]
