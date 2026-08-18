@@ -4028,11 +4028,21 @@ impl Editor {
             return false;
         }
         let text = self.lines.join("\n");
-        let lines = crate::markdown::render_markdown(&text, self.theme, &mut self.registry);
+        let base = self
+            .path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let (lines, images) = crate::markdown::render_markdown_with_images(
+            &text,
+            self.theme,
+            &mut self.registry,
+            base.as_deref(),
+        );
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             lines,
             scroll: 0,
             built_seq: self.edit_seq,
+            images,
         });
         true
     }

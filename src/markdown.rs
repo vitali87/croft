@@ -27,6 +27,19 @@ pub struct MarkdownPreview {
     pub lines: Vec<Line<'static>>,
     pub scroll: u16,
     pub built_seq: u64,
+    /// Local images resolved at build (#176): each owns a run of blank
+    /// reserved lines in `lines` that the app's overlay paints into.
+    pub images: Vec<MdImage>,
+}
+
+/// One local image block in a rendered preview (#176).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MdImage {
+    /// Index of the first reserved (blank) line in the built lines.
+    pub first_line: usize,
+    /// Reserved line count, from the image's aspect at build time.
+    pub rows: u16,
+    pub path: std::path::PathBuf,
 }
 
 /// Map a fenced code block's info string to a highlighter language. Accepts
@@ -93,6 +106,10 @@ struct Renderer<'r> {
     code_block: Option<(Option<LangKind>, String)>,
     /// Rows of cell texts while inside a table (row 0 is the header).
     table: Option<Vec<Vec<String>>>,
+    /// Directory local image paths resolve against (#176); None keeps
+    /// every image a placeholder.
+    base_dir: Option<std::path::PathBuf>,
+    images: Vec<MdImage>,
 }
 
 impl Renderer<'_> {
@@ -255,6 +272,17 @@ pub fn render_markdown(
     theme: Theme,
     registry: &mut LangRegistry,
 ) -> Vec<Line<'static>> {
+    render_markdown_with_images(text, theme, registry, None).0
+}
+
+/// Like [`render_markdown`], resolving local images against `base_dir`
+/// into reserved blocks (#176).
+pub fn render_markdown_with_images(
+    text: &str,
+    theme: Theme,
+    registry: &mut LangRegistry,
+    base_dir: Option<&std::path::Path>,
+) -> (Vec<Line<'static>>, Vec<MdImage>) {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut r = Renderer {
@@ -272,6 +300,8 @@ pub fn render_markdown(
         pending_marker: None,
         code_block: None,
         table: None,
+        base_dir: base_dir.map(|p| p.to_path_buf()),
+        images: Vec::new(),
     };
     for event in Parser::new_ext(text, options) {
         match event {
@@ -320,13 +350,38 @@ pub fn render_markdown(
                 Tag::Strikethrough => r.strike += 1,
                 Tag::Link { .. } => r.link += 1,
                 Tag::Image { dest_url, .. } => {
-                    r.begin_content();
-                    let style = Style::default().fg(DIM).add_modifier(Modifier::ITALIC);
-                    r.cur.push(Span::styled("\u{f03e} ", style));
-                    // ponytail: images render as a labelled placeholder; true
-                    // inline pictures need per-image Kitty placements, add
-                    // when the overlay pipeline grows multi-image slots.
-                    r.cur.push(Span::styled(format!("({dest_url}) "), style));
+                    // Local, existing, decodable images reserve blank
+                    // lines the app's inline-image overlay paints into
+                    // (#176). Remote URLs and misses keep the labelled
+                    // placeholder - the preview never fetches.
+                    let local = (!dest_url.contains("://"))
+                        .then(|| r.base_dir.as_ref().map(|d| d.join(dest_url.as_ref())))
+                        .flatten()
+                        .filter(|p| p.is_file());
+                    let dims = local.as_ref().and_then(|p| image::image_dimensions(p).ok());
+                    if let (Some(path), Some((px_w, px_h))) = (local, dims) {
+                        r.ensure_blank();
+                        // Cells are roughly twice as tall as wide; the
+                        // preview column is ~72 cells. Clamped so a tall
+                        // banner cannot swallow the viewport.
+                        let rows = ((px_h as f32 / px_w.max(1) as f32) * 72.0 / 2.0)
+                            .round()
+                            .clamp(3.0, 18.0) as u16;
+                        let first_line = r.out.len();
+                        for _ in 0..rows {
+                            r.out.push(Line::default());
+                        }
+                        r.images.push(MdImage {
+                            first_line,
+                            rows,
+                            path,
+                        });
+                    } else {
+                        r.begin_content();
+                        let style = Style::default().fg(DIM).add_modifier(Modifier::ITALIC);
+                        r.cur.push(Span::styled("\u{f03e} ", style));
+                        r.cur.push(Span::styled(format!("({dest_url}) "), style));
+                    }
                 }
                 Tag::Table(_) => {
                     r.ensure_blank();
@@ -435,14 +490,32 @@ pub fn render_markdown(
     }
     r.flush_line();
     // Trim the leading/trailing blank separators so the preview starts at
-    // the first real line.
-    while r.out.first().is_some_and(|l| l.spans.is_empty()) {
+    // the first real line - shifting the image anchors with the front
+    // trim, and never eating a trailing image's RESERVED blanks.
+    let reserved_end = r
+        .images
+        .iter()
+        .map(|i| i.first_line + i.rows as usize)
+        .max()
+        .unwrap_or(0);
+    let mut removed_front = 0usize;
+    while r.out.first().is_some_and(|l| l.spans.is_empty())
+        && r.images
+            .first()
+            .is_none_or(|i| removed_front < i.first_line)
+    {
         r.out.remove(0);
+        removed_front += 1;
     }
-    while r.out.last().is_some_and(|l| l.spans.is_empty()) {
+    for img in &mut r.images {
+        img.first_line -= removed_front;
+    }
+    while r.out.len() > reserved_end.saturating_sub(removed_front)
+        && r.out.last().is_some_and(|l| l.spans.is_empty())
+    {
         r.out.pop();
     }
-    r.out
+    (r.out, r.images)
 }
 
 #[cfg(test)]
@@ -455,6 +528,56 @@ mod tests {
 
     fn text_of(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn local_images_reserve_anchored_rows_and_urls_stay_placeholders() {
+        let tmp = tempfile::tempdir().unwrap();
+        image::RgbaImage::new(100, 50)
+            .save(tmp.path().join("pic.png"))
+            .unwrap();
+        let text = "# Title\n\n![local](pic.png)\n\n![remote](https://x/y.png)\n\n![gone](nope.png)\n\ntail";
+        let mut reg = crate::highlight::LangRegistry::default();
+        let (lines, images) =
+            super::render_markdown_with_images(text, Theme::BLACK, &mut reg, Some(tmp.path()));
+        assert_eq!(images.len(), 1, "only the local existing image reserves");
+        let img = &images[0];
+        assert!(img.path.ends_with("pic.png"));
+        // 100x50 at the 72-col budget: (50/100)*72/2 = 18 rows.
+        assert_eq!(img.rows, 18);
+        for i in 0..img.rows as usize {
+            assert!(
+                lines[img.first_line + i].spans.is_empty(),
+                "reserved line {i} must be blank"
+            );
+        }
+        let all = all_text(&lines);
+        assert!(all.contains("https://x/y.png"), "URL keeps the placeholder");
+        assert!(
+            all.contains("nope.png"),
+            "missing file keeps the placeholder"
+        );
+        assert!(all.contains("tail"));
+    }
+
+    #[test]
+    fn a_leading_image_survives_the_blank_trim_with_true_anchors() {
+        let tmp = tempfile::tempdir().unwrap();
+        image::RgbaImage::new(100, 200)
+            .save(tmp.path().join("tall.png"))
+            .unwrap();
+        let text = "![t](tall.png)";
+        let mut reg = crate::highlight::LangRegistry::default();
+        let (lines, images) =
+            super::render_markdown_with_images(text, Theme::BLACK, &mut reg, Some(tmp.path()));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].first_line, 0, "front trim shifted the anchor");
+        assert_eq!(images[0].rows, 18, "tall image clamps at 18");
+        assert!(
+            lines.len() >= images[0].rows as usize,
+            "the tail trim must not eat reserved rows: {} lines",
+            lines.len()
+        );
     }
 
     fn all_text(lines: &[Line]) -> String {
