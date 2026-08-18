@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "The Markdown preview (Cmd+Shift+V) now renders LOCAL images inline: pictures referenced by relative or absolute paths paint as real inline images (Kitty, iTerm2, or sixel) in an aspect-sized block at their place in the document, scrolling with the text and re-rendering when the picture changes on disk. Remote URLs and missing files keep the labelled placeholder - the preview never fetches from the network.",
+    summary: "Archives now open as a browsable member list: zip, jar, wheel, tar, and tar.gz files show every member with its size, Enter (or a second click) extracts the selected member to a scratch copy and opens it with its REAL viewer - a PNG member renders as an image, a CSV as a sheet, a binary in hex - and E extracts a member to a folder of your choice. Extraction is containment-checked, so hostile archives cannot write outside the destination.",
 }];
