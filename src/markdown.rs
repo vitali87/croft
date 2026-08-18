@@ -279,6 +279,9 @@ impl Renderer<'_> {
 }
 
 /// Render markdown `text` into styled preview lines.
+/// Image-less build: used by tests and any caller with no source
+/// directory to resolve pictures against.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn render_markdown(
     text: &str,
     theme: Theme,
