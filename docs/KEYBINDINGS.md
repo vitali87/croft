@@ -317,14 +317,22 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 
 **Spreadsheet (`.csv`, `.tsv`, `.xlsx`, `.xls`, `.xlsb`, `.ods`)**
 
+CSV and TSV grids are editable; workbook formats (xlsx/xls/ods/xlsb) are read-only until #178.
+
 | Keys | Action |
 |------|--------|
-| `↑` / `↓` / `←` / `→` | Pan one row / column |
-| `PageUp` / `PageDown` | Pan a full viewport vertically |
-| `Home` | Jump to row 1, column 1 |
-| `End` | Jump to the last visible page |
+| `↑` / `↓` / `←` / `→` | Move the cell cursor (viewport follows) |
+| `PageUp` / `PageDown` | Move a full viewport vertically |
+| `Home` / `End` | First / last column; with `Cmd`/`Ctrl` also first / last row |
+| Type a character | Start editing the cell, REPLACING its value (spreadsheet convention) |
+| `Enter` / `F2` | Edit the cell in place (caret at the end) |
+| `Enter` (while editing) | Commit and move down; `Tab` commits and moves right; `Esc` cancels |
+| `Delete` | Clear the cell |
+| `Cmd+S` | Save with the file's own delimiter and quoting; refuses once on an external change, twice overwrites |
+| Click a cell | Select it; a second click on the selected cell opens the editor |
+| Palette: Sheet: Insert Row Below / Delete Row / Insert Column Right / Delete Column | Structure edits anchored on the selected cell |
 | Wheel down / up over the grid | Pan three rows |
-| `Tab` / `Shift+Tab` | Switch worksheet |
+| `Tab` / `Shift+Tab` | Switch worksheet (multi-sheet workbooks) |
 
 **Hex viewer (any binary file; `File: Reopen as Hex` for the rest)**
 

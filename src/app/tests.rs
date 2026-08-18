@@ -168,6 +168,23 @@ fn persistence_advisory_only_for_nonpersistent_remote_sessions() {
 }
 
 #[test]
+fn terminal_warning_renders_inside_a_narrow_frame_without_panicking() {
+    // #192: the modal's width clamp had a lower bound of 50, so any
+    // terminal narrower than that produced a rect wider than the buffer
+    // and the paint panicked at launch.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pending_terminal_warning = true;
+    let backend = ratatui::backend::TestBackend::new(46, 12);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // And pathologically small: still no panic.
+    let backend = ratatui::backend::TestBackend::new(8, 3);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+}
+
+#[test]
 fn terminal_warning_swallows_a_key_and_dismisses_for_the_session() {
     // While the unsupported-terminal nudge is up, any non-D key dismisses it
     // for this session and is swallowed so it never reaches the editor below.
@@ -7290,6 +7307,50 @@ fn change_workspace_root_writes_cd_into_active_terminal_pty() {
         app.workspace_root(),
         target_dir,
         "workspace_root must still flip to the new path"
+    );
+}
+
+#[test]
+fn sheet_grid_editing_types_commits_and_saves_with_the_delimiter() {
+    // #177 end-to-end: cell cursor, type-to-replace, commit-and-advance,
+    // dirty mirroring, the serialisation save path, and a structure op.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("data.csv");
+    std::fs::write(&p, "a,b\n1,2\n3,4\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.sheet.is_some());
+
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Char('9'), KeyModifiers::NONE));
+    assert!(
+        app.editor.sheet.as_ref().unwrap().editing.is_some(),
+        "typing opens the in-grid editor, replacing the value"
+    );
+    app.handle_sheet_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let view = app.editor.sheet.as_ref().unwrap();
+    assert_eq!(view.sheets[0].cell(0, 1), "9!", "Enter commits");
+    assert_eq!(view.sheets[0].cur_row, 1, "and advances down");
+    assert!(view.dirty && app.editor.dirty);
+
+    app.save();
+    assert!(!app.editor.dirty);
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), "a,b\n1,9!\n3,4\n");
+
+    // Structure op on the selected row (row index 1: "3,4").
+    app.sheet_structure_op(crate::widgets::command_palette::Command::SheetDeleteRow);
+    assert!(app.editor.dirty);
+    app.save();
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), "a,b\n1,9!\n");
+
+    // Esc cancels an edit without committing.
+    app.handle_sheet_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.editor.sheet.as_ref().unwrap().editing.is_none());
+    assert_eq!(
+        app.editor.sheet.as_ref().unwrap().sheets[0].cell(0, 1),
+        "9!"
     );
 }
 
@@ -25194,6 +25255,12 @@ fn current_pdf_page(app: &App) -> u32 {
         .current_page
 }
 
+fn sheet_cursor(app: &App) -> (usize, usize) {
+    let sheet = app.editor.sheet.as_ref().expect("a spreadsheet tab");
+    let data = &sheet.sheets[sheet.current_sheet];
+    (data.cur_row, data.cur_col)
+}
+
 fn sheet_scroll(app: &App) -> (usize, usize) {
     let sheet = app.editor.sheet.as_ref().expect("a spreadsheet tab");
     let data = &sheet.sheets[sheet.current_sheet];
@@ -25485,13 +25552,17 @@ fn a_spreadsheet_opened_from_the_explorer_scrolls_with_the_arrow_keys() {
 
     app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(sheet_scroll(&app).0, 1, "Down scrolls the sheet by a row");
+    assert_eq!(
+        sheet_cursor(&app).0,
+        1,
+        "Down moves the cell cursor down a row (#177)"
+    );
     app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(
-        sheet_scroll(&app).1,
+        sheet_cursor(&app).1,
         1,
-        "Right scrolls the sheet by a column"
+        "Right moves the cell cursor a column"
     );
 }
 
@@ -25819,7 +25890,11 @@ fn a_spreadsheet_opened_with_one_click_scrolls_with_the_arrow_keys() {
     click_open_in_explorer(&mut app, "data.csv");
     app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(sheet_scroll(&app).0, 1, "Down must scroll the grid");
+    assert_eq!(
+        sheet_cursor(&app).0,
+        1,
+        "Down must act on the grid (cell cursor), not the file list"
+    );
 }
 
 /// Selecting a folder row must not move focus: the click is a tree gesture and

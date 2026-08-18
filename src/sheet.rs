@@ -38,6 +38,30 @@ pub struct SheetView {
     /// One entry per worksheet (single entry for CSV/TSV).
     pub sheets: Vec<SheetData>,
     pub current_sheet: usize,
+    /// Unsaved cell/row/column changes (#177). Mirrored into the
+    /// editor's dirty flag so tab dots, close guards, and the FS-sync
+    /// conflict contract all behave exactly like text tabs.
+    pub dirty: bool,
+    /// The in-grid cell editor when a cell is being typed into.
+    pub editing: Option<CellEdit>,
+    /// Frame-truth layout for mouse hit-testing, written by the render.
+    pub grid: SheetGridLayout,
+}
+
+/// In-grid cell input state (#177): plain value + char cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellEdit {
+    pub value: String,
+    pub cursor: usize,
+}
+
+/// Geometry of the last painted grid frame (mouse hit-testing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SheetGridLayout {
+    pub data_top: u16,
+    pub data_rows: u16,
+    pub body_x: u16,
+    pub body_w: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +75,10 @@ pub struct SheetData {
     pub col_widths: Vec<u16>,
     pub scroll_row: usize,
     pub scroll_col: usize,
+    /// Selected cell (#177): body-row and column indices. Arrow keys
+    /// move it; the viewport follows.
+    pub cur_row: usize,
+    pub cur_col: usize,
 }
 
 impl SheetData {
@@ -113,6 +141,9 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
                 source_byte_size: meta.len(),
                 sheets: vec![sheet],
                 current_sheet: 0,
+                dirty: false,
+                editing: None,
+                grid: SheetGridLayout::default(),
             })
         }
         SheetKind::Xlsx | SheetKind::Xls | SheetKind::Ods | SheetKind::Xlsb => {
@@ -132,6 +163,9 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
                 source_byte_size: meta.len(),
                 sheets,
                 current_sheet: 0,
+                dirty: false,
+                editing: None,
+                grid: SheetGridLayout::default(),
             })
         }
     }
@@ -157,7 +191,99 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
         col_widths,
         scroll_row: 0,
         scroll_col: 0,
+        cur_row: 0,
+        cur_col: 0,
     })
+}
+
+impl SheetData {
+    /// Overwrite one body cell (#177), growing a short row (the csv
+    /// reader is `flexible`, so ragged rows are real) and refreshing the
+    /// column widths so the grid re-lays-out immediately.
+    pub fn set_cell(&mut self, row: usize, col: usize, value: String) {
+        let Some(r) = self.rows.get_mut(row) else {
+            return;
+        };
+        if r.len() <= col {
+            r.resize(col + 1, String::new());
+        }
+        r[col] = value;
+        self.recompute_widths();
+    }
+
+    pub fn cell(&self, row: usize, col: usize) -> &str {
+        self.rows
+            .get(row)
+            .and_then(|r| r.get(col))
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    pub fn insert_row(&mut self, at: usize) {
+        let cols = self.col_count().max(1);
+        let at = at.min(self.rows.len());
+        self.rows.insert(at, vec![String::new(); cols]);
+        self.recompute_widths();
+    }
+
+    pub fn delete_row(&mut self, at: usize) -> bool {
+        if at >= self.rows.len() {
+            return false;
+        }
+        self.rows.remove(at);
+        self.recompute_widths();
+        true
+    }
+
+    pub fn insert_col(&mut self, at: usize) {
+        if !self.headers.is_empty() {
+            let hat = at.min(self.headers.len());
+            self.headers.insert(hat, String::new());
+        }
+        for r in &mut self.rows {
+            let rat = at.min(r.len());
+            r.insert(rat, String::new());
+        }
+        self.recompute_widths();
+    }
+
+    pub fn delete_col(&mut self, at: usize) -> bool {
+        if at >= self.col_count() {
+            return false;
+        }
+        if at < self.headers.len() {
+            self.headers.remove(at);
+        }
+        for r in &mut self.rows {
+            if at < r.len() {
+                r.remove(at);
+            }
+        }
+        self.recompute_widths();
+        true
+    }
+
+    fn recompute_widths(&mut self) {
+        let headers = (!self.headers.is_empty()).then_some(&self.headers);
+        self.col_widths = compute_col_widths(headers, &self.rows);
+    }
+}
+
+/// Serialize the sheet back to delimited bytes: the header row first
+/// (it is the file's own row 0, split off at parse), then the body,
+/// quoted per csv rules with the delimiter the file was READ with.
+pub fn serialize_delimited(data: &SheetData, delim: u8) -> Vec<u8> {
+    let mut w = csv::WriterBuilder::new()
+        .delimiter(delim)
+        .flexible(true)
+        .from_writer(Vec::new());
+    if !data.headers.is_empty() {
+        let _ = w.write_record(&data.headers);
+    }
+    for r in &data.rows {
+        let _ = w.write_record(r);
+    }
+    w.into_inner().unwrap_or_default()
 }
 
 fn split_header(mut rows: Vec<Vec<String>>) -> (Option<Vec<String>>, Vec<Vec<String>>) {
@@ -237,6 +363,8 @@ fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>
             col_widths,
             scroll_row: 0,
             scroll_col: 0,
+            cur_row: 0,
+            cur_col: 0,
         });
     }
     let _ = Data::Empty; // keeps the import explicit even if unused above
@@ -266,6 +394,47 @@ fn format_float(f: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cell_edits_grow_ragged_rows_and_serialize_with_quoting() {
+        let mut d = super::parse_delimited(b"a,b,c\n1,2\n", b',', "S").unwrap();
+        assert_eq!(d.headers, vec!["a", "b", "c"]);
+        d.set_cell(0, 2, String::from("x,y"));
+        assert_eq!(d.cell(0, 2), "x,y", "short row grew to hold the cell");
+        let out = super::serialize_delimited(&d, b',');
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "a,b,c\n1,2,\"x,y\"\n",
+            "delimiter-bearing cells are quoted, header row survives"
+        );
+    }
+
+    #[test]
+    fn row_and_column_ops_keep_headers_and_widths_in_step() {
+        let mut d = super::parse_delimited(b"a,b\n1,2\n3,4\n", b',', "S").unwrap();
+        d.insert_row(1);
+        assert_eq!(d.rows.len(), 3);
+        assert_eq!(d.cell(1, 0), "");
+        assert!(d.delete_row(1));
+        d.insert_col(1);
+        assert_eq!(d.headers, vec!["a", "", "b"]);
+        assert_eq!(d.cell(0, 2), "2");
+        assert_eq!(d.col_count(), 3);
+        assert!(d.delete_col(1));
+        assert_eq!(d.headers, vec!["a", "b"]);
+        assert_eq!(d.cell(1, 1), "4");
+        assert!(!d.delete_col(9), "out of range refuses");
+        let out = super::serialize_delimited(&d, b',');
+        assert_eq!(String::from_utf8(out).unwrap(), "a,b\n1,2\n3,4\n");
+    }
+
+    #[test]
+    fn tsv_round_trips_with_its_own_delimiter() {
+        let mut d = super::parse_delimited(b"x\ty\n1\t2\n", b'\t', "S").unwrap();
+        d.set_cell(0, 0, String::from("9"));
+        let out = super::serialize_delimited(&d, b'\t');
+        assert_eq!(String::from_utf8(out).unwrap(), "x\ty\n9\t2\n");
+    }
+
     use super::*;
 
     #[test]

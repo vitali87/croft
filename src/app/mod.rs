@@ -13305,8 +13305,11 @@ impl App {
             return;
         }
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
-        let height: u16 = 11;
+        // The lower clamp bound must never beat the frame itself: on a
+        // terminal narrower than 50 columns the modal used to come out
+        // WIDER than the buffer and the paint panicked at launch (#192).
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let height: u16 = 11u16.min(area.height);
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
         let rect = Rect {
@@ -24725,6 +24728,10 @@ impl App {
                 None => self.status = String::from("No file in the active tab"),
             },
             Cmd::HexFindNext => self.hex_find_next(),
+            Cmd::SheetInsertRowBelow
+            | Cmd::SheetDeleteRow
+            | Cmd::SheetInsertColRight
+            | Cmd::SheetDeleteCol => self.sheet_structure_op(cmd),
             Cmd::ReopenAsPreview => match self.editor.path.clone() {
                 Some(_) if self.editor.dirty => {
                     self.status =
@@ -28329,6 +28336,31 @@ impl App {
                     // pane only, so anchoring one in the editor drops any
                     // leftover terminal selection (issue #23).
                     self.terminal_mut().clear_selection();
+                    // Sheet tab (#177): a click selects the cell under the
+                    // pointer; the second click on the SAME selected cell
+                    // opens the in-grid editor (editable kinds only).
+                    if let Some(view) = self.editor.sheet.as_mut() {
+                        if let Some((r, c)) = sheet_cell_at(view, m.column, m.row) {
+                            let editable = matches!(
+                                view.kind,
+                                crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv
+                            );
+                            let current = view.current_sheet;
+                            let data = &mut view.sheets[current];
+                            let was_here = data.cur_row == r && data.cur_col == c;
+                            data.cur_row = r;
+                            data.cur_col = c;
+                            if was_here && editable && view.editing.is_none() {
+                                let value = view.sheets[current].cell(r, c).to_string();
+                                let cursor = value.len();
+                                view.editing = Some(crate::sheet::CellEdit { value, cursor });
+                            } else if !was_here {
+                                view.editing = None;
+                            }
+                        }
+                        self.poke_cursor();
+                        return;
+                    }
                     // Hex tab (#172): a click on a byte cell — hex grid or
                     // ASCII gutter — parks the cursor there; Shift extends
                     // the selection; a drag from here extends it live.
@@ -29437,6 +29469,32 @@ impl App {
                     );
                 }
                 Ok(_) => unreachable!("hex_save reports Saved or DiskConflict"),
+                Err(e) => self.status = format!("Save failed: {e}"),
+            }
+            return;
+        }
+        // A CSV/TSV sheet with grid edits saves through its own
+        // serialisation path (#177), same shape as the hex branch above.
+        if self.editor.sheet.as_ref().is_some_and(|v| v.dirty) {
+            use crate::widgets::editor::SaveOutcome;
+            let force = std::mem::take(&mut self.force_save_armed);
+            match self.editor.sheet_save(force) {
+                Ok(SaveOutcome::Saved) => {
+                    self.status = self.editor.status.clone();
+                }
+                Ok(SaveOutcome::DiskConflict) => {
+                    self.force_save_armed = true;
+                    let name = self
+                        .editor
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    self.status = format!(
+                        "{name} changed on disk since you opened it - press Cmd+S again to overwrite"
+                    );
+                }
+                Ok(_) => unreachable!("sheet_save reports Saved or DiskConflict"),
                 Err(e) => self.status = format!("Save failed: {e}"),
             }
             return;
@@ -31858,8 +31916,93 @@ impl App {
         let Some(sheet) = self.editor.sheet.as_mut() else {
             return;
         };
+        let editable = matches!(
+            sheet.kind,
+            crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv
+        );
         let total_sheets = sheet.sheets.len();
         let current = sheet.current_sheet;
+        let plain = !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SUPER)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+        // In-grid cell editor (#177): it owns every key while open.
+        if sheet.editing.is_some() {
+            let (commit, next) = {
+                let edit = sheet.editing.as_mut().expect("checked");
+                match key.code {
+                    KeyCode::Esc => {
+                        sheet.editing = None;
+                        return;
+                    }
+                    KeyCode::Enter => (true, (1i64, 0i64)),
+                    KeyCode::Tab => (true, (0, 1)),
+                    KeyCode::BackTab => (true, (0, -1)),
+                    KeyCode::Backspace => {
+                        if edit.cursor > 0 {
+                            let i = floor_char(&edit.value, edit.cursor - 1);
+                            edit.value.remove(i);
+                            edit.cursor = i;
+                        }
+                        (false, (0, 0))
+                    }
+                    KeyCode::Delete => {
+                        if edit.cursor < edit.value.len() {
+                            edit.value.remove(edit.cursor);
+                        }
+                        (false, (0, 0))
+                    }
+                    KeyCode::Left => {
+                        if edit.cursor > 0 {
+                            edit.cursor = floor_char(&edit.value, edit.cursor - 1);
+                        }
+                        (false, (0, 0))
+                    }
+                    KeyCode::Right => {
+                        if edit.cursor < edit.value.len() {
+                            edit.cursor = ceil_char(&edit.value, edit.cursor + 1);
+                        }
+                        (false, (0, 0))
+                    }
+                    KeyCode::Home => {
+                        edit.cursor = 0;
+                        (false, (0, 0))
+                    }
+                    KeyCode::End => {
+                        edit.cursor = edit.value.len();
+                        (false, (0, 0))
+                    }
+                    KeyCode::Char(c) if plain => {
+                        edit.value.insert(edit.cursor, c);
+                        edit.cursor += c.len_utf8();
+                        (false, (0, 0))
+                    }
+                    _ => (false, (0, 0)),
+                }
+            };
+            if commit {
+                let edit = sheet.editing.take().expect("checked");
+                let (r, c) = {
+                    let data = &mut sheet.sheets[current];
+                    data.set_cell(data.cur_row, data.cur_col, edit.value);
+                    (data.cur_row, data.cur_col)
+                };
+                sheet.dirty = true;
+                self.editor.dirty = true;
+                let data = &mut self.editor.sheet.as_mut().expect("checked").sheets[current];
+                data.cur_row = r
+                    .saturating_add_signed(next.0 as isize)
+                    .min(data.row_count().saturating_sub(1));
+                data.cur_col = c
+                    .saturating_add_signed(next.1 as isize)
+                    .min(data.col_count().saturating_sub(1));
+                sheet_follow_cursor(
+                    self.editor.sheet.as_mut().expect("checked"),
+                    current,
+                    visible,
+                );
+            }
+            return;
+        }
         let data = match sheet.sheets.get_mut(current) {
             Some(d) => d,
             None => return,
@@ -31867,39 +32010,79 @@ impl App {
         let row_count = data.rows.len();
         let col_count = data.col_widths.len();
         match key.code {
-            KeyCode::Down if data.scroll_row + 1 < row_count => {
-                data.scroll_row += 1;
+            KeyCode::Down => {
+                data.cur_row = (data.cur_row + 1).min(row_count.saturating_sub(1));
             }
-            KeyCode::Up => {
-                data.scroll_row = data.scroll_row.saturating_sub(1);
+            KeyCode::Up => data.cur_row = data.cur_row.saturating_sub(1),
+            KeyCode::Right => {
+                data.cur_col = (data.cur_col + 1).min(col_count.saturating_sub(1));
             }
-            KeyCode::Right if data.scroll_col + 1 < col_count => {
-                data.scroll_col += 1;
-            }
-            KeyCode::Left => {
-                data.scroll_col = data.scroll_col.saturating_sub(1);
-            }
+            KeyCode::Left => data.cur_col = data.cur_col.saturating_sub(1),
             KeyCode::PageDown => {
-                data.scroll_row = (data.scroll_row + visible).min(row_count.saturating_sub(1));
+                data.cur_row = (data.cur_row + visible).min(row_count.saturating_sub(1));
             }
-            KeyCode::PageUp => {
-                data.scroll_row = data.scroll_row.saturating_sub(visible);
-            }
+            KeyCode::PageUp => data.cur_row = data.cur_row.saturating_sub(visible),
             KeyCode::Home => {
-                data.scroll_row = 0;
-                data.scroll_col = 0;
+                data.cur_col = 0;
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::SUPER)
+                {
+                    data.cur_row = 0;
+                }
             }
             KeyCode::End => {
-                data.scroll_row = row_count.saturating_sub(visible.max(1));
+                data.cur_col = col_count.saturating_sub(1);
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::SUPER)
+                {
+                    data.cur_row = row_count.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter | KeyCode::F(2) => {
+                if editable {
+                    if row_count > 0 {
+                        let value = data.cell(data.cur_row, data.cur_col).to_string();
+                        let cursor = value.len();
+                        sheet.editing = Some(crate::sheet::CellEdit { value, cursor });
+                    }
+                } else {
+                    self.status =
+                        String::from("This workbook view is read-only (editing lands with #178)");
+                }
+                return;
+            }
+            KeyCode::Delete if editable && row_count > 0 => {
+                data.set_cell(data.cur_row, data.cur_col, String::new());
+                sheet.dirty = true;
+                self.editor.dirty = true;
+                return;
             }
             KeyCode::Tab if total_sheets > 1 => {
                 sheet.current_sheet = (current + 1) % total_sheets;
+                return;
             }
             KeyCode::BackTab if total_sheets > 1 => {
                 sheet.current_sheet = (current + total_sheets - 1) % total_sheets;
+                return;
             }
-            _ => {}
+            KeyCode::Char(c) if plain && (' '..='~').contains(&c) => {
+                if editable {
+                    if row_count > 0 {
+                        // Spreadsheet convention: typing REPLACES the cell.
+                        sheet.editing = Some(crate::sheet::CellEdit {
+                            value: String::from(c),
+                            cursor: c.len_utf8(),
+                        });
+                    }
+                } else {
+                    self.status =
+                        String::from("This workbook view is read-only (editing lands with #178)");
+                }
+                return;
+            }
+            _ => return,
         }
+        sheet_follow_cursor(sheet, current, visible);
     }
 
     /// Hex-tab navigation (#172): cursor movement over bytes, Shift
@@ -32021,6 +32204,61 @@ impl App {
     /// cursor. The query itself is set by the find prompt
     /// (`InputPurpose::HexFind`), whose submit searches cursor-INCLUSIVE
     /// via `hex_find_run` directly.
+    /// Sheet row/column structure ops (#177), palette-driven, anchored
+    /// on the selected cell. CSV/TSV only; the workbook kinds are still
+    /// read-only (#178).
+    fn sheet_structure_op(&mut self, cmd: crate::widgets::command_palette::Command) {
+        use crate::widgets::command_palette::Command as Cmd;
+        let Some(view) = self.editor.sheet.as_mut() else {
+            self.status = String::from("The active tab is not a spreadsheet");
+            return;
+        };
+        if !matches!(
+            view.kind,
+            crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv
+        ) {
+            self.status = String::from("This workbook view is read-only (editing lands with #178)");
+            return;
+        }
+        view.editing = None;
+        let current = view.current_sheet;
+        let Some(data) = view.sheets.get_mut(current) else {
+            return;
+        };
+        let (r, c) = (data.cur_row, data.cur_col);
+        let changed = match cmd {
+            Cmd::SheetInsertRowBelow => {
+                let at = if data.row_count() == 0 { 0 } else { r + 1 };
+                data.insert_row(at);
+                data.cur_row = at;
+                true
+            }
+            Cmd::SheetDeleteRow => {
+                let did = data.delete_row(r);
+                data.cur_row = r.min(data.row_count().saturating_sub(1));
+                did
+            }
+            Cmd::SheetInsertColRight => {
+                let at = if data.col_count() == 0 { 0 } else { c + 1 };
+                data.insert_col(at);
+                data.cur_col = at;
+                true
+            }
+            Cmd::SheetDeleteCol => {
+                let did = data.delete_col(c);
+                data.cur_col = c.min(data.col_count().saturating_sub(1));
+                did
+            }
+            _ => false,
+        };
+        if changed {
+            view.dirty = true;
+            self.editor.dirty = true;
+        } else {
+            self.status = String::from("Nothing to remove there");
+        }
+    }
+
     fn hex_find_next(&mut self) {
         let Some(view) = self.editor.hex.as_ref() else {
             return;
@@ -34802,6 +35040,83 @@ fn hex_digit(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+/// Map a screen cell to a sheet grid cell (#177) using the frame-truth
+/// layout the render wrote: row from the vertical band, column by
+/// walking the visible column widths from `scroll_col`.
+fn sheet_cell_at(view: &crate::sheet::SheetView, col: u16, row: u16) -> Option<(usize, usize)> {
+    let g = view.grid;
+    if g.data_rows == 0 || row < g.data_top || row >= g.data_top + g.data_rows {
+        return None;
+    }
+    let data = view.sheets.get(view.current_sheet)?;
+    let r = data.scroll_row + (row - g.data_top) as usize;
+    if r >= data.row_count() {
+        return None;
+    }
+    if col < g.body_x {
+        return None;
+    }
+    let mut x_off = 0u16;
+    for (c, w) in data.col_widths.iter().enumerate().skip(data.scroll_col) {
+        if x_off + w + 1 > g.body_w {
+            break;
+        }
+        if col >= g.body_x + x_off && col < g.body_x + x_off + w {
+            return Some((r, c));
+        }
+        x_off += w + 1;
+    }
+    None
+}
+
+/// Char-boundary helpers for the in-grid cell editor (#177): byte
+/// cursor stepped to valid boundaries.
+fn floor_char(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Keep the selected cell visible: rows directly, columns by advancing
+/// `scroll_col` until the cumulative widths place `cur_col` inside the
+/// last painted body width (frame truth from the render).
+fn sheet_follow_cursor(view: &mut crate::sheet::SheetView, idx: usize, visible: usize) {
+    let body_w = view.grid.body_w.max(8) as usize;
+    let Some(data) = view.sheets.get_mut(idx) else {
+        return;
+    };
+    if data.cur_row < data.scroll_row {
+        data.scroll_row = data.cur_row;
+    } else if visible > 0 && data.cur_row >= data.scroll_row + visible {
+        data.scroll_row = data.cur_row + 1 - visible;
+    }
+    if data.cur_col < data.scroll_col {
+        data.scroll_col = data.cur_col;
+    } else {
+        // Advance until the cursor column's right edge fits.
+        while data.scroll_col < data.cur_col {
+            let used: usize = data.col_widths[data.scroll_col..=data.cur_col]
+                .iter()
+                .map(|&w| w as usize + 1)
+                .sum();
+            if used <= body_w {
+                break;
+            }
+            data.scroll_col += 1;
+        }
     }
 }
 
