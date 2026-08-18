@@ -236,6 +236,14 @@ impl SheetData {
     }
 
     pub fn insert_col(&mut self, at: usize) {
+        // A fully EMPTY sheet gains its header cell too (#193 review):
+        // without one, the first saved body row would be re-read as the
+        // header on reopen and vanish from the editable grid.
+        if self.headers.is_empty() && self.rows.is_empty() {
+            self.headers.push(String::new());
+            self.recompute_widths();
+            return;
+        }
         if !self.headers.is_empty() {
             let hat = at.min(self.headers.len());
             self.headers.insert(hat, String::new());
@@ -425,6 +433,21 @@ mod tests {
         assert!(!d.delete_col(9), "out of range refuses");
         let out = super::serialize_delimited(&d, b',');
         assert_eq!(String::from_utf8(out).unwrap(), "a,b\n1,2\n3,4\n");
+    }
+
+    #[test]
+    fn empty_sheet_grows_structure_that_survives_a_save_round_trip() {
+        // #193 review: on a fully empty sheet, insert column + row, edit,
+        // save, reopen - the body row must NOT be swallowed as the header.
+        let mut d = super::parse_delimited(b"", b',', "S").unwrap();
+        d.insert_col(0);
+        assert_eq!(d.headers, vec![String::new()], "the header cell exists");
+        d.insert_row(0);
+        d.set_cell(0, 0, String::from("v"));
+        let out = super::serialize_delimited(&d, b',');
+        let again = super::parse_delimited(&out, b',', "S").unwrap();
+        assert_eq!(again.rows.len(), 1, "the body row survives the reopen");
+        assert_eq!(again.cell(0, 0), "v");
     }
 
     #[test]

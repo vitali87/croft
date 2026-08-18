@@ -470,15 +470,18 @@ fn render_sheet(
                 if let Some(edit) = editing.as_ref() {
                     // In-grid editor (#177): show the tail that keeps the
                     // caret visible, caret cell reversed.
+                    // Window in CHARACTERS (#193 review: the cursor is
+                    // a byte offset, and byte math shortened the tail
+                    // for multi-byte text), then convert to a byte start.
                     let avail = w as usize;
-                    let start = edit.cursor.saturating_sub(avail.saturating_sub(1));
-                    let start = {
-                        let mut s = start.min(edit.value.len());
-                        while s > 0 && !edit.value.is_char_boundary(s) {
-                            s -= 1;
-                        }
-                        s
-                    };
+                    let chars_before = edit.value[..edit.cursor].chars().count();
+                    let skip = chars_before.saturating_sub(avail.saturating_sub(1));
+                    let start = edit
+                        .value
+                        .char_indices()
+                        .nth(skip)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
                     let shown = &edit.value[start..];
                     let edit_style = Style::default().fg(Color::Black).bg(theme.accent());
                     write_cell(buf, body_x + *x_off, y, w, shown, edit_style);
@@ -2980,7 +2983,10 @@ impl Editor {
                 // The FS sweep never reloads a dirty tab, and Revert
                 // clears the flag first, re-arming the reload.
                 if self.path.as_deref() == Some(path)
-                    && self.sheet.as_ref().is_some_and(|v| v.dirty)
+                    && self
+                        .sheet
+                        .as_ref()
+                        .is_some_and(|v| v.dirty || v.editing.is_some())
                 {
                     return Ok(());
                 }

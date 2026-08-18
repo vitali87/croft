@@ -28346,16 +28346,28 @@ impl App {
                                 crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv
                             );
                             let current = view.current_sheet;
+                            // An in-progress edit COMMITS when the
+                            // click lands elsewhere (the spreadsheet
+                            // convention; #193 review - discarding it
+                            // silently lost the typed value).
+                            let (pr, pc) = {
+                                let d = &view.sheets[current];
+                                (d.cur_row, d.cur_col)
+                            };
+                            let was_here = pr == r && pc == c;
+                            if !was_here && let Some(edit) = view.editing.take() {
+                                view.sheets[current].set_cell(pr, pc, edit.value);
+                                view.dirty = true;
+                                self.editor.dirty = true;
+                            }
+                            let view = self.editor.sheet.as_mut().expect("checked");
                             let data = &mut view.sheets[current];
-                            let was_here = data.cur_row == r && data.cur_col == c;
                             data.cur_row = r;
                             data.cur_col = c;
                             if was_here && editable && view.editing.is_none() {
                                 let value = view.sheets[current].cell(r, c).to_string();
                                 let cursor = value.len();
                                 view.editing = Some(crate::sheet::CellEdit { value, cursor });
-                            } else if !was_here {
-                                view.editing = None;
                             }
                         }
                         self.poke_cursor();
@@ -29481,6 +29493,9 @@ impl App {
             match self.editor.sheet_save(force) {
                 Ok(SaveOutcome::Saved) => {
                     self.status = self.editor.status.clone();
+                    if let Some(path) = self.editor.path.clone() {
+                        self.record_history_snapshot(&path);
+                    }
                 }
                 Ok(SaveOutcome::DiskConflict) => {
                     self.force_save_armed = true;
@@ -32253,6 +32268,10 @@ impl App {
         };
         if changed {
             view.dirty = true;
+            let visible = sheet_visible_rows(self.editor.last_inner);
+            if let Some(view) = self.editor.sheet.as_mut() {
+                sheet_follow_cursor(view, current, visible);
+            }
             self.editor.dirty = true;
         } else {
             self.status = String::from("Nothing to remove there");
