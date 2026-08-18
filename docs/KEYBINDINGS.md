@@ -317,7 +317,7 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 
 **Spreadsheet (`.csv`, `.tsv`, `.xlsx`, `.xls`, `.xlsb`, `.ods`)**
 
-CSV and TSV grids are editable; workbook formats (xlsx/xls/ods/xlsb) are read-only until #178.
+CSV, TSV, and xlsx grids are editable (xlsx cell edits write through a real xlsx writer, preserving styles and untouched formulas; a formula cell needs a second Cmd+S to consent to its overwrite). xls/ods/xlsb stay read-only. Row/column structure commands are CSV/TSV only.
 
 | Keys | Action |
 |------|--------|

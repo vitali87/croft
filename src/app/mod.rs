@@ -28343,7 +28343,9 @@ impl App {
                         if let Some((r, c)) = sheet_cell_at(view, m.column, m.row) {
                             let editable = matches!(
                                 view.kind,
-                                crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv
+                                crate::sheet::SheetKind::Csv
+                                    | crate::sheet::SheetKind::Tsv
+                                    | crate::sheet::SheetKind::Xlsx
                             );
                             let current = view.current_sheet;
                             // An in-progress edit COMMITS when the
@@ -29495,6 +29497,12 @@ impl App {
                     self.status = self.editor.status.clone();
                     if let Some(path) = self.editor.path.clone() {
                         self.record_history_snapshot(&path);
+                    }
+                    // Formula cells held back (#178): the NEXT Cmd+S is
+                    // the explicit consent, same double-press contract
+                    // as disk conflicts.
+                    if self.editor.sheet.as_ref().is_some_and(|v| v.dirty) {
+                        self.force_save_armed = true;
                     }
                 }
                 Ok(SaveOutcome::DiskConflict) => {
@@ -31931,9 +31939,13 @@ impl App {
         let Some(sheet) = self.editor.sheet.as_mut() else {
             return;
         };
+        // Cell editing covers CSV/TSV and (via the umya write path,
+        // #178) xlsx; the legacy binary kinds stay read-only.
         let editable = matches!(
             sheet.kind,
-            crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv
+            crate::sheet::SheetKind::Csv
+                | crate::sheet::SheetKind::Tsv
+                | crate::sheet::SheetKind::Xlsx
         );
         let total_sheets = sheet.sheets.len();
         let current = sheet.current_sheet;
@@ -32001,6 +32013,9 @@ impl App {
                     data.set_cell(data.cur_row, data.cur_col, edit.value);
                     (data.cur_row, data.cur_col)
                 };
+                if !sheet.cell_edits.contains(&(current, r, c)) {
+                    sheet.cell_edits.push((current, r, c));
+                }
                 sheet.dirty = true;
                 self.editor.dirty = true;
                 let data = &mut self.editor.sheet.as_mut().expect("checked").sheets[current];
@@ -32061,13 +32076,16 @@ impl App {
                         sheet.editing = Some(crate::sheet::CellEdit { value, cursor });
                     }
                 } else {
-                    self.status =
-                        String::from("This workbook view is read-only (editing lands with #178)");
+                    self.status = String::from("This workbook format is read-only (xls/ods/xlsb)");
                 }
                 return;
             }
             KeyCode::Delete if editable && row_count > 0 => {
-                data.set_cell(data.cur_row, data.cur_col, String::new());
+                let (r, c) = (data.cur_row, data.cur_col);
+                data.set_cell(r, c, String::new());
+                if !sheet.cell_edits.contains(&(current, r, c)) {
+                    sheet.cell_edits.push((current, r, c));
+                }
                 sheet.dirty = true;
                 self.editor.dirty = true;
                 return;
@@ -32090,8 +32108,7 @@ impl App {
                         });
                     }
                 } else {
-                    self.status =
-                        String::from("This workbook view is read-only (editing lands with #178)");
+                    self.status = String::from("This workbook format is read-only (xls/ods/xlsb)");
                 }
                 return;
             }
@@ -32232,7 +32249,9 @@ impl App {
             view.kind,
             crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv
         ) {
-            self.status = String::from("This workbook view is read-only (editing lands with #178)");
+            self.status = String::from(
+                "Row/column structure edits are CSV/TSV only; xlsx supports cell edits",
+            );
             return;
         }
         view.editing = None;

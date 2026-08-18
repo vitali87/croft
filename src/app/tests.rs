@@ -7311,6 +7311,67 @@ fn change_workspace_root_writes_cd_into_active_terminal_pty() {
 }
 
 #[test]
+fn xlsx_grid_editing_saves_cells_and_holds_formulas_for_consent() {
+    // #178 end-to-end: xlsx cells edit like CSV, Cmd+S applies exactly
+    // the touched cells through umya, and a formula cell needs the
+    // second (forced) save to be overwritten.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("book.xlsx");
+    let mut book = umya_spreadsheet::new_file();
+    let ws = book.sheet_mut(0).unwrap();
+    ws.cell_mut((1u32, 1u32)).set_value("name");
+    ws.cell_mut((2u32, 1u32)).set_value("qty");
+    ws.cell_mut((1u32, 2u32)).set_value("apples");
+    ws.cell_mut((2u32, 2u32)).set_value_number(3);
+    ws.cell_mut((2u32, 3u32)).set_formula("SUM(B2)");
+    umya_spreadsheet::writer::xlsx::write(&book, &p).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.sheet.is_some());
+
+    // Edit qty (0,1) to 42.
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Char('4'), KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Char('2'), KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.editor.dirty);
+    // And overwrite the formula cell (1,1).
+    app.handle_sheet_key(key(KeyCode::Char('8'), KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Enter, KeyModifiers::NONE));
+
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        app.editor.dirty,
+        "the formula cell is held back, so the tab stays dirty: {}",
+        app.status
+    );
+    assert!(
+        app.status.contains("formula"),
+        "status names it: {}",
+        app.status
+    );
+    let book2 = umya_spreadsheet::reader::xlsx::read(&p).unwrap();
+    let ws2 = book2.sheet_by_name("Sheet1").unwrap();
+    assert_eq!(
+        ws2.cell((2u32, 2u32)).unwrap().value(),
+        "42",
+        "the plain cell landed on the first save"
+    );
+    assert!(ws2.cell((2u32, 3u32)).unwrap().is_formula());
+
+    // Second Cmd+S consents to the formula overwrite.
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(!app.editor.dirty, "everything saved: {}", app.status);
+    let book3 = umya_spreadsheet::reader::xlsx::read(&p).unwrap();
+    let ws3 = book3.sheet_by_name("Sheet1").unwrap();
+    assert!(!ws3.cell((2u32, 3u32)).unwrap().is_formula());
+    assert_eq!(ws3.cell((2u32, 3u32)).unwrap().value(), "8");
+}
+
+#[test]
 fn sheet_grid_editing_types_commits_and_saves_with_the_delimiter() {
     // #177 end-to-end: cell cursor, type-to-replace, commit-and-advance,
     // dirty mirroring, the serialisation save path, and a structure op.
