@@ -338,6 +338,8 @@ pub struct OverlayManager {
     /// The active terminal pane's newest inline image (captured OSC 1337
     /// imgcat output), anchored to its grid line.
     pub terminal_image: ImageOverlay<super::TerminalImageLayout>,
+    /// The markdown preview's topmost visible local image (#176).
+    pub markdown_image: ImageOverlay<super::MarkdownImageLayout>,
     pub minimap: ImageOverlay<super::MinimapLayout>,
     pub hero: ImageOverlay<super::WelcomeLayout>,
     pub ssh: ImageOverlay<()>,

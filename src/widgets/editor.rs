@@ -3710,10 +3710,24 @@ impl Editor {
         // user touches the file. Requires `self.theme` to already carry the
         // new theme (the caller assigns it first).
         if self.markdown_preview.is_some() {
+            // The image-aware builder (#196 review): the plain one left
+            // md.images pointing at anchors into the REPLACED lines, and
+            // the wrap-key recompute then sliced with stale first_line
+            // values - an out-of-range panic on a theme switch.
             let text = self.lines.join("\n");
-            let lines = crate::markdown::render_markdown(&text, self.theme, &mut self.registry);
+            let base = self
+                .path
+                .as_ref()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            let (lines, images) = crate::markdown::render_markdown_with_images(
+                &text,
+                self.theme,
+                &mut self.registry,
+                base.as_deref(),
+            );
             if let Some(md) = self.markdown_preview.as_mut() {
                 md.lines = lines;
+                md.images = images;
                 md.built_seq = self.edit_seq;
             }
         }
@@ -4028,11 +4042,24 @@ impl Editor {
             return false;
         }
         let text = self.lines.join("\n");
-        let lines = crate::markdown::render_markdown(&text, self.theme, &mut self.registry);
+        let base = self
+            .path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let (lines, images) = crate::markdown::render_markdown_with_images(
+            &text,
+            self.theme,
+            &mut self.registry,
+            base.as_deref(),
+        );
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             lines,
             scroll: 0,
             built_seq: self.edit_seq,
+            images,
+            anchor_rows: Vec::new(),
+            wrap_key: (0, 0),
+            last_area: Rect::default(),
         });
         true
     }
@@ -9452,10 +9479,22 @@ impl Editor {
             .as_ref()
             .is_some_and(|md| md.built_seq != self.edit_seq);
         if stale {
+            // The image-aware builder (#176): the plain one here left the
+            // images list pointing at STALE anchors after a live edit.
             let text = self.lines.join("\n");
-            let lines = crate::markdown::render_markdown(&text, self.theme, &mut self.registry);
+            let base = self
+                .path
+                .as_ref()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            let (lines, images) = crate::markdown::render_markdown_with_images(
+                &text,
+                self.theme,
+                &mut self.registry,
+                base.as_deref(),
+            );
             if let Some(md) = self.markdown_preview.as_mut() {
                 md.lines = lines;
+                md.images = images;
                 md.built_seq = self.edit_seq;
             }
         }
@@ -9475,6 +9514,24 @@ impl Editor {
         let total = para.line_count(text_area.width);
         let max_scroll = total.saturating_sub(inner.height as usize) as u16;
         md.scroll = md.scroll.min(max_scroll);
+        // Anchor mapping (#176): each image's first reserved line as a
+        // VISUAL row, through the same wrap the paragraph uses. Cached on
+        // (built_seq, width) - blank lines never wrap, so the prefix
+        // line_count is exact.
+        if md.wrap_key != (md.built_seq, text_area.width) {
+            md.anchor_rows = md
+                .images
+                .iter()
+                .map(|img| {
+                    let prefix: Vec<Line> = md.lines[..img.first_line].to_vec();
+                    Paragraph::new(Text::from(prefix))
+                        .wrap(Wrap { trim: false })
+                        .line_count(text_area.width)
+                })
+                .collect();
+            md.wrap_key = (md.built_seq, text_area.width);
+        }
+        md.last_area = text_area;
         para.scroll((md.scroll, 0)).render(text_area, buf);
         if let Some(metrics) = scrollbar::vertical_metrics(
             Rect {
