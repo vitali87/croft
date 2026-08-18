@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "The hex viewer is now a hex EDITOR: overwrite bytes by typing hex digits in the grid or characters in the ASCII gutter (Tab switches panes), with amber-tinted pending edits, undo/redo (Cmd+Z / Cmd+Shift+Z), per-byte revert (Delete), and Cmd+S writing the changed bytes in place - a two-byte fix to a multi-gigabyte file writes two bytes. Read-only files refuse edits up front, and external changes get the same conflict guard as text tabs.",
+    summary: "CSV and TSV files are now editable in the spreadsheet grid: arrow keys move a cell cursor, typing replaces the cell (Enter/F2 edits in place, Enter commits down, Tab commits right, Esc cancels), Delete clears, and palette commands insert or delete rows and columns. Cmd+S writes the file back with its own delimiter and quoting; unsaved grids wear a tab dot and the same external-change conflict guard as text files. Click a cell to select it; click again to edit.",
 }];

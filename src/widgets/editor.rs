@@ -329,12 +329,18 @@ fn render_hex(
 }
 
 fn render_sheet(
-    view: &crate::sheet::SheetView,
+    view: &mut crate::sheet::SheetView,
     path: Option<&Path>,
     inner: Rect,
     buf: &mut Buffer,
     bg: Color,
+    theme: crate::theme::Theme,
 ) {
+    // Frame truth: reset before any early return so stale geometry can
+    // never serve a mouse hit-test.
+    view.grid = crate::sheet::SheetGridLayout::default();
+    let editing = view.editing.clone();
+    let dirty = view.dirty;
     // Bg fill so the spreadsheet sits on a clean canvas regardless of
     // what the previous tab left behind (see [`canvas_bg`]).
     let bg_style = Style::default().bg(bg);
@@ -358,7 +364,7 @@ fn render_sheet(
     let row_count = sheet.row_count();
     let col_count = sheet.col_count();
     let header = format!(
-        " {} · {} · sheet {}/{} ({}) · {} rows × {} cols ",
+        " {} · {} · sheet {}/{} ({}) · {} rows × {} cols{} ",
         name,
         view.kind.label(),
         view.current_sheet + 1,
@@ -366,6 +372,7 @@ fn render_sheet(
         sheet.name,
         row_count,
         col_count,
+        if dirty { " · edited (Cmd+S)" } else { "" },
     );
     buf.set_string(
         inner.x,
@@ -458,9 +465,52 @@ fn render_sheet(
         for (c, x_off) in &visible {
             let cell_text = row.get(*c).map(|s| s.as_str()).unwrap_or("");
             let w = sheet.col_widths[*c];
-            write_cell(buf, body_x + *x_off, y, w, cell_text, style);
+            let is_cursor = row_idx == sheet.cur_row && *c == sheet.cur_col;
+            if is_cursor {
+                if let Some(edit) = editing.as_ref() {
+                    // In-grid editor (#177): show the tail that keeps the
+                    // caret visible, caret cell reversed.
+                    // Window in CHARACTERS (#193 review: the cursor is
+                    // a byte offset, and byte math shortened the tail
+                    // for multi-byte text), then convert to a byte start.
+                    let avail = w as usize;
+                    let chars_before = edit.value[..edit.cursor].chars().count();
+                    let skip = chars_before.saturating_sub(avail.saturating_sub(1));
+                    let start = edit
+                        .value
+                        .char_indices()
+                        .nth(skip)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    let shown = &edit.value[start..];
+                    let edit_style = Style::default().fg(Color::Black).bg(theme.accent());
+                    write_cell(buf, body_x + *x_off, y, w, shown, edit_style);
+                    let caret_cells = shown[..edit.cursor - start].chars().count() as u16;
+                    let cx = body_x + *x_off + caret_cells.min(w.saturating_sub(1));
+                    buf[(cx, y)].set_style(
+                        Style::default()
+                            .fg(theme.accent())
+                            .bg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                } else {
+                    let cursor_style = Style::default()
+                        .fg(Color::Black)
+                        .bg(theme.accent())
+                        .add_modifier(Modifier::BOLD);
+                    write_cell(buf, body_x + *x_off, y, w, cell_text, cursor_style);
+                }
+            } else {
+                write_cell(buf, body_x + *x_off, y, w, cell_text, style);
+            }
         }
     }
+    view.grid = crate::sheet::SheetGridLayout {
+        data_top,
+        data_rows: data_rows as u16,
+        body_x,
+        body_w,
+    };
 
     // Status row at the bottom showing scroll position + nav hint.
     let status_y = inner.y + inner.height - 1;
@@ -2928,6 +2978,18 @@ impl Editor {
                 return self.open_pdf(path);
             }
             if crate::sheet::extension_is_sheet(ext) && self.csv_viewer_enabled {
+                // Unsaved grid edits survive a same-path re-open (#177):
+                // a tree re-click must not rebuild the view over them.
+                // The FS sweep never reloads a dirty tab, and Revert
+                // clears the flag first, re-arming the reload.
+                if self.path.as_deref() == Some(path)
+                    && self
+                        .sheet
+                        .as_ref()
+                        .is_some_and(|v| v.dirty || v.editing.is_some())
+                {
+                    return Ok(());
+                }
                 // Same fall-through for a workbook/CSV that does not parse
                 // as its extension claims (#174) — but ONLY for parse
                 // failures. A SIZE refusal ("too large") is a deliberate
@@ -3466,6 +3528,41 @@ impl Editor {
             if written == 1 { "" } else { "s" },
             path.display()
         );
+        Ok(SaveOutcome::Saved)
+    }
+
+    /// Write a CSV/TSV sheet tab's grid edits back to disk (#177),
+    /// serialised with the delimiter the file was read with. Same
+    /// disk-conflict contract as text saves; never the text choke point
+    /// (#185).
+    pub fn sheet_save(&mut self, force: bool) -> Result<SaveOutcome> {
+        let Some(path) = self.path.clone() else {
+            anyhow::bail!("No file open");
+        };
+        let Some(view) = self.sheet.as_ref() else {
+            anyhow::bail!("Not a sheet tab");
+        };
+        let delim = match view.kind {
+            crate::sheet::SheetKind::Csv => b',',
+            crate::sheet::SheetKind::Tsv => b'\t',
+            _ => anyhow::bail!("Only CSV/TSV sheets are editable (workbooks land with #178)"),
+        };
+        if !force && self.disk_changed_externally() {
+            self.disk_conflict = true;
+            return Ok(SaveOutcome::DiskConflict);
+        }
+        let view = self.sheet.as_mut().expect("checked above");
+        let data = match view.sheets.get(view.current_sheet) {
+            Some(d) => d,
+            None => anyhow::bail!("No worksheet"),
+        };
+        let bytes = crate::sheet::serialize_delimited(data, delim);
+        std::fs::write(&path, &bytes).map_err(|e| anyhow::anyhow!("Sheet save failed: {e}"))?;
+        view.dirty = false;
+        self.disk_stamp = Self::disk_stamp_of(&path);
+        self.disk_conflict = false;
+        self.dirty = false;
+        self.status = format!("Saved {}", path.display());
         Ok(SaveOutcome::Saved)
     }
 
@@ -5357,6 +5454,12 @@ impl Editor {
         // `open_hex` lets the disk reload through (#173).
         if let Some(view) = self.hex.as_mut() {
             view.discard_edits();
+        }
+        // Same for a sheet tab's grid edits (#177): drop the dirty flag
+        // so the same-path guard in `open` lets the rebuild through.
+        if let Some(view) = self.sheet.as_mut() {
+            view.dirty = false;
+            view.editing = None;
         }
         // Reload FIRST: clearing `dirty` before a reload that then fails
         // (file deleted between the conflict popup and the Enter) would
@@ -8223,8 +8326,8 @@ impl Widget for &mut Editor {
             render_image_placeholder(image, self.path.as_deref(), inner, buf, ibg);
             return;
         }
-        if let Some(view) = self.sheet.as_ref() {
-            render_sheet(view, self.path.as_deref(), inner, buf, cbg);
+        if let Some(view) = self.sheet.as_mut() {
+            render_sheet(view, self.path.as_deref(), inner, buf, cbg, self.theme);
             return;
         }
         if let Some(view) = self.hex.as_mut() {
