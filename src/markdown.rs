@@ -117,6 +117,11 @@ struct Renderer<'r> {
     /// every image a placeholder.
     base_dir: Option<std::path::PathBuf>,
     images: Vec<MdImage>,
+    /// Set while inside a RESERVED image's tag pair: pulldown-cmark
+    /// emits the alt content between Tag::Image and TagEnd::Image, and
+    /// letting it through painted the alt text after the reserved rows
+    /// (#196 review). Placeholder images keep their alt.
+    suppress_inline: bool,
 }
 
 impl Renderer<'_> {
@@ -309,6 +314,7 @@ pub fn render_markdown_with_images(
         table: None,
         base_dir: base_dir.map(|p| p.to_path_buf()),
         images: Vec::new(),
+        suppress_inline: false,
     };
     for event in Parser::new_ext(text, options) {
         match event {
@@ -383,6 +389,7 @@ pub fn render_markdown_with_images(
                             rows,
                             path,
                         });
+                        r.suppress_inline = true;
                     } else {
                         r.begin_content();
                         let style = Style::default().fg(DIM).add_modifier(Modifier::ITALIC);
@@ -445,12 +452,13 @@ pub fn render_markdown_with_images(
                 TagEnd::Strong => r.bold = r.bold.saturating_sub(1),
                 TagEnd::Strikethrough => r.strike = r.strike.saturating_sub(1),
                 TagEnd::Link => r.link = r.link.saturating_sub(1),
-                TagEnd::Image => {}
+                TagEnd::Image => r.suppress_inline = false,
                 TagEnd::Table => r.end_table(),
                 _ => {}
             },
             Event::Text(text) => {
-                if let Some((_, buf)) = r.code_block.as_mut() {
+                if r.suppress_inline {
+                } else if let Some((_, buf)) = r.code_block.as_mut() {
                     buf.push_str(&text);
                 } else if let Some(rows) = r.table.as_mut() {
                     if let Some(cell) = rows.last_mut().and_then(|row| row.last_mut()) {
@@ -462,7 +470,8 @@ pub fn render_markdown_with_images(
                 }
             }
             Event::Code(code) => {
-                if let Some(rows) = r.table.as_mut() {
+                if r.suppress_inline {
+                } else if let Some(rows) = r.table.as_mut() {
                     if let Some(cell) = rows.last_mut().and_then(|row| row.last_mut()) {
                         cell.push_str(&code);
                     }
@@ -473,10 +482,16 @@ pub fn render_markdown_with_images(
                 }
             }
             Event::SoftBreak => {
-                let style = r.inline_style();
-                r.push_text(" ", style);
+                if !r.suppress_inline {
+                    let style = r.inline_style();
+                    r.push_text(" ", style);
+                }
             }
-            Event::HardBreak => r.flush_line(),
+            Event::HardBreak => {
+                if !r.suppress_inline {
+                    r.flush_line();
+                }
+            }
             Event::Rule => {
                 r.ensure_blank();
                 r.out.push(Line::from(Span::styled(
@@ -565,6 +580,30 @@ mod tests {
             "missing file keeps the placeholder"
         );
         assert!(all.contains("tail"));
+    }
+
+    #[test]
+    fn reserved_image_alt_text_is_suppressed_but_placeholder_alt_survives() {
+        // #196 review: pulldown-cmark emits the alt content between the
+        // image tag pair; a reserved image must swallow it, a
+        // placeholder keeps its label.
+        let tmp = tempfile::tempdir().unwrap();
+        image::RgbaImage::new(10, 10).save(tmp.path().join("p.png")).unwrap();
+        let text = "![the alt words](p.png)\n\n![web alt](https://x/y.png)";
+        let mut reg = crate::highlight::LangRegistry::default();
+        let (lines, images) = super::render_markdown_with_images(
+            text,
+            Theme::BLACK,
+            &mut reg,
+            Some(tmp.path()),
+        );
+        assert_eq!(images.len(), 1);
+        let all = all_text(&lines);
+        assert!(
+            !all.contains("the alt words"),
+            "reserved image swallows its alt: {all}"
+        );
+        assert!(all.contains("web alt"), "placeholder keeps its alt");
     }
 
     #[test]

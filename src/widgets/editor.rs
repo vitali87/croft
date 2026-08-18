@@ -3710,10 +3710,24 @@ impl Editor {
         // user touches the file. Requires `self.theme` to already carry the
         // new theme (the caller assigns it first).
         if self.markdown_preview.is_some() {
+            // The image-aware builder (#196 review): the plain one left
+            // md.images pointing at anchors into the REPLACED lines, and
+            // the wrap-key recompute then sliced with stale first_line
+            // values - an out-of-range panic on a theme switch.
             let text = self.lines.join("\n");
-            let lines = crate::markdown::render_markdown(&text, self.theme, &mut self.registry);
+            let base = self
+                .path
+                .as_ref()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            let (lines, images) = crate::markdown::render_markdown_with_images(
+                &text,
+                self.theme,
+                &mut self.registry,
+                base.as_deref(),
+            );
             if let Some(md) = self.markdown_preview.as_mut() {
                 md.lines = lines;
+                md.images = images;
                 md.built_seq = self.edit_seq;
             }
         }
