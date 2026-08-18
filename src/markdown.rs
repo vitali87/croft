@@ -591,15 +591,13 @@ mod tests {
         // image tag pair; a reserved image must swallow it, a
         // placeholder keeps its label.
         let tmp = tempfile::tempdir().unwrap();
-        image::RgbaImage::new(10, 10).save(tmp.path().join("p.png")).unwrap();
+        image::RgbaImage::new(10, 10)
+            .save(tmp.path().join("p.png"))
+            .unwrap();
         let text = "![the alt words](p.png)\n\n![web alt](https://x/y.png)";
         let mut reg = crate::highlight::LangRegistry::default();
-        let (lines, images) = super::render_markdown_with_images(
-            text,
-            Theme::BLACK,
-            &mut reg,
-            Some(tmp.path()),
-        );
+        let (lines, images) =
+            super::render_markdown_with_images(text, Theme::BLACK, &mut reg, Some(tmp.path()));
         assert_eq!(images.len(), 1);
         let all = all_text(&lines);
         assert!(
