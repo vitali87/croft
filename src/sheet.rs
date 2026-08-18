@@ -44,6 +44,12 @@ pub struct SheetView {
     pub dirty: bool,
     /// The in-grid cell editor when a cell is being typed into.
     pub editing: Option<CellEdit>,
+    /// Cells the user edited since the last save (#178): (sheet, body
+    /// row, col). The xlsx save path applies EXACTLY these through umya,
+    /// so untouched cells (formulas included) are never rewritten from
+    /// calamine's formatted strings. CSV saves ignore it (whole-file
+    /// serialisation).
+    pub cell_edits: Vec<(usize, usize, usize)>,
     /// Frame-truth layout for mouse hit-testing, written by the render.
     pub grid: SheetGridLayout,
 }
@@ -79,6 +85,10 @@ pub struct SheetData {
     /// move it; the viewport follows.
     pub cur_row: usize,
     pub cur_col: usize,
+    /// Absolute 0-based (row, col) of the used range's first cell in the
+    /// SOURCE sheet (#178): calamine's grid starts at the used range, not
+    /// A1, so writing an edit back needs this offset. (0, 0) for CSV.
+    pub origin: (u32, u32),
 }
 
 impl SheetData {
@@ -143,6 +153,7 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
                 current_sheet: 0,
                 dirty: false,
                 editing: None,
+                cell_edits: Vec::new(),
                 grid: SheetGridLayout::default(),
             })
         }
@@ -165,6 +176,7 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
                 current_sheet: 0,
                 dirty: false,
                 editing: None,
+                cell_edits: Vec::new(),
                 grid: SheetGridLayout::default(),
             })
         }
@@ -193,6 +205,7 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
         scroll_col: 0,
         cur_row: 0,
         cur_col: 0,
+        origin: (0, 0),
     })
 }
 
@@ -294,6 +307,84 @@ pub fn serialize_delimited(data: &SheetData, delim: u8) -> Vec<u8> {
     w.into_inner().unwrap_or_default()
 }
 
+/// Outcome of an xlsx edit save (#178).
+pub struct XlsxSaveReport {
+    pub written: usize,
+    /// A1-style coordinates of formula cells left untouched because the
+    /// caller did not consent to overwriting formulas.
+    pub formula_skipped: Vec<String>,
+}
+
+/// Write grid cell edits back into the workbook through umya (#178):
+/// the file is re-read (styles, widths, and untouched cells preserved),
+/// each edited cell's grid value is applied (numbers as numbers, all
+/// else as strings), and the workbook is written in place. A cell that
+/// holds a FORMULA is skipped unless `overwrite_formulas`, since the
+/// grid shows calamine's cached value and writing it back would destroy
+/// the formula silently.
+pub fn save_xlsx_edits(
+    path: &Path,
+    sheets: &[SheetData],
+    edits: &[(usize, usize, usize)],
+    overwrite_formulas: bool,
+) -> Result<XlsxSaveReport, String> {
+    let mut book = umya_spreadsheet::reader::xlsx::read(path).map_err(|e| e.to_string())?;
+    let mut written = 0usize;
+    let mut formula_skipped: Vec<String> = Vec::new();
+    for &(si, r, c) in edits {
+        let Some(data) = sheets.get(si) else {
+            continue;
+        };
+        let value = data.cell(r, c).to_string();
+        let Ok(ws) = book.sheet_by_name_mut(&data.name) else {
+            continue;
+        };
+        // Grid body row r sits below the header (one range row) inside
+        // the used range at `origin`; umya coordinates are 1-based.
+        let col = data.origin.1 + c as u32 + 1;
+        let row = data.origin.0 + r as u32 + 2;
+        let cell = ws.cell_mut((col, row));
+        if cell.is_formula() && !overwrite_formulas {
+            // Sheet-QUALIFIED (#194 review): a bare A1 key would pin an
+            // ordinary edit at the same coordinates on another sheet.
+            formula_skipped.push(format!("{}!{}{row}", data.name, column_letters(col)));
+            continue;
+        }
+        // Typed writes (#194 review): calamine formats booleans as
+        // lowercase true/false, which set_value would store as STRINGS.
+        if value.eq_ignore_ascii_case("true") {
+            cell.set_value_bool(true);
+        } else if value.eq_ignore_ascii_case("false") {
+            cell.set_value_bool(false);
+        } else if !value.is_empty() && value.parse::<f64>().is_ok() {
+            cell.set_value_number(value.parse::<f64>().expect("checked"));
+        } else {
+            cell.set_value_string(value);
+        }
+        written += 1;
+    }
+    umya_spreadsheet::writer::xlsx::write(&book, path).map_err(|e| e.to_string())?;
+    Ok(XlsxSaveReport {
+        written,
+        formula_skipped,
+    })
+}
+
+/// 1-based column index to A1 letters (1 -> A, 27 -> AA).
+pub fn column_letters_pub(col: u32) -> String {
+    column_letters(col)
+}
+
+fn column_letters(mut col: u32) -> String {
+    let mut s = String::new();
+    while col > 0 {
+        let rem = ((col - 1) % 26) as u8;
+        s.insert(0, (b'A' + rem) as char);
+        col = (col - 1) / 26;
+    }
+    s
+}
+
 fn split_header(mut rows: Vec<Vec<String>>) -> (Option<Vec<String>>, Vec<Vec<String>>) {
     if rows.is_empty() {
         return (None, Vec::new());
@@ -358,6 +449,7 @@ fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>
             Ok(r) => r,
             Err(_) => continue,
         };
+        let origin = range.start().unwrap_or((0, 0));
         let mut rows: Vec<Vec<String>> = Vec::with_capacity(range.height());
         for row in range.rows() {
             rows.push(row.iter().map(format_cell).collect());
@@ -373,6 +465,7 @@ fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>
             scroll_col: 0,
             cur_row: 0,
             cur_col: 0,
+            origin,
         });
     }
     let _ = Data::Empty; // keeps the import explicit even if unused above
@@ -402,6 +495,74 @@ fn format_float(f: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xlsx_edits_write_back_preserving_untouched_formulas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("book.xlsx");
+        // Build the fixture through umya itself: headers on row 1, data
+        // below, one formula cell.
+        let mut book = umya_spreadsheet::new_file();
+        let ws = book.sheet_mut(0).unwrap();
+        ws.cell_mut((1, 1)).set_value("name");
+        ws.cell_mut((2, 1)).set_value("qty");
+        ws.cell_mut((1, 2)).set_value("apples");
+        ws.cell_mut((2, 2)).set_value_number(3);
+        ws.cell_mut((1, 3)).set_value("pears");
+        ws.cell_mut((2, 3)).set_formula("SUM(B2)");
+        umya_spreadsheet::writer::xlsx::write(&book, &p).unwrap();
+
+        let mut view = super::open_sheet_with_kind(&p, super::SheetKind::Xlsx).unwrap();
+        let data = &mut view.sheets[0];
+        assert_eq!(data.cell(0, 0), "apples");
+        // Edit a plain cell and TRY to edit the formula cell.
+        data.set_cell(0, 1, String::from("99"));
+        data.set_cell(1, 1, String::from("7"));
+        let edits = vec![(0usize, 0usize, 1usize), (0, 1, 1)];
+        let report = super::save_xlsx_edits(&p, &view.sheets, &edits, false).unwrap();
+        assert_eq!(report.written, 1, "the formula cell is skipped");
+        assert_eq!(
+            report.formula_skipped,
+            vec![String::from("Sheet1!B3")],
+            "skip keys are sheet-qualified (#194 review)"
+        );
+
+        // calamine re-read sees the new number; umya re-read still holds
+        // the formula.
+        let again = super::open_sheet_with_kind(&p, super::SheetKind::Xlsx).unwrap();
+        assert_eq!(again.sheets[0].cell(0, 1), "99");
+        let book2 = umya_spreadsheet::reader::xlsx::read(&p).unwrap();
+        let ws2 = book2.sheet_by_name("Sheet1").unwrap();
+        assert!(ws2.cell((2u32, 3u32)).unwrap().is_formula());
+
+        // Explicit consent overwrites the formula with the literal.
+        let report = super::save_xlsx_edits(&p, &view.sheets, &edits, true).unwrap();
+        assert_eq!(report.written, 2);
+        // Booleans round-trip TYPED, not as strings (#194 review).
+        let data = &mut view.sheets[0];
+        data.set_cell(0, 1, String::from("true"));
+        data.set_cell(1, 1, String::from("FALSE"));
+        let bool_edits = vec![(0usize, 0usize, 1usize), (0, 1, 1)];
+        super::save_xlsx_edits(&p, &view.sheets, &bool_edits, true).unwrap();
+        let again = super::open_sheet_with_kind(&p, super::SheetKind::Xlsx).unwrap();
+        assert_eq!(
+            again.sheets[0].cell(0, 1),
+            "true",
+            "typed bool re-reads as bool"
+        );
+        assert_eq!(again.sheets[0].cell(1, 1), "false");
+        let book3 = umya_spreadsheet::reader::xlsx::read(&p).unwrap();
+        let ws3 = book3.sheet_by_name("Sheet1").unwrap();
+        assert!(!ws3.cell((2u32, 3u32)).unwrap().is_formula());
+    }
+
+    #[test]
+    fn column_letters_cover_the_aa_rollover() {
+        assert_eq!(super::column_letters(1), "A");
+        assert_eq!(super::column_letters(26), "Z");
+        assert_eq!(super::column_letters(27), "AA");
+        assert_eq!(super::column_letters(52), "AZ");
+    }
+
     #[test]
     fn cell_edits_grow_ragged_rows_and_serialize_with_quoting() {
         let mut d = super::parse_delimited(b"a,b,c\n1,2\n", b',', "S").unwrap();

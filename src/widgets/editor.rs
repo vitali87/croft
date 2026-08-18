@@ -3535,7 +3535,7 @@ impl Editor {
     /// serialised with the delimiter the file was read with. Same
     /// disk-conflict contract as text saves; never the text choke point
     /// (#185).
-    pub fn sheet_save(&mut self, force: bool) -> Result<SaveOutcome> {
+    pub fn sheet_save(&mut self, force: bool, overwrite_formulas: bool) -> Result<SaveOutcome> {
         let Some(path) = self.path.clone() else {
             anyhow::bail!("No file open");
         };
@@ -3543,26 +3543,80 @@ impl Editor {
             anyhow::bail!("Not a sheet tab");
         };
         let delim = match view.kind {
-            crate::sheet::SheetKind::Csv => b',',
-            crate::sheet::SheetKind::Tsv => b'\t',
-            _ => anyhow::bail!("Only CSV/TSV sheets are editable (workbooks land with #178)"),
+            crate::sheet::SheetKind::Csv => Some(b','),
+            crate::sheet::SheetKind::Tsv => Some(b'\t'),
+            crate::sheet::SheetKind::Xlsx => None,
+            _ => anyhow::bail!("This workbook format is read-only (xls/ods/xlsb)"),
         };
         if !force && self.disk_changed_externally() {
             self.disk_conflict = true;
             return Ok(SaveOutcome::DiskConflict);
         }
         let view = self.sheet.as_mut().expect("checked above");
-        let data = match view.sheets.get(view.current_sheet) {
-            Some(d) => d,
-            None => anyhow::bail!("No worksheet"),
-        };
-        let bytes = crate::sheet::serialize_delimited(data, delim);
-        std::fs::write(&path, &bytes).map_err(|e| anyhow::anyhow!("Sheet save failed: {e}"))?;
-        view.dirty = false;
+        match delim {
+            Some(delim) => {
+                let data = match view.sheets.get(view.current_sheet) {
+                    Some(d) => d,
+                    None => anyhow::bail!("No worksheet"),
+                };
+                let bytes = crate::sheet::serialize_delimited(data, delim);
+                std::fs::write(&path, &bytes)
+                    .map_err(|e| anyhow::anyhow!("Sheet save failed: {e}"))?;
+                view.dirty = false;
+                view.cell_edits.clear();
+                self.status = format!("Saved {}", path.display());
+            }
+            None => {
+                // xlsx (#178): apply exactly the edited cells through
+                // umya. `force` doubles as formula-overwrite consent, the
+                // same double-press contract as disk conflicts; skipped
+                // formula cells stay pending so the tab stays dirty.
+                let edits = view.cell_edits.clone();
+                let report =
+                    crate::sheet::save_xlsx_edits(&path, &view.sheets, &edits, overwrite_formulas)
+                        .map_err(|e| anyhow::anyhow!("Workbook save failed: {e}"))?;
+                if report.formula_skipped.is_empty() {
+                    view.cell_edits.clear();
+                    view.dirty = false;
+                    self.status = format!(
+                        "Saved {} ({} cell{})",
+                        path.display(),
+                        report.written,
+                        if report.written == 1 { "" } else { "s" }
+                    );
+                } else {
+                    // Keep ONLY the skipped formula cells pending.
+                    let names = &view.sheets;
+                    view.cell_edits.retain(|&(si, r, c)| {
+                        names.get(si).is_some_and(|d| {
+                            report.formula_skipped.contains(&format!(
+                                "{}!{}{}",
+                                d.name,
+                                crate::sheet::column_letters_pub(d.origin.1 + c as u32 + 1),
+                                d.origin.0 + r as u32 + 2
+                            ))
+                        })
+                    });
+                    view.dirty = true;
+                    self.status = format!(
+                        "Saved {} cell{}; {} formula cell{} kept ({}) - Cmd+S again overwrites the formulas",
+                        report.written,
+                        if report.written == 1 { "" } else { "s" },
+                        report.formula_skipped.len(),
+                        if report.formula_skipped.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        report.formula_skipped.join(", ")
+                    );
+                }
+            }
+        }
+        let still_dirty = self.sheet.as_ref().is_some_and(|v| v.dirty);
         self.disk_stamp = Self::disk_stamp_of(&path);
         self.disk_conflict = false;
-        self.dirty = false;
-        self.status = format!("Saved {}", path.display());
+        self.dirty = still_dirty;
         Ok(SaveOutcome::Saved)
     }
 

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "CSV and TSV files are now editable in the spreadsheet grid: arrow keys move a cell cursor, typing replaces the cell (Enter/F2 edits in place, Enter commits down, Tab commits right, Esc cancels), Delete clears, and palette commands insert or delete rows and columns. Cmd+S writes the file back with its own delimiter and quoting; unsaved grids wear a tab dot and the same external-change conflict guard as text files. Click a cell to select it; click again to edit.",
+    summary: "xlsx workbooks are now editable in the sheet grid: cells edit exactly like CSV (typing replaces, Enter/F2 in place, click to select then click to edit), and Cmd+S writes ONLY the touched cells back through a real xlsx writer - styles, column widths, other sheets, and untouched formulas all survive the round trip. A formula cell is never silently destroyed: the first save holds it back and names it, the second Cmd+S consents to replacing it with your literal.",
 }];
