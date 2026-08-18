@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Jupyter notebooks (.ipynb) now open as a rendered document: markdown cells with full styling, code cells framed by their In [n] counts with real syntax highlighting in the kernel's language, stream and error outputs (ANSI-clean, errors in red), and image outputs painted inline through the same overlay as Markdown pictures. File: Reopen as Text shows the raw JSON and sticks; Reopen as Preview returns. croft runs no kernels - the view is read-only truth about the file.",
+    summary: "Word-processor documents now open readable: .docx and .odt files render their structure - headings, bold/italic, lists, tables, and embedded pictures (inline, through the image overlay) - instead of hitting a binary dead-end. Read-only by design; File: Reopen as Text routes the underlying zip container onward, so the archive browser and hex viewer stay one command away.",
 }];

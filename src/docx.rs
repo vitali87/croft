@@ -125,11 +125,7 @@ fn docx_to_md(
     let mut italic = false;
     let mut in_rpr = false;
     let mut table: Option<Vec<Vec<String>>> = None;
-    loop {
-        let ev = match r.read_event() {
-            Ok(ev) => ev,
-            Err(_) => break,
-        };
+    while let Ok(ev) = r.read_event() {
         match &ev {
             Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
                 b"p" => {
@@ -259,11 +255,7 @@ fn odt_to_md(xml: &str, z: &mut zip::ZipArchive<std::fs::File>, scratch: &Path) 
     let mut para = String::new();
     let mut heading = 0usize;
     let mut list_depth = 0usize;
-    loop {
-        let ev = match r.read_event() {
-            Ok(ev) => ev,
-            Err(_) => break,
-        };
+    while let Ok(ev) = r.read_event() {
         match &ev {
             Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
                 b"h" => {
