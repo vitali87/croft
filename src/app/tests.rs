@@ -168,6 +168,51 @@ fn persistence_advisory_only_for_nonpersistent_remote_sessions() {
 }
 
 #[test]
+fn notebook_opens_rendered_with_reopen_as_text_for_the_json() {
+    // #180: an .ipynb opens as the rendered view over its JSON text;
+    // Reopen as Text shows the raw JSON and sticks.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("run.ipynb");
+    std::fs::write(
+        &p,
+        r##"{"nbformat":4,"metadata":{"kernelspec":{"language":"python"}},"cells":[
+            {"cell_type":"markdown","source":["# Report"]},
+            {"cell_type":"code","execution_count":3,"source":["x = 1"],
+             "outputs":[{"output_type":"stream","text":["done\n"]}]}]}"##,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    let md = app
+        .editor
+        .markdown_preview
+        .as_ref()
+        .expect("notebook opens rendered");
+    assert!(md.notebook);
+    let all: String = md
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(all.contains("Report"));
+    assert!(all.contains("In [3]:"));
+    assert!(all.contains("done"));
+
+    // Reopen as Text: the raw JSON, sticky across a same-path reload.
+    app.editor.force_text = true;
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.markdown_preview.is_none());
+    assert!(app.editor.lines[0].contains("nbformat"));
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.markdown_preview.is_none(), "sticky");
+    // And back to the render.
+    app.editor.force_text = false;
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.markdown_preview.is_some());
+}
+
+#[test]
 fn archive_tab_lists_members_and_enter_opens_an_extracted_copy() {
     // #179 end-to-end: a zip opens as the member browser, Enter on a
     // text member extracts it to scratch and opens it through the

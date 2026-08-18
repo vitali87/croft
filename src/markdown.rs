@@ -37,6 +37,10 @@ pub struct MarkdownPreview {
     pub anchor_rows: Vec<usize>,
     pub wrap_key: (u64, u16),
     pub last_area: ratatui::layout::Rect,
+    /// True when this preview renders a Jupyter notebook (#180): the
+    /// stale-rebuild and theme-switch paths dispatch to the notebook
+    /// builder instead of the markdown one.
+    pub notebook: bool,
 }
 
 /// One local image block in a rendered preview (#176).

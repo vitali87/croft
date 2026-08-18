@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Archives now open as a browsable member list: zip, jar, wheel, tar, and tar.gz files show every member with its size, Enter (or a second click) extracts the selected member to a scratch copy and opens it with its REAL viewer - a PNG member renders as an image, a CSV as a sheet, a binary in hex - and E extracts a member to a folder of your choice. Extraction is containment-checked, so hostile archives cannot write outside the destination.",
+    summary: "Jupyter notebooks (.ipynb) now open as a rendered document: markdown cells with full styling, code cells framed by their In [n] counts with real syntax highlighting in the kernel's language, stream and error outputs (ANSI-clean, errors in red), and image outputs painted inline through the same overlay as Markdown pictures. File: Reopen as Text shows the raw JSON and sticks; Reopen as Preview returns. croft runs no kernels - the view is read-only truth about the file.",
 }];
