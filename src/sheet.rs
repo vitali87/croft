@@ -345,13 +345,21 @@ pub fn save_xlsx_edits(
         let row = data.origin.0 + r as u32 + 2;
         let cell = ws.cell_mut((col, row));
         if cell.is_formula() && !overwrite_formulas {
-            formula_skipped.push(format!("{}{row}", column_letters(col)));
+            // Sheet-QUALIFIED (#194 review): a bare A1 key would pin an
+            // ordinary edit at the same coordinates on another sheet.
+            formula_skipped.push(format!("{}!{}{row}", data.name, column_letters(col)));
             continue;
         }
-        if !value.is_empty() && value.parse::<f64>().is_ok() {
+        // Typed writes (#194 review): calamine formats booleans as
+        // lowercase true/false, which set_value would store as STRINGS.
+        if value.eq_ignore_ascii_case("true") {
+            cell.set_value_bool(true);
+        } else if value.eq_ignore_ascii_case("false") {
+            cell.set_value_bool(false);
+        } else if !value.is_empty() && value.parse::<f64>().is_ok() {
             cell.set_value_number(value.parse::<f64>().expect("checked"));
         } else {
-            cell.set_value(value);
+            cell.set_value_string(value);
         }
         written += 1;
     }
@@ -512,7 +520,11 @@ mod tests {
         let edits = vec![(0usize, 0usize, 1usize), (0, 1, 1)];
         let report = super::save_xlsx_edits(&p, &view.sheets, &edits, false).unwrap();
         assert_eq!(report.written, 1, "the formula cell is skipped");
-        assert_eq!(report.formula_skipped, vec![String::from("B3")]);
+        assert_eq!(
+            report.formula_skipped,
+            vec![String::from("Sheet1!B3")],
+            "skip keys are sheet-qualified (#194 review)"
+        );
 
         // calamine re-read sees the new number; umya re-read still holds
         // the formula.
@@ -525,6 +537,19 @@ mod tests {
         // Explicit consent overwrites the formula with the literal.
         let report = super::save_xlsx_edits(&p, &view.sheets, &edits, true).unwrap();
         assert_eq!(report.written, 2);
+        // Booleans round-trip TYPED, not as strings (#194 review).
+        let data = &mut view.sheets[0];
+        data.set_cell(0, 1, String::from("true"));
+        data.set_cell(1, 1, String::from("FALSE"));
+        let bool_edits = vec![(0usize, 0usize, 1usize), (0, 1, 1)];
+        super::save_xlsx_edits(&p, &view.sheets, &bool_edits, true).unwrap();
+        let again = super::open_sheet_with_kind(&p, super::SheetKind::Xlsx).unwrap();
+        assert_eq!(
+            again.sheets[0].cell(0, 1),
+            "true",
+            "typed bool re-reads as bool"
+        );
+        assert_eq!(again.sheets[0].cell(1, 1), "false");
         let book3 = umya_spreadsheet::reader::xlsx::read(&p).unwrap();
         let ws3 = book3.sheet_by_name("Sheet1").unwrap();
         assert!(!ws3.cell((2u32, 3u32)).unwrap().is_formula());

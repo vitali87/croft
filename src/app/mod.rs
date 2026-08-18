@@ -2272,6 +2272,10 @@ pub struct App {
     /// Keyed by document: switching to another PDF starts fresh - a reader's
     /// first gesture there is not a repeat.
     last_pdf_wheel: Option<(std::time::Instant, i32, Option<PathBuf>)>,
+    /// One-shot consent to overwrite FORMULA cells on the next xlsx
+    /// save (#178/#194): armed by the save that held them back, distinct
+    /// from `force_save_armed` (the disk-conflict consent).
+    formula_overwrite_armed: bool,
     /// Pre-encoded inline-image for the source-control change-count badge (an
     /// accent pill + count, VS Code's `activityBarBadge`), emitted at z=1 over
     /// the SCM activity icon's bottom-right. `None` when there are no changes,
@@ -3717,6 +3721,7 @@ impl App {
             search_results_rx,
             cell_pixel: None,
             last_pdf_wheel: None,
+            formula_overwrite_armed: false,
             scm_change_badge: None,
             scm_change_badge_count: 0,
             explorer_unsaved_badge: None,
@@ -29492,7 +29497,11 @@ impl App {
         if self.editor.sheet.as_ref().is_some_and(|v| v.dirty) {
             use crate::widgets::editor::SaveOutcome;
             let force = std::mem::take(&mut self.force_save_armed);
-            match self.editor.sheet_save(force) {
+            // Distinct consents (#194 review): overwriting an external
+            // disk change and replacing a FORMULA are different
+            // decisions, each armed by its own refusal message.
+            let overwrite_formulas = std::mem::take(&mut self.formula_overwrite_armed);
+            match self.editor.sheet_save(force, overwrite_formulas) {
                 Ok(SaveOutcome::Saved) => {
                     self.status = self.editor.status.clone();
                     if let Some(path) = self.editor.path.clone() {
@@ -29502,7 +29511,7 @@ impl App {
                     // the explicit consent, same double-press contract
                     // as disk conflicts.
                     if self.editor.sheet.as_ref().is_some_and(|v| v.dirty) {
-                        self.force_save_armed = true;
+                        self.formula_overwrite_armed = true;
                     }
                 }
                 Ok(SaveOutcome::DiskConflict) => {

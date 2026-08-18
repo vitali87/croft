@@ -328,7 +328,7 @@ CSV, TSV, and xlsx grids are editable (xlsx cell edits write through a real xlsx
 | `Enter` / `F2` | Edit the cell in place (caret at the end) |
 | `Enter` (while editing) | Commit and move down; `Tab` commits and moves right; `Esc` cancels |
 | `Delete` | Clear the cell |
-| `Cmd+S` | Save with the file's own delimiter and quoting; refuses once on an external change, twice overwrites |
+| `Cmd+S` | CSV/TSV: rewrite the file with its own delimiter and quoting. xlsx: write ONLY the touched cells (styles, widths, untouched formulas survive). An external change refuses once and the next Cmd+S overwrites; an xlsx formula cell is held back separately, and the Cmd+S after ITS refusal replaces the formula |
 | Click a cell | Select it; a second click on the selected cell opens the editor |
 | Palette: Sheet: Insert Row Below / Delete Row / Insert Column Right / Delete Column | Structure edits anchored on the selected cell |
 | Wheel down / up over the grid | Pan three rows |

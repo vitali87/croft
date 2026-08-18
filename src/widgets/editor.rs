@@ -3535,7 +3535,7 @@ impl Editor {
     /// serialised with the delimiter the file was read with. Same
     /// disk-conflict contract as text saves; never the text choke point
     /// (#185).
-    pub fn sheet_save(&mut self, force: bool) -> Result<SaveOutcome> {
+    pub fn sheet_save(&mut self, force: bool, overwrite_formulas: bool) -> Result<SaveOutcome> {
         let Some(path) = self.path.clone() else {
             anyhow::bail!("No file open");
         };
@@ -3572,8 +3572,9 @@ impl Editor {
                 // same double-press contract as disk conflicts; skipped
                 // formula cells stay pending so the tab stays dirty.
                 let edits = view.cell_edits.clone();
-                let report = crate::sheet::save_xlsx_edits(&path, &view.sheets, &edits, force)
-                    .map_err(|e| anyhow::anyhow!("Workbook save failed: {e}"))?;
+                let report =
+                    crate::sheet::save_xlsx_edits(&path, &view.sheets, &edits, overwrite_formulas)
+                        .map_err(|e| anyhow::anyhow!("Workbook save failed: {e}"))?;
                 if report.formula_skipped.is_empty() {
                     view.cell_edits.clear();
                     view.dirty = false;
@@ -3589,7 +3590,8 @@ impl Editor {
                     view.cell_edits.retain(|&(si, r, c)| {
                         names.get(si).is_some_and(|d| {
                             report.formula_skipped.contains(&format!(
-                                "{}{}",
+                                "{}!{}{}",
+                                d.name,
                                 crate::sheet::column_letters_pub(d.origin.1 + c as u32 + 1),
                                 d.origin.0 + r as u32 + 2
                             ))
