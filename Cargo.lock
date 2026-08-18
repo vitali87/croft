@@ -622,6 +622,7 @@ dependencies = [
  "portable-pty",
  "pretty_assertions",
  "pulldown-cmark",
+ "quick-xml 0.39.2",
  "ratatui",
  "rayon",
  "regex",

@@ -161,6 +161,10 @@ flate2 = "1"
 # one on demand (tar/tar.gz/tgz); zip rides the existing zip crate.
 # 0.4.46 verified current on crates.io 2026-08-18.
 tar = "0.4"
+# XML pull parsing for the docx/odt read-only preview (#181): walk
+# word/document.xml / content.xml paragraph runs. Already in the tree
+# transitively (calamine, umya-spreadsheet), so no new lock version.
+quick-xml = "0.39"
 zip = { version = "7", default-features = false, features = ["deflate"] }
 # Read-only TOML parser for the Explorer DEPENDENCIES view: extracts the
 # dependency list from `pyproject.toml` (PEP 621 `[project].dependencies` or

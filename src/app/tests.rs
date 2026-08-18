@@ -168,6 +168,44 @@ fn persistence_advisory_only_for_nonpersistent_remote_sessions() {
 }
 
 #[test]
+fn docx_opens_as_a_rendered_document() {
+    // #181: a docx renders headings/emphasis through the preview
+    // machinery; the text side is a stub (Reopen as Text routes the zip
+    // container onward, never a mojibake buffer).
+    use std::io::Write as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("memo.docx");
+    let f = std::fs::File::create(&p).unwrap();
+    let mut z = zip::ZipWriter::new(f);
+    let o =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    z.start_file("word/document.xml", o).unwrap();
+    z.write_all(
+        br#"<w:document xmlns:w="x"><w:body>
+<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Memo Title</w:t></w:r></w:p>
+<w:p><w:r><w:t>memo body</w:t></w:r></w:p></w:body></w:document>"#,
+    )
+    .unwrap();
+    z.finish().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    let md = app
+        .editor
+        .markdown_preview
+        .as_ref()
+        .expect("docx opens rendered");
+    assert!(md.doc_path.is_some());
+    let all: String = md
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(all.contains("Memo Title"), "{all}");
+    assert!(all.contains("memo body"));
+}
+
+#[test]
 fn notebook_opens_rendered_with_reopen_as_text_for_the_json() {
     // #180: an .ipynb opens as the rendered view over its JSON text;
     // Reopen as Text shows the raw JSON and sticks.

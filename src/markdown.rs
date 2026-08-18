@@ -41,6 +41,9 @@ pub struct MarkdownPreview {
     /// stale-rebuild and theme-switch paths dispatch to the notebook
     /// builder instead of the markdown one.
     pub notebook: bool,
+    /// Set when this preview renders a docx/odt document (#181): the
+    /// rebuild paths re-walk THIS file instead of the text buffer.
+    pub doc_path: Option<std::path::PathBuf>,
 }
 
 /// One local image block in a rendered preview (#176).
