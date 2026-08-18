@@ -168,6 +168,57 @@ fn persistence_advisory_only_for_nonpersistent_remote_sessions() {
 }
 
 #[test]
+fn archive_tab_lists_members_and_enter_opens_an_extracted_copy() {
+    // #179 end-to-end: a zip opens as the member browser, Enter on a
+    // text member extracts it to scratch and opens it through the
+    // normal dispatch.
+    use std::io::Write as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let zp = tmp.path().join("bundle.zip");
+    let f = std::fs::File::create(&zp).unwrap();
+    let mut z = zip::ZipWriter::new(f);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    z.start_file("notes/inner.txt", opts).unwrap();
+    z.write_all(b"member text").unwrap();
+    z.finish().unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&zp).unwrap();
+    let view = app.editor.archive.as_ref().expect("zip opens as a browser");
+    assert_eq!(view.entries.len(), 1);
+    assert_eq!(view.entries[0].path, "notes/inner.txt");
+
+    app.handle_archive_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.editor.archive.is_none(),
+        "the member opened in the editor: {}",
+        app.status
+    );
+    assert_eq!(app.editor.lines, vec!["member text".to_string()]);
+}
+
+#[test]
+fn misnamed_zip_routes_to_the_archive_browser_by_content() {
+    use std::io::Write as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("data.bin");
+    let f = std::fs::File::create(&p).unwrap();
+    let mut z = zip::ZipWriter::new(f);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    z.start_file("x.txt", opts).unwrap();
+    z.write_all(b"in").unwrap();
+    z.finish().unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&p).unwrap();
+    assert!(
+        e.archive.is_some(),
+        "sniffed zip lands in the browser, not hex"
+    );
+}
+
+#[test]
 fn markdown_preview_computes_image_anchor_frame_truth() {
     // #176: the preview render must publish each image's wrapped visual
     // row and the paragraph's text area, which the overlay driver

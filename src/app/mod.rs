@@ -17404,6 +17404,22 @@ impl App {
                 self.close_input_prompt();
                 self.add_watch_expression(value);
             }
+            InputPurpose::ArchiveExtract { member } => {
+                self.close_input_prompt();
+                let dest = PathBuf::from(value.trim());
+                let Some((path, kind)) = self
+                    .editor
+                    .archive
+                    .as_ref()
+                    .and_then(|v| Some((self.editor.path.clone()?, v.kind)))
+                else {
+                    return;
+                };
+                match crate::archive::extract_member(&path, kind, &member, &dest) {
+                    Ok(p) => self.status = format!("Extracted to {}", p.display()),
+                    Err(e) => self.status = format!("Extract failed: {e}"),
+                }
+            }
             InputPurpose::HexFind => {
                 self.close_input_prompt();
                 match crate::hex::HexView::parse_find_query(&value) {
@@ -20727,6 +20743,10 @@ impl App {
         }
         if self.editor.hex.is_some() {
             self.handle_hex_key(key);
+            return;
+        }
+        if self.editor.archive.is_some() {
+            self.handle_archive_key(key);
             return;
         }
         // Image preview tabs are read-only. PDF tabs page with every
@@ -28394,6 +28414,25 @@ impl App {
                         self.poke_cursor();
                         return;
                     }
+                    // Archive browser (#179): click selects; a second
+                    // click on the selected row opens the member.
+                    if let Some(view) = self.editor.archive.as_mut() {
+                        if view.rows_visible > 0
+                            && m.row >= view.rows_top
+                            && m.row < view.rows_top + view.rows_visible
+                        {
+                            let idx = view.scroll + (m.row - view.rows_top) as usize;
+                            if idx < view.entries.len() {
+                                if view.selected == idx {
+                                    self.open_selected_archive_member();
+                                } else {
+                                    view.selected = idx;
+                                }
+                            }
+                        }
+                        self.poke_cursor();
+                        return;
+                    }
                     // Hex tab (#172): a click on a byte cell — hex grid or
                     // ASCII gutter — parks the cursor there; Shift extends
                     // the selection; a drag from here extends it live.
@@ -32296,6 +32335,77 @@ impl App {
     /// extending the selection, F3 repeating the last find. The viewport
     /// row count comes from the last painted frame's layout (frame
     /// truth), so PageUp/PageDown match what the user sees.
+    /// Archive browser keys (#179): selection movement, Enter extracts
+    /// the member to scratch and opens it through the normal dispatch,
+    /// E prompts for an extraction folder.
+    fn handle_archive_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.editor.archive.as_mut() else {
+            return;
+        };
+        let rows = (view.rows_visible as usize).max(1);
+        let last = view.entries.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Down => view.selected = (view.selected + 1).min(last),
+            KeyCode::Up => view.selected = view.selected.saturating_sub(1),
+            KeyCode::PageDown => view.selected = (view.selected + rows).min(last),
+            KeyCode::PageUp => view.selected = view.selected.saturating_sub(rows),
+            KeyCode::Home => view.selected = 0,
+            KeyCode::End => view.selected = last,
+            KeyCode::Enter => self.open_selected_archive_member(),
+            KeyCode::Char('e') | KeyCode::Char('E') => self.open_archive_extract_prompt(),
+            _ => {}
+        }
+    }
+
+    /// Extract the selected member into the session scratch dir and open
+    /// the extracted FILE through the standard dispatch, so text, images,
+    /// PDFs, sheets, and binaries all render with their real viewers.
+    fn open_selected_archive_member(&mut self) {
+        let Some((path, kind, member, dir)) = self.editor.archive.as_ref().and_then(|v| {
+            let e = v.entries.get(v.selected)?;
+            Some((self.editor.path.clone()?, v.kind, e.path.clone(), e.dir))
+        }) else {
+            return;
+        };
+        if dir {
+            self.status = String::from("Directories only group members; open a file");
+            return;
+        }
+        let dest = std::env::temp_dir().join("croft-archive-members");
+        match crate::archive::extract_member(&path, kind, &member, &dest) {
+            Ok(extracted) => {
+                if let Err(e) = self.open_at(&extracted, 0, 0) {
+                    self.status = format!("Member open failed: {e}");
+                } else {
+                    self.status = format!("Opened {member} (extracted copy)");
+                }
+            }
+            Err(e) => self.status = format!("Member open failed: {e}"),
+        }
+    }
+
+    fn open_archive_extract_prompt(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some(member) = self
+            .editor
+            .archive
+            .as_ref()
+            .and_then(|v| v.entries.get(v.selected))
+            .map(|e| e.path.clone())
+        else {
+            return;
+        };
+        let suggestion = self.workspace_root().display().to_string();
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::ArchiveExtract { member },
+                String::from("Extract Member To"),
+                "destination folder",
+            )
+            .with_value(&suggestion),
+        );
+    }
+
     fn handle_hex_key(&mut self, key: KeyEvent) {
         // Cmd/Ctrl+F never reaches here — `is_editor_find_key` routes to
         // `open_editor_find` earlier in the dispatch, which forwards hex

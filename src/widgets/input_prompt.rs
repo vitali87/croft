@@ -23,6 +23,11 @@ use ratatui::{
 /// step needs (e.g. the base ref a new branch forks from).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputPurpose {
+    /// Extract one archive member (#179): the typed value is the
+    /// destination folder.
+    ArchiveExtract {
+        member: String,
+    },
     /// Find in a hex tab (#172): the typed value is hex byte pairs
     /// ("de ad be ef") or, when it does not parse as hex, literal ASCII.
     /// Submitting stores the query on the view and jumps to the first
