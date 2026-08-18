@@ -24700,6 +24700,12 @@ impl App {
                 Some(_) if !self.editor.has_non_text_view() => {
                     self.status = String::from("The active tab is already a text view");
                 }
+                // A dirty hex tab holds unwritten byte overwrites; the
+                // text route would silently drop them (#173).
+                Some(_) if self.editor.dirty => {
+                    self.status =
+                        String::from("Save or revert the pending edits before reopening as text");
+                }
                 Some(p) => {
                     // Per-tab override (#175): skip every preview route —
                     // an SVG lands in its XML source, a hex tab in the
@@ -29132,6 +29138,13 @@ impl App {
         let due = |e: &crate::widgets::editor::Editor| {
             e.dirty
                 && e.path.is_some()
+                // Preview-kind edits (hex bytes, sheet cells) are
+                // EXPLICIT-save only: an automatic write mid-edit could
+                // land a half-updated byte sequence, and the serialising
+                // kinds normalise quoting the user did not ask to touch.
+                // (They also never set last_edit_at, so this guard makes
+                // an implicit exclusion structural - #191 review.)
+                && !e.has_non_text_view()
                 && !e.disk_conflict
                 // A latched encoding refusal: only an explicit Cmd+S can
                 // consent to the lossy write, so retrying here would just
@@ -29395,6 +29408,39 @@ impl App {
     }
 
     fn save(&mut self) {
+        // A hex tab with pending overwrites saves through its own byte
+        // path (#173) — never `write_buffer_to_disk`, whose #185 guard
+        // refuses every preview kind. Same disk-conflict double-press
+        // contract as text saves.
+        if self.editor.hex.as_ref().is_some_and(|v| v.has_edits()) {
+            use crate::widgets::editor::SaveOutcome;
+            let force = std::mem::take(&mut self.force_save_armed);
+            match self.editor.hex_save(force) {
+                Ok(SaveOutcome::Saved) => {
+                    self.status = self.editor.status.clone();
+                    // Local history captures the new bytes like every
+                    // other successful save path (#191 review).
+                    if let Some(path) = self.editor.path.clone() {
+                        self.record_history_snapshot(&path);
+                    }
+                }
+                Ok(SaveOutcome::DiskConflict) => {
+                    self.force_save_armed = true;
+                    let name = self
+                        .editor
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    self.status = format!(
+                        "{name} changed on disk since you opened it - press Cmd+S again to overwrite the changed bytes"
+                    );
+                }
+                Ok(_) => unreachable!("hex_save reports Saved or DiskConflict"),
+                Err(e) => self.status = format!("Save failed: {e}"),
+            }
+            return;
+        }
         // A preview tab has nothing to save (and #185: letting the write
         // proceed truncated the previewed file). Friendly no-op here; the
         // choke-point guard in `write_buffer_to_disk` backstops every
@@ -31872,6 +31918,78 @@ impl App {
         let select = key.modifiers.contains(KeyModifiers::SHIFT);
         let jump = key.modifiers.contains(KeyModifiers::CONTROL)
             || key.modifiers.contains(KeyModifiers::SUPER);
+        // Editing (#173): undo/redo chords, then plain typing. The
+        // chord check comes first so Cmd+Z is never read as the letter.
+        if jump && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z')) {
+            let did = if select {
+                view.redo_edit()
+            } else {
+                view.undo_edit()
+            };
+            if did {
+                self.editor.dirty = self.editor.hex.as_ref().is_some_and(|v| v.has_edits());
+            } else {
+                self.status = String::from(if select {
+                    "Nothing to redo"
+                } else {
+                    "Nothing to undo"
+                });
+            }
+            return;
+        }
+        if let KeyCode::Char(c) = key.code
+            && !jump
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            if view.read_only {
+                self.status = String::from("Read-only file: no write permission");
+                return;
+            }
+            let mut wrote = false;
+            if view.ascii_focus {
+                if (' '..='~').contains(&c) {
+                    let off = view.cursor;
+                    view.apply_edit(off, c as u8);
+                    view.move_cursor(1, false, rows);
+                    wrote = true;
+                }
+            } else if let Some(d) = c.to_digit(16) {
+                if view.type_hex_digit(d as u8) {
+                    view.move_cursor(1, false, rows);
+                }
+                wrote = true;
+            }
+            if wrote {
+                self.editor.dirty = self.editor.hex.as_ref().is_some_and(|v| v.has_edits());
+                return;
+            }
+            // Not a typable char for this pane: fall through to the
+            // navigation matches below (F3 etc. are KeyCode variants,
+            // never Char, so nothing else claims chars).
+            return;
+        }
+        match key.code {
+            KeyCode::Tab => {
+                view.ascii_focus = !view.ascii_focus;
+                view.pending_nibble = None;
+                return;
+            }
+            KeyCode::Backspace => {
+                view.pending_nibble = None;
+                view.move_cursor(-1, false, rows);
+                return;
+            }
+            KeyCode::Delete => {
+                let off = view.cursor;
+                view.revert_edit(off);
+                self.editor.dirty = self.editor.hex.as_ref().is_some_and(|v| v.has_edits());
+                return;
+            }
+            _ => {}
+        }
+        let Some(view) = self.editor.hex.as_mut() else {
+            return;
+        };
         match key.code {
             KeyCode::Left => view.move_cursor(-1, select, rows),
             KeyCode::Right => view.move_cursor(1, select, rows),
@@ -31890,7 +32008,10 @@ impl App {
                     view.cursor - view.cursor % view.bytes_per_row + (view.bytes_per_row - 1);
                 view.set_cursor(row_end, select, rows);
             }
-            KeyCode::Esc => view.sel_anchor = None,
+            KeyCode::Esc => {
+                view.sel_anchor = None;
+                view.pending_nibble = None;
+            }
             KeyCode::F(3) => self.hex_find_next(),
             _ => {}
         }

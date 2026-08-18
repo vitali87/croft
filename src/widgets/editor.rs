@@ -261,7 +261,8 @@ fn render_hex(
             if ax >= inner.x + inner.width || x + 1 >= inner.x + inner.width {
                 break;
             }
-            let (hex_s, ascii_ch, byte_dim) = match view.byte(off) {
+            let edited = view.edits.contains_key(&off);
+            let (mut hex_s, ascii_ch, byte_dim) = match view.effective_byte(off) {
                 Some(v) => (
                     format!("{v:02X}"),
                     if (0x20..0x7f).contains(&v) {
@@ -269,7 +270,7 @@ fn render_hex(
                     } else {
                         String::from("·")
                     },
-                    v == 0,
+                    v == 0 && !edited,
                 ),
                 // Not resident (an IO error mid-scroll): an honest blank,
                 // never a stale byte.
@@ -277,17 +278,42 @@ fn render_hex(
             };
             let selected = sel.map(|(a, b)| off >= a && off < b).unwrap_or(false);
             let is_cursor = off == view.cursor;
-            let style = if is_cursor {
-                Style::default().fg(Color::Black).bg(theme.accent())
-            } else if selected {
+            // A half-typed byte shows its high nibble in place (#173).
+            if is_cursor
+                && !view.ascii_focus
+                && let Some(n) = view.pending_nibble
+            {
+                hex_s = format!("{n:X}·");
+            }
+            // The focused pane's cursor is the accent block; its mirror
+            // in the other pane is a dim block so the pairing stays
+            // visible without stealing focus.
+            let cursor_style = Style::default().fg(Color::Black).bg(theme.accent());
+            let mirror_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+            let edited_style = Style::default()
+                .fg(Color::Rgb(0xe0, 0x9a, 0x4e))
+                .bg(bg)
+                .add_modifier(Modifier::BOLD);
+            let base_style = if selected {
                 Style::default().fg(Color::White).bg(theme.selection())
+            } else if edited {
+                edited_style
             } else if byte_dim {
                 dim
             } else {
                 Style::default().fg(Color::Gray).bg(bg)
             };
-            buf.set_string(x, y, &hex_s, style);
-            buf.set_string(ax, y, &ascii_ch, style);
+            let (hex_style, ascii_style) = if is_cursor {
+                if view.ascii_focus {
+                    (mirror_style, cursor_style)
+                } else {
+                    (cursor_style, mirror_style)
+                }
+            } else {
+                (base_style, base_style)
+            };
+            buf.set_string(x, y, &hex_s, hex_style);
+            buf.set_string(ax, y, &ascii_ch, ascii_style);
         }
     }
     let status = format!(" {} ", view.status_line());
@@ -3350,6 +3376,13 @@ impl Editor {
         if self.path.as_deref() == Some(path)
             && let Some(view) = self.hex.as_mut()
         {
+            // Pending overwrites survive a same-path re-open (a tree
+            // re-click must not silently drop them); the FS sweep never
+            // reloads a dirty tab, and an explicit Revert discards via
+            // `discard_edits` first, which re-arms this refresh.
+            if view.has_edits() {
+                return Ok(());
+            }
             view.refresh_from_disk(path)
                 .map_err(|e| anyhow::anyhow!("Hex reload failed: {e}"))?;
             self.disk_stamp = Self::disk_stamp_of(path);
@@ -3394,6 +3427,46 @@ impl Editor {
         self.hex = Some(view);
         self.status = format!("Opened {} in the hex viewer", path.display());
         Ok(())
+    }
+
+    /// Write a hex tab's pending byte overwrites to disk (#173). The
+    /// same disk-conflict contract as `save_to_disk`: an external change
+    /// since the last sync refuses (once), and `force` overrides. Never
+    /// routes through `write_buffer_to_disk` — that choke point refuses
+    /// every preview kind (#185), and hex writes bytes, not lines.
+    pub fn hex_save(&mut self, force: bool) -> Result<SaveOutcome> {
+        let Some(path) = self.path.clone() else {
+            anyhow::bail!("No file open");
+        };
+        if self.hex.is_none() {
+            anyhow::bail!("Not a hex tab");
+        }
+        // Nothing pending: touch NOTHING (#191 review). Re-anchoring the
+        // disk stamp here would claim sync with an external change the
+        // window never read, and the FS sweep would then skip the reload.
+        if self.hex.as_ref().is_some_and(|v| !v.has_edits()) {
+            self.status = String::from("No pending byte edits");
+            return Ok(SaveOutcome::Saved);
+        }
+        if !force && self.disk_changed_externally() {
+            self.disk_conflict = true;
+            return Ok(SaveOutcome::DiskConflict);
+        }
+        let Some(view) = self.hex.as_mut() else {
+            unreachable!("checked above");
+        };
+        let written = view
+            .save_edits(&path)
+            .map_err(|e| anyhow::anyhow!("Hex save failed: {e}"))?;
+        self.disk_stamp = Self::disk_stamp_of(&path);
+        self.disk_conflict = false;
+        self.dirty = false;
+        self.status = format!(
+            "Wrote {written} byte{} to {}",
+            if written == 1 { "" } else { "s" },
+            path.display()
+        );
+        Ok(SaveOutcome::Saved)
     }
 
     /// The page an open PDF preview is showing, if this tab is one.
@@ -5279,6 +5352,12 @@ impl Editor {
     /// Discard local edits and reload from disk unconditionally — the
     /// "Revert" half of a conflict resolution.
     pub fn revert_to_disk(&mut self) -> Result<()> {
+        // A hex tab's pending overwrites are the thing being reverted:
+        // discard them first so the same-path refresh guard in
+        // `open_hex` lets the disk reload through (#173).
+        if let Some(view) = self.hex.as_mut() {
+            view.discard_edits();
+        }
         // Reload FIRST: clearing `dirty` before a reload that then fails
         // (file deleted between the conflict popup and the Enter) would
         // launder unsaved edits as clean — the tab loses its marker and
@@ -12195,6 +12274,25 @@ mod tests {
             view.layout.data_rows, 0,
             "empty state publishes no hit-test rows"
         );
+    }
+
+    #[test]
+    fn pending_hex_edits_survive_a_reclick_and_die_on_revert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blob.bin");
+        std::fs::write(&p, vec![0u8; 8]).unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        e.hex.as_mut().unwrap().apply_edit(0, 0x77);
+        e.dirty = true;
+        // A same-path re-open (tree re-click) must not drop the edits.
+        e.open(&p).unwrap();
+        assert_eq!(e.hex.as_ref().unwrap().effective_byte(0), Some(0x77));
+        // Revert is the explicit discard: disk truth returns.
+        e.revert_to_disk().unwrap();
+        assert!(!e.hex.as_ref().unwrap().has_edits());
+        assert_eq!(e.hex.as_ref().unwrap().effective_byte(0), Some(0));
+        assert!(!e.dirty);
     }
 
     #[test]
