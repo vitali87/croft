@@ -24739,7 +24739,12 @@ impl App {
                 None => self.status = String::from("No file in the active tab"),
             },
             Cmd::ReopenAsText => match self.editor.path.clone() {
-                Some(_) if !self.editor.has_non_text_view() => {
+                // A rendered notebook/markdown preview counts (#180): the
+                // command lands in the raw source.
+                Some(_)
+                    if !self.editor.has_non_text_view()
+                        && self.editor.markdown_preview.is_none() =>
+                {
                     self.status = String::from("The active tab is already a text view");
                 }
                 // A dirty hex tab holds unwritten byte overwrites; the
@@ -24781,7 +24786,10 @@ impl App {
                     // view again (SVG raster, image, sheet, hex).
                     self.editor.force_text = false;
                     match self.editor.open(&p) {
-                        Ok(()) if !self.editor.has_non_text_view() => {
+                        Ok(())
+                            if !self.editor.has_non_text_view()
+                                && self.editor.markdown_preview.is_none() =>
+                        {
                             self.status =
                                 String::from("No preview for this file type; showing the text");
                         }

@@ -26,6 +26,7 @@ mod magic;
 mod markdown;
 mod mcp;
 mod merge;
+mod notebook;
 mod outline_syntax;
 mod output;
 mod pair;

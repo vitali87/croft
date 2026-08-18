@@ -364,6 +364,10 @@ Binary files open here automatically instead of erroring; the file is read in wi
 | `E` | Extract the selected member to a folder you pick |
 | Click a member | Select it; a second click opens it |
 
+**Jupyter notebooks (`.ipynb`)**
+
+Open as a rendered document (markdown cells, highlighted code with `In [n]` frames, outputs incl. inline images). `File: Reopen as Text` shows the raw JSON and sticks for the tab; `File: Reopen as Preview` returns to the render.
+
 **SVG (`.svg`)**
 
 Opens as a rendered preview (shapes, text via system fonts, embedded images). `File: Reopen as Text` switches the tab to the editable XML source — the choice sticks for that tab, external edits refresh whichever view the tab shows, and an SVG that fails to parse opens as its source directly.

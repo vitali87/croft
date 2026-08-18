@@ -3307,6 +3307,11 @@ impl Editor {
         self.inlay_path = None;
         self.inlay_spans = Vec::new();
         self.recompute_highlights();
+        // Notebooks auto-open rendered (#180): the JSON stays one
+        // Reopen-as-Text away, and force_text keeps that choice sticky.
+        if !self.force_text && path.extension().and_then(|e| e.to_str()) == Some("ipynb") {
+            self.build_notebook_preview();
+        }
         Ok(())
     }
 
@@ -3876,7 +3881,18 @@ impl Editor {
         // switch must rebuild it here or it keeps the old colors until the
         // user touches the file. Requires `self.theme` to already carry the
         // new theme (the caller assigns it first).
-        if self.markdown_preview.is_some() {
+        if self.markdown_preview.as_ref().is_some_and(|md| md.notebook) {
+            let scroll = self
+                .markdown_preview
+                .as_ref()
+                .map(|m| m.scroll)
+                .unwrap_or(0);
+            if self.build_notebook_preview()
+                && let Some(md) = self.markdown_preview.as_mut()
+            {
+                md.scroll = scroll;
+            }
+        } else if self.markdown_preview.is_some() {
             // The image-aware builder (#196 review): the plain one left
             // md.images pointing at anchors into the REPLACED lines, and
             // the wrap-key recompute then sliced with stale first_line
@@ -4201,6 +4217,14 @@ impl Editor {
         if self.markdown_preview.take().is_some() {
             return true;
         }
+        let is_notebook = self
+            .path
+            .as_deref()
+            .is_some_and(|p| p.extension().and_then(|e| e.to_str()) == Some("ipynb"))
+            && !self.has_non_text_view();
+        if is_notebook {
+            return self.build_notebook_preview();
+        }
         let is_md_text = matches!(self.lang, Some(LangKind::Markdown))
             && self.image.is_none()
             && self.sheet.is_none()
@@ -4227,6 +4251,42 @@ impl Editor {
             anchor_rows: Vec::new(),
             wrap_key: (0, 0),
             last_area: Rect::default(),
+            notebook: false,
+        });
+        true
+    }
+
+    /// Build (or rebuild) the rendered notebook view (#180) over the
+    /// raw-JSON text tab. Returns false when the JSON does not parse as
+    /// a notebook - the tab stays plain text.
+    pub fn build_notebook_preview(&mut self) -> bool {
+        let text = self.lines.join("\n");
+        if !crate::notebook::looks_like_notebook(&text) {
+            return false;
+        }
+        let base = self
+            .path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let scratch = std::env::temp_dir().join("croft-notebook-outputs");
+        let Some((lines, images)) = crate::notebook::render(
+            &text,
+            self.theme,
+            &mut self.registry,
+            base.as_deref(),
+            &scratch,
+        ) else {
+            return false;
+        };
+        self.markdown_preview = Some(crate::markdown::MarkdownPreview {
+            lines,
+            scroll: 0,
+            built_seq: self.edit_seq,
+            images,
+            anchor_rows: Vec::new(),
+            wrap_key: (0, 0),
+            last_area: Rect::default(),
+            notebook: true,
         });
         true
     }
@@ -9649,7 +9709,20 @@ impl Editor {
             .markdown_preview
             .as_ref()
             .is_some_and(|md| md.built_seq != self.edit_seq);
-        if stale {
+        let is_nb = self.markdown_preview.as_ref().is_some_and(|md| md.notebook);
+        if stale && is_nb {
+            // Notebook rebuild (#180): keep the scroll, refresh the rest.
+            let scroll = self
+                .markdown_preview
+                .as_ref()
+                .map(|m| m.scroll)
+                .unwrap_or(0);
+            if self.build_notebook_preview()
+                && let Some(md) = self.markdown_preview.as_mut()
+            {
+                md.scroll = scroll;
+            }
+        } else if stale {
             // The image-aware builder (#176): the plain one here left the
             // images list pointing at STALE anchors after a live edit.
             let text = self.lines.join("\n");
