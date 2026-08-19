@@ -1537,6 +1537,17 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
             }
             let mut st = state.lock().unwrap();
             let Some(lines) = st.doc_lines(&file) else {
+                // The file left the live session between wait_live releasing
+                // the lock and this reacquisition: same outcome, same warning.
+                drop(st);
+                diag(
+                    state,
+                    crate::output::OutputLevel::Warn,
+                    &format!(
+                        "[pair] no live croft session serves {file}; note dropped \
+                         (start croft in this workspace first)"
+                    ),
+                );
                 return;
             };
             let offset = note_offset(&lines, row);
@@ -4143,13 +4154,23 @@ mod tests {
             crate::pair_host::PairHost::spawn_cmd(&harness.socket, "navigator", None, cmd).unwrap();
         host.send_task("@demo.txt look this over").unwrap();
 
+        // The reader queues NoteAdded (events channel) before TurnEnd (turn
+        // channel), but poll() drains events FIRST: the poll that surfaces
+        // TurnDone may have drained events before the note was queued, so
+        // wait until BOTH landed; the deadline bounds a real regression.
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut events: Vec<crate::pair_host::PairEvent> = Vec::new();
-        while !events
+        while !(events
             .iter()
             .any(|e| matches!(e, crate::pair_host::PairEvent::TurnDone { .. }))
+            && events
+                .iter()
+                .any(|e| matches!(e, crate::pair_host::PairEvent::NoteAdded { .. })))
         {
-            assert!(Instant::now() < deadline, "no TurnDone; saw {events:?}");
+            assert!(
+                Instant::now() < deadline,
+                "no TurnDone + NoteAdded; saw {events:?}"
+            );
             events.extend(host.poll());
             std::thread::sleep(Duration::from_millis(10));
         }

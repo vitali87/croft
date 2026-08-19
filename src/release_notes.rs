@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "An AI pair note that cannot anchor (no live session serves the file) is now reported in the output panel instead of vanishing silently, and the test suite's pair and commit-graph timing checks were made immune to loaded-runner scheduling.",
+    summary: "An AI pair note that cannot anchor (no live session serves the file) is now reported in the output panel instead of vanishing silently, and the test suite's pair and commit-graph timing checks were stabilized with bounded polling on loaded runners.",
 }];
