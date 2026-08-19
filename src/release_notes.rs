@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Quick-pick results are now mouse-clickable: clicking a row in Quick Open (Cmd+P), the Command Palette, Go to Symbol, the branch and directory pickers, and the process attach list opens or runs that row, exactly like pressing Enter on it.",
+    summary: "Quick-pick results are now mouse-clickable: clicking a row in Quick Open (Cmd+P), the Command Palette, Go to Symbol, the branch and directory pickers, and the Python process attach list performs exactly the action Enter would on that row.",
 }];
