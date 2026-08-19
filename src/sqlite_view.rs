@@ -19,13 +19,12 @@ pub fn extension_is_sqlite(ext: &str) -> bool {
     )
 }
 
+/// One fetched table page: headers, rows, and the table's total count.
+pub type TablePage = (Vec<String>, Vec<Vec<String>>, i64);
+
 /// Fetch one page of a table (#201 review: real paging, not a
-/// permanent head snapshot). Returns (headers, rows, total).
-pub fn table_page(
-    path: &Path,
-    table: &str,
-    page: usize,
-) -> Result<(Vec<String>, Vec<Vec<String>>, i64), String> {
+/// permanent head snapshot).
+pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, String> {
     let conn = rusqlite::Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
