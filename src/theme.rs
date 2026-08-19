@@ -216,6 +216,14 @@ impl Theme {
         // selection fill, hover tints the strip toward the accent, and the
         // close pill is the accent itself.
         let tab_strip = hex_or(&d.tab_strip, search);
+        // An inactive tab lifts off the strip toward white on a dark strip
+        // and toward black on a light one, so light manifests that omit
+        // tab colors still get visible tabs.
+        let tab_lift = if luma(tab_strip) > 128.0 {
+            (0x00, 0x00, 0x00)
+        } else {
+            (0xff, 0xff, 0xff)
+        };
         Theme {
             id: intern(&d.id),
             label: intern(&d.label),
@@ -225,7 +233,7 @@ impl Theme {
             search,
             button: parse_hex(&d.button),
             tab_strip,
-            tab_inactive: hex_or(&d.tab_inactive, blend((0xff, 0xff, 0xff), 0.06, tab_strip)),
+            tab_inactive: hex_or(&d.tab_inactive, blend(tab_lift, 0.06, tab_strip)),
             tab_active: hex_or(&d.tab_active, selection),
             tab_hover: hex_or(&d.tab_hover, blend(accent, 0.25, tab_strip)),
             tab_pill: hex_or(&d.tab_close_pill, accent),
@@ -296,6 +304,114 @@ impl Theme {
         self.gradient
     }
 
+    /// True when the editor background is light (luma above the midpoint).
+    /// The manifest-driven switch every light-vs-dark derivation branches
+    /// on, so a third-party light theme inherits the same treatment as the
+    /// built-in Croft Light.
+    pub fn is_light(self) -> bool {
+        luma(self.bg) > 128.0
+    }
+
+    /// Adapt a hardcoded dark-chrome color to the active theme. On every
+    /// dark theme this is the identity, so wrapping a legacy constant in
+    /// `theme.ui(..)` is byte-for-byte invisible there. On a light
+    /// background the recurring chrome vocabulary (the historical dark
+    /// constants that predate theme-driven popups) resolves to its VS Code
+    /// Light Modern counterpart, and anything unmapped falls through to a
+    /// luminance flip that keeps the hue but lands legibly on white.
+    ///
+    /// Call sites keep the historical constant in place (`theme.ui(
+    /// Color::Rgb(0x16, 0x18, 0x1f))`), which documents the dark rendering
+    /// and concentrates all light-theme knowledge here.
+    pub fn ui(self, dark: Color) -> Color {
+        if !self.is_light() {
+            return dark;
+        }
+        let Color::Rgb(r, g, b) = dark else {
+            // The named ANSI colors that read on dark but wash out on white
+            // land on their VS Code light-terminal counterparts; everything
+            // else (Reset, the legible named colors, indexed) passes through.
+            return match dark {
+                Color::White => Color::Rgb(0x1f, 0x1f, 0x1f),
+                Color::Yellow | Color::LightYellow => Color::Rgb(0xbf, 0x88, 0x03),
+                Color::Green | Color::LightGreen => Color::Rgb(0x10, 0x7c, 0x10),
+                Color::Cyan | Color::LightCyan => Color::Rgb(0x05, 0x98, 0xbc),
+                other => other,
+            };
+        };
+        let mapped = match (r, g, b) {
+            // -- fills -----------------------------------------------------
+            // Popup / widget body -> quickInput.background.
+            (0x16, 0x18, 0x1f) => (0xf8, 0xf8, 0xf8),
+            (0x1e, 0x1e, 0x1e) => (0xf8, 0xf8, 0xf8),
+            // Panel and input fills, darkest first.
+            (0x14, 0x14, 0x14) => (0xec, 0xec, 0xec),
+            (0x1e, 0x21, 0x2a) => (0xf3, 0xf3, 0xf3),
+            (0x1f, 0x24, 0x36) => (0xf3, 0xf3, 0xf3),
+            (0x20, 0x24, 0x2b) => (0xe8, 0xe8, 0xe8),
+            (0x23, 0x27, 0x2f) => (0xec, 0xec, 0xec),
+            (0x2a, 0x2f, 0x3e) => (0xec, 0xec, 0xec),
+            (0x2b, 0x31, 0x42) => (0xe0, 0xe0, 0xe0),
+            (0x2c, 0x31, 0x40) => (0xe4, 0xe4, 0xe4),
+            (0x2f, 0x35, 0x50) => (0xe4, 0xe4, 0xe4),
+            (0x34, 0x50, 0x7f) => (0xd0, 0xd0, 0xd0),
+            (0x3a, 0x40, 0x52) => (0xd8, 0xd8, 0xd8),
+            // Selected list row -> list.activeSelectionBackground.
+            (0x1e, 0x3a, 0x6e) => (0xe8, 0xe8, 0xe8),
+            // Editor text selection blues -> editor.selectionBackground.
+            (0x26, 0x4f, 0x78) => (0xad, 0xd6, 0xff),
+            (0x09, 0x4d, 0x77) => (0xad, 0xd6, 0xff),
+            (0x07, 0x33, 0x55) => (0xd0, 0xe6, 0xff),
+            (0x37, 0x61, 0x8e) => (0xc8, 0xdf, 0xf5),
+            // Separators and borders -> widget.border.
+            (0x3b, 0x42, 0x52) => (0xe5, 0xe5, 0xe5),
+            (0x60, 0x68, 0x78) => (0xc8, 0xc8, 0xc8),
+            // -- foregrounds ----------------------------------------------
+            (0xff, 0xff, 0xff) => (0x1f, 0x1f, 0x1f),
+            (0xec, 0xef, 0xf4) => (0x3b, 0x3b, 0x3b),
+            (0xe8, 0xee, 0xf8) => (0x3b, 0x3b, 0x3b),
+            (0xe5, 0xe9, 0xf0) => (0x3b, 0x3b, 0x3b),
+            (0xcc, 0xcc, 0xcc) => (0x3b, 0x3b, 0x3b),
+            (0xd8, 0xde, 0xe9) => (0x42, 0x42, 0x42),
+            (0xc5, 0xcd, 0xd9) => (0x50, 0x50, 0x50),
+            (0xb4, 0xbe, 0xc8) => (0x50, 0x50, 0x50),
+            (0xb0, 0xb8, 0xc8) => (0x50, 0x50, 0x50),
+            (0x9d, 0xa5, 0xb4) => (0x61, 0x61, 0x61),
+            (0x9a, 0xa4, 0xb2) => (0x61, 0x61, 0x61),
+            (0x8e, 0x95, 0xa4) => (0x71, 0x71, 0x71),
+            (0x8b, 0x93, 0xa1) => (0x71, 0x71, 0x71),
+            (0x7a, 0x82, 0x90) => (0x71, 0x71, 0x71),
+            (0xa0, 0xb4, 0xd8) => (0x71, 0x71, 0x71),
+            (0x80, 0x88, 0x98) => (0x8e, 0x8e, 0x8e),
+            (0x6c, 0x76, 0x86) => (0x8e, 0x8e, 0x8e),
+            (0x6c, 0x7d, 0x9c) => (0x8e, 0x8e, 0x8e),
+            // Accents: the two recurring blues -> focusBorder.
+            (0x4e, 0x9a, 0xff) => (0x00, 0x5f, 0xb8),
+            (0x88, 0xc0, 0xd0) => (0x00, 0x5f, 0xb8),
+            // -- status hues (dark-tuned pastels -> saturated-on-white) ----
+            (0xff, 0xd7, 0x4a) => (0xbf, 0x88, 0x03),
+            (0xe5, 0xc0, 0x7b) => (0xbf, 0x88, 0x03),
+            (0xeb, 0xcb, 0x8b) => (0xbf, 0x88, 0x03),
+            (0xcc, 0xa7, 0x00) => (0xbf, 0x88, 0x03),
+            (0xff, 0xa5, 0x00) => (0xc0, 0x6c, 0x00),
+            (0xff, 0x9d, 0x2f) => (0xc0, 0x6c, 0x00),
+            (0xe0, 0x9a, 0x4e) => (0xc0, 0x6c, 0x00),
+            (0xa3, 0xbe, 0x8c) => (0x10, 0x7c, 0x10),
+            (0xb6, 0xee, 0xc4) => (0x10, 0x7c, 0x10),
+            (0x8c, 0xc2, 0x65) => (0x10, 0x7c, 0x10),
+            (0xe7, 0x70, 0x70) => (0xc4, 0x2b, 0x1f),
+            (0xf1, 0x4c, 0x4c) => (0xcd, 0x31, 0x31),
+            // Fills that carry BLACK text (the editor block cursor, the
+            // active search-match band): they must stay light so the black
+            // glyph keeps its contrast, not be darkened as if they were
+            // foregrounds (review round 1).
+            (0xae, 0xc6, 0xff) => (0xad, 0xd6, 0xff),
+            (0xff, 0x8c, 0x2a) => (0xff, 0x8c, 0x2a),
+            other => light_fallback(other),
+        };
+        rgb(mapped)
+    }
+
     /// The 16 ANSI terminal colors (black..bright white) the theme's panes
     /// render Named/Indexed 0-15 cell colors with.
     pub fn ansi(self) -> [(u8, u8, u8); 16] {
@@ -318,6 +434,18 @@ impl Theme {
     /// badge's inline-image canvas (VS Code `activityBarBadge.background`).
     pub fn accent_rgb(self) -> (u8, u8, u8) {
         self.accent
+    }
+
+    /// The text color that keeps contrast ON an accent-filled cell (the
+    /// hex/sheet/archive cursors paint their glyph over `accent()`). Every
+    /// built-in dark theme has a light accent, so black text is unchanged
+    /// there; a dark accent (Croft Light's #005fb8) flips to white.
+    pub fn accent_contrast_fg(self) -> Color {
+        if luma(self.accent) < 128.0 {
+            Color::White
+        } else {
+            Color::Black
+        }
     }
 
     /// Selected-row fill in lists/popups.
@@ -400,9 +528,7 @@ impl Theme {
     /// Light's blue / green / brown, picked by the background's luminance so
     /// manifest themes inherit a legible set either way.
     pub fn bracket_pair_color(self, depth: usize) -> Color {
-        let (r, g, b) = self.bg;
-        let luma = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
-        let cycle: [(u8, u8, u8); 3] = if luma > 128.0 {
+        let cycle: [(u8, u8, u8); 3] = if self.is_light() {
             [(0x04, 0x31, 0xfa), (0x31, 0x93, 0x31), (0x7b, 0x38, 0x14)]
         } else {
             [(0xff, 0xd7, 0x00), (0xda, 0x70, 0xd6), (0x17, 0x9f, 0xff)]
@@ -440,24 +566,34 @@ impl Theme {
     }
 
     /// Background tint under read occurrences of the symbol at the caret
-    /// (VS Code `editor.wordHighlightBackground`, #575757 at 72% alpha),
-    /// blended over each theme's background.
+    /// (VS Code `editor.wordHighlightBackground`, #575757 at 72% alpha on
+    /// dark; a 25% wash on light so black text stays legible, matching VS
+    /// Code Light's #57575740), blended over each theme's background.
     pub fn occurrence_bg(self) -> Color {
-        self.blend_over_bg((0x57, 0x57, 0x57), 0.72)
+        let alpha = if self.is_light() { 0.25 } else { 0.72 };
+        self.blend_over_bg((0x57, 0x57, 0x57), alpha)
     }
 
     /// Background tint under write occurrences of the symbol at the caret
-    /// (VS Code `editor.wordHighlightStrongBackground`, #004972 at 72%): the
-    /// assignment site reads stronger than the uses.
+    /// (VS Code `editor.wordHighlightStrongBackground`, #004972 at 72% on
+    /// dark, a 25% wash on light): the assignment site reads stronger than
+    /// the uses.
     pub fn occurrence_write_bg(self) -> Color {
-        self.blend_over_bg((0x00, 0x49, 0x72), 0.72)
+        let alpha = if self.is_light() { 0.25 } else { 0.72 };
+        self.blend_over_bg((0x00, 0x49, 0x72), alpha)
     }
 
     /// Background of the pinned sticky-scroll header rows (VS Code
-    /// `editorStickyScroll.background`): the editor background lifted a hair so
-    /// the pinned scope headers read as a distinct band above the content.
+    /// `editorStickyScroll.background`): the editor background lifted a hair
+    /// so the pinned scope headers read as a distinct band above the content
+    /// (toward white on dark themes, toward black on light ones).
     pub fn sticky_scroll_bg(self) -> Color {
-        self.blend_over_bg((0xff, 0xff, 0xff), 0.06)
+        let lift = if self.is_light() {
+            (0x00, 0x00, 0x00)
+        } else {
+            (0xff, 0xff, 0xff)
+        };
+        self.blend_over_bg(lift, 0.06)
     }
 
     /// Git gutter bar for an added line (VS Code `editorGutter.addedBackground`,
@@ -487,9 +623,15 @@ impl Theme {
     /// Explorer name foreground for a git-ignored file or directory (VS Code
     /// `gitDecoration.ignoredResourceForeground`, #8C8C8C on dark themes).
     /// White at 55% over the theme background lands exactly on that grey for
-    /// the Black theme and stays a legible muted grey on every dark bg.
+    /// the Black theme and stays a legible muted grey on every dark bg; a
+    /// light background blends toward black instead, landing on the same
+    /// #8C8C8C for pure white rather than vanishing into it.
     pub fn ignored_fg(self) -> Color {
-        self.blend_over_bg((0xff, 0xff, 0xff), 0.55)
+        if self.is_light() {
+            self.blend_over_bg((0x00, 0x00, 0x00), 0.45)
+        } else {
+            self.blend_over_bg((0xff, 0xff, 0xff), 0.55)
+        }
     }
 
     /// The scrollbar track. VS Code paints no track, so we match the editor
@@ -550,6 +692,25 @@ impl Default for Theme {
 
 fn rgb(c: (u8, u8, u8)) -> Color {
     Color::Rgb(c.0, c.1, c.2)
+}
+
+/// Perceived luminance (0..=255) of an sRGB tuple.
+fn luma((r, g, b): (u8, u8, u8)) -> f32 {
+    0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)
+}
+
+/// The [`Theme::ui`] fallback for colors outside the mapped vocabulary: a
+/// light foreground scales toward black (keeping hue) until it reads on
+/// white; a dark fill blends to near-white with a whisper of its hue left.
+fn light_fallback(c: (u8, u8, u8)) -> (u8, u8, u8) {
+    let l = luma(c);
+    if l >= 128.0 {
+        let k = 80.0 / l;
+        let scale = |v: u8| (f32::from(v) * k).round().min(255.0) as u8;
+        (scale(c.0), scale(c.1), scale(c.2))
+    } else {
+        blend(c, 0.12, (0xf5, 0xf5, 0xf5))
+    }
 }
 
 /// Alpha-composite `fg` over `bg` at `alpha`, as raw bytes. The tuple-level
@@ -758,5 +919,144 @@ mod tests {
     fn black_uses_gradient_brand_chrome_dark_blue_does_not() {
         assert!(Theme::BLACK.gradient());
         assert!(!Theme::DARK_BLUE.gradient());
+    }
+
+    #[test]
+    fn croft_light_ships_the_verified_vscode_light_palette() {
+        let l = Theme::from_id("light");
+        assert_eq!(l.label(), "Croft Light");
+        assert!(l.is_light(), "white background must classify as light");
+        assert_eq!(l.editor_bg_rgb(), (0xff, 0xff, 0xff));
+        assert_eq!(l.accent_rgb(), (0x00, 0x5f, 0xb8));
+        assert!(!l.gradient(), "the teal brand gradient is dark chrome");
+        // VS Code Light+ code colors: blue keywords, red strings, green
+        // comments, the Light Modern editor foreground.
+        assert_eq!(l.syntax().keyword, (0x00, 0x00, 0xff));
+        assert_eq!(l.syntax().string, (0xa3, 0x15, 0x15));
+        assert_eq!(l.syntax().comment, (0x00, 0x80, 0x00));
+        assert_eq!(l.syntax().fg, (0x3b, 0x3b, 0x3b));
+        // VS Code's light terminal ANSI palette: the dark green and the
+        // grey "white" slots are its signatures.
+        assert_eq!(l.ansi()[2], (0x10, 0x7c, 0x10));
+        assert_eq!(l.ansi()[7], (0x55, 0x55, 0x55));
+        // Tab chrome: the white active tab lifting off the #f8f8f8 strip.
+        assert_eq!(l.tab_strip_bg(), Color::Rgb(0xf8, 0xf8, 0xf8));
+        assert_eq!(l.tab_active_bg(), Color::Rgb(0xff, 0xff, 0xff));
+    }
+
+    #[test]
+    fn only_the_light_theme_classifies_as_light() {
+        for t in Theme::all() {
+            assert_eq!(
+                t.is_light(),
+                t.id() == "light",
+                "`{}` misclassified by is_light",
+                t.id()
+            );
+        }
+    }
+
+    #[test]
+    fn the_ui_adapter_is_the_identity_on_every_dark_theme() {
+        // The whole sweep's safety net: wrapping a hardcoded chrome color in
+        // `theme.ui(..)` must be byte-for-byte invisible on dark themes.
+        for t in Theme::all() {
+            if t.is_light() {
+                continue;
+            }
+            for c in [
+                Color::Rgb(0x16, 0x18, 0x1f),
+                Color::Rgb(0xec, 0xef, 0xf4),
+                Color::Rgb(0x12, 0x34, 0x56),
+                Color::White,
+                Color::Reset,
+            ] {
+                assert_eq!(t.ui(c), c, "`{}` must pass {c:?} through", t.id());
+            }
+        }
+    }
+
+    #[test]
+    fn the_ui_adapter_maps_the_dark_chrome_vocabulary_onto_light() {
+        let l = Theme::from_id("light");
+        // The recurring popup constants land on their Light Modern versions.
+        assert_eq!(
+            l.ui(Color::Rgb(0x16, 0x18, 0x1f)),
+            Color::Rgb(0xf8, 0xf8, 0xf8),
+            "popup fill -> quickInput.background"
+        );
+        assert_eq!(
+            l.ui(Color::Rgb(0xec, 0xef, 0xf4)),
+            Color::Rgb(0x3b, 0x3b, 0x3b),
+            "primary text -> Light Modern foreground"
+        );
+        assert_eq!(
+            l.ui(Color::Rgb(0x4e, 0x9a, 0xff)),
+            Color::Rgb(0x00, 0x5f, 0xb8),
+            "accent blue -> focusBorder"
+        );
+        assert_eq!(
+            l.ui(Color::Rgb(0x1e, 0x3a, 0x6e)),
+            Color::Rgb(0xe8, 0xe8, 0xe8),
+            "selected row -> list.activeSelectionBackground"
+        );
+        assert_eq!(
+            l.ui(Color::White),
+            Color::Rgb(0x1f, 0x1f, 0x1f),
+            "white popup titles go near-black"
+        );
+        let luma = |c: Color| {
+            let Color::Rgb(r, g, b) = c else {
+                panic!("adapter must return Rgb, got {c:?}")
+            };
+            0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)
+        };
+        // Unmapped colors still land legibly: a light foreground darkens,
+        // a dark fill lightens to near-white.
+        assert!(luma(l.ui(Color::Rgb(0xab, 0xcd, 0xef))) < 128.0);
+        assert!(luma(l.ui(Color::Rgb(0x10, 0x20, 0x30))) > 200.0);
+        // Fills that carry black text (block cursor, active search match)
+        // must stay LIGHT rather than be darkened as foregrounds.
+        assert!(luma(l.ui(Color::Rgb(0xae, 0xc6, 0xff))) > 150.0);
+        assert!(luma(l.ui(Color::Rgb(0xff, 0x8c, 0x2a))) > 150.0);
+    }
+
+    #[test]
+    fn accent_contrast_fg_flips_only_on_dark_accents() {
+        // Built-in dark themes have light accents: black text, unchanged.
+        assert_eq!(Theme::BLACK.accent_contrast_fg(), Color::Black);
+        assert_eq!(Theme::DARK_BLUE.accent_contrast_fg(), Color::Black);
+        // Croft Light's #005fb8 accent is dark: white text keeps contrast.
+        assert_eq!(Theme::from_id("light").accent_contrast_fg(), Color::White);
+    }
+
+    #[test]
+    fn derived_blends_flip_direction_on_the_light_background() {
+        let l = Theme::from_id("light");
+        let luma = |c: Color| {
+            let Color::Rgb(r, g, b) = c else {
+                panic!("expected Rgb, got {c:?}")
+            };
+            0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)
+        };
+        // The white-blend helpers must darken on white, not brighten into
+        // invisibility: ignored files a readable grey, sticky headers a
+        // shade below the editor surface, occurrence tints a light wash
+        // that keeps black text legible.
+        assert!(
+            luma(l.ignored_fg()) < 200.0,
+            "ignored files must stay visible"
+        );
+        assert!(luma(l.sticky_scroll_bg()) < 255.0 - 1.0);
+        assert!(
+            luma(l.occurrence_bg()) > 180.0,
+            "occurrence tint must stay a wash"
+        );
+        // Dark themes keep their historical values.
+        assert_eq!(
+            Theme::BLACK.ignored_fg(),
+            Color::Rgb(0x8c, 0x8c, 0x8c),
+            "black ignored grey unchanged"
+        );
     }
 }

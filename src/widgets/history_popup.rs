@@ -118,21 +118,26 @@ fn dur_label(ms: u64) -> String {
 
 /// Draw the popup into `rect` exactly as given; placement is the caller's
 /// job (same contract as `render_zoxide_jump`).
-pub fn render_history_popup(pop: &mut HistoryPopup, rect: Rect, buf: &mut Buffer, gradient: bool) {
+pub fn render_history_popup(
+    pop: &mut HistoryPopup,
+    rect: Rect,
+    buf: &mut Buffer,
+    theme: crate::theme::Theme,
+) {
     pop.last_rect = rect;
 
     Widget::render(Clear, rect, buf);
     let title = Span::styled(
         " Command History — ⏎ types it, ⌃R cycles scope, Esc closes ",
         Style::default()
-            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
+        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
         .title(title.clone())
-        .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
+        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -140,27 +145,27 @@ pub fn render_history_popup(pop: &mut HistoryPopup, rect: Rect, buf: &mut Buffer
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
-    if gradient {
+    if theme.gradient() {
         crate::gradient::paint_gradient_box(buf, rect);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    let sel_bg = if gradient {
+    let sel_bg = if theme.gradient() {
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        Color::Rgb(0x1e, 0x3a, 0x6e)
+        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
     };
 
     // Query line with a block caret, the zoxide-jump idiom.
     let query_style = Style::default()
-        .fg(Color::Rgb(0xec, 0xef, 0xf4))
+        .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
         .add_modifier(Modifier::BOLD);
     let caret_style = Style::default()
-        .fg(Color::Rgb(0x16, 0x18, 0x1f))
-        .bg(Color::Rgb(0xec, 0xef, 0xf4));
+        .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
+        .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)));
     let cursor = pop.cursor.min(pop.char_count());
     let before: String = pop.query.chars().take(cursor).collect();
     let at: String = pop.query.chars().skip(cursor).take(1).collect();
@@ -172,13 +177,16 @@ pub fn render_history_popup(pop: &mut HistoryPopup, rect: Rect, buf: &mut Buffer
         HistoryScope::Failed => String::from("  [failed only]"),
     };
     let prompt_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0))),
+        Span::styled(
+            "> ",
+            Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
+        ),
         Span::styled(before, query_style),
         Span::styled(caret_glyph, caret_style),
         Span::styled(after, query_style),
         Span::styled(
             scope_note,
-            Style::default().fg(Color::Rgb(0xe5, 0xc0, 0x7b)),
+            Style::default().fg(theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b))),
         ),
     ]);
     Widget::render(
@@ -205,7 +213,7 @@ pub fn render_history_popup(pop: &mut HistoryPopup, rect: Rect, buf: &mut Buffer
         Widget::render(
             Paragraph::new(Line::from(Span::styled(
                 "  No matching commands yet (history records shell-integrated panes).",
-                Style::default().fg(Color::Rgb(0x80, 0x88, 0x98)),
+                Style::default().fg(theme.ui(Color::Rgb(0x80, 0x88, 0x98))),
             ))),
             list_rect,
             buf,
@@ -229,9 +237,9 @@ pub fn render_history_popup(pop: &mut HistoryPopup, rect: Rect, buf: &mut Buffer
         }
         let ok = e.exit == Some(0);
         let mark_style = Style::default().fg(if ok {
-            Color::Rgb(0x4f, 0xb1, 0xa6)
+            theme.ui(Color::Rgb(0x4f, 0xb1, 0xa6))
         } else {
-            Color::Rgb(0xf1, 0x4c, 0x4c)
+            theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))
         });
         let meta = format!(
             "  {} · {}{}",
@@ -247,10 +255,13 @@ pub fn render_history_popup(pop: &mut HistoryPopup, rect: Rect, buf: &mut Buffer
             Span::styled(
                 e.cmd.clone(),
                 Style::default()
-                    .fg(Color::Rgb(0xec, 0xef, 0xf4))
+                    .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(meta, Style::default().fg(Color::Rgb(0x80, 0x88, 0x98))),
+            Span::styled(
+                meta,
+                Style::default().fg(theme.ui(Color::Rgb(0x80, 0x88, 0x98))),
+            ),
         ];
         Widget::render(
             Paragraph::new(Line::from(spans)),

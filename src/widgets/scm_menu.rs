@@ -372,7 +372,13 @@ fn column_width(labels: impl Iterator<Item = usize>, with_arrow: bool) -> u16 {
 /// Paint the menu anchored under `anchor` within `screen`, recording hit
 /// rects into `state`. The submenu fly-out renders to the right of the top
 /// column (or to its left when there is no room).
-pub fn render(state: &mut ScmMenuState, anchor: Rect, screen: Rect, buf: &mut Buffer) {
+pub fn render(
+    state: &mut ScmMenuState,
+    anchor: Rect,
+    screen: Rect,
+    buf: &mut Buffer,
+    theme: crate::theme::Theme,
+) {
     state.top_hits.clear();
     state.sub_hits.clear();
     let nodes = menu();
@@ -395,7 +401,7 @@ pub fn render(state: &mut ScmMenuState, anchor: Rect, screen: Rect, buf: &mut Bu
         height: top_h.min(screen.height),
     };
     Widget::render(Clear, top_rect, buf);
-    fill(buf, top_rect, BG);
+    fill(buf, top_rect, theme.ui(BG));
 
     for (i, node) in nodes.iter().enumerate() {
         let row_y = top_rect.y + i as u16;
@@ -411,17 +417,44 @@ pub fn render(state: &mut ScmMenuState, anchor: Rect, screen: Rect, buf: &mut Bu
         match node {
             Node::Sep => {
                 for x in row.x + 1..row.x + row.width.saturating_sub(1) {
-                    buf.set_string(x, row_y, "─", Style::default().fg(SEP_FG).bg(BG));
+                    buf.set_string(
+                        x,
+                        row_y,
+                        "─",
+                        Style::default().fg(theme.ui(SEP_FG)).bg(theme.ui(BG)),
+                    );
                 }
             }
             Node::Item(l) => {
-                paint_row(buf, row, l.icon, action_color(l.action), l.label, false, BG);
+                paint_row(
+                    buf,
+                    row,
+                    l.icon,
+                    theme.ui(action_color(l.action)),
+                    l.label,
+                    false,
+                    theme.ui(BG),
+                    theme,
+                );
                 state.top_hits.push((row, TopHit::Action(l.action)));
             }
             Node::Sub { label, icon, .. } => {
                 let is_open = state.expanded == Some(i);
-                let row_bg = if is_open { SUB_BG } else { BG };
-                paint_row(buf, row, *icon, submenu_color(label), label, true, row_bg);
+                let row_bg = if is_open {
+                    theme.ui(SUB_BG)
+                } else {
+                    theme.ui(BG)
+                };
+                paint_row(
+                    buf,
+                    row,
+                    *icon,
+                    theme.ui(submenu_color(label)),
+                    label,
+                    true,
+                    row_bg,
+                    theme,
+                );
                 state.top_hits.push((row, TopHit::Expand(i)));
             }
         }
@@ -449,7 +482,7 @@ pub fn render(state: &mut ScmMenuState, anchor: Rect, screen: Rect, buf: &mut Bu
             height: sub_h.min(screen.height),
         };
         Widget::render(Clear, sub_rect, buf);
-        fill(buf, sub_rect, SUB_BG);
+        fill(buf, sub_rect, theme.ui(SUB_BG));
         for (j, l) in items.iter().enumerate() {
             let row_y = sub_rect.y + j as u16;
             if row_y >= screen.y + screen.height {
@@ -465,10 +498,11 @@ pub fn render(state: &mut ScmMenuState, anchor: Rect, screen: Rect, buf: &mut Bu
                 buf,
                 row,
                 l.icon,
-                action_color(l.action),
+                theme.ui(action_color(l.action)),
                 l.label,
                 false,
-                SUB_BG,
+                theme.ui(SUB_BG),
+                theme,
             );
             state.sub_hits.push((row, l.action));
         }
@@ -486,6 +520,7 @@ fn fill(buf: &mut Buffer, rect: Rect, bg: Color) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_row(
     buf: &mut Buffer,
     row: Rect,
@@ -494,8 +529,9 @@ fn paint_row(
     label: &str,
     submenu: bool,
     bg: Color,
+    theme: crate::theme::Theme,
 ) {
-    let fg = Style::default().fg(FG).bg(bg);
+    let fg = Style::default().fg(theme.ui(FG)).bg(bg);
     buf.set_string(
         row.x + 1,
         row.y,
@@ -511,7 +547,7 @@ fn paint_row(
             row.x + row.width - 2,
             row.y,
             "›",
-            Style::default().fg(SUB_ARROW_FG).bg(bg),
+            Style::default().fg(theme.ui(SUB_ARROW_FG)).bg(bg),
         );
     }
 }
@@ -536,7 +572,13 @@ mod tests {
         let anchor = Rect::new(10, 0, 2, 1);
         let mut buf = Buffer::empty(screen);
         st.open = true;
-        render(&mut st, anchor, screen, &mut buf);
+        render(
+            &mut st,
+            anchor,
+            screen,
+            &mut buf,
+            crate::theme::Theme::default(),
+        );
         // Find the "Branch" submenu's top-level index and its rect.
         let branch_idx = menu()
             .iter()
@@ -559,7 +601,13 @@ mod tests {
         let screen = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(screen);
         st.open = true;
-        render(&mut st, Rect::new(10, 0, 2, 1), screen, &mut buf);
+        render(
+            &mut st,
+            Rect::new(10, 0, 2, 1),
+            screen,
+            &mut buf,
+            crate::theme::Theme::default(),
+        );
         let (rect, _) = st
             .top_hits
             .iter()
@@ -578,7 +626,13 @@ mod tests {
         let screen = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(screen);
         st.open = true;
-        render(&mut st, Rect::new(10, 0, 2, 1), screen, &mut buf);
+        render(
+            &mut st,
+            Rect::new(10, 0, 2, 1),
+            screen,
+            &mut buf,
+            crate::theme::Theme::default(),
+        );
         let (rect, _) = st
             .top_hits
             .iter()
@@ -604,7 +658,13 @@ mod tests {
             .position(|n| matches!(n, Node::Sub { label, .. } if *label == "Stash"))
             .unwrap();
         st.expanded = Some(stash_idx);
-        render(&mut st, Rect::new(10, 0, 2, 1), screen, &mut buf);
+        render(
+            &mut st,
+            Rect::new(10, 0, 2, 1),
+            screen,
+            &mut buf,
+            crate::theme::Theme::default(),
+        );
         assert!(
             st.sub_hits.iter().any(|(_, a)| *a == ScmAction::DropStash),
             "the expanded Stash submenu must expose Drop Stash as a hit target"

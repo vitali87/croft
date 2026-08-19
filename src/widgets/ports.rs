@@ -328,7 +328,7 @@ impl Widget for &mut PortsPanel {
         if self.entries.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No ports detected yet. Croft watches this session and surfaces a port the moment one starts listening.",
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             )))
             .render(area, buf);
             return;
@@ -348,7 +348,9 @@ impl Widget for &mut PortsPanel {
                 "{:<8}{:<24}{:<18}{}",
                 "PORT", "ADDRESS", "PROCESS", "ORIGIN"
             ),
-            Style::default().fg(COLOR_HEAD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(self.theme.ui(COLOR_HEAD))
+                .add_modifier(Modifier::BOLD),
         );
 
         // Body rows; reserve the last line for the keyboard hints.
@@ -391,7 +393,7 @@ impl Widget for &mut PortsPanel {
             self.row_rects.push((r, idx));
             let selected = idx == self.selected;
             let hovered =
-                crate::widgets::hover::row_hover_bg(r, self.hover_pointer, false).is_some();
+                crate::widgets::hover::row_hover_bg(r, self.hover_pointer, self.theme).is_some();
             if selected || hovered {
                 buf.set_style(
                     r,
@@ -401,7 +403,11 @@ impl Widget for &mut PortsPanel {
 
             // Green only while the port is actually listening; a stopped server
             // greys out (and a non-forwarded one is then dropped by the poll).
-            let dot_color = if entry.live { COLOR_LIVE } else { COLOR_DIM };
+            let dot_color = if entry.live {
+                self.theme.ui(COLOR_LIVE)
+            } else {
+                self.theme.ui(COLOR_DIM)
+            };
             let addr = match (&entry.origin, entry.local_port) {
                 (PortOrigin::Remote(_), Some(lp)) if lp != entry.port => {
                     format!("localhost:{lp} \u{2190} :{}", entry.port)
@@ -409,9 +415,15 @@ impl Widget for &mut PortsPanel {
                 _ => format!("localhost:{}", entry.port),
             };
             let origin = match &entry.origin {
-                PortOrigin::Local => Span::styled("local", Style::default().fg(COLOR_DIM)),
+                PortOrigin::Local => {
+                    Span::styled("local", Style::default().fg(self.theme.ui(COLOR_DIM)))
+                }
                 PortOrigin::Remote(host) => {
-                    let fg = if entry.forwarded { orange } else { COLOR_DIM };
+                    let fg = if entry.forwarded {
+                        orange
+                    } else {
+                        self.theme.ui(COLOR_DIM)
+                    };
                     Span::styled(format!("\u{21c4} {host}"), Style::default().fg(fg))
                 }
             };
@@ -421,10 +433,13 @@ impl Widget for &mut PortsPanel {
                     format!("{:<6}", entry.port),
                     Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("{addr:<24}"), Style::default().fg(COLOR_MSG)),
+                Span::styled(
+                    format!("{addr:<24}"),
+                    Style::default().fg(self.theme.ui(COLOR_MSG)),
+                ),
                 Span::styled(
                     format!("{:<18}", entry.process.as_deref().unwrap_or("")),
-                    Style::default().fg(COLOR_DIM),
+                    Style::default().fg(self.theme.ui(COLOR_DIM)),
                 ),
                 origin,
             ];
@@ -459,7 +474,7 @@ impl Widget for &mut PortsPanel {
                 area.y + area.height - 1,
                 hint,
                 area.width as usize,
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             );
         }
     }

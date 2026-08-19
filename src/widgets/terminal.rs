@@ -513,6 +513,9 @@ pub struct PtyTerminal {
     /// When focused, draw the orange→green gradient border (Black theme)
     /// instead of the solid blue one. Set by the app's focus/theme sync.
     pub focus_gradient: bool,
+    /// Active color theme; the pane's chrome (borders, pills, gauges) routes
+    /// through `Theme::ui` so it follows light themes. Set by the same sync.
+    pub theme: crate::theme::Theme,
     pub last_area: Rect,
     pub last_inner: Rect,
     selection: Option<Selection>,
@@ -1732,6 +1735,7 @@ impl PtyTerminal {
             focused: false,
             broadcast_excluded: false,
             focus_gradient: false,
+            theme: crate::theme::Theme::default(),
             last_area: Rect::default(),
             last_inner: Rect::default(),
             selection: None,
@@ -3714,7 +3718,7 @@ impl Widget for &mut PtyTerminal {
         let block_style = if let Some((r, g, b)) = self.accent {
             Style::default().fg(Color::Rgb(r, g, b))
         } else if self.focused {
-            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
+            Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -3928,7 +3932,7 @@ impl Widget for &mut PtyTerminal {
                     .any(|&(l, s0, ln)| l == line_idx && x >= s0 && x < s0 + ln)
                 {
                     style = style
-                        .fg(Color::Rgb(0xe5, 0xc0, 0x7b))
+                        .fg(self.theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b)))
                         .add_modifier(Modifier::UNDERLINED);
                 }
                 if cursor_visible
@@ -3949,7 +3953,7 @@ impl Widget for &mut PtyTerminal {
                         cell_in_selection(line_idx, x, sr, sc, er, ec)
                     }
                 {
-                    style = style.bg(Color::Rgb(0x26, 0x4f, 0x78));
+                    style = style.bg(self.theme.ui(Color::Rgb(0x26, 0x4f, 0x78)));
                 }
                 // Find highlight: muted amber on every occurrence, bright
                 // orange on the active match (VS Code's find colours).
@@ -3958,13 +3962,13 @@ impl Widget for &mut PtyTerminal {
                         Some(1) => {
                             style = style
                                 .fg(Color::Black)
-                                .bg(Color::Rgb(0xff, 0xd7, 0x4a))
+                                .bg(self.theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
                                 .add_modifier(Modifier::BOLD);
                         }
                         Some(2) => {
                             style = style
                                 .fg(Color::Black)
-                                .bg(Color::Rgb(0xff, 0x8c, 0x2a))
+                                .bg(self.theme.ui(Color::Rgb(0xff, 0x8c, 0x2a)))
                                 .add_modifier(Modifier::BOLD);
                         }
                         _ => {}
@@ -3977,7 +3981,7 @@ impl Widget for &mut PtyTerminal {
                     match span.get(x as usize) {
                         Some(1) => {
                             style = style
-                                .fg(Color::Rgb(0x66, 0xcc, 0x66))
+                                .fg(self.theme.ui(Color::Rgb(0x66, 0xcc, 0x66)))
                                 .add_modifier(Modifier::BOLD);
                         }
                         Some(2) => {
@@ -3988,7 +3992,7 @@ impl Widget for &mut PtyTerminal {
                             }
                             style = Style::default()
                                 .fg(Color::Black)
-                                .bg(Color::Rgb(0xff, 0xd7, 0x4a))
+                                .bg(self.theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
                                 .add_modifier(Modifier::BOLD);
                         }
                         _ => {}
@@ -4002,7 +4006,7 @@ impl Widget for &mut PtyTerminal {
                 {
                     style = Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Rgb(0x66, 0xcc, 0x66))
+                        .bg(self.theme.ui(Color::Rgb(0x66, 0xcc, 0x66)))
                         .add_modifier(Modifier::BOLD);
                 }
                 let target_x = inner.x + x;
@@ -4037,9 +4041,9 @@ impl Widget for &mut PtyTerminal {
                 (0, w * u32::from(pct.min(100)) / 100)
             };
             let color = match state {
-                2 => Color::Rgb(0xf1, 0x4c, 0x4c),
-                4 => Color::Rgb(0xe5, 0xc0, 0x7b),
-                _ => Color::Rgb(0x1b, 0x81, 0xa8),
+                2 => self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
+                4 => self.theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b)),
+                _ => self.theme.ui(Color::Rgb(0x1b, 0x81, 0xa8)),
             };
             let by = area.y + area.height - 1;
             for i in 0..fill_len.min(w) {
@@ -4075,9 +4079,9 @@ impl Widget for &mut PtyTerminal {
                 }
                 let x0 = inner.x + inner.width - tw;
                 let fg = if stalled {
-                    Color::Rgb(0xe5, 0xc0, 0x7b)
+                    self.theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b))
                 } else {
-                    Color::Rgb(0x5b, 0x64, 0x72)
+                    self.theme.ui(Color::Rgb(0x5b, 0x64, 0x72))
                 };
                 for (j, c) in text.chars().enumerate() {
                     let cell = &mut buf[(x0 + j as u16, inner.y + y)];
@@ -4140,7 +4144,7 @@ impl Widget for &mut PtyTerminal {
                 })
                 .filter(|t| !t.trim().is_empty());
             if let Some(text) = header {
-                let bg = Color::Rgb(0x25, 0x2b, 0x36);
+                let bg = self.theme.ui(Color::Rgb(0x25, 0x2b, 0x36));
                 for x in 0..inner.width {
                     let cell = &mut buf[(inner.x + x, inner.y)];
                     cell.set_symbol(" ");
@@ -4164,7 +4168,7 @@ impl Widget for &mut PtyTerminal {
                     cell.set_symbol(ch.encode_utf8(&mut tmpc));
                     cell.set_style(
                         Style::default()
-                            .fg(Color::Rgb(0xec, 0xf0, 0xf4))
+                            .fg(self.theme.ui(Color::Rgb(0xec, 0xf0, 0xf4)))
                             .bg(bg)
                             .add_modifier(Modifier::BOLD),
                     );
@@ -4178,7 +4182,11 @@ impl Widget for &mut PtyTerminal {
                         let cell = &mut buf[(x0 + j as u16, inner.y)];
                         let mut tmpc = [0u8; 4];
                         cell.set_symbol(ch.encode_utf8(&mut tmpc));
-                        cell.set_style(Style::default().fg(Color::Rgb(0x8b, 0x93, 0xa1)).bg(bg));
+                        cell.set_style(
+                            Style::default()
+                                .fg(self.theme.ui(Color::Rgb(0x8b, 0x93, 0xa1)))
+                                .bg(bg),
+                        );
                     }
                 }
             }
@@ -4195,9 +4203,9 @@ impl Widget for &mut PtyTerminal {
                     let cell = &mut buf[(area.x, inner.y + vp as u16)];
                     cell.set_symbol("●");
                     cell.set_style(Style::default().fg(if ok {
-                        Color::Rgb(0x1b, 0x81, 0xa8)
+                        self.theme.ui(Color::Rgb(0x1b, 0x81, 0xa8))
                     } else {
-                        Color::Rgb(0xf1, 0x4c, 0x4c)
+                        self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))
                     }));
                 }
             }

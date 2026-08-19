@@ -207,7 +207,7 @@ impl Widget for &mut TimelinePanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(COLOR_DIM));
+            .border_style(Style::default().fg(self.theme.ui(COLOR_DIM)));
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;
@@ -229,11 +229,14 @@ impl Widget for &mut TimelinePanel {
         };
         let header_y = inner.y;
         Paragraph::new(Line::from(vec![
-            Span::styled(format!("{chevron} "), Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                format!("{chevron} "),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ),
             Span::styled(
                 "TIMELINE",
                 Style::default()
-                    .fg(COLOR_HEADER)
+                    .fg(self.theme.ui(COLOR_HEADER))
                     .add_modifier(Modifier::BOLD),
             ),
         ]))
@@ -269,7 +272,7 @@ impl Widget for &mut TimelinePanel {
             };
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -317,16 +320,14 @@ impl Widget for &mut TimelinePanel {
                 width: content_w,
                 height: 1,
             };
-            if let Some(bg) = crate::widgets::hover::row_hover_bg(
-                summary_rect,
-                self.hover_pointer,
-                self.focus_gradient,
-            ) {
+            if let Some(bg) =
+                crate::widgets::hover::row_hover_bg(summary_rect, self.hover_pointer, self.theme)
+            {
                 buf.set_style(summary_rect, Style::default().bg(bg));
             }
             Paragraph::new(Line::from(Span::styled(
                 entry.summary.clone(),
-                Style::default().fg(COLOR_SUMMARY),
+                Style::default().fg(self.theme.ui(COLOR_SUMMARY)),
             )))
             .render(summary_rect, buf);
 
@@ -339,7 +340,7 @@ impl Widget for &mut TimelinePanel {
                 );
                 Paragraph::new(Line::from(Span::styled(
                     meta,
-                    Style::default().fg(COLOR_DIM),
+                    Style::default().fg(self.theme.ui(COLOR_DIM)),
                 )))
                 .render(
                     Rect {

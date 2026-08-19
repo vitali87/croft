@@ -66,7 +66,6 @@ const TRASH_GLYPH: char = '\u{ea81}';
 /// active [`Theme`] so the Black theme wears the brand teal where the Dark-Blue
 /// theme keeps the historical VS Code blue.
 struct Palette {
-    brand: bool,
     accent: Color,    // magnifier glyph
     selection: Color, // selected-row fill
     search_bg: Color, // filter input fill
@@ -79,7 +78,6 @@ impl Palette {
         // brand chrome (was `theme == Black`). Byte-identical to the old
         // hardcoded values for the two first-party themes.
         Palette {
-            brand: theme.gradient(),
             accent: theme.accent(),
             selection: theme.selection(),
             search_bg: theme.search_bg(),
@@ -525,7 +523,7 @@ impl Widget for &mut ExtensionsPanel {
             right,
             "EXTENSIONS",
             Style::default()
-                .fg(SECTION_HEADER)
+                .fg(self.theme.ui(SECTION_HEADER))
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -666,7 +664,7 @@ impl Widget for &mut ExtensionsPanel {
             let row_bg = if is_selected {
                 Some(pal.selection)
             } else {
-                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, pal.brand)
+                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
             };
             if let Some(bg) = row_bg {
                 buf.set_style(row_rect, Style::default().bg(bg));
@@ -688,7 +686,8 @@ impl Widget for &mut ExtensionsPanel {
             } else {
                 sw_x.saturating_sub(1)
             };
-            let (chip, chip_color) = chip_for(&item.id).unwrap_or(('\u{25c6}', ICON_CHIP_FALLBACK));
+            let (chip, chip_color) =
+                chip_for(&item.id).unwrap_or(('\u{25c6}', self.theme.ui(ICON_CHIP_FALLBACK)));
             let mut chip_style = Style::default().fg(chip_color);
             if let Some(bg) = row_bg {
                 chip_style = chip_style.bg(bg);

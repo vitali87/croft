@@ -8518,10 +8518,15 @@ impl App {
         if !cfg!(test) {
             let _ = crate::prefs::save_theme(theme);
         }
-        if !cfg!(test) && crate::iterm2_inline::detect_iterm2_inline_support() {
+        if !cfg!(test) {
             use std::io::Write;
             let mut out = stdout();
-            let _ = out.write_all(set_session_bg_srgb_seq(theme.editor_bg_rgb()).as_bytes());
+            // Portable dynamic colors first (all hosts), then the iTerm2
+            // sRGB override where supported.
+            let _ = out.write_all(host_colors_seq(theme).as_bytes());
+            if crate::iterm2_inline::detect_iterm2_inline_support() {
+                let _ = out.write_all(set_session_bg_srgb_seq(theme.editor_bg_rgb()).as_bytes());
+            }
             let _ = out.flush();
         }
         // Re-bake the fixed icon/badge/run-debug PNGs against the new bg.
@@ -9637,7 +9642,7 @@ impl App {
                 ly,
                 label,
                 Style::default()
-                    .fg(Color::Rgb(0x9d, 0xa5, 0xb4))
+                    .fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
                     .add_modifier(Modifier::BOLD),
             );
         }
@@ -9711,7 +9716,7 @@ impl App {
                 tagline_x,
                 tagline_y,
                 WELCOME_TAGLINE,
-                Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
+                Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
             );
         }
 
@@ -9733,7 +9738,7 @@ impl App {
             let inner_y = box_rect.y + 1;
             let inner_w_actual = welcome_card_inner_width(box_rect.width);
 
-            let row_style = Style::default().fg(Color::Rgb(0xc5, 0xcd, 0xd9));
+            let row_style = Style::default().fg(self.theme.ui(Color::Rgb(0xc5, 0xcd, 0xd9)));
 
             // Header row: "> IN THIS RELEASE (vX.Y.Z)". The leading chevron
             // echoes the cr<>ft wordmark's bracket. The highlights below are
@@ -9809,7 +9814,7 @@ impl App {
         // like the primary side bar's seam against the editor.
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::LEFT)
-            .border_style(Style::default().fg(Color::Rgb(0x2b, 0x2b, 0x2b)))
+            .border_style(Style::default().fg(self.theme.ui(Color::Rgb(0x2b, 0x2b, 0x2b))))
             .style(Style::default().bg(self.theme.editor_bg()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -9866,8 +9871,8 @@ impl App {
         // The codicon shape carries the on/off state (filled vs. hollow), like
         // VS Code; colour brightens to the accent on hover. Glyphs sit centred
         // in the 4-wide slot.
-        let base = Color::Rgb(0xcc, 0xcc, 0xcc);
-        let accent = Color::Rgb(0x4e, 0x9a, 0xff);
+        let base = self.theme.ui(Color::Rgb(0xcc, 0xcc, 0xcc));
+        let accent = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
         let mut paint = |x: u16, glyph: char| {
             let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
             let color = if hovered { accent } else { base };
@@ -9922,7 +9927,7 @@ impl App {
         if !self.overlays.activity.has_images() {
             frame.render_widget(ratatui::widgets::Block::default().style(bg), area);
         }
-        let active_bar = Color::Rgb(0x4e, 0x9a, 0xff);
+        let active_bar = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
         let bg_color = bg.bg.unwrap_or(Color::Reset);
         let explorer_block = activity_explorer_block(area);
         let search_block = activity_search_block(area);
@@ -9953,7 +9958,7 @@ impl App {
         let settings_hovered = hov == Some(ActivityIcon::Settings);
 
         let active_color = Color::White;
-        let inactive_color = Color::Rgb(0x6c, 0x7d, 0x9c);
+        let inactive_color = self.theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c));
         let glyph_x = activity_icon_glyph_x(area);
         let render_glyph = |frame: &mut ratatui::Frame,
                             block: Rect,
@@ -10652,7 +10657,7 @@ impl App {
         let sel_bg = if brand {
             crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
         } else {
-            Color::Rgb(0x09, 0x4d, 0x77)
+            self.theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
         };
         // With more terminals than rows the rail is a window over the list,
         // scrolled by the wheel — the panel floors at 3 rows, so four panes
@@ -10691,7 +10696,7 @@ impl App {
             let bg = if active {
                 Some(sel_bg)
             } else {
-                crate::widgets::hover::row_hover_bg(row, self.pointer_cell, brand)
+                crate::widgets::hover::row_hover_bg(row, self.pointer_cell, self.theme)
             };
             if let Some(bg) = bg {
                 frame.buffer_mut().set_style(row, Style::default().bg(bg));
@@ -11051,6 +11056,7 @@ impl App {
         self.source_control.theme = self.theme;
         self.refresh_scm_repositories();
         self.run_debug.focus_gradient = gradient;
+        self.run_debug.theme = self.theme;
         let explorer_focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
         self.outline.focus_gradient = gradient;
@@ -11094,6 +11100,7 @@ impl App {
         self.captures.hover_pointer = self.pointer_cell;
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
+            t.theme = self.theme;
             t.set_palette(self.theme.ansi());
         }
         self.dress_host_accents();
@@ -11148,12 +11155,12 @@ impl App {
         } else {
             Color::White
         };
-        let inactive_fg = Color::Rgb(0x80, 0x88, 0x98);
+        let inactive_fg = self.theme.ui(Color::Rgb(0x80, 0x88, 0x98));
         let right = strip.x + strip.width;
         let count = self.problems.total_count();
         let pointer = self.pointer_cell;
         let orange = crate::gradient::rgb_color(crate::gradient::GRAD_TR);
-        let badge_fg = Color::Rgb(0x1a, 0x12, 0x0a);
+        let badge_fg = self.theme.ui(Color::Rgb(0x1a, 0x12, 0x0a));
         let active = self.bottom_panel_tab;
 
         self.problems_tab_rect = Rect::default();
@@ -11222,7 +11229,7 @@ impl App {
                     .fg(active_fg)
                     .bg(strip_bg)
                     .add_modifier(Modifier::BOLD)
-            } else if crate::widgets::hover::row_hover_bg(*rect, pointer, brand).is_some() {
+            } else if crate::widgets::hover::row_hover_bg(*rect, pointer, self.theme).is_some() {
                 Style::default().fg(active_fg).bg(strip_bg)
             } else {
                 Style::default().fg(inactive_fg).bg(strip_bg)
@@ -11987,14 +11994,13 @@ impl App {
                 self.disable_minimap_image();
                 editor_area
             };
-            let grad = self.popup_gradient();
             if self.focus == Pane::Editor
                 && self.completion_popup.is_some()
                 && let Some((cx, cy)) = self.editor.cursor_screen_pos()
             {
                 if let Some(popup) = self.completion_popup.as_mut() {
                     popup.anchor = (cx, cy);
-                    popup.gradient = grad;
+                    popup.theme = self.theme;
                 }
                 let popup_ref = self.completion_popup.as_ref().unwrap();
                 let area = popup_ref.area_for(focused_area);
@@ -12010,7 +12016,7 @@ impl App {
             {
                 if let Some(popup) = self.signature_help_popup.as_mut() {
                     popup.anchor = (cx, cy);
-                    popup.gradient = grad;
+                    popup.theme = self.theme;
                 }
                 let popup_ref = self.signature_help_popup.as_ref().unwrap();
                 let area = popup_ref.area_for(focused_area);
@@ -12019,7 +12025,7 @@ impl App {
                 }
             }
             if let Some(popup) = self.tab_tooltip.as_mut() {
-                popup.gradient = grad;
+                popup.theme = self.theme;
                 let area = popup.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
                     frame.render_widget(&*popup, area);
@@ -12133,7 +12139,6 @@ impl App {
                         }
                     }
                     let show_close = multi;
-                    let brand = self.theme.gradient();
                     self.terminal_add_buttons.clear();
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
@@ -12155,7 +12160,7 @@ impl App {
                             *col,
                             show_close,
                             maximized,
-                            brand,
+                            self.theme,
                             self.pointer_cell,
                         );
                         self.terminal_add_buttons
@@ -12217,7 +12222,7 @@ impl App {
                                 let style = if receiving {
                                     Style::default()
                                         .fg(Color::Black)
-                                        .bg(Color::Rgb(0xe7, 0x70, 0x70))
+                                        .bg(self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)))
                                         .add_modifier(Modifier::BOLD)
                                 } else if let Some((r, g, b)) = accent {
                                     Style::default()
@@ -12225,7 +12230,7 @@ impl App {
                                         .bg(Color::Rgb(r, g, b))
                                         .add_modifier(Modifier::BOLD)
                                 } else {
-                                    crate::widgets::header_pill::action_style(brand, false)
+                                    crate::widgets::header_pill::action_style(self.theme, false)
                                 };
                                 // `room` bounds how much of the name is worth
                                 // showing, but it counts CHARACTERS while the
@@ -12343,7 +12348,7 @@ impl App {
             spans.push(Span::styled(
                 " ⟳ Update ready - F9 to relaunch ",
                 Style::default()
-                    .bg(Color::Rgb(0x1f, 0x7a, 0x33))
+                    .bg(self.theme.ui(Color::Rgb(0x1f, 0x7a, 0x33)))
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -12357,7 +12362,7 @@ impl App {
                     self.update_spinner_glyph()
                 ),
                 Style::default()
-                    .fg(Color::Rgb(0xff, 0x45, 0x4d))
+                    .fg(self.theme.ui(Color::Rgb(0xff, 0x45, 0x4d)))
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -12369,7 +12374,7 @@ impl App {
             spans.push(Span::styled(
                 format!(" ⟳ {progress} "),
                 Style::default()
-                    .fg(Color::Rgb(0x4e, 0x9a, 0xff))
+                    .fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -12379,21 +12384,24 @@ impl App {
             spans.push(Span::styled(
                 format!(" {} {label} ", self.mcp_spinner_glyph()),
                 Style::default()
-                    .fg(Color::Rgb(0x2d, 0xd4, 0xbf))
+                    .fg(self.theme.ui(Color::Rgb(0x2d, 0xd4, 0xbf)))
                     .add_modifier(Modifier::BOLD),
             ));
         }
         if self.vim.enabled {
             let (text, bg) = match self.vim.command_line() {
-                Some(cmd) => (format!(" {cmd} "), Color::Rgb(0x33, 0x33, 0x33)),
+                Some(cmd) => (
+                    format!(" {cmd} "),
+                    self.theme.ui(Color::Rgb(0x33, 0x33, 0x33)),
+                ),
                 None => {
                     let label = self.vim.mode_label().unwrap_or("NORMAL");
                     let bg = match self.vim.mode() {
-                        crate::vim::VimMode::Insert => Color::Rgb(0x1f, 0x7a, 0x33),
+                        crate::vim::VimMode::Insert => self.theme.ui(Color::Rgb(0x1f, 0x7a, 0x33)),
                         crate::vim::VimMode::Visual | crate::vim::VimMode::VisualLine => {
-                            Color::Rgb(0x8a, 0x4f, 0xbf)
+                            self.theme.ui(Color::Rgb(0x8a, 0x4f, 0xbf))
                         }
-                        _ => Color::Rgb(0x4e, 0x9a, 0xff),
+                        _ => self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)),
                     };
                     (format!(" {label} "), bg)
                 }
@@ -12416,8 +12424,8 @@ impl App {
             spans.push(Span::styled(
                 format!(" \u{26a0} {warning} "),
                 Style::default()
-                    .bg(Color::Rgb(0xff, 0x9d, 0x2f))
-                    .fg(Color::Rgb(0x10, 0x13, 0x1a))
+                    .bg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
+                    .fg(self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)))
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw("  "));
@@ -12429,8 +12437,8 @@ impl App {
             spans.push(Span::styled(
                 format!(" \u{f0c0} {} attached ", self.session_participants.len()),
                 Style::default()
-                    .bg(Color::Rgb(0x2f, 0x6f, 0xd0))
-                    .fg(Color::Rgb(0xff, 0xff, 0xff))
+                    .bg(self.theme.ui(Color::Rgb(0x2f, 0x6f, 0xd0)))
+                    .fg(self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw("  "));
@@ -12445,8 +12453,8 @@ impl App {
                     stream.name, stream.file
                 ),
                 Style::default()
-                    .bg(Color::Rgb(0xff, 0x9d, 0x2f))
-                    .fg(Color::Rgb(0x10, 0x13, 0x1a))
+                    .bg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
+                    .fg(self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)))
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw("  "));
@@ -12456,8 +12464,8 @@ impl App {
             spans.push(Span::styled(
                 format!(" \u{25c6} {} seated ", host.title()),
                 Style::default()
-                    .bg(Color::Rgb(0x3c, 0x41, 0x4f))
-                    .fg(Color::Rgb(0xff, 0x9d, 0x2f))
+                    .bg(self.theme.ui(Color::Rgb(0x3c, 0x41, 0x4f)))
+                    .fg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw("  "));
@@ -12471,11 +12479,11 @@ impl App {
         let diag_len = diag_text.chars().count() as u16;
         spans.push(Span::styled(
             format!(" \u{ea87} {err_count} "),
-            Style::default().fg(Color::Rgb(0xf1, 0x4c, 0x4c)),
+            Style::default().fg(self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))),
         ));
         spans.push(Span::styled(
             format!(" \u{ea6c} {warn_count} "),
-            Style::default().fg(Color::Rgb(0xcc, 0xa7, 0x00)),
+            Style::default().fg(self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00))),
         ));
         // Transient status message (e.g. "Saved editor.rs"), no keybinding
         // cheat-sheet — those live in F1 / the Command Palette now.
@@ -12512,7 +12520,7 @@ impl App {
         // ---- Right cluster: document facts, right-justified. Indentation /
         // encoding / EOL / language are clickable to change (hit rects recorded
         // below). ----
-        let dim = Style::default().fg(Color::Rgb(0x9a, 0xa4, 0xb8));
+        let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8)));
         let right: Vec<Span> = vec![
             Span::styled(
                 format!(
@@ -12558,9 +12566,9 @@ impl App {
         // lighter than the #000000 editor so the bar still reads as distinct),
         // matching VS Code's OLED themes. Croft Dark keeps the navy band.
         let status_bg = if self.popup_gradient() {
-            Color::Rgb(0x18, 0x18, 0x18)
+            self.theme.ui(Color::Rgb(0x18, 0x18, 0x18))
         } else {
-            Color::Rgb(0x1e, 0x3a, 0x6e)
+            self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
         };
         // Left fills the whole bar (background + left text); the right cluster
         // overwrites the right portion.
@@ -12623,16 +12631,15 @@ impl App {
         // focused_area: its anchor may sit in the terminal panel, and the
         // welcome screen skips the editor-tabs branch entirely, which used to
         // drop a terminal annotation's note without painting it at all.
-        let hover_grad = self.popup_gradient();
         if let Some(popup) = self.peek_popup.as_mut() {
-            popup.gradient = hover_grad;
+            popup.theme = self.theme;
             let area = popup.area_for(frame.area());
             if area.width > 0 && area.height > 0 {
                 frame.render_widget(&*popup, area);
             }
         }
         if let Some(popup) = self.hover_popup.as_mut() {
-            popup.gradient = hover_grad;
+            popup.theme = self.theme;
             let area = popup.area_for(frame.area());
             if area.width > 0 && area.height > 0 {
                 frame.render_widget(&*popup, area);
@@ -12677,10 +12684,9 @@ impl App {
         // labels live in the activity bar and sidebar, outside the editor pane;
         // clamping it to the editor area would yank it away from the control or,
         // on the welcome screen, drop it entirely.
-        let tooltip_grad = self.popup_gradient();
         let mut tooltip_area = None;
         if let Some(popup) = self.ui_tooltip.as_mut() {
-            popup.gradient = tooltip_grad;
+            popup.theme = self.theme;
             let full = frame.area();
             let mut area = popup.area_for(full);
             // Keep the box clear of the activity bar's inline-image column. Those
@@ -12798,11 +12804,11 @@ impl App {
         // Black theme: orange→green gradient border + muted dark-teal
         // selection. Croft Dark keeps the legacy bright-blue accent so the
         // menu stays coherent with that theme's blue focus border.
-        let border_blue = Color::Rgb(0x4e, 0x9a, 0xff);
+        let border_blue = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(border_blue))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)));
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))));
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(block, rect);
         if grad {
@@ -12836,7 +12842,7 @@ impl App {
                     inner.x,
                     row.y,
                     &rule,
-                    Style::default().fg(Color::Rgb(0x45, 0x45, 0x45)),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0x45, 0x45, 0x45))),
                 );
                 continue;
             }
@@ -12848,7 +12854,7 @@ impl App {
                     row.y,
                     format!(" {label}"),
                     Style::default()
-                        .fg(Color::Rgb(0x7a, 0x82, 0x90))
+                        .fg(self.theme.ui(Color::Rgb(0x7a, 0x82, 0x90)))
                         .add_modifier(Modifier::BOLD),
                 );
                 continue;
@@ -12880,7 +12886,7 @@ impl App {
                     let hint_style = if is_sel {
                         Style::default().fg(sel_fg).bg(sel_bg)
                     } else {
-                        Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4))
+                        Style::default().fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
                     };
                     frame
                         .buffer_mut()
@@ -12929,7 +12935,7 @@ impl App {
             width: item_w,
             height: items.len() as u16,
         };
-        let bg = Color::Rgb(0x25, 0x2b, 0x37);
+        let bg = self.theme.ui(Color::Rgb(0x25, 0x2b, 0x37));
         let fg = Color::White;
         let style = Style::default().fg(fg).bg(bg);
         frame.render_widget(ratatui::widgets::Clear, menu_rect);
@@ -12950,15 +12956,19 @@ impl App {
             // Leading codicon, colored per action: push glyphs in blue,
             // diff/compare glyphs in purple, mirroring VS Code's SCM accents.
             let icon_color = match item {
-                CommitMenuItem::CommitAndPush => Color::Rgb(0x9a, 0xa4, 0xb2),
+                CommitMenuItem::CommitAndPush => self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb2)),
                 CommitMenuItem::Push | CommitMenuItem::Pull | CommitMenuItem::Sync => {
-                    Color::Rgb(0x6c, 0xb6, 0xff)
+                    self.theme.ui(Color::Rgb(0x6c, 0xb6, 0xff))
                 }
-                CommitMenuItem::CheckoutBranch => Color::Rgb(0x88, 0xc0, 0xd0),
-                CommitMenuItem::Stash | CommitMenuItem::StashPop => Color::Rgb(0xeb, 0xcb, 0x8b),
+                CommitMenuItem::CheckoutBranch => self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)),
+                CommitMenuItem::Stash | CommitMenuItem::StashPop => {
+                    self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))
+                }
                 CommitMenuItem::ViewStagedDiff
                 | CommitMenuItem::ViewPreviousCommitDiff
-                | CommitMenuItem::ViewDefaultBranchDiff => Color::Rgb(0xc0, 0xa4, 0xf5),
+                | CommitMenuItem::ViewDefaultBranchDiff => {
+                    self.theme.ui(Color::Rgb(0xc0, 0xa4, 0xf5))
+                }
             };
             frame.buffer_mut().set_string(
                 row_rect.x + 1,
@@ -13008,11 +13018,11 @@ impl App {
             width,
             height,
         };
-        let warn = Color::Rgb(0xe7, 0x70, 0x70);
+        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
                 " DISCARD CHANGES? ",
                 Style::default()
@@ -13041,7 +13051,7 @@ impl App {
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(ratatui::text::Span::styled(
                 truncate_for_display(&pd.rel_path, inner.width as usize),
-                Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
+                Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
             )),
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(vec![
@@ -13079,11 +13089,11 @@ impl App {
             width,
             height,
         };
-        let warn = Color::Rgb(0xe7, 0x70, 0x70);
+        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
                 " REVERT HUNK? ",
                 Style::default()
@@ -13107,7 +13117,7 @@ impl App {
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(ratatui::text::Span::styled(
                 truncate_for_display(&pr.rel_path, inner.width as usize),
-                Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
+                Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
             )),
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(vec![
@@ -13155,11 +13165,11 @@ impl App {
             width,
             height,
         };
-        let warn = Color::Rgb(0xe7, 0xa7, 0x3c);
+        let warn = self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
                 " REPLACE ALL? ",
                 Style::default()
@@ -13183,7 +13193,7 @@ impl App {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Enter / Y replaces \u{00b7} Esc cancels",
-            Style::default().fg(Color::Rgb(0x9a, 0xa4, 0xb8)),
+            Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
         )));
         frame.render_widget(
             Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
@@ -13204,11 +13214,11 @@ impl App {
             width,
             height,
         };
-        let warn = Color::Rgb(0xe7, 0x70, 0x70);
+        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
                 " DISCARD ALL CHANGES? ",
                 Style::default()
@@ -13264,11 +13274,11 @@ impl App {
             width,
             height,
         };
-        let warn = Color::Rgb(0xe7, 0x70, 0x70);
+        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
                 " BROADCAST INPUT TO ALL PANES? ",
                 Style::default()
@@ -13337,12 +13347,12 @@ impl App {
             width,
             height,
         };
-        let warn = Color::Rgb(0xff, 0xa5, 0x00);
-        let accent = Color::Rgb(0x4e, 0x9a, 0xff);
+        let warn = self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00));
+        let accent = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
                 " UNSUPPORTED TERMINAL ",
                 Style::default()
@@ -13434,13 +13444,13 @@ impl App {
         };
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(0xff, 0xa5, 0x00)))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .border_style(Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00))))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
                 " OPEN ON LOCAL MAC? ",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Rgb(0xff, 0xa5, 0x00))
+                    .bg(self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00)))
                     .add_modifier(Modifier::BOLD),
             ));
         frame.render_widget(ratatui::widgets::Clear, rect);
@@ -13459,7 +13469,7 @@ impl App {
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(ratatui::text::Span::styled(
                 truncate_for_display(url, inner.width as usize),
-                Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
+                Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))),
             )),
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(vec![
@@ -13559,7 +13569,7 @@ impl App {
             inner.y,
             &title_line,
             inner.width as usize,
-            Style::default().fg(Color::Rgb(0xCC, 0xCC, 0xCC)),
+            Style::default().fg(self.theme.ui(Color::Rgb(0xCC, 0xCC, 0xCC))),
         );
         let mut bx = inner.x;
         let by = inner.y + 1;
@@ -13612,12 +13622,12 @@ impl App {
         let cursor_fg = if grad {
             rgb_color(GRAD_TL)
         } else {
-            Color::Rgb(0x4e, 0x9a, 0xff)
+            self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))
         };
         let title_bg = if grad {
             rgb_color(POPUP_SEL_BG)
         } else {
-            Color::Rgb(0x1e, 0x3a, 0x6e)
+            self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
         };
         let title = ratatui::text::Span::styled(
             format!(" {} ", p.label),
@@ -13628,8 +13638,8 @@ impl App {
         );
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x1e, 0x1e)))
+            .border_style(Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(title.clone());
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(block, rect);
@@ -13754,7 +13764,7 @@ impl App {
             let line = ratatui::widgets::Paragraph::new(ratatui::text::Line::from(format!(
                 "Error: {err}"
             )))
-            .style(Style::default().fg(Color::Rgb(0xe8, 0x27, 0x4b)));
+            .style(Style::default().fg(self.theme.ui(Color::Rgb(0xe8, 0x27, 0x4b))));
             frame.render_widget(
                 line,
                 Rect {
@@ -23799,7 +23809,7 @@ impl App {
     }
 
     fn render_file_finder(&mut self, frame: &mut ratatui::Frame) {
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let center = self.quick_input_position == QuickInputPosition::Center;
         let Some(finder) = self.file_finder.as_mut() else {
             return;
@@ -23809,7 +23819,7 @@ impl App {
             finder,
             area,
             frame.buffer_mut(),
-            gradient,
+            theme,
             center,
         );
     }
@@ -23934,7 +23944,7 @@ impl App {
     }
 
     fn render_command_palette(&mut self, frame: &mut ratatui::Frame) {
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let center = self.quick_input_position == QuickInputPosition::Center;
         let Some(palette) = self.command_palette.as_mut() else {
             return;
@@ -23944,7 +23954,7 @@ impl App {
             palette,
             area,
             frame.buffer_mut(),
-            gradient,
+            theme,
             center,
         );
     }
@@ -24077,7 +24087,7 @@ impl App {
     }
 
     fn render_go_to_symbol(&mut self, frame: &mut ratatui::Frame) {
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let center = self.quick_input_position == QuickInputPosition::Center;
         let Some(picker) = self.go_to_symbol.as_mut() else {
             return;
@@ -24087,7 +24097,7 @@ impl App {
             picker,
             area,
             frame.buffer_mut(),
-            gradient,
+            theme,
             center,
         );
     }
@@ -24302,7 +24312,7 @@ impl App {
     }
 
     fn render_workspace_symbols(&mut self, frame: &mut ratatui::Frame) {
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let center = self.quick_input_position == QuickInputPosition::Center;
         let Some(picker) = self.workspace_symbols.as_mut() else {
             return;
@@ -24312,7 +24322,7 @@ impl App {
             picker,
             area,
             frame.buffer_mut(),
-            gradient,
+            theme,
             center,
         );
     }
@@ -24423,7 +24433,7 @@ impl App {
     }
 
     fn render_process_picker(&mut self, frame: &mut ratatui::Frame) {
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let Some(picker) = self.process_picker.as_mut() else {
             return;
         };
@@ -24432,7 +24442,7 @@ impl App {
             picker,
             area,
             frame.buffer_mut(),
-            gradient,
+            theme,
         );
     }
 
@@ -25220,7 +25230,7 @@ impl App {
     fn render_zoxide_jump(&mut self, frame: &mut ratatui::Frame) {
         let sidebar = self.last_sidebar_area;
         let full = frame.area();
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let Some(jump) = self.zoxide_jump.as_mut() else {
             return;
         };
@@ -25244,24 +25254,19 @@ impl App {
             }
             _ => fallback_popup_rect(full, 100),
         };
-        crate::widgets::zoxide_jump::render_zoxide_jump(jump, rect, frame.buffer_mut(), gradient);
+        crate::widgets::zoxide_jump::render_zoxide_jump(jump, rect, frame.buffer_mut(), theme);
     }
 
     fn render_command_history_popup(&mut self, frame: &mut ratatui::Frame) {
         let full = frame.area();
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let Some(pop) = self.command_history_popup.as_mut() else {
             return;
         };
         // Centered box, the zoxide-jump fallback geometry: wide enough for
         // command lines, anchored in the upper half like Quick Open.
         let rect = fallback_popup_rect(full, 110);
-        crate::widgets::history_popup::render_history_popup(
-            pop,
-            rect,
-            frame.buffer_mut(),
-            gradient,
-        );
+        crate::widgets::history_popup::render_history_popup(pop, rect, frame.buffer_mut(), theme);
     }
 
     pub fn consume_branch_picker_image_clear(&mut self) -> bool {
@@ -25406,7 +25411,7 @@ impl App {
     fn render_branch_picker(&mut self, frame: &mut ratatui::Frame) {
         let sidebar = self.last_sidebar_area;
         let full = frame.area();
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let Some(picker) = self.branch_picker.as_mut() else {
             return;
         };
@@ -25432,7 +25437,7 @@ impl App {
             picker,
             rect,
             frame.buffer_mut(),
-            gradient,
+            theme,
         );
     }
 
@@ -25480,16 +25485,11 @@ impl App {
 
     fn render_input_prompt(&mut self, frame: &mut ratatui::Frame) {
         let full = frame.area();
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let Some(prompt) = self.input_prompt.as_mut() else {
             return;
         };
-        crate::widgets::input_prompt::render_input_prompt(
-            prompt,
-            full,
-            frame.buffer_mut(),
-            gradient,
-        );
+        crate::widgets::input_prompt::render_input_prompt(prompt, full, frame.buffer_mut(), theme);
     }
 
     fn handle_list_picker_key(&mut self, key: KeyEvent) {
@@ -25555,11 +25555,11 @@ impl App {
 
     fn render_list_picker(&mut self, frame: &mut ratatui::Frame) {
         let full = frame.area();
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let Some(picker) = self.list_picker.as_mut() else {
             return;
         };
-        crate::widgets::list_picker::render_list_picker(picker, full, frame.buffer_mut(), gradient);
+        crate::widgets::list_picker::render_list_picker(picker, full, frame.buffer_mut(), theme);
     }
 
     /// Render the Source Control "⋯" actions menu under the header pill.
@@ -25573,7 +25573,13 @@ impl App {
             return;
         }
         let screen = frame.area();
-        crate::widgets::scm_menu::render(&mut self.scm_menu, anchor, screen, frame.buffer_mut());
+        crate::widgets::scm_menu::render(
+            &mut self.scm_menu,
+            anchor,
+            screen,
+            frame.buffer_mut(),
+            self.theme,
+        );
     }
 
     fn open_editor_find(&mut self) {
@@ -26692,7 +26698,7 @@ impl App {
     }
 
     fn render_editor_find(&mut self, frame: &mut ratatui::Frame) {
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
@@ -26700,7 +26706,7 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        crate::widgets::editor_find::render_editor_find(state, area, frame.buffer_mut(), gradient);
+        crate::widgets::editor_find::render_editor_find(state, area, frame.buffer_mut(), theme);
     }
 
     /// Draw the find-in-terminal bar over the active terminal pane, reusing
@@ -26709,7 +26715,7 @@ impl App {
         if self.terminal_find.is_none() || !self.show_terminal {
             return;
         }
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let area = self.terminal().last_area;
         if area.width == 0 || area.height == 0 {
             return;
@@ -26717,7 +26723,7 @@ impl App {
         let Some(state) = self.terminal_find.as_mut() else {
             return;
         };
-        crate::widgets::editor_find::render_editor_find(state, area, frame.buffer_mut(), gradient);
+        crate::widgets::editor_find::render_editor_find(state, area, frame.buffer_mut(), theme);
     }
 
     fn handle_shortcuts_modal_key(&mut self, key: KeyEvent) {
@@ -26755,26 +26761,21 @@ impl App {
     }
 
     fn render_shortcuts_modal(&mut self, frame: &mut ratatui::Frame) {
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let Some(modal) = self.shortcuts_modal.as_mut() else {
             return;
         };
         let area = frame.area();
-        crate::widgets::shortcuts::render_shortcuts_modal(
-            modal,
-            area,
-            frame.buffer_mut(),
-            gradient,
-        );
+        crate::widgets::shortcuts::render_shortcuts_modal(modal, area, frame.buffer_mut(), theme);
     }
 
     fn render_connect_dialog(&mut self, frame: &mut ratatui::Frame) {
         let visible = self.cursor_visible_phase();
-        let gradient = self.popup_gradient();
+        let theme = self.theme;
         let Some(dialog) = self.connect_dialog.as_mut() else {
             return;
         };
-        dialog.gradient = gradient;
+        dialog.theme = theme;
         let area = frame.area();
         use ratatui::widgets::Widget as _;
         dialog.render(area, frame.buffer_mut());
@@ -33584,6 +33585,26 @@ fn reset_session_bg_seq() -> String {
     String::from("\x1b]1337;SetColors=bg=default\x07")
 }
 
+/// Standard dynamic-color OSCs setting the HOST terminal's default
+/// background (OSC 11) and foreground (OSC 10) to the theme's. iTerm2 gets
+/// its proprietary sRGB variant on top, but this portable pair is what
+/// recolors Ghostty, Kitty, WezTerm, xterm and friends, so a light theme
+/// turns the whole session white (the issue's "including the terminal it
+/// runs on") and `Color::Reset` cells inherit the theme on every host. The
+/// host fg is the theme's default code foreground, the color plain text
+/// renders in anyway.
+fn host_colors_seq(theme: crate::theme::Theme) -> String {
+    let (br, bg, bb) = theme.editor_bg_rgb();
+    let (fr, fg, fb) = theme.syntax().fg;
+    format!("\x1b]11;rgb:{br:02x}/{bg:02x}/{bb:02x}\x07\x1b]10;rgb:{fr:02x}/{fg:02x}/{fb:02x}\x07")
+}
+
+/// Reset the host terminal's default foreground and background to its own
+/// configuration (OSC 110/111), undoing [`host_colors_seq`] on exit.
+fn reset_host_colors_seq() -> &'static str {
+    "\x1b]110\x07\x1b]111\x07"
+}
+
 /// The host terminal croft is running inside, for spawning a new window of the
 /// SAME terminal (Move/Copy into New Window). Detected from `$TERM_PROGRAM` /
 /// `$TERM`, the same signals croft's inline-image detection keys off.
@@ -36032,7 +36053,7 @@ fn paint_terminal_pane_buttons(
     area: Rect,
     show_close_button: bool,
     pane_maximized: bool,
-    brand: bool,
+    theme: crate::theme::Theme,
     pointer: Option<(u16, u16)>,
 ) -> TerminalPaneButtons {
     let add_w = TERMINAL_ADD_LABEL.chars().count() as u16;
@@ -36049,7 +36070,7 @@ fn paint_terminal_pane_buttons(
     // Croft Dark. The Explorer `⋯` button draws from the same source of truth.
     let style_at = |x: u16, w: u16| -> Style {
         let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
-        crate::widgets::header_pill::action_style(brand, hovered)
+        crate::widgets::header_pill::action_style(theme, hovered)
     };
     // Right to left: [+] at the edge, the profile caret just left of it, then
     // [-]. The caret mirrors VS Code's `∨` next to `+`.
@@ -36505,8 +36526,9 @@ pub fn run(
         // sRGB → display path and the welcome image bg matches the
         // surrounding pane bg pixel-for-pixel
         // (https://gitlab.com/gnachman/iterm2/-/issues/12529).
+        let theme = crate::prefs::Prefs::load_or_default().theme();
+        out.write_all(host_colors_seq(theme).as_bytes()).ok();
         if crate::iterm2_inline::detect_iterm2_inline_support() {
-            let theme = crate::prefs::Prefs::load_or_default().theme();
             out.write_all(set_session_bg_srgb_seq(theme.editor_bg_rgb()).as_bytes())
                 .ok();
         }
@@ -36546,8 +36568,10 @@ pub fn run(
         use std::io::Write;
         let mut out = stdout();
         out.write_all(&set_title_seq("")).ok();
-        // Revert iTerm2's session bg to the profile default so the user's
-        // shell after croft exits doesn't keep our forced editor-bg colour.
+        // Revert the host terminal's default colors (OSC 110/111, plus the
+        // iTerm2 sRGB override where present) so the user's shell after
+        // croft exits doesn't keep our forced theme colours.
+        out.write_all(reset_host_colors_seq().as_bytes()).ok();
         if crate::iterm2_inline::detect_iterm2_inline_support() {
             out.write_all(reset_session_bg_seq().as_bytes()).ok();
         }
@@ -36633,12 +36657,15 @@ fn restore_host_terminal_state() {
 
 // Disable every mouse-tracking mode crossterm knows about (1000/1002/1003
 // normal+button+any-motion, 1015/1006 urxvt+SGR encodings), bracketed
-// paste (2004), exit any leftover alt-screen (1049l), and reset the
-// cursor style. Written as raw bytes because the callers that need it
-// (the panic hook, the post-remote-ssh restore) no longer hold a
-// crossterm Backend handle for `execute!`.
+// paste (2004), exit any leftover alt-screen (1049l), reset the cursor
+// style, and reset the host's default fg/bg (OSC 110/111, undoing the
+// theme's dynamic colors). Written as raw bytes because the callers that
+// need it (the panic hook, the post-remote-ssh restore) no longer hold a
+// crossterm Backend handle for `execute!`. Both callers are done with the
+// tty (a return from remote re-enters `run`, which re-applies the theme's
+// host colors), so the color reset can't strand a live session.
 const TERMINAL_RESTORE_SEQ: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[ q";
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[ q\x1b]110\x07\x1b]111\x07";
 
 fn install_terminal_restore_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Quick-pick results are now mouse-clickable: clicking a row in Quick Open (Cmd+P), the Command Palette, Go to Symbol, the branch and directory pickers, and the Python process attach list performs exactly the action Enter would on that row.",
+    summary: "New Croft Light theme: a full VS Code Light-style palette (white editor, light chrome, Light+ code colors, light terminal ANSI) that recolors every popup, picker, sidebar and menu, and sets the host terminal's own background and foreground (Ghostty, iTerm2, and friends) while croft runs, restoring them on exit.",
 }];

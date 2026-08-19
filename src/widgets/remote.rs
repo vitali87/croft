@@ -266,7 +266,7 @@ pub use crate::widgets::header_pill::{ADD_GLYPH, REFRESH_GLYPH};
 
 fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect) {
     let header_style = Style::default()
-        .fg(Color::Rgb(0xcc, 0xcc, 0xcc))
+        .fg(panel.theme.ui(Color::Rgb(0xcc, 0xcc, 0xcc)))
         .add_modifier(Modifier::BOLD);
     let chevron = if panel.collapsed { '▸' } else { '▾' };
     buf.set_line(
@@ -301,14 +301,7 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
         };
         panel.header_add_btn = rect;
         let hovered = crate::widgets::hover::contains(rect, pointer);
-        crate::widgets::header_pill::render(
-            buf,
-            add_x,
-            inner.y,
-            ADD_GLYPH,
-            panel.focus_gradient,
-            hovered,
-        );
+        crate::widgets::header_pill::render(buf, add_x, inner.y, ADD_GLYPH, panel.theme, hovered);
     }
     if refresh_x > inner.x + 5 {
         let rect = Rect {
@@ -324,13 +317,13 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
             refresh_x,
             inner.y,
             REFRESH_GLYPH,
-            panel.focus_gradient,
+            panel.theme,
             hovered,
         );
     }
 }
 
-fn render_filter_row(buf: &mut Buffer, area: Rect, filter: &str) {
+fn render_filter_row(buf: &mut Buffer, area: Rect, filter: &str, theme: crate::theme::Theme) {
     if area.width < 4 {
         return;
     }
@@ -340,7 +333,7 @@ fn render_filter_row(buf: &mut Buffer, area: Rect, filter: &str) {
         cell.set_style(Style::default());
     }
     let label_style = Style::default()
-        .fg(Color::Rgb(0x9d, 0xa5, 0xb4))
+        .fg(theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
         .add_modifier(Modifier::ITALIC);
     let val_style = Style::default()
         .fg(Color::White)
@@ -376,7 +369,7 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
     let card_block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(CARD_BORDER));
+        .border_style(Style::default().fg(panel.theme.ui(CARD_BORDER)));
     let card_inner = card_block.inner(card_rect);
     card_block.render(card_rect, buf);
 
@@ -423,7 +416,7 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
     }
 
     let body_lines = wrap_body(content_w as usize);
-    let body_fg = Style::default().fg(BODY_FG);
+    let body_fg = Style::default().fg(panel.theme.ui(BODY_FG));
     for line in body_lines.iter() {
         if y >= content_end_y {
             break;
@@ -439,14 +432,20 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
     let btn_x = content_x + (content_w.saturating_sub(btn_width)) / 2;
 
     if y + 3 <= content_end_y {
-        panel.empty_primary_btn =
-            render_filled_button(buf, btn_x, y, btn_width, "+  Add New Host", PRIMARY_BG);
+        panel.empty_primary_btn = render_filled_button(
+            buf,
+            btn_x,
+            y,
+            btn_width,
+            "+  Add New Host",
+            panel.theme.ui(PRIMARY_BG),
+        );
         y += 4;
     }
 
     if y + 3 <= content_end_y {
         panel.empty_secondary_btn =
-            render_outlined_button(buf, btn_x, y, btn_width, "Open SSH Config");
+            render_outlined_button(buf, btn_x, y, btn_width, "Open SSH Config", panel.theme);
         y += 4;
     }
 
@@ -468,7 +467,7 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
                 y,
                 link,
                 Style::default()
-                    .fg(LINK_FG)
+                    .fg(panel.theme.ui(LINK_FG))
                     .add_modifier(Modifier::UNDERLINED),
             );
             panel.empty_learn_link = Rect {
@@ -546,7 +545,14 @@ fn render_filled_button(
     }
 }
 
-fn render_outlined_button(buf: &mut Buffer, x: u16, y: u16, width: u16, label: &str) -> Rect {
+fn render_outlined_button(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    label: &str,
+    theme: crate::theme::Theme,
+) -> Rect {
     for dx in 0..width {
         for dy in 0..3 {
             let cell = &mut buf[(x + dx, y + dy)];
@@ -555,7 +561,7 @@ fn render_outlined_button(buf: &mut Buffer, x: u16, y: u16, width: u16, label: &
         }
     }
     let right = x + width.saturating_sub(1);
-    let border_style = Style::default().fg(CARD_BORDER);
+    let border_style = Style::default().fg(theme.ui(CARD_BORDER));
     buf[(x, y)].set_char('╭').set_style(border_style);
     for dx in 1..width.saturating_sub(1) {
         buf[(x + dx, y)].set_char('─').set_style(border_style);
@@ -569,7 +575,7 @@ fn render_outlined_button(buf: &mut Buffer, x: u16, y: u16, width: u16, label: &
     }
     buf[(right, y + 2)].set_char('╯').set_style(border_style);
     let label_style = Style::default()
-        .fg(CARD_BORDER)
+        .fg(theme.ui(CARD_BORDER))
         .add_modifier(Modifier::BOLD);
     let lbl_w = label.chars().count() as u16;
     let lbl_x = x + (width.saturating_sub(lbl_w)) / 2;
@@ -585,7 +591,7 @@ fn render_outlined_button(buf: &mut Buffer, x: u16, y: u16, width: u16, label: &
 impl Widget for &mut RemotePanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block_style = if self.focused {
-            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
+            Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -603,7 +609,7 @@ impl Widget for &mut RemotePanel {
                 " REMOTE EXPLORER ",
                 Style::default()
                     .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
+                    .bg(self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e)))
                     .add_modifier(Modifier::BOLD),
             )
         };
@@ -659,6 +665,7 @@ impl Widget for &mut RemotePanel {
                     height: 1,
                 },
                 &self.filter,
+                self.theme,
             );
             body_y = body_y.saturating_add(1);
         }
@@ -680,7 +687,9 @@ impl Widget for &mut RemotePanel {
                     cx,
                     self.last_list_area.y,
                     &msg,
-                    Style::default().fg(BODY_FG).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(self.theme.ui(BODY_FG))
+                        .add_modifier(Modifier::ITALIC),
                 );
             }
             return;
@@ -720,10 +729,9 @@ impl Widget for &mut RemotePanel {
         let sel_bg = if self.focus_gradient {
             crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
         } else {
-            Color::Rgb(0x09, 0x4d, 0x77)
+            self.theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
         };
         let pointer = self.hover_pointer;
-        let brand = self.focus_gradient;
         let end = (self.scroll + viewport).min(self.visible.len());
         for (row, vis_idx) in (self.scroll..end).enumerate() {
             let idx = self.visible[vis_idx];
@@ -738,7 +746,9 @@ impl Widget for &mut RemotePanel {
             };
             let style = if selected {
                 Style::default().bg(sel_bg)
-            } else if let Some(bg) = crate::widgets::hover::row_hover_bg(row_rect, pointer, brand) {
+            } else if let Some(bg) =
+                crate::widgets::hover::row_hover_bg(row_rect, pointer, self.theme)
+            {
                 Style::default().bg(bg)
             } else {
                 Style::default()
@@ -749,7 +759,7 @@ impl Widget for &mut RemotePanel {
                 Span::raw("  "),
                 Span::styled(
                     "\u{f108} ",
-                    Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4)),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4))),
                 ),
                 Span::styled(
                     target.alias.as_str(),
@@ -838,6 +848,7 @@ mod tests {
     fn header_add_pill_brightens_under_the_pointer() {
         let mut p = populated_panel(&["a", "b"]);
         p.focus_gradient = false; // Croft Dark navy pill
+        p.theme = crate::theme::Theme::DARK_BLUE;
         let area = Rect {
             x: 0,
             y: 0,
@@ -869,6 +880,7 @@ mod tests {
     fn hovering_an_unselected_host_row_lifts_it() {
         let mut p = populated_panel(&["a", "b", "c"]);
         p.focus_gradient = false; // Croft Dark
+        p.theme = crate::theme::Theme::DARK_BLUE;
         p.selected = 0; // row 0 is selected
         let area = Rect {
             x: 0,

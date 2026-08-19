@@ -308,7 +308,7 @@ impl Widget for &mut OutlinePanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(COLOR_DIM));
+            .border_style(Style::default().fg(self.theme.ui(COLOR_DIM)));
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;
@@ -331,11 +331,14 @@ impl Widget for &mut OutlinePanel {
         };
         let header_y = inner.y;
         Paragraph::new(Line::from(vec![
-            Span::styled(format!("{chevron} "), Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                format!("{chevron} "),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ),
             Span::styled(
                 "OUTLINE",
                 Style::default()
-                    .fg(COLOR_HEADER)
+                    .fg(self.theme.ui(COLOR_HEADER))
                     .add_modifier(Modifier::BOLD),
             ),
         ]))
@@ -373,7 +376,7 @@ impl Widget for &mut OutlinePanel {
             };
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -412,7 +415,7 @@ impl Widget for &mut OutlinePanel {
         let sel_bg = if brand {
             crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
         } else {
-            Color::Rgb(0x09, 0x4d, 0x77)
+            self.theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
         };
 
         for row in 0..visible {
@@ -438,21 +441,21 @@ impl Widget for &mut OutlinePanel {
             ));
             spans.push(Span::styled(
                 sym.name.clone(),
-                Style::default().fg(COLOR_NAME),
+                Style::default().fg(self.theme.ui(COLOR_NAME)),
             ));
             if let Some(detail) = &sym.detail
                 && !detail.is_empty()
             {
                 spans.push(Span::styled(
                     format!(" {detail}"),
-                    Style::default().fg(COLOR_DIM),
+                    Style::default().fg(self.theme.ui(COLOR_DIM)),
                 ));
             }
 
             let style = if self.current == Some(idx) {
                 Style::default().bg(sel_bg)
             } else if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, brand)
+                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
             {
                 Style::default().bg(bg)
             } else {

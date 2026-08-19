@@ -26,7 +26,7 @@ pub struct SignatureHelpPopup {
     pub request_id: u64,
     /// Black theme: gradient border instead of the legacy bright-blue. Set by
     /// the app before render from `popup_gradient`.
-    pub gradient: bool,
+    pub theme: crate::theme::Theme,
 }
 
 impl SignatureHelpPopup {
@@ -43,7 +43,7 @@ impl SignatureHelpPopup {
             anchor,
             path,
             request_id,
-            gradient: false,
+            theme: crate::theme::Theme::default(),
         }
     }
 
@@ -102,9 +102,9 @@ impl Widget for &SignatureHelpPopup {
         };
         // Split the label into (before, active param, after) so the active
         // parameter renders bold-and-bright while the rest stays dim.
-        let base = Style::default().fg(Color::Rgb(0xc8, 0xce, 0xda));
+        let base = Style::default().fg(self.theme.ui(Color::Rgb(0xc8, 0xce, 0xda)));
         let active = Style::default()
-            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .fg(self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD);
         let chars: Vec<char> = sig.label.chars().collect();
         let spans: Vec<Span<'static>> = match sig.active_param {
@@ -124,19 +124,19 @@ impl Widget for &SignatureHelpPopup {
         if self.signatures.len() > 1 {
             title_spans.push(Span::styled(
                 format!(" {}/{} ", self.active_signature + 1, self.signatures.len()),
-                Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
+                Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
             ));
         }
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
+            .border_style(Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
             .title(Line::from(title_spans))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x21, 0x2a)));
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x21, 0x2a))));
 
         Widget::render(Clear, area, buf);
         Widget::render(Paragraph::new(Line::from(spans)).block(block), area, buf);
-        if self.gradient {
+        if self.theme.gradient() {
             crate::gradient::paint_gradient_box(buf, area);
         }
     }

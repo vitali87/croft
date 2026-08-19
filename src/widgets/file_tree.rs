@@ -1270,7 +1270,13 @@ const FILTER_MATCH_FG: Color = Color::Rgb(0xe5, 0xa3, 0x4b);
 /// filter `query` matched (per [`subsequence_match`]). With an empty query the
 /// whole name is pushed as a single span in `base` style, so the unfiltered
 /// path is unchanged.
-fn push_name_spans(spans: &mut Vec<Span<'static>>, name: &str, query: &str, base: Style) {
+fn push_name_spans(
+    spans: &mut Vec<Span<'static>>,
+    name: &str,
+    query: &str,
+    base: Style,
+    theme: crate::theme::Theme,
+) {
     let Some(offsets) = (!query.is_empty())
         .then(|| subsequence_match(name, query))
         .flatten()
@@ -1278,7 +1284,9 @@ fn push_name_spans(spans: &mut Vec<Span<'static>>, name: &str, query: &str, base
         spans.push(Span::styled(name.to_string(), base));
         return;
     };
-    let match_style = base.fg(FILTER_MATCH_FG).add_modifier(Modifier::BOLD);
+    let match_style = base
+        .fg(theme.ui(FILTER_MATCH_FG))
+        .add_modifier(Modifier::BOLD);
     let mut cursor = 0usize;
     for &off in &offsets {
         if off > cursor {
@@ -1312,7 +1320,7 @@ pub fn create_folder_in(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
 impl Widget for &mut FileTree {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block_style = if self.focused {
-            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
+            Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -1330,7 +1338,7 @@ impl Widget for &mut FileTree {
                 " EXPLORER ",
                 Style::default()
                     .fg(Color::White)
-                    .bg(Color::Rgb(0x1e, 0x3a, 0x6e))
+                    .bg(self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e)))
                     .add_modifier(Modifier::BOLD),
             )
         };
@@ -1373,7 +1381,7 @@ impl Widget for &mut FileTree {
                 area.x + area.width - 1,
                 area.y,
                 crate::widgets::header_pill::MORE_LABEL,
-                self.focus_gradient,
+                self.theme,
                 self.hover_pointer,
             )
         {
@@ -1422,7 +1430,6 @@ impl Widget for &mut FileTree {
             .saturating_sub(u16::from(scrollbar_metrics.is_some()));
 
         let pointer = self.hover_pointer;
-        let brand = self.focus_gradient;
         // No Explorer filter any more, so no characters are ever highlighted.
         let query = String::new();
         let end = (scroll_pos + visible_height).min(visible.len());
@@ -1471,7 +1478,7 @@ impl Widget for &mut FileTree {
                     Style::default().fg(icon.color),
                 ));
                 let base = Style::default().fg(name_fg).add_modifier(Modifier::BOLD);
-                push_name_spans(&mut spans, &name, &query, base);
+                push_name_spans(&mut spans, &name, &query, base, self.theme);
             } else {
                 let suffix = node
                     .path
@@ -1484,7 +1491,13 @@ impl Widget for &mut FileTree {
                     format!("{} ", icon.glyph),
                     Style::default().fg(icon.color),
                 ));
-                push_name_spans(&mut spans, &name, &query, Style::default().fg(name_fg));
+                push_name_spans(
+                    &mut spans,
+                    &name,
+                    &query,
+                    Style::default().fg(name_fg),
+                    self.theme,
+                );
             }
 
             let line = Line::from(spans);
@@ -1495,10 +1508,13 @@ impl Widget for &mut FileTree {
             let (sel_bg, mark_bg) = if self.focus_gradient {
                 (
                     crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG),
-                    Color::Rgb(0x18, 0x35, 0x32),
+                    self.theme.ui(Color::Rgb(0x18, 0x35, 0x32)),
                 )
             } else {
-                (Color::Rgb(0x09, 0x4d, 0x77), Color::Rgb(0x07, 0x33, 0x55))
+                (
+                    self.theme.ui(Color::Rgb(0x09, 0x4d, 0x77)),
+                    self.theme.ui(Color::Rgb(0x07, 0x33, 0x55)),
+                )
             };
             let row_rect = Rect {
                 x: inner.x,
@@ -1507,12 +1523,14 @@ impl Widget for &mut FileTree {
                 height: 1,
             };
             let line_style = if is_drop_target {
-                Style::default().bg(Color::Rgb(0x2c, 0x60, 0x2e))
+                Style::default().bg(self.theme.ui(Color::Rgb(0x2c, 0x60, 0x2e)))
             } else if is_selected {
                 Style::default().bg(sel_bg)
             } else if is_marked {
                 Style::default().bg(mark_bg)
-            } else if let Some(bg) = crate::widgets::hover::row_hover_bg(row_rect, pointer, brand) {
+            } else if let Some(bg) =
+                crate::widgets::hover::row_hover_bg(row_rect, pointer, self.theme)
+            {
                 Style::default().bg(bg)
             } else {
                 Style::default()
@@ -1554,7 +1572,6 @@ impl Widget for &mut FileTree {
             if row_width > label_w + block_w + right_pad + 2 {
                 let start_x = inner.x + row_width - right_pad - block_w;
                 let y = inner.y;
-                let brand = self.focus_gradient;
                 for (i, &glyph) in GLYPHS.iter().enumerate() {
                     let x = start_x + i as u16 * step;
                     let rect = Rect {
@@ -1564,7 +1581,7 @@ impl Widget for &mut FileTree {
                         height: 1,
                     };
                     let hovered = crate::widgets::hover::contains(rect, self.hover_pointer);
-                    header_pill::render(buf, x, y, glyph, brand, hovered);
+                    header_pill::render(buf, x, y, glyph, self.theme, hovered);
                     match i {
                         0 => self.header_new_file_btn = rect,
                         1 => self.header_new_folder_btn = rect,
@@ -2007,6 +2024,7 @@ mod tests {
         let (_tmp, mut tree) = fixture();
         tree.focused = true;
         tree.focus_gradient = false; // Croft Dark
+        tree.theme = crate::theme::Theme::DARK_BLUE;
         tree.selected = 0; // the root row stays selected
         let area = Rect {
             x: 0,

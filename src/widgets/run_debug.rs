@@ -60,13 +60,15 @@ fn with_bg(style: Style, bg: Option<Color>) -> Style {
 /// Colour a Python value by its `type_name` (PyCharm/Darcula-ish): strings and
 /// collections green, numbers cyan, None/bool orange, everything else (objects)
 /// the neutral name grey.
-fn value_color(type_name: &str) -> Color {
+fn value_color(type_name: &str, theme: crate::theme::Theme) -> Color {
     match type_name {
-        "str" => DBG_STR,
-        "int" | "float" | "complex" => DBG_NUM,
-        "bool" | "NoneType" => DBG_KW,
-        "list" | "tuple" | "dict" | "set" | "frozenset" | "bytes" | "bytearray" => DBG_STR,
-        _ => DBG_NAME,
+        "str" => theme.ui(DBG_STR),
+        "int" | "float" | "complex" => theme.ui(DBG_NUM),
+        "bool" | "NoneType" => theme.ui(DBG_KW),
+        "list" | "tuple" | "dict" | "set" | "frozenset" | "bytes" | "bytearray" => {
+            theme.ui(DBG_STR)
+        }
+        _ => theme.ui(DBG_NAME),
     }
 }
 
@@ -137,6 +139,9 @@ pub struct DebugRow {
 
 pub struct RunDebugPanel {
     pub focused: bool,
+    /// Active color theme; chrome colors route through `Theme::ui` so the
+    /// panel follows light themes. Set by the app's focus/theme sync.
+    pub theme: crate::theme::Theme,
     /// True under the Black theme: overpaint the focused outer border with the
     /// orange→green brand gradient instead of the legacy solid blue. Set by the
     /// app's focus/theme sync.
@@ -190,6 +195,7 @@ impl RunDebugPanel {
     pub fn new() -> Self {
         Self {
             focused: false,
+            theme: crate::theme::Theme::default(),
             focus_gradient: false,
             active_file: None,
             runnable: false,
@@ -268,8 +274,8 @@ impl RunDebugPanel {
                 y,
                 &pill,
                 Style::default()
-                    .fg(DBG_PILL_FG)
-                    .bg(DBG_PILL_BG)
+                    .fg(self.theme.ui(DBG_PILL_FG))
+                    .bg(self.theme.ui(DBG_PILL_BG))
                     .add_modifier(Modifier::BOLD),
             );
             y += 2;
@@ -309,7 +315,7 @@ impl RunDebugPanel {
                             width: inner.width,
                             height: 1,
                         },
-                        Style::default().bg(DBG_BAR_BG),
+                        Style::default().bg(self.theme.ui(DBG_BAR_BG)),
                     );
                     let t: String = title
                         .chars()
@@ -320,8 +326,8 @@ impl RunDebugPanel {
                         row_y,
                         &t,
                         Style::default()
-                            .fg(DBG_BAR_FG)
-                            .bg(DBG_BAR_BG)
+                            .fg(self.theme.ui(DBG_BAR_FG))
+                            .bg(self.theme.ui(DBG_BAR_BG))
                             .add_modifier(Modifier::BOLD),
                     );
                 }
@@ -339,23 +345,29 @@ impl RunDebugPanel {
                                 width: inner.width,
                                 height: 1,
                             },
-                            Style::default().bg(DBG_FRAME_BG),
+                            Style::default().bg(self.theme.ui(DBG_FRAME_BG)),
                         );
                         buf.set_string(
                             inner.x,
                             row_y,
                             "▌",
-                            Style::default().fg(DBG_ACCENT).bg(DBG_FRAME_BG),
+                            Style::default()
+                                .fg(self.theme.ui(DBG_ACCENT))
+                                .bg(self.theme.ui(DBG_FRAME_BG)),
                         );
                     }
-                    let bg = if *selected { Some(DBG_FRAME_BG) } else { None };
+                    let bg = if *selected {
+                        Some(self.theme.ui(DBG_FRAME_BG))
+                    } else {
+                        None
+                    };
                     let mut x = inner.x + 2;
                     let name_style = if *selected {
                         Style::default()
-                            .fg(DBG_FRAME_SEL_FG)
+                            .fg(self.theme.ui(DBG_FRAME_SEL_FG))
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(DBG_NAME)
+                        Style::default().fg(self.theme.ui(DBG_NAME))
                     };
                     x = put(buf, x, row_y, right, name, with_bg(name_style, bg));
                     x = put(buf, x, row_y, right, " ", with_bg(Style::default(), bg));
@@ -365,7 +377,7 @@ impl RunDebugPanel {
                         row_y,
                         right,
                         location,
-                        with_bg(Style::default().fg(DBG_LOC), bg),
+                        with_bg(Style::default().fg(self.theme.ui(DBG_LOC)), bg),
                     );
                 }
                 DebugRowKind::Scope { name } => {
@@ -375,7 +387,9 @@ impl RunDebugPanel {
                         row_y,
                         right,
                         name,
-                        Style::default().fg(DBG_SCOPE).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(self.theme.ui(DBG_SCOPE))
+                            .add_modifier(Modifier::BOLD),
                     );
                 }
                 DebugRowKind::Variable {
@@ -393,16 +407,37 @@ impl RunDebugPanel {
                     } else {
                         "  "
                     };
-                    x = put(buf, x, row_y, right, chev, Style::default().fg(DBG_CHEV));
-                    x = put(buf, x, row_y, right, name, Style::default().fg(DBG_NAME));
-                    x = put(buf, x, row_y, right, " = ", Style::default().fg(DBG_EQ));
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        chev,
+                        Style::default().fg(self.theme.ui(DBG_CHEV)),
+                    );
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        name,
+                        Style::default().fg(self.theme.ui(DBG_NAME)),
+                    );
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        " = ",
+                        Style::default().fg(self.theme.ui(DBG_EQ)),
+                    );
                     x = put(
                         buf,
                         x,
                         row_y,
                         right,
                         value,
-                        Style::default().fg(value_color(type_name)),
+                        Style::default().fg(value_color(type_name, self.theme)),
                     );
                     if !type_name.is_empty() {
                         put(
@@ -411,7 +446,9 @@ impl RunDebugPanel {
                             row_y,
                             right,
                             &format!(" : {type_name}"),
-                            Style::default().fg(DBG_TYPE).add_modifier(Modifier::ITALIC),
+                            Style::default()
+                                .fg(self.theme.ui(DBG_TYPE))
+                                .add_modifier(Modifier::ITALIC),
                         );
                     }
                 }
@@ -434,25 +471,37 @@ impl RunDebugPanel {
                         row_y,
                         right,
                         expression,
-                        Style::default().fg(DBG_NAME),
+                        Style::default().fg(self.theme.ui(DBG_NAME)),
                     );
-                    x = put(buf, x, row_y, right, " = ", Style::default().fg(DBG_EQ));
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        " = ",
+                        Style::default().fg(self.theme.ui(DBG_EQ)),
+                    );
                     let (text, style) = if *pending {
-                        ("\u{2026}", Style::default().fg(DBG_TYPE))
+                        ("\u{2026}", Style::default().fg(self.theme.ui(DBG_TYPE)))
                     } else if !*available {
                         (
                             "<not available>",
-                            Style::default().fg(DBG_TYPE).add_modifier(Modifier::ITALIC),
+                            Style::default()
+                                .fg(self.theme.ui(DBG_TYPE))
+                                .add_modifier(Modifier::ITALIC),
                         )
                     } else if *changed {
                         (
                             value.as_str(),
                             Style::default()
-                                .fg(Color::Rgb(0xb6, 0xee, 0xc4))
+                                .fg(self.theme.ui(Color::Rgb(0xb6, 0xee, 0xc4)))
                                 .add_modifier(Modifier::BOLD),
                         )
                     } else {
-                        (value.as_str(), Style::default().fg(value_color("")))
+                        (
+                            value.as_str(),
+                            Style::default().fg(value_color("", self.theme)),
+                        )
                     };
                     put(buf, x, row_y, right, text, style);
                     // Per-row remove ✕ pinned at the right edge, recorded for
@@ -467,7 +516,7 @@ impl RunDebugPanel {
                             row_y,
                             right,
                             "\u{2715}",
-                            Style::default().fg(DBG_TYPE),
+                            Style::default().fg(self.theme.ui(DBG_TYPE)),
                         );
                         self.watch_remove_rects.push((row_y, rx, *index));
                     }
@@ -480,7 +529,9 @@ impl RunDebugPanel {
                         row_y,
                         right,
                         "+ Add Expression",
-                        Style::default().fg(DBG_TYPE).add_modifier(Modifier::ITALIC),
+                        Style::default()
+                            .fg(self.theme.ui(DBG_TYPE))
+                            .add_modifier(Modifier::ITALIC),
                     );
                 }
             }
@@ -505,9 +556,9 @@ impl RunDebugPanel {
                 .enumerate()
             {
                 let style = if line.starts_with('❯') {
-                    Style::default().fg(DBG_ACCENT)
+                    Style::default().fg(self.theme.ui(DBG_ACCENT))
                 } else {
-                    Style::default().fg(DBG_LOC)
+                    Style::default().fg(self.theme.ui(DBG_LOC))
                 };
                 put(buf, inner.x + 1, console_y0 + i as u16, right, line, style);
             }
@@ -520,7 +571,9 @@ impl RunDebugPanel {
             label_y,
             right,
             "DEBUG CONSOLE",
-            Style::default().fg(DBG_LOC).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(self.theme.ui(DBG_LOC))
+                .add_modifier(Modifier::BOLD),
         );
 
         // The input field: a subtle full-width fill makes it read as a text box.
@@ -533,9 +586,9 @@ impl RunDebugPanel {
                 width: inner.width,
                 height: 1,
             },
-            Style::default().bg(DBG_FIELD_BG),
+            Style::default().bg(self.theme.ui(DBG_FIELD_BG)),
         );
-        let bg = Some(DBG_FIELD_BG);
+        let bg = Some(self.theme.ui(DBG_FIELD_BG));
         let caret_end = put(
             buf,
             inner.x + 1,
@@ -543,7 +596,9 @@ impl RunDebugPanel {
             right,
             "❯ ",
             with_bg(
-                Style::default().fg(DBG_ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(self.theme.ui(DBG_ACCENT))
+                    .add_modifier(Modifier::BOLD),
                 bg,
             ),
         );
@@ -555,7 +610,7 @@ impl RunDebugPanel {
                 field_y,
                 right,
                 " ",
-                Style::default().bg(DBG_ACCENT),
+                Style::default().bg(self.theme.ui(DBG_ACCENT)),
             );
             put(
                 buf,
@@ -565,7 +620,7 @@ impl RunDebugPanel {
                 "Evaluate expression",
                 with_bg(
                     Style::default()
-                        .fg(DBG_PLACEHOLDER)
+                        .fg(self.theme.ui(DBG_PLACEHOLDER))
                         .add_modifier(Modifier::ITALIC),
                     bg,
                 ),
@@ -577,7 +632,7 @@ impl RunDebugPanel {
                 field_y,
                 right,
                 &self.repl_input,
-                with_bg(Style::default().fg(DBG_NAME), bg),
+                with_bg(Style::default().fg(self.theme.ui(DBG_NAME)), bg),
             );
             put(
                 buf,
@@ -585,7 +640,7 @@ impl RunDebugPanel {
                 field_y,
                 right,
                 " ",
-                Style::default().bg(DBG_ACCENT),
+                Style::default().bg(self.theme.ui(DBG_ACCENT)),
             );
         }
     }
@@ -806,9 +861,9 @@ impl Widget for &mut RunDebugPanel {
             && next_y < inner.y + inner.height
         {
             let style = if self.feedback_is_error {
-                Style::default().fg(Color::Rgb(0xe7, 0x70, 0x70))
+                Style::default().fg(self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)))
             } else {
-                Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))
+                Style::default().fg(self.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
             };
             buf.set_string(inner.x + 1, next_y, msg.as_str(), style);
             next_y = next_y.saturating_add(1);
@@ -830,7 +885,7 @@ impl Widget for &mut RunDebugPanel {
             let avail = bottom.saturating_sub(next_y) as usize;
             let start = self.console_tail.len().saturating_sub(avail);
             let max_w = inner.width.saturating_sub(2) as usize;
-            let line_style = Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4));
+            let line_style = Style::default().fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)));
             for line in &self.console_tail[start..] {
                 if next_y >= bottom {
                     break;

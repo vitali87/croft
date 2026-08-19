@@ -113,6 +113,7 @@ fn render_image_placeholder(
     inner: Rect,
     buf: &mut Buffer,
     bg: Color,
+    theme: crate::theme::Theme,
 ) {
     // Solid bg fill so the OSC-1337 inline image (emitted post-frame on
     // capable terminals) sits on a clean canvas; on non-capable terminals
@@ -157,7 +158,7 @@ fn render_image_placeholder(
         &header,
         Style::default()
             .fg(Color::White)
-            .bg(Color::Rgb(0x09, 0x4d, 0x77))
+            .bg(theme.ui(Color::Rgb(0x09, 0x4d, 0x77)))
             .add_modifier(Modifier::BOLD),
     );
 }
@@ -207,7 +208,7 @@ fn render_hex(
         inner.width as usize,
         Style::default()
             .fg(Color::White)
-            .bg(Color::Rgb(0x09, 0x4d, 0x77))
+            .bg(theme.ui(Color::Rgb(0x09, 0x4d, 0x77)))
             .add_modifier(Modifier::BOLD),
     );
     if inner.height < 3 || inner.width < need8 {
@@ -288,10 +289,12 @@ fn render_hex(
             // The focused pane's cursor is the accent block; its mirror
             // in the other pane is a dim block so the pairing stays
             // visible without stealing focus.
-            let cursor_style = Style::default().fg(Color::Black).bg(theme.accent());
+            let cursor_style = Style::default()
+                .fg(theme.accent_contrast_fg())
+                .bg(theme.accent());
             let mirror_style = Style::default().fg(Color::White).bg(Color::DarkGray);
             let edited_style = Style::default()
-                .fg(Color::Rgb(0xe0, 0x9a, 0x4e))
+                .fg(theme.ui(Color::Rgb(0xe0, 0x9a, 0x4e)))
                 .bg(bg)
                 .add_modifier(Modifier::BOLD);
             let base_style = if selected {
@@ -324,7 +327,7 @@ fn render_hex(
         inner.width as usize,
         Style::default()
             .fg(Color::Gray)
-            .bg(Color::Rgb(0x07, 0x33, 0x55)),
+            .bg(theme.ui(Color::Rgb(0x07, 0x33, 0x55))),
     );
 }
 
@@ -369,7 +372,7 @@ fn render_archive(
         inner.width as usize,
         Style::default()
             .fg(Color::White)
-            .bg(Color::Rgb(0x09, 0x4d, 0x77))
+            .bg(theme.ui(Color::Rgb(0x09, 0x4d, 0x77)))
             .add_modifier(Modifier::BOLD),
     );
     let rows_top = inner.y + 1;
@@ -395,7 +398,9 @@ fn render_archive(
             format!("{} ", entry.size)
         };
         let style = if idx == view.selected {
-            Style::default().fg(Color::Black).bg(theme.accent())
+            Style::default()
+                .fg(theme.accent_contrast_fg())
+                .bg(theme.accent())
         } else if entry.dir {
             Style::default().fg(Color::DarkGray).bg(bg)
         } else {
@@ -413,7 +418,7 @@ fn render_archive(
         inner.width as usize,
         Style::default()
             .fg(Color::Gray)
-            .bg(Color::Rgb(0x07, 0x33, 0x55)),
+            .bg(theme.ui(Color::Rgb(0x07, 0x33, 0x55))),
     );
 }
 
@@ -469,7 +474,7 @@ fn render_sheet(
         &header,
         Style::default()
             .fg(Color::White)
-            .bg(Color::Rgb(0x09, 0x4d, 0x77))
+            .bg(theme.ui(Color::Rgb(0x09, 0x4d, 0x77)))
             .add_modifier(Modifier::BOLD),
     );
 
@@ -496,7 +501,7 @@ fn render_sheet(
     // Header row backdrop.
     let head_style = Style::default()
         .fg(Color::White)
-        .bg(Color::Rgb(0x07, 0x33, 0x55))
+        .bg(theme.ui(Color::Rgb(0x07, 0x33, 0x55)))
         .add_modifier(Modifier::BOLD);
     for x in inner.x..inner.x + inner.width {
         buf[(x, header_y)].set_style(head_style);
@@ -530,7 +535,7 @@ fn render_sheet(
     let row_style = Style::default().fg(Color::White).bg(bg);
     let alt_row_style = Style::default()
         .fg(Color::White)
-        .bg(Color::Rgb(0x24, 0x29, 0x37));
+        .bg(theme.ui(Color::Rgb(0x24, 0x29, 0x37)));
     let gutter_style = Style::default().fg(Color::DarkGray);
     for (display_row, row_idx) in (sheet.scroll_row..row_end).enumerate() {
         let y = data_top + display_row as u16;
@@ -572,7 +577,9 @@ fn render_sheet(
                         .map(|(i, _)| i)
                         .unwrap_or(0);
                     let shown = &edit.value[start..];
-                    let edit_style = Style::default().fg(Color::Black).bg(theme.accent());
+                    let edit_style = Style::default()
+                        .fg(theme.accent_contrast_fg())
+                        .bg(theme.accent());
                     write_cell(buf, body_x + *x_off, y, w, shown, edit_style);
                     let caret_cells = shown[..edit.cursor - start].chars().count() as u16;
                     let cx = body_x + *x_off + caret_cells.min(w.saturating_sub(1));
@@ -584,7 +591,7 @@ fn render_sheet(
                     );
                 } else {
                     let cursor_style = Style::default()
-                        .fg(Color::Black)
+                        .fg(theme.accent_contrast_fg())
                         .bg(theme.accent())
                         .add_modifier(Modifier::BOLD);
                     write_cell(buf, body_x + *x_off, y, w, cell_text, cursor_style);
@@ -619,7 +626,7 @@ fn render_sheet(
         &status,
         Style::default()
             .fg(Color::Gray)
-            .bg(Color::Rgb(0x14, 0x18, 0x22)),
+            .bg(theme.ui(Color::Rgb(0x14, 0x18, 0x22))),
     );
 }
 
@@ -631,6 +638,7 @@ fn render_diff(
     inner: Rect,
     buf: &mut Buffer,
     bg: Color,
+    theme: crate::theme::Theme,
 ) -> (Rect, Rect) {
     use crate::widgets::diff::DiffRow;
     // Background fill so the diff sits on a clean canvas (see [`canvas_bg`]).
@@ -645,7 +653,7 @@ fn render_diff(
         return (Rect::default(), Rect::default());
     }
     if diff.unified {
-        return render_unified_deletion(diff, inner, buf, bg);
+        return render_unified_deletion(diff, inner, buf, bg, theme);
     }
     let left_name = diff
         .left_path
@@ -674,9 +682,9 @@ fn render_diff(
         (None, _) => format!(" {left_name} "),
     };
     let head_bg = if diff.bytes_differ_but_lines_equal {
-        Color::Rgb(0x8a, 0x4a, 0x10)
+        theme.ui(Color::Rgb(0x8a, 0x4a, 0x10))
     } else {
-        Color::Rgb(0x09, 0x4d, 0x77)
+        theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
     };
     let head_style = Style::default()
         .fg(Color::White)
@@ -720,7 +728,7 @@ fn render_diff(
     let seam_x = inner.x + half;
     for y in body_top..body_top + body_height {
         buf[(seam_x, y)].set_symbol("\u{2502}");
-        buf[(seam_x, y)].set_style(Style::default().fg(Color::Rgb(0x3a, 0x42, 0x52)));
+        buf[(seam_x, y)].set_style(Style::default().fg(theme.ui(Color::Rgb(0x3a, 0x42, 0x52))));
     }
 
     let total = diff.rows.len();
@@ -730,12 +738,12 @@ fn render_diff(
         diff.scroll = max_scroll;
     }
 
-    let removed_bg = Color::Rgb(0x4a, 0x1f, 0x1f);
-    let removed_fg = Color::Rgb(0xff, 0xb3, 0xb3);
-    let added_bg = Color::Rgb(0x1f, 0x42, 0x2a);
-    let added_fg = Color::Rgb(0xb6, 0xee, 0xc4);
-    let equal_fg = Color::Rgb(0xc5, 0xcd, 0xd9);
-    let gutter_fg = Color::Rgb(0x6c, 0x7d, 0x9c);
+    let removed_bg = theme.ui(Color::Rgb(0x4a, 0x1f, 0x1f));
+    let removed_fg = theme.ui(Color::Rgb(0xff, 0xb3, 0xb3));
+    let added_bg = theme.ui(Color::Rgb(0x1f, 0x42, 0x2a));
+    let added_fg = theme.ui(Color::Rgb(0xb6, 0xee, 0xc4));
+    let equal_fg = theme.ui(Color::Rgb(0xc5, 0xcd, 0xd9));
+    let gutter_fg = theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c));
 
     let find_needle = diff.find.needle.clone();
     let find_opts = diff.find.opts;
@@ -911,6 +919,7 @@ fn render_diff(
                     diff.scroll_x,
                     active,
                     &[],
+                    theme,
                 );
             }
             if r_right_idx.is_some() && r_text_w > 0 {
@@ -928,6 +937,7 @@ fn render_diff(
                     diff.scroll_x,
                     active,
                     &[],
+                    theme,
                 );
             }
         }
@@ -947,6 +957,7 @@ fn render_diff(
                     needle,
                     diff.scroll_x,
                     &[],
+                    theme,
                 );
             }
             if r_right_idx.is_some() && r_text_w > 0 {
@@ -959,6 +970,7 @@ fn render_diff(
                     needle,
                     diff.scroll_x,
                     &[],
+                    theme,
                 );
             }
         }
@@ -974,6 +986,7 @@ fn render_diff(
         r_text_w,
         end,
         buf,
+        theme,
     );
 
     // Status footer.
@@ -988,7 +1001,7 @@ fn render_diff(
         &status,
         Style::default()
             .fg(Color::Gray)
-            .bg(Color::Rgb(0x14, 0x18, 0x22)),
+            .bg(theme.ui(Color::Rgb(0x14, 0x18, 0x22))),
     );
     (prev_arrow, next_arrow)
 }
@@ -1012,6 +1025,7 @@ fn paint_diff_selection_band(
     r_text_w: u16,
     end: usize,
     buf: &mut Buffer,
+    theme: crate::theme::Theme,
 ) {
     use crate::widgets::diff::DiffSide;
     let Some(sel) = diff.selection else {
@@ -1051,7 +1065,7 @@ fn paint_diff_selection_band(
         };
         let cs_screen = cs.saturating_sub(diff.scroll_x);
         let ce_screen = ce.saturating_sub(diff.scroll_x);
-        paint_selection_band(buf, text_x, y, text_w, cs_screen, ce_screen);
+        paint_selection_band(buf, text_x, y, text_w, cs_screen, ce_screen, theme);
     }
 }
 
@@ -1170,6 +1184,7 @@ fn render_unified_deletion(
     inner: Rect,
     buf: &mut Buffer,
     bg: Color,
+    theme: crate::theme::Theme,
 ) -> (Rect, Rect) {
     use crate::widgets::diff::DiffRow;
     let name = diff
@@ -1180,14 +1195,15 @@ fn render_unified_deletion(
     let header = format!(" diff: {name}  \u{2022} deleted (HEAD \u{2192} /dev/null) ");
     let head_style = Style::default()
         .fg(Color::White)
-        .bg(Color::Rgb(0x6b, 0x1f, 0x1f))
+        .bg(theme.ui(Color::Rgb(0x6b, 0x1f, 0x1f)))
         .add_modifier(Modifier::BOLD);
     for x in inner.x..inner.x + inner.width {
         buf[(x, inner.y)].set_style(head_style);
         buf[(x, inner.y)].set_symbol(" ");
     }
     buf.set_string(inner.x, inner.y, &header, head_style);
-    let (prev_arrow, next_arrow) = paint_diff_nav_arrows(inner, Color::Rgb(0x6b, 0x1f, 0x1f), buf);
+    let (prev_arrow, next_arrow) =
+        paint_diff_nav_arrows(inner, theme.ui(Color::Rgb(0x6b, 0x1f, 0x1f)), buf);
 
     let body_top = inner.y + 1;
     let body_height = inner.height.saturating_sub(2);
@@ -1208,9 +1224,9 @@ fn render_unified_deletion(
         diff.scroll = max_scroll;
     }
 
-    let removed_bg = Color::Rgb(0x4a, 0x1f, 0x1f);
-    let removed_fg = Color::Rgb(0xff, 0xb3, 0xb3);
-    let gutter_fg = Color::Rgb(0x6c, 0x7d, 0x9c);
+    let removed_bg = theme.ui(Color::Rgb(0x4a, 0x1f, 0x1f));
+    let removed_fg = theme.ui(Color::Rgb(0xff, 0xb3, 0xb3));
+    let gutter_fg = theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c));
 
     let end = (diff.scroll + viewport).min(total);
     for (vis_row, row_idx) in (diff.scroll..end).enumerate() {
@@ -1266,7 +1282,7 @@ fn render_unified_deletion(
                 .fg(if cell_bg == removed_bg {
                     removed_fg
                 } else {
-                    Color::Rgb(0xc5, 0xcd, 0xd9)
+                    theme.ui(Color::Rgb(0xc5, 0xcd, 0xd9))
                 })
                 .bg(cell_bg),
         );
@@ -1283,7 +1299,7 @@ fn render_unified_deletion(
         &status,
         Style::default()
             .fg(Color::Gray)
-            .bg(Color::Rgb(0x14, 0x18, 0x22)),
+            .bg(theme.ui(Color::Rgb(0x14, 0x18, 0x22))),
     );
     (prev_arrow, next_arrow)
 }
@@ -8781,7 +8797,7 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
 impl Widget for &mut Editor {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block_style = if self.focused {
-            Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff))
+            Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -8815,7 +8831,7 @@ impl Widget for &mut Editor {
                 crate::iterm2_inline::detect_inline_image_protocol(),
                 self.theme,
             );
-            render_image_placeholder(image, self.path.as_deref(), inner, buf, ibg);
+            render_image_placeholder(image, self.path.as_deref(), inner, buf, ibg, self.theme);
             return;
         }
         if let Some(view) = self.sheet.as_mut() {
@@ -8835,7 +8851,7 @@ impl Widget for &mut Editor {
             return;
         }
         if let Some(diff) = self.diff.as_mut() {
-            let (prev_arrow, next_arrow) = render_diff(diff, inner, buf, cbg);
+            let (prev_arrow, next_arrow) = render_diff(diff, inner, buf, cbg, self.theme);
             self.diff_prev_arrow = prev_arrow;
             self.diff_next_arrow = next_arrow;
             return;
@@ -9195,7 +9211,7 @@ impl Widget for &mut Editor {
                         sign_x,
                         y,
                         "▶",
-                        Style::default().fg(Color::Rgb(0xff, 0xcc, 0x00)),
+                        Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0xcc, 0x00))),
                     );
                     sign_taken = true;
                 } else if is_bp {
@@ -9203,13 +9219,13 @@ impl Widget for &mut Editor {
                     // red diamond for a conditional breakpoint; an amber one
                     // for a logpoint; a solid red dot for a plain, live one.
                     let (glyph, color) = if is_unverified {
-                        ("○", Color::Rgb(0x99, 0x99, 0x99))
+                        ("○", self.theme.ui(Color::Rgb(0x99, 0x99, 0x99)))
                     } else if is_conditional {
-                        ("◆", Color::Rgb(0xe5, 0x1c, 0x23))
+                        ("◆", self.theme.ui(Color::Rgb(0xe5, 0x1c, 0x23)))
                     } else if is_logpoint {
-                        ("◆", Color::Rgb(0xe5, 0xc0, 0x7b))
+                        ("◆", self.theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b)))
                     } else {
-                        ("●", Color::Rgb(0xe5, 0x1c, 0x23))
+                        ("●", self.theme.ui(Color::Rgb(0xe5, 0x1c, 0x23)))
                     };
                     buf.set_string(sign_x, y, glyph, Style::default().fg(color));
                     sign_taken = true;
@@ -9226,7 +9242,7 @@ impl Widget for &mut Editor {
                     sign_x,
                     y,
                     "■",
-                    Style::default().fg(Color::Rgb(0xff, 0x9d, 0x2f)),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f))),
                 );
                 sign_taken = true;
             }
@@ -9248,7 +9264,7 @@ impl Widget for &mut Editor {
                     sign_x,
                     y,
                     "\u{eb2c}", // cod-play, the Testing panel's run glyph
-                    Style::default().fg(Color::Rgb(0x73, 0xc9, 0x91)),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0x73, 0xc9, 0x91))),
                 );
             }
 
@@ -9497,7 +9513,7 @@ impl Widget for &mut Editor {
             // Merge-conflict region tints (VS Code's current/incoming
             // backgrounds), painted right after the text so diagnostics,
             // search highlights, and the selection all win over them.
-            if let Some(tint) = conflict_row_tint(&self.conflicts, line_idx) {
+            if let Some(tint) = conflict_row_tint(&self.conflicts, line_idx, self.theme) {
                 paint_full_row_bg(buf, text_x, y, row_width, tint);
             }
             // Clickable accept actions on the conflict header row — VS Code's
@@ -9529,7 +9545,7 @@ impl Widget for &mut Editor {
                         y,
                         label,
                         Style::default()
-                            .fg(Color::Rgb(0x8a, 0xb4, 0xf8))
+                            .fg(self.theme.ui(Color::Rgb(0x8a, 0xb4, 0xf8)))
                             .add_modifier(Modifier::UNDERLINED),
                     );
                     self.merge_action_spans
@@ -9552,7 +9568,9 @@ impl Widget for &mut Editor {
                 // so an underline never swallows a hint anchored right at it.
                 let ve = (ec + ex(ec.saturating_sub(1))).saturating_sub(row_start);
                 if ve > vs {
-                    paint_diagnostic_underline(buf, text_x, y, row_width, vs, ve, severity);
+                    paint_diagnostic_underline(
+                        buf, text_x, y, row_width, vs, ve, severity, self.theme,
+                    );
                 }
             }
 
@@ -9600,6 +9618,7 @@ impl Widget for &mut Editor {
                     row_start,
                     active_on_line,
                     &hint_cells,
+                    self.theme,
                 );
             }
 
@@ -9613,6 +9632,7 @@ impl Widget for &mut Editor {
                     needle,
                     row_start,
                     &hint_cells,
+                    self.theme,
                 );
             }
 
@@ -9628,7 +9648,15 @@ impl Widget for &mut Editor {
                 let visible_end =
                     (sel_end + ex(sel_end.saturating_sub(1))).saturating_sub(row_start);
                 if visible_end > visible_start {
-                    paint_selection_band(buf, text_x, y, row_width, visible_start, visible_end);
+                    paint_selection_band(
+                        buf,
+                        text_x,
+                        y,
+                        row_width,
+                        visible_start,
+                        visible_end,
+                        self.theme,
+                    );
                 }
             }
 
@@ -9662,7 +9690,7 @@ impl Widget for &mut Editor {
                     let vs = (cs + ex(cs)).saturating_sub(row_start);
                     let ve = (ce + ex(ce.saturating_sub(1))).saturating_sub(row_start);
                     if ve > vs {
-                        paint_selection_band(buf, text_x, y, row_width, vs, ve);
+                        paint_selection_band(buf, text_x, y, row_width, vs, ve, self.theme);
                     }
                 }
                 // Only paint the block on the visual row that holds the caret.
@@ -9675,7 +9703,15 @@ impl Widget for &mut Editor {
                     // sits left of the hint like the primary caret
                     // (`cursor_screen_pos`), marking the cell its typed
                     // character will land on, inside its own band.
-                    paint_block_cursor(buf, text_x, y, row_width, c + ex_caret(c), row_start);
+                    paint_block_cursor(
+                        buf,
+                        text_x,
+                        y,
+                        row_width,
+                        c + ex_caret(c),
+                        row_start,
+                        self.theme,
+                    );
                 }
             }
 
@@ -10227,17 +10263,18 @@ fn paint_search_highlight(
     scroll_col: usize,
     active_match_on_line: Option<(usize, usize)>,
     hints: &[(usize, usize)],
+    theme: crate::theme::Theme,
 ) {
     if needle.is_empty() {
         return;
     }
     let inactive_style = Style::default()
         .fg(Color::Black)
-        .bg(Color::Rgb(0xff, 0xd7, 0x4a))
+        .bg(theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
         .add_modifier(Modifier::BOLD);
     let active_style = Style::default()
         .fg(Color::Black)
-        .bg(Color::Rgb(0xff, 0x8c, 0x2a))
+        .bg(theme.ui(Color::Rgb(0xff, 0x8c, 0x2a)))
         .add_modifier(Modifier::BOLD);
     let segments = crate::widgets::search::split_for_highlight(raw_line, needle, opts);
     // `abs_col` tracks the absolute character index in the original line.
@@ -10290,11 +10327,12 @@ fn paint_selection_occurrences(
     needle: &str,
     scroll_col: usize,
     hints: &[(usize, usize)],
+    theme: crate::theme::Theme,
 ) {
     if needle.is_empty() {
         return;
     }
-    let bg = Color::Rgb(0x37, 0x61, 0x8e);
+    let bg = theme.ui(Color::Rgb(0x37, 0x61, 0x8e));
     let needle_cols = needle.chars().count();
     let mut search_from = 0usize;
     while let Some(rel) = raw_line[search_from..].find(needle) {
@@ -10326,6 +10364,7 @@ fn paint_block_cursor(
     text_width: u16,
     col_char: usize,
     scroll_col: usize,
+    theme: crate::theme::Theme,
 ) {
     if col_char < scroll_col {
         return;
@@ -10338,7 +10377,7 @@ fn paint_block_cursor(
     cell.set_style(
         Style::default()
             .fg(Color::Black)
-            .bg(Color::Rgb(0xae, 0xc6, 0xff))
+            .bg(theme.ui(Color::Rgb(0xae, 0xc6, 0xff)))
             .add_modifier(Modifier::BOLD),
     );
 }
@@ -10426,21 +10465,25 @@ fn is_pair_quote(c: char) -> bool {
     matches!(c, '"' | '\'' | '`')
 }
 
-fn conflict_row_tint(blocks: &[crate::merge::ConflictBlock], row: usize) -> Option<Color> {
+fn conflict_row_tint(
+    blocks: &[crate::merge::ConflictBlock],
+    row: usize,
+    theme: crate::theme::Theme,
+) -> Option<Color> {
     let block = blocks.iter().find(|b| b.contains(row))?;
     let ours_end = block.base_start.unwrap_or(block.sep);
     Some(if row == block.ours_start {
-        Color::Rgb(0x2a, 0x4f, 0x33)
+        theme.ui(Color::Rgb(0x2a, 0x4f, 0x33))
     } else if row < ours_end {
-        Color::Rgb(0x1b, 0x33, 0x22)
+        theme.ui(Color::Rgb(0x1b, 0x33, 0x22))
     } else if row < block.sep {
-        Color::Rgb(0x2a, 0x2a, 0x2a)
+        theme.ui(Color::Rgb(0x2a, 0x2a, 0x2a))
     } else if row == block.sep {
-        Color::Rgb(0x28, 0x28, 0x28)
+        theme.ui(Color::Rgb(0x28, 0x28, 0x28))
     } else if row == block.theirs_end {
-        Color::Rgb(0x1f, 0x41, 0x66)
+        theme.ui(Color::Rgb(0x1f, 0x41, 0x66))
     } else {
-        Color::Rgb(0x16, 0x2b, 0x44)
+        theme.ui(Color::Rgb(0x16, 0x2b, 0x44))
     })
 }
 
@@ -10460,8 +10503,9 @@ fn paint_selection_band(
     text_width: u16,
     start_char: usize,
     end_char: usize,
+    theme: crate::theme::Theme,
 ) {
-    let bg = Color::Rgb(0x26, 0x4f, 0x78);
+    let bg = theme.ui(Color::Rgb(0x26, 0x4f, 0x78));
     let s = start_char.min(text_width as usize);
     let e = end_char.min(text_width as usize);
     if e <= s {
@@ -10480,6 +10524,7 @@ fn paint_selection_band(
 /// terminal's separate underline colour so the glyph's foreground (its syntax
 /// or semantic colour) is left untouched, the way VS Code's squiggle sits
 /// under unchanged text.
+#[allow(clippy::too_many_arguments)]
 fn paint_diagnostic_underline(
     buf: &mut Buffer,
     text_x: u16,
@@ -10488,12 +10533,15 @@ fn paint_diagnostic_underline(
     start_char: usize,
     end_char: usize,
     severity: crate::lsp::manager::DiagnosticSeverity,
+    theme: crate::theme::Theme,
 ) {
     use crate::lsp::manager::DiagnosticSeverity;
     let color = match severity {
-        DiagnosticSeverity::Error => Color::Rgb(0xf1, 0x4c, 0x4c),
-        DiagnosticSeverity::Warning => Color::Rgb(0xcc, 0xa7, 0x00),
-        DiagnosticSeverity::Information | DiagnosticSeverity::Hint => Color::Rgb(0x3b, 0x9e, 0xff),
+        DiagnosticSeverity::Error => theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
+        DiagnosticSeverity::Warning => theme.ui(Color::Rgb(0xcc, 0xa7, 0x00)),
+        DiagnosticSeverity::Information | DiagnosticSeverity::Hint => {
+            theme.ui(Color::Rgb(0x3b, 0x9e, 0xff))
+        }
     };
     let s = start_char.min(text_width as usize);
     let e = end_char.min(text_width as usize);
@@ -18094,6 +18142,7 @@ mod tests {
             area,
             &mut buf,
             canvas_bg(false, themed),
+            crate::theme::Theme::default(),
         );
         assert_eq!(
             buf[(1, area.height - 1)].bg,
@@ -18159,6 +18208,7 @@ mod tests {
             area,
             &mut buf,
             image_canvas_bg(InlineImageProtocol::Kitty, themed),
+            crate::theme::Theme::default(),
         );
         // The metadata pill on the first row keeps its explicit bg by design:
         // the overlay anchors the picture one row BELOW it

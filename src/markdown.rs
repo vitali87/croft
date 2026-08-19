@@ -136,7 +136,7 @@ struct Renderer<'r> {
 
 impl Renderer<'_> {
     fn inline_style(&self) -> Style {
-        let mut style = Style::default().fg(FG);
+        let mut style = Style::default().fg(self.theme.ui(FG));
         if let Some(level) = self.heading {
             style = style.add_modifier(Modifier::BOLD);
             style = match level {
@@ -144,8 +144,8 @@ impl Renderer<'_> {
                     .fg(self.theme.accent())
                     .add_modifier(Modifier::UNDERLINED),
                 HeadingLevel::H2 => style.fg(self.theme.accent()),
-                HeadingLevel::H3 => style.fg(FG),
-                _ => style.fg(DIM),
+                HeadingLevel::H3 => style.fg(self.theme.ui(FG)),
+                _ => style.fg(self.theme.ui(DIM)),
             };
         }
         if self.bold > 0 {
@@ -163,7 +163,7 @@ impl Renderer<'_> {
                 .add_modifier(Modifier::UNDERLINED);
         }
         if self.quote_depth > 0 {
-            style = style.fg(DIM).add_modifier(Modifier::ITALIC);
+            style = style.fg(self.theme.ui(DIM)).add_modifier(Modifier::ITALIC);
         }
         style
     }
@@ -175,8 +175,10 @@ impl Renderer<'_> {
             return;
         }
         for _ in 0..self.quote_depth {
-            self.cur
-                .push(Span::styled("\u{258e} ", Style::default().fg(DIM)));
+            self.cur.push(Span::styled(
+                "\u{258e} ",
+                Style::default().fg(self.theme.ui(DIM)),
+            ));
         }
         if !self.list_stack.is_empty() {
             let depth = self.list_stack.len() - 1;
@@ -253,13 +255,18 @@ impl Renderer<'_> {
         for (r, row) in rows.iter().enumerate() {
             let mut spans: Vec<Span<'static>> = Vec::new();
             let style = if r == 0 {
-                Style::default().fg(FG).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(self.theme.ui(FG))
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(FG)
+                Style::default().fg(self.theme.ui(FG))
             };
             for (i, width) in widths.iter().enumerate() {
                 if i > 0 {
-                    spans.push(Span::styled(" \u{2502} ", Style::default().fg(DIM)));
+                    spans.push(Span::styled(
+                        " \u{2502} ",
+                        Style::default().fg(self.theme.ui(DIM)),
+                    ));
                 }
                 let cell = row.get(i).map(String::as_str).unwrap_or("");
                 let pad = width.saturating_sub(cell.chars().count());
@@ -273,12 +280,12 @@ impl Renderer<'_> {
                     if i > 0 {
                         sep.push(Span::styled(
                             "\u{2500}\u{253c}\u{2500}",
-                            Style::default().fg(DIM),
+                            Style::default().fg(self.theme.ui(DIM)),
                         ));
                     }
                     sep.push(Span::styled(
                         "\u{2500}".repeat(*width),
-                        Style::default().fg(DIM),
+                        Style::default().fg(self.theme.ui(DIM)),
                     ));
                 }
                 self.out.push(Line::from(sep));
@@ -405,7 +412,9 @@ pub fn render_markdown_with_images(
                         r.suppress_inline = true;
                     } else {
                         r.begin_content();
-                        let style = Style::default().fg(DIM).add_modifier(Modifier::ITALIC);
+                        let style = Style::default()
+                            .fg(theme.ui(DIM))
+                            .add_modifier(Modifier::ITALIC);
                         r.cur.push(Span::styled("\u{f03e} ", style));
                         r.cur.push(Span::styled(format!("({dest_url}) "), style));
                     }
@@ -490,8 +499,10 @@ pub fn render_markdown_with_images(
                     }
                 } else {
                     r.begin_content();
-                    r.cur
-                        .push(Span::styled(code.to_string(), Style::default().fg(CODE)));
+                    r.cur.push(Span::styled(
+                        code.to_string(),
+                        Style::default().fg(theme.ui(CODE)),
+                    ));
                 }
             }
             Event::SoftBreak => {
@@ -509,7 +520,7 @@ pub fn render_markdown_with_images(
                 r.ensure_blank();
                 r.out.push(Line::from(Span::styled(
                     "\u{2500}".repeat(RULE_COLS),
-                    Style::default().fg(DIM),
+                    Style::default().fg(theme.ui(DIM)),
                 )));
                 r.out.push(Line::default());
             }

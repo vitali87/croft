@@ -340,7 +340,7 @@ pub fn render_editor_find(
     state: &mut EditorFind,
     editor_area: Rect,
     buf: &mut Buffer,
-    gradient: bool,
+    theme: crate::theme::Theme,
 ) {
     if editor_area.width < 30 || editor_area.height < 3 {
         state.last_rect = Rect::default();
@@ -374,14 +374,14 @@ pub fn render_editor_find(
     let title = Span::styled(
         title,
         Style::default()
-            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
+        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
         .title(title.clone())
-        .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
+        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -390,7 +390,7 @@ pub fn render_editor_find(
     };
     Widget::render(block, rect, buf);
     // Black theme: gradient border over the solid one, then re-stamp the title.
-    if gradient {
+    if theme.gradient() {
         crate::gradient::paint_gradient_box(buf, rect);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
@@ -401,12 +401,12 @@ pub fn render_editor_find(
         let mut spans = vec![
             Span::styled(
                 marker.to_string(),
-                Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
+                Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
             ),
             Span::styled(
                 text.to_string(),
                 Style::default()
-                    .fg(Color::Rgb(0xec, 0xef, 0xf4))
+                    .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
                     .add_modifier(Modifier::BOLD),
             ),
         ];
@@ -414,7 +414,7 @@ pub fn render_editor_find(
             spans.push(Span::styled(
                 "_",
                 Style::default()
-                    .fg(Color::Rgb(0xec, 0xef, 0xf4))
+                    .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
                     .add_modifier(Modifier::SLOW_BLINK),
             ));
         }

@@ -229,7 +229,7 @@ pub fn render_branch_picker(
     picker: &mut BranchPicker,
     rect: Rect,
     buf: &mut Buffer,
-    gradient: bool,
+    theme: crate::theme::Theme,
 ) {
     picker.last_rect = rect;
 
@@ -237,14 +237,14 @@ pub fn render_branch_picker(
     let title = Span::styled(
         " Checkout / Create Branch — Esc to close, ↑/↓ navigate, Enter select ",
         Style::default()
-            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
+        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
         .title(title.clone())
-        .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
+        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -252,15 +252,15 @@ pub fn render_branch_picker(
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
-    if gradient {
+    if theme.gradient() {
         crate::gradient::paint_gradient_box(buf, rect);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
-    let sel_bg = if gradient {
+    let sel_bg = if theme.gradient() {
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        Color::Rgb(0x1e, 0x3a, 0x6e)
+        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
     };
 
     if inner.height == 0 || inner.width == 0 {
@@ -269,11 +269,11 @@ pub fn render_branch_picker(
 
     // Prompt row with a blinking caret, identical treatment to the jumper.
     let query_style = Style::default()
-        .fg(Color::Rgb(0xec, 0xef, 0xf4))
+        .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
         .add_modifier(Modifier::BOLD);
     let caret_style = Style::default()
-        .fg(Color::Rgb(0x16, 0x18, 0x1f))
-        .bg(Color::Rgb(0xec, 0xef, 0xf4))
+        .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
+        .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
         .add_modifier(Modifier::SLOW_BLINK);
     let cursor = picker.cursor.min(picker.query.chars().count());
     let before: String = picker.query.chars().take(cursor).collect();
@@ -283,7 +283,7 @@ pub fn render_branch_picker(
     let prompt_line = Line::from(vec![
         Span::styled(
             "\u{ea68} ",
-            Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
+            Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
         ),
         Span::styled(before, query_style),
         Span::styled(caret_glyph, caret_style),
@@ -302,7 +302,7 @@ pub fn render_branch_picker(
 
     let sep_line = Line::from(Span::styled(
         "─".repeat(inner.width as usize),
-        Style::default().fg(Color::Rgb(0x3b, 0x42, 0x52)),
+        Style::default().fg(theme.ui(Color::Rgb(0x3b, 0x42, 0x52))),
     ));
     Widget::render(
         Paragraph::new(sep_line),
@@ -331,7 +331,7 @@ pub fn render_branch_picker(
         Widget::render(
             Paragraph::new(Line::from(Span::styled(
                 "  No branches",
-                Style::default().fg(Color::Rgb(0x7a, 0x82, 0x90)),
+                Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
             ))),
             list_rect,
             buf,
@@ -353,9 +353,9 @@ pub fn render_branch_picker(
         let row_idx = picker.scroll + offset;
         let is_selected = row_idx == picker.selected;
         let base = if is_selected {
-            Style::default().bg(sel_bg).fg(Color::White)
+            Style::default().bg(sel_bg).fg(theme.ui(Color::White))
         } else {
-            Style::default().fg(Color::Rgb(0xec, 0xef, 0xf4))
+            Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
         };
         let prefix = if is_selected { "> " } else { "  " };
         let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix.to_string(), base)];
@@ -366,7 +366,7 @@ pub fn render_branch_picker(
                 spans.push(Span::styled(
                     marker.to_string(),
                     if b.is_current {
-                        Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))
+                        Style::default().fg(theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
                     } else {
                         base
                     },
@@ -375,13 +375,13 @@ pub fn render_branch_picker(
                 if b.is_remote {
                     spans.push(Span::styled(
                         "  (remote)".to_string(),
-                        Style::default().fg(Color::Rgb(0x7a, 0x82, 0x90)),
+                        Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
                     ));
                 }
             }
             Row::Create(name) => {
                 let accent = Style::default()
-                    .fg(Color::Rgb(0x88, 0xc0, 0xd0))
+                    .fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)))
                     .add_modifier(Modifier::BOLD);
                 spans.push(Span::styled("\u{eadc} ".to_string(), accent));
                 spans.push(Span::styled(
