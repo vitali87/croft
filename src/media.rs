@@ -408,10 +408,8 @@ fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
     };
     // Rename-on-success (#202 review): a killed or failed ffmpeg can
     // leave a partial file, which must never be served from the cache.
-    if ok && tmp.is_file() {
-        if std::fs::rename(&tmp, &out).is_ok() {
-            return Some(out);
-        }
+    if ok && tmp.is_file() && std::fs::rename(&tmp, &out).is_ok() {
+        return Some(out);
     }
     let _ = std::fs::remove_file(&tmp);
     None
