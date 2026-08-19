@@ -1044,7 +1044,7 @@ pub struct ShortcutsModal {
 }
 
 impl ShortcutsModal {
-    pub fn lines(&self) -> Vec<Line<'static>> {
+    pub fn lines(&self, theme: crate::theme::Theme) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         for (i, group) in SHORTCUT_GROUPS.iter().enumerate() {
             if i > 0 {
@@ -1053,22 +1053,22 @@ impl ShortcutsModal {
             out.push(Line::from(Span::styled(
                 group.title,
                 Style::default()
-                    .fg(Color::Rgb(0x4e, 0x9a, 0xff))
+                    .fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
                     .add_modifier(Modifier::BOLD),
             )));
             out.push(Line::from(Span::styled(
                 "─".repeat(group.title.chars().count()),
-                Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)),
+                Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))),
             )));
             for entry in group.entries {
                 out.push(Line::from(vec![
                     Span::styled(
                         format!("  {:<32} ", entry.keys),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(theme.ui(Color::Yellow)),
                     ),
                     Span::styled(
                         entry.description,
-                        Style::default().fg(Color::Rgb(0xd0, 0xd0, 0xd0)),
+                        Style::default().fg(theme.ui(Color::Rgb(0xd0, 0xd0, 0xd0))),
                     ),
                 ]));
             }
@@ -1102,7 +1102,7 @@ pub fn render_shortcuts_modal(
     modal: &mut ShortcutsModal,
     area: Rect,
     buf: &mut Buffer,
-    gradient: bool,
+    theme: crate::theme::Theme,
 ) {
     let width = area.width.saturating_mul(8) / 10;
     let width = width.clamp(40, 110.min(area.width));
@@ -1122,14 +1122,14 @@ pub fn render_shortcuts_modal(
     let title = Span::styled(
         " Shortcuts — Esc/q to close, ↑/↓ PgUp/PgDn Home/End to scroll ",
         Style::default()
-            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
+        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
         .title(title.clone())
-        .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
+        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -1138,12 +1138,12 @@ pub fn render_shortcuts_modal(
     };
     Widget::render(block, rect, buf);
     // Black theme: gradient border over the solid one, then re-stamp the title.
-    if gradient {
+    if theme.gradient() {
         crate::gradient::paint_gradient_box(buf, rect);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
 
-    let paragraph = Paragraph::new(modal.lines()).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(modal.lines(theme)).wrap(Wrap { trim: false });
     // Count the rows AFTER wrapping, not the logical-line count: a description
     // that wraps onto a second visual row adds a row the scroll ceiling must
     // account for, otherwise the bottom of the list is unreachable.
@@ -1194,7 +1194,7 @@ mod tests {
     fn lines_contain_every_keys_label_so_the_user_can_find_any_binding_in_the_modal() {
         let modal = ShortcutsModal::default();
         let rendered = modal
-            .lines()
+            .lines(crate::theme::Theme::default())
             .into_iter()
             .flat_map(|l| l.spans.into_iter().map(|s| s.content.to_string()))
             .collect::<Vec<_>>()
@@ -1286,10 +1286,10 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let mut modal = ShortcutsModal::default();
         // First render populates last_content_height / last_inner_height.
-        render_shortcuts_modal(&mut modal, area, &mut buf, false);
+        render_shortcuts_modal(&mut modal, area, &mut buf, crate::theme::Theme::default());
         modal.scroll_to_bottom();
         let mut buf = Buffer::empty(area);
-        render_shortcuts_modal(&mut modal, area, &mut buf, false);
+        render_shortcuts_modal(&mut modal, area, &mut buf, crate::theme::Theme::default());
         let last_entry = SHORTCUT_GROUPS
             .last()
             .and_then(|g| g.entries.last())

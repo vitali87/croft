@@ -373,11 +373,13 @@ impl Default for ProblemsPanel {
     }
 }
 
-fn severity_glyph(severity: DiagnosticSeverity) -> (char, Color) {
+fn severity_glyph(severity: DiagnosticSeverity, theme: crate::theme::Theme) -> (char, Color) {
     match severity {
-        DiagnosticSeverity::Error => (GLYPH_ERROR, COLOR_ERROR),
-        DiagnosticSeverity::Warning => (GLYPH_WARNING, COLOR_WARNING),
-        DiagnosticSeverity::Information | DiagnosticSeverity::Hint => (GLYPH_INFO, COLOR_INFO),
+        DiagnosticSeverity::Error => (GLYPH_ERROR, theme.ui(COLOR_ERROR)),
+        DiagnosticSeverity::Warning => (GLYPH_WARNING, theme.ui(COLOR_WARNING)),
+        DiagnosticSeverity::Information | DiagnosticSeverity::Hint => {
+            (GLYPH_INFO, theme.ui(COLOR_INFO))
+        }
     }
 }
 
@@ -399,7 +401,7 @@ impl Widget for &mut ProblemsPanel {
         if self.groups.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No problems have been detected in the workspace.",
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -434,7 +436,7 @@ impl Widget for &mut ProblemsPanel {
         if self.rows.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No problems match the current filter.",
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -468,7 +470,6 @@ impl Widget for &mut ProblemsPanel {
 
         let visible = (body.height as usize).min(self.rows.len().saturating_sub(self.scroll));
         self.visible_rows = visible as u16;
-        let brand = self.focus_gradient;
 
         for row in 0..visible {
             let render_row = self.rows[self.scroll + row].clone();
@@ -480,7 +481,7 @@ impl Widget for &mut ProblemsPanel {
                 height: 1,
             };
             if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, brand)
+                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
             {
                 buf.set_style(row_rect, Style::default().bg(bg));
             }
@@ -561,19 +562,22 @@ impl ProblemsPanel {
             .unwrap_or_default();
         let icon = crate::icons::for_path(&group.name, &suffix);
         let mut spans = vec![
-            Span::styled(format!("{chevron} "), Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                format!("{chevron} "),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ),
             Span::styled(format!("{} ", icon.glyph), Style::default().fg(icon.color)),
             Span::styled(
                 group.name.clone(),
                 Style::default()
-                    .fg(COLOR_HEADER)
+                    .fg(self.theme.ui(COLOR_HEADER))
                     .add_modifier(Modifier::BOLD),
             ),
         ];
         if !group.rel_dir.is_empty() {
             spans.push(Span::styled(
                 format!(" {}", group.rel_dir),
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             ));
         }
         // Count what the filter actually shows beneath this header, not the
@@ -585,35 +589,35 @@ impl ProblemsPanel {
             .count();
         spans.push(Span::styled(
             format!("  {shown}"),
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(self.theme.ui(COLOR_DIM)),
         ));
         spans
     }
 
     fn diag_spans(&self, g: usize, i: usize) -> Vec<Span<'static>> {
         let item = &self.groups[g].items[i];
-        let (glyph, color) = severity_glyph(item.severity);
+        let (glyph, color) = severity_glyph(item.severity, self.theme);
         // The message can span several lines on the wire; collapse to one row.
         let message = item.message.replace('\n', " ");
         let mut spans = vec![
             Span::styled(format!("   {glyph} "), Style::default().fg(color)),
-            Span::styled(message, Style::default().fg(COLOR_MSG)),
+            Span::styled(message, Style::default().fg(self.theme.ui(COLOR_MSG))),
         ];
         if !item.source.is_empty() {
             spans.push(Span::styled(
                 format!(" {} ", item.source),
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             ));
         }
         spans.push(Span::styled(
             format!("[Ln {}, Col {}]", item.line + 1, item.col + 1),
-            Style::default().fg(COLOR_DIM),
+            Style::default().fg(self.theme.ui(COLOR_DIM)),
         ));
         // Flat list has no file header, so name the file on the row itself.
         if !self.group_by_file {
             spans.push(Span::styled(
                 format!(" {}", self.groups[g].name),
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             ));
         }
         spans
@@ -772,13 +776,26 @@ mod tests {
 
     #[test]
     fn severity_glyphs_are_the_verified_codicons() {
-        assert_eq!(severity_glyph(DiagnosticSeverity::Error).0, '\u{ea87}');
-        assert_eq!(severity_glyph(DiagnosticSeverity::Warning).0, '\u{ea6c}');
         assert_eq!(
-            severity_glyph(DiagnosticSeverity::Information).0,
+            severity_glyph(DiagnosticSeverity::Error, crate::theme::Theme::default()).0,
+            '\u{ea87}'
+        );
+        assert_eq!(
+            severity_glyph(DiagnosticSeverity::Warning, crate::theme::Theme::default()).0,
+            '\u{ea6c}'
+        );
+        assert_eq!(
+            severity_glyph(
+                DiagnosticSeverity::Information,
+                crate::theme::Theme::default()
+            )
+            .0,
             '\u{ea74}'
         );
-        assert_eq!(severity_glyph(DiagnosticSeverity::Hint).0, '\u{ea74}');
+        assert_eq!(
+            severity_glyph(DiagnosticSeverity::Hint, crate::theme::Theme::default()).0,
+            '\u{ea74}'
+        );
     }
 
     #[test]

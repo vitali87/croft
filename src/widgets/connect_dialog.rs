@@ -58,9 +58,9 @@ pub struct ConnectDialog {
     pub caret_pos: Option<(u16, u16)>,
     pub submitted: bool,
     pub install_started_at: Option<Instant>,
-    /// Black theme: wear the orange→green gradient border instead of the legacy
-    /// bright-blue. Set by the app before render from `popup_gradient`.
-    pub gradient: bool,
+    /// The active theme: drives the gradient border on Black and every
+    /// chrome color. Set by the app before render.
+    pub theme: crate::theme::Theme,
 }
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -92,7 +92,7 @@ impl ConnectDialog {
             caret_pos: None,
             submitted: false,
             install_started_at: None,
-            gradient: false,
+            theme: crate::theme::Theme::default(),
         }
     }
 
@@ -215,20 +215,20 @@ impl ConnectDialog {
     }
 }
 
-fn log_line_color(line: &str) -> Color {
+fn log_line_color(line: &str, theme: crate::theme::Theme) -> Color {
     let lower = line.to_ascii_lowercase();
     if lower.contains("error") || lower.contains("failed") || lower.contains("permission denied") {
-        return RED;
+        return theme.ui(RED);
     }
     if lower.contains("warning") || lower.contains("warn:") {
-        return Color::Rgb(0xf9, 0xc8, 0x5b);
+        return theme.ui(Color::Rgb(0xf9, 0xc8, 0x5b));
     }
     if lower.starts_with("installed ")
         || lower.contains("install complete")
         || lower.contains("up to date")
         || lower.contains("authenticated")
     {
-        return TEAL;
+        return theme.ui(TEAL);
     }
     if lower.starts_with("compiling ")
         || lower.starts_with("downloading ")
@@ -244,9 +244,9 @@ fn log_line_color(line: &str) -> Color {
         || lower.starts_with("adopting ")
         || lower.starts_with("local source stamp")
     {
-        return ACCENT;
+        return theme.ui(ACCENT);
     }
-    Color::Rgb(0xb4, 0xbe, 0xc8)
+    theme.ui(Color::Rgb(0xb4, 0xbe, 0xc8))
 }
 
 fn default_status_for(phase: &DialogPhase, host: &str) -> String {
@@ -288,23 +288,27 @@ impl Widget for &mut ConnectDialog {
             for dx in 0..rect.width {
                 let cell = &mut buf[(rect.x + dx, rect.y + dy)];
                 cell.set_char(' ');
-                cell.set_style(Style::default().bg(PANEL_BG));
+                cell.set_style(Style::default().bg(self.theme.ui(PANEL_BG)));
             }
         }
         let title_style = Style::default()
-            .fg(Color::White)
-            .bg(PANEL_BG)
+            .fg(self.theme.ui(Color::White))
+            .bg(self.theme.ui(PANEL_BG))
             .add_modifier(Modifier::BOLD);
         let title = Span::styled(format!(" Connect — {} ", self.host), title_style);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT).bg(PANEL_BG))
+            .border_style(
+                Style::default()
+                    .fg(self.theme.ui(ACCENT))
+                    .bg(self.theme.ui(PANEL_BG)),
+            )
             .title(title.clone());
         let inner = block.inner(rect);
         block.render(rect, buf);
         // Black theme: overpaint the solid border with the gradient, then
         // re-stamp the title the gradient top edge just covered.
-        if self.gradient {
+        if self.theme.gradient() {
             crate::gradient::paint_gradient_box(buf, rect);
             buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
         }
@@ -331,9 +335,9 @@ impl Widget for &mut ConnectDialog {
             DialogPhase::Failed => "Failed",
         };
         let phase_color = match self.phase {
-            DialogPhase::Authenticated => TEAL,
-            DialogPhase::Failed => RED,
-            _ => ACCENT,
+            DialogPhase::Authenticated => self.theme.ui(TEAL),
+            DialogPhase::Failed => self.theme.ui(RED),
+            _ => self.theme.ui(ACCENT),
         };
         let indicator = if self.phase.is_terminal() {
             '●'
@@ -343,20 +347,20 @@ impl Widget for &mut ConnectDialog {
         let mut header_spans: Vec<Span<'_>> = vec![
             Span::styled(
                 format!(" {indicator} "),
-                Style::default().fg(phase_color).bg(PANEL_BG),
+                Style::default().fg(phase_color).bg(self.theme.ui(PANEL_BG)),
             ),
             Span::styled(
                 phase_label,
                 Style::default()
-                    .fg(Color::White)
-                    .bg(PANEL_BG)
+                    .fg(self.theme.ui(Color::White))
+                    .bg(self.theme.ui(PANEL_BG))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("  {}", self.status_line),
                 Style::default()
-                    .fg(Color::Rgb(0xb4, 0xbe, 0xc8))
-                    .bg(PANEL_BG),
+                    .fg(self.theme.ui(Color::Rgb(0xb4, 0xbe, 0xc8)))
+                    .bg(self.theme.ui(PANEL_BG)),
             ),
         ];
         if installing && let Some(started) = self.install_started_at {
@@ -365,8 +369,8 @@ impl Widget for &mut ConnectDialog {
             header_spans.push(Span::styled(
                 label,
                 Style::default()
-                    .fg(TEAL)
-                    .bg(PANEL_BG)
+                    .fg(self.theme.ui(TEAL))
+                    .bg(self.theme.ui(PANEL_BG))
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -380,8 +384,8 @@ impl Widget for &mut ConnectDialog {
                 &Line::from(vec![Span::styled(
                     truncate(&self.prompt_text, inner.width as usize),
                     Style::default()
-                        .fg(Color::Rgb(0xe6, 0xed, 0xf5))
-                        .bg(PANEL_BG),
+                        .fg(self.theme.ui(Color::Rgb(0xe6, 0xed, 0xf5)))
+                        .bg(self.theme.ui(PANEL_BG)),
                 )]),
                 inner.width,
             );
@@ -399,7 +403,7 @@ impl Widget for &mut ConnectDialog {
             for dx in 0..field_rect.width {
                 let cell = &mut buf[(field_rect.x + dx, field_rect.y)];
                 cell.set_char(' ');
-                cell.set_style(Style::default().bg(FIELD_BG));
+                cell.set_style(Style::default().bg(self.theme.ui(FIELD_BG)));
             }
             let shown_text: String = if self.input_is_secret() {
                 "•".repeat(self.input.chars().count())
@@ -412,7 +416,9 @@ impl Widget for &mut ConnectDialog {
                 field_rect.x,
                 field_rect.y,
                 &shown,
-                Style::default().fg(Color::White).bg(FIELD_BG),
+                Style::default()
+                    .fg(self.theme.ui(Color::White))
+                    .bg(self.theme.ui(FIELD_BG)),
             );
             let caret_col = field_rect
                 .x
@@ -437,8 +443,8 @@ impl Widget for &mut ConnectDialog {
                         field_rect.y,
                         &truncated,
                         Style::default()
-                            .fg(Color::Rgb(0x6b, 0x74, 0x82))
-                            .bg(FIELD_BG)
+                            .fg(self.theme.ui(Color::Rgb(0x6b, 0x74, 0x82)))
+                            .bg(self.theme.ui(FIELD_BG))
                             .add_modifier(Modifier::ITALIC),
                     );
                 }
@@ -448,8 +454,8 @@ impl Widget for &mut ConnectDialog {
                 field_rect.y,
                 cursor_glyph.to_string(),
                 Style::default()
-                    .fg(ACCENT)
-                    .bg(FIELD_BG)
+                    .fg(self.theme.ui(ACCENT))
+                    .bg(self.theme.ui(FIELD_BG))
                     .add_modifier(Modifier::BOLD),
             );
             self.field_rect = field_rect;
@@ -465,7 +471,9 @@ impl Widget for &mut ConnectDialog {
                 cy,
                 &Line::from(vec![Span::styled(
                     truncate(err, inner.width as usize),
-                    Style::default().fg(RED).bg(PANEL_BG),
+                    Style::default()
+                        .fg(self.theme.ui(RED))
+                        .bg(self.theme.ui(PANEL_BG)),
                 )]),
                 inner.width,
             );
@@ -496,23 +504,23 @@ impl Widget for &mut ConnectDialog {
                 Span::styled(
                     toggle_label,
                     Style::default()
-                        .fg(TEAL)
-                        .bg(PANEL_BG)
+                        .fg(self.theme.ui(TEAL))
+                        .bg(self.theme.ui(PANEL_BG))
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("    ", Style::default().bg(PANEL_BG)),
+                Span::styled("    ", Style::default().bg(self.theme.ui(PANEL_BG))),
                 Span::styled(
                     cancel_label,
                     Style::default()
-                        .fg(Color::Rgb(0xb4, 0xbe, 0xc8))
-                        .bg(PANEL_BG),
+                        .fg(self.theme.ui(Color::Rgb(0xb4, 0xbe, 0xc8)))
+                        .bg(self.theme.ui(PANEL_BG)),
                 ),
-                Span::styled("    ", Style::default().bg(PANEL_BG)),
+                Span::styled("    ", Style::default().bg(self.theme.ui(PANEL_BG))),
                 Span::styled(
                     submit_label,
                     Style::default()
-                        .fg(ACCENT)
-                        .bg(PANEL_BG)
+                        .fg(self.theme.ui(ACCENT))
+                        .bg(self.theme.ui(PANEL_BG))
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
@@ -551,12 +559,16 @@ impl Widget for &mut ConnectDialog {
                 if log_rect.height > 0 {
                     let block = Block::default()
                         .borders(Borders::TOP)
-                        .border_style(Style::default().fg(Color::DarkGray).bg(PANEL_BG))
+                        .border_style(
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .bg(self.theme.ui(PANEL_BG)),
+                        )
                         .title(Span::styled(
                             " ssh transcript ",
                             Style::default()
-                                .fg(Color::Rgb(0x9d, 0xa5, 0xb4))
-                                .bg(PANEL_BG),
+                                .fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
+                                .bg(self.theme.ui(PANEL_BG)),
                         ));
                     let inner_log = block.inner(log_rect);
                     block.render(log_rect, buf);
@@ -575,10 +587,15 @@ impl Widget for &mut ConnectDialog {
                         for dx in 0..inner_log.width {
                             let cell = &mut buf[(inner_log.x + dx, y)];
                             cell.set_char(' ');
-                            cell.set_style(Style::default().bg(PANEL_BG));
+                            cell.set_style(Style::default().bg(self.theme.ui(PANEL_BG)));
                         }
-                        let fg = log_line_color(line);
-                        buf.set_string(inner_log.x, y, txt, Style::default().fg(fg).bg(PANEL_BG));
+                        let fg = log_line_color(line, self.theme);
+                        buf.set_string(
+                            inner_log.x,
+                            y,
+                            txt,
+                            Style::default().fg(fg).bg(self.theme.ui(PANEL_BG)),
+                        );
                     }
                 }
             }

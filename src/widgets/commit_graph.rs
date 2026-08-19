@@ -318,7 +318,7 @@ impl Widget for &mut CommitGraphPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::TOP)
-            .border_style(Style::default().fg(COLOR_DIM));
+            .border_style(Style::default().fg(self.theme.ui(COLOR_DIM)));
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;
@@ -340,11 +340,14 @@ impl Widget for &mut CommitGraphPanel {
         };
         let header_y = inner.y;
         Paragraph::new(Line::from(vec![
-            Span::styled(format!("{chevron} "), Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                format!("{chevron} "),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ),
             Span::styled(
                 "COMMITS",
                 Style::default()
-                    .fg(COLOR_HEADER)
+                    .fg(self.theme.ui(COLOR_HEADER))
                     .add_modifier(Modifier::BOLD),
             ),
         ]))
@@ -374,7 +377,7 @@ impl Widget for &mut CommitGraphPanel {
             let msg = if self.loaded { "No commits" } else { "Loading" };
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -424,11 +427,9 @@ impl Widget for &mut CommitGraphPanel {
                 width: content_w,
                 height: 1,
             };
-            if let Some(bg) = crate::widgets::hover::row_hover_bg(
-                row_rect,
-                self.hover_pointer,
-                self.focus_gradient,
-            ) {
+            if let Some(bg) =
+                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
+            {
                 buf.set_style(row_rect, Style::default().bg(bg));
             }
             let mut spans: Vec<Span> = Vec::new();
@@ -444,7 +445,7 @@ impl Widget for &mut CommitGraphPanel {
             for decoration in &graph_row.commit.refs {
                 let (name, is_tag, is_head) = badge_of(decoration);
                 let color = if is_tag {
-                    COLOR_TAG
+                    self.theme.ui(COLOR_TAG)
                 } else {
                     self.theme.accent()
                 };
@@ -456,7 +457,7 @@ impl Widget for &mut CommitGraphPanel {
             }
             spans.push(Span::styled(
                 graph_row.commit.summary.clone(),
-                Style::default().fg(COLOR_SUMMARY),
+                Style::default().fg(self.theme.ui(COLOR_SUMMARY)),
             ));
             // Right-aligned dim age, clipped away first when width is tight.
             let age = crate::git::humanize_age(graph_row.commit.age_secs);
@@ -465,7 +466,10 @@ impl Widget for &mut CommitGraphPanel {
             if used + age_cols < content_w as usize {
                 let pad = content_w as usize - used - age_cols;
                 spans.push(Span::raw(" ".repeat(pad)));
-                spans.push(Span::styled(age, Style::default().fg(COLOR_DIM)));
+                spans.push(Span::styled(
+                    age,
+                    Style::default().fg(self.theme.ui(COLOR_DIM)),
+                ));
             }
             Paragraph::new(Line::from(spans)).render(row_rect, buf);
         }

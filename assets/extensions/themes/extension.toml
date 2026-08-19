@@ -279,3 +279,37 @@ syn_type = "#a9b7c6"
 syn_tag = "#bbb529"
 syn_fg = "#a9b7c6"
 ansi = ["#000000","#ff6b68","#a8c023","#d6bf55","#5394ec","#ae8abe","#299999","#999999","#555555","#ff8785","#a8c023","#ffff00","#7eaef4","#ff99ff","#6cdada","#ffffff"]
+
+# --- Croft Light: the first-party light theme (#207). The chrome mirrors VS
+# Code's Light Modern defaults (editor #ffffff over #f8f8f8 panels, #005fb8
+# accent), the code palette is VS Code Light+ (blue keywords, red strings,
+# green comments), and the terminal ships VS Code's light ANSI palette so
+# shell output stays legible on white. Widgets whose dark chrome is hardcoded
+# resolve their colors through `Theme::ui`, which keys off the light
+# background this block declares.
+[[themes]]
+id = "light"
+label = "Croft Light"
+background = "#ffffff"
+accent = "#005fb8"
+selection = "#add6ff"
+search = "#ececec"
+button = "#005fb8"
+gradient = false
+osk_key = "#e8e8e8"
+osk_special = "#d8d8d8"
+osk_armed = "#005fb8"
+tab_strip = "#f8f8f8"
+tab_inactive = "#ececec"
+tab_active = "#ffffff"
+tab_hover = "#f0f0f0"
+tab_close_pill = "#d4d4d4"
+syn_comment = "#008000"
+syn_keyword = "#0000ff"
+syn_string = "#a31515"
+syn_constant = "#098658"
+syn_function = "#795e26"
+syn_type = "#267f99"
+syn_tag = "#800000"
+syn_fg = "#3b3b3b"
+ansi = ["#000000","#cd3131","#107c10","#949800","#0451a5","#bc05bc","#0598bc","#555555","#666666","#cd3131","#14ce14","#b5ba00","#0451a5","#bc05bc","#0598bc","#a5a5a5"]

@@ -558,7 +558,7 @@ impl Widget for &mut DependenciesPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(COLOR_DIM));
+            .border_style(Style::default().fg(self.theme.ui(COLOR_DIM)));
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;
@@ -580,11 +580,14 @@ impl Widget for &mut DependenciesPanel {
         };
         let header_y = inner.y;
         Paragraph::new(Line::from(vec![
-            Span::styled(format!("{chevron} "), Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                format!("{chevron} "),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ),
             Span::styled(
                 self.header.clone(),
                 Style::default()
-                    .fg(COLOR_HEADER)
+                    .fg(self.theme.ui(COLOR_HEADER))
                     .add_modifier(Modifier::BOLD),
             ),
         ]))
@@ -618,7 +621,7 @@ impl Widget for &mut DependenciesPanel {
             };
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -661,21 +664,25 @@ impl Widget for &mut DependenciesPanel {
                 width: content_w,
                 height: 1,
             };
-            if let Some(bg) = crate::widgets::hover::row_hover_bg(
-                row_rect,
-                self.hover_pointer,
-                self.focus_gradient,
-            ) {
+            if let Some(bg) =
+                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
+            {
                 buf.set_style(row_rect, Style::default().bg(bg));
             }
             let mut spans = vec![
-                Span::styled(format!("{PACKAGE_GLYPH} "), Style::default().fg(COLOR_DIM)),
-                Span::styled(dep.name.clone(), Style::default().fg(COLOR_NAME)),
+                Span::styled(
+                    format!("{PACKAGE_GLYPH} "),
+                    Style::default().fg(self.theme.ui(COLOR_DIM)),
+                ),
+                Span::styled(
+                    dep.name.clone(),
+                    Style::default().fg(self.theme.ui(COLOR_NAME)),
+                ),
             ];
             if !dep.version.is_empty() {
                 spans.push(Span::styled(
                     format!(" {}", dep.version),
-                    Style::default().fg(COLOR_VERSION),
+                    Style::default().fg(self.theme.ui(COLOR_VERSION)),
                 ));
             }
             Paragraph::new(Line::from(spans)).render(row_rect, buf);

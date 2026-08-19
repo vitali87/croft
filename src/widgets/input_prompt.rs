@@ -185,7 +185,7 @@ pub fn render_input_prompt(
     prompt: &mut InputPrompt,
     screen: Rect,
     buf: &mut Buffer,
-    gradient: bool,
+    theme: crate::theme::Theme,
 ) {
     let width = (screen.width.saturating_mul(6) / 10).clamp(30, 90.min(screen.width));
     let height: u16 = 5;
@@ -200,14 +200,14 @@ pub fn render_input_prompt(
     let title = Span::styled(
         format!(" {} ", prompt.title),
         Style::default()
-            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
+        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
         .title(title.clone())
-        .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
+        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
     let inner = Rect {
         x: rect.x + 2,
         y: rect.y + 1,
@@ -215,7 +215,7 @@ pub fn render_input_prompt(
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
-    if gradient {
+    if theme.gradient() {
         crate::gradient::paint_gradient_box(buf, rect);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
@@ -232,7 +232,7 @@ pub fn render_input_prompt(
             &prompt.placeholder,
             inner.width as usize,
             Style::default()
-                .fg(Color::Rgb(0x6c, 0x7d, 0x9c))
+                .fg(theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c)))
                 .add_modifier(Modifier::ITALIC),
         );
     } else {
@@ -241,10 +241,10 @@ pub fn render_input_prompt(
         let at: String = prompt.value.chars().skip(cursor).take(1).collect();
         let after: String = prompt.value.chars().skip(cursor + 1).collect();
         let caret = if at.is_empty() { " ".to_string() } else { at };
-        let value_style = Style::default().fg(Color::Rgb(0xec, 0xef, 0xf4));
+        let value_style = Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)));
         let caret_style = Style::default()
-            .fg(Color::Rgb(0x16, 0x18, 0x1f))
-            .bg(Color::Rgb(0xec, 0xef, 0xf4))
+            .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
+            .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
             .add_modifier(Modifier::SLOW_BLINK);
         let line = Line::from(vec![
             Span::styled(before, value_style),
@@ -268,7 +268,7 @@ pub fn render_input_prompt(
             inner.x,
             inner.y + 2,
             "Enter to confirm · Esc to cancel",
-            Style::default().fg(Color::Rgb(0x7a, 0x82, 0x90)),
+            Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
         );
     }
 }

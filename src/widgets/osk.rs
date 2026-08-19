@@ -742,7 +742,7 @@ fn palette(theme: Theme) -> OskPalette {
     // fill is the theme's primary-action color). Byte-identical to the old
     // per-theme match for the two first-party themes; any theme works now.
     OskPalette {
-        fg: Color::Rgb(0xd4, 0xd8, 0xe0),
+        fg: theme.ui(Color::Rgb(0xd4, 0xd8, 0xe0)),
         armed_fg: Color::White,
         key_bg: theme.osk_key_bg(),
         special_bg: theme.osk_special_bg(),

@@ -32,12 +32,12 @@ fn rect_has(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
-fn level_color(level: OutputLevel) -> Color {
+fn level_color(level: OutputLevel, theme: crate::theme::Theme) -> Color {
     match level {
-        OutputLevel::Error => COLOR_ERROR,
-        OutputLevel::Warn => COLOR_WARNING,
-        OutputLevel::Info => COLOR_INFO,
-        OutputLevel::Debug | OutputLevel::Trace => COLOR_DIM,
+        OutputLevel::Error => theme.ui(COLOR_ERROR),
+        OutputLevel::Warn => theme.ui(COLOR_WARNING),
+        OutputLevel::Info => theme.ui(COLOR_INFO),
+        OutputLevel::Debug | OutputLevel::Trace => theme.ui(COLOR_DIM),
     }
 }
 
@@ -356,7 +356,7 @@ impl Widget for &mut OutputPanel {
         if self.channels.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No output yet. Channels appear as language servers and tasks log.",
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             )))
             .render(body, buf);
             return;
@@ -406,9 +406,12 @@ impl Widget for &mut OutputPanel {
             let spans = vec![
                 Span::styled(
                     format!("{} ", line.level.label()),
-                    Style::default().fg(level_color(line.level)),
+                    Style::default().fg(level_color(line.level, self.theme)),
                 ),
-                Span::styled(line.text.replace('\n', " "), Style::default().fg(COLOR_MSG)),
+                Span::styled(
+                    line.text.replace('\n', " "),
+                    Style::default().fg(self.theme.ui(COLOR_MSG)),
+                ),
             ];
             Paragraph::new(Line::from(spans)).render(row_rect, buf);
         }
@@ -468,9 +471,13 @@ impl OutputPanel {
                 height: 1,
             };
             let hovered =
-                crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, false).is_some();
+                crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, self.theme).is_some();
             let on = slot == 1 && rpc_on;
-            let fg = if on || hovered { accent } else { COLOR_DIM };
+            let fg = if on || hovered {
+                accent
+            } else {
+                self.theme.ui(COLOR_DIM)
+            };
             buf.set_stringn(rect.x, area.y, &tok, tw as usize, Style::default().fg(fg));
             match slot {
                 0 => self.clear_rect = rect,
@@ -547,14 +554,18 @@ impl OutputPanel {
             self.dropdown_items.push((r, row));
             let selected = row == self.selected;
             let hovered =
-                crate::widgets::hover::row_hover_bg(r, self.hover_pointer, false).is_some();
+                crate::widgets::hover::row_hover_bg(r, self.hover_pointer, self.theme).is_some();
             if hovered || selected {
                 buf.set_style(
                     r,
                     Style::default().bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)),
                 );
             }
-            let fg = if selected { accent } else { COLOR_MSG };
+            let fg = if selected {
+                accent
+            } else {
+                self.theme.ui(COLOR_MSG)
+            };
             buf.set_stringn(
                 area.x + 1,
                 y,

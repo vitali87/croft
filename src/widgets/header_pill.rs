@@ -54,13 +54,21 @@ pub const MORE_LABEL: &str = " \u{22ef} ";
 /// 1-cell glyph always left a bare highlight cell beside the icon, which read
 /// as a misalignment. Callers keep a wider hit-test rect for a forgiving click
 /// target; only the visible highlight is snug.
-pub fn render(buf: &mut Buffer, x: u16, y: u16, glyph: char, brand: bool, hovered: bool) {
+pub fn render(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    glyph: char,
+    theme: crate::theme::Theme,
+    hovered: bool,
+) {
+    let brand = theme.gradient();
     let fill = if brand {
         hovered.then(|| crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
     } else if hovered {
-        Some(HEADER_BTN_HOVER_BG)
+        Some(theme.ui(HEADER_BTN_HOVER_BG))
     } else {
-        Some(HEADER_BTN_BG)
+        Some(theme.ui(HEADER_BTN_BG))
     };
     let mut style = Style::default().add_modifier(Modifier::BOLD);
     if let Some(c) = fill {
@@ -73,7 +81,7 @@ pub fn render(buf: &mut Buffer, x: u16, y: u16, glyph: char, brand: bool, hovere
     style = if brand {
         style.fg(crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG))
     } else {
-        style.fg(HEADER_BTN_FG)
+        style.fg(theme.ui(HEADER_BTN_FG))
     };
     buf.set_string(x, y, glyph.to_string(), style);
 }
@@ -88,11 +96,12 @@ pub fn render(buf: &mut Buffer, x: u16, y: u16, glyph: char, brand: bool, hovere
 ///   toolbar spirit (`icon.foreground`), no bold.
 /// * Black hover: white on the muted teal `POPUP_SEL_BG` pill standing in for
 ///   `toolbar.hoverBackground`.
-pub fn action_style(brand: bool, hovered: bool) -> Style {
+pub fn action_style(theme: crate::theme::Theme, hovered: bool) -> Style {
+    let brand = theme.gradient();
     if !brand {
         return Style::default()
-            .fg(Color::White)
-            .bg(HEADER_BTN_BG)
+            .fg(theme.ui(Color::White))
+            .bg(theme.ui(HEADER_BTN_BG))
             .add_modifier(Modifier::BOLD);
     }
     if hovered {
@@ -118,7 +127,7 @@ pub fn render_action(
     right_edge: u16,
     y: u16,
     label: &str,
-    brand: bool,
+    theme: crate::theme::Theme,
     pointer: Option<(u16, u16)>,
 ) -> Option<Rect> {
     let w = label.chars().count() as u16;
@@ -127,7 +136,7 @@ pub fn render_action(
     }
     let x = right_edge - w; // leave the corner cell (right_edge) for the border
     let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
-    buf.set_string(x, y, label, action_style(brand, hovered));
+    buf.set_string(x, y, label, action_style(theme, hovered));
     Some(Rect {
         x,
         y,
@@ -150,7 +159,14 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         // Croft Dark (brand = false) always paints the navy chip. Render at x=2.
-        render(&mut buf, 2, 0, REFRESH_GLYPH, false, false);
+        render(
+            &mut buf,
+            2,
+            0,
+            REFRESH_GLYPH,
+            crate::theme::Theme::DARK_BLUE,
+            false,
+        );
         assert_eq!(
             buf[(2, 0)].bg,
             HEADER_BTN_BG,
@@ -181,7 +197,14 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         // Black theme (brand = true), not hovered: a chipless teal glyph.
-        render(&mut buf, 2, 0, REFRESH_GLYPH, true, false);
+        render(
+            &mut buf,
+            2,
+            0,
+            REFRESH_GLYPH,
+            crate::theme::Theme::BLACK,
+            false,
+        );
         assert_eq!(
             buf[(2, 0)].bg,
             Color::Reset,

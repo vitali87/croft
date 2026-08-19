@@ -570,7 +570,7 @@ impl SourceControlPanel {
             "REPOSITORIES",
             inner.width.saturating_sub(1) as usize,
             Style::default()
-                .fg(Color::Rgb(0x8a, 0x92, 0xa4))
+                .fg(self.theme.ui(Color::Rgb(0x8a, 0x92, 0xa4)))
                 .add_modifier(Modifier::BOLD),
         );
         y += 1;
@@ -585,7 +585,7 @@ impl SourceControlPanel {
                 height: 1,
             };
             let hover_bg =
-                crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, self.focus_gradient);
+                crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, self.theme);
             let (bg, fg) = if row.active {
                 (self.theme.selection(), Color::White)
             } else if let Some(h) = hover_bg {
@@ -617,7 +617,9 @@ impl SourceControlPanel {
                         cx,
                         y,
                         &count,
-                        Style::default().bg(bg).fg(Color::Rgb(0xe0, 0x9a, 0x4e)),
+                        Style::default()
+                            .bg(bg)
+                            .fg(self.theme.ui(Color::Rgb(0xe0, 0x9a, 0x4e))),
                     );
                 }
             }
@@ -656,7 +658,7 @@ impl SourceControlPanel {
             width: card_w,
             height: card_h,
         };
-        let card_border = Style::default().fg(Color::Rgb(0x60, 0x68, 0x78));
+        let card_border = Style::default().fg(self.theme.ui(Color::Rgb(0x60, 0x68, 0x78)));
         let card_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -673,11 +675,11 @@ impl SourceControlPanel {
         let blue = if self.focus_gradient {
             crate::gradient::rgb_color(crate::gradient::CARD_ACCENT)
         } else {
-            Color::Rgb(0x60, 0x9a, 0xfe)
+            self.theme.ui(Color::Rgb(0x60, 0x9a, 0xfe))
         };
-        let dim_blue = Color::Rgb(0x4b, 0x50, 0x5a);
-        let text_white = Color::Rgb(0xff, 0xff, 0xff);
-        let text_dim = Color::Rgb(0x9d, 0xa5, 0xb4);
+        let dim_blue = self.theme.ui(Color::Rgb(0x4b, 0x50, 0x5a));
+        let text_white = self.theme.ui(Color::Rgb(0xff, 0xff, 0xff));
+        let text_dim = self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4));
         let blue_bg = if self.focus_gradient {
             crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG)
         } else {
@@ -979,20 +981,20 @@ pub fn render_rounded_button(buf: &mut Buffer, area: Rect, label: &str, bg: Colo
     );
 }
 
-fn badge_color(kind: ChangeKind) -> Color {
+fn badge_color(kind: ChangeKind, theme: crate::theme::Theme) -> Color {
     match kind {
-        ChangeKind::StagedAdded => Color::Rgb(0x81, 0xb8, 0x8c),
-        ChangeKind::StagedModified | ChangeKind::Modified => Color::Rgb(0xeb, 0xcb, 0x8b),
-        ChangeKind::StagedDeleted | ChangeKind::Deleted => Color::Rgb(0xe7, 0x70, 0x70),
-        ChangeKind::StagedRenamed => Color::Rgb(0xb4, 0x8e, 0xad),
-        ChangeKind::Untracked => Color::Rgb(0x88, 0xc0, 0xd0),
-        ChangeKind::Conflicted => Color::Rgb(0xe7, 0x4c, 0x3c),
+        ChangeKind::StagedAdded => theme.ui(Color::Rgb(0x81, 0xb8, 0x8c)),
+        ChangeKind::StagedModified | ChangeKind::Modified => theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b)),
+        ChangeKind::StagedDeleted | ChangeKind::Deleted => theme.ui(Color::Rgb(0xe7, 0x70, 0x70)),
+        ChangeKind::StagedRenamed => theme.ui(Color::Rgb(0xb4, 0x8e, 0xad)),
+        ChangeKind::Untracked => theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)),
+        ChangeKind::Conflicted => theme.ui(Color::Rgb(0xe7, 0x4c, 0x3c)),
     }
 }
 
 impl Widget for &mut SourceControlPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let focus_blue = Color::Rgb(0x4e, 0x9a, 0xff);
+        let focus_blue = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
         // Black theme: the commit-input focus ring wears the muted brand teal
         // instead of the legacy blue (the outer border becomes the gradient).
         let accent = if self.focus_gradient {
@@ -1042,7 +1044,7 @@ impl Widget for &mut SourceControlPanel {
             inner.y,
             "SOURCE CONTROL",
             Style::default()
-                .fg(Color::Rgb(0xb0, 0xb8, 0xc8))
+                .fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
                 .add_modifier(Modifier::BOLD),
         );
         // Refresh pill at the right of the header row, mirroring the Remote
@@ -1065,7 +1067,7 @@ impl Widget for &mut SourceControlPanel {
                 refresh_x,
                 inner.y,
                 crate::widgets::header_pill::REFRESH_GLYPH,
-                self.focus_gradient,
+                self.theme,
                 hovered,
             );
             // "⋯" actions pill, one pill-plus-gap to the left of refresh,
@@ -1086,7 +1088,7 @@ impl Widget for &mut SourceControlPanel {
                     more_x,
                     inner.y,
                     crate::widgets::scm_menu::ICON_ELLIPSIS,
-                    self.focus_gradient,
+                    self.theme,
                     more_hovered,
                 );
             }
@@ -1125,7 +1127,7 @@ impl Widget for &mut SourceControlPanel {
         // same mis-pin and is fixed in the same commit.
         spans.push(Span::styled(
             "\u{ea68} ",
-            Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0)),
+            Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
         ));
         let label = match (&self.status.branch, &self.status.detached_hash) {
             (Some(b), _) => b.clone(),
@@ -1150,13 +1152,13 @@ impl Widget for &mut SourceControlPanel {
         if self.status.ahead > 0 {
             spans.push(Span::styled(
                 format!("  \u{2191}{}", self.status.ahead),
-                Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c)),
+                Style::default().fg(self.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c))),
             ));
         }
         if self.status.behind > 0 {
             spans.push(Span::styled(
                 format!("  \u{2193}{}", self.status.behind),
-                Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
+                Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
             ));
         }
         buf.set_line(inner.x, y, &Line::from(spans), inner.width);
@@ -1176,7 +1178,7 @@ impl Widget for &mut SourceControlPanel {
         let input_border_style = if self.focused {
             Style::default().fg(accent)
         } else {
-            Style::default().fg(Color::Rgb(0x60, 0x68, 0x78))
+            Style::default().fg(self.theme.ui(Color::Rgb(0x60, 0x68, 0x78)))
         };
         let input_block = Block::default()
             .borders(Borders::ALL)
@@ -1296,9 +1298,9 @@ impl Widget for &mut SourceControlPanel {
             && y < inner.y + inner.height
         {
             let style = if self.commit_feedback_is_error {
-                Style::default().fg(Color::Rgb(0xe7, 0x70, 0x70))
+                Style::default().fg(self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)))
             } else {
-                Style::default().fg(Color::Rgb(0xa3, 0xbe, 0x8c))
+                Style::default().fg(self.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
             };
             buf.set_string(inner.x, y, msg.as_str(), style);
             y += 2;
@@ -1308,7 +1310,7 @@ impl Widget for &mut SourceControlPanel {
         if y >= inner.y + inner.height {
             return;
         }
-        let sep_style = Style::default().fg(Color::Rgb(0x40, 0x48, 0x58));
+        let sep_style = Style::default().fg(self.theme.ui(Color::Rgb(0x40, 0x48, 0x58)));
         for x in inner.x..inner.x + inner.width {
             buf.set_string(x, y, "─", sep_style);
         }
@@ -1360,7 +1362,7 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
 
-        let selected_bg = Color::Rgb(0x26, 0x4f, 0x78);
+        let selected_bg = self.theme.ui(Color::Rgb(0x26, 0x4f, 0x78));
         let end = (self.scroll + viewport).min(total);
         for (row, idx) in (self.scroll..end).enumerate() {
             let row_y = list_area.y + row as u16;
@@ -1376,7 +1378,7 @@ impl Widget for &mut SourceControlPanel {
                     let mut header_spans = vec![
                         Span::styled(
                             "\u{25be} ",
-                            Style::default().fg(Color::Rgb(0xb0, 0xb8, 0xc8)),
+                            Style::default().fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8))),
                         ),
                         Span::styled(
                             section_label(*section),
@@ -1393,7 +1395,7 @@ impl Widget for &mut SourceControlPanel {
                             format!(" {count} "),
                             Style::default()
                                 .fg(Color::White)
-                                .bg(Color::Rgb(0x2a, 0x33, 0x42))
+                                .bg(self.theme.ui(Color::Rgb(0x2a, 0x33, 0x42)))
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ];
@@ -1448,12 +1450,12 @@ impl Widget for &mut SourceControlPanel {
                     let row_bg = if is_primary {
                         Some(selected_bg)
                     } else if is_in_multi {
-                        Some(Color::Rgb(0x1f, 0x3a, 0x5c))
+                        Some(self.theme.ui(Color::Rgb(0x1f, 0x3a, 0x5c)))
                     } else {
                         crate::widgets::hover::row_hover_bg(
                             row_rect,
                             self.hover_pointer,
-                            self.focus_gradient,
+                            self.theme,
                         )
                     };
                     let is_selected = is_primary;
@@ -1488,7 +1490,7 @@ impl Widget for &mut SourceControlPanel {
                         .x
                         .saturating_add(row_rect.width.saturating_sub(badge_w + row_padding));
                     let mut badge_style = Style::default()
-                        .fg(badge_color(entry.kind))
+                        .fg(badge_color(entry.kind, self.theme))
                         .add_modifier(Modifier::BOLD);
                     let mut icon_style = Style::default().fg(icon.color);
                     let mut path_style = Style::default().fg(Color::White);
@@ -1527,7 +1529,7 @@ impl Widget for &mut SourceControlPanel {
                         );
                     }
                     if show_actions {
-                        let action_fg = Color::Rgb(0xd4, 0xd9, 0xe2);
+                        let action_fg = self.theme.ui(Color::Rgb(0xd4, 0xd9, 0xe2));
                         let mut action_style = Style::default().fg(action_fg);
                         if let Some(bg) = row_bg {
                             action_style = action_style.bg(bg);
@@ -1614,6 +1616,7 @@ mod tests {
         use ratatui::buffer::Buffer;
         let mut p = SourceControlPanel::new();
         p.focus_gradient = false; // Croft Dark
+        p.theme = crate::theme::Theme::DARK_BLUE;
         p.status.in_repo = true;
         p.selected_change = None; // nothing selected
         p.entries = vec![

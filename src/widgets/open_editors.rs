@@ -185,7 +185,7 @@ impl Widget for &mut OpenEditorsPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(COLOR_DIM));
+            .border_style(Style::default().fg(self.theme.ui(COLOR_DIM)));
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;
@@ -207,11 +207,14 @@ impl Widget for &mut OpenEditorsPanel {
         };
         let header_y = inner.y;
         Paragraph::new(Line::from(vec![
-            Span::styled(format!("{chevron} "), Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                format!("{chevron} "),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ),
             Span::styled(
                 "OPEN EDITORS",
                 Style::default()
-                    .fg(COLOR_HEADER)
+                    .fg(self.theme.ui(COLOR_HEADER))
                     .add_modifier(Modifier::BOLD),
             ),
         ]))
@@ -240,7 +243,7 @@ impl Widget for &mut OpenEditorsPanel {
         if self.items.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No open editors",
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -276,7 +279,7 @@ impl Widget for &mut OpenEditorsPanel {
         let sel_bg = if brand {
             crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
         } else {
-            Color::Rgb(0x09, 0x4d, 0x77)
+            self.theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
         };
 
         for row in 0..visible {
@@ -293,16 +296,16 @@ impl Widget for &mut OpenEditorsPanel {
             // Dirty tabs lead with a filled dot in the dirty colour; clean tabs
             // pad the same column so the names stay aligned.
             let (marker, marker_color) = if item.dirty {
-                ("● ", COLOR_DIRTY)
+                ("● ", self.theme.ui(COLOR_DIRTY))
             } else {
-                ("  ", COLOR_DIM)
+                ("  ", self.theme.ui(COLOR_DIM))
             };
             let name_style = if item.active {
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(COLOR_NAME)
+                Style::default().fg(self.theme.ui(COLOR_NAME))
             };
             let spans = vec![
                 Span::styled(marker, Style::default().fg(marker_color)),
@@ -312,7 +315,7 @@ impl Widget for &mut OpenEditorsPanel {
             let style = if item.active {
                 Style::default().bg(sel_bg)
             } else if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, brand)
+                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
             {
                 Style::default().bg(bg)
             } else {

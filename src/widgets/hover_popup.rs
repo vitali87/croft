@@ -19,7 +19,7 @@ pub struct HoverPopup {
     pub anchor: (u16, u16),
     /// Black theme: wear the orange→green gradient border instead of the
     /// legacy bright-blue. Set by the app before render from `popup_gradient`.
-    pub gradient: bool,
+    pub theme: crate::theme::Theme,
     /// Shrink-to-fit width for short button hints. Cleared (false) for the
     /// LSP/diagnostic hover, which wants the wider minimum for readability.
     pub compact: bool,
@@ -30,7 +30,7 @@ impl HoverPopup {
         Self {
             lines: text.lines().map(|s| s.to_string()).collect(),
             anchor,
-            gradient: false,
+            theme: crate::theme::Theme::default(),
             compact: false,
         }
     }
@@ -101,8 +101,8 @@ impl Widget for &HoverPopup {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
-            .style(Style::default().bg(Color::Rgb(0x1e, 0x21, 0x2a)));
+            .border_style(Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x21, 0x2a))));
         let text = Text::from(
             self.lines
                 .iter()
@@ -111,11 +111,11 @@ impl Widget for &HoverPopup {
         );
         let para = Paragraph::new(text)
             .block(block)
-            .style(Style::default().fg(Color::Rgb(0xd0, 0xd6, 0xe0)))
+            .style(Style::default().fg(self.theme.ui(Color::Rgb(0xd0, 0xd6, 0xe0))))
             .wrap(Wrap { trim: false });
         Widget::render(Clear, area, buf);
         para.render(area, buf);
-        if self.gradient {
+        if self.theme.gradient() {
             crate::gradient::paint_gradient_box(buf, area);
         }
     }

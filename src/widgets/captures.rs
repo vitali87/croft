@@ -145,7 +145,7 @@ impl Widget for &mut CapturesPanel {
         if self.entries.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No captured output yet. Add a trigger with \"action\": \"capture\" to triggers.json (Preferences: Open Terminal Triggers) and matching lines collect here.",
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             )))
             .render(area, buf);
             return;
@@ -156,7 +156,9 @@ impl Widget for &mut CapturesPanel {
             area.x + 1,
             area.y,
             format!("{:<12}{:<28}{}", "PANE", "MATCH", "LINE"),
-            Style::default().fg(COLOR_HEAD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(self.theme.ui(COLOR_HEAD))
+                .add_modifier(Modifier::BOLD),
         );
 
         // Body rows; reserve the last line for the keyboard hints. The
@@ -179,7 +181,7 @@ impl Widget for &mut CapturesPanel {
             self.row_rects.push((r, idx));
             let selected = idx == self.selected;
             let hovered =
-                crate::widgets::hover::row_hover_bg(r, self.hover_pointer, false).is_some();
+                crate::widgets::hover::row_hover_bg(r, self.hover_pointer, self.theme).is_some();
             if selected || hovered {
                 buf.set_style(
                     r,
@@ -196,9 +198,14 @@ impl Widget for &mut CapturesPanel {
                 ),
                 Span::styled(
                     format!("{msg:<28}"),
-                    Style::default().fg(COLOR_MSG).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(self.theme.ui(COLOR_MSG))
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(entry.line.clone(), Style::default().fg(COLOR_DIM)),
+                Span::styled(
+                    entry.line.clone(),
+                    Style::default().fg(self.theme.ui(COLOR_DIM)),
+                ),
             ];
             Paragraph::new(Line::from(spans)).render(
                 Rect {
@@ -217,7 +224,7 @@ impl Widget for &mut CapturesPanel {
                 area.y + area.height - 1,
                 "  ⏎ jump to line   ·   x remove   ·   c clear all",
                 area.width as usize,
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             );
         }
     }

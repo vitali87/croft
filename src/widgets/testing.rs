@@ -424,8 +424,8 @@ fn status_glyph(status: TestStatus, theme: Theme) -> (char, Color) {
         TestStatus::Passed => (GLYPH_PASS, theme.git_added()),
         TestStatus::Failed => (GLYPH_FAIL, theme.git_deleted()),
         TestStatus::Running => (GLYPH_DOT, theme.accent()),
-        TestStatus::Skipped => (GLYPH_DOT, COLOR_DIM),
-        TestStatus::NotRun => (GLYPH_PLAY, COLOR_DIM),
+        TestStatus::Skipped => (GLYPH_DOT, theme.ui(COLOR_DIM)),
+        TestStatus::NotRun => (GLYPH_PLAY, theme.ui(COLOR_DIM)),
     }
 }
 
@@ -465,7 +465,7 @@ impl Widget for &mut TestingPanel {
             inner.y,
             "TESTING",
             Style::default()
-                .fg(COLOR_HEADER)
+                .fg(self.theme.ui(COLOR_HEADER))
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -500,7 +500,7 @@ impl Widget for &mut TestingPanel {
             let (text, color) = if self.last_run_ok == Some(false) {
                 ("Run failed", self.theme.git_deleted())
             } else {
-                ("Run All Tests (Enter)", COLOR_DIM)
+                ("Run All Tests (Enter)", self.theme.ui(COLOR_DIM))
             };
             buf.set_stringn(
                 inner.x + 1,
@@ -552,7 +552,7 @@ impl Widget for &mut TestingPanel {
                 body_y0,
                 p,
                 avail(inner.x + 1),
-                Style::default().fg(COLOR_DIM),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
             );
         }
         self.first_row_y = body_y0;
@@ -579,7 +579,7 @@ impl Widget for &mut TestingPanel {
                         inner.x + 1,
                         y,
                         GLYPH_PLAY.to_string(),
-                        Style::default().fg(COLOR_DIM),
+                        Style::default().fg(self.theme.ui(COLOR_DIM)),
                     );
                     buf.set_stringn(
                         inner.x + 3,
@@ -587,7 +587,7 @@ impl Widget for &mut TestingPanel {
                         suite,
                         avail(inner.x + 3),
                         Style::default()
-                            .fg(COLOR_HEADER)
+                            .fg(self.theme.ui(COLOR_HEADER))
                             .add_modifier(Modifier::BOLD),
                     );
                 }
@@ -606,7 +606,7 @@ impl Widget for &mut TestingPanel {
                         y,
                         leaf,
                         avail(inner.x + 4),
-                        Style::default().fg(COLOR_CASE),
+                        Style::default().fg(self.theme.ui(COLOR_CASE)),
                     );
                 }
             }

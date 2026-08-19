@@ -11316,6 +11316,84 @@ fn esc_closes_the_file_finder_modal() {
     );
 }
 
+/// Issue #207: the light theme must recolor the HOST terminal too. The
+/// portable OSC 10/11 pair carries the theme's fg/bg to Ghostty and every
+/// other host (iTerm2 additionally gets its sRGB override), and the
+/// panic/exit restore must hand the user's own colors back.
+#[test]
+fn host_dynamic_colors_follow_the_theme() {
+    let light = crate::theme::Theme::from_id("light");
+    let seq = super::host_colors_seq(light);
+    assert!(
+        seq.contains("\x1b]11;rgb:ff/ff/ff"),
+        "light background must reach the host via OSC 11"
+    );
+    assert!(
+        seq.contains("\x1b]10;rgb:3b/3b/3b"),
+        "light foreground must reach the host via OSC 10"
+    );
+    let black = super::host_colors_seq(crate::theme::Theme::BLACK);
+    assert!(black.contains("\x1b]11;rgb:00/00/00"));
+    assert!(
+        String::from_utf8_lossy(super::TERMINAL_RESTORE_SEQ).contains("\x1b]110\x07\x1b]111\x07"),
+        "the panic/exit restore must reset the host's own colors"
+    );
+}
+
+/// Issue #207: under Croft Light the quick-input popups must paint light
+/// chrome, not the historical hardcoded dark constants. Renders the Cmd+P
+/// finder under both a dark theme and the light theme and inspects actual
+/// buffer cells: dark stays byte-identical to the legacy palette, light
+/// lands on the VS Code Light Modern quick-input fill with dark text.
+#[test]
+fn quick_open_popup_follows_the_light_theme() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+    std::fs::write(tmp.path().join("beta.rs"), "").unwrap();
+    for (theme, want_bg, dark_text) in [
+        (
+            crate::theme::Theme::DARK_BLUE,
+            ratatui::style::Color::Rgb(0x16, 0x18, 0x1f),
+            false,
+        ),
+        (
+            crate::theme::Theme::from_id("light"),
+            ratatui::style::Color::Rgb(0xf8, 0xf8, 0xf8),
+            true,
+        ),
+    ] {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.apply_theme(theme);
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|frame| app.render(frame)).unwrap();
+        let finder = app.file_finder.as_ref().unwrap();
+        // Probe the SECOND result row: the first wears the selection fill,
+        // the second the plain popup body.
+        let (x, y) = (finder.last_rect.x + 4, finder.last_rect.y + 4);
+        let cell = &term.backend().buffer()[(x, y)];
+        assert_eq!(
+            cell.bg,
+            want_bg,
+            "{}: the finder body must wear the theme's popup fill",
+            theme.id()
+        );
+        if dark_text {
+            let ratatui::style::Color::Rgb(r, g, b) = cell.fg else {
+                panic!("light finder text must be an Rgb color, got {:?}", cell.fg)
+            };
+            let luma = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+            assert!(
+                luma < 128.0,
+                "light finder text must be dark on the white popup, got {:?}",
+                cell.fg
+            );
+        }
+    }
+}
+
 /// Issue #205: Cmd+P search results must be mouse clickable. A left click on
 /// a result row confirms that row (the way VS Code's quick-pick behaves):
 /// it opens the clicked file, not the keyboard-selected one, and dismisses

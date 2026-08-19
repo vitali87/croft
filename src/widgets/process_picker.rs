@@ -73,7 +73,7 @@ pub fn render_process_picker(
     picker: &mut ProcessPicker,
     area: Rect,
     buf: &mut Buffer,
-    gradient: bool,
+    theme: crate::theme::Theme,
 ) {
     let width = area.width.saturating_mul(7) / 10;
     let width = width.clamp(40, 110.min(area.width));
@@ -93,14 +93,14 @@ pub fn render_process_picker(
     let title = Span::styled(
         " Attach to Python Process — Esc to close, ↑/↓ to navigate, Enter to attach ",
         Style::default()
-            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
+        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
         .title(title.clone())
-        .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
+        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -108,15 +108,15 @@ pub fn render_process_picker(
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
-    if gradient {
+    if theme.gradient() {
         crate::gradient::paint_gradient_box(buf, rect);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
-    let sel_bg = if gradient {
+    let sel_bg = if theme.gradient() {
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        Color::Rgb(0x1e, 0x3a, 0x6e)
+        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
     };
 
     if inner.height == 0 || inner.width == 0 {
@@ -139,9 +139,9 @@ pub fn render_process_picker(
         let row_idx = picker.scroll + offset;
         let is_selected = row_idx == picker.selected;
         let row_style = if is_selected {
-            Style::default().bg(sel_bg).fg(Color::White)
+            Style::default().bg(sel_bg).fg(theme.ui(Color::White))
         } else {
-            Style::default().fg(Color::Rgb(0xec, 0xef, 0xf4))
+            Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
         };
         let prefix = if is_selected { "> " } else { "  " };
         lines.push(Line::from(vec![

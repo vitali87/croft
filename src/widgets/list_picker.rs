@@ -167,7 +167,12 @@ impl ListPicker {
     }
 }
 
-pub fn render_list_picker(picker: &mut ListPicker, screen: Rect, buf: &mut Buffer, gradient: bool) {
+pub fn render_list_picker(
+    picker: &mut ListPicker,
+    screen: Rect,
+    buf: &mut Buffer,
+    theme: crate::theme::Theme,
+) {
     let width = (screen.width.saturating_mul(6) / 10).clamp(36, 96.min(screen.width));
     let height = (screen.height.saturating_mul(6) / 10).clamp(8, screen.height);
     let rect = Rect {
@@ -184,14 +189,14 @@ pub fn render_list_picker(picker: &mut ListPicker, screen: Rect, buf: &mut Buffe
             picker.title
         ),
         Style::default()
-            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
+        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
         .title(title.clone())
-        .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
+        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -199,15 +204,15 @@ pub fn render_list_picker(picker: &mut ListPicker, screen: Rect, buf: &mut Buffe
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
-    if gradient {
+    if theme.gradient() {
         crate::gradient::paint_gradient_box(buf, rect);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
-    let sel_bg = if gradient {
+    let sel_bg = if theme.gradient() {
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        Color::Rgb(0x1e, 0x3a, 0x6e)
+        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
     };
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -219,14 +224,17 @@ pub fn render_list_picker(picker: &mut ListPicker, screen: Rect, buf: &mut Buffe
     let at: String = picker.query.chars().skip(cursor).take(1).collect();
     let after: String = picker.query.chars().skip(cursor + 1).collect();
     let caret = if at.is_empty() { " ".to_string() } else { at };
-    let qstyle = Style::default().fg(Color::Rgb(0xec, 0xef, 0xf4));
+    let qstyle = Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)));
     let caret_style = Style::default()
-        .fg(Color::Rgb(0x16, 0x18, 0x1f))
-        .bg(Color::Rgb(0xec, 0xef, 0xf4))
+        .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
+        .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
         .add_modifier(Modifier::SLOW_BLINK);
     Widget::render(
         Paragraph::new(Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0))),
+            Span::styled(
+                "> ",
+                Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
+            ),
             Span::styled(before, qstyle),
             Span::styled(caret, caret_style),
             Span::styled(after, qstyle),
@@ -254,7 +262,7 @@ pub fn render_list_picker(picker: &mut ListPicker, screen: Rect, buf: &mut Buffe
         Widget::render(
             Paragraph::new(Line::from(Span::styled(
                 "  (nothing to choose)",
-                Style::default().fg(Color::Rgb(0x7a, 0x82, 0x90)),
+                Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
             ))),
             list,
             buf,
@@ -274,9 +282,9 @@ pub fn render_list_picker(picker: &mut ListPicker, screen: Rect, buf: &mut Buffe
         let row_idx = picker.scroll + offset;
         let is_sel = row_idx == picker.selected;
         let style = if is_sel {
-            Style::default().bg(sel_bg).fg(Color::White)
+            Style::default().bg(sel_bg).fg(theme.ui(Color::White))
         } else {
-            Style::default().fg(Color::Rgb(0xec, 0xef, 0xf4))
+            Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
         };
         let prefix = if is_sel { "> " } else { "  " };
         lines.push(Line::from(vec![

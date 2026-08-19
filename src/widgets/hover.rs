@@ -18,6 +18,7 @@ use ratatui::style::Color;
 /// Dark, a plain dark-grey lift on the OLED-black theme.
 const ROW_HOVER_BG_DARK: Color = Color::Rgb(0x2b, 0x31, 0x42);
 const ROW_HOVER_BG_BLACK: Color = Color::Rgb(0x1a, 0x1a, 0x1a);
+const ROW_HOVER_BG_LIGHT: Color = Color::Rgb(0xf2, 0xf2, 0xf2);
 
 /// True when `pointer` rests on any cell of `rect`. The single hit-test every
 /// hover affordance is built on.
@@ -30,14 +31,22 @@ pub fn contains(rect: Rect, pointer: Option<(u16, u16)>) -> bool {
     })
 }
 
-/// The row-hover background for the active theme (`brand` = Croft Black), or
-/// `None` when the pointer is not over `rect`. Callers paint this only on rows
-/// that are not already selected/marked, so it never masks a stronger state.
-pub fn row_hover_bg(rect: Rect, pointer: Option<(u16, u16)>, brand: bool) -> Option<Color> {
+/// The row-hover background for the active theme, or `None` when the pointer
+/// is not over `rect`. Callers paint this only on rows that are not already
+/// selected/marked, so it never masks a stronger state. VS Code's light
+/// `list.hoverBackground` (#f2f2f2) on light themes; the gradient brand
+/// (Croft Black) keeps its grey lift, every other dark theme the navy one.
+pub fn row_hover_bg(
+    rect: Rect,
+    pointer: Option<(u16, u16)>,
+    theme: crate::theme::Theme,
+) -> Option<Color> {
     if !contains(rect, pointer) {
         return None;
     }
-    Some(if brand {
+    Some(if theme.is_light() {
+        ROW_HOVER_BG_LIGHT
+    } else if theme.gradient() {
         ROW_HOVER_BG_BLACK
     } else {
         ROW_HOVER_BG_DARK
@@ -76,14 +85,17 @@ mod tests {
     fn row_hover_bg_is_theme_aware_and_only_fires_over_the_rect() {
         let r = rect(0, 0, 8, 1);
         assert_eq!(
-            row_hover_bg(r, Some((2, 0)), false),
+            row_hover_bg(r, Some((2, 0)), crate::theme::Theme::DARK_BLUE),
             Some(ROW_HOVER_BG_DARK)
         );
         assert_eq!(
-            row_hover_bg(r, Some((2, 0)), true),
+            row_hover_bg(r, Some((2, 0)), crate::theme::Theme::BLACK),
             Some(ROW_HOVER_BG_BLACK)
         );
-        assert_eq!(row_hover_bg(r, Some((2, 5)), false), None);
-        assert_eq!(row_hover_bg(r, None, true), None);
+        assert_eq!(
+            row_hover_bg(r, Some((2, 5)), crate::theme::Theme::DARK_BLUE),
+            None
+        );
+        assert_eq!(row_hover_bg(r, None, crate::theme::Theme::BLACK), None);
     }
 }

@@ -45,8 +45,8 @@ fn lift_bg((r, g, b): (u8, u8, u8), d: u8) -> Color {
 /// row into a deliberate rule instead of dead space. It is dimmer than, and
 /// spans less width than, the full results separator so the two never read as
 /// the same element.
-fn draw_field_divider(buf: &mut Buffer, x0: u16, x1: u16, y: u16) {
-    let style = Style::default().fg(FIELD_BAR_IDLE);
+fn draw_field_divider(buf: &mut Buffer, x0: u16, x1: u16, y: u16, theme: crate::theme::Theme) {
+    let style = Style::default().fg(theme.ui(FIELD_BAR_IDLE));
     for x in x0..=x1 {
         buf.set_string(x, y, "─", style);
     }
@@ -1531,7 +1531,12 @@ struct FieldArgs<'a> {
 /// the app can drive the host's blinking hardware caret there, matching the
 /// Source Control commit box. We no longer paint a static full block, which
 /// never blinked and so read differently from the commit input.
-fn render_field(buf: &mut Buffer, args: FieldArgs, caret_out: &mut Option<(u16, u16)>) -> Rect {
+fn render_field(
+    buf: &mut Buffer,
+    args: FieldArgs,
+    theme: crate::theme::Theme,
+    caret_out: &mut Option<(u16, u16)>,
+) -> Rect {
     if args.fill_right <= args.bar_x {
         return Rect {
             x: args.bar_x,
@@ -1546,7 +1551,7 @@ fn render_field(buf: &mut Buffer, args: FieldArgs, caret_out: &mut Option<(u16, 
     let bar_color = if args.field_focused {
         args.accent
     } else {
-        FIELD_BAR_IDLE
+        theme.ui(FIELD_BAR_IDLE)
     };
     buf.set_string(args.bar_x, args.y, "▏", Style::default().fg(bar_color));
 
@@ -1567,7 +1572,7 @@ fn render_field(buf: &mut Buffer, args: FieldArgs, caret_out: &mut Option<(u16, 
         let lead_color = if args.field_focused {
             args.accent
         } else {
-            Color::Rgb(0x9d, 0xa5, 0xb4)
+            theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4))
         };
         buf.set_string(fill_x, args.y, g, Style::default().fg(lead_color).bg(fill));
     }
@@ -1582,7 +1587,7 @@ fn render_field(buf: &mut Buffer, args: FieldArgs, caret_out: &mut Option<(u16, 
         spans.push(Span::styled(
             args.placeholder.to_string(),
             Style::default()
-                .fg(Color::Rgb(0x6c, 0x7d, 0x9c))
+                .fg(theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c)))
                 .bg(fill)
                 .add_modifier(Modifier::ITALIC),
         ));
@@ -1590,7 +1595,7 @@ fn render_field(buf: &mut Buffer, args: FieldArgs, caret_out: &mut Option<(u16, 
         let plain = Style::default().fg(Color::White).bg(fill);
         let selected = Style::default()
             .fg(Color::White)
-            .bg(Color::Rgb(0x26, 0x4f, 0x78));
+            .bg(theme.ui(Color::Rgb(0x26, 0x4f, 0x78)));
         match args.selection {
             Some((a, b)) if a < b => {
                 if a > 0 {
@@ -1630,7 +1635,7 @@ fn render_field(buf: &mut Buffer, args: FieldArgs, caret_out: &mut Option<(u16, 
 
 impl Widget for &mut SearchPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let focus_blue = Color::Rgb(0x4e, 0x9a, 0xff);
+        let focus_blue = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
         // Black theme: inner stroke accents (chevron, input ring, magnifier,
         // cursor) wear the muted brand teal instead of the legacy blue.
         let accent = if self.focus_gradient {
@@ -1670,7 +1675,7 @@ impl Widget for &mut SearchPanel {
             inner.y,
             "SEARCH",
             Style::default()
-                .fg(Color::Rgb(0xb0, 0xb8, 0xc8))
+                .fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -1694,7 +1699,7 @@ impl Widget for &mut SearchPanel {
                 let color = if hot {
                     accent
                 } else {
-                    Color::Rgb(0x8b, 0x94, 0xa4)
+                    self.theme.ui(Color::Rgb(0x8b, 0x94, 0xa4))
                 };
                 buf.set_string(x, inner.y, glyph.to_string(), Style::default().fg(color));
             }
@@ -1781,6 +1786,7 @@ impl Widget for &mut SearchPanel {
                 bg,
                 reserve_right: query_reserve,
             },
+            self.theme,
             &mut caret,
         );
 
@@ -1804,7 +1810,7 @@ impl Widget for &mut SearchPanel {
             .bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
             .add_modifier(Modifier::BOLD);
         let inactive_style = Style::default()
-            .fg(Color::Rgb(0x79, 0x82, 0x8f))
+            .fg(self.theme.ui(Color::Rgb(0x79, 0x82, 0x8f)))
             .bg(toggle_fill);
         self.toggle_y = content_y;
         self.toggle_case_x = case_x;
@@ -1823,7 +1829,7 @@ impl Widget for &mut SearchPanel {
         let ellipsis_style = if self.details_open {
             Style::default().fg(accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Rgb(0x79, 0x82, 0x8f))
+            Style::default().fg(self.theme.ui(Color::Rgb(0x79, 0x82, 0x8f)))
         };
         buf.set_string(
             ellipsis_x,
@@ -1844,7 +1850,7 @@ impl Widget for &mut SearchPanel {
         if self.replace_open && next_y + 1 < inner.y + inner.height {
             // A faint hairline between the query and replace fields so they read
             // as two separate inputs instead of one continuous filled container.
-            draw_field_divider(buf, bar_x, query_fill_right, next_y);
+            draw_field_divider(buf, bar_x, query_fill_right, next_y, self.theme);
             next_y += 1;
             // The replace-all action icon sits at the far right (under the ...),
             // and the replace fill ends two cells short of it.
@@ -1870,6 +1876,7 @@ impl Widget for &mut SearchPanel {
                     bg,
                     reserve_right: 0,
                 },
+                self.theme,
                 &mut caret,
             );
             buf.set_string(
@@ -1879,7 +1886,7 @@ impl Widget for &mut SearchPanel {
                 Style::default().fg(if self.focused {
                     accent
                 } else {
-                    Color::Rgb(0x9d, 0xa5, 0xb4)
+                    self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4))
                 }),
             );
             self.replace_all_x = replace_all_x;
@@ -1895,12 +1902,12 @@ impl Widget for &mut SearchPanel {
         self.exclude_input_rect = Rect::default();
         if self.details_open {
             let detail_fill_right = inner_right.saturating_sub(1).max(bar_x + 1);
-            let caption_style = Style::default().fg(Color::Rgb(0x9d, 0xa5, 0xb4));
+            let caption_style = Style::default().fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)));
 
             if next_y + 2 < inner.y + inner.height {
                 // Hairline before the include group, matching the query/replace
                 // separation so every input reads as its own row.
-                draw_field_divider(buf, bar_x, detail_fill_right, next_y);
+                draw_field_divider(buf, bar_x, detail_fill_right, next_y, self.theme);
                 next_y += 1;
                 buf.set_string(bar_x, next_y, "files to include", caption_style);
                 next_y += 1;
@@ -1924,13 +1931,14 @@ impl Widget for &mut SearchPanel {
                         bg,
                         reserve_right: 0,
                     },
+                    self.theme,
                     &mut caret,
                 );
                 next_y += 1;
             }
             if next_y + 2 < inner.y + inner.height {
                 // Hairline before the exclude group, same as above.
-                draw_field_divider(buf, bar_x, detail_fill_right, next_y);
+                draw_field_divider(buf, bar_x, detail_fill_right, next_y, self.theme);
                 next_y += 1;
                 buf.set_string(bar_x, next_y, "files to exclude", caption_style);
                 next_y += 1;
@@ -1954,6 +1962,7 @@ impl Widget for &mut SearchPanel {
                         bg,
                         reserve_right: 0,
                     },
+                    self.theme,
                     &mut caret,
                 );
                 next_y += 1;
@@ -1967,7 +1976,7 @@ impl Widget for &mut SearchPanel {
         // ---- Separator + match-count caption ----
         let separator_y = next_y;
         if separator_y < inner.y + inner.height {
-            let sep_style = Style::default().fg(Color::Rgb(0x40, 0x48, 0x58));
+            let sep_style = Style::default().fg(self.theme.ui(Color::Rgb(0x40, 0x48, 0x58)));
             for x in inner.x..inner.x + inner.width {
                 buf.set_string(x, separator_y, "─", sep_style);
             }
@@ -1982,7 +1991,7 @@ impl Widget for &mut SearchPanel {
             let caption = Line::from(Span::styled(
                 header,
                 Style::default()
-                    .fg(Color::Rgb(0x9d, 0xa5, 0xb4))
+                    .fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
                     .add_modifier(Modifier::ITALIC),
             ));
             buf.set_line(inner.x, caption_y, &caption, inner.width);
@@ -2043,11 +2052,8 @@ impl Widget for &mut SearchPanel {
                 height: 1,
             };
             if hit_idx != self.selected
-                && let Some(bg) = crate::widgets::hover::row_hover_bg(
-                    row_rect,
-                    self.hover_pointer,
-                    self.focus_gradient,
-                )
+                && let Some(bg) =
+                    crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
             {
                 let fill = Style::default().bg(bg);
                 for rx in 0..row_width {
@@ -2101,7 +2107,7 @@ impl Widget for &mut SearchPanel {
                 } else {
                     Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Rgb(0x4e, 0x9a, 0xff))
+                        .bg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
                         .add_modifier(Modifier::BOLD)
                 }
             } else {
@@ -2114,14 +2120,14 @@ impl Widget for &mut SearchPanel {
             // the blue row bg instead of fighting it.
             let highlight_style = Style::default()
                 .fg(Color::Black)
-                .bg(Color::Rgb(0xff, 0xd7, 0x4a))
+                .bg(self.theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
                 .add_modifier(Modifier::BOLD);
             let plain_style = Style::default().fg(Color::Gray);
             let mut spans: Vec<Span> = vec![
                 Span::styled(format!(" {path_display}"), header_style),
                 Span::styled(
                     format!(":{}: ", hit.line_no),
-                    Style::default().fg(Color::Rgb(0xeb, 0xcb, 0x8b)),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
                 ),
             ];
             // Inline replace preview (#123): while a replacement is typed,
@@ -2135,13 +2141,13 @@ impl Widget for &mut SearchPanel {
                     spans.push(Span::styled(
                         chunk,
                         Style::default()
-                            .fg(Color::Rgb(0x8b, 0x93, 0xa5))
+                            .fg(self.theme.ui(Color::Rgb(0x8b, 0x93, 0xa5)))
                             .add_modifier(Modifier::CROSSED_OUT),
                     ));
                     spans.push(Span::styled(
                         new_text,
                         Style::default()
-                            .fg(Color::Rgb(0xb6, 0xee, 0xc4))
+                            .fg(self.theme.ui(Color::Rgb(0xb6, 0xee, 0xc4)))
                             .add_modifier(Modifier::BOLD),
                     ));
                     continue;
@@ -3172,6 +3178,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut panel = make_panel_with_hits(&tmp, 20);
         panel.focus_gradient = false; // Croft Dark
+        panel.theme = crate::theme::Theme::DARK_BLUE;
         panel.selected = 0;
         panel.scroll = 0;
         let area = Rect {

@@ -252,21 +252,26 @@ fn collapse_home(path: &Path, home: &str) -> String {
 /// the Explorer column vs. a centered fallback) is decided by the caller
 /// in `App::render_zoxide_jump`, which knows the pane layout; this widget
 /// just fills the box it is handed.
-pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer, gradient: bool) {
+pub fn render_zoxide_jump(
+    jump: &mut ZoxideJump,
+    rect: Rect,
+    buf: &mut Buffer,
+    theme: crate::theme::Theme,
+) {
     jump.last_rect = rect;
 
     Widget::render(Clear, rect, buf);
     let title = Span::styled(
         " Jump (zoxide) — Esc to close, ↑/↓ to navigate, Enter to jump ",
         Style::default()
-            .fg(Color::Rgb(0xff, 0xff, 0xff))
+            .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(0x4e, 0x9a, 0xff)))
+        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
         .title(title.clone())
-        .style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x1f)));
+        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -275,15 +280,15 @@ pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer, g
     };
     Widget::render(block, rect, buf);
     // Black theme: gradient border over the solid one, then re-stamp the title.
-    if gradient {
+    if theme.gradient() {
         crate::gradient::paint_gradient_box(buf, rect);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
-    let sel_bg = if gradient {
+    let sel_bg = if theme.gradient() {
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        Color::Rgb(0x1e, 0x3a, 0x6e)
+        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
     };
 
     if inner.height == 0 || inner.width == 0 {
@@ -291,11 +296,11 @@ pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer, g
     }
 
     let query_style = Style::default()
-        .fg(Color::Rgb(0xec, 0xef, 0xf4))
+        .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
         .add_modifier(Modifier::BOLD);
     let caret_style = Style::default()
-        .fg(Color::Rgb(0x16, 0x18, 0x1f))
-        .bg(Color::Rgb(0xec, 0xef, 0xf4))
+        .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
+        .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
         .add_modifier(Modifier::SLOW_BLINK);
     let cursor = jump.cursor.min(jump.query.chars().count());
     let before: String = jump.query.chars().take(cursor).collect();
@@ -303,7 +308,10 @@ pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer, g
     let after: String = jump.query.chars().skip(cursor + 1).collect();
     let caret_glyph = if at.is_empty() { String::from(" ") } else { at };
     let prompt_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Rgb(0x88, 0xc0, 0xd0))),
+        Span::styled(
+            "> ",
+            Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
+        ),
         Span::styled(before, query_style),
         Span::styled(caret_glyph, caret_style),
         Span::styled(after, query_style),
@@ -326,13 +334,13 @@ pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer, g
         Line::from(Span::styled(
             "≈ no exact match — closest by spelling",
             Style::default()
-                .fg(Color::Rgb(0xe5, 0xc0, 0x7b))
+                .fg(theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b)))
                 .add_modifier(Modifier::ITALIC),
         ))
     } else {
         Line::from(Span::styled(
             "─".repeat(separator_rect.width as usize),
-            Style::default().fg(Color::Rgb(0x3b, 0x42, 0x52)),
+            Style::default().fg(theme.ui(Color::Rgb(0x3b, 0x42, 0x52))),
         ))
     };
     Widget::render(Paragraph::new(sep_line), separator_rect, buf);
@@ -351,7 +359,7 @@ pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer, g
     if !jump.available {
         let msg = Line::from(Span::styled(
             unavailable_message(jump.install_state, jump.termux),
-            Style::default().fg(Color::Rgb(0xe5, 0xc0, 0x7b)),
+            Style::default().fg(theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b))),
         ));
         // Wrapped, not clipped: the popup is as narrow as the Explorer
         // column (phone-width on Termux), and the install hint's tail is
@@ -378,12 +386,12 @@ pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer, g
         let empty = if jump.query.trim().is_empty() {
             Line::from(Span::styled(
                 "  (no directories in the zoxide database yet)",
-                Style::default().fg(Color::Rgb(0x7a, 0x82, 0x90)),
+                Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
             ))
         } else {
             Line::from(Span::styled(
                 format!("  No matches for '{}'", jump.query),
-                Style::default().fg(Color::Rgb(0x7a, 0x82, 0x90)),
+                Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
             ))
         };
         Widget::render(Paragraph::new(empty), list_rect, buf);
@@ -395,9 +403,9 @@ pub fn render_zoxide_jump(jump: &mut ZoxideJump, rect: Rect, buf: &mut Buffer, g
         let row_idx = jump.scroll + offset;
         let is_selected = row_idx == jump.selected;
         let row_style = if is_selected {
-            Style::default().bg(sel_bg).fg(Color::White)
+            Style::default().bg(sel_bg).fg(theme.ui(Color::White))
         } else {
-            Style::default().fg(Color::Rgb(0xec, 0xef, 0xf4))
+            Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
         };
         let prefix = if is_selected { "> " } else { "  " };
         let spans: Vec<Span<'static>> = vec![
@@ -497,7 +505,7 @@ mod tests {
         j.termux = true;
         let rect = Rect::new(0, 0, 30, 12);
         let mut buf = Buffer::empty(rect);
-        render_zoxide_jump(&mut j, rect, &mut buf, false);
+        render_zoxide_jump(&mut j, rect, &mut buf, crate::theme::Theme::default());
         let screen: String = (0..rect.height)
             .map(|y| {
                 (0..rect.width)

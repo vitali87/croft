@@ -202,8 +202,10 @@ pub fn render(
         .to_string();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut images: Vec<MdImage> = Vec::new();
-    let frame = Style::default().fg(FRAME).add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(DIM);
+    let frame = Style::default()
+        .fg(theme.ui(FRAME))
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.ui(DIM));
     for cell in cells {
         let kind = cell.get("cell_type").and_then(|v| v.as_str()).unwrap_or("");
         let source = cell.get("source").map(joined).unwrap_or_default();
@@ -265,7 +267,7 @@ fn render_output(
             lines.extend(ansi_lines(&text, dim, theme, "  "));
         }
         "error" => {
-            let err = Style::default().fg(ERR);
+            let err = Style::default().fg(theme.ui(ERR));
             for tl in output
                 .get("traceback")
                 .and_then(|v| v.as_array())
