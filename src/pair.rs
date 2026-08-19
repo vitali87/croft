@@ -1525,10 +1525,29 @@ fn apply_fence_event(state: &Mutex<PairState>, event: FenceEvent) {
             // an edit gets. Still no live doc = the owner never served the
             // file: nothing to anchor to (mirrors the edit-drop path).
             if !wait_live(state, &file) {
+                diag(
+                    state,
+                    crate::output::OutputLevel::Warn,
+                    &format!(
+                        "[pair] no live croft session serves {file}; note dropped \
+                         (start croft in this workspace first)"
+                    ),
+                );
                 return;
             }
             let mut st = state.lock().unwrap();
             let Some(lines) = st.doc_lines(&file) else {
+                // The file left the live session between wait_live releasing
+                // the lock and this reacquisition: same outcome, same warning.
+                drop(st);
+                diag(
+                    state,
+                    crate::output::OutputLevel::Warn,
+                    &format!(
+                        "[pair] no live croft session serves {file}; note dropped \
+                         (start croft in this workspace first)"
+                    ),
+                );
                 return;
             };
             let offset = note_offset(&lines, row);
@@ -2172,6 +2191,24 @@ mod tests {
         assert_eq!(system_prompt(&Provider::Claude), PAIR_SYSTEM_PROMPT);
     }
 
+    /// Bounded poll toward `expected` through a contention-lossy accessor,
+    /// returning the last value read. The host's UI-tick reads are
+    /// deliberately imprecise under momentary pump contention
+    /// (`notes_snapshot` serves its stale cache on a contended try_lock,
+    /// `is_busy` answers busy on a lost `lock_briefly` race), so a one-shot
+    /// read of a state-final value can flake on a starved runner. The
+    /// deadline only bounds a real regression.
+    fn settle<T: PartialEq>(expected: &T, mut read: impl FnMut() -> T) -> T {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let got = read();
+            if &got == expected || Instant::now() >= deadline {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// A relay plus a pumping owner session that serves `demo.txt`,
     /// collecting every owner-side event for the assertions.
     struct OwnerHarness {
@@ -2474,7 +2511,10 @@ mod tests {
             assert!(Instant::now() < deadline, "TurnDone never arrived");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(!host.is_busy(), "consumed: the seat is idle again");
+        assert!(
+            !settle(&false, || host.is_busy()),
+            "consumed: the seat is idle again"
+        );
         drop(host);
     }
 
@@ -2489,12 +2529,20 @@ mod tests {
             return;
         }
         let harness = OwnerHarness::start("hello world");
-        // A child that exits immediately: the first send hits a dead stdin.
+        // A child whose stdin is dead by the time Died is observable: it
+        // closes stdin BEFORE stdout, so stdout's EOF (what fires Died)
+        // proves the write end already has no reader. A child that merely
+        // exits (`-c pass`) races process teardown: on a starved runner the
+        // reader sees stdout close while the process, and with it stdin's
+        // read end, is still winding down, and the send lands in the pipe
+        // buffer instead of failing. The sleep keeps the pid alive for the
+        // host's grace-kill teardown, like the real CLI's linger.
         let mut cmd = Command::new("python3");
-        cmd.arg("-c").arg("pass");
+        cmd.arg("-c")
+            .arg("import os,time; os.close(0); os.close(1); time.sleep(60)");
         let mut host =
             crate::pair_host::PairHost::spawn_cmd(&harness.socket, "nav", None, cmd).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if host
                 .poll()
@@ -2519,7 +2567,10 @@ mod tests {
             None,
             "a failed yield keeps no baseline"
         );
-        assert!(!host.is_busy(), "a failed yield keeps no busy latch");
+        assert!(
+            !settle(&false, || host.is_busy()),
+            "a failed yield keeps no busy latch"
+        );
         drop(host);
     }
 
@@ -4103,13 +4154,23 @@ mod tests {
             crate::pair_host::PairHost::spawn_cmd(&harness.socket, "navigator", None, cmd).unwrap();
         host.send_task("@demo.txt look this over").unwrap();
 
+        // The reader queues NoteAdded (events channel) before TurnEnd (turn
+        // channel), but poll() drains events FIRST: the poll that surfaces
+        // TurnDone may have drained events before the note was queued, so
+        // wait until BOTH landed; the deadline bounds a real regression.
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut events: Vec<crate::pair_host::PairEvent> = Vec::new();
-        while !events
+        while !(events
             .iter()
             .any(|e| matches!(e, crate::pair_host::PairEvent::TurnDone { .. }))
+            && events
+                .iter()
+                .any(|e| matches!(e, crate::pair_host::PairEvent::NoteAdded { .. })))
         {
-            assert!(Instant::now() < deadline, "no TurnDone; saw {events:?}");
+            assert!(
+                Instant::now() < deadline,
+                "no TurnDone + NoteAdded; saw {events:?}"
+            );
             events.extend(host.poll());
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -4125,9 +4186,10 @@ mod tests {
         assert_eq!(note.0, "demo.txt");
         assert_eq!(note.1, 1, "anchored to the fenced row");
         assert!(note.2.contains("second line could be tighter"));
+        let expected = vec![(1, 1, "second line could be tighter".to_string())];
         assert_eq!(
-            host.notes_snapshot("demo.txt"),
-            vec![(1, 1, "second line could be tighter".to_string())],
+            settle(&expected, || host.notes_snapshot("demo.txt")),
+            expected,
             "(id, row, body): the first note of the seat gets id 1"
         );
         drop(host); // must not hang: the shutdown grace-kill path
@@ -4246,15 +4308,28 @@ mod tests {
             assert!(Instant::now() < deadline, "no TurnDone");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let before = host.notes_snapshot("demo.txt");
-        assert_eq!(before.len(), 1, "the scripted note landed");
+        // The reader applies NoteEnd before it sends the TurnEnd, so note
+        // state is final here; the snapshot accessor is not exact under
+        // contention (see `settle`), so poll it to the resolved value.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let before = loop {
+            let snap = host.notes_snapshot("demo.txt");
+            if snap.len() == 1 {
+                break snap;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the scripted note landed: {snap:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
 
         // A follow-up turn targeting the same file: begin_turn runs
         // synchronously inside send_yield_turn.
         host.send_yield_turn("demo.txt", "hello world\nsecond line")
             .unwrap();
         assert_eq!(
-            host.notes_snapshot("demo.txt"),
+            settle(&before, || host.notes_snapshot("demo.txt")),
             before,
             "open boxes survive the next turn"
         );

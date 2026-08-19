@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "XML now renders pretty, exactly like JSON: .xml, .xsd, .xsl/.xslt, .plist, and SVG-as-text files get real tree-sitter syntax highlighting - tags, attributes, and values in the theme's colors - with the status bar reporting the XML language mode.",
+    kind: NoteKind::Fix,
+    summary: "An AI pair note that cannot anchor (no live session serves the file) is now reported in the output panel instead of vanishing silently, and the test suite's pair and commit-graph timing checks were stabilized with bounded polling on loaded runners.",
 }];
