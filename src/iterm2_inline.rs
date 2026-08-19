@@ -577,6 +577,38 @@ pub fn fit_image(
     fit_image_auto(src_png, canvas_w_px, canvas_h_px, bg)
 }
 
+/// [`fit_image`] with an optional ink recolor for light themes: pixels that
+/// are near-white (every channel above ~200) take `ink`'s hue while keeping
+/// their alpha, so a brand asset drawn with white glyphs (the welcome
+/// wordmark's "cr" / "ft" letters) stays legible on a white canvas. Colored
+/// strokes (the logo's orange and teal) pass through untouched. `None`
+/// bakes exactly like [`fit_image`].
+pub fn fit_image_with_ink(
+    src_png: &[u8],
+    canvas_w_px: u32,
+    canvas_h_px: u32,
+    bg: Rgba<u8>,
+    ink: Option<(u8, u8, u8)>,
+) -> Result<Vec<u8>, image::ImageError> {
+    let Some((ir, ig, ib)) = ink else {
+        return fit_image_auto(src_png, canvas_w_px, canvas_h_px, bg);
+    };
+    let mut img = image::load_from_memory(src_png)?.to_rgba8();
+    for px in img.pixels_mut() {
+        let [r, g, b, a] = px.0;
+        if a > 0 && r > 200 && g > 200 && b > 200 {
+            // Keep the pixel's alpha so antialiased glyph edges stay soft.
+            px.0 = [ir, ig, ib, a];
+        }
+    }
+    let mut recolored = Vec::with_capacity(src_png.len());
+    image::DynamicImage::ImageRgba8(img).write_to(
+        &mut std::io::Cursor::new(&mut recolored),
+        image::ImageFormat::Png,
+    )?;
+    fit_image_auto(&recolored, canvas_w_px, canvas_h_px, bg)
+}
+
 // Test-only counter of full `fit_image_auto` bakes, so tests can pin that
 // a pure anchor move does not re-decode a photo per scrolled row.
 // Thread-local: the bake runs on the asserting test's own thread, and a
@@ -1003,6 +1035,40 @@ mod tests {
     #[test]
     fn iterm_app_is_iterm2() {
         assert!(is_iterm2_term_program(Some("iTerm.app")));
+    }
+
+    /// Issue #217: the welcome wordmark's white letters vanished on the
+    /// light theme. The ink recolor must turn near-white pixels dark while
+    /// leaving colored strokes (the logo's orange) untouched, and `None`
+    /// must bake byte-identically to the plain path.
+    #[test]
+    fn fit_image_with_ink_darkens_only_the_white_glyphs() {
+        // 2x1 source: one white pixel, one orange pixel.
+        let mut src = RgbaImage::new(2, 1);
+        src.put_pixel(0, 0, Rgba([0xff, 0xff, 0xff, 0xff]));
+        src.put_pixel(1, 0, Rgba([0xe9, 0x7c, 0x41, 0xff]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(src)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let bg = Rgba([0xff, 0xff, 0xff, 0xff]);
+        let baked = fit_image_with_ink(&png, 2, 1, bg, Some((0x3b, 0x3b, 0x3b))).unwrap();
+        let out = image::load_from_memory(&baked).unwrap().to_rgba8();
+        let white_side = out.get_pixel(0, 0);
+        let orange_side = out.get_pixel(1, 0);
+        assert!(
+            white_side.0[0] < 0x80 && white_side.0[1] < 0x80,
+            "the white glyph pixel must take the dark ink, got {white_side:?}"
+        );
+        assert!(
+            orange_side.0[0] > 0xc0 && orange_side.0[2] < 0x80,
+            "the orange stroke must pass through untouched, got {orange_side:?}"
+        );
+        // No ink: identical to the plain bake.
+        assert_eq!(
+            fit_image_with_ink(&png, 2, 1, bg, None).unwrap(),
+            fit_image(&png, 2, 1, bg).unwrap()
+        );
     }
 
     /// Every fixed Kitty image id owns exactly one placement: two overlays

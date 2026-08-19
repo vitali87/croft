@@ -437,7 +437,7 @@ impl Widget for &mut OutlinePanel {
             spans.push(Span::raw("  ".repeat(depth)));
             spans.push(Span::styled(
                 format!("{} ", icon.glyph),
-                Style::default().fg(icon.color),
+                Style::default().fg(self.theme.ui(icon.color)),
             ));
             spans.push(Span::styled(
                 sym.name.clone(),

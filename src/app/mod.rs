@@ -762,9 +762,9 @@ pub(crate) const BRAND_ORANGE: Color = Color::Rgb(0xe9, 0x7c, 0x41);
 /// Spans for the "cr<>ft" wordmark at the left of the status bar, styled to
 /// mirror the app logo: white letters with the `<>` (the stylised "o") in the
 /// brand orange, sitting on the bar's own background rather than a pill.
-fn brand_spans() -> Vec<Span<'static>> {
+fn brand_spans(theme: crate::theme::Theme) -> Vec<Span<'static>> {
     let letter = Style::default()
-        .fg(Color::White)
+        .fg(theme.ui(Color::White))
         .add_modifier(Modifier::BOLD);
     vec![
         Span::styled(" cr", letter),
@@ -4556,6 +4556,13 @@ impl App {
         }
         let hero = self.source_control.last_hero_area;
         if hero.width == 0 || hero.height == 0 {
+            return;
+        }
+        // The hero asset carries its own opaque dark backdrop; on a light
+        // theme it would sit as a dark slab on the white panel, so the
+        // panel keeps its text-only empty state instead.
+        if self.theme.is_light() {
+            self.overlays.hero.mark_hidden();
             return;
         }
         let Some((cw, ch)) = self.cell_pixel else {
@@ -9627,11 +9634,16 @@ impl App {
                 let canvas_h = (logo_h_cells as u32) * ch;
                 let bg = self.theme_bg_pixel();
                 let protocol = self.inline_protocol;
-                if let Ok(baked) = crate::iterm2_inline::fit_image(
+                // On a light background the asset's white "cr"/"ft"
+                // letters would vanish; the ink recolor turns just those
+                // pixels dark while the orange/teal strokes pass through.
+                let ink = self.theme.is_light().then_some((0x3b_u8, 0x3b_u8, 0x3b_u8));
+                if let Ok(baked) = crate::iterm2_inline::fit_image_with_ink(
                     crate::iterm2_inline::WELCOME_LOGO_PNG,
                     canvas_w,
                     canvas_h,
                     bg,
+                    ink,
                 ) && let Some(raw) = crate::iterm2_inline::build_inline_image(
                     protocol,
                     &baked,
@@ -9676,7 +9688,7 @@ impl App {
         let badge_y = logo_y + (logo_h_cells * 5) / 6;
         if badge_x + version_w + 2 <= area.x + area.width && badge_y + 2 < area_max_y {
             let badge_style = Style::default()
-                .fg(rgb_color(GRAD_TL))
+                .fg(self.theme.ui(rgb_color(GRAD_TL)))
                 .add_modifier(Modifier::BOLD);
             frame
                 .buffer_mut()
@@ -9700,7 +9712,7 @@ impl App {
                 badge_y + 1,
                 &version_label,
                 Style::default()
-                    .fg(Color::White)
+                    .fg(self.theme.ui(Color::White))
                     .add_modifier(Modifier::BOLD),
             );
             frame.buffer_mut().set_string(
@@ -9749,7 +9761,41 @@ impl App {
                 width: block_w,
                 height: box_h,
             };
-            paint_gradient_box(frame.buffer_mut(), box_rect);
+            if self.theme.is_light() {
+                // The brand gradient's teal leg washes out on white; paint
+                // the card border in the light widget-border grey instead.
+                let border = Style::default().fg(self.theme.ui(Color::Rgb(0x3b, 0x42, 0x52)));
+                let b = frame.buffer_mut();
+                for x in box_rect.x..box_rect.x + box_rect.width {
+                    b.set_string(x, box_rect.y, "\u{2500}", border);
+                    b.set_string(x, box_rect.y + box_rect.height - 1, "\u{2500}", border);
+                }
+                for y in box_rect.y..box_rect.y + box_rect.height {
+                    b.set_string(box_rect.x, y, "\u{2502}", border);
+                    b.set_string(box_rect.x + box_rect.width - 1, y, "\u{2502}", border);
+                }
+                b.set_string(box_rect.x, box_rect.y, "\u{256d}", border);
+                b.set_string(
+                    box_rect.x + box_rect.width - 1,
+                    box_rect.y,
+                    "\u{256e}",
+                    border,
+                );
+                b.set_string(
+                    box_rect.x,
+                    box_rect.y + box_rect.height - 1,
+                    "\u{2570}",
+                    border,
+                );
+                b.set_string(
+                    box_rect.x + box_rect.width - 1,
+                    box_rect.y + box_rect.height - 1,
+                    "\u{256f}",
+                    border,
+                );
+            } else {
+                paint_gradient_box(frame.buffer_mut(), box_rect);
+            }
 
             // Inner content area: 1-cell inset from each border. The width
             // comes from the same helper the height measure used, so the
@@ -9771,7 +9817,7 @@ impl App {
                 header_y,
                 "> ",
                 Style::default()
-                    .fg(rgb_color(GRAD_TR))
+                    .fg(self.theme.ui(rgb_color(GRAD_TR)))
                     .add_modifier(Modifier::BOLD),
             );
             frame.buffer_mut().set_string(
@@ -9779,7 +9825,7 @@ impl App {
                 header_y,
                 format!("IN THIS RELEASE (v{})", env!("CARGO_PKG_VERSION")),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(self.theme.ui(Color::White))
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -9978,7 +10024,7 @@ impl App {
         let testing_hovered = hov == Some(ActivityIcon::Testing);
         let settings_hovered = hov == Some(ActivityIcon::Settings);
 
-        let active_color = Color::White;
+        let active_color = self.theme.ui(Color::White);
         let inactive_color = self.theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c));
         let glyph_x = activity_icon_glyph_x(area);
         let render_glyph = |frame: &mut ratatui::Frame,
@@ -10727,7 +10773,7 @@ impl App {
             let shown: String = label.chars().take(room).collect();
             let fg = if active {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(self.theme.ui(Color::White))
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -11256,7 +11302,7 @@ impl App {
         let active_fg = if brand {
             crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
         } else {
-            Color::White
+            self.theme.ui(Color::White)
         };
         let inactive_fg = self.theme.ui(Color::Rgb(0x80, 0x88, 0x98));
         let right = strip.x + strip.width;
@@ -12443,7 +12489,7 @@ impl App {
         // through scm_worker() would pin all of &self for the whole render.
         let scm_status = self.scm_worker().status().clone();
         let mut spans: Vec<Span> = Vec::with_capacity(20);
-        spans.extend(brand_spans());
+        spans.extend(brand_spans(self.theme));
         if let Some(span) = self.perf.status_span() {
             spans.push(span);
         }
@@ -12966,7 +13012,7 @@ impl App {
             let row_style = if is_sel {
                 Style::default().fg(sel_fg).bg(sel_bg)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(self.theme.ui(Color::White))
             };
             let (label, right_hint) = match entry {
                 MenuEntry::Item { label, action } => {
@@ -13039,7 +13085,7 @@ impl App {
             height: items.len() as u16,
         };
         let bg = self.theme.ui(Color::Rgb(0x25, 0x2b, 0x37));
-        let fg = Color::White;
+        let fg = self.theme.ui(Color::White);
         let style = Style::default().fg(fg).bg(bg);
         frame.render_widget(ratatui::widgets::Clear, menu_rect);
         self.source_control.commit_menu_item_areas.clear();
@@ -13149,7 +13195,7 @@ impl App {
         let body = ratatui::text::Text::from(vec![
             ratatui::text::Line::from(ratatui::text::Span::styled(
                 warn_text,
-                Style::default().fg(Color::White),
+                Style::default().fg(self.theme.ui(Color::White)),
             )),
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(ratatui::text::Span::styled(
@@ -13215,7 +13261,7 @@ impl App {
         let body = ratatui::text::Text::from(vec![
             ratatui::text::Line::from(ratatui::text::Span::styled(
                 "This will undo the change hunk under the cursor on disk.",
-                Style::default().fg(Color::White),
+                Style::default().fg(self.theme.ui(Color::White)),
             )),
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(ratatui::text::Span::styled(
@@ -13340,7 +13386,7 @@ impl App {
         let body = ratatui::text::Text::from(vec![
             ratatui::text::Line::from(ratatui::text::Span::styled(
                 "This reverts every tracked file to HEAD. Untracked files are kept.",
-                Style::default().fg(Color::White),
+                Style::default().fg(self.theme.ui(Color::White)),
             )),
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(vec![
@@ -13408,7 +13454,7 @@ impl App {
                 format!(
                     "Every keystroke and paste will go to {receiving} terminal panes at once (red \u{21f6} pills mark them). Cmd+K I stops it; Cmd+K Shift+I excludes a pane."
                 ),
-                Style::default().fg(Color::White),
+                Style::default().fg(self.theme.ui(Color::White)),
             )),
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(vec![
@@ -13479,15 +13525,15 @@ impl App {
         let body = ratatui::text::Text::from(vec![
             Line::from(Span::styled(
                 "Croft draws its icons and images with inline-image protocols",
-                Style::default().fg(Color::White),
+                Style::default().fg(self.theme.ui(Color::White)),
             )),
             Line::from(Span::styled(
                 format!("that {current} does not support, so the activity bar and"),
-                Style::default().fg(Color::White),
+                Style::default().fg(self.theme.ui(Color::White)),
             )),
             Line::from(Span::styled(
                 "file icons stay blank. Croft still runs; for the full UI use:",
-                Style::default().fg(Color::White),
+                Style::default().fg(self.theme.ui(Color::White)),
             )),
             Line::from(""),
             Line::from(vec![
@@ -13567,7 +13613,7 @@ impl App {
         let body = ratatui::text::Text::from(vec![
             ratatui::text::Line::from(ratatui::text::Span::styled(
                 "This URL will open in YOUR LOCAL MAC's browser via the croft relay.",
-                Style::default().fg(Color::White),
+                Style::default().fg(self.theme.ui(Color::White)),
             )),
             ratatui::text::Line::from(""),
             ratatui::text::Line::from(ratatui::text::Span::styled(
@@ -13735,7 +13781,7 @@ impl App {
         let title = ratatui::text::Span::styled(
             format!(" {} ", p.label),
             Style::default()
-                .fg(Color::White)
+                .fg(self.theme.ui(Color::White))
                 .bg(title_bg)
                 .add_modifier(Modifier::BOLD),
         );
@@ -13766,7 +13812,7 @@ impl App {
                     ratatui::text::Span::raw("> "),
                     ratatui::text::Span::styled(
                         p.buffer.as_str(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(self.theme.ui(Color::White)),
                     ),
                     ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),
@@ -13777,7 +13823,7 @@ impl App {
                     ratatui::text::Span::raw("> "),
                     ratatui::text::Span::styled(
                         p.buffer.as_str(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(self.theme.ui(Color::White)),
                     ),
                     ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),
@@ -13788,7 +13834,7 @@ impl App {
                     ratatui::text::Span::raw("> "),
                     ratatui::text::Span::styled(
                         p.buffer.as_str(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(self.theme.ui(Color::White)),
                     ),
                     ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),
@@ -13799,7 +13845,7 @@ impl App {
                     ratatui::text::Span::raw("> "),
                     ratatui::text::Span::styled(
                         p.buffer.as_str(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(self.theme.ui(Color::White)),
                     ),
                     ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),
@@ -13810,7 +13856,7 @@ impl App {
                     ratatui::text::Span::raw("> "),
                     ratatui::text::Span::styled(
                         p.buffer.as_str(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(self.theme.ui(Color::White)),
                     ),
                     ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),
@@ -13825,7 +13871,7 @@ impl App {
                     ratatui::text::Span::raw("> "),
                     ratatui::text::Span::styled(
                         p.buffer.as_str(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(self.theme.ui(Color::White)),
                     ),
                     ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),
@@ -13836,7 +13882,7 @@ impl App {
                     ratatui::text::Span::raw("> "),
                     ratatui::text::Span::styled(
                         p.buffer.as_str(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(self.theme.ui(Color::White)),
                     ),
                     ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),

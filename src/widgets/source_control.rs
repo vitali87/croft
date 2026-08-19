@@ -587,11 +587,11 @@ impl SourceControlPanel {
             let hover_bg =
                 crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, self.theme);
             let (bg, fg) = if row.active {
-                (self.theme.selection(), Color::White)
+                (self.theme.selection(), self.theme.ui(Color::White))
             } else if let Some(h) = hover_bg {
-                (h, Color::Gray)
+                (h, self.theme.ui(Color::Gray))
             } else {
-                (Color::Reset, Color::Gray)
+                (Color::Reset, self.theme.ui(Color::Gray))
             };
             for x in rect.x..rect.x + rect.width {
                 buf[(x, y)].set_bg(bg);
@@ -1146,7 +1146,7 @@ impl Widget for &mut SourceControlPanel {
         spans.push(Span::styled(
             label,
             Style::default()
-                .fg(Color::White)
+                .fg(self.theme.ui(Color::White))
                 .add_modifier(Modifier::BOLD),
         ));
         if self.status.ahead > 0 {
@@ -1236,7 +1236,7 @@ impl Widget for &mut SourceControlPanel {
                     content_y,
                     &visible,
                     text_max,
-                    Style::default().fg(Color::White),
+                    Style::default().fg(self.theme.ui(Color::White)),
                 );
             }
         }
@@ -1394,7 +1394,7 @@ impl Widget for &mut SourceControlPanel {
                         Span::styled(
                             format!(" {count} "),
                             Style::default()
-                                .fg(Color::White)
+                                .fg(self.theme.ui(Color::White))
                                 .bg(self.theme.ui(Color::Rgb(0x2a, 0x33, 0x42)))
                                 .add_modifier(Modifier::BOLD),
                         ),
@@ -1492,8 +1492,8 @@ impl Widget for &mut SourceControlPanel {
                     let mut badge_style = Style::default()
                         .fg(badge_color(entry.kind, self.theme))
                         .add_modifier(Modifier::BOLD);
-                    let mut icon_style = Style::default().fg(icon.color);
-                    let mut path_style = Style::default().fg(Color::White);
+                    let mut icon_style = Style::default().fg(self.theme.ui(icon.color));
+                    let mut path_style = Style::default().fg(self.theme.ui(Color::White));
                     if let Some(bg) = row_bg {
                         badge_style = badge_style.bg(bg);
                         icon_style = icon_style.bg(bg);

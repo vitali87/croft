@@ -1592,9 +1592,9 @@ fn render_field(
                 .add_modifier(Modifier::ITALIC),
         ));
     } else {
-        let plain = Style::default().fg(Color::White).bg(fill);
+        let plain = Style::default().fg(theme.ui(Color::White)).bg(fill);
         let selected = Style::default()
-            .fg(Color::White)
+            .fg(theme.ui(Color::White))
             .bg(theme.ui(Color::Rgb(0x26, 0x4f, 0x78)));
         match args.selection {
             Some((a, b)) if a < b => {
@@ -2111,7 +2111,7 @@ impl Widget for &mut SearchPanel {
                         .add_modifier(Modifier::BOLD)
                 }
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(self.theme.ui(Color::White))
             };
             let needle = self.query.trim();
             // High-contrast yellow background like ripgrep / VS Code's
@@ -2122,7 +2122,7 @@ impl Widget for &mut SearchPanel {
                 .fg(Color::Black)
                 .bg(self.theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
                 .add_modifier(Modifier::BOLD);
-            let plain_style = Style::default().fg(Color::Gray);
+            let plain_style = Style::default().fg(self.theme.ui(Color::Gray));
             let mut spans: Vec<Span> = vec![
                 Span::styled(format!(" {path_display}"), header_style),
                 Span::styled(

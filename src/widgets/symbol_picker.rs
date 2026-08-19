@@ -370,9 +370,9 @@ pub fn render_symbol_picker(
         };
         let icon = for_outline_kind(sym.kind);
         let icon_style = if is_selected {
-            Style::default().bg(sel_bg).fg(icon.color)
+            Style::default().bg(sel_bg).fg(theme.ui(icon.color))
         } else {
-            Style::default().fg(icon.color)
+            Style::default().fg(theme.ui(icon.color))
         };
         // Indent nested symbols by depth (capped), like the outline tree.
         let indent = "  ".repeat((sym.depth as usize).min(6));

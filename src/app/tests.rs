@@ -6689,7 +6689,7 @@ fn welcome_image_bake_produces_osc1337_carrying_logo_pixels() {
 
 #[test]
 fn brand_spans_render_the_cr_ft_wordmark_with_orange_brackets() {
-    let spans = brand_spans();
+    let spans = brand_spans(crate::theme::Theme::default());
     let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(text, " cr<>ft ");
     // The "<>" (the stylised "o") carries the logo orange; letters stay white.
@@ -11497,6 +11497,56 @@ fn quick_open_popup_follows_the_light_theme() {
                 luma < 128.0,
                 "light finder text must be dark on the white popup, got {:?}",
                 cell.fg
+            );
+        }
+    }
+}
+
+/// Issue #217: the Explorer's file names were white-on-white under Croft
+/// Light (a bare `Color::White` that bypassed the theme adapter). Render
+/// the tree under the light theme and inspect the actual name cell: the
+/// text must be dark, and under a dark theme it must stay white.
+#[test]
+fn explorer_names_are_legible_on_the_light_theme() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+    for (theme, want_dark) in [
+        (crate::theme::Theme::DARK_BLUE, false),
+        (crate::theme::Theme::from_id("light"), true),
+    ] {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.apply_theme(theme);
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|frame| app.render(frame)).unwrap();
+        // Find the cell where "alpha.rs" is painted in the tree column.
+        let buf = term.backend().buffer();
+        let mut found = None;
+        'rows: for y in 0..40u16 {
+            for x in 0..40u16 {
+                if buf[(x, y)].symbol() == "a"
+                    && buf[(x + 1, y)].symbol() == "l"
+                    && buf[(x + 2, y)].symbol() == "p"
+                    && buf[(x + 3, y)].symbol() == "h"
+                {
+                    found = Some((x, y));
+                    break 'rows;
+                }
+            }
+        }
+        let (x, y) = found.expect("alpha.rs must be visible in the Explorer");
+        let fg = buf[(x, y)].fg;
+        if want_dark {
+            let ratatui::style::Color::Rgb(r, g, b) = fg else {
+                panic!("light tree names must resolve to Rgb, got {fg:?}")
+            };
+            let luma = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+            assert!(luma < 128.0, "tree name must be dark on white, got {fg:?}");
+        } else {
+            assert_eq!(
+                fg,
+                ratatui::style::Color::White,
+                "dark themes keep the historical white tree names"
             );
         }
     }

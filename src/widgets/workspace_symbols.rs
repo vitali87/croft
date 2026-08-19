@@ -321,9 +321,9 @@ pub fn render_workspace_symbols(
         };
         let icon = for_outline_kind(item.kind);
         let icon_style = if is_selected {
-            Style::default().bg(sel_bg).fg(icon.color)
+            Style::default().bg(sel_bg).fg(theme.ui(icon.color))
         } else {
-            Style::default().fg(icon.color)
+            Style::default().fg(theme.ui(icon.color))
         };
         let prefix = if is_selected { "> " } else { "  " };
         // Right-align the workspace-relative path + line, like the in-file

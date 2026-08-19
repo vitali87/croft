@@ -566,7 +566,10 @@ impl ProblemsPanel {
                 format!("{chevron} "),
                 Style::default().fg(self.theme.ui(COLOR_DIM)),
             ),
-            Span::styled(format!("{} ", icon.glyph), Style::default().fg(icon.color)),
+            Span::styled(
+                format!("{} ", icon.glyph),
+                Style::default().fg(self.theme.ui(icon.color)),
+            ),
             Span::styled(
                 group.name.clone(),
                 Style::default()
