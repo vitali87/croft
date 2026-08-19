@@ -366,7 +366,7 @@ Binary files open here automatically instead of erroring; the file is read in wi
 
 **Audio / video (`.mp3`, `.wav`, `.flac`, `.m4a`, `.mp4`, `.m4v`, `.mov`)**
 
-Open as a read-only info card: format, duration, dimensions, rates, and tags from the file's own headers, plus a poster frame for video when `ffmpeg` is installed. Playback stays with the system player: `Media: Open in System Player` (palette) hands the file over.
+Open as a read-only info card: format, codec, duration, dimensions, sample rate, channels, bitrate, and tags from the file's own headers, plus a poster frame for video when `ffmpeg` is installed. Playback stays with the system player: `Media: Open in System Player` (palette) hands the file over.
 
 **Word documents (`.docx`, `.odt`)**
 

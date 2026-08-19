@@ -283,10 +283,12 @@ pub fn to_markdown(path: &Path, info: &MediaInfo, scratch: &Path) -> String {
 ",
         info.format
     ));
+    let esc = |t: &str| t.replace('\\', "\\\\").replace('|', "\\|");
     if let Some(c) = &info.codec {
         md.push_str(&format!(
-            "|codec|{c}|
-"
+            "|codec|{}|
+",
+            esc(c)
         ));
     }
     if let Some(d) = info.duration_s {
@@ -331,7 +333,6 @@ pub fn to_markdown(path: &Path, info: &MediaInfo, scratch: &Path) -> String {
     for (k, v) in &info.tags {
         // Escape pipes/backslashes (#202 review): tag text is arbitrary
         // and must not restructure the synthesised table.
-        let esc = |t: &str| t.replace('\\', "\\\\").replace('|', "\\|");
         md.push_str(&format!(
             "|{}|{}|
 ",
@@ -375,6 +376,11 @@ fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
         return Some(out);
     }
     std::fs::create_dir_all(scratch).ok()?;
+    let tmp = scratch.join(format!(
+        "tmp-{}-{:016x}.png",
+        std::process::id(),
+        h.finish()
+    ));
     // Bounded (#202 review): poll with try_wait and kill+reap on the
     // deadline, so a wedged ffmpeg cannot stall the open. First open of
     // a given video only - the poster is hash-cached thereafter.
@@ -382,7 +388,7 @@ fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
         .args(["-y", "-loglevel", "quiet", "-ss", "1", "-i"])
         .arg(path)
         .args(["-frames:v", "1"])
-        .arg(&out)
+        .arg(&tmp)
         .stdin(std::process::Stdio::null())
         .spawn()
         .ok()?;
@@ -400,7 +406,15 @@ fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
             }
         }
     };
-    (ok && out.is_file()).then_some(out)
+    // Rename-on-success (#202 review): a killed or failed ffmpeg can
+    // leave a partial file, which must never be served from the cache.
+    if ok && tmp.is_file() {
+        if std::fs::rename(&tmp, &out).is_ok() {
+            return Some(out);
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    None
 }
 
 #[cfg(test)]

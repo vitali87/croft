@@ -24784,11 +24784,21 @@ impl App {
                         .as_ref()
                         .is_some_and(|md| md.media) =>
                 {
-                    // The OS opener takes a filesystem path directly.
-                    self.status = match open_url(&p.display().to_string()) {
-                        Ok(()) => format!("Handed {} to the system player", p.display()),
-                        Err(e) => format!("System player failed: {e}"),
-                    };
+                    // A remote session has no display to hand the file
+                    // to (#202 review): the opener would run on the
+                    // headless host and claim success.
+                    if is_remote_session() {
+                        self.status = format!(
+                            "Running remotely: copy {} to your machine to play it",
+                            p.display()
+                        );
+                    } else {
+                        // The OS opener takes a filesystem path directly.
+                        self.status = match open_url(&p.display().to_string()) {
+                            Ok(()) => format!("Handed {} to the system player", p.display()),
+                            Err(e) => format!("System player failed: {e}"),
+                        };
+                    }
                 }
                 _ => {
                     self.status = String::from("The active tab is not a media info card");
