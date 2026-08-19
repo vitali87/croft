@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.1.745"
+version = "0.1.746"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -47,6 +47,10 @@ tree-sitter-yaml = "0.7"
 tree-sitter-md = "0.5"
 tree-sitter-go = "0.25"
 tree-sitter-html = "0.23"
+# XML syntax highlighting (#197): dedicated grammar (the HTML grammar
+# chokes on declarations, CDATA, and processing instructions).
+# 0.7.0 verified current on crates.io 2026-08-19.
+tree-sitter-xml = "0.7"
 tree-sitter-css = "0.25"
 tree-sitter-bash = "0.25"
 

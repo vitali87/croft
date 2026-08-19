@@ -405,6 +405,7 @@ pub enum LangKind {
     TypeScript,
     Tsx,
     Json,
+    Xml,
     Toml,
     Yaml,
     Markdown,
@@ -424,6 +425,7 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "ts" => LangKind::TypeScript,
         "tsx" => LangKind::Tsx,
         "json" | "jsonc" => LangKind::Json,
+        "xml" | "xsd" | "xsl" | "xslt" | "svg" | "plist" => LangKind::Xml,
         "toml" => LangKind::Toml,
         "yaml" | "yml" => LangKind::Yaml,
         "md" | "markdown" => LangKind::Markdown,
@@ -578,6 +580,14 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             tree_sitter_json::LANGUAGE.into(),
             "json",
             tree_sitter_json::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Xml => HighlightConfiguration::new(
+            tree_sitter_xml::LANGUAGE_XML.into(),
+            "xml",
+            tree_sitter_xml::XML_HIGHLIGHT_QUERY,
             "",
             "",
         )
@@ -1133,6 +1143,22 @@ def f() -> Config:\n\
             !h[0].is_empty(),
             "line 0 of C++ source should have highlight spans"
         );
+    }
+
+    #[test]
+    fn xml_gets_highlight_spans() {
+        // #197: XML must be pretty-shown like JSON - tags, attributes,
+        // and values get real spans instead of plain text.
+        let mut reg = LangRegistry::default();
+        let src = "<config version=\"1.2\">\n  <name enabled=\"true\">demo</name>\n</config>\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Xml, src.as_bytes(), &line_starts);
+        assert!(!h[0].is_empty(), "the opening tag line has spans");
+        assert!(!h[1].is_empty(), "the attribute line has spans");
+        assert_eq!(lang_for_extension("xml"), Some(LangKind::Xml));
+        assert_eq!(lang_for_extension("xsd"), Some(LangKind::Xml));
+        assert_eq!(lang_for_extension("plist"), Some(LangKind::Xml));
+        assert_eq!(lang_for_extension("svg"), Some(LangKind::Xml));
     }
 
     #[test]
