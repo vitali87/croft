@@ -364,6 +364,10 @@ Binary files open here automatically instead of erroring; the file is read in wi
 | `E` | Extract the selected member to a folder you pick |
 | Click a member | Select it; a second click opens it |
 
+**Audio / video (`.mp3`, `.wav`, `.flac`, `.m4a`, `.mp4`, `.mov`)**
+
+Open as a read-only info card: format, duration, dimensions, rates, and tags from the file's own headers, plus a poster frame for video when `ffmpeg` is installed. Playback stays with the system player.
+
 **Word documents (`.docx`, `.odt`)**
 
 Open as a rendered read-only document: headings, emphasis, lists, tables, and embedded pictures. `File: Reopen as Text` moves on to the underlying container (archive browser / hex).

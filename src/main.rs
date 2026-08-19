@@ -26,6 +26,7 @@ mod lsp;
 mod magic;
 mod markdown;
 mod mcp;
+mod media;
 mod merge;
 mod notebook;
 mod outline_syntax;
