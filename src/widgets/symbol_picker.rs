@@ -148,6 +148,25 @@ impl SymbolPicker {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    /// The result index at screen row `y`, if `y` lands on a visible row.
+    /// The list body starts three rows below `last_rect.y` (top border, the
+    /// query prompt, then the separator) and runs `last_inner_height` rows,
+    /// so this stays in lock-step with [`render_symbol_picker`]. Used to map
+    /// a mouse click to a result row. Line mode (`:N`) renders a "Go to
+    /// line" hint in the list area while `results` still holds every
+    /// symbol, so clicks there map to nothing.
+    pub fn row_index_at(&self, y: u16) -> Option<usize> {
+        if self.is_line_mode() {
+            return None;
+        }
+        let list_top = self.last_rect.y.saturating_add(3);
+        if y < list_top || y - list_top >= self.last_inner_height {
+            return None;
+        }
+        let idx = self.scroll + (y - list_top) as usize;
+        (idx < self.results.len()).then_some(idx)
+    }
+
     /// Re-rank the symbol list against the query. Line mode (`:`) shows the
     /// symbols untouched (the list is irrelevant; Enter jumps to the line). An
     /// empty query lists every symbol in document order; otherwise rows are
@@ -406,6 +425,35 @@ mod tests {
     fn empty_query_lists_every_symbol_in_order() {
         let p = picker();
         assert_eq!(p.results, vec![0, 1, 2]);
+    }
+
+    /// In line mode (`:42`) the list area renders only a "Go to line" hint,
+    /// yet `results` still holds every symbol; a click there must map to
+    /// nothing rather than jump to an invisible symbol row.
+    #[test]
+    fn row_index_at_refuses_clicks_in_line_mode() {
+        let mut p = picker();
+        p.last_rect = Rect {
+            x: 10,
+            y: 5,
+            width: 60,
+            height: 10,
+        };
+        p.last_inner_height = 6;
+        assert_eq!(
+            p.row_index_at(8),
+            Some(0),
+            "outside line mode the first list row maps to the first symbol"
+        );
+        for c in [':', '4', '2'] {
+            p.push_char(c);
+        }
+        assert!(p.is_line_mode());
+        assert_eq!(
+            p.row_index_at(8),
+            None,
+            "line mode renders a hint, not rows; clicks must map to nothing"
+        );
     }
 
     #[test]

@@ -206,6 +206,21 @@ impl BranchPicker {
             self.selected -= 1;
         }
     }
+
+    /// The row index at screen row `y`, if `y` lands on a visible row
+    /// (an existing branch or the synthetic "create" row). The list body
+    /// starts three rows below `last_rect.y` (top border, the query prompt,
+    /// then the separator) and runs `last_inner_height` rows, so this stays
+    /// in lock-step with [`render_branch_picker`]. Used to map a mouse click
+    /// to a row.
+    pub fn row_index_at(&self, y: u16) -> Option<usize> {
+        let list_top = self.last_rect.y.saturating_add(3);
+        if y < list_top || y - list_top >= self.last_inner_height {
+            return None;
+        }
+        let idx = self.scroll + (y - list_top) as usize;
+        (idx < self.row_count()).then_some(idx)
+    }
 }
 
 /// Draw the picker into `rect`. Placement is decided by the caller in

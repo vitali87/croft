@@ -200,6 +200,20 @@ impl ZoxideJump {
         self.results.get(self.selected).map(|p| p.as_path())
     }
 
+    /// The result index at screen row `y`, if `y` lands on a visible row.
+    /// The list body starts three rows below `last_rect.y` (top border, the
+    /// query prompt, then the separator or approximate-match hint) and runs
+    /// `last_inner_height` rows, so this stays in lock-step with
+    /// [`render_zoxide_jump`]. Used to map a mouse click to a result row.
+    pub fn row_index_at(&self, y: u16) -> Option<usize> {
+        let list_top = self.last_rect.y.saturating_add(3);
+        if y < list_top || y - list_top >= self.last_inner_height {
+            return None;
+        }
+        let idx = self.scroll + (y - list_top) as usize;
+        (idx < self.results.len()).then_some(idx)
+    }
+
     #[cfg(test)]
     pub fn selected_index(&self) -> usize {
         self.selected
