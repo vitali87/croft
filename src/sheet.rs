@@ -15,6 +15,8 @@ pub enum SheetKind {
     Xls,
     Ods,
     Xlsb,
+    /// Read-only SQLite browser (#182): tables page as worksheets.
+    Sqlite,
 }
 
 impl SheetKind {
@@ -26,6 +28,7 @@ impl SheetKind {
             SheetKind::Xls => "XLS",
             SheetKind::Ods => "ODS",
             SheetKind::Xlsb => "XLSB",
+            SheetKind::Sqlite => "SQLITE",
         }
     }
 }
@@ -52,6 +55,9 @@ pub struct SheetView {
     pub cell_edits: Vec<(usize, usize, usize)>,
     /// Frame-truth layout for mouse hit-testing, written by the render.
     pub grid: SheetGridLayout,
+    /// SQLite paging state (#182/#201): per-sheet (table name, page).
+    /// Empty for every other kind.
+    pub sqlite_pages: Vec<(String, usize)>,
 }
 
 /// In-grid cell input state (#177): plain value + char cursor.
@@ -97,6 +103,45 @@ impl SheetData {
     }
     pub fn row_count(&self) -> usize {
         self.rows.len()
+    }
+}
+
+/// Assemble a SheetData from parts (the SQLite browser's tables).
+pub fn sheet_data_from_parts(
+    name: String,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> SheetData {
+    let col_widths = compute_col_widths((!headers.is_empty()).then_some(&headers), &rows);
+    SheetData {
+        name,
+        headers,
+        rows,
+        col_widths,
+        scroll_row: 0,
+        scroll_col: 0,
+        cur_row: 0,
+        cur_col: 0,
+        origin: (0, 0),
+    }
+}
+
+/// Assemble a view over pre-built sheets (the SQLite browser).
+pub fn view_from_sheets(
+    kind: SheetKind,
+    source_byte_size: u64,
+    sheets: Vec<SheetData>,
+) -> SheetView {
+    SheetView {
+        kind,
+        source_byte_size,
+        sheets,
+        current_sheet: 0,
+        dirty: false,
+        editing: None,
+        cell_edits: Vec::new(),
+        grid: SheetGridLayout::default(),
+        sqlite_pages: Vec::new(),
     }
 }
 
@@ -155,8 +200,12 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
                 editing: None,
                 cell_edits: Vec::new(),
                 grid: SheetGridLayout::default(),
+                sqlite_pages: Vec::new(),
             })
         }
+        SheetKind::Sqlite => Err(std::io::Error::other(
+            "SQLite opens through the database browser, not the sheet parser",
+        )),
         SheetKind::Xlsx | SheetKind::Xls | SheetKind::Ods | SheetKind::Xlsb => {
             if meta.len() > XLSX_BYTES_CAP {
                 return Err(std::io::Error::other(format!(
@@ -178,6 +227,7 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
                 editing: None,
                 cell_edits: Vec::new(),
                 grid: SheetGridLayout::default(),
+                sqlite_pages: Vec::new(),
             })
         }
     }
@@ -439,7 +489,7 @@ fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>
             SheetKind::Xls => calamine::Sheets::Xls(calamine::open_workbook(path)?),
             SheetKind::Ods => calamine::Sheets::Ods(calamine::open_workbook(path)?),
             SheetKind::Xlsb => calamine::Sheets::Xlsb(calamine::open_workbook(path)?),
-            SheetKind::Csv | SheetKind::Tsv => return Err(auto_err),
+            SheetKind::Csv | SheetKind::Tsv | SheetKind::Sqlite => return Err(auto_err),
         },
     };
     let sheet_names = workbook.sheet_names();

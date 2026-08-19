@@ -47,6 +47,7 @@ mod session_state;
 mod sheet;
 mod shell_integration;
 mod snippets;
+mod sqlite_view;
 mod svg;
 mod tasks;
 mod terminal_session;

@@ -332,7 +332,7 @@ CSV, TSV, and xlsx grids are editable (xlsx cell edits write through a real xlsx
 | Click a cell | Select it; a second click on the selected cell opens the editor |
 | Palette: Sheet: Insert Row Below / Delete Row / Insert Column Right / Delete Column | Structure edits anchored on the selected cell |
 | Wheel down / up over the grid | Pan three rows |
-| `Tab` / `Shift+Tab` | Switch worksheet (multi-sheet workbooks) |
+| `Tab` / `Shift+Tab` | Switch worksheet (multi-sheet workbooks) or table (SQLite databases, which browse read-only through this grid) |
 
 **Hex viewer (any binary file; `File: Reopen as Hex` for the rest)**
 

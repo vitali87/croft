@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Word-processor documents now open readable: .docx and .odt files render their structure - headings, bold/italic, lists, tables, and embedded pictures (inline, through the image overlay) - instead of hitting a binary dead-end. Read-only by design; File: Reopen as Text routes the underlying zip container onward, so the archive browser and hex viewer stay one command away.",
+    summary: "SQLite databases (.sqlite/.sqlite3/.db, and misnamed files detected by content) now open as a read-only browser: every table pages through the spreadsheet grid with typed cells (NULL empty, blobs summarised), Tab switches between tables, and large tables show their first 500 rows with the true count stated. Databases open read-only with sqlite bundled in, so nothing is ever locked, mutated, or created - a live application database is safe to inspect.",
 }];

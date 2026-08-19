@@ -32229,6 +32229,14 @@ impl App {
                 }
             };
             if commit {
+                if !editable {
+                    // Belt-and-braces (#201 review): editing should never
+                    // start on a read-only kind, but a commit must not
+                    // mutate one either.
+                    sheet.editing = None;
+                    self.status = String::from("This view is read-only");
+                    return;
+                }
                 let edit = sheet.editing.take().expect("checked");
                 let (r, c) = {
                     let data = &mut sheet.sheets[current];
@@ -32271,9 +32279,26 @@ impl App {
             }
             KeyCode::Left => data.cur_col = data.cur_col.saturating_sub(1),
             KeyCode::PageDown => {
+                // SQLite (#201 review): at the bottom of the loaded
+                // batch, fetch the NEXT page instead of stopping.
+                if sheet.kind == crate::sheet::SheetKind::Sqlite
+                    && data.cur_row + visible.max(1) >= row_count
+                {
+                    self.sqlite_page_step(1);
+                    return;
+                }
                 data.cur_row = (data.cur_row + visible).min(row_count.saturating_sub(1));
             }
-            KeyCode::PageUp => data.cur_row = data.cur_row.saturating_sub(visible),
+            KeyCode::PageUp => {
+                if sheet.kind == crate::sheet::SheetKind::Sqlite
+                    && data.cur_row == 0
+                    && data.scroll_row == 0
+                {
+                    self.sqlite_page_step(-1);
+                    return;
+                }
+                data.cur_row = data.cur_row.saturating_sub(visible);
+            }
             KeyCode::Home => {
                 data.cur_col = 0;
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -32300,6 +32325,10 @@ impl App {
                 } else {
                     self.status = String::from("This workbook format is read-only (xls/ods/xlsb)");
                 }
+                return;
+            }
+            KeyCode::Delete if !editable => {
+                self.status = String::from("This view is read-only");
                 return;
             }
             KeyCode::Delete if editable && row_count > 0 => {
@@ -32595,6 +32624,46 @@ impl App {
             self.editor.dirty = true;
         } else {
             self.status = String::from("Nothing to remove there");
+        }
+    }
+
+    /// Step the active SQLite table to an adjacent page (#201 review),
+    /// replacing the sheet's rows and keeping the cursor sane.
+    fn sqlite_page_step(&mut self, delta: i64) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(view) = self.editor.sheet.as_mut() else {
+            return;
+        };
+        let idx = view.current_sheet;
+        let Some((table, page)) = view.sqlite_pages.get(idx).cloned() else {
+            return;
+        };
+        let next = page.saturating_add_signed(delta as isize);
+        if delta > 0 {
+            // Do not run past the end: only step when a further page can
+            // exist per the loaded batch being full.
+            if view.sheets[idx].row_count() < crate::sqlite_view::ROW_CAP {
+                self.status = String::from("Last page");
+                return;
+            }
+        } else if page == 0 {
+            return;
+        }
+        match crate::sqlite_view::table_page(&path, &table, next) {
+            Ok((headers, rows, total)) if !rows.is_empty() || next == 0 => {
+                let got = rows.len();
+                let label = crate::sqlite_view::page_label(&table, next, got, total);
+                view.sheets[idx] = crate::sheet::sheet_data_from_parts(label, headers, rows);
+                if delta < 0 {
+                    let last = view.sheets[idx].row_count().saturating_sub(1);
+                    view.sheets[idx].cur_row = last;
+                }
+                view.sqlite_pages[idx].1 = next;
+            }
+            Ok(_) => self.status = String::from("Last page"),
+            Err(e) => self.status = format!("Page fetch failed: {e}"),
         }
     }
 

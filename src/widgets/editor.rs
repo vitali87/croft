@@ -3053,6 +3053,22 @@ impl Editor {
             self.force_text = false;
         }
         if !self.force_text {
+            // SQLite (#182): by extension here, by magic below.
+            let is_sqlite_ext = path
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(crate::sqlite_view::extension_is_sqlite);
+            if is_sqlite_ext {
+                // Propagate errors when the MAGIC confirms sqlite (#201
+                // review: a corrupt database must error, not fall to
+                // hex); a .db that is not sqlite at all falls through.
+                let magic = read_file_head(path)
+                    .map(|h| crate::magic::sniff(&h) == Some(crate::magic::Magic::Sqlite))
+                    .unwrap_or(false);
+                if magic {
+                    return self.open_sqlite(path).map_err(|e| anyhow::anyhow!("{e}"));
+                }
+            }
             // docx/odt (#181): a document that fails the walk falls
             // through (its zip container then reaches the archive route).
             if crate::docx::extension_is_doc(ext) && self.open_doc_preview(path).is_ok() {
@@ -3174,6 +3190,9 @@ impl Editor {
                     .is_ok() =>
             {
                 return Ok(());
+            }
+            Some(crate::magic::Magic::Sqlite) => {
+                return self.open_sqlite(path);
             }
             Some(crate::magic::Magic::Tar)
                 if self
@@ -3380,6 +3399,15 @@ impl Editor {
     fn open_sheet(&mut self, path: &Path) -> Result<()> {
         let view = crate::sheet::open_sheet(path)
             .map_err(|e| anyhow::anyhow!("Spreadsheet open failed: {e}"))?;
+        self.install_sheet_view(path, view);
+        Ok(())
+    }
+
+    /// Read-only SQLite browser (#182): tables as sheet-grid
+    /// worksheets, through the standard sheet install.
+    fn open_sqlite(&mut self, path: &Path) -> Result<()> {
+        let view = crate::sqlite_view::open_database(path)
+            .map_err(|e| anyhow::anyhow!("SQLite open failed: {e}"))?;
         self.install_sheet_view(path, view);
         Ok(())
     }
@@ -3782,6 +3810,9 @@ impl Editor {
             crate::sheet::SheetKind::Csv => Some(b','),
             crate::sheet::SheetKind::Tsv => Some(b'\t'),
             crate::sheet::SheetKind::Xlsx => None,
+            crate::sheet::SheetKind::Sqlite => {
+                anyhow::bail!("SQLite databases are read-only in the browser")
+            }
             _ => anyhow::bail!("This workbook format is read-only (xls/ods/xlsb)"),
         };
         if !force && self.disk_changed_externally() {
