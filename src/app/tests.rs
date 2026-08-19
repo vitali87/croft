@@ -8068,11 +8068,23 @@ fn cmd_k_shift_w_reopens_the_last_closed_tab_with_its_cursor() {
     app.editor.open_pinned(&b).unwrap();
     app.focus_pane(Pane::Editor);
     app.editor.cursor_row = 2;
-    // Close b.rs (active), then a.rs.
+    // Close b.rs (active), then a.rs, both through the keyboard path.
     app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
         .unwrap();
     assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
-    // Reopen must restore b.rs, the most recent close, at its cursor row.
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    // Reopen walks the closes in reverse order: a.rs first, then b.rs
+    // with its remembered cursor row.
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('W'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "the first reopen restores the most recent close"
+    );
     app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
         .unwrap();
     app.handle_key(key(KeyCode::Char('W'), KeyModifiers::SHIFT))
@@ -8080,7 +8092,7 @@ fn cmd_k_shift_w_reopens_the_last_closed_tab_with_its_cursor() {
     assert_eq!(
         app.editor.path.as_deref(),
         Some(b.as_path()),
-        "Cmd+K Shift+W must reopen the last closed tab"
+        "the second reopen walks back to the earlier close"
     );
     assert_eq!(
         app.editor.cursor_row, 2,
@@ -8107,15 +8119,17 @@ fn reopen_closed_tab_skips_files_deleted_since_the_close() {
         .unwrap();
     app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
         .unwrap();
-    std::fs::remove_file(&b).unwrap();
+    // The stack top is a.rs (the last close); deleting IT forces the
+    // missing-file skip down to b.rs.
+    std::fs::remove_file(&a).unwrap();
     app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
         .unwrap();
     app.handle_key(key(KeyCode::Char('W'), KeyModifiers::SHIFT))
         .unwrap();
     assert_eq!(
         app.editor.path.as_deref(),
-        Some(a.as_path()),
-        "a vanished file is skipped and the next closed tab reopens"
+        Some(b.as_path()),
+        "a vanished top entry is skipped and the next closed tab reopens"
     );
 }
 
