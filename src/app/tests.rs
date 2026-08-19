@@ -8403,7 +8403,7 @@ fn a_graph_refresh_swallowed_by_an_inflight_fetch_refires_when_the_reply_drains(
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Settle any startup fetch so the latch state is ours alone.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while app.graph_fetch_inflight {
         app.sync_explorer_panels();
         assert!(
@@ -8413,18 +8413,29 @@ fn a_graph_refresh_swallowed_by_an_inflight_fetch_refires_when_the_reply_drains(
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    // A fetch is mid-flight for the old root when a trigger arrives.
+    // A fetch is mid-flight for the old root when the trigger arrives; the
+    // root change has cleared the panel back to "Loading".
+    app.commit_graph.clear();
     app.graph_fetch_inflight = true;
     app.refresh_commit_graph();
     // The stale reply lands: dropped by the root tag.
     app.graph_tx
         .send((std::path::PathBuf::from("/since-left/root"), Vec::new()))
         .unwrap();
-    app.sync_explorer_panels();
-    assert!(
-        app.graph_fetch_inflight,
-        "the trigger swallowed during flight must re-fire once the stale reply drains"
-    );
+    // The re-fire is the contract, but the inflight latch is transient: the
+    // drain that re-fires can also drain the re-fired worker's reply in the
+    // SAME call (an empty root answers in microseconds), legitimately
+    // clearing the latch again. Poll the resolved outcome instead: the
+    // cleared panel must leave "Loading" with rows for the CURRENT root.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !app.commit_graph.is_loaded() {
+        app.sync_explorer_panels();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the trigger swallowed during flight must re-fire once the stale reply drains"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[test]

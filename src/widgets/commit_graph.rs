@@ -213,6 +213,12 @@ impl CommitGraphPanel {
         }
     }
 
+    /// Whether a fetched graph has landed since the last [`Self::clear`]
+    /// (false = the section still says "Loading").
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
+    }
+
     pub fn clear(&mut self) {
         self.rows.clear();
         self.loaded = false;
