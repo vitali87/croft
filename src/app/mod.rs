@@ -24776,6 +24776,24 @@ impl App {
             | Cmd::SheetDeleteRow
             | Cmd::SheetInsertColRight
             | Cmd::SheetDeleteCol => self.sheet_structure_op(cmd),
+            Cmd::MediaOpenExternal => match self.editor.path.clone() {
+                Some(p)
+                    if self
+                        .editor
+                        .markdown_preview
+                        .as_ref()
+                        .is_some_and(|md| md.media) =>
+                {
+                    // The OS opener takes a filesystem path directly.
+                    self.status = match open_url(&p.display().to_string()) {
+                        Ok(()) => format!("Handed {} to the system player", p.display()),
+                        Err(e) => format!("System player failed: {e}"),
+                    };
+                }
+                _ => {
+                    self.status = String::from("The active tab is not a media info card");
+                }
+            },
             Cmd::ReopenAsPreview => match self.editor.path.clone() {
                 Some(_) if self.editor.dirty => {
                     self.status =

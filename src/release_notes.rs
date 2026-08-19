@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Audio and video files (mp3, wav, flac, m4a, mp4, mov) now open as an info card instead of a binary dead-end: format, duration, dimensions, sample rate, channels, bitrate, and tags parsed from the file's own headers in pure Rust - no external tools - plus a poster frame for video when ffmpeg is available. Playback stays with your system player, stated honestly on the card.",
+    summary: "Audio and video files (mp3, wav, flac, m4a, mp4, m4v, mov) now open as an info card instead of a binary dead-end: format, duration, dimensions, sample rate, channels, bitrate, and tags parsed from the file's own headers in pure Rust - no external tools - plus codec details, a poster frame for video when ffmpeg is available, and a palette command handing the file to your system player. Playback stays with your system player, stated honestly on the card.",
 }];

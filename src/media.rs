@@ -14,6 +14,7 @@ const HEAD_BYTES: usize = 512 * 1024;
 #[derive(Debug, Default, PartialEq)]
 pub struct MediaInfo {
     pub format: String,
+    pub codec: Option<String>,
     pub duration_s: Option<f64>,
     pub sample_rate: Option<u32>,
     pub channels: Option<u16>,
@@ -49,7 +50,10 @@ pub fn probe(path: &Path) -> Option<MediaInfo> {
         return parse_mp3(&head, len);
     }
     if head.get(4..8) == Some(b"ftyp") {
-        return parse_mp4(&head);
+        let brand = head
+            .get(8..12)
+            .map(|b| String::from_utf8_lossy(b).trim().to_string());
+        return parse_mp4(&head, brand);
     }
     None
 }
@@ -77,6 +81,14 @@ fn parse_wav(head: &[u8], file_len: u64) -> Option<MediaInfo> {
         let id = &head[i..i + 4];
         let sz = le32(head, i + 4)? as usize;
         if id == b"fmt " {
+            info.codec = le16(head, i + 8).map(|tag| match tag {
+                1 => String::from("PCM"),
+                3 => String::from("IEEE float"),
+                6 => String::from("A-law"),
+                7 => String::from("mu-law"),
+                85 => String::from("MP3"),
+                other => format!("format tag {other}"),
+            });
             info.channels = le16(head, i + 10);
             info.sample_rate = le32(head, i + 12);
             byte_rate = le32(head, i + 16).unwrap_or(0);
@@ -105,6 +117,7 @@ fn parse_flac(head: &[u8]) -> Option<MediaInfo> {
         | (b[17] as u64);
     Some(MediaInfo {
         format: String::from("FLAC (lossless audio)"),
+        codec: Some(String::from("FLAC")),
         duration_s: (sample_rate > 0 && total > 0).then(|| total as f64 / sample_rate as f64),
         sample_rate: Some(sample_rate),
         channels: Some(channels),
@@ -115,6 +128,7 @@ fn parse_flac(head: &[u8]) -> Option<MediaInfo> {
 fn parse_mp3(head: &[u8], file_len: u64) -> Option<MediaInfo> {
     let mut info = MediaInfo {
         format: String::from("MP3 (MPEG audio)"),
+        codec: Some(String::from("MPEG Layer III")),
         ..Default::default()
     };
     let mut off = 0usize;
@@ -136,10 +150,22 @@ fn parse_mp3(head: &[u8], file_len: u64) -> Option<MediaInfo> {
                 && matches!(name, "TIT2" | "TPE1" | "TALB")
             {
                 let body = &head[i + 10..i + 10 + fsz];
-                let text = if body.first() == Some(&0) {
-                    String::from_utf8_lossy(&body[1..]).into_owned()
-                } else {
-                    String::from_utf8_lossy(body).into_owned()
+                // The first byte declares the ENCODING (#202 review):
+                // strip it unconditionally and decode accordingly, or a
+                // UTF-8/UTF-16 tag keeps a stray control byte.
+                let text = match body.split_first() {
+                    Some((0, rest)) => encoding_rs::WINDOWS_1252.decode(rest).0.into_owned(),
+                    Some((1, rest)) => {
+                        let (enc, skip) = match rest.get(0..2) {
+                            Some([0xfe, 0xff]) => (encoding_rs::UTF_16BE, 2),
+                            Some([0xff, 0xfe]) => (encoding_rs::UTF_16LE, 2),
+                            _ => (encoding_rs::UTF_16LE, 0),
+                        };
+                        enc.decode(&rest[skip..]).0.into_owned()
+                    }
+                    Some((2, rest)) => encoding_rs::UTF_16BE.decode(rest).0.into_owned(),
+                    Some((3, rest)) => String::from_utf8_lossy(rest).into_owned(),
+                    _ => String::new(),
                 };
                 let label = match name {
                     "TIT2" => "title",
@@ -178,9 +204,10 @@ fn parse_mp3(head: &[u8], file_len: u64) -> Option<MediaInfo> {
     Some(info)
 }
 
-fn parse_mp4(head: &[u8]) -> Option<MediaInfo> {
+fn parse_mp4(head: &[u8], brand: Option<String>) -> Option<MediaInfo> {
     let mut info = MediaInfo {
         format: String::from("MP4/MOV container"),
+        codec: brand.map(|b| format!("brand {b}")),
         ..Default::default()
     };
     // Box walk: find moov/mvhd (timescale+duration) and any tkhd dims.
@@ -256,6 +283,12 @@ pub fn to_markdown(path: &Path, info: &MediaInfo, scratch: &Path) -> String {
 ",
         info.format
     ));
+    if let Some(c) = &info.codec {
+        md.push_str(&format!(
+            "|codec|{c}|
+"
+        ));
+    }
     if let Some(d) = info.duration_s {
         let m = (d / 60.0).floor() as u64;
         md.push_str(&format!(
@@ -296,9 +329,14 @@ pub fn to_markdown(path: &Path, info: &MediaInfo, scratch: &Path) -> String {
         ));
     }
     for (k, v) in &info.tags {
+        // Escape pipes/backslashes (#202 review): tag text is arbitrary
+        // and must not restructure the synthesised table.
+        let esc = |t: &str| t.replace('\\', "\\\\").replace('|', "\\|");
         md.push_str(&format!(
-            "|{k}|{v}|
-"
+            "|{}|{}|
+",
+            esc(k),
+            esc(v)
         ));
     }
     md.push('\n');
@@ -314,8 +352,7 @@ pub fn to_markdown(path: &Path, info: &MediaInfo, scratch: &Path) -> String {
         ));
     }
     md.push_str(
-        "Playback is not available in a terminal; use your system player.
-",
+        "Playback is not available in a terminal. Media: Open in System Player (palette) hands the file to your OS.\n",
     );
     md
 }
@@ -324,20 +361,46 @@ fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
     use std::hash::{Hash as _, Hasher as _};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);
-    std::fs::metadata(path).ok()?.len().hash(&mut h);
+    let meta = std::fs::metadata(path).ok()?;
+    meta.len().hash(&mut h);
+    // mtime joins the key (#202 review): a re-encode landing at the
+    // same byte length must not serve a stale poster forever.
+    if let Ok(m) = meta.modified()
+        && let Ok(d) = m.duration_since(std::time::UNIX_EPOCH)
+    {
+        d.as_nanos().hash(&mut h);
+    }
     let out = scratch.join(format!("poster-{:016x}.png", h.finish()));
     if out.is_file() {
         return Some(out);
     }
     std::fs::create_dir_all(scratch).ok()?;
-    let status = std::process::Command::new("ffmpeg")
+    // Bounded (#202 review): poll with try_wait and kill+reap on the
+    // deadline, so a wedged ffmpeg cannot stall the open. First open of
+    // a given video only - the poster is hash-cached thereafter.
+    let mut child = std::process::Command::new("ffmpeg")
         .args(["-y", "-loglevel", "quiet", "-ss", "1", "-i"])
         .arg(path)
         .args(["-frames:v", "1"])
         .arg(&out)
-        .status()
+        .stdin(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    (status.success() && out.is_file()).then_some(out)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let ok = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    (ok && out.is_file()).then_some(out)
 }
 
 #[cfg(test)]
