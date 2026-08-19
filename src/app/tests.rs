@@ -8053,6 +8053,114 @@ fn ctrl_d_with_no_anchor_stashes_selected_file() {
     assert_eq!(app.compare_anchor.as_deref(), Some(f.as_path()));
 }
 
+/// Issue #209: VS Code's Reopen Closed Editor. Closing a tab records it;
+/// Cmd+K Shift+W restores the most recently closed tab with its cursor
+/// position, LIFO across multiple closes.
+#[test]
+fn cmd_k_shift_w_reopens_the_last_closed_tab_with_its_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn a() {}\nfn a2() {}\n").unwrap();
+    std::fs::write(&b, "fn b() {}\nfn b2() {}\nfn b3() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 2;
+    // Close b.rs (active), then a.rs, both through the keyboard path.
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    // Reopen walks the closes in reverse order: a.rs first, then b.rs
+    // with its remembered cursor row.
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('W'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "the first reopen restores the most recent close"
+    );
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('W'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "the second reopen walks back to the earlier close"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 2,
+        "the reopened tab must restore its cursor row"
+    );
+}
+
+/// A closed tab whose file has since vanished is skipped, falling through
+/// to the next reopenable entry rather than failing.
+#[test]
+fn reopen_closed_tab_skips_files_deleted_since_the_close() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn a() {}\n").unwrap();
+    std::fs::write(&b, "fn b() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.focus_pane(Pane::Editor);
+    // Close b.rs then a.rs; both are recorded (a.rs closes down to the
+    // blank buffer, which still counts as closing the tab).
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    // The stack top is a.rs (the last close); deleting IT forces the
+    // missing-file skip down to b.rs.
+    std::fs::remove_file(&a).unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('W'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "a vanished top entry is skipped and the next closed tab reopens"
+    );
+}
+
+/// Close Others records every unpinned tab it drops, so each can be
+/// reopened in most-recent-first order.
+#[test]
+fn close_others_records_the_dropped_tabs_for_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    let c = tmp.path().join("c.rs");
+    for f in [&a, &b, &c] {
+        std::fs::write(f, "x\n").unwrap();
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.open_pinned(&c).unwrap();
+    let keep = app.editor.active_index();
+    app.dispatch_menu_action(MenuAction::CloseOtherTabs(keep), tmp.path().to_path_buf());
+    assert_eq!(app.editor.tab_count(), 1, "only c.rs survives");
+    app.reopen_closed_tab();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "the last-recorded dropped tab reopens first"
+    );
+    app.reopen_closed_tab();
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
