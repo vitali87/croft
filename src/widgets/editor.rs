@@ -3053,6 +3053,11 @@ impl Editor {
             self.force_text = false;
         }
         if !self.force_text {
+            // docx/odt (#181): a document that fails the walk falls
+            // through (its zip container then reaches the archive route).
+            if crate::docx::extension_is_doc(ext) && self.open_doc_preview(path).is_ok() {
+                return Ok(());
+            }
             // A corrupt archive falls through to content routing and,
             // ultimately, the hex fallback.
             if let Some(kind) = crate::archive::kind_from_ext(path)
@@ -3379,6 +3384,58 @@ impl Editor {
         Ok(())
     }
 
+    /// docx/odt read-only preview (#181): the document walks into
+    /// markdown and renders through the preview machinery; embedded
+    /// images extract to scratch and ride the inline-image overlay.
+    fn open_doc_preview(&mut self, path: &Path) -> Result<()> {
+        let scratch = std::env::temp_dir().join("croft-doc-images");
+        let md = crate::docx::to_markdown(path, &scratch)
+            .ok_or_else(|| anyhow::anyhow!("not a recognisable document"))?;
+        let (lines, images) = crate::markdown::render_markdown_with_images(
+            &md,
+            self.theme,
+            &mut self.registry,
+            Some(&scratch),
+        );
+        self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
+        self.lines = vec![String::new()];
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.lang = None;
+        self.scroll = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty = false;
+        self.selection = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit_kind = None;
+        self.highlights = vec![Vec::new()];
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
+        self.image = None;
+        self.sheet = None;
+        self.hex = None;
+        self.archive = None;
+        self.markdown_preview = Some(crate::markdown::MarkdownPreview {
+            lines,
+            scroll: 0,
+            built_seq: self.edit_seq,
+            images,
+            anchor_rows: Vec::new(),
+            wrap_key: (0, 0),
+            last_area: Rect::default(),
+            notebook: false,
+            doc_path: Some(path.to_path_buf()),
+        });
+        self.status = format!("Opened document {}", path.display());
+        Ok(())
+    }
+
     /// Archive browser (#179): list the members read-only; Enter
     /// extracts one to scratch and reopens it through the dispatch.
     fn open_archive(&mut self, path: &Path, kind: crate::archive::ArchiveKind) -> Result<()> {
@@ -3595,6 +3652,13 @@ impl Editor {
             || self.image.is_some()
             || self.hex.is_some()
             || self.archive.is_some()
+            // A docx/odt preview's text side is a STUB (#200 review):
+            // letting a save through would overwrite the document with
+            // the placeholder, the exact #185 class.
+            || self
+                .markdown_preview
+                .as_ref()
+                .is_some_and(|md| md.doc_path.is_some())
     }
 
     /// Open `path` in the read-only hex viewer (#172): the routing
@@ -3881,7 +3945,22 @@ impl Editor {
         // switch must rebuild it here or it keeps the old colors until the
         // user touches the file. Requires `self.theme` to already carry the
         // new theme (the caller assigns it first).
-        if self.markdown_preview.as_ref().is_some_and(|md| md.notebook) {
+        if let Some(doc) = self
+            .markdown_preview
+            .as_ref()
+            .and_then(|md| md.doc_path.clone())
+        {
+            let scroll = self
+                .markdown_preview
+                .as_ref()
+                .map(|m| m.scroll)
+                .unwrap_or(0);
+            if self.open_doc_preview(&doc).is_ok()
+                && let Some(md) = self.markdown_preview.as_mut()
+            {
+                md.scroll = scroll;
+            }
+        } else if self.markdown_preview.as_ref().is_some_and(|md| md.notebook) {
             let scroll = self
                 .markdown_preview
                 .as_ref()
@@ -4256,6 +4335,7 @@ impl Editor {
             wrap_key: (0, 0),
             last_area: Rect::default(),
             notebook: false,
+            doc_path: None,
         });
         true
     }
@@ -4291,6 +4371,7 @@ impl Editor {
             wrap_key: (0, 0),
             last_area: Rect::default(),
             notebook: true,
+            doc_path: None,
         });
         true
     }

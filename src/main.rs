@@ -7,6 +7,7 @@ mod collab;
 mod collab_agent;
 mod command_history;
 mod dap;
+mod docx;
 mod file_ref;
 mod ghostty;
 mod git;

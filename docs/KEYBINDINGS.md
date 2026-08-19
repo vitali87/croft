@@ -364,6 +364,10 @@ Binary files open here automatically instead of erroring; the file is read in wi
 | `E` | Extract the selected member to a folder you pick |
 | Click a member | Select it; a second click opens it |
 
+**Word documents (`.docx`, `.odt`)**
+
+Open as a rendered read-only document: headings, emphasis, lists, tables, and embedded pictures. `File: Reopen as Text` moves on to the underlying container (archive browser / hex).
+
 **Jupyter notebooks (`.ipynb`)**
 
 Open as a rendered document (markdown cells, highlighted code with `In [n]` frames, outputs incl. inline images). `File: Reopen as Text` shows the raw JSON and sticks for the tab; `File: Reopen as Preview` returns to the render.
