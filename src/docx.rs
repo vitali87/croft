@@ -17,10 +17,31 @@ pub fn extension_is_doc(ext: &str) -> bool {
     matches!(ext.to_ascii_lowercase().as_str(), "docx" | "odt")
 }
 
+/// Escape markdown metacharacters in document text (#200 review): the
+/// walker SYNTHESISES markdown, so literal #, -, *, _, |, etc. in the
+/// document must not become structure.
+fn md_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(
+            c,
+            '\\' | '`' | '*' | '_' | '#' | '|' | '[' | ']' | '<' | '>' | '~'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn read_member(z: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<String> {
+    // Cap the DECOMPRESSED bytes (#200 review): the on-disk cap says
+    // nothing about what a crafted member inflates to.
     let mut s = String::new();
-    z.by_name(name).ok()?.read_to_string(&mut s).ok()?;
-    Some(s)
+    let member = z.by_name(name).ok()?;
+    let mut limited = member.take(MAX_DOC_BYTES + 1);
+    limited.read_to_string(&mut s).ok()?;
+    (s.len() as u64 <= MAX_DOC_BYTES).then_some(s)
 }
 
 /// Extract an embedded image into `scratch` (hash-named) and return
@@ -31,7 +52,12 @@ fn extract_image(
     scratch: &Path,
 ) -> Option<PathBuf> {
     let mut bytes = Vec::new();
-    z.by_name(member).ok()?.read_to_end(&mut bytes).ok()?;
+    let m = z.by_name(member).ok()?;
+    let mut limited = m.take(MAX_DOC_BYTES + 1);
+    limited.read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_DOC_BYTES {
+        return None;
+    }
     image::load_from_memory(&bytes).ok()?;
     use std::hash::{Hash as _, Hasher as _};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -229,6 +255,7 @@ fn docx_to_md(
             },
             Event::Text(t) => {
                 if let Ok(text) = t.xml_content() {
+                    let text = md_escape(&text);
                     let styled = if bold && italic {
                         format!("***{text}***")
                     } else if bold {
@@ -236,7 +263,7 @@ fn docx_to_md(
                     } else if italic {
                         format!("*{text}*")
                     } else {
-                        text.into_owned()
+                        text
                     };
                     para.push_str(&styled);
                 }
@@ -270,7 +297,7 @@ fn odt_to_md(xml: &str, z: &mut zip::ZipArchive<std::fs::File>, scratch: &Path) 
                     para.clear();
                 }
                 b"p" => para.clear(),
-                b"list" => list_depth += 1,
+                b"list" if matches!(&ev, Event::Start(_)) => list_depth += 1,
                 b"image" => {
                     for a in e.attributes().flatten() {
                         if a.key.local_name().as_ref() == b"href"
@@ -309,7 +336,7 @@ fn odt_to_md(xml: &str, z: &mut zip::ZipArchive<std::fs::File>, scratch: &Path) 
             },
             Event::Text(t) => {
                 if let Ok(text) = t.xml_content() {
-                    para.push_str(&text);
+                    para.push_str(&md_escape(&text));
                 }
             }
             Event::Eof => break,
@@ -382,6 +409,28 @@ mod tests {
         assert!(md.contains("## Sub Head"), "{md}");
         assert!(md.contains("body words"), "{md}");
         assert!(md.contains("- li"), "{md}");
+    }
+
+    #[test]
+    fn literal_metacharacters_stay_text_not_structure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("d.docx");
+        let f = std::fs::File::create(&p).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let o = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.start_file("word/document.xml", o).unwrap();
+        z.write_all(
+            br#"<w:document xmlns:w="x"><w:body>
+<w:p><w:r><w:t># not a heading</w:t></w:r></w:p>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:t>a|b</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+</w:body></w:document>"#,
+        )
+        .unwrap();
+        z.finish().unwrap();
+        let md = to_markdown(&p, tmp.path()).unwrap();
+        assert!(md.contains("\\# not a heading"), "{md}");
+        assert!(md.contains("a\\|b"), "pipes stay inside the cell: {md}");
     }
 
     #[test]

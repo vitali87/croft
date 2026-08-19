@@ -203,6 +203,14 @@ fn docx_opens_as_a_rendered_document() {
         .collect();
     assert!(all.contains("Memo Title"), "{all}");
     assert!(all.contains("memo body"));
+    // #200 review: the text side is a stub - a save must refuse at the
+    // choke point (#185 class), leaving the document untouched.
+    let before = std::fs::read(&p).unwrap();
+    assert!(
+        app.editor.save_to_disk().is_err(),
+        "doc preview save refuses"
+    );
+    assert_eq!(std::fs::read(&p).unwrap(), before, "document intact");
 }
 
 #[test]

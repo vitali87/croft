@@ -3652,6 +3652,13 @@ impl Editor {
             || self.image.is_some()
             || self.hex.is_some()
             || self.archive.is_some()
+            // A docx/odt preview's text side is a STUB (#200 review):
+            // letting a save through would overwrite the document with
+            // the placeholder, the exact #185 class.
+            || self
+                .markdown_preview
+                .as_ref()
+                .is_some_and(|md| md.doc_path.is_some())
     }
 
     /// Open `path` in the read-only hex viewer (#172): the routing
