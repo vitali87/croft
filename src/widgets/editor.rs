@@ -304,7 +304,7 @@ fn render_hex(
             } else if byte_dim {
                 dim
             } else {
-                Style::default().fg(Color::Gray).bg(bg)
+                Style::default().fg(theme.ui(Color::Gray)).bg(bg)
             };
             let (hex_style, ascii_style) = if is_cursor {
                 if view.ascii_focus {
@@ -326,7 +326,7 @@ fn render_hex(
         &status,
         inner.width as usize,
         Style::default()
-            .fg(Color::Gray)
+            .fg(theme.ui(Color::Gray))
             .bg(theme.ui(Color::Rgb(0x07, 0x33, 0x55))),
     );
 }
@@ -404,7 +404,7 @@ fn render_archive(
         } else if entry.dir {
             Style::default().fg(Color::DarkGray).bg(bg)
         } else {
-            Style::default().fg(Color::Gray).bg(bg)
+            Style::default().fg(theme.ui(Color::Gray)).bg(bg)
         };
         let name_w = (inner.width as usize).saturating_sub(size.len() + 3);
         let line = format!(" {marker}{:<name_w$}{size}", entry.path, name_w = name_w);
@@ -417,7 +417,7 @@ fn render_archive(
         hint,
         inner.width as usize,
         Style::default()
-            .fg(Color::Gray)
+            .fg(theme.ui(Color::Gray))
             .bg(theme.ui(Color::Rgb(0x07, 0x33, 0x55))),
     );
 }
@@ -625,7 +625,7 @@ fn render_sheet(
         status_y,
         &status,
         Style::default()
-            .fg(Color::Gray)
+            .fg(theme.ui(Color::Gray))
             .bg(theme.ui(Color::Rgb(0x14, 0x18, 0x22))),
     );
 }
@@ -1000,7 +1000,7 @@ fn render_diff(
         status_y,
         &status,
         Style::default()
-            .fg(Color::Gray)
+            .fg(theme.ui(Color::Gray))
             .bg(theme.ui(Color::Rgb(0x14, 0x18, 0x22))),
     );
     (prev_arrow, next_arrow)
@@ -1298,7 +1298,7 @@ fn render_unified_deletion(
         status_y,
         &status,
         Style::default()
-            .fg(Color::Gray)
+            .fg(theme.ui(Color::Gray))
             .bg(theme.ui(Color::Rgb(0x14, 0x18, 0x22))),
     );
     (prev_arrow, next_arrow)
@@ -9276,7 +9276,7 @@ impl Widget for &mut Editor {
             if (!wrap || row_start == 0) && self.is_foldable(line_idx) {
                 let collapsed = self.folded.contains(&line_idx);
                 let (glyph, color) = if collapsed {
-                    ("▸", Color::Gray)
+                    ("▸", self.theme.ui(Color::Gray))
                 } else {
                     ("▾", Color::DarkGray)
                 };
@@ -11672,7 +11672,7 @@ impl Widget for &mut EditorTabs {
                 // Symbol crumbs (clickable) read brighter than the informational
                 // path crumbs, mirroring VS Code's active/inactive breadcrumbs.
                 let fg = if crumb.target.is_some() {
-                    Color::Gray
+                    self.theme.ui(Color::Gray)
                 } else {
                     Color::DarkGray
                 };

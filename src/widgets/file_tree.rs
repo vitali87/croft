@@ -1337,7 +1337,7 @@ impl Widget for &mut FileTree {
             Span::styled(
                 " EXPLORER ",
                 Style::default()
-                    .fg(Color::White)
+                    .fg(self.theme.ui(Color::White))
                     .bg(self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e)))
                     .add_modifier(Modifier::BOLD),
             )
@@ -1455,7 +1455,7 @@ impl Widget for &mut FileTree {
             let name_fg = if self.is_ignored(&node.path) {
                 self.theme.ignored_fg()
             } else {
-                Color::White
+                self.theme.ui(Color::White)
             };
 
             if node.is_dir {
@@ -1471,11 +1471,11 @@ impl Widget for &mut FileTree {
                 };
                 spans.push(Span::styled(
                     format!("{chev} "),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(self.theme.ui(Color::Gray)),
                 ));
                 spans.push(Span::styled(
                     format!("{} ", icon.glyph),
-                    Style::default().fg(icon.color),
+                    Style::default().fg(self.theme.ui(icon.color)),
                 ));
                 let base = Style::default().fg(name_fg).add_modifier(Modifier::BOLD);
                 push_name_spans(&mut spans, &name, &query, base, self.theme);
@@ -1489,7 +1489,7 @@ impl Widget for &mut FileTree {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     format!("{} ", icon.glyph),
-                    Style::default().fg(icon.color),
+                    Style::default().fg(self.theme.ui(icon.color)),
                 ));
                 push_name_spans(
                     &mut spans,
@@ -1622,17 +1622,19 @@ impl Widget for &mut FileTree {
                 let name_fg = if self.is_ignored(&node.path) {
                     self.theme.ignored_fg()
                 } else {
-                    Color::White
+                    self.theme.ui(Color::White)
                 };
                 let spans = vec![
                     Span::raw("  ".repeat(node.depth)),
                     Span::styled(
                         format!("{} ", icons::CHEVRON_OPEN),
-                        Style::default().fg(Color::Gray).bg(bg),
+                        Style::default().fg(self.theme.ui(Color::Gray)).bg(bg),
                     ),
                     Span::styled(
                         format!("{} ", icons::FOLDER_OPEN.glyph),
-                        Style::default().fg(icons::FOLDER_OPEN.color).bg(bg),
+                        Style::default()
+                            .fg(self.theme.ui(icons::FOLDER_OPEN.color))
+                            .bg(bg),
                     ),
                     Span::styled(
                         name,

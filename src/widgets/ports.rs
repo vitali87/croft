@@ -320,7 +320,7 @@ impl Widget for &mut PortsPanel {
         let accent = if self.focus_gradient {
             crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
         } else {
-            Color::White
+            self.theme.ui(Color::White)
         };
         let orange = crate::gradient::rgb_color(crate::gradient::GRAD_TR);
         buf.set_style(area, Style::default().bg(self.theme.editor_bg()));

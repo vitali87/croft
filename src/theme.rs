@@ -336,6 +336,7 @@ impl Theme {
                 Color::Yellow | Color::LightYellow => Color::Rgb(0xbf, 0x88, 0x03),
                 Color::Green | Color::LightGreen => Color::Rgb(0x10, 0x7c, 0x10),
                 Color::Cyan | Color::LightCyan => Color::Rgb(0x05, 0x98, 0xbc),
+                Color::Gray => Color::Rgb(0x61, 0x61, 0x61),
                 other => other,
             };
         };

@@ -273,7 +273,10 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
         inner.x,
         inner.y,
         &Line::from(vec![
-            Span::styled(format!("{chevron} "), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{chevron} "),
+                Style::default().fg(panel.theme.ui(Color::Gray)),
+            ),
             Span::styled("SSH", header_style),
         ]),
         inner.width,
@@ -336,7 +339,7 @@ fn render_filter_row(buf: &mut Buffer, area: Rect, filter: &str, theme: crate::t
         .fg(theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
         .add_modifier(Modifier::ITALIC);
     let val_style = Style::default()
-        .fg(Color::White)
+        .fg(theme.ui(Color::White))
         .add_modifier(Modifier::BOLD);
     let prefix = "filter: ";
     buf.set_string(area.x, area.y, prefix, label_style);
@@ -409,7 +412,7 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
             y,
             title,
             Style::default()
-                .fg(Color::White)
+                .fg(panel.theme.ui(Color::White))
                 .add_modifier(Modifier::BOLD),
         );
         y += 2;
@@ -764,7 +767,7 @@ impl Widget for &mut RemotePanel {
                 Span::styled(
                     target.alias.as_str(),
                     Style::default()
-                        .fg(Color::White)
+                        .fg(self.theme.ui(Color::White))
                         .add_modifier(Modifier::BOLD),
                 ),
             ];

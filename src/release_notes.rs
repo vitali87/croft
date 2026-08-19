@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Reopen Closed Editor: Cmd+K Shift+W (or the Command Palette) brings back the most recently closed editor tab with its pin state, cursor, and scroll, walking back through the last 20 closes.",
+    kind: NoteKind::Fix,
+    summary: "The light theme is now legible everywhere: Explorer file names, panel headers, dialog text, menus, the status-bar and welcome wordmarks, the version badge, and the release card all render dark-on-light instead of keeping their dark-theme whites and pale accents.",
 }];

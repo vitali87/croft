@@ -138,7 +138,7 @@ impl Widget for &mut CapturesPanel {
         let accent = if self.focus_gradient {
             crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
         } else {
-            Color::White
+            self.theme.ui(Color::White)
         };
         buf.set_style(area, Style::default().bg(self.theme.editor_bg()));
 

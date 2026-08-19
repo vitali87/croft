@@ -302,7 +302,7 @@ impl Widget for &mut OpenEditorsPanel {
             };
             let name_style = if item.active {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(self.theme.ui(Color::White))
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(self.theme.ui(COLOR_NAME))
