@@ -2117,6 +2117,10 @@ pub struct Editor {
     /// When the buffer last changed, driving the auto-save delay. `None`
     /// until the first edit.
     pub last_edit_at: Option<std::time::Instant>,
+    /// The caret position of the last buffer edit, for "Go to Last Edit
+    /// Location" (Cmd+K Cmd+Q). Set beside `last_edit_at` in
+    /// `mark_buffer_changed`.
+    pub last_edit_pos: Option<(usize, usize)>,
 }
 
 impl Editor {
@@ -2228,6 +2232,7 @@ impl Editor {
             encoding_loss: false,
             lossy_save_armed: false,
             last_edit_at: None,
+            last_edit_pos: None,
         }
     }
 
@@ -2435,6 +2440,7 @@ impl Editor {
     fn mark_buffer_changed(&mut self) {
         self.dirty = true;
         self.last_edit_at = Some(std::time::Instant::now());
+        self.last_edit_pos = Some((self.cursor_row, self.cursor_col));
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
