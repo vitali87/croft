@@ -401,6 +401,12 @@ impl Theme {
             (0x8c, 0xc2, 0x65) => (0x10, 0x7c, 0x10),
             (0xe7, 0x70, 0x70) => (0xc4, 0x2b, 0x1f),
             (0xf1, 0x4c, 0x4c) => (0xcd, 0x31, 0x31),
+            // Fills that carry BLACK text (the editor block cursor, the
+            // active search-match band): they must stay light so the black
+            // glyph keeps its contrast, not be darkened as if they were
+            // foregrounds (review round 1).
+            (0xae, 0xc6, 0xff) => (0xad, 0xd6, 0xff),
+            (0xff, 0x8c, 0x2a) => (0xff, 0x8c, 0x2a),
             other => light_fallback(other),
         };
         rgb(mapped)
@@ -428,6 +434,18 @@ impl Theme {
     /// badge's inline-image canvas (VS Code `activityBarBadge.background`).
     pub fn accent_rgb(self) -> (u8, u8, u8) {
         self.accent
+    }
+
+    /// The text color that keeps contrast ON an accent-filled cell (the
+    /// hex/sheet/archive cursors paint their glyph over `accent()`). Every
+    /// built-in dark theme has a light accent, so black text is unchanged
+    /// there; a dark accent (Croft Light's #005fb8) flips to white.
+    pub fn accent_contrast_fg(self) -> Color {
+        if luma(self.accent) < 128.0 {
+            Color::White
+        } else {
+            Color::Black
+        }
     }
 
     /// Selected-row fill in lists/popups.
@@ -997,6 +1015,19 @@ mod tests {
         // a dark fill lightens to near-white.
         assert!(luma(l.ui(Color::Rgb(0xab, 0xcd, 0xef))) < 128.0);
         assert!(luma(l.ui(Color::Rgb(0x10, 0x20, 0x30))) > 200.0);
+        // Fills that carry black text (block cursor, active search match)
+        // must stay LIGHT rather than be darkened as foregrounds.
+        assert!(luma(l.ui(Color::Rgb(0xae, 0xc6, 0xff))) > 150.0);
+        assert!(luma(l.ui(Color::Rgb(0xff, 0x8c, 0x2a))) > 150.0);
+    }
+
+    #[test]
+    fn accent_contrast_fg_flips_only_on_dark_accents() {
+        // Built-in dark themes have light accents: black text, unchanged.
+        assert_eq!(Theme::BLACK.accent_contrast_fg(), Color::Black);
+        assert_eq!(Theme::DARK_BLUE.accent_contrast_fg(), Color::Black);
+        // Croft Light's #005fb8 accent is dark: white text keeps contrast.
+        assert_eq!(Theme::from_id("light").accent_contrast_fg(), Color::White);
     }
 
     #[test]

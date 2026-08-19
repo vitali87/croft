@@ -289,7 +289,9 @@ fn render_hex(
             // The focused pane's cursor is the accent block; its mirror
             // in the other pane is a dim block so the pairing stays
             // visible without stealing focus.
-            let cursor_style = Style::default().fg(Color::Black).bg(theme.accent());
+            let cursor_style = Style::default()
+                .fg(theme.accent_contrast_fg())
+                .bg(theme.accent());
             let mirror_style = Style::default().fg(Color::White).bg(Color::DarkGray);
             let edited_style = Style::default()
                 .fg(theme.ui(Color::Rgb(0xe0, 0x9a, 0x4e)))
@@ -396,7 +398,9 @@ fn render_archive(
             format!("{} ", entry.size)
         };
         let style = if idx == view.selected {
-            Style::default().fg(Color::Black).bg(theme.accent())
+            Style::default()
+                .fg(theme.accent_contrast_fg())
+                .bg(theme.accent())
         } else if entry.dir {
             Style::default().fg(Color::DarkGray).bg(bg)
         } else {
@@ -573,7 +577,9 @@ fn render_sheet(
                         .map(|(i, _)| i)
                         .unwrap_or(0);
                     let shown = &edit.value[start..];
-                    let edit_style = Style::default().fg(Color::Black).bg(theme.accent());
+                    let edit_style = Style::default()
+                        .fg(theme.accent_contrast_fg())
+                        .bg(theme.accent());
                     write_cell(buf, body_x + *x_off, y, w, shown, edit_style);
                     let caret_cells = shown[..edit.cursor - start].chars().count() as u16;
                     let cx = body_x + *x_off + caret_cells.min(w.saturating_sub(1));
@@ -585,7 +591,7 @@ fn render_sheet(
                     );
                 } else {
                     let cursor_style = Style::default()
-                        .fg(Color::Black)
+                        .fg(theme.accent_contrast_fg())
                         .bg(theme.accent())
                         .add_modifier(Modifier::BOLD);
                     write_cell(buf, body_x + *x_off, y, w, cell_text, cursor_style);
