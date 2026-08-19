@@ -53,6 +53,20 @@ impl ProcessPicker {
     pub fn selected_target(&self) -> Option<&PyTarget> {
         self.targets.get(self.selected)
     }
+
+    /// The target index at screen row `y`, if `y` lands on a visible row.
+    /// Unlike the query-line pickers this popup has no prompt or separator:
+    /// the list body starts one row below `last_rect.y` (just the top
+    /// border) and runs `last_inner_height` rows, in lock-step with
+    /// [`render_process_picker`]. Used to map a mouse click to a row.
+    pub fn row_index_at(&self, y: u16) -> Option<usize> {
+        let list_top = self.last_rect.y.saturating_add(1);
+        if y < list_top || y - list_top >= self.last_inner_height {
+            return None;
+        }
+        let idx = self.scroll + (y - list_top) as usize;
+        (idx < self.targets.len()).then_some(idx)
+    }
 }
 
 pub fn render_process_picker(
@@ -175,5 +189,31 @@ mod tests {
     fn empty_picker_has_no_selection() {
         let p = ProcessPicker::new(vec![]);
         assert_eq!(p.selected_target(), None);
+    }
+
+    /// This popup has no prompt or separator, so its click hit-test starts
+    /// one row below the popup top (the border), not three like the
+    /// query-line pickers. Rows outside the body (borders, or below the
+    /// last target) map to nothing.
+    #[test]
+    fn row_index_at_maps_the_borderless_list_geometry() {
+        let mut p = ProcessPicker::new(vec![target(1), target(2), target(3)]);
+        p.last_rect = Rect {
+            x: 10,
+            y: 5,
+            width: 40,
+            height: 8,
+        };
+        p.last_inner_height = 6;
+        assert_eq!(p.row_index_at(5), None, "top border is not a row");
+        assert_eq!(
+            p.row_index_at(6),
+            Some(0),
+            "first row sits under the border"
+        );
+        assert_eq!(p.row_index_at(8), Some(2));
+        assert_eq!(p.row_index_at(9), None, "below the last target is empty");
+        p.scroll = 1;
+        assert_eq!(p.row_index_at(6), Some(1), "scroll offsets the mapping");
     }
 }

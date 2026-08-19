@@ -23702,27 +23702,7 @@ impl App {
             (KeyCode::Esc, _) => {
                 self.close_file_finder();
             }
-            (KeyCode::Enter, _) => {
-                let path = finder.selected_entry().map(|e| e.path.clone());
-                if let Some(path) = path {
-                    self.close_file_finder();
-                    match self.editor.open_preview(&path) {
-                        Ok(()) => {
-                            self.sync_open_file_poll_mtime();
-                            // VS Code's `explorer.autoReveal` analogue:
-                            // expand every parent dir of the picked file
-                            // and park the cursor on its row so the user
-                            // sees where in the workspace the file lives.
-                            self.tree.reveal_path(&path);
-                            self.focus_pane(Pane::Editor);
-                            self.status = format!("Opened {}", self.status_path(&path));
-                        }
-                        Err(e) => {
-                            self.status = format!("Open failed: {e}");
-                        }
-                    }
-                }
-            }
+            (KeyCode::Enter, _) => self.open_file_finder_selection(),
             (KeyCode::Up, _) => finder.select_prev(),
             (KeyCode::Down, _) => finder.select_next(),
             (KeyCode::PageUp, _) => {
@@ -23759,6 +23739,33 @@ impl App {
         }
     }
 
+    /// Open the highlighted result and dismiss the finder: Enter's action,
+    /// shared with a mouse click on a result row.
+    fn open_file_finder_selection(&mut self) {
+        let Some(finder) = self.file_finder.as_ref() else {
+            return;
+        };
+        let path = finder.selected_entry().map(|e| e.path.clone());
+        if let Some(path) = path {
+            self.close_file_finder();
+            match self.editor.open_preview(&path) {
+                Ok(()) => {
+                    self.sync_open_file_poll_mtime();
+                    // VS Code's `explorer.autoReveal` analogue:
+                    // expand every parent dir of the picked file
+                    // and park the cursor on its row so the user
+                    // sees where in the workspace the file lives.
+                    self.tree.reveal_path(&path);
+                    self.focus_pane(Pane::Editor);
+                    self.status = format!("Opened {}", self.status_path(&path));
+                }
+                Err(e) => {
+                    self.status = format!("Open failed: {e}");
+                }
+            }
+        }
+    }
+
     fn handle_file_finder_mouse(&mut self, m: MouseEvent) {
         let Some(finder) = self.file_finder.as_mut() else {
             return;
@@ -23779,6 +23786,13 @@ impl App {
                 if !inside =>
             {
                 self.close_file_finder();
+            }
+            // Click a row to open it, the way VS Code's quick-pick behaves.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = finder.row_index_at(m.row) {
+                    finder.selected = idx;
+                    self.open_file_finder_selection();
+                }
             }
             _ => {}
         }
@@ -23848,13 +23862,7 @@ impl App {
         };
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_command_palette(),
-            (KeyCode::Enter, _) => {
-                let item = palette.selected_item();
-                self.close_command_palette();
-                if let Some(item) = item {
-                    self.run_palette_item(item);
-                }
-            }
+            (KeyCode::Enter, _) => self.run_command_palette_selection(),
             (KeyCode::Up, _) => palette.select_prev(),
             (KeyCode::Down, _) => palette.select_next(),
             (KeyCode::PageUp, _) => {
@@ -23880,6 +23888,19 @@ impl App {
         }
     }
 
+    /// Run the highlighted command and dismiss the palette: Enter's action,
+    /// shared with a mouse click on a result row.
+    fn run_command_palette_selection(&mut self) {
+        let Some(palette) = self.command_palette.as_ref() else {
+            return;
+        };
+        let item = palette.selected_item();
+        self.close_command_palette();
+        if let Some(item) = item {
+            self.run_palette_item(item);
+        }
+    }
+
     fn handle_command_palette_mouse(&mut self, m: MouseEvent) {
         let Some(palette) = self.command_palette.as_mut() else {
             return;
@@ -23900,6 +23921,13 @@ impl App {
                 if !inside =>
             {
                 self.close_command_palette();
+            }
+            // Click a row to run it, the way VS Code's quick-pick behaves.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = palette.row_index_at(m.row) {
+                    palette.selected = idx;
+                    self.run_command_palette_selection();
+                }
             }
             _ => {}
         }
@@ -23962,16 +23990,16 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_go_to_symbol(),
             (KeyCode::Enter, _) => {
-                // Resolve the target before closing (close drops the picker).
-                let target = if picker.is_line_mode() {
-                    picker.line_target().map(|n| (n as u32 - 1, 0))
+                if picker.is_line_mode() {
+                    // Resolve the target before closing (close drops the picker).
+                    let target = picker.line_target().map(|n| (n as u32 - 1, 0));
+                    let path = picker.path.clone();
+                    self.close_go_to_symbol();
+                    if let Some((line, col)) = target {
+                        self.go_to_definition(path, line, col);
+                    }
                 } else {
-                    picker.selected_target()
-                };
-                let path = picker.path.clone();
-                self.close_go_to_symbol();
-                if let Some((line, col)) = target {
-                    self.go_to_definition(path, line, col);
+                    self.jump_to_go_to_symbol_selection();
                 }
             }
             (KeyCode::Up, _) => picker.select_prev(),
@@ -23999,6 +24027,23 @@ impl App {
         }
     }
 
+    /// Jump to the highlighted symbol and dismiss the picker: Enter's action
+    /// outside line mode, shared with a mouse click on a result row (a click
+    /// names a concrete row, so it always means the symbol, never a `:N`
+    /// line query).
+    fn jump_to_go_to_symbol_selection(&mut self) {
+        let Some(picker) = self.go_to_symbol.as_ref() else {
+            return;
+        };
+        // Resolve the target before closing (close drops the picker).
+        let target = picker.selected_target();
+        let path = picker.path.clone();
+        self.close_go_to_symbol();
+        if let Some((line, col)) = target {
+            self.go_to_definition(path, line, col);
+        }
+    }
+
     fn handle_go_to_symbol_mouse(&mut self, m: MouseEvent) {
         let Some(picker) = self.go_to_symbol.as_mut() else {
             return;
@@ -24019,6 +24064,13 @@ impl App {
                 if !inside =>
             {
                 self.close_go_to_symbol();
+            }
+            // Click a row to jump to it, the way VS Code's quick-pick behaves.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = picker.row_index_at(m.row) {
+                    picker.selected = idx;
+                    self.jump_to_go_to_symbol_selection();
+                }
             }
             _ => {}
         }
@@ -24169,15 +24221,7 @@ impl App {
         };
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_workspace_symbols(),
-            (KeyCode::Enter, _) => {
-                let target = picker
-                    .selected_item()
-                    .map(|i| (i.path.clone(), i.line, i.character));
-                self.close_workspace_symbols();
-                if let Some((path, line, character)) = target {
-                    self.go_to_definition(path, line, character);
-                }
-            }
+            (KeyCode::Enter, _) => self.jump_to_workspace_symbol_selection(),
             (KeyCode::Up, _) => picker.select_prev(),
             (KeyCode::Down, _) => picker.select_next(),
             (KeyCode::PageUp, _) => {
@@ -24210,6 +24254,21 @@ impl App {
         }
     }
 
+    /// Jump to the highlighted workspace symbol and dismiss the picker:
+    /// Enter's action, shared with a mouse click on a result row.
+    fn jump_to_workspace_symbol_selection(&mut self) {
+        let Some(picker) = self.workspace_symbols.as_ref() else {
+            return;
+        };
+        let target = picker
+            .selected_item()
+            .map(|i| (i.path.clone(), i.line, i.character));
+        self.close_workspace_symbols();
+        if let Some((path, line, character)) = target {
+            self.go_to_definition(path, line, character);
+        }
+    }
+
     fn handle_workspace_symbols_mouse(&mut self, m: MouseEvent) {
         let Some(picker) = self.workspace_symbols.as_mut() else {
             return;
@@ -24230,6 +24289,13 @@ impl App {
                 if !inside =>
             {
                 self.close_workspace_symbols();
+            }
+            // Click a row to jump to it, the way VS Code's quick-pick behaves.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = picker.row_index_at(m.row) {
+                    picker.selected = idx;
+                    self.jump_to_workspace_symbol_selection();
+                }
             }
             _ => {}
         }
@@ -24294,13 +24360,7 @@ impl App {
         };
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_process_picker(),
-            (KeyCode::Enter, _) => {
-                let target = picker.selected_target().cloned();
-                self.close_process_picker();
-                if let Some(target) = target {
-                    self.attach_to_python_target(target);
-                }
-            }
+            (KeyCode::Enter, _) => self.attach_process_picker_selection(),
             (KeyCode::Up, _) => picker.select_prev(),
             (KeyCode::Down, _) => picker.select_next(),
             (KeyCode::PageUp, _) => {
@@ -24314,6 +24374,19 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Attach to the highlighted process and dismiss the picker: Enter's
+    /// action, shared with a mouse click on a result row.
+    fn attach_process_picker_selection(&mut self) {
+        let Some(picker) = self.process_picker.as_ref() else {
+            return;
+        };
+        let target = picker.selected_target().cloned();
+        self.close_process_picker();
+        if let Some(target) = target {
+            self.attach_to_python_target(target);
         }
     }
 
@@ -24337,6 +24410,13 @@ impl App {
                 if !inside =>
             {
                 self.close_process_picker();
+            }
+            // Click a row to attach to it, the way VS Code's quick-pick behaves.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = picker.row_index_at(m.row) {
+                    picker.selected = idx;
+                    self.attach_process_picker_selection();
+                }
             }
             _ => {}
         }
@@ -25054,18 +25134,7 @@ impl App {
             (KeyCode::Esc, _) => {
                 self.close_zoxide_jump();
             }
-            (KeyCode::Enter, _) => {
-                let path = jump.selected_path().map(|p| p.to_path_buf());
-                if let Some(path) = path {
-                    let add = self.zoxide_add_folder;
-                    self.close_zoxide_jump();
-                    if add {
-                        self.add_workspace_folder(path);
-                    } else {
-                        self.change_workspace_root(path);
-                    }
-                }
-            }
+            (KeyCode::Enter, _) => self.apply_zoxide_jump_selection(),
             (KeyCode::Up, _) => jump.select_prev(),
             (KeyCode::Down, _) => jump.select_next(),
             (KeyCode::PageUp, _) => {
@@ -25098,6 +25167,24 @@ impl App {
         }
     }
 
+    /// Jump to (or add) the highlighted directory and dismiss the popup:
+    /// Enter's action, shared with a mouse click on a result row.
+    fn apply_zoxide_jump_selection(&mut self) {
+        let Some(jump) = self.zoxide_jump.as_ref() else {
+            return;
+        };
+        let path = jump.selected_path().map(|p| p.to_path_buf());
+        if let Some(path) = path {
+            let add = self.zoxide_add_folder;
+            self.close_zoxide_jump();
+            if add {
+                self.add_workspace_folder(path);
+            } else {
+                self.change_workspace_root(path);
+            }
+        }
+    }
+
     fn handle_zoxide_jump_mouse(&mut self, m: MouseEvent) {
         let Some(jump) = self.zoxide_jump.as_mut() else {
             return;
@@ -25118,6 +25205,13 @@ impl App {
                 if !inside =>
             {
                 self.close_zoxide_jump();
+            }
+            // Click a row to jump to it, the way VS Code's quick-pick behaves.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = jump.row_index_at(m.row) {
+                    jump.selected = idx;
+                    self.apply_zoxide_jump_selection();
+                }
             }
             _ => {}
         }
@@ -25297,6 +25391,13 @@ impl App {
                 if !inside =>
             {
                 self.close_branch_picker();
+            }
+            // Click a row to act on it, the way VS Code's quick-pick behaves.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = picker.row_index_at(m.row) {
+                    picker.selected = idx;
+                    self.apply_branch_picker_selection();
+                }
             }
             _ => {}
         }

@@ -11316,6 +11316,154 @@ fn esc_closes_the_file_finder_modal() {
     );
 }
 
+/// Issue #205: Cmd+P search results must be mouse clickable. A left click on
+/// a result row confirms that row (the way VS Code's quick-pick behaves):
+/// it opens the clicked file, not the keyboard-selected one, and dismisses
+/// the finder.
+#[test]
+fn clicking_a_file_finder_row_opens_that_file() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+    std::fs::write(tmp.path().join("beta.rs"), "").unwrap();
+    std::fs::write(tmp.path().join("gamma.rs"), "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+        .unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let finder = app.file_finder.as_ref().unwrap();
+    assert!(
+        finder.results.len() >= 3,
+        "the three seeded files must all be indexed"
+    );
+    // The list body starts three rows below the popup top (border, prompt,
+    // separator). Row 1 of the list is the SECOND result - clicking it must
+    // open that entry, not the keyboard selection parked on row 0.
+    let col = finder.last_rect.x + 4;
+    let row = finder.last_rect.y + 3 + 1;
+    let expected = finder.results[1].entry.path.clone();
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.file_finder.is_none(),
+        "a click on a result row must confirm the pick and dismiss the finder"
+    );
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(expected.as_path()),
+        "the clicked row's file must be the one that opens"
+    );
+}
+
+/// A click inside the popup but off the result rows (the query prompt line)
+/// must neither open a file nor dismiss the finder - only clicks OUTSIDE the
+/// popup close it, and only clicks ON a row confirm it.
+#[test]
+fn clicking_the_file_finder_prompt_line_is_inert() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+        .unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let finder = app.file_finder.as_ref().unwrap();
+    let col = finder.last_rect.x + 4;
+    let prompt_row = finder.last_rect.y + 1;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        col,
+        prompt_row,
+    ));
+    assert!(
+        app.file_finder.is_some(),
+        "a click on the query line must not dismiss the finder"
+    );
+    assert_eq!(
+        app.editor.path, None,
+        "a click on the query line must not open anything"
+    );
+}
+
+/// A click on an empty list row (inside the popup, below the last result)
+/// maps to no result and must be inert rather than opening some file or
+/// closing the popup.
+#[test]
+fn clicking_below_the_last_file_finder_result_is_inert() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+        .unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let finder = app.file_finder.as_ref().unwrap();
+    let results = finder.results.len();
+    let col = finder.last_rect.x + 4;
+    // One row past the last result, still inside the popup body.
+    let row = finder.last_rect.y + 3 + results as u16;
+    assert!(
+        row < finder.last_rect.y + finder.last_rect.height - 1,
+        "the empty row must land inside the popup for this test to mean anything"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.file_finder.is_some(),
+        "a click on an empty list row must not dismiss the finder"
+    );
+    assert_eq!(
+        app.editor.path, None,
+        "a click on an empty list row must not open anything"
+    );
+}
+
+/// The command palette shares the quick-pick anatomy, so its rows must be
+/// clickable too: a left click on a result row runs that command and
+/// dismisses the palette.
+#[test]
+fn clicking_a_command_palette_row_runs_that_command() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(
+        app.command_palette.is_some(),
+        "Cmd+Shift+P must open the palette"
+    );
+    for c in "keyboard shortcuts reference".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let palette = app.command_palette.as_ref().unwrap();
+    assert!(
+        !palette.results.is_empty(),
+        "the query must keep the Help: Keyboard Shortcuts Reference command"
+    );
+    let col = palette.last_rect.x + 4;
+    let row = palette.last_rect.y + 3;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.command_palette.is_none(),
+        "a click on a palette row must run the command and dismiss the palette"
+    );
+    assert!(
+        app.shortcuts_modal.is_some(),
+        "the clicked command (Help: Keyboard Shortcuts Reference) must actually run"
+    );
+}
+
 #[test]
 fn typing_in_file_finder_fuzzy_filters_the_result_list() {
     let tmp = tempfile::tempdir().unwrap();

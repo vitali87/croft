@@ -154,11 +154,12 @@ impl ListPicker {
 
     /// The matched-row index at screen row `y`, if `y` lands on a visible row.
     /// The list body starts two rows below `last_rect.y` (the top border, then
-    /// the prompt row), so the renderer and this stay in lock-step. Used to map
-    /// a mouse click to a selectable row.
+    /// the prompt row) and ends above the bottom border, so the renderer and
+    /// this stay in lock-step. Used to map a mouse click to a selectable row.
     pub fn row_index_at(&self, y: u16) -> Option<usize> {
         let list_top = self.last_rect.y.saturating_add(2);
-        if y < list_top {
+        let list_height = self.last_rect.height.saturating_sub(3);
+        if y < list_top || y - list_top >= list_height {
             return None;
         }
         let idx = self.scroll + (y - list_top) as usize;

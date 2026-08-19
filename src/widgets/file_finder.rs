@@ -180,6 +180,20 @@ impl FileFinder {
         self.results.get(self.selected).map(|r| &r.entry)
     }
 
+    /// The result index at screen row `y`, if `y` lands on a visible row.
+    /// The list body starts three rows below `last_rect.y` (top border, the
+    /// query prompt, then the separator) and runs `last_inner_height` rows,
+    /// so this stays in lock-step with [`render_file_finder`]. Used to map
+    /// a mouse click to a result row.
+    pub fn row_index_at(&self, y: u16) -> Option<usize> {
+        let list_top = self.last_rect.y.saturating_add(3);
+        if y < list_top || y - list_top >= self.last_inner_height {
+            return None;
+        }
+        let idx = self.scroll + (y - list_top) as usize;
+        (idx < self.results.len()).then_some(idx)
+    }
+
     #[cfg(test)]
     pub fn selected_index(&self) -> usize {
         self.selected
@@ -811,6 +825,42 @@ fn split_dir_file(rel: &str, filename_start: usize) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The click hit-test starts three rows below the popup top (border,
+    /// prompt, separator), scrolls with the list, refuses the bottom border
+    /// (one past `last_inner_height`), and refuses empty rows past the last
+    /// result.
+    #[test]
+    fn row_index_at_maps_the_quick_pick_list_geometry() {
+        let entry = |name: &str| FileEntry {
+            path: std::path::PathBuf::from(name),
+            rel: name.to_string(),
+            rel_lower: name.to_lowercase(),
+            filename_start: 0,
+            filename_start_lower: 0,
+        };
+        let mut f = FileFinder::new(Arc::new(vec![entry("a.rs"), entry("b.rs"), entry("c.rs")]));
+        f.last_rect = Rect {
+            x: 10,
+            y: 5,
+            width: 60,
+            height: 10,
+        };
+        // inner height 8, minus prompt and separator = 6 list rows;
+        // the popup bottom border sits at y = 14.
+        f.last_inner_height = 6;
+        assert_eq!(f.row_index_at(7), None, "the separator is not a row");
+        assert_eq!(
+            f.row_index_at(8),
+            Some(0),
+            "the list starts below the separator"
+        );
+        assert_eq!(f.row_index_at(10), Some(2));
+        assert_eq!(f.row_index_at(11), None, "below the last result is empty");
+        assert_eq!(f.row_index_at(14), None, "the bottom border is not a row");
+        f.scroll = 2;
+        assert_eq!(f.row_index_at(8), Some(2), "scroll offsets the mapping");
+    }
 
     #[test]
     fn multi_root_index_survives_root_names_whose_lowercase_changes_byte_length() {

@@ -148,6 +148,20 @@ impl SymbolPicker {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    /// The result index at screen row `y`, if `y` lands on a visible row.
+    /// The list body starts three rows below `last_rect.y` (top border, the
+    /// query prompt, then the separator) and runs `last_inner_height` rows,
+    /// so this stays in lock-step with [`render_symbol_picker`]. Used to map
+    /// a mouse click to a result row.
+    pub fn row_index_at(&self, y: u16) -> Option<usize> {
+        let list_top = self.last_rect.y.saturating_add(3);
+        if y < list_top || y - list_top >= self.last_inner_height {
+            return None;
+        }
+        let idx = self.scroll + (y - list_top) as usize;
+        (idx < self.results.len()).then_some(idx)
+    }
+
     /// Re-rank the symbol list against the query. Line mode (`:`) shows the
     /// symbols untouched (the list is irrelevant; Enter jumps to the line). An
     /// empty query lists every symbol in document order; otherwise rows are
