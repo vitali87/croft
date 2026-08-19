@@ -1956,6 +1956,20 @@ enum CopySelKind {
 /// TUI status line that is easier to miss than a native toast.
 pub const UNDO_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How many closed editor tabs Cmd+K ⇧W can walk back through.
+const CLOSED_TAB_STACK_CAP: usize = 20;
+
+/// A closed editor tab, reopenable via Cmd+K ⇧W (VS Code "Reopen Closed
+/// Editor"): the file plus the view state needed to restore the tab as the
+/// user left it. Unlike [`ClosedTerminal`] there is no live process to
+/// park, so entries never expire; the stack is just bounded.
+pub struct ClosedTab {
+    pub path: PathBuf,
+    pub pinned: bool,
+    pub cursor: (usize, usize),
+    pub scroll: usize,
+}
+
 /// A terminal pane parked by close for the undo-close grace window: the
 /// live pane, the slot it occupied (so restore puts it back where it was),
 /// and when it was closed (for expiry).
@@ -2795,6 +2809,12 @@ pub struct App {
     /// alive but hidden until Cmd+K ⇧T restores the newest or the tick reaps
     /// entries older than [`UNDO_CLOSE_GRACE`]. Newest last.
     pub closed_terminals: Vec<ClosedTerminal>,
+    /// Recently closed editor tabs (VS Code "Reopen Closed Editor"): the
+    /// path plus enough view state (pin, cursor, scroll) to restore the tab
+    /// as it was. Newest last; Cmd+K ⇧W pops. Bounded at
+    /// [`CLOSED_TAB_STACK_CAP`]; entries whose file has since vanished are
+    /// skipped at reopen time.
+    pub closed_tabs: Vec<ClosedTab>,
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
     /// the modal is closed.
     pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
@@ -3901,6 +3921,7 @@ impl App {
             show_terminal_timestamps: false,
             host_accents: compile_host_accents(&loaded_prefs.host_accents),
             closed_terminals: Vec::new(),
+            closed_tabs: Vec::new(),
             file_finder: None,
             command_palette: None,
             go_to_symbol: None,
@@ -10816,6 +10837,88 @@ impl App {
             .retain(|p| p.closed_at.elapsed() <= UNDO_CLOSE_GRACE);
     }
 
+    /// Record the focused group's tab at `idx` as reopenable (Cmd+K ⇧W).
+    /// Scratch buffers with no backing file are not recorded. Must run
+    /// BEFORE the close mutates the tab list. Tabs that merely move (into a
+    /// new window) or whose file was just trashed are deliberately never
+    /// recorded by their callers.
+    fn record_closed_tab_at(&mut self, idx: usize) {
+        let Some(ed) = self.editor.editors.get(idx) else {
+            return;
+        };
+        let Some(path) = ed.path.clone() else {
+            return;
+        };
+        self.closed_tabs.push(ClosedTab {
+            path,
+            pinned: ed.pinned,
+            cursor: (ed.cursor_row, ed.cursor_col),
+            scroll: ed.scroll,
+        });
+        if self.closed_tabs.len() > CLOSED_TAB_STACK_CAP {
+            self.closed_tabs.remove(0);
+        }
+    }
+
+    /// Record every tab the bulk closes (Close Others / Close to the Right)
+    /// are about to drop: the unpinned, file-backed ones `pred` selects, in
+    /// tab order so the reopen stack pops most-recent-first.
+    fn record_closed_tabs_where(&mut self, pred: impl Fn(usize, &Editor) -> bool) {
+        let picks: Vec<usize> = self
+            .editor
+            .editors
+            .iter()
+            .enumerate()
+            .filter(|(i, ed)| pred(*i, ed))
+            .map(|(i, _)| i)
+            .collect();
+        for i in picks {
+            self.record_closed_tab_at(i);
+        }
+    }
+
+    /// Cmd+K ⇧W: reopen the most recently closed editor tab (VS Code
+    /// "Reopen Closed Editor"), restoring its pin state, cursor, and
+    /// scroll. Entries whose file has vanished since the close are skipped,
+    /// falling through to the next reopenable one.
+    pub fn reopen_closed_tab(&mut self) {
+        while let Some(t) = self.closed_tabs.pop() {
+            if !t.path.exists() {
+                continue;
+            }
+            let opened = if t.pinned {
+                self.editor.open_pinned(&t.path)
+            } else {
+                self.editor.open_preview(&t.path)
+            };
+            match opened {
+                Ok(()) => {
+                    self.sync_open_file_poll_mtime();
+                    let rows = self.editor.lines.len();
+                    self.editor.cursor_row = t.cursor.0.min(rows.saturating_sub(1));
+                    let max_col = self
+                        .editor
+                        .lines
+                        .get(self.editor.cursor_row)
+                        .map(|l| l.chars().count())
+                        .unwrap_or(0);
+                    self.editor.cursor_col = t.cursor.1.min(max_col);
+                    self.editor.scroll = t.scroll.min(rows.saturating_sub(1));
+                    self.editor.ensure_cursor_col_visible();
+                    self.tree.reveal_path(&t.path);
+                    self.focus_pane(Pane::Editor);
+                    self.poke_cursor();
+                    self.status = format!("Reopened {}", self.status_path(&t.path));
+                }
+                Err(e) => {
+                    self.status = format!("Reopen failed: {e}");
+                }
+            }
+            return;
+        }
+        self.status = String::from("No closed tabs to reopen");
+    }
+
     /// Swap the per-host accent rules (config.json reload, and tests).
     pub fn set_host_accents(&mut self, rules: &[crate::prefs::HostAccentRule]) {
         self.host_accents = compile_host_accents(rules);
@@ -13813,6 +13916,16 @@ impl App {
                 self.undo_close_terminal();
                 true
             }
+            // Cmd+K Shift+W: reopen the most recently closed editor tab
+            // (VS Code "Reopen Closed Editor"; ⇧W pairs with Cmd+W the way
+            // ⇧T pairs with the terminal close). Matched case-insensitively
+            // because CSI-u hosts report Shift+W as `Char('w') + SHIFT`
+            // while iTerm2's forwarder delivers `Char('W')`. Must precede
+            // any case-insensitive W arm.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'w') => {
+                self.reopen_closed_tab();
+                true
+            }
             // Cmd+K Shift+N with the terminal focused: delete the
             // annotation(s) under the selection. Must precede any
             // case-insensitive N arm.
@@ -13883,6 +13996,7 @@ impl App {
             // Cmd+K →: close the editors to the right of the active tab.
             KeyCode::Right if plain => {
                 let from = self.editor.active_index();
+                self.record_closed_tabs_where(|i, ed| i > from && !ed.pinned);
                 let removed = self.editor.close_to_right(from);
                 if removed > 0 {
                     self.sync_open_file_poll_mtime();
@@ -20732,6 +20846,7 @@ impl App {
         // so without this hoist Cmd+W is silently swallowed on a diff, sheet,
         // or image tab and the tab can never be closed from the keyboard.
         if is_close_tab_key(key) {
+            self.record_closed_tab_at(self.editor.active_index());
             if self.editor.close_active() {
                 self.sync_open_file_poll_mtime();
                 self.status = String::from("Closed tab");
@@ -21636,6 +21751,7 @@ impl App {
         match cmd {
             "w" | "write" => self.save(),
             "q" | "q!" | "quit" => {
+                self.record_closed_tab_at(self.editor.active_index());
                 if self.editor.close_active() {
                     self.sync_open_file_poll_mtime();
                     self.status = String::from("Closed tab");
@@ -21645,6 +21761,7 @@ impl App {
             }
             "wq" | "x" | "wq!" => {
                 self.save();
+                self.record_closed_tab_at(self.editor.active_index());
                 if !self.editor.close_active() {
                     self.quit = true;
                 }
@@ -24767,12 +24884,14 @@ impl App {
                 };
             }
             Cmd::CloseEditor => {
+                self.record_closed_tab_at(self.editor.active_index());
                 if self.editor.close_active() {
                     self.sync_open_file_poll_mtime();
                     self.collapse_split_if_empty();
                     self.status = String::from("Closed tab");
                 }
             }
+            Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
             Cmd::GoToSymbol => self.open_go_to_symbol(),
@@ -28484,11 +28603,14 @@ impl App {
                             self.editor.toggle_pin(idx);
                             self.status = String::from("Unpinned tab");
                             self.poke_cursor();
-                        } else if self.editor.close_tab(idx) {
-                            self.sync_open_file_poll_mtime();
-                            self.status = String::from("Closed tab");
-                            self.poke_cursor();
-                            self.collapse_split_if_empty();
+                        } else {
+                            self.record_closed_tab_at(idx);
+                            if self.editor.close_tab(idx) {
+                                self.sync_open_file_poll_mtime();
+                                self.status = String::from("Closed tab");
+                                self.poke_cursor();
+                                self.collapse_split_if_empty();
+                            }
                         }
                     } else if let Some(idx) = self.editor.tab_at(m.column, m.row) {
                         self.focus_pane(Pane::Editor);
@@ -30679,6 +30801,7 @@ impl App {
             MenuAction::CopyTabRelativePath(path) => self.copy_relative_path_to_clipboard(path),
             MenuAction::RevealInExplorer(path) => self.reveal_in_explorer(path),
             MenuAction::CloseTab(idx) => {
+                self.record_closed_tab_at(idx);
                 if self.editor.close_tab(idx) {
                     self.sync_open_file_poll_mtime();
                     self.status = String::from("Closed tab");
@@ -30687,6 +30810,7 @@ impl App {
                 }
             }
             MenuAction::CloseOtherTabs(keep_idx) => {
+                self.record_closed_tabs_where(|i, ed| i != keep_idx && !ed.pinned);
                 let removed = self.editor.close_others(keep_idx);
                 if removed > 0 {
                     self.sync_open_file_poll_mtime();
@@ -30699,6 +30823,7 @@ impl App {
                 }
             }
             MenuAction::CloseTabsToRight(from_idx) => {
+                self.record_closed_tabs_where(|i, ed| i > from_idx && !ed.pinned);
                 let removed = self.editor.close_to_right(from_idx);
                 if removed > 0 {
                     self.sync_open_file_poll_mtime();
