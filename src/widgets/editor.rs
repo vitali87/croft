@@ -3053,6 +3053,11 @@ impl Editor {
             self.force_text = false;
         }
         if !self.force_text {
+            // Media (#183): header-probed info card; junk with a media
+            // extension falls through to the binary path.
+            if crate::media::extension_is_media(ext) && self.open_media_preview(path).is_ok() {
+                return Ok(());
+            }
             // SQLite (#182): by extension here, by magic below.
             let is_sqlite_ext = path
                 .extension()
@@ -3403,6 +3408,59 @@ impl Editor {
         Ok(())
     }
 
+    /// Media info view (#183): header-probed properties rendered as a
+    /// markdown card, with an ffmpeg poster frame when available.
+    fn open_media_preview(&mut self, path: &Path) -> Result<()> {
+        let info = crate::media::probe(path)
+            .ok_or_else(|| anyhow::anyhow!("no recognisable media header"))?;
+        let scratch = std::env::temp_dir().join(format!("croft-media-{}", std::process::id()));
+        let md_text = crate::media::to_markdown(path, &info, &scratch);
+        let (lines, images) = crate::markdown::render_markdown_with_images(
+            &md_text,
+            self.theme,
+            &mut self.registry,
+            Some(&scratch),
+        );
+        self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
+        self.lines = vec![String::new()];
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.lang = None;
+        self.scroll = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty = false;
+        self.selection = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit_kind = None;
+        self.highlights = vec![Vec::new()];
+        self.diff = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
+        self.image = None;
+        self.sheet = None;
+        self.hex = None;
+        self.archive = None;
+        self.markdown_preview = Some(crate::markdown::MarkdownPreview {
+            lines,
+            scroll: 0,
+            built_seq: self.edit_seq,
+            images,
+            anchor_rows: Vec::new(),
+            wrap_key: (0, 0),
+            last_area: Rect::default(),
+            notebook: false,
+            doc_path: Some(path.to_path_buf()),
+            media: true,
+        });
+        self.status = format!("Opened media info {}", path.display());
+        Ok(())
+    }
+
     /// Read-only SQLite browser (#182): tables as sheet-grid
     /// worksheets, through the standard sheet install.
     fn open_sqlite(&mut self, path: &Path) -> Result<()> {
@@ -3459,6 +3517,7 @@ impl Editor {
             last_area: Rect::default(),
             notebook: false,
             doc_path: Some(path.to_path_buf()),
+            media: false,
         });
         self.status = format!("Opened document {}", path.display());
         Ok(())
@@ -3981,14 +4040,19 @@ impl Editor {
             .as_ref()
             .and_then(|md| md.doc_path.clone())
         {
+            let is_media = self.markdown_preview.as_ref().is_some_and(|md| md.media);
             let scroll = self
                 .markdown_preview
                 .as_ref()
                 .map(|m| m.scroll)
                 .unwrap_or(0);
-            if self.open_doc_preview(&doc).is_ok()
-                && let Some(md) = self.markdown_preview.as_mut()
-            {
+            // Media cards re-probe headers; documents re-walk XML (#183).
+            let rebuilt = if is_media {
+                self.open_media_preview(&doc).is_ok()
+            } else {
+                self.open_doc_preview(&doc).is_ok()
+            };
+            if rebuilt && let Some(md) = self.markdown_preview.as_mut() {
                 md.scroll = scroll;
             }
         } else if self.markdown_preview.as_ref().is_some_and(|md| md.notebook) {
@@ -4367,6 +4431,7 @@ impl Editor {
             last_area: Rect::default(),
             notebook: false,
             doc_path: None,
+            media: false,
         });
         true
     }
@@ -4403,6 +4468,7 @@ impl Editor {
             last_area: Rect::default(),
             notebook: true,
             doc_path: None,
+            media: false,
         });
         true
     }

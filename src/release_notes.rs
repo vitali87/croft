@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "SQLite databases (.sqlite/.sqlite3/.db, and misnamed files detected by content) now open as a read-only browser: every table pages through the spreadsheet grid with typed cells (NULL empty, blobs summarised), Tab switches between tables, and large tables show their first 500 rows with the true count stated. Databases open read-only with sqlite bundled in, so nothing is ever locked, mutated, or created - a live application database is safe to inspect.",
+    summary: "Audio and video files (mp3, wav, flac, m4a, mp4, m4v, mov) now open as an info card instead of a binary dead-end: format, duration, dimensions, sample rate, channels, bitrate, and tags parsed from the file's own headers in pure Rust - no external tools - plus codec details, a poster frame for video when ffmpeg is available, and a palette command handing the file to your system player. Playback stays with your system player, stated honestly on the card.",
 }];

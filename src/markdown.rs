@@ -44,6 +44,9 @@ pub struct MarkdownPreview {
     /// Set when this preview renders a docx/odt document (#181): the
     /// rebuild paths re-walk THIS file instead of the text buffer.
     pub doc_path: Option<std::path::PathBuf>,
+    /// True when `doc_path` names a MEDIA file (#183): the rebuild
+    /// dispatch probes headers instead of walking document XML.
+    pub media: bool,
 }
 
 /// One local image block in a rendered preview (#176).

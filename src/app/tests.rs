@@ -209,6 +209,61 @@ fn sqlite_pages_step_at_batch_boundaries() {
 }
 
 #[test]
+fn media_file_opens_as_an_info_card_and_save_refuses() {
+    // #183: a WAV opens as the rendered info card (duration, rates), a
+    // save refuses (#185 class), and junk with a media extension falls
+    // through to the binary path instead of erroring.
+    use std::io::Write as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("tone.wav");
+    let mut f = std::fs::File::create(&p).unwrap();
+    let byte_rate = 16000u32;
+    let data = vec![0u8; byte_rate as usize]; // 1 second
+    let mut hdr = Vec::new();
+    hdr.extend_from_slice(b"RIFF");
+    hdr.extend_from_slice(&((36 + data.len()) as u32).to_le_bytes());
+    hdr.extend_from_slice(b"WAVEfmt ");
+    hdr.extend_from_slice(&16u32.to_le_bytes());
+    hdr.extend_from_slice(&1u16.to_le_bytes());
+    hdr.extend_from_slice(&1u16.to_le_bytes());
+    hdr.extend_from_slice(&8000u32.to_le_bytes());
+    hdr.extend_from_slice(&byte_rate.to_le_bytes());
+    hdr.extend_from_slice(&2u16.to_le_bytes());
+    hdr.extend_from_slice(&16u16.to_le_bytes());
+    hdr.extend_from_slice(b"data");
+    hdr.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    f.write_all(&hdr).unwrap();
+    f.write_all(&data).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    let md = app
+        .editor
+        .markdown_preview
+        .as_ref()
+        .expect("media opens as the info card");
+    assert!(md.media && md.doc_path.is_some());
+    let all: String = md
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(all.contains("tone.wav"), "{all}");
+    assert!(all.contains("8000 Hz"), "{all}");
+    let before = std::fs::read(&p).unwrap();
+    assert!(app.editor.save_to_disk().is_err(), "info card save refuses");
+    assert_eq!(std::fs::read(&p).unwrap(), before);
+
+    // Junk wearing .mp3: never a dead-end.
+    let junk = tmp.path().join("noise.mp3");
+    std::fs::write(&junk, b"\x00\x01 not audio").unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&junk).unwrap();
+    assert!(e.hex.is_some(), "junk media falls to hex");
+}
+
+#[test]
 fn docx_opens_as_a_rendered_document() {
     // #181: a docx renders headings/emphasis through the preview
     // machinery; the text side is a stub (Reopen as Text routes the zip
