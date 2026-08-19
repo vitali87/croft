@@ -206,6 +206,9 @@ fn sqlite_pages_step_at_batch_boundaries() {
         "{}",
         view.sheets[0].name
     );
+}
+
+#[test]
 fn media_file_opens_as_an_info_card_and_save_refuses() {
     // #183: a WAV opens as the rendered info card (duration, rates), a
     // save refuses (#185 class), and junk with a media extension falls
