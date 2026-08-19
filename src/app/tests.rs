@@ -17325,13 +17325,20 @@ fn clicking_an_outline_row_jumps_the_editor_to_that_symbol() {
 #[test]
 fn shift_tab_in_editor_dedents_the_current_python_line() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "snippet.py", "def f():\n        pass\n");
-    app.editor.cursor_row = 1;
+    // Two 4-space levels so indent detection (#211) reads the file's step
+    // as 4; the old single 8-space jump now detects (correctly) as one
+    // 8-wide level.
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "snippet.py",
+        "def f():\n    if x:\n        pass\n",
+    );
+    app.editor.cursor_row = 2;
     app.editor.cursor_col = 8;
     // Shift+Tab reaches the editor as BackTab.
     app.handle_editor_key(key(KeyCode::BackTab, KeyModifiers::SHIFT));
     assert_eq!(
-        app.editor.lines[1], "    pass",
+        app.editor.lines[2], "    pass",
         "Shift+Tab must outdent the line one level"
     );
     assert_eq!(app.editor.cursor_col, 4);

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Navigation history is now two-way: Ctrl+Shift+- goes forward along the trail Go Back walked, and Cmd+K Cmd+Q jumps to the last edit location, both also in the Command Palette and the editor context menu.",
+    summary: "Indentation is now detected from each file's own content on open (tabs vs spaces and the step width), so Tab matches the file's existing style instead of the language default; the status bar's indent pill reflects it and a manual override still wins.",
 }];

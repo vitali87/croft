@@ -1650,6 +1650,66 @@ pub struct IndentStyle {
     pub use_spaces: bool,
 }
 
+/// Detect the dominant indentation of a buffer's lines (VS Code's
+/// `editor.detectIndentation`). Tabs vs spaces is a straight majority of
+/// indented lines; the space width is the most common positive step
+/// between consecutive indentation depths (2..=8), falling back to the
+/// smallest leading run when the file never nests. `None` when nothing is
+/// indented, so the caller keeps the language default. Scans at most the
+/// first 10k lines: enough signal for any real file, bounded for huge ones.
+pub fn detect_indentation(lines: &[String]) -> Option<IndentStyle> {
+    let mut tab_lines = 0usize;
+    let mut space_lines = 0usize;
+    let mut steps: [usize; 9] = [0; 9];
+    let mut prev_depth = 0usize;
+    let mut min_run = usize::MAX;
+    for line in lines.iter().take(10_000) {
+        if line.starts_with('\t') {
+            tab_lines += 1;
+            continue;
+        }
+        let depth = line.chars().take_while(|&c| c == ' ').count();
+        if depth == 0 {
+            if !line.is_empty() {
+                prev_depth = 0;
+            }
+            continue;
+        }
+        if line.chars().nth(depth).is_none() {
+            // Whitespace-only lines carry no intent.
+            continue;
+        }
+        space_lines += 1;
+        min_run = min_run.min(depth);
+        let step = depth.abs_diff(prev_depth);
+        if (2..=8).contains(&step) {
+            steps[step] += 1;
+        }
+        prev_depth = depth;
+    }
+    if tab_lines == 0 && space_lines == 0 {
+        return None;
+    }
+    if tab_lines >= space_lines {
+        return Some(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        });
+    }
+    let width = steps
+        .iter()
+        .enumerate()
+        .skip(2)
+        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(&a.0)))
+        .filter(|&(_, &n)| n > 0)
+        .map(|(w, _)| w)
+        .or(((2..=8).contains(&min_run)).then_some(min_run))?;
+    Some(IndentStyle {
+        width: width as u32,
+        use_spaces: true,
+    })
+}
+
 impl IndentStyle {
     /// The indentation unit as text: `width` spaces, or a single tab.
     pub fn unit(self) -> String {
@@ -1947,6 +2007,11 @@ pub struct Editor {
     /// falls back to the language default (2 spaces for YAML, 4 otherwise);
     /// `Some` pins spaces-vs-tabs and width for newly typed indentation.
     indent_override: Option<IndentStyle>,
+    /// Indentation detected from the buffer's own content on open (VS
+    /// Code's `editor.detectIndentation`): `Some` when the file showed a
+    /// clear preference, `None` when it gave no signal. The manual
+    /// status-bar override always wins over this.
+    detected_indent: Option<IndentStyle>,
     /// Line-ending style, detected on open and applied on save. Surfaced in the
     /// status bar; the user can switch it there.
     pub eol: LineEnding,
@@ -2191,6 +2256,7 @@ impl Editor {
             last_edit_kind: None,
             lang: None,
             indent_override: None,
+            detected_indent: None,
             eol: LineEnding::Lf,
             encoding: encoding_rs::UTF_8,
             bom: false,
@@ -3272,6 +3338,9 @@ impl Editor {
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
+        // VS Code's editor.detectIndentation: the freshly loaded content
+        // decides the buffer's indent style unless the user overrides it.
+        self.detected_indent = detect_indentation(&self.lines);
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
         self.scroll_sub = 0;
@@ -4655,13 +4724,16 @@ impl Editor {
         n
     }
 
-    /// The buffer's active indentation style: the status-bar override if set,
-    /// else the language default (2 spaces for YAML, 4 spaces otherwise).
+    /// The buffer's active indentation style: the status-bar override if
+    /// set, else the style detected from the file's content on open, else
+    /// the language default (2 spaces for YAML, 4 spaces otherwise).
     pub fn indent_style(&self) -> IndentStyle {
-        self.indent_override.unwrap_or(IndentStyle {
-            width: indent_unit_for(self.lang).chars().count() as u32,
-            use_spaces: true,
-        })
+        self.indent_override
+            .or(self.detected_indent)
+            .unwrap_or(IndentStyle {
+                width: indent_unit_for(self.lang).chars().count() as u32,
+                use_spaces: true,
+            })
     }
 
     /// Pin the buffer's indentation style (status-bar "Indent Using …" /
@@ -20847,6 +20919,98 @@ mod tests {
         e.indentation_to_tabs();
         // 4 spaces -> 1 tab; 6 spaces -> 1 tab + 2 leftover; interior spaces stay.
         assert_eq!(e.lines, vec!["\tfoo", "\t  bar", "b  c"]);
+    }
+
+    /// Issue #211: VS Code's editor.detectIndentation. Opening a file
+    /// whose content indents with 2 spaces must set the buffer's indent
+    /// style to 2 spaces even though the language default is 4; tabs win
+    /// when the content uses tabs; a flat file keeps the language default;
+    /// the manual status-bar override still beats detection.
+    #[test]
+    fn open_detects_indentation_from_file_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let two = tmp.path().join("two.rs");
+        std::fs::write(
+            &two,
+            "fn main() {\n  let a = 1;\n  if a > 0 {\n    println!();\n  }\n}\n",
+        )
+        .unwrap();
+        let mut e = Editor::new();
+        e.open(&two).unwrap();
+        assert_eq!(
+            e.indent_style(),
+            IndentStyle {
+                width: 2,
+                use_spaces: true
+            },
+            "2-space content must be detected over the 4-space rust default"
+        );
+
+        let tabs = tmp.path().join("tabs.rs");
+        std::fs::write(
+            &tabs,
+            "fn main() {\n\tlet a = 1;\n\tif a > 0 {\n\t\tprintln!();\n\t}\n}\n",
+        )
+        .unwrap();
+        let mut t = Editor::new();
+        t.open(&tabs).unwrap();
+        assert!(
+            !t.indent_style().use_spaces,
+            "tab-indented content must detect tabs"
+        );
+
+        let flat = tmp.path().join("flat.rs");
+        std::fs::write(&flat, "fn main() {}\nfn other() {}\n").unwrap();
+        let mut f = Editor::new();
+        f.open(&flat).unwrap();
+        assert_eq!(
+            f.indent_style(),
+            IndentStyle {
+                width: 4,
+                use_spaces: true
+            },
+            "a file with no indented lines keeps the language default"
+        );
+
+        // The manual override still wins over detection.
+        let mut o = Editor::new();
+        o.open(&two).unwrap();
+        o.set_indent_style(IndentStyle {
+            width: 8,
+            use_spaces: true,
+        });
+        assert_eq!(o.indent_style().width, 8, "override beats detection");
+    }
+
+    /// The pure detector: majority rules between tabs and spaces, and the
+    /// space width comes from the most common indentation step.
+    #[test]
+    fn detect_indentation_picks_majority_and_step() {
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            detect_indentation(&lines(&["a {", "    b;", "        c;", "    d;", "}"])),
+            Some(IndentStyle {
+                width: 4,
+                use_spaces: true
+            })
+        );
+        assert_eq!(
+            detect_indentation(&lines(&["a {", "\tb;", "\t\tc;", "}"])),
+            Some(IndentStyle {
+                width: 4,
+                use_spaces: false
+            })
+        );
+        assert_eq!(detect_indentation(&lines(&["a", "b", "c"])), None);
+        // Mixed content: the majority style wins (three tab lines, one
+        // spaced line).
+        assert_eq!(
+            detect_indentation(&lines(&["a {", "\tb;", "\tc;", "\td;", "  e;", "}"])),
+            Some(IndentStyle {
+                width: 4,
+                use_spaces: false
+            })
+        );
     }
 
     #[test]

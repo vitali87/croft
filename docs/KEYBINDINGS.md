@@ -206,7 +206,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | Two-finger horizontal swipe, or drag the bar | Pan long lines in code files; the cursor pans the view when it passes either edge |
 | Markdown soft-wrap | Markdown files wrap long lines onto the next visual row (no horizontal scrollbar); `↑`/`↓` move by visual row |
 | Printable char, Enter, Backspace, Delete | Edit (typing or deleting with a selection replaces it) |
-| `Tab` | Indent: a multi-line selection indents every touched line one level; otherwise inserts to the next tab stop (4, or 2 in YAML) |
+| `Tab` | Indent: a multi-line selection indents every touched line one level; otherwise inserts to the next tab stop. The stop width and tabs-vs-spaces are detected from the file's own content on open (VS Code's `editor.detectIndentation`), falling back to the language default (4, or 2 in YAML); the status bar's indent pill shows the result and clicking it overrides both |
 | `Shift`+`Tab` | Outdent one level, tab-stop aligned, for the current line or every line a selection touches |
 | `Alt`+`↑` / `Alt`+`↓` | Move the current line (or selected block) up / down, carrying the cursor and selection |
 | `Shift`+`Alt`+`↑` / `↓` | Copy the current line (or selected block) up / down |
