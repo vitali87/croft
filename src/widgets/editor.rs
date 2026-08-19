@@ -3058,8 +3058,16 @@ impl Editor {
                 .extension()
                 .and_then(|x| x.to_str())
                 .is_some_and(crate::sqlite_view::extension_is_sqlite);
-            if is_sqlite_ext && self.open_sqlite(path).is_ok() {
-                return Ok(());
+            if is_sqlite_ext {
+                // Propagate errors when the MAGIC confirms sqlite (#201
+                // review: a corrupt database must error, not fall to
+                // hex); a .db that is not sqlite at all falls through.
+                let magic = read_file_head(path)
+                    .map(|h| crate::magic::sniff(&h) == Some(crate::magic::Magic::Sqlite))
+                    .unwrap_or(false);
+                if magic {
+                    return self.open_sqlite(path).map_err(|e| anyhow::anyhow!("{e}"));
+                }
             }
             // docx/odt (#181): a document that fails the walk falls
             // through (its zip container then reaches the archive route).
@@ -3183,8 +3191,8 @@ impl Editor {
             {
                 return Ok(());
             }
-            Some(crate::magic::Magic::Sqlite) if self.open_sqlite(path).is_ok() => {
-                return Ok(());
+            Some(crate::magic::Magic::Sqlite) => {
+                return self.open_sqlite(path);
             }
             Some(crate::magic::Magic::Tar)
                 if self

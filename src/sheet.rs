@@ -55,6 +55,9 @@ pub struct SheetView {
     pub cell_edits: Vec<(usize, usize, usize)>,
     /// Frame-truth layout for mouse hit-testing, written by the render.
     pub grid: SheetGridLayout,
+    /// SQLite paging state (#182/#201): per-sheet (table name, page).
+    /// Empty for every other kind.
+    pub sqlite_pages: Vec<(String, usize)>,
 }
 
 /// In-grid cell input state (#177): plain value + char cursor.
@@ -138,6 +141,7 @@ pub fn view_from_sheets(
         editing: None,
         cell_edits: Vec::new(),
         grid: SheetGridLayout::default(),
+        sqlite_pages: Vec::new(),
     }
 }
 
@@ -196,6 +200,7 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
                 editing: None,
                 cell_edits: Vec::new(),
                 grid: SheetGridLayout::default(),
+                sqlite_pages: Vec::new(),
             })
         }
         SheetKind::Sqlite => Err(std::io::Error::other(
@@ -222,6 +227,7 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
                 editing: None,
                 cell_edits: Vec::new(),
                 grid: SheetGridLayout::default(),
+                sqlite_pages: Vec::new(),
             })
         }
     }

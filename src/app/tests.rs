@@ -168,6 +168,47 @@ fn persistence_advisory_only_for_nonpersistent_remote_sessions() {
 }
 
 #[test]
+fn sqlite_pages_step_at_batch_boundaries() {
+    // #201 review: PageDown at the bottom of a full batch fetches the
+    // next page; PageUp at the top returns.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("big.db");
+    {
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.execute_batch("CREATE TABLE t (n INTEGER);").unwrap();
+        let mut ins = conn.prepare("INSERT INTO t VALUES (?1)").unwrap();
+        for i in 0..700 {
+            ins.execute([i]).unwrap();
+        }
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    let view = app.editor.sheet.as_ref().unwrap();
+    assert_eq!(view.sheets[0].row_count(), 500);
+    assert!(view.sheets[0].name.contains("rows 1-500 of 700"));
+
+    app.handle_sheet_key(key(KeyCode::End, KeyModifiers::SUPER));
+    app.handle_sheet_key(key(KeyCode::PageDown, KeyModifiers::NONE));
+    let view = app.editor.sheet.as_ref().unwrap();
+    assert_eq!(view.sheets[0].row_count(), 200, "second page loaded");
+    assert!(
+        view.sheets[0].name.contains("rows 501-700 of 700"),
+        "{}",
+        view.sheets[0].name
+    );
+    assert_eq!(view.sheets[0].cell(0, 0), "500", "first value of page 2");
+
+    app.handle_sheet_key(key(KeyCode::Home, KeyModifiers::SUPER));
+    app.handle_sheet_key(key(KeyCode::PageUp, KeyModifiers::NONE));
+    let view = app.editor.sheet.as_ref().unwrap();
+    assert!(
+        view.sheets[0].name.contains("rows 1-500"),
+        "{}",
+        view.sheets[0].name
+    );
+}
+
+#[test]
 fn docx_opens_as_a_rendered_document() {
     // #181: a docx renders headings/emphasis through the preview
     // machinery; the text side is a stub (Reopen as Text routes the zip
