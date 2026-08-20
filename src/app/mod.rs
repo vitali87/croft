@@ -20662,6 +20662,24 @@ impl App {
         // navigation scrolls the preview and every other key is swallowed
         // (no invisible edits). Cmd+Shift+V above flips back to the source.
         if self.editor.markdown_preview.is_some() {
+            // Copy Path / Copy Relative Path first: their chords are
+            // Cmd+Opt+C and Cmd+Opt+Shift+C, which the looser copy-key
+            // predicate below also matches. They are meaningful while a
+            // preview is up (the file has a path either way), and this
+            // block returns unconditionally, so they must be dispatched
+            // here or they never run.
+            if is_copy_path_key(key) {
+                if let Some(path) = self.editor.path.clone() {
+                    self.copy_path_to_clipboard(path);
+                }
+                return;
+            }
+            if is_copy_relative_path_key(key) {
+                if let Some(path) = self.editor.path.clone() {
+                    self.copy_relative_path_to_clipboard(path);
+                }
+                return;
+            }
             // Copy the rendered selection (#215): the preview swallows every
             // other key, so without this branch Cmd+C here never copies.
             if is_editor_copy_key(key) {

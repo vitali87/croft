@@ -41,11 +41,14 @@ pub struct MarkdownPreview {
     /// stale-rebuild and theme-switch paths dispatch to the notebook
     /// builder instead of the markdown one.
     pub notebook: bool,
-    /// Frame truth, written by the editor's render: the plain text of
-    /// each painted visual row of `last_area`, trailing padding trimmed.
-    /// The rendered view is a wrapped `Paragraph`, so this is the only
-    /// faithful record of what the user can actually see and select.
-    pub rows: Vec<String>,
+    /// Frame truth, written by the editor's render: one entry per painted
+    /// visual row of `last_area`, each holding that row's cell symbols by
+    /// SCREEN COLUMN. Per-column (not a joined string) keeps wide glyphs
+    /// aligned: a double-width character owns its column and leaves an
+    /// empty continuation cell, so a column index always addresses the
+    /// right character. The rendered view is a wrapped `Paragraph`, so
+    /// these cells are the only faithful record of what the user sees.
+    pub rows: Vec<Vec<String>>,
     /// The user's selection over the rendered view, as (row, col) pairs
     /// relative to `last_area`: `anchor` is where the drag started,
     /// `head` where it is now. `None` when nothing is selected.
@@ -579,6 +582,12 @@ impl MarkdownPreview {
     /// The selection normalised to (start, end) in reading order.
     fn ordered_selection(&self) -> Option<((u16, u16), (u16, u16))> {
         let (a, b) = self.selection?;
+        // A click anchors head == anchor: that is a caret, not a
+        // selection. Treating it as one would tint a stray cell and let a
+        // plain click copy a character nobody selected.
+        if a == b {
+            return None;
+        }
         Some(if (a.0, a.1) <= (b.0, b.1) {
             (a, b)
         } else {
@@ -609,22 +618,24 @@ impl MarkdownPreview {
         };
         let mut out: Vec<String> = Vec::new();
         for row in start.0..=end.0 {
-            let Some(text) = self.rows.get(row as usize) else {
+            let Some(cells) = self.rows.get(row as usize) else {
                 continue;
             };
-            let chars: Vec<char> = text.chars().collect();
             let from = if row == start.0 {
-                (start.1 as usize).min(chars.len())
+                (start.1 as usize).min(cells.len())
             } else {
                 0
             };
             let to = if row == end.0 {
-                ((end.1 as usize) + 1).min(chars.len())
+                ((end.1 as usize) + 1).min(cells.len())
             } else {
-                chars.len()
+                cells.len()
             };
+            // Column-indexed: a wide glyph's continuation cell is empty and
+            // contributes nothing, so copied text keeps characters whole
+            // however the row is sliced.
             out.push(if from <= to {
-                chars[from..to].iter().collect::<String>()
+                cells[from..to].concat().trim_end().to_string()
             } else {
                 String::new()
             });
@@ -890,7 +901,10 @@ mod preview_selection_tests {
             anchor_rows: Vec::new(),
             wrap_key: (0, 0),
             last_area: ratatui::layout::Rect::default(),
-            rows: rows.iter().map(|r| r.to_string()).collect(),
+            rows: rows
+                .iter()
+                .map(|r| r.chars().map(|c| c.to_string()).collect())
+                .collect(),
             selection: None,
             dragging: false,
             notebook: false,
@@ -918,6 +932,45 @@ mod preview_selection_tests {
         p.selection = None;
         assert_eq!(p.selection_text(), "");
         assert!(!p.has_selection());
+    }
+
+    /// Review round 1: a plain click (anchor == head) is a caret, not a
+    /// selection: nothing tints and nothing copies.
+    #[test]
+    fn a_zero_area_click_is_not_a_selection() {
+        let mut p = preview(&["abcdef"]);
+        p.selection = Some(((0, 3), (0, 3)));
+        assert!(!p.has_selection(), "a click selects nothing");
+        assert!(!p.cell_selected(0, 3), "and tints nothing");
+        assert_eq!(p.selection_text(), "", "and copies nothing");
+    }
+
+    /// Review round 1: rows are stored per SCREEN COLUMN, so a wide glyph
+    /// (which owns one column and leaves an empty continuation cell) is
+    /// copied whole and the columns after it still address the right
+    /// characters.
+    #[test]
+    fn wide_glyphs_keep_columns_and_characters_aligned() {
+        // Columns:      0     1(cont) 2    3
+        let mut p = preview(&[""]);
+        p.rows = vec![vec![
+            "\u{5e83}".to_string(),
+            String::new(),
+            "a".to_string(),
+            "b".to_string(),
+        ]];
+        p.selection = Some(((0, 0), (0, 2)));
+        assert_eq!(
+            p.selection_text(),
+            "\u{5e83}a",
+            "the wide glyph and the character at column 2 come through"
+        );
+        p.selection = Some(((0, 2), (0, 3)));
+        assert_eq!(
+            p.selection_text(),
+            "ab",
+            "columns after a wide glyph still address their own characters"
+        );
     }
 
     #[test]

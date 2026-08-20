@@ -18541,8 +18541,8 @@ fn dragging_in_the_markdown_preview_selects_and_copies_rendered_text() {
             .rows
             .iter()
             .enumerate()
+            .map(|(i, cells)| (i as u16, cells.concat()))
             .find(|(_, r)| r.contains("rendered body"))
-            .map(|(i, r)| (i as u16, r.clone()))
             .expect("the body text must be rendered");
         (md.last_area, i, t)
     };

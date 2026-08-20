@@ -10104,14 +10104,13 @@ impl Editor {
         // selected span.
         md.rows = (0..text_area.height)
             .map(|dy| {
-                let row: String = (0..text_area.width)
+                (0..text_area.width)
                     .map(|dx| {
                         buf[(text_area.x + dx, text_area.y + dy)]
                             .symbol()
                             .to_string()
                     })
-                    .collect();
-                row.trim_end().to_string()
+                    .collect::<Vec<String>>()
             })
             .collect();
         if md.has_selection() {
