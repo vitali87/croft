@@ -57,6 +57,58 @@ const ACTIVE_PILL: Rgba<u8> = Rgba([0x4e, 0x9a, 0xff, 0xff]);
 const ACTIVE_TINT: Rgba<u8> = Rgba([0xff, 0xff, 0xff, 0xff]);
 const INACTIVE_TINT: Rgba<u8> = Rgba([0x9d, 0xa5, 0xb4, 0xff]);
 
+/// Ink for the activity-bar icon family: the glyph tint in each
+/// [`IconState`] plus the selection pill. A baked icon picks its colors here
+/// rather than at the render call site, so unlike a styled cell it cannot
+/// route through `Theme::ui` on the way out; the caller resolves the active
+/// theme's values and passes them in. [`IconInk::default`] is the dark
+/// chrome every dark theme renders with. Hardcoding it was issue #225: on a
+/// light bar the selected icon came out white on white.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IconInk {
+    /// Resting, unselected glyph (VS Code `activityBar.inactiveForeground`).
+    pub inactive: Rgba<u8>,
+    /// Selected glyph, and any glyph under the pointer
+    /// (`activityBar.foreground`).
+    pub active: Rgba<u8>,
+    /// The selection bar down the icon's left edge
+    /// (`activityBar.activeBorder`).
+    pub pill: Rgba<u8>,
+}
+
+impl Default for IconInk {
+    fn default() -> Self {
+        Self {
+            inactive: INACTIVE_TINT,
+            active: ACTIVE_TINT,
+            pill: ACTIVE_PILL,
+        }
+    }
+}
+
+impl IconInk {
+    /// Build from the active theme's opaque sRGB values.
+    pub fn new(inactive: (u8, u8, u8), active: (u8, u8, u8), pill: (u8, u8, u8)) -> Self {
+        let opaque = |(r, g, b): (u8, u8, u8)| Rgba([r, g, b, 0xff]);
+        Self {
+            inactive: opaque(inactive),
+            active: opaque(active),
+            pill: opaque(pill),
+        }
+    }
+
+    /// The glyph tint for `state`: hovered borrows the active ink (VS Code
+    /// lifts a hovered icon to the foreground color), only the pill tells
+    /// selected apart from merely hovered.
+    fn tint(self, state: IconState) -> Rgba<u8> {
+        if state.tinted() {
+            self.active
+        } else {
+            self.inactive
+        }
+    }
+}
+
 /// Compose a runtime-sized icon canvas matching the iTerm2 cell viewport
 /// exactly: width × height in physical pixels, bar-bg fill, codicon scaled
 /// to a square area centred inside the canvas, optional active blue pill on
@@ -75,6 +127,7 @@ pub fn compose_icon(
     canvas_w: u32,
     canvas_h: u32,
     is_active: bool,
+    ink: IconInk,
     bg: Rgba<u8>,
     off_y_bias: i64,
 ) -> Result<Vec<u8>, image::ImageError> {
@@ -88,14 +141,14 @@ pub fn compose_icon(
         icon_h,
         image::imageops::FilterType::Lanczos3,
     );
-    let tint = if is_active {
-        ACTIVE_TINT
+    let tint = ink.tint(if is_active {
+        IconState::Active
     } else {
-        INACTIVE_TINT
-    };
+        IconState::Inactive
+    });
     let tinted = tint_rgba(&scaled, tint);
     Ok(finish_icon(
-        &tinted, canvas_w, canvas_h, is_active, bg, off_y_bias,
+        &tinted, canvas_w, canvas_h, is_active, ink.pill, bg, off_y_bias,
     ))
 }
 
@@ -135,6 +188,7 @@ pub fn compose_icon_svg(
     canvas_w: u32,
     canvas_h: u32,
     state: IconState,
+    ink: IconInk,
     bg: Rgba<u8>,
     off_y_bias: i64,
 ) -> Option<Vec<u8>> {
@@ -158,11 +212,7 @@ pub fn compose_icon_svg(
     // colour on top, mirroring `tint_rgba` for the raster path. tiny-skia stores
     // premultiplied RGBA but the alpha byte itself is straight, which is all the
     // alpha-composited overlay below needs.
-    let tint = if state.tinted() {
-        ACTIVE_TINT
-    } else {
-        INACTIVE_TINT
-    };
+    let tint = ink.tint(state);
     let data = pixmap.data();
     let mut glyph: RgbaImage = ImageBuffer::new(icon_w, icon_h);
     for (i, px) in glyph.pixels_mut().enumerate() {
@@ -173,6 +223,7 @@ pub fn compose_icon_svg(
         canvas_w,
         canvas_h,
         state.pill(),
+        ink.pill,
         bg,
         off_y_bias,
     ))
@@ -205,6 +256,7 @@ fn finish_icon(
     canvas_w: u32,
     canvas_h: u32,
     is_active: bool,
+    pill_color: Rgba<u8>,
     bg: Rgba<u8>,
     off_y_bias: i64,
 ) -> Vec<u8> {
@@ -223,7 +275,7 @@ fn finish_icon(
         let pill_y_end = (pill_y_start + icon_h).min(canvas_h);
         for y in pill_y_start..pill_y_end {
             for x in 0..pill_w {
-                canvas.put_pixel(x, y, ACTIVE_PILL);
+                canvas.put_pixel(x, y, pill_color);
             }
         }
     }
@@ -1284,9 +1336,19 @@ mod tests {
             (top.unwrap(), bottom.unwrap())
         };
         let (canvas_w, canvas_h) = (32u32, 48u32);
-        let centered = compose_icon(&src, canvas_w, canvas_h, false, bg, 0).unwrap();
+        let centered =
+            compose_icon(&src, canvas_w, canvas_h, false, IconInk::default(), bg, 0).unwrap();
         // A bias far larger than the canvas: clamp must keep the glyph inside.
-        let lowered = compose_icon(&src, canvas_w, canvas_h, false, bg, 10_000).unwrap();
+        let lowered = compose_icon(
+            &src,
+            canvas_w,
+            canvas_h,
+            false,
+            IconInk::default(),
+            bg,
+            10_000,
+        )
+        .unwrap();
         let (c_top, c_bottom) = content_span(&centered);
         let (l_top, l_bottom) = content_span(&lowered);
         assert!(
@@ -1318,7 +1380,7 @@ mod tests {
             buf
         };
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked = compose_icon(&src, 32, 16, false, bg, 0).unwrap();
+        let baked = compose_icon(&src, 32, 16, false, IconInk::default(), bg, 0).unwrap();
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
             .to_rgba8();
@@ -1354,7 +1416,7 @@ mod tests {
     #[test]
     fn compose_icon_preserves_source_aspect_ratio_for_a_portrait_png() {
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked = compose_icon(NO_REPO_HERO_PNG, 32, 16, false, bg, 0)
+        let baked = compose_icon(NO_REPO_HERO_PNG, 32, 16, false, IconInk::default(), bg, 0)
             .expect("compose_icon must accept the portrait source-control PNG");
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
@@ -1385,8 +1447,16 @@ mod tests {
         // canvas dimensions, carry an opaque glyph, and keep the bar-bg fill in
         // the corners (the codicon never bleeds to the canvas edge).
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked = compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, IconState::Inactive, bg, 0)
-            .expect("the files codicon SVG must rasterise");
+        let baked = compose_icon_svg(
+            EXPLORER_SRC_SVG,
+            40,
+            40,
+            IconState::Inactive,
+            IconInk::default(),
+            bg,
+            0,
+        )
+        .expect("the files codicon SVG must rasterise");
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
             .to_rgba8();
@@ -1408,7 +1478,16 @@ mod tests {
     #[test]
     fn compose_icon_svg_active_paints_the_blue_pill() {
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked = compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, IconState::Active, bg, 0).unwrap();
+        let baked = compose_icon_svg(
+            EXPLORER_SRC_SVG,
+            40,
+            40,
+            IconState::Active,
+            IconInk::default(),
+            bg,
+            0,
+        )
+        .unwrap();
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
             .to_rgba8();
@@ -1429,11 +1508,36 @@ mod tests {
         // the icon light up under the pointer, but it must NOT paint the blue
         // selection pill — that bar is reserved for the actually-selected view.
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let hovered =
-            compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, IconState::Hovered, bg, 0).unwrap();
-        let active = compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, IconState::Active, bg, 0).unwrap();
-        let inactive =
-            compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, IconState::Inactive, bg, 0).unwrap();
+        let hovered = compose_icon_svg(
+            EXPLORER_SRC_SVG,
+            40,
+            40,
+            IconState::Hovered,
+            IconInk::default(),
+            bg,
+            0,
+        )
+        .unwrap();
+        let active = compose_icon_svg(
+            EXPLORER_SRC_SVG,
+            40,
+            40,
+            IconState::Active,
+            IconInk::default(),
+            bg,
+            0,
+        )
+        .unwrap();
+        let inactive = compose_icon_svg(
+            EXPLORER_SRC_SVG,
+            40,
+            40,
+            IconState::Inactive,
+            IconInk::default(),
+            bg,
+            0,
+        )
+        .unwrap();
         let decode = |b: &[u8]| {
             image::load_from_memory_with_format(b, image::ImageFormat::Png)
                 .unwrap()
@@ -1459,6 +1563,48 @@ mod tests {
         // Sanity: both renders are still the requested canvas size.
         assert_eq!((hov.width(), hov.height()), (40, 40));
         assert_eq!((inact.width(), inact.height()), (40, 40));
+    }
+
+    /// Issue #225: the canvas background comes from the active theme, so the
+    /// ink has to as well. Baked on a light bar with dark-chrome ink, the
+    /// selected icon was white on white and vanished.
+    #[test]
+    fn compose_icon_svg_ink_follows_the_bar_background() {
+        let light = crate::theme::Theme::from_id("light");
+        let (r, g, b) = light.editor_bg_rgb();
+        let bar = Rgba([r, g, b, 0xff]);
+        let ink = IconInk::new(
+            light.activity_icon_inactive_rgb(),
+            light.activity_icon_active_rgb(),
+            light.activity_icon_pill_rgb(),
+        );
+        let luma = |p: [u8; 4]| {
+            0.299 * f32::from(p[0]) + 0.587 * f32::from(p[1]) + 0.114 * f32::from(p[2])
+        };
+        for state in [IconState::Inactive, IconState::Hovered, IconState::Active] {
+            let baked = compose_icon_svg(EXPLORER_SRC_SVG, 40, 40, state, ink, bar, 0).unwrap();
+            let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
+                .unwrap()
+                .to_rgba8();
+            // Skip the left-edge selection bar: the glyph itself must carry
+            // the contrast, not the pill beside it.
+            let readable_glyph = decoded
+                .enumerate_pixels()
+                .any(|(x, _, p)| x >= 8 && luma(p.0) < 160.0);
+            assert!(
+                readable_glyph,
+                "{state:?} icon must stay readable on a light activity bar"
+            );
+            // The dark chrome's pill would still be legible on white, but it
+            // must follow the theme too, not stay at the hardcoded blue.
+            if state == IconState::Active {
+                let (pr, pg, pb) = light.activity_icon_pill_rgb();
+                assert!(
+                    (0..40).any(|y| decoded.get_pixel(0, y).0 == [pr, pg, pb, 0xff]),
+                    "the selection bar must carry the theme's activeBorder"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1496,7 +1642,7 @@ mod tests {
     #[test]
     fn run_debug_icon_composes_through_icon_pipeline() {
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
-        let baked = compose_icon(RUN_DEBUG_SRC_PNG, 32, 16, false, bg, 0)
+        let baked = compose_icon(RUN_DEBUG_SRC_PNG, 32, 16, false, IconInk::default(), bg, 0)
             .expect("compose_icon must accept the SVG-rasterised run-debug PNG");
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
@@ -1516,8 +1662,16 @@ mod tests {
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
         let canvas_w = 40u32;
         let canvas_h = 40u32;
-        let baked = compose_icon(NO_REPO_HERO_PNG, canvas_w, canvas_h, false, bg, 0)
-            .expect("portrait source must compose into the activity-bar cell");
+        let baked = compose_icon(
+            NO_REPO_HERO_PNG,
+            canvas_w,
+            canvas_h,
+            false,
+            IconInk::default(),
+            bg,
+            0,
+        )
+        .expect("portrait source must compose into the activity-bar cell");
         let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
             .unwrap()
             .to_rgba8();
