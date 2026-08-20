@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "The light theme is now legible everywhere: Explorer file names, panel headers, dialog text, menus, the status-bar and welcome wordmarks, the version badge, and the release card all render dark-on-light instead of keeping their dark-theme whites and pale accents.",
+    kind: NoteKind::Feature,
+    summary: "Navigation history is now two-way: Ctrl+Shift+- goes forward along the trail Go Back walked, and Cmd+K Cmd+Q jumps to the last edit location, both also in the Command Palette and the editor context menu.",
 }];

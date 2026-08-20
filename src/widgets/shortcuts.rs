@@ -412,6 +412,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_navigate_back_key",
             },
             ShortcutEntry {
+                keys: "Ctrl+Shift+-",
+                description: "Go Forward: return along the trail Go Back walked",
+                handler: "is_navigate_forward_key",
+            },
+            ShortcutEntry {
                 keys: "Ctrl+T",
                 description: "Transpose the characters around the cursor",
                 handler: "is_transpose_key",

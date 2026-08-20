@@ -8053,6 +8053,99 @@ fn ctrl_d_with_no_anchor_stashes_selected_file() {
     assert_eq!(app.compare_anchor.as_deref(), Some(f.as_path()));
 }
 
+/// Issue #210: Go Forward. After Go Back (Ctrl+-), Ctrl+Shift+- must
+/// return to where the user came from, at the same cursor position.
+#[test]
+fn ctrl_shift_minus_goes_forward_after_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn a() {}\n").unwrap();
+    std::fs::write(
+        &b,
+        "fn b() {}\nfn b2() {}\nfn b3() {}\nfn b4() {}\nfn b5() {}\nfn b6() {}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    // Jump (records a.rs:0 on the back stack, like go-to-definition).
+    app.go_to_definition(b.clone(), 5, 0);
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    assert_eq!(app.editor.cursor_row, 5);
+    // Back returns to a.rs.
+    app.handle_key(key(KeyCode::Char('-'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    // Forward must return to b.rs:5.
+    app.handle_key(key(
+        KeyCode::Char('-'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "Ctrl+Shift+- must go forward to the jump target"
+    );
+    assert_eq!(app.editor.cursor_row, 5, "forward restores the position");
+}
+
+/// Legacy encodings fold Ctrl+- into 0x1F (`_` + CONTROL, no SHIFT); that
+/// spelling must stay Go BACK, never forward.
+#[test]
+fn legacy_ctrl_underscore_without_shift_stays_go_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn a() {}\n").unwrap();
+    std::fs::write(&b, "fn b() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.go_to_definition(b.clone(), 0, 0);
+    app.handle_key(key(KeyCode::Char('_'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "bare Ctrl+_ (legacy Ctrl+-) must still go back"
+    );
+}
+
+/// Issue #210: Go to Last Edit Location (Cmd+K Cmd+Q). After editing one
+/// file and navigating elsewhere, the chord returns to the edit point.
+#[test]
+fn cmd_k_cmd_q_jumps_to_the_last_edit_location() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn a() {}\nfn a2() {}\nfn a3() {}\n").unwrap();
+    std::fs::write(&b, "fn b() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    // Edit a.rs at row 2.
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    // Navigate away.
+    app.editor.open_pinned(&b).unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    // Cmd+K Cmd+Q returns to the edit point in a.rs.
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "Cmd+K Cmd+Q must return to the last edited file"
+    );
+    assert_eq!(app.editor.cursor_row, 2, "and to the edited row");
+}
+
 /// Issue #209: VS Code's Reopen Closed Editor. Closing a tab records it;
 /// Cmd+K Shift+W restores the most recently closed tab with its cursor
 /// position, LIFO across multiple closes.

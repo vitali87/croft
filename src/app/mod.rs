@@ -1009,6 +1009,7 @@ enum MenuAction {
     },
     /// Return to the location before the last navigation jump (#31).
     NavigateBack,
+    NavigateForward,
     /// Editor body: LSP "Quick Fix" of the position at buffer `(row, col)`.
     QuickFixAt {
         row: usize,
@@ -1181,6 +1182,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::GoToDefinitionAt { .. } => Some("F12"),
         MenuAction::GoToReferencesAt { .. } => Some("⇧F12"),
         MenuAction::NavigateBack => Some("⌃-"),
+        MenuAction::NavigateForward => Some("⌃⇧-"),
         MenuAction::QuickFixAt { .. } => Some("⌘."),
         MenuAction::GoToDeclarationAt { .. } => Some("⌃⇧F12"),
         MenuAction::GoToTypeDefinitionAt { .. } => Some("⌃F12"),
@@ -8598,8 +8600,21 @@ impl App {
         Ok(())
     }
 
+    /// The active editor's position as a NavLoc, for threading through
+    /// back/forward so the walk is reversible. None on file-less surfaces
+    /// (welcome screen, image tabs without a path).
+    fn current_nav_loc(&self) -> Option<NavLoc> {
+        let path = self.editor.path.clone()?;
+        Some(NavLoc {
+            path,
+            row: self.editor.cursor_row,
+            col: self.editor.cursor_col,
+        })
+    }
+
     fn nav_back(&mut self) {
-        let Some(loc) = self.nav.back() else {
+        let current = self.current_nav_loc();
+        let Some(loc) = self.nav.back(current) else {
             self.status = "No previous location".to_string();
             return;
         };
@@ -8609,6 +8624,68 @@ impl App {
                 self.status = format!("Back to {} line {}", self.status_path(&loc.path), line + 1)
             }
             Err(e) => self.status = format!("Go back failed: {e}"),
+        }
+    }
+
+    /// VS Code "Go Forward" (Ctrl+Shift+-): return along the trail Go Back
+    /// walked, restoring the position each back step left.
+    fn nav_forward(&mut self) {
+        let current = self.current_nav_loc();
+        let Some(loc) = self.nav.forward(current) else {
+            self.status = "No forward location".to_string();
+            return;
+        };
+        let line = loc.row;
+        match self.open_at(&loc.path, loc.row, loc.col) {
+            Ok(()) => {
+                self.status = format!(
+                    "Forward to {} line {}",
+                    self.status_path(&loc.path),
+                    line + 1
+                )
+            }
+            Err(e) => self.status = format!("Go forward failed: {e}"),
+        }
+    }
+
+    /// VS Code "Go to Last Edit Location" (Cmd+K Cmd+Q): jump to the most
+    /// recent buffer edit across the open editors, threading the current
+    /// position onto the back stack so Ctrl+- returns. The location lives
+    /// on each editor (`last_edit_pos`), so an edit in a background split
+    /// counts too; a buffer closed since its edit takes its location with
+    /// it, like the rest of its view state.
+    fn goto_last_edit_location(&mut self) {
+        let mut best: Option<(std::time::Instant, NavLoc)> = None;
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        for group in groups {
+            for ed in &group.editors {
+                let (Some(at), Some((row, col)), Some(path)) =
+                    (ed.last_edit_at, ed.last_edit_pos, ed.path.clone())
+                else {
+                    continue;
+                };
+                if best.as_ref().is_none_or(|(b, _)| at > *b) {
+                    best = Some((at, NavLoc { path, row, col }));
+                }
+            }
+        }
+        let Some((_, loc)) = best else {
+            self.status = String::from("No edits this session");
+            return;
+        };
+        if let Some(cur) = self.current_nav_loc() {
+            self.nav.record(cur);
+        }
+        let line = loc.row;
+        match self.open_at(&loc.path, loc.row, loc.col) {
+            Ok(()) => {
+                self.status = format!(
+                    "Last edit: {} line {}",
+                    self.status_path(&loc.path),
+                    line + 1
+                )
+            }
+            Err(e) => self.status = format!("Go to last edit failed: {e}"),
         }
     }
 
@@ -14004,6 +14081,15 @@ impl App {
             // streamed text.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'x') => {
                 self.collab_cancel_stream();
+                true
+            }
+            // Cmd+K Cmd+Q: Go to Last Edit Location (VS Code's chord; the
+            // second key carries Cmd, which keeps it distinct from the
+            // navigator's plain Cmd+K Q below).
+            KeyCode::Char(c)
+                if c.eq_ignore_ascii_case(&'q') && key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
+                self.goto_last_edit_location();
                 true
             }
             // Cmd+K Q: ask the navigator about the caret line, or the
@@ -20708,6 +20794,10 @@ impl App {
         // VS Code "Go Back" (Ctrl+-): the keyboard twin of the
         // Ctrl+Shift+click chord, so navigation history is reachable
         // without depending on the host terminal's mouse delivery (#31).
+        if is_navigate_forward_key(key) {
+            self.nav_forward();
+            return;
+        }
         if is_navigate_back_key(key) {
             self.nav_back();
             return;
@@ -24943,6 +25033,8 @@ impl App {
             Cmd::GoToSymbol => self.open_go_to_symbol(),
             Cmd::GoToWorkspaceSymbol => self.open_workspace_symbols(""),
             Cmd::NavigateBack => self.nav_back(),
+            Cmd::NavigateForward => self.nav_forward(),
+            Cmd::GoToLastEditLocation => self.goto_last_edit_location(),
             Cmd::ToggleVimMode => self.toggle_vim_mode(),
             Cmd::ShowExplorer => self.set_sidebar_view(SidebarView::Explorer),
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
@@ -27757,6 +27849,7 @@ impl App {
                         ));
                     }
                     items.push((String::from("Go Back"), MenuAction::NavigateBack));
+                    items.push((String::from("Go Forward"), MenuAction::NavigateForward));
                     items.push((
                         String::from("Rename Symbol"),
                         MenuAction::RenameSymbolAt { row, col },
@@ -30959,6 +31052,7 @@ impl App {
                 self.start_change_all_occurrences();
             }
             MenuAction::NavigateBack => self.nav_back(),
+            MenuAction::NavigateForward => self.nav_forward(),
             MenuAction::GoToDefinitionAt { row, col } => {
                 self.editor.cursor_row = row;
                 self.editor.cursor_col = col;
@@ -34624,6 +34718,23 @@ fn is_navigate_back_key(key: KeyEvent) -> bool {
     };
     (c == '-' || c == '_')
         && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// VS Code "Go Forward" (Ctrl+Shift+-). Only the explicitly SHIFT-tagged
+/// spellings count: the kitty protocol reports the chord as `-` (or the
+/// shifted `_`) with CONTROL|SHIFT, while the legacy 0x1F byte decodes as
+/// `_` + CONTROL with no SHIFT and must stay Go Back (a legacy host cannot
+/// distinguish Ctrl+- from Ctrl+Shift+-, and Back is the safer meaning).
+fn is_navigate_forward_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    (c == '-' || c == '_')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
         && !key.modifiers.contains(KeyModifiers::SUPER)
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
