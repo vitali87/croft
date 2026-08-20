@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "The PROBLEMS panel takes a free-text filter: with the tab focused, type to narrow diagnostics by message or file path (composing with the severity filter), Backspace pops a character, and Esc clears before handing focus back to the editor.",
+    summary: "Auto Save gains VS Code's onFocusChange mode: with it on, a dirty buffer writes itself the moment it loses focus (the editor pane handing focus away, or the active tab changing), independently of the existing after-delay mode.",
 }];

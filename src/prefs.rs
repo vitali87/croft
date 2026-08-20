@@ -158,6 +158,12 @@ pub struct Prefs {
     /// default, matching VS Code.
     #[serde(default)]
     pub auto_save: bool,
+    /// When true, a dirty buffer writes itself the moment it loses focus
+    /// (VS Code's `files.autoSave: onFocusChange`): the editor pane losing
+    /// focus, or the active tab changing. Independent of `auto_save`, so
+    /// both can be on. Off by default, matching VS Code.
+    #[serde(default)]
+    pub auto_save_on_focus_change: bool,
     /// Opt-out for the GitLens-style current-line inline blame annotation,
     /// which is on by default. Stored as the disable flag (like
     /// `suppress_terminal_warning`) so the derived `Default` and an older
@@ -362,6 +368,15 @@ pub fn save_auto_save(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.auto_save = enabled;
+    prefs.save(&path)
+}
+
+/// Persist the on-focus-change auto-save choice, preserving other
+/// settings. Best-effort, like [`save_auto_save`].
+pub fn save_auto_save_on_focus_change(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.auto_save_on_focus_change = enabled;
     prefs.save(&path)
 }
 

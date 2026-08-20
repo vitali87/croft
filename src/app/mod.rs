@@ -2060,6 +2060,14 @@ pub struct App {
     /// VS Code's `files.autoSave: afterDelay`: dirty buffers write
     /// themselves to disk once the delay elapses after the last edit.
     auto_save: bool,
+    /// VS Code's `files.autoSave: onFocusChange`: a dirty buffer writes
+    /// itself the moment it loses focus. Independent of `auto_save`.
+    pub auto_save_on_focus_change: bool,
+    /// The focus signature (pane, group, active path) seen by the last
+    /// auto-save tick. A change means something lost focus, which is the
+    /// only trigger `onFocusChange` fires on. `None` until the first tick
+    /// so opening croft never writes anything on its own.
+    last_focus_signature: Option<(usize, usize, Option<PathBuf>)>,
     /// Latch set while a save is waiting on a format reply. `drain_lsp_format`
     /// consumes it to write the (now formatted) buffer to disk.
     save_after_format: Option<PathBuf>,
@@ -3643,6 +3651,8 @@ impl App {
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
             auto_save: loaded_prefs.auto_save,
+            auto_save_on_focus_change: loaded_prefs.auto_save_on_focus_change,
+            last_focus_signature: None,
             save_after_format: None,
             outline,
             open_editors,
@@ -19287,6 +19297,7 @@ impl App {
                     "toggle:format_on_save" => self.toggle_format_on_save(),
                     "toggle:auto_close_pairs" => self.toggle_auto_close_pairs(),
                     "toggle:auto_save" => self.toggle_auto_save(),
+                    "toggle:auto_save_on_focus_change" => self.toggle_auto_save_on_focus_change(),
                     "toggle:inline_blame" => self.toggle_inline_blame(),
                     "toggle:indent_guides" => self.toggle_indent_guides(),
                     "toggle:bracket_colors" => self.toggle_bracket_colors(),
@@ -19347,6 +19358,13 @@ impl App {
             ListRow {
                 id: String::from("toggle:auto_save"),
                 label: format!("Auto Save: {}", on_off(self.auto_save)),
+            },
+            ListRow {
+                id: String::from("toggle:auto_save_on_focus_change"),
+                label: format!(
+                    "Auto Save on Focus Change: {}",
+                    on_off(self.auto_save_on_focus_change)
+                ),
             },
             ListRow {
                 id: String::from("toggle:inline_blame"),
@@ -24967,6 +24985,7 @@ impl App {
             Cmd::FormatDocument => self.start_format_document(),
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
+            Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
             Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
             Cmd::ToggleBracketColors => self.toggle_bracket_colors(),
@@ -29646,10 +29665,46 @@ impl App {
     /// Runs every frame; returns true when anything was saved so the
     /// caller redraws (dirty markers, badges, status).
     pub fn tick_auto_save(&mut self) -> bool {
-        if !self.auto_save {
-            return false;
+        // `onFocusChange` fires on the transition, so the signature is
+        // sampled every tick regardless of which modes are enabled.
+        let focus_changed = self.note_focus_signature();
+        let mut changed = false;
+        if self.auto_save_on_focus_change && focus_changed {
+            changed = self.sweep_auto_save(false);
         }
+        if self.auto_save {
+            changed |= self.sweep_auto_save(true);
+        }
+        changed
+    }
+
+    /// Sample the current focus (pane, active tab, active path) and report
+    /// whether it moved since the last sample. The first sample never
+    /// counts as a change, so launching croft writes nothing on its own.
+    fn note_focus_signature(&mut self) -> bool {
+        let pane = match self.focus {
+            Pane::Tree => 0usize,
+            Pane::Editor => 1,
+            Pane::Terminal => 2,
+        };
+        let sig = (pane, self.editor.active_index(), self.editor.path.clone());
+        match self.last_focus_signature.replace(sig.clone()) {
+            None => false,
+            Some(prev) => prev != sig,
+        }
+    }
+
+    /// The shared auto-save sweep. `require_delay` selects the mode:
+    /// `afterDelay` waits out [`Self::AUTO_SAVE_DELAY`] since the last
+    /// edit and writes every dirty buffer; `onFocusChange` writes
+    /// immediately but skips the editor that currently HAS focus (it has
+    /// not lost it yet). Returns true when anything changed on screen.
+    fn sweep_auto_save(&mut self, require_delay: bool) -> bool {
         let mut saved_paths: Vec<PathBuf> = Vec::new();
+        // The tab that still holds focus is not saved by the focus-change
+        // mode: only buffers that LOST focus are written.
+        let keep_focused =
+            (!require_delay && self.focus == Pane::Editor).then(|| self.editor.active_index());
         // Collab guests never write shared (workspace) files; the session
         // owner is the single writer (docs/MULTIPLAYER.md, Phase D).
         let guest = self.is_collab_guest();
@@ -29673,15 +29728,21 @@ impl App {
                     && e.path
                         .as_ref()
                         .is_some_and(|p| collab_file_key(&root, p).is_some()))
-                && e.last_edit_at
-                    .is_some_and(|t| t.elapsed() >= Self::AUTO_SAVE_DELAY)
+                && (!require_delay
+                    || e.last_edit_at
+                        .is_some_and(|t| t.elapsed() >= Self::AUTO_SAVE_DELAY))
         };
         let mut conflicted: Vec<PathBuf> = Vec::new();
         // "name (encoding)" per refused tab: the refusal message names each
         // tab's OWN encoding, which need not be the active tab's.
         let mut lossy: Vec<String> = Vec::new();
-        let mut sweep = |editors: &mut [crate::widgets::editor::Editor]| {
-            for e in editors.iter_mut().filter(|e| due(e)) {
+        let mut sweep = |editors: &mut [crate::widgets::editor::Editor], skip: Option<usize>| {
+            for (i, e) in editors
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, e)| Some(*i) != skip && due(e))
+            {
+                let _ = i;
                 // `save_to_disk` re-checks the disk and flags (never
                 // overwrites) an external change; auto save must not
                 // arm the force-overwrite path an explicit Cmd+S offers.
@@ -29714,9 +29775,9 @@ impl App {
                 }
             }
         };
-        sweep(&mut self.editor.editors);
+        sweep(&mut self.editor.editors, keep_focused);
         for group in self.editor_layout.inactive_groups_mut() {
-            sweep(&mut group.editors);
+            sweep(&mut group.editors, None);
         }
         let had_conflicts = !conflicted.is_empty();
         if had_conflicts {
@@ -29763,6 +29824,20 @@ impl App {
         };
         if !cfg!(test) {
             let _ = crate::prefs::save_auto_save(self.auto_save);
+        }
+    }
+
+    /// Flip `files.autoSave: onFocusChange` and persist it, like
+    /// [`Self::toggle_auto_save`] does for the delay mode.
+    fn toggle_auto_save_on_focus_change(&mut self) {
+        self.auto_save_on_focus_change = !self.auto_save_on_focus_change;
+        self.status = if self.auto_save_on_focus_change {
+            String::from("Auto Save on Focus Change: on")
+        } else {
+            String::from("Auto Save on Focus Change: off")
+        };
+        if !cfg!(test) {
+            let _ = crate::prefs::save_auto_save_on_focus_change(self.auto_save_on_focus_change);
         }
     }
 
