@@ -117,6 +117,10 @@ pub enum ProblemHit {
     Diagnostic { path: PathBuf, line: u32, col: u32 },
 }
 
+/// How many trailing characters of the free-text filter the toolbar
+/// chip shows. The filter itself is unbounded; only its display is.
+const FILTER_CHIP_CHARS: usize = 24;
+
 pub struct ProblemsPanel {
     groups: Vec<ProblemGroup>,
     collapsed: HashSet<PathBuf>,
@@ -557,13 +561,26 @@ impl ProblemsPanel {
         let accent = self.theme.accent();
         let chip = self.theme.accent_chip_bg();
 
+        // The chip carries user-typed text, so bound what it shows: the
+        // last FILTER_CHIP_CHARS characters (the tail is what the user is
+        // typing). Unbounded, a long filter would push the toolbar's other
+        // control off the row, and a wide-glyph filter would measure short
+        // against the codebase's chars()-count convention (see
+        // `sheet::display_width`) and be clipped mid-render.
+        let shown_filter: String = {
+            let n = self.text_filter.chars().count();
+            self.text_filter
+                .chars()
+                .skip(n.saturating_sub(FILTER_CHIP_CHARS))
+                .collect()
+        };
         let filter_label = if self.text_filter.is_empty() {
             format!(" {} \u{25be} ", self.filter.label())
         } else {
             format!(
                 " {} \u{25be} \u{eb85} {} ",
                 self.filter.label(),
-                self.text_filter
+                shown_filter
             )
         };
         let group_label = format!(
@@ -725,6 +742,44 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// Review round 1: the toolbar chip carries user text, so a long or
+    /// wide-glyph filter must not push the group toggle off the row or
+    /// overflow the panel. The chip shows a bounded tail and both
+    /// controls still render inside the area.
+    #[test]
+    fn a_long_or_wide_filter_keeps_the_toolbar_inside_the_panel() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![diag(0, DiagnosticSeverity::Error, "boom")],
+        )]);
+        for c in "\u{5e83}\u{3044}\u{6587}\u{5b57}".repeat(20).chars() {
+            p.push_filter_char(c);
+        }
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        // Every painted cell stays inside the buffer (a render that ran
+        // past `area` would have panicked above), and the severity label
+        // is still visible on the toolbar row beside the bounded filter.
+        let row: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            row.contains("All"),
+            "the severity control must survive a long filter, got {row:?}"
+        );
+        assert!(
+            p.text_filter.chars().count() > FILTER_CHIP_CHARS,
+            "the filter itself stays unbounded; only its display is capped"
+        );
     }
 
     /// Issue #212: the free-text filter narrows by message AND path
