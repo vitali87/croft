@@ -18508,6 +18508,92 @@ fn the_output_view_renders_a_pushed_channel_line() {
     );
 }
 
+/// Issue #215: text in the rendered Markdown view must be selectable.
+/// A drag over the preview selects what is on screen, Cmd+C copies the
+/// RENDERED text (not the source), and Esc clears the selection.
+#[test]
+fn dragging_in_the_markdown_preview_selects_and_copies_rendered_text() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let md = tmp.path().join("doc.md");
+    std::fs::write(&md, "# Heading\n\nSome rendered body text here.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&md).unwrap();
+    app.focus_pane(Pane::Editor);
+    // Cmd+Shift+V flips to the rendered preview.
+    app.handle_key(key(
+        KeyCode::Char('v'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(
+        app.editor.markdown_preview.is_some(),
+        "the preview must be up"
+    );
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    // Find the rendered row carrying the body text and drag across it.
+    let (area, row_idx, text) = {
+        let md = app.editor.markdown_preview.as_ref().unwrap();
+        let (i, t) = md
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.contains("rendered body"))
+            .map(|(i, r)| (i as u16, r.clone()))
+            .expect("the body text must be rendered");
+        (md.last_area, i, t)
+    };
+    let start_col = text.find("rendered").unwrap() as u16;
+    let end_col = start_col + "rendered".len() as u16 - 1;
+    let y = area.y + row_idx;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + start_col,
+        y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        area.x + end_col,
+        y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x + end_col,
+        y,
+    ));
+    assert_eq!(
+        app.editor
+            .markdown_preview
+            .as_ref()
+            .map(|md| md.selection_text())
+            .unwrap_or_default(),
+        "rendered",
+        "the drag must select the rendered word under the pointer"
+    );
+    // The selection paints: re-render and check the tinted cell.
+    term.draw(|frame| app.render(frame)).unwrap();
+    let sel_bg = app.theme.selection();
+    assert_eq!(
+        term.backend().buffer()[(area.x + start_col, y)].bg,
+        sel_bg,
+        "the selected cell must wear the selection background"
+    );
+    // Esc clears it.
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !app.editor
+            .markdown_preview
+            .as_ref()
+            .map(|md| md.has_selection())
+            .unwrap_or(false),
+        "Esc clears the preview selection"
+    );
+}
+
 /// Issue #212: typing in the focused Problems panel filters diagnostics
 /// by text; Backspace pops a character; Esc clears the filter before it
 /// gives the pane back to the editor.
@@ -20994,6 +21080,7 @@ fn age_last_edit(e: &mut crate::widgets::editor::Editor) {
 fn auto_save_on_focus_change_writes_when_the_editor_loses_focus() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.auto_save = false;
     app.auto_save_on_focus_change = true;
     app.focus_pane(Pane::Editor);
     app.tick_auto_save(); // settle the focus signature
@@ -21026,6 +21113,7 @@ fn auto_save_on_focus_change_writes_the_tab_that_lost_focus() {
     std::fs::write(&a, "aaa").unwrap();
     std::fs::write(&b, "bbb").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
     app.auto_save_on_focus_change = true;
     app.editor.open_pinned(&a).unwrap();
     app.focus_pane(Pane::Editor);
@@ -21048,6 +21136,10 @@ fn auto_save_on_focus_change_writes_the_tab_that_lost_focus() {
 fn focus_changes_do_not_save_when_the_mode_is_off() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    // Pin both modes off explicitly: App::new loads the developer's real
+    // prefs, so asserting a DEFAULT here would depend on machine state.
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
     app.focus_pane(Pane::Editor);
     app.tick_auto_save();
     app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))

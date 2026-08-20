@@ -3542,6 +3542,9 @@ impl Editor {
         self.hex = None;
         self.archive = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
+            rows: Vec::new(),
+            selection: None,
+            dragging: false,
             lines,
             scroll: 0,
             built_seq: self.edit_seq,
@@ -3604,6 +3607,9 @@ impl Editor {
         self.hex = None;
         self.archive = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
+            rows: Vec::new(),
+            selection: None,
+            dragging: false,
             lines,
             scroll: 0,
             built_seq: self.edit_seq,
@@ -4518,6 +4524,9 @@ impl Editor {
             base.as_deref(),
         );
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
+            rows: Vec::new(),
+            selection: None,
+            dragging: false,
             lines,
             scroll: 0,
             built_seq: self.edit_seq,
@@ -4555,6 +4564,9 @@ impl Editor {
             return false;
         };
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
+            rows: Vec::new(),
+            selection: None,
+            dragging: false,
             lines,
             scroll: 0,
             built_seq: self.edit_seq,
@@ -10086,6 +10098,32 @@ impl Editor {
         }
         md.last_area = text_area;
         para.scroll((md.scroll, 0)).render(text_area, buf);
+        // Frame truth for selection (#215): the rendered view is a wrapped
+        // Paragraph, so the only faithful record of what the user sees is
+        // the cells we just painted. Read them back per row, then tint the
+        // selected span.
+        md.rows = (0..text_area.height)
+            .map(|dy| {
+                let row: String = (0..text_area.width)
+                    .map(|dx| {
+                        buf[(text_area.x + dx, text_area.y + dy)]
+                            .symbol()
+                            .to_string()
+                    })
+                    .collect();
+                row.trim_end().to_string()
+            })
+            .collect();
+        if md.has_selection() {
+            let sel_bg = self.theme.selection();
+            for dy in 0..text_area.height {
+                for dx in 0..text_area.width {
+                    if md.cell_selected(dy, dx) {
+                        buf[(text_area.x + dx, text_area.y + dy)].set_bg(sel_bg);
+                    }
+                }
+            }
+        }
         if let Some(metrics) = scrollbar::vertical_metrics(
             Rect {
                 x: inner.x + inner.width.saturating_sub(1),
