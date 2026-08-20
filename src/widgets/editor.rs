@@ -1665,7 +1665,12 @@ pub fn detect_indentation(lines: &[String]) -> Option<IndentStyle> {
     let mut min_run = usize::MAX;
     for line in lines.iter().take(10_000) {
         if line.starts_with('\t') {
-            tab_lines += 1;
+            // Whitespace-only lines carry no intent, same as the space
+            // branch below: a blank line with leftover tab indentation
+            // must not vote.
+            if line.chars().any(|c| !c.is_whitespace()) {
+                tab_lines += 1;
+            }
             continue;
         }
         let depth = line.chars().take_while(|&c| c == ' ').count();
@@ -21009,6 +21014,16 @@ mod tests {
             Some(IndentStyle {
                 width: 4,
                 use_spaces: false
+            })
+        );
+        // Whitespace-only lines carry no intent on EITHER side: tab-only
+        // blank lines must not outvote real space indentation (review
+        // round 1).
+        assert_eq!(
+            detect_indentation(&lines(&["a {", "  b;", "  c;", "\t", "\t\t", "\t \t", "}"])),
+            Some(IndentStyle {
+                width: 2,
+                use_spaces: true
             })
         );
     }
