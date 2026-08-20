@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "The rendered Markdown / document preview is selectable: drag to select what is on screen, Cmd/Ctrl+C copies the rendered text rather than the source, and Esc clears the selection.",
+    summary: "Stage and unstage selected lines: drag a selection inside a Source Control diff and S / U now act on exactly those lines instead of the whole hunk, so one mixed hunk can be split across several commits.",
 }];

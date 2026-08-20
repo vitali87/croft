@@ -181,8 +181,8 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `Enter` | Commit all tracked changes with the message |
 | Click ✓ Commit | Same as `Enter` |
 | Click a change row | Open that file's diff against HEAD in a read-only editor tab |
-| `S` in a diff tab | Stage only the change hunk under the cursor (click a row or `F7` to pick the hunk) |
-| `U` in a diff tab | Unstage only the change hunk under the cursor |
+| `S` in a diff tab | Stage only the change hunk under the cursor (click a row or `F7` to pick the hunk). With a selection dragged across rows, stages only the SELECTED lines instead (VS Code's Stage Selected Ranges): unselected additions stay out of the index and unselected deletions stay in it |
+| `U` in a diff tab | Unstage only the change hunk under the cursor, or only the selected lines when a selection spans rows |
 | `R` in a diff tab | Revert only the change hunk under the cursor after a `Y`/`N` confirm modal |
 | `F7` / `Shift`+`F7` in a diff tab | Jump to the next / previous change hunk |
 | Command Palette: `Git: Toggle Inline Blame` | Show/hide the GitLens-style current-line blame annotation (author, age, summary trailing the cursor's line; on by default, persisted) |

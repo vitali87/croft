@@ -954,6 +954,169 @@ impl DiffData {
     /// header). Because `git apply` verifies a hunk against its context
     /// (with offset search), the same patch stages (`--cached`), unstages
     /// (`--cached -R`) or reverts (`-R`) that one hunk.
+    /// A patch that stages ONLY the rows in `sel` (VS Code's "Stage
+    /// Selected Ranges"), with every other row of the surrounding hunk
+    /// represented as the index already has it: an unselected `+` is
+    /// dropped (it is not being staged) and an unselected `-` becomes a
+    /// context line (that line still exists in HEAD). Applied with `-R`
+    /// the same patch unstages exactly those lines.
+    ///
+    /// `None` when the range covers no changed row, so the caller can
+    /// fall back to the whole-hunk action.
+    pub fn selected_lines_patch(&self, rel_path: &str, sel: (usize, usize)) -> Option<String> {
+        const CTX: usize = 3;
+        let (sel_start, sel_end) = (sel.0.min(sel.1), sel.0.max(sel.1));
+        let selected = |i: usize| i >= sel_start && i <= sel_end;
+        let is_change = |i: usize| !matches!(self.rows.get(i), Some(DiffRow::Equal { .. }) | None);
+        if !(sel_start..=sel_end.min(self.rows.len().saturating_sub(1))).any(is_change) {
+            return None;
+        }
+        // Widen to the enclosing change run so the patch carries the whole
+        // hunk (with the unselected rows neutralised), then add context.
+        let mut hs = sel_start;
+        while hs > 0 && is_change(hs - 1) {
+            hs -= 1;
+        }
+        let mut he = sel_end.min(self.rows.len().saturating_sub(1));
+        while he + 1 < self.rows.len() && is_change(he + 1) {
+            he += 1;
+        }
+        let s = hs.saturating_sub(CTX);
+        let e = (he + CTX).min(self.rows.len().saturating_sub(1));
+        const NO_NL: &str = "\\ No newline at end of file";
+        let left_line = |sig: char, i: usize| {
+            let cr = if self.left_crlf.get(i).copied().unwrap_or(false) {
+                "\r"
+            } else {
+                ""
+            };
+            format!("{sig}{}{cr}", self.left_lines[i])
+        };
+        let right_line = |sig: char, i: usize| {
+            let cr = if self.right_crlf.get(i).copied().unwrap_or(false) {
+                "\r"
+            } else {
+                ""
+            };
+            format!("{sig}{}{cr}", self.right_lines[i])
+        };
+        let left_last = |i: usize| i + 1 == self.left_lines.len() && self.left_no_final_nl;
+        let right_last = |i: usize| i + 1 == self.right_lines.len() && self.right_no_final_nl;
+        let mut old_start: Option<usize> = None;
+        let mut new_start: Option<usize> = None;
+        let mut old_count = 0usize;
+        let mut new_count = 0usize;
+        let mut body: Vec<String> = Vec::new();
+        let mut minus: Vec<String> = Vec::new();
+        let mut plus: Vec<String> = Vec::new();
+        // Emit a HEAD line as context: it exists on both sides of this
+        // patch, because the change touching it is not being staged.
+        // Emit a HEAD line as context: the change touching it is not being
+        // staged, so it exists unchanged on both sides of THIS patch.
+        // Only the old-side start is recorded here; the new side's start
+        // is derived below (an unselected change contributes no new-side
+        // line number of its own).
+        let push_context_left = |i: usize,
+                                 body: &mut Vec<String>,
+                                 old_start: &mut Option<usize>,
+                                 old_count: &mut usize,
+                                 new_count: &mut usize| {
+            old_start.get_or_insert(i + 1);
+            *old_count += 1;
+            *new_count += 1;
+            body.push(left_line(' ', i));
+            if left_last(i) {
+                body.push(NO_NL.into());
+            }
+        };
+        for i in s..=e {
+            match self.rows[i] {
+                DiffRow::Equal { left, right } => {
+                    body.append(&mut minus);
+                    body.append(&mut plus);
+                    old_start.get_or_insert(left + 1);
+                    new_start.get_or_insert(right + 1);
+                    old_count += 1;
+                    new_count += 1;
+                    body.push(left_line(' ', left));
+                    if left_last(left) && right_last(right) {
+                        body.push(NO_NL.into());
+                    }
+                }
+                DiffRow::Removed { left } => {
+                    if selected(i) {
+                        old_start.get_or_insert(left + 1);
+                        old_count += 1;
+                        minus.push(left_line('-', left));
+                        if left_last(left) {
+                            minus.push(NO_NL.into());
+                        }
+                    } else {
+                        body.append(&mut minus);
+                        body.append(&mut plus);
+                        push_context_left(
+                            left,
+                            &mut body,
+                            &mut old_start,
+                            &mut old_count,
+                            &mut new_count,
+                        );
+                    }
+                }
+                DiffRow::Added { right } => {
+                    if selected(i) {
+                        new_start.get_or_insert(right + 1);
+                        new_count += 1;
+                        plus.push(right_line('+', right));
+                        if right_last(right) {
+                            plus.push(NO_NL.into());
+                        }
+                    }
+                    // An unselected addition simply does not exist in the
+                    // index-to-be: nothing to emit.
+                }
+                DiffRow::Replaced { left, right } => {
+                    if selected(i) {
+                        old_start.get_or_insert(left + 1);
+                        new_start.get_or_insert(right + 1);
+                        old_count += 1;
+                        new_count += 1;
+                        minus.push(left_line('-', left));
+                        if left_last(left) {
+                            minus.push(NO_NL.into());
+                        }
+                        plus.push(right_line('+', right));
+                        if right_last(right) {
+                            plus.push(NO_NL.into());
+                        }
+                    } else {
+                        body.append(&mut minus);
+                        body.append(&mut plus);
+                        push_context_left(
+                            left,
+                            &mut body,
+                            &mut old_start,
+                            &mut old_count,
+                            &mut new_count,
+                        );
+                    }
+                }
+            }
+        }
+        body.append(&mut minus);
+        body.append(&mut plus);
+        let old_start = old_start.unwrap_or(1);
+        // No selected change contributed a new-side start, which happens
+        // when the patch opens on context (including a neutralised
+        // unselected change): the two sides are still in step there, so
+        // the old-side number is also the new-side one.
+        let new_start = new_start.unwrap_or(old_start);
+        Some(format!(
+            "--- a/{rel_path}\n+++ b/{rel_path}\n@@ -{old_start},{old_count} +{new_start},{new_count} @@\n{}\n",
+            body.join("\n")
+        ))
+    }
+
     pub fn hunk_patch(&self, rel_path: &str, range: (usize, usize)) -> String {
         const CTX: usize = 3;
         let (hs, he) = range;
@@ -1553,6 +1716,161 @@ mod tests {
         if let Err(e) = git_apply_check(&root, &patch) {
             panic!("git apply rejected the patch:\n{patch}\n{e}");
         }
+    }
+
+    /// Issue #214: stage only the SELECTED lines. Rows outside the
+    /// selection must be represented as the index already has them: an
+    /// unselected `+` is dropped (it is not being staged), an unselected
+    /// `-` becomes context (that line still exists in HEAD).
+    /// The patch must not just LOOK right: git has to accept it and the
+    /// index must end up holding exactly the selected line. Runs a real
+    /// repo end to end (issue #214).
+    /// The risky shape: the patch opens on an UNSELECTED change (no
+    /// leading context to anchor the line numbers). git must still accept
+    /// it and stage only the selected line.
+    #[test]
+    fn git_accepts_a_patch_that_opens_on_an_unselected_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let head = "a\nb\nc\n";
+        let work = "X\nY\nc\n";
+        git_repo_with(root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(root, head, work);
+        // Rows 0 and 1 are both changes; select only the SECOND.
+        let patch = d.selected_lines_patch("f.txt", (1, 1)).unwrap();
+        if let Err(e) = git_apply_check(root, &patch) {
+            panic!("git rejected the patch:\n{patch}\n{e}");
+        }
+        let applied = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "apply", "--cached"])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.take().unwrap().write_all(patch.as_bytes())?;
+                c.wait()
+            })
+            .map(|st| st.success())
+            .unwrap_or(false);
+        assert!(applied, "git apply --cached must succeed for:\n{patch}");
+        let staged = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "show", ":f.txt"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout),
+            "a\nY\nc\n",
+            "the unselected first change must stay out of the index"
+        );
+    }
+
+    #[test]
+    fn git_accepts_a_selected_lines_patch_and_stages_only_those_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let head = "a\nb\nc\nd\n";
+        let work = "a\nX\nY\nd\n";
+        git_repo_with(root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(root, head, work);
+        // Row 1 is b -> X; row 2 is c -> Y. Stage only the first.
+        let patch = d.selected_lines_patch("f.txt", (1, 1)).unwrap();
+        if let Err(e) = git_apply_check(root, &patch) {
+            panic!("git rejected the selected-lines patch:\n{patch}\n{e}");
+        }
+        let ok = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "apply", "--cached"])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.take().unwrap().write_all(patch.as_bytes())?;
+                c.wait()
+            })
+            .map(|st| st.success())
+            .unwrap_or(false);
+        assert!(ok, "git apply --cached must succeed for:\n{patch}");
+        // The staged blob holds the FIRST change only: X applied, c intact.
+        let staged = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "show", ":f.txt"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout),
+            "a\nX\nc\nd\n",
+            "only the selected line may reach the index"
+        );
+    }
+
+    #[test]
+    fn selected_lines_patch_keeps_unselected_changes_out_of_the_index() {
+        // HEAD: a b c d ; work: a X Y d  -> two independent changes.
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d"]),
+            lines(&["a", "X", "Y", "d"]),
+        );
+        // Select just the first changed row (b -> X).
+        let patch = d
+            .selected_lines_patch("f.txt", (1, 1))
+            .expect("the selection covers a change");
+        assert_eq!(
+            patch, "--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,4 @@\n a\n-b\n+X\n c\n d\n",
+            "only the selected replacement is staged; the unselected c->Y \
+             leaves c as context and drops Y"
+        );
+    }
+
+    #[test]
+    fn selected_lines_patch_stages_one_added_line_of_several() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b"]),
+            lines(&["a", "x", "y", "b"]),
+        );
+        // Rows: 0 Equal(a), 1 Added(x), 2 Added(y), 3 Equal(b).
+        let patch = d
+            .selected_lines_patch("f.txt", (1, 1))
+            .expect("the selection covers the first addition");
+        assert_eq!(
+            patch, "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,3 @@\n a\n+x\n b\n",
+            "the unselected second addition must not reach the index"
+        );
+    }
+
+    #[test]
+    fn selected_lines_patch_stages_one_deletion_of_several() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d"]),
+            lines(&["a", "d"]),
+        );
+        // Rows: 0 Equal(a), 1 Removed(b), 2 Removed(c), 3 Equal(d).
+        let patch = d
+            .selected_lines_patch("f.txt", (1, 1))
+            .expect("the selection covers the first deletion");
+        assert_eq!(
+            patch, "--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,3 @@\n a\n-b\n c\n d\n",
+            "the unselected deletion stays in the index as context"
+        );
+    }
+
+    #[test]
+    fn selected_lines_patch_is_none_without_a_change_in_range() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c"]),
+            lines(&["a", "B", "c"]),
+        );
+        // Row 0 is context only.
+        assert!(d.selected_lines_patch("f.txt", (0, 0)).is_none());
     }
 
     #[test]
