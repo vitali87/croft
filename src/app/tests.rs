@@ -20987,6 +20987,76 @@ fn age_last_edit(e: &mut crate::widgets::editor::Editor) {
     e.last_edit_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(5));
 }
 
+/// Issue #213: files.autoSave onFocusChange. With the mode on, moving
+/// focus off the editor writes the dirty buffer immediately, without
+/// waiting for the afterDelay timer (which stays off here).
+#[test]
+fn auto_save_on_focus_change_writes_when_the_editor_loses_focus() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.auto_save_on_focus_change = true;
+    app.focus_pane(Pane::Editor);
+    app.tick_auto_save(); // settle the focus signature
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.dirty);
+    assert!(
+        !app.tick_auto_save(),
+        "no focus change yet, and the delay mode is off"
+    );
+    assert!(app.editor.dirty, "still dirty while focus has not moved");
+    // Focus leaves the editor: the buffer must be written on the next tick.
+    app.focus_pane(Pane::Terminal);
+    assert!(app.tick_auto_save(), "losing focus saves the buffer");
+    assert!(!app.editor.dirty, "saving clears the dirty flag");
+    let on_disk = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert!(
+        on_disk.contains('x'),
+        "the edit must be on disk: {on_disk:?}"
+    );
+}
+
+/// Switching tabs saves the tab that lost focus, and leaves the newly
+/// focused (untouched) tab alone.
+#[test]
+fn auto_save_on_focus_change_writes_the_tab_that_lost_focus() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save_on_focus_change = true;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.tick_auto_save();
+    app.handle_key(key(KeyCode::Char('Z'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.dirty, "a.txt is dirty");
+    // Opening b.txt takes focus away from a.txt.
+    app.editor.open_pinned(&b).unwrap();
+    assert!(app.tick_auto_save(), "the tab that lost focus is saved");
+    let on_disk = std::fs::read_to_string(&a).unwrap();
+    assert!(
+        on_disk.contains('Z'),
+        "a.txt must be written when it lost focus: {on_disk:?}"
+    );
+}
+
+/// The mode is off by default, so a focus change alone never writes.
+#[test]
+fn focus_changes_do_not_save_when_the_mode_is_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.focus_pane(Pane::Editor);
+    app.tick_auto_save();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.focus_pane(Pane::Terminal);
+    assert!(!app.tick_auto_save(), "the mode is off");
+    assert!(app.editor.dirty, "the buffer stays dirty");
+}
+
 #[test]
 fn auto_save_writes_a_dirty_buffer_after_the_delay() {
     let tmp = tempfile::tempdir().unwrap();
