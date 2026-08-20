@@ -21983,13 +21983,29 @@ impl App {
 
     /// Keyboard handling for the PROBLEMS view while it owns the panel pane:
     /// arrow / page keys scroll the list, Escape hands focus back to the editor.
+    /// Keys while the PROBLEMS tab owns the panel pane. Plain typing goes
+    /// to the free-text filter (VS Code's Problems filter box), so Esc
+    /// clears the filter first and only hands the pane back once it is
+    /// already empty, mirroring the Remote panel's filter behaviour.
     fn handle_problems_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up => self.problems.scroll_up(1),
             KeyCode::Down => self.problems.scroll_down(1),
             KeyCode::PageUp => self.problems.scroll_up(10),
             KeyCode::PageDown => self.problems.scroll_down(10),
-            KeyCode::Esc => self.focus_pane(Pane::Editor),
+            KeyCode::Backspace if !self.problems.text_filter.is_empty() => {
+                self.problems.pop_filter_char();
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT,
+                ) =>
+            {
+                self.problems.push_filter_char(c);
+            }
+            KeyCode::Esc if !self.problems.clear_text_filter() => {
+                self.focus_pane(Pane::Editor);
+            }
             _ => {}
         }
     }

@@ -18508,6 +18508,68 @@ fn the_output_view_renders_a_pushed_channel_line() {
     );
 }
 
+/// Issue #212: typing in the focused Problems panel filters diagnostics
+/// by text; Backspace pops a character; Esc clears the filter before it
+/// gives the pane back to the editor.
+#[test]
+fn typing_in_the_problems_panel_filters_and_esc_clears_before_leaving() {
+    use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("hello.rs");
+    std::fs::write(&file, "fn a() {}\nfn b() {}\nfn run() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("rustc"),
+        vec![
+            Diagnostic {
+                start_line: 0,
+                start_char: 0,
+                end_line: 0,
+                end_char: 1,
+                severity: DiagnosticSeverity::Error,
+                message: String::from("mismatched types"),
+            },
+            Diagnostic {
+                start_line: 2,
+                start_char: 3,
+                end_line: 2,
+                end_char: 6,
+                severity: DiagnosticSeverity::Warning,
+                message: String::from("function `run` is never used"),
+            },
+        ],
+    );
+    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.rebuild_problems();
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    app.focus_pane(Pane::Terminal);
+
+    for c in "mismatch".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.problems.text_filter, "mismatch",
+        "plain typing must reach the panel's filter"
+    );
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.problems.text_filter, "mismatc", "Backspace pops");
+    // Esc clears the filter but keeps the pane focused.
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.problems.text_filter.is_empty(), "Esc clears the filter");
+    assert!(
+        app.focus == Pane::Terminal,
+        "the first Esc only clears; the pane keeps focus"
+    );
+    // A second Esc, with nothing to clear, hands the pane back.
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.focus == Pane::Editor, "the second Esc leaves the panel");
+}
+
 #[test]
 fn clicking_a_problem_row_opens_that_file_at_the_line() {
     use crate::lsp::manager::DiagnosticSeverity;

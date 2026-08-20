@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Indentation is now detected from each file's own content on open (tabs vs spaces and the step width), so Tab matches the file's existing style instead of the language default; the status bar's indent pill reflects it and a manual override still wins.",
+    summary: "The PROBLEMS panel takes a free-text filter: with the tab focused, type to narrow diagnostics by message or file path (composing with the severity filter), Backspace pops a character, and Esc clears before handing focus back to the editor.",
 }];

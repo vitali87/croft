@@ -123,6 +123,11 @@ pub struct ProblemsPanel {
     scroll: usize,
     /// Severity filter, cycled from the toolbar (VS Code's funnel menu).
     filter: ProblemFilter,
+    /// Free-text filter (VS Code's Problems filter box): a case-insensitive
+    /// substring matched against each diagnostic's message and its file's
+    /// path, composing with the severity filter. Typed directly while the
+    /// panel is focused; Backspace pops, Esc clears.
+    pub text_filter: String,
     /// Group diagnostics under a file header (VS Code default) or show a flat,
     /// file-annotated list. Toggled from the toolbar.
     group_by_file: bool,
@@ -152,6 +157,7 @@ impl ProblemsPanel {
             collapsed: HashSet::new(),
             scroll: 0,
             filter: ProblemFilter::All,
+            text_filter: String::new(),
             group_by_file: true,
             focus_gradient: false,
             theme: Theme::default(),
@@ -238,6 +244,46 @@ impl ProblemsPanel {
     /// its items that pass the filter)`. Groups with no passing item are
     /// dropped so a filtered-away file shows no header. Indices are into
     /// `self.groups`, so `hit_at` / `*_spans` need no remapping.
+    /// True when `it` in `group` passes BOTH the severity cycle and the
+    /// free-text filter (case-insensitive substring of the message or the
+    /// file path).
+    fn keeps_item(&self, group: &ProblemGroup, it: &ProblemItem) -> bool {
+        if !self.filter.keeps(it.severity) {
+            return false;
+        }
+        if self.text_filter.is_empty() {
+            return true;
+        }
+        let needle = self.text_filter.to_lowercase();
+        it.message.to_lowercase().contains(&needle)
+            || group
+                .path
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&needle)
+    }
+
+    pub fn push_filter_char(&mut self, c: char) {
+        self.text_filter.push(c);
+        self.scroll = 0;
+    }
+
+    pub fn pop_filter_char(&mut self) {
+        self.text_filter.pop();
+        self.scroll = 0;
+    }
+
+    /// Clear the text filter, reporting whether there was one (so Esc can
+    /// clear first and only leave the panel when already clear).
+    pub fn clear_text_filter(&mut self) -> bool {
+        if self.text_filter.is_empty() {
+            return false;
+        }
+        self.text_filter.clear();
+        self.scroll = 0;
+        true
+    }
+
     fn visible_groups(&self) -> Vec<(usize, Vec<usize>)> {
         self.groups
             .iter()
@@ -247,7 +293,7 @@ impl ProblemsPanel {
                     .items
                     .iter()
                     .enumerate()
-                    .filter(|(_, it)| self.filter.keeps(it.severity))
+                    .filter(|(_, it)| self.keeps_item(group, it))
                     .map(|(i, _)| i)
                     .collect();
                 (!items.is_empty()).then_some((g, items))
@@ -511,7 +557,15 @@ impl ProblemsPanel {
         let accent = self.theme.accent();
         let chip = self.theme.accent_chip_bg();
 
-        let filter_label = format!(" {} \u{25be} ", self.filter.label());
+        let filter_label = if self.text_filter.is_empty() {
+            format!(" {} \u{25be} ", self.filter.label())
+        } else {
+            format!(
+                " {} \u{25be} \u{eb85} {} ",
+                self.filter.label(),
+                self.text_filter
+            )
+        };
         let group_label = format!(
             " {} ",
             if self.group_by_file {
@@ -544,7 +598,11 @@ impl ProblemsPanel {
             x += w + 1;
             r
         };
-        self.filter_rect = control(filter_label, self.filter != ProblemFilter::All, buf);
+        self.filter_rect = control(
+            filter_label,
+            self.filter != ProblemFilter::All || !self.text_filter.is_empty(),
+            buf,
+        );
         self.group_rect = control(group_label, !self.group_by_file, buf);
     }
 
@@ -588,7 +646,7 @@ impl ProblemsPanel {
         let shown = group
             .items
             .iter()
-            .filter(|it| self.filter.keeps(it.severity))
+            .filter(|it| self.keeps_item(group, it))
             .count();
         spans.push(Span::styled(
             format!("  {shown}"),
@@ -667,6 +725,56 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// Issue #212: the free-text filter narrows by message AND path
+    /// substring, case-insensitively, composing with the severity cycle.
+    #[test]
+    fn text_filter_narrows_by_message_and_path() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![
+            group(
+                "alpha.rs",
+                vec![
+                    diag(0, DiagnosticSeverity::Error, "Mismatched types"),
+                    diag(1, DiagnosticSeverity::Warning, "unused variable"),
+                ],
+            ),
+            group("beta.rs", vec![diag(0, DiagnosticSeverity::Error, "boom")]),
+        ]);
+        assert_eq!(p.total_rows(), 5, "2 headers + 3 diagnostics");
+        // Message substring, case-insensitive.
+        for c in "MISMATCH".chars() {
+            p.push_filter_char(c.to_ascii_lowercase());
+        }
+        assert_eq!(p.total_rows(), 2, "one header + the one matching row");
+        // Backspace back to empty restores everything.
+        while !p.text_filter.is_empty() {
+            p.pop_filter_char();
+        }
+        assert_eq!(p.total_rows(), 5);
+        // Path substring: "beta" keeps the beta.rs group only.
+        for c in "beta".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 2);
+        // Composes with the severity cycle. Narrow the text to alpha's
+        // WARNING, then cycle to Errors-only: nothing survives both.
+        // (`Warnings` here means "Errors & Warnings", so Errors is the
+        // filter that actually excludes a warning.)
+        while !p.text_filter.is_empty() {
+            p.pop_filter_char();
+        }
+        for c in "unused".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 2, "the warning matches on its own");
+        while p.filter != ProblemFilter::Errors {
+            p.cycle_filter();
+        }
+        assert_eq!(p.total_rows(), 0, "text and severity filters compose");
+        assert!(p.clear_text_filter(), "clearing reports it had text");
+        assert!(!p.clear_text_filter(), "second clear is a no-op");
     }
 
     /// The file header's count badge must reflect the ACTIVE severity
