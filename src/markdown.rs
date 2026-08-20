@@ -41,6 +41,20 @@ pub struct MarkdownPreview {
     /// stale-rebuild and theme-switch paths dispatch to the notebook
     /// builder instead of the markdown one.
     pub notebook: bool,
+    /// Frame truth, written by the editor's render: one entry per painted
+    /// visual row of `last_area`, each holding that row's cell symbols by
+    /// SCREEN COLUMN. Per-column (not a joined string) keeps wide glyphs
+    /// aligned: a double-width character owns its column and leaves an
+    /// empty continuation cell, so a column index always addresses the
+    /// right character. The rendered view is a wrapped `Paragraph`, so
+    /// these cells are the only faithful record of what the user sees.
+    pub rows: Vec<Vec<String>>,
+    /// The user's selection over the rendered view, as (row, col) pairs
+    /// relative to `last_area`: `anchor` is where the drag started,
+    /// `head` where it is now. `None` when nothing is selected.
+    pub selection: Option<((u16, u16), (u16, u16))>,
+    /// True while a mouse drag is extending `selection`.
+    pub dragging: bool,
     /// Set when this preview renders a docx/odt document (#181): the
     /// rebuild paths re-walk THIS file instead of the text buffer.
     pub doc_path: Option<std::path::PathBuf>,
@@ -564,6 +578,80 @@ pub fn render_markdown_with_images(
     (r.out, r.images)
 }
 
+impl MarkdownPreview {
+    /// The selection normalised to (start, end) in reading order.
+    fn ordered_selection(&self) -> Option<((u16, u16), (u16, u16))> {
+        let (a, b) = self.selection?;
+        // A click anchors head == anchor: that is a caret, not a
+        // selection. Treating it as one would tint a stray cell and let a
+        // plain click copy a character nobody selected.
+        if a == b {
+            return None;
+        }
+        Some(if (a.0, a.1) <= (b.0, b.1) {
+            (a, b)
+        } else {
+            (b, a)
+        })
+    }
+
+    /// True when cell (row, col) of the rendered view is selected. The
+    /// render pass paints these cells with the selection background.
+    pub fn cell_selected(&self, row: u16, col: u16) -> bool {
+        let Some((start, end)) = self.ordered_selection() else {
+            return false;
+        };
+        if row < start.0 || row > end.0 {
+            return false;
+        }
+        let from = if row == start.0 { start.1 } else { 0 };
+        let to = if row == end.0 { end.1 } else { u16::MAX };
+        col >= from && col <= to
+    }
+
+    /// The selected text of the rendered view, extracted from the rows the
+    /// last render recorded. Rows join with newlines, exactly as they read
+    /// on screen (VS Code copies the rendered text, not the source).
+    pub fn selection_text(&self) -> String {
+        let Some((start, end)) = self.ordered_selection() else {
+            return String::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for row in start.0..=end.0 {
+            let Some(cells) = self.rows.get(row as usize) else {
+                continue;
+            };
+            let from = if row == start.0 {
+                (start.1 as usize).min(cells.len())
+            } else {
+                0
+            };
+            let to = if row == end.0 {
+                ((end.1 as usize) + 1).min(cells.len())
+            } else {
+                cells.len()
+            };
+            // Column-indexed: a wide glyph's continuation cell is empty and
+            // contributes nothing, so copied text keeps characters whole
+            // however the row is sliced.
+            out.push(if from <= to {
+                cells[from..to].concat().trim_end().to_string()
+            } else {
+                String::new()
+            });
+        }
+        // A single-row selection has no line break; multi-row keeps the
+        // visual line structure, trailing padding already trimmed.
+        out.join("\n").trim_end().to_string()
+    }
+
+    /// Whether anything is selected (drives the copy path and the
+    /// "clear selection" gestures).
+    pub fn has_selection(&self) -> bool {
+        self.ordered_selection().is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,5 +885,113 @@ mod tests {
             Some(Color::Rgb(r, g, b)),
             "unhighlighted code must wear the theme's code fg, not Base16 slate"
         );
+    }
+}
+
+#[cfg(test)]
+mod preview_selection_tests {
+    use super::*;
+
+    fn preview(rows: &[&str]) -> MarkdownPreview {
+        MarkdownPreview {
+            lines: Vec::new(),
+            scroll: 0,
+            built_seq: 0,
+            images: Vec::new(),
+            anchor_rows: Vec::new(),
+            wrap_key: (0, 0),
+            last_area: ratatui::layout::Rect::default(),
+            rows: rows
+                .iter()
+                .map(|r| r.chars().map(|c| c.to_string()).collect())
+                .collect(),
+            selection: None,
+            dragging: false,
+            notebook: false,
+            doc_path: None,
+            media: false,
+        }
+    }
+
+    /// Issue #215: the rendered Markdown view must be selectable. A drag
+    /// within one row copies that span; a multi-row drag keeps the visual
+    /// line structure; the selection is direction-agnostic.
+    #[test]
+    fn selection_text_extracts_the_rendered_rows() {
+        let mut p = preview(&["Hello world", "second line", "third line"]);
+        // Single row, columns 0..=4 -> "Hello".
+        p.selection = Some(((0, 0), (0, 4)));
+        assert_eq!(p.selection_text(), "Hello");
+        // Multi-row: tail of row 0, all of row 1, head of row 2.
+        p.selection = Some(((0, 6), (2, 4)));
+        assert_eq!(p.selection_text(), "world\nsecond line\nthird");
+        // Dragging upward selects the same span.
+        p.selection = Some(((2, 4), (0, 6)));
+        assert_eq!(p.selection_text(), "world\nsecond line\nthird");
+        // No selection copies nothing.
+        p.selection = None;
+        assert_eq!(p.selection_text(), "");
+        assert!(!p.has_selection());
+    }
+
+    /// Review round 1: a plain click (anchor == head) is a caret, not a
+    /// selection: nothing tints and nothing copies.
+    #[test]
+    fn a_zero_area_click_is_not_a_selection() {
+        let mut p = preview(&["abcdef"]);
+        p.selection = Some(((0, 3), (0, 3)));
+        assert!(!p.has_selection(), "a click selects nothing");
+        assert!(!p.cell_selected(0, 3), "and tints nothing");
+        assert_eq!(p.selection_text(), "", "and copies nothing");
+    }
+
+    /// Review round 1: rows are stored per SCREEN COLUMN, so a wide glyph
+    /// (which owns one column and leaves an empty continuation cell) is
+    /// copied whole and the columns after it still address the right
+    /// characters.
+    #[test]
+    fn wide_glyphs_keep_columns_and_characters_aligned() {
+        // Columns:      0     1(cont) 2    3
+        let mut p = preview(&[""]);
+        p.rows = vec![vec![
+            "\u{5e83}".to_string(),
+            String::new(),
+            "a".to_string(),
+            "b".to_string(),
+        ]];
+        p.selection = Some(((0, 0), (0, 2)));
+        assert_eq!(
+            p.selection_text(),
+            "\u{5e83}a",
+            "the wide glyph and the character at column 2 come through"
+        );
+        p.selection = Some(((0, 2), (0, 3)));
+        assert_eq!(
+            p.selection_text(),
+            "ab",
+            "columns after a wide glyph still address their own characters"
+        );
+    }
+
+    #[test]
+    fn cell_selected_marks_exactly_the_dragged_cells() {
+        let mut p = preview(&["abcdef", "ghijkl"]);
+        p.selection = Some(((0, 2), (1, 1)));
+        assert!(!p.cell_selected(0, 1), "before the anchor column");
+        assert!(p.cell_selected(0, 2), "the anchor cell");
+        assert!(p.cell_selected(0, 5), "to the end of the first row");
+        assert!(p.cell_selected(1, 0), "the head row from column 0");
+        assert!(p.cell_selected(1, 1), "up to the head column");
+        assert!(!p.cell_selected(1, 2), "past the head column");
+        assert!(!p.cell_selected(2, 0), "below the selection");
+    }
+
+    /// A selection that outlives a rebuild (fewer rows) must not panic or
+    /// invent text.
+    #[test]
+    fn selection_past_the_rendered_rows_is_harmless() {
+        let mut p = preview(&["only row"]);
+        p.selection = Some(((0, 2), (9, 40)));
+        assert_eq!(p.selection_text(), "ly row");
     }
 }

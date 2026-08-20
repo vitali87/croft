@@ -20662,6 +20662,38 @@ impl App {
         // navigation scrolls the preview and every other key is swallowed
         // (no invisible edits). Cmd+Shift+V above flips back to the source.
         if self.editor.markdown_preview.is_some() {
+            // Copy Path / Copy Relative Path first: their chords are
+            // Cmd+Opt+C and Cmd+Opt+Shift+C, which the looser copy-key
+            // predicate below also matches. They are meaningful while a
+            // preview is up (the file has a path either way), and this
+            // block returns unconditionally, so they must be dispatched
+            // here or they never run.
+            if is_copy_path_key(key) {
+                if let Some(path) = self.editor.path.clone() {
+                    self.copy_path_to_clipboard(path);
+                }
+                return;
+            }
+            if is_copy_relative_path_key(key) {
+                if let Some(path) = self.editor.path.clone() {
+                    self.copy_relative_path_to_clipboard(path);
+                }
+                return;
+            }
+            // Copy the rendered selection (#215): the preview swallows every
+            // other key, so without this branch Cmd+C here never copies.
+            if is_editor_copy_key(key) {
+                self.copy_editor_selection();
+                return;
+            }
+            if matches!(key.code, KeyCode::Esc)
+                && let Some(md) = self.editor.markdown_preview.as_mut()
+                && md.has_selection()
+            {
+                md.selection = None;
+                md.dragging = false;
+                return;
+            }
             let page = self.editor.text_rows() as i32;
             match key.code {
                 KeyCode::Up => {
@@ -22425,7 +22457,85 @@ impl App {
         self.status = format!("Copied {} chars to clipboard", text.chars().count());
     }
 
+    /// Start a drag-selection in the rendered Markdown/document preview
+    /// when `(col, row)` lands inside it. Returns true when the press was
+    /// consumed, so the normal editor click path is skipped: the source
+    /// buffer is not visible, and a caret there would serve nobody.
+    fn begin_preview_selection(&mut self, col: u16, row: u16) -> bool {
+        let Some(md) = self.editor.markdown_preview.as_mut() else {
+            return false;
+        };
+        if !rect_contains(md.last_area, col, row) {
+            // A press elsewhere drops the selection, like the editor's.
+            if md.has_selection() {
+                md.selection = None;
+                md.dragging = false;
+            }
+            return false;
+        }
+        let cell = (row - md.last_area.y, col - md.last_area.x);
+        md.selection = Some((cell, cell));
+        md.dragging = true;
+        self.focus_pane(Pane::Editor);
+        true
+    }
+
+    /// Extend a live preview drag and finish it on release. Returns true
+    /// when the event was consumed.
+    fn update_preview_selection(&mut self, m: MouseEvent) -> bool {
+        let Some(md) = self.editor.markdown_preview.as_mut() else {
+            return false;
+        };
+        if !md.dragging {
+            return false;
+        }
+        match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // Clamp to the view: dragging past an edge extends to it
+                // rather than dropping the gesture.
+                let area = md.last_area;
+                let row = m.row.clamp(area.y, area.y + area.height.saturating_sub(1)) - area.y;
+                let col = m
+                    .column
+                    .clamp(area.x, area.x + area.width.saturating_sub(1))
+                    - area.x;
+                if let Some((anchor, _)) = md.selection {
+                    md.selection = Some((anchor, (row, col)));
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                md.dragging = false;
+                // Mirror the editor's copy-on-select setting so a finished
+                // drag lands on the clipboard when the user asked for that.
+                if self.copy_on_select {
+                    let text = self
+                        .editor
+                        .markdown_preview
+                        .as_ref()
+                        .map(|md| md.selection_text())
+                        .unwrap_or_default();
+                    if !text.is_empty() {
+                        copy_to_clipboard(&text);
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn copy_editor_selection(&mut self) {
+        // The rendered preview hides the source buffer, so its selection
+        // is the only one the user can see (#215).
+        if let Some(md) = self.editor.markdown_preview.as_ref() {
+            let text = md.selection_text();
+            if !text.is_empty() {
+                copy_to_clipboard(&text);
+                self.status = format!("Copied {} chars to clipboard", text.chars().count());
+            }
+            return;
+        }
         if let Some(diff) = self.editor.diff.as_ref() {
             if let Some(text) = diff.selection_text()
                 && !text.is_empty()
@@ -27515,6 +27625,11 @@ impl App {
             self.on_mouse_moved(m.column, m.row, in_editor);
             return;
         }
+        // Extend / finish a rendered-preview selection (#215) before any
+        // other gesture claims the drag.
+        if self.update_preview_selection(m) {
+            return;
+        }
         // The release of a press is not a new gesture, so it keeps the popup:
         // that is what lets a press-and-hold (touch) read the hover after
         // lifting the finger. Every other event dismisses it.
@@ -27917,6 +28032,12 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // Markdown/rendered preview selection (#215): a press inside
+                // the rendered view starts a drag-selection over what the
+                // user can SEE, not the source buffer beneath it.
+                if self.begin_preview_selection(m.column, m.row) {
+                    return;
+                }
                 // (H) Go to Definition rides CTRL, matching the terminal pane's
                 // file/URL clicks. SGR mouse reporting carries no super bit, so
                 // ALT is left to the editor's Alt+click multi-cursor below.

@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Auto Save gains VS Code's onFocusChange mode: with it on, a dirty buffer writes itself the moment it loses focus (the editor pane handing focus away, or the active tab changing), independently of the existing after-delay mode.",
+    summary: "The rendered Markdown / document preview is selectable: drag to select what is on screen, Cmd/Ctrl+C copies the rendered text rather than the source, and Esc clears the selection.",
 }];
