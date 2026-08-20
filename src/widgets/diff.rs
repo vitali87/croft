@@ -1011,15 +1011,17 @@ impl DiffData {
         let mut plus: Vec<String> = Vec::new();
         // Emit a HEAD line as context: it exists on both sides of this
         // patch, because the change touching it is not being staged.
-        let mut push_context_left = |i: usize,
-                                     body: &mut Vec<String>,
-                                     old_start: &mut Option<usize>,
-                                     new_start: &mut Option<usize>,
-                                     old_count: &mut usize,
-                                     new_count: &mut usize| {
+        // Emit a HEAD line as context: the change touching it is not being
+        // staged, so it exists unchanged on both sides of THIS patch.
+        // Only the old-side start is recorded here; the new side's start
+        // is derived below (an unselected change contributes no new-side
+        // line number of its own).
+        let push_context_left = |i: usize,
+                                 body: &mut Vec<String>,
+                                 old_start: &mut Option<usize>,
+                                 old_count: &mut usize,
+                                 new_count: &mut usize| {
             old_start.get_or_insert(i + 1);
-            // The new side's line number tracks the old one here: an
-            // unstaged change contributes the SAME line to both sides.
             *old_count += 1;
             *new_count += 1;
             body.push(left_line(' ', i));
@@ -1056,7 +1058,6 @@ impl DiffData {
                             left,
                             &mut body,
                             &mut old_start,
-                            &mut new_start,
                             &mut old_count,
                             &mut new_count,
                         );
@@ -1095,7 +1096,6 @@ impl DiffData {
                             left,
                             &mut body,
                             &mut old_start,
-                            &mut new_start,
                             &mut old_count,
                             &mut new_count,
                         );
@@ -1106,6 +1106,10 @@ impl DiffData {
         body.append(&mut minus);
         body.append(&mut plus);
         let old_start = old_start.unwrap_or(1);
+        // No selected change contributed a new-side start, which happens
+        // when the patch opens on context (including a neutralised
+        // unselected change): the two sides are still in step there, so
+        // the old-side number is also the new-side one.
         let new_start = new_start.unwrap_or(old_start);
         Some(format!(
             "--- a/{rel_path}\n+++ b/{rel_path}\n@@ -{old_start},{old_count} +{new_start},{new_count} @@\n{}\n",
@@ -1718,6 +1722,89 @@ mod tests {
     /// selection must be represented as the index already has them: an
     /// unselected `+` is dropped (it is not being staged), an unselected
     /// `-` becomes context (that line still exists in HEAD).
+    /// The patch must not just LOOK right: git has to accept it and the
+    /// index must end up holding exactly the selected line. Runs a real
+    /// repo end to end (issue #214).
+    /// The risky shape: the patch opens on an UNSELECTED change (no
+    /// leading context to anchor the line numbers). git must still accept
+    /// it and stage only the selected line.
+    #[test]
+    fn git_accepts_a_patch_that_opens_on_an_unselected_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let head = "a\nb\nc\n";
+        let work = "X\nY\nc\n";
+        git_repo_with(root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(root, head, work);
+        // Rows 0 and 1 are both changes; select only the SECOND.
+        let patch = d.selected_lines_patch("f.txt", (1, 1)).unwrap();
+        if let Err(e) = git_apply_check(root, &patch) {
+            panic!("git rejected the patch:\n{patch}\n{e}");
+        }
+        let applied = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "apply", "--cached"])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.take().unwrap().write_all(patch.as_bytes())?;
+                c.wait()
+            })
+            .map(|st| st.success())
+            .unwrap_or(false);
+        assert!(applied, "git apply --cached must succeed for:\n{patch}");
+        let staged = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "show", ":f.txt"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout),
+            "a\nY\nc\n",
+            "the unselected first change must stay out of the index"
+        );
+    }
+
+    #[test]
+    fn git_accepts_a_selected_lines_patch_and_stages_only_those_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let head = "a\nb\nc\nd\n";
+        let work = "a\nX\nY\nd\n";
+        git_repo_with(root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(root, head, work);
+        // Row 1 is b -> X; row 2 is c -> Y. Stage only the first.
+        let patch = d.selected_lines_patch("f.txt", (1, 1)).unwrap();
+        if let Err(e) = git_apply_check(root, &patch) {
+            panic!("git rejected the selected-lines patch:\n{patch}\n{e}");
+        }
+        let ok = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "apply", "--cached"])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.take().unwrap().write_all(patch.as_bytes())?;
+                c.wait()
+            })
+            .map(|st| st.success())
+            .unwrap_or(false);
+        assert!(ok, "git apply --cached must succeed for:\n{patch}");
+        // The staged blob holds the FIRST change only: X applied, c intact.
+        let staged = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "show", ":f.txt"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout),
+            "a\nX\nc\nd\n",
+            "only the selected line may reach the index"
+        );
+    }
+
     #[test]
     fn selected_lines_patch_keeps_unselected_changes_out_of_the_index() {
         // HEAD: a b c d ; work: a X Y d  -> two independent changes.
@@ -1732,8 +1819,7 @@ mod tests {
             .selected_lines_patch("f.txt", (1, 1))
             .expect("the selection covers a change");
         assert_eq!(
-            patch,
-            "--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,4 @@\n a\n-b\n+X\n c\n d\n",
+            patch, "--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,4 @@\n a\n-b\n+X\n c\n d\n",
             "only the selected replacement is staged; the unselected c->Y \
              leaves c as context and drops Y"
         );
@@ -1752,8 +1838,7 @@ mod tests {
             .selected_lines_patch("f.txt", (1, 1))
             .expect("the selection covers the first addition");
         assert_eq!(
-            patch,
-            "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,3 @@\n a\n+x\n b\n",
+            patch, "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,3 @@\n a\n+x\n b\n",
             "the unselected second addition must not reach the index"
         );
     }
@@ -1771,8 +1856,7 @@ mod tests {
             .selected_lines_patch("f.txt", (1, 1))
             .expect("the selection covers the first deletion");
         assert_eq!(
-            patch,
-            "--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,3 @@\n a\n-b\n c\n d\n",
+            patch, "--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,3 @@\n a\n-b\n c\n d\n",
             "the unselected deletion stays in the index as context"
         );
     }

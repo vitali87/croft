@@ -19754,8 +19754,42 @@ impl App {
         }
     }
 
+    /// The workspace-relative path + patch for the SELECTED lines of the
+    /// open working-tree diff (VS Code's "Stage Selected Ranges"), or
+    /// `None` when there is no selection spanning a changed row, so the
+    /// caller falls back to the whole-hunk action.
+    fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
+        let root = self.tree.root.clone();
+        let diff = self.editor.diff.as_ref()?;
+        if !diff.left_is_git_head {
+            return None;
+        }
+        let sel = diff.selection?;
+        if !sel.has_area() {
+            return None;
+        }
+        let rel = diff.right_path.strip_prefix(&root).ok()?;
+        let rel = rel.to_string_lossy().to_string();
+        let (start, end) = sel.normalized();
+        let patch = diff.selected_lines_patch(&rel, (start.0, end.0))?;
+        Some((rel, patch))
+    }
+
     /// Stage only the hunk under the diff caret (`git apply --cached`).
     pub fn stage_hunk_at_caret(&mut self) {
+        // A selection spanning changed rows narrows the action to those
+        // lines (VS Code's "Stage Selected Ranges"); without one the whole
+        // hunk under the caret is staged, as before.
+        if let Some((rel, patch)) = self.diff_selected_lines_patch() {
+            match crate::git::apply_patch(&self.scm_root(), &patch, true, false) {
+                Ok(_) => {
+                    self.status = format!("Staged selected lines in {rel}");
+                    self.refresh_after_hunk_op();
+                }
+                Err(err) => self.status = format!("Stage selected lines failed: {err}"),
+            }
+            return;
+        }
         let Some((rel, patch)) = self.diff_hunk_patch_at_caret() else {
             return;
         };
@@ -19772,6 +19806,18 @@ impl App {
     /// (`git apply --cached -R`). Errors surface verbatim, e.g. when the
     /// hunk was never staged.
     pub fn unstage_hunk_at_caret(&mut self) {
+        // Same selection-first rule as staging: the reverse patch removes
+        // exactly the selected lines from the index.
+        if let Some((rel, patch)) = self.diff_selected_lines_patch() {
+            match crate::git::apply_patch(&self.scm_root(), &patch, true, true) {
+                Ok(_) => {
+                    self.status = format!("Unstaged selected lines in {rel}");
+                    self.refresh_after_hunk_op();
+                }
+                Err(err) => self.status = format!("Unstage selected lines failed: {err}"),
+            }
+            return;
+        }
         let Some((rel, patch)) = self.diff_hunk_patch_at_caret() else {
             return;
         };
