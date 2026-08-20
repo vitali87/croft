@@ -6,6 +6,22 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
 }
 
+/// Shell command that prints `probe` on its own line WITHOUT the typed
+/// command line spelling the probe out.
+///
+/// The terminal end-to-end tests find their probe by searching the rendered
+/// grid for it, but the shell echoes what was typed, so a literal
+/// `printf '<probe>\n'` puts two matching rows on screen. Under load the echo
+/// arrives first, the wait loop is satisfied by it, and the row search lands
+/// on the echoed command: its quoting shifts the columns, and the selection
+/// comes back as `"oft-e2e-638881\\n"` instead of the probe (issue #226).
+/// Splitting the probe across two printf arguments leaves the echo carrying
+/// only the fragments, so nothing but the OUTPUT can ever match.
+fn probe_command(probe: &str) -> String {
+    let (head, tail) = probe.split_at(1);
+    format!("printf '%s%s\\n' '{head}' '{tail}'\r")
+}
+
 #[test]
 fn minimap_rgba_paints_chars_skips_whitespace() {
     let mut e = crate::widgets::editor::Editor::new();
@@ -4687,7 +4703,7 @@ fn cmd_c_on_terminal_selection_lands_text_on_macos_clipboard() {
 
     let probe = format!("croft-terminal-cmdc-{}", std::process::id());
     app.terminal_mut()
-        .write_input(format!("printf '{probe}\\n'\r").as_bytes());
+        .write_input(probe_command(&probe).as_bytes());
 
     // Wait for the shell to push bytes through the PTY and the
     // background reader thread to drain them into the grid.
@@ -6107,7 +6123,7 @@ fn double_click_in_terminal_word_selects_in_split_and_maximised_layout() {
         app.focus_pane(Pane::Terminal);
         let probe = format!("croft-dclick-{}", std::process::id());
         app.terminal_mut()
-            .write_input(format!("printf '{probe}\\n'\r").as_bytes());
+            .write_input(probe_command(&probe).as_bytes());
         let started = std::time::Instant::now();
         while started.elapsed() < std::time::Duration::from_millis(3000) {
             if app.terminal().visible_text().contains(&probe) {
@@ -6165,7 +6181,7 @@ fn terminal_copy_paste_into_other_panes_works_in_split_and_maximised_layout() {
     fn copy_terminal_word(app: &mut App) -> String {
         let probe = format!("croft-e2e-{}", std::process::id());
         app.terminal_mut()
-            .write_input(format!("printf '{probe}\\n'\r").as_bytes());
+            .write_input(probe_command(&probe).as_bytes());
         let started = std::time::Instant::now();
         while started.elapsed() < std::time::Duration::from_millis(3000) {
             if app.terminal().visible_text().contains(&probe) {
@@ -6325,6 +6341,47 @@ fn terminal_copy_paste_into_other_panes_works_in_split_and_maximised_layout() {
     }
 }
 
+/// Issue #226: the probe command must not spell the probe out, or the
+/// shell's echo of it becomes a second row that matches the grid search
+/// (and wins the race under load). Pins both halves of `probe_command`:
+/// the echoed text can't contain the probe, and running it still puts the
+/// probe on screen.
+#[test]
+fn the_terminal_probe_command_prints_the_probe_without_echoing_it() {
+    let probe = format!("croft-probe-echo-{}", std::process::id());
+    let cmd = probe_command(&probe);
+    assert!(
+        !cmd.contains(&probe),
+        "the typed command line must not contain the probe verbatim, or the shell echo matches the grid search alongside the output; got {cmd:?}"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.terminal_mut().focused = true;
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminal_mut().write_input(cmd.as_bytes());
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(3000) {
+        if app.terminal().visible_text().contains(&probe) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let snap = app.terminal().visible_text();
+    let rows: Vec<&str> = snap.lines().filter(|l| l.contains(&probe)).collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one row may carry the probe (the command's output); got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].trim(),
+        probe,
+        "the matching row must be the printed probe alone, not a command line quoting it"
+    );
+}
+
 /// User-reported root cause: with the Search sidebar open, Cmd+C /
 /// Cmd+V in the terminal silently no-op because the search-editing
 /// shortcut guard fired on `focus != Editor`, swallowing the keys
@@ -6345,7 +6402,7 @@ fn terminal_cmd_c_copies_even_when_search_sidebar_is_open() {
 
     let probe = format!("croft-search-open-{}", std::process::id());
     app.terminal_mut()
-        .write_input(format!("printf '{probe}\\n'\r").as_bytes());
+        .write_input(probe_command(&probe).as_bytes());
     let started = std::time::Instant::now();
     while started.elapsed() < std::time::Duration::from_millis(3000) {
         if app.terminal().visible_text().contains(&probe) {
