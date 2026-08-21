@@ -354,9 +354,15 @@ struct Client {
     cols: u16,
     rows: u16,
     control: bool,
+    /// Owning handle on the socket. Nothing reads it any more — output goes
+    /// through `outbox` and disconnects through `fd` — but it must stay:
+    /// this `Arc` is what keeps the `UnixStream` alive, and therefore what
+    /// keeps `fd` a valid descriptor rather than a recycled one.
+    #[allow(dead_code)]
     tx: Arc<Mutex<UnixStream>>,
     /// This client's socket fd, captured at registration so a disconnect can
     /// call [`shutdown_now`] without waiting on the writer thread's lock.
+    /// Valid for exactly as long as `tx` above is held.
     fd: std::os::fd::RawFd,
     /// Queued output for this client, drained by its own writer thread.
     outbox: Arc<Outbox>,
@@ -705,28 +711,17 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                         // client came back" from "a second person joined".
                         // An empty id matches nothing, so clients that send
                         // none are unaffected.
+                        // Partition rather than clone field by field: the
+                        // ghosts are MOVED out, so a `Client` field added
+                        // later cannot be silently dropped on this path.
                         let displaced: Vec<Client> = if client_id.is_empty() {
                             Vec::new()
                         } else {
-                            let mut taken = Vec::new();
-                            clients.retain(|c| {
-                                if c.client_id == client_id {
-                                    taken.push(Client {
-                                        id: c.id,
-                                        name: c.name.clone(),
-                                        cols: c.cols,
-                                        rows: c.rows,
-                                        control: c.control,
-                                        tx: Arc::clone(&c.tx),
-                                        fd: c.fd,
-                                        outbox: Arc::clone(&c.outbox),
-                                        client_id: c.client_id.clone(),
-                                    });
-                                    false
-                                } else {
-                                    true
-                                }
-                            });
+                            let (taken, kept): (Vec<Client>, Vec<Client>) =
+                                std::mem::take(&mut *clients)
+                                    .into_iter()
+                                    .partition(|c| c.client_id == client_id);
+                            *clients = kept;
                             taken
                         };
                         // Write control auto-attaches only when nobody holds
@@ -1484,16 +1479,34 @@ pub(crate) fn client_name() -> String {
 /// clients — two terminals on the same machine attaching to one session are
 /// two real participants and neither may evict the other.
 ///
-/// `CROFT_RELAY_KEY` satisfies both on the remote path, which is where
-/// ghosts actually come from. `remote::run_croft_session` computes it as
-/// `hash(launch arg)` and passes it to every attempt in the reconnect loop,
-/// so it is stable by construction across exactly the reconnects this
-/// targets, while a different launch (a different workspace, a second
-/// terminal) hashes differently. Falling back to the empty string off that
-/// path is deliberate: a local attach has no ghost problem, since a dead
-/// unix socket reports EPIPE at once and is pruned on the next broadcast.
+/// `CROFT_RELAY_KEY` alone satisfies only the first half. It is
+/// `hash(launch arg)` (`remote::relay_session_id`), so two terminals running
+/// `croft remote host /same/path` derive the SAME key, and the second would
+/// evict the first — turning a ghost fix into a way to kick a colleague off.
+/// The launch key is therefore combined with `CROFT_CLIENT_NONCE`, which
+/// `remote::run_croft_session` mints once per client process, outside its
+/// reconnect loop: constant across every reattach that loop performs, and
+/// different in any other process.
+///
+/// Off the remote path both are absent and this returns empty, which
+/// displaces nothing. That is deliberate: a local attach has no ghost
+/// problem, because a dead unix socket reports EPIPE at once and is pruned
+/// on the next broadcast.
 pub(crate) fn client_identity() -> String {
-    std::env::var("CROFT_RELAY_KEY").unwrap_or_default()
+    compose_client_identity(
+        &std::env::var("CROFT_RELAY_KEY").unwrap_or_default(),
+        &std::env::var("CROFT_CLIENT_NONCE").unwrap_or_default(),
+    )
+}
+
+/// The composition rule behind [`client_identity`], split out so it can be
+/// tested directly: `set_var` races sibling test threads (#37), so the env
+/// read stays a one-liner and the logic worth asserting lives here.
+fn compose_client_identity(relay_key: &str, nonce: &str) -> String {
+    if relay_key.is_empty() || nonce.is_empty() {
+        return String::new();
+    }
+    format!("{relay_key}.{nonce}")
 }
 
 #[cfg(unix)]
@@ -1534,6 +1547,35 @@ mod tests {
             InnerChannel::from_env().is_none(),
             "a test-built App must not connect to the launching shell's session host"
         );
+    }
+
+    /// #229: the client identity must distinguish two terminals that opened
+    /// the SAME path. The relay key cannot do that alone — it is a pure hash
+    /// of the launch arg (`remote::relay_session_id`), so both launches
+    /// derive it identically and the host would read the second attach as
+    /// the first reconnecting and evict it: a ghost fix that kicks a real
+    /// participant off. The per-process nonce is what separates them.
+    #[test]
+    fn two_clients_sharing_a_launch_arg_get_distinct_identities() {
+        // Same relay key on purpose: this is the colliding case.
+        let key = "same-launch-arg-hash";
+        let a = compose_client_identity(key, &crate::remote::client_process_nonce());
+        let b = compose_client_identity(key, &crate::remote::client_process_nonce());
+        assert_ne!(
+            a, b,
+            "two client processes sharing one launch arg must not share an identity"
+        );
+        // Same process reconnecting: the nonce is minted once and carried,
+        // so the identity must be stable — that is what evicts the ghost.
+        let nonce = crate::remote::client_process_nonce();
+        assert_eq!(
+            compose_client_identity(key, &nonce),
+            compose_client_identity(key, &nonce),
+            "one client's identity must survive its own reconnects"
+        );
+        // Either half missing yields empty, which displaces nothing.
+        assert_eq!(compose_client_identity("", "nonce"), "");
+        assert_eq!(compose_client_identity(key, ""), "");
     }
 
     #[test]
@@ -2170,7 +2212,12 @@ mod tests {
         while drained < 64 * 32 * 1024 && Instant::now() < warm_deadline {
             match owner.try_read_some() {
                 Some(n) if n > 0 => drained += n,
-                _ => break,
+                // A read that decoded no PTY bytes yet — a control frame, or
+                // a frame still split across reads — is progress, not the
+                // end. Breaking here would leave the ghost's buffer
+                // unsaturated and quietly weaken the probe rounds below.
+                Some(_) => continue,
+                None => break,
             }
         }
         let _ = warm.join();

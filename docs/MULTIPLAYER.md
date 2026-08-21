@@ -240,14 +240,25 @@ that dead peer while holding the clients lock: the whole session froze for
 everyone until the ghost was pruned (#228).
 
 The ghost itself is prevented separately (#229): `hello` carries a
-`client_id`, the stable per-client-process identity (`CROFT_RELAY_KEY` on
-the remote path, which `remote::run_croft_session` holds constant across
-the reconnects in its retry loop). On attach the host evicts any client
-already registered under the same id, and the reconnecting client inherits
-the control its ghost held, so a dropped transport never demotes the owner
-to read-only. An empty id — pre-0.1.701 clients, and local attaches, which
-have no ghost problem because a dead unix socket reports EPIPE at once —
-matches nothing and displaces nothing.
+`client_id`, and on attach the host evicts any client already registered
+under the same id. The reconnecting client inherits the control its ghost
+held, so a dropped transport never demotes the owner to read-only.
+
+The id is `CROFT_RELAY_KEY` **and** `CROFT_CLIENT_NONCE`, and it needs both
+halves. The relay key is `hash(launch arg)`, constant across the reconnects
+`remote::run_croft_session` performs — but for that same reason two
+terminals opening the same path derive it identically, and keying eviction
+on it alone would let the second attach kick the first off. The nonce is
+minted once per client process, outside that reconnect loop, which supplies
+the missing half: constant across one client's reattaches, distinct in any
+other process. Deliberately non-deterministic, and safe precisely because
+nothing recomputes it — dtach freezing the first launch's value is the
+intent, since that frozen value *is* this client's identity for the life of
+the session.
+
+An empty id — pre-0.1.701 clients, and local attaches, which have no ghost
+problem because a dead unix socket reports EPIPE at once — matches nothing
+and displaces nothing.
 
 ## Presence and permissions
 
