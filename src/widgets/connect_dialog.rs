@@ -176,6 +176,9 @@ impl ConnectDialog {
         self.show_logs = true;
     }
 
+    /// Switch to the installing phase: reveal the log panel and start the
+    /// elapsed-time clock. Entered once credentials are accepted, or when
+    /// the user consents to the slow compile-on-remote fallback.
     pub fn set_installing(&mut self) {
         self.phase = DialogPhase::Installing;
         self.status_line = format!("Preparing remote croft on {}", self.host);

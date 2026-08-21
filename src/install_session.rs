@@ -114,6 +114,9 @@ impl InstallSession {
         let _ = self.fallback_answer_tx.send(proceed);
     }
 
+    /// Hand the adopted control master to the caller, leaving `None`
+    /// behind. Taken once the TUI has surrendered the alt-screen and is
+    /// ready to launch through the existing connection.
     pub fn take_adopted(&mut self) -> Option<AdoptedMaster> {
         self.adopted.take()
     }

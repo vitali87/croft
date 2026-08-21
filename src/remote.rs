@@ -180,6 +180,15 @@ pub fn install_only_streaming(
     result.map(|_| adopted)
 }
 
+/// The body of `install_only_streaming`, split out so the SSH control
+/// master can be leaked on every exit path rather than dropped (its `Drop`
+/// kills the shared master the user may already be attached through).
+///
+/// Probes the remote first: an already-installed croft releases
+/// `can_launch_tx` within one SSH roundtrip and the (re)install continues
+/// behind the user's session, so `confirm_fallback` is bypassed in favour
+/// of an automatic decline — there is nobody left to ask, and an
+/// unrequested on-box compile would load a live session.
 fn install_only_streaming_over(
     ssh: &SshControl,
     host_label: &str,
@@ -453,6 +462,13 @@ fn run_command_streaming(
     Ok(status)
 }
 
+/// Ship croft to the remote, preferring the fast path: cross-build a
+/// static binary locally and rsync it over.
+///
+/// When that path is unavailable, `confirm_fallback` is asked — with the
+/// reason — whether to compile on the remote box instead. Declining is an
+/// error, not a silent skip, so the caller can point the user at
+/// `croft setup-cross`. The slow path never engages on its own.
 fn install_remote_croft_streaming(
     ssh: &SshControl,
     lane: &crate::remote_bulk::BulkLane,
@@ -589,6 +605,11 @@ fn try_local_cross_install_streaming(
     Ok(None)
 }
 
+/// Rsync the local source tree into `~/.cache/croft/source` on the remote,
+/// streaming rsync's progress through `log_tx`. Only needed for the slow
+/// compile-on-remote fallback; the fast path ships a built binary instead.
+/// Runs over `lane` so the bulk transfer never queues ahead of the user's
+/// keystrokes on the shared interactive master.
 fn sync_local_source_to_remote_streaming(
     ssh: &SshControl,
     lane: &crate::remote_bulk::BulkLane,
