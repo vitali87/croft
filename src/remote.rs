@@ -386,6 +386,20 @@ fn run_croft_session(
     // pump always agree on one log. (The original bug was the id being *random*,
     // not its being in env.)
     let relay_id = relay_session_id(path.unwrap_or(""));
+    // Per-client-process nonce for the session-host roster (#229). The relay
+    // key above cannot serve as a client identity on its own: it is a pure
+    // hash of the launch arg, so two terminals opening the SAME path derive
+    // the same key and the host would treat the second as the first
+    // reconnecting and evict it. Minting this ONCE, outside the loop, gives
+    // the pair the two properties the host needs — constant across every
+    // reattach this loop performs, distinct in any other process.
+    //
+    // Unlike the relay key this one is deliberately NOT deterministic, and
+    // that is safe for the opposite reason: nothing recomputes it. Only the
+    // remote client sends it, and dtach freezing the first launch's value is
+    // exactly the desired behavior — that frozen value IS this client's
+    // identity for the life of the session.
+    let client_nonce = client_process_nonce();
     loop {
         let pump = match DropPump::start(&ssh, &relay_id) {
             Ok(p) => Some(p),
@@ -394,7 +408,10 @@ fn run_croft_session(
                 None
             }
         };
-        let env = vec![(String::from("CROFT_RELAY_KEY"), relay_id.clone())];
+        let env = vec![
+            (String::from("CROFT_RELAY_KEY"), relay_id.clone()),
+            (String::from("CROFT_CLIENT_NONCE"), client_nonce.clone()),
+        ];
         let status = run_remote_croft(&ssh, path, &env, solo)?;
         match classify_remote_status(status.code()) {
             RemoteStatusClass::ReturnToLocal => return Ok(RemoteOutcome::ReturnToLocal),
@@ -1501,6 +1518,28 @@ fn write_relay_err(host: &str, socket: &Path, inbox_dir: &str, request_id: &str,
 pub(crate) fn relay_session_id(launch_arg: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hasher.write(launch_arg.as_bytes());
+    format!("{:016x}", hasher.finish())
+}
+
+/// A value unique to THIS client process, for the session-host client
+/// identity (#229). Call once per process and carry the result; calling it
+/// twice yields different values by design.
+///
+/// pid alone is not enough — pids are recycled, and two croft clients on
+/// different machines attaching to one remote session can share one. Mixing
+/// in the start time and the address of a local allocation distinguishes
+/// those without needing a uuid dependency.
+pub(crate) fn client_process_nonce() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::process::id().hash(&mut hasher);
+    if let Ok(since_epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        since_epoch.as_nanos().hash(&mut hasher);
+    }
+    // ASLR plus allocator state: distinct between concurrent processes that
+    // started in the same nanosecond and share a recycled pid.
+    let here = Box::new(0u8);
+    (Box::as_ref(&here) as *const u8 as usize).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 

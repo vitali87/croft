@@ -48,6 +48,22 @@ pub enum Control {
         rows: u16,
         #[serde(default)]
         version: String,
+        /// Stable identity of the attaching *client process*, so a
+        /// reconnect can displace its own previous registration (#229).
+        ///
+        /// When an SSH transport dies the remote croft survives under the
+        /// session host and the client reconnects, but the host cannot tell
+        /// that the old socket is gone: a half-open SSH connection never
+        /// returns EPIPE, it just stops draining. The stale entry lingers as
+        /// a ghost participant — inflating the roster badge, pinning the
+        /// shared winsize through `min_winsize`, and costing every broadcast
+        /// its queue until it overflows.
+        ///
+        /// Empty (the `default`) from pre-0.1.701 clients and from any
+        /// client that cannot determine one; an empty id never displaces
+        /// anything, so those clients keep the old behavior exactly.
+        #[serde(default)]
+        client_id: String,
     },
     /// Client terminal was resized.
     Resize { cols: u16, rows: u16 },
@@ -187,13 +203,173 @@ pub fn presence_path(socket: &Path) -> PathBuf {
     socket.with_file_name(name)
 }
 
+/// How many bytes of undelivered output one client may accumulate before it
+/// is declared too slow to keep up. The PTY pump must never wait on a
+/// socket (#228), so a peer that stops draining cannot be allowed to apply
+/// backpressure — the only alternatives are dropping it or growing the
+/// queue without bound. A wedged client's queue fills at the rate the inner
+/// croft produces output, so this is a time bound in disguise: roughly a
+/// full screen of dense repaints at a large window size, which a healthy
+/// peer drains in milliseconds and a dead one never drains at all.
+const CLIENT_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
+
+/// A client's outbound half: a bounded queue drained by that client's own
+/// writer thread.
+///
+/// Senders ([`broadcast`], and every control frame the server originates)
+/// only ever push here and wake the writer — they never block on the peer's
+/// socket, which is what kept one wedged client from freezing everyone
+/// else. When the queue exceeds [`CLIENT_QUEUE_LIMIT`] the client is marked
+/// dead and its queue dropped; the writer thread then exits and the client
+/// thread deregisters it, exactly as for a peer that closed the connection.
+struct Outbox {
+    queue: Mutex<OutboxState>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct OutboxState {
+    /// Frames awaiting delivery, oldest first.
+    pending: std::collections::VecDeque<Vec<u8>>,
+    /// Total bytes held in `pending`, tracked incrementally so the overflow
+    /// check stays O(1) on the pump's path.
+    bytes: usize,
+    /// Set once the peer is gone (closed, wedged past the queue limit, or
+    /// deliberately disconnected). Latches: a dead outbox never revives.
+    dead: bool,
+}
+
+impl Outbox {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: Mutex::new(OutboxState::default()),
+            wake: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Queue one frame for delivery. Returns false once the peer is dead —
+    /// either already marked, or newly over the queue limit. Never blocks
+    /// on the socket, so this is safe to call from the PTY pump.
+    fn push(&self, frame: &[u8]) -> bool {
+        let mut state = self.queue.lock().unwrap();
+        if state.dead {
+            return false;
+        }
+        // Overflow is judged against the BACKLOG the new frame joins, not
+        // the total including it, so one frame larger than the whole limit
+        // still reaches a healthy peer rather than killing it for a single
+        // big repaint (a Kitty image, a full-screen redraw at a huge size).
+        // What marks a peer dead is a backlog that was already at the limit
+        // before this frame arrived — that only happens when it has stopped
+        // draining.
+        let backlog = state.bytes;
+        state.bytes += frame.len();
+        state.pending.push_back(frame.to_vec());
+        if backlog > CLIENT_QUEUE_LIMIT {
+            state.dead = true;
+            state.pending.clear();
+            state.bytes = 0;
+            self.wake.notify_all();
+            return false;
+        }
+        self.wake.notify_all();
+        true
+    }
+
+    /// Mark the peer gone and wake its writer so the thread can exit.
+    fn kill(&self) {
+        let mut state = self.queue.lock().unwrap();
+        state.dead = true;
+        state.pending.clear();
+        state.bytes = 0;
+        self.wake.notify_all();
+    }
+
+    #[cfg(test)]
+    fn is_dead(&self) -> bool {
+        self.queue.lock().unwrap().dead
+    }
+
+    /// Block until a frame is available or the peer is dead. `None` means
+    /// the writer thread should exit.
+    fn pop_blocking(&self) -> Option<Vec<u8>> {
+        let mut state = self.queue.lock().unwrap();
+        loop {
+            if state.dead {
+                return None;
+            }
+            if let Some(frame) = state.pending.pop_front() {
+                state.bytes -= frame.len();
+                return Some(frame);
+            }
+            state = self.wake.wait(state).unwrap();
+        }
+    }
+}
+
+/// Shut a client's socket down WITHOUT taking its stream lock, given the
+/// raw fd captured at registration ([`Client::fd`]).
+///
+/// The lock is held by that client's writer thread for as long as a frame
+/// write takes — up to [`WRITE_FRAME_DEADLINE`] against a wedged peer. Any
+/// disconnect path that waited for it would inherit exactly the multi-second
+/// stall the outbox design exists to remove (#228), and would do so on the
+/// attach path, where a reconnecting client evicts its ghost (#229).
+///
+/// `shutdown(2)` is safe to call on a fd another thread is mid-write on, and
+/// is precisely what unblocks that writer. The fd stays valid because the
+/// `Client` holds an `Arc<Mutex<UnixStream>>` that owns it; worst case the
+/// writer's in-flight `write` fails, which is the intent.
+fn shutdown_now(fd: std::os::fd::RawFd) {
+    unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+}
+
+/// Drain `outbox` into `stream` until the peer dies. One of these runs per
+/// client, so a slow socket stalls only its own thread.
+fn spawn_writer(stream: Arc<Mutex<UnixStream>>, outbox: Arc<Outbox>, fd: std::os::fd::RawFd) {
+    std::thread::spawn(move || {
+        while let Some(frame) = outbox.pop_blocking() {
+            // The deadline still applies per frame: it bounds how long this
+            // thread lingers on a wedged peer before releasing the socket,
+            // and no other client's output waits behind it.
+            let ok = write_frame_bounded(
+                &mut stream.lock().unwrap(),
+                &frame,
+                Instant::now() + WRITE_FRAME_DEADLINE,
+            );
+            if !ok {
+                outbox.kill();
+                break;
+            }
+        }
+        // Unblock the client thread's read so it deregisters promptly
+        // instead of lingering until the peer happens to send something.
+        shutdown_now(fd);
+    });
+}
+
 struct Client {
     id: u64,
     name: String,
     cols: u16,
     rows: u16,
     control: bool,
+    /// Owning handle on the socket. Nothing reads it any more — output goes
+    /// through `outbox` and disconnects through `fd` — but it must stay:
+    /// this `Arc` is what keeps the `UnixStream` alive, and therefore what
+    /// keeps `fd` a valid descriptor rather than a recycled one.
+    #[allow(dead_code)]
     tx: Arc<Mutex<UnixStream>>,
+    /// This client's socket fd, captured at registration so a disconnect can
+    /// call [`shutdown_now`] without waiting on the writer thread's lock.
+    /// Valid for exactly as long as `tx` above is held.
+    fd: std::os::fd::RawFd,
+    /// Queued output for this client, drained by its own writer thread.
+    outbox: Arc<Outbox>,
+    /// Stable per-client-process identity from [`Control::Hello`], or empty
+    /// when the client did not supply one. Used to evict this client's own
+    /// stale registration on reconnect (#229).
+    client_id: String,
 }
 
 struct Host {
@@ -365,12 +541,20 @@ pub(crate) fn serve_with_token(
     Ok(code)
 }
 
-/// Write `frame` to every connected client, pruning the ones whose
-/// connection died — including a WEDGED one (#53): a `kill -STOP`ped
-/// client stops draining, its socket buffer fills, and a plain `write_all`
-/// here blocked the PTY pump forever while holding the clients lock,
-/// starving every other client and every future attach. The bounded write
-/// treats a peer that drains nothing for [`WRITE_FRAME_DEADLINE`] as gone.
+/// Queue `frame` for every connected client, pruning the ones whose
+/// connection died — including a WEDGED one (#53, #228).
+///
+/// This runs on the PTY pump for every chunk the inner croft draws, so it
+/// must never wait on a peer's socket. It doesn't: each client owns a
+/// bounded [`Outbox`] drained by its own writer thread, and this only
+/// pushes into those queues. A `kill -STOP`ped client stops draining, its
+/// queue fills, and its writer thread — not the pump — absorbs the stall;
+/// once the queue passes [`CLIENT_QUEUE_LIMIT`] the client is marked dead
+/// and dropped here. Every other client keeps flowing at full speed
+/// throughout, which the earlier bounded-write version could not do: it
+/// paid up to [`WRITE_FRAME_DEADLINE`] inline, holding the clients lock,
+/// freezing the session for everyone.
+///
 /// After any prune the shared size and roster are recomputed, so a dead
 /// ghost releases the min winsize it was pinning. Returns whether any
 /// client was pruned.
@@ -378,16 +562,7 @@ fn broadcast(host: &Host, frame: &[u8]) -> bool {
     let pruned = {
         let mut clients = host.clients.lock().unwrap();
         let before = clients.len();
-        // A fresh deadline PER CLIENT: retain visits them sequentially,
-        // and a shared deadline consumed by one wedged peer would evict
-        // every healthy client after it without a single write attempted.
-        clients.retain(|c| {
-            write_frame_bounded(
-                &mut c.tx.lock().unwrap(),
-                frame,
-                Instant::now() + WRITE_FRAME_DEADLINE,
-            )
-        });
+        clients.retain(|c| c.outbox.push(frame));
         clients.len() != before
     };
     if pruned {
@@ -491,33 +666,73 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                     // otherwise never be repeated for the same writer.
                     let current = *host.last_writer.lock().unwrap();
                     if let Some(id) = current {
-                        let _ = tx
-                            .lock()
-                            .unwrap()
-                            .write_all(&encode_control_frame(&Control::Typing { id }));
+                        write_frame_bounded(
+                            &mut tx.lock().unwrap(),
+                            &encode_control_frame(&Control::Typing { id }),
+                            Instant::now() + WRITE_FRAME_DEADLINE,
+                        );
                     }
                 }
                 Frame::Control(Control::Hello {
-                    name, cols, rows, ..
+                    name,
+                    cols,
+                    rows,
+                    client_id,
+                    ..
                 }) if my_id.is_none() && !privileged => {
                     // Answer with our version FIRST: registration below makes
                     // this client a broadcast target, and the ServerHello must
                     // beat any PTY bytes so the attaching client's version
-                    // phase ends on the first frame (#53).
-                    let _ = tx.lock().unwrap().write_all(&encode_control_frame(
-                        &Control::ServerHello {
-                            version: String::from(env!("CARGO_PKG_VERSION")),
-                        },
-                    ));
+                    // phase ends on the first frame (#53). Queueing it before
+                    // the client is registered preserves that ordering
+                    // without writing to the socket from this thread: the
+                    // outbox is FIFO and its writer is the only producer on
+                    // the wire, so a direct write here could otherwise
+                    // interleave mid-frame with a broadcast and desync the
+                    // peer's FrameReader.
+                    let outbox = Outbox::new();
+                    outbox.push(&encode_control_frame(&Control::ServerHello {
+                        version: String::from(env!("CARGO_PKG_VERSION")),
+                    }));
+                    let fd = {
+                        use std::os::fd::AsRawFd;
+                        tx.lock().unwrap().as_raw_fd()
+                    };
+                    spawn_writer(Arc::clone(&tx), Arc::clone(&outbox), fd);
                     let id = host.next_id.fetch_add(1, Ordering::Relaxed);
                     my_id = Some(id);
-                    {
+                    let displaced = {
                         let mut clients = host.clients.lock().unwrap();
+                        // Evict this client's own earlier registration
+                        // (#229). A reconnect after a dead SSH transport
+                        // arrives as a brand-new connection while the stale
+                        // one is still seated and undetectably half-open;
+                        // the client_id match is what lets us tell "the same
+                        // client came back" from "a second person joined".
+                        // An empty id matches nothing, so clients that send
+                        // none are unaffected.
+                        // Partition rather than clone field by field: the
+                        // ghosts are MOVED out, so a `Client` field added
+                        // later cannot be silently dropped on this path.
+                        let displaced: Vec<Client> = if client_id.is_empty() {
+                            Vec::new()
+                        } else {
+                            let (taken, kept): (Vec<Client>, Vec<Client>) =
+                                std::mem::take(&mut *clients)
+                                    .into_iter()
+                                    .partition(|c| c.client_id == client_id);
+                            *clients = kept;
+                            taken
+                        };
                         // Write control auto-attaches only when nobody holds
                         // it: the first client, or an owner reattaching after
                         // every control holder left. Everyone else starts as
-                        // a read-only observer until granted.
-                        let control = !clients.iter().any(|c| c.control);
+                        // a read-only observer until granted. A reconnecting
+                        // client inherits the control its ghost held, so a
+                        // dropped transport never silently demotes the owner
+                        // to read-only.
+                        let control = displaced.iter().any(|c| c.control)
+                            || !clients.iter().any(|c| c.control);
                         clients.push(Client {
                             id,
                             name,
@@ -525,7 +740,19 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                             rows,
                             control,
                             tx: Arc::clone(&tx),
+                            fd,
+                            outbox,
+                            client_id,
                         });
+                        displaced
+                    };
+                    // Tear the ghosts down outside the clients lock: killing
+                    // an outbox wakes its writer, and shutdown unblocks the
+                    // ghost's client thread so it deregisters (finding
+                    // itself already gone) rather than lingering.
+                    for ghost in displaced {
+                        ghost.outbox.kill();
+                        shutdown_now(ghost.fd);
                     }
                     apply_winsize(host, true);
                     update_presence(host);
@@ -575,6 +802,11 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
     if let Some(id) = my_id {
         {
             let mut clients = host.clients.lock().unwrap();
+            // Kill the outbox on the way out so this client's writer thread
+            // wakes and exits instead of parking on an empty queue forever.
+            if let Some(c) = clients.iter().find(|c| c.id == id) {
+                c.outbox.kill();
+            }
             clients.retain(|c| c.id != id);
         }
         apply_winsize(host, false);
@@ -595,7 +827,17 @@ fn announce_typing(host: &Host, id: u64) {
     }
     let frame = encode_control_frame(&Control::Typing { id });
     let mut channels = host.privileged.lock().unwrap();
-    channels.retain(|tx| tx.lock().unwrap().write_all(&frame).is_ok());
+    // Bounded, like every other server-originated write (#228): this sits
+    // directly in front of the PTY write on the keystroke path, so an inner
+    // channel that stopped draining would otherwise block the typing client
+    // forever on a plain `write_all`.
+    channels.retain(|tx| {
+        write_frame_bounded(
+            &mut tx.lock().unwrap(),
+            &frame,
+            Instant::now() + WRITE_FRAME_DEADLINE,
+        )
+    });
 }
 
 /// Grant or revoke write control on `target`, but only when the requester
@@ -634,7 +876,11 @@ fn kick(host: &Host, privileged: bool, requester: Option<u64>, target: u64) {
         return;
     }
     if let Some(c) = clients.iter().find(|c| c.id == target) {
-        let _ = c.tx.lock().unwrap().shutdown(std::net::Shutdown::Both);
+        // Kill the outbox too: the writer thread may be parked on a wedged
+        // socket, and shutdown alone would leave it holding the stream lock
+        // until its deadline expired.
+        c.outbox.kill();
+        shutdown_now(c.fd);
     }
 }
 
@@ -839,6 +1085,7 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
             cols,
             rows,
             version: String::from(env!("CARGO_PKG_VERSION")),
+            client_id: client_identity(),
         }))
         .context("sending hello")?;
 
@@ -1224,6 +1471,44 @@ pub(crate) fn client_name() -> String {
     format!("{user}@{}", hostname())
 }
 
+/// Stable identity for this attaching client process (#229), used by the
+/// host to displace the same client's earlier, now-dead registration.
+///
+/// The requirement is narrow and two-sided: it must be IDENTICAL across
+/// reconnects of one client, and DISTINCT between genuinely separate
+/// clients — two terminals on the same machine attaching to one session are
+/// two real participants and neither may evict the other.
+///
+/// `CROFT_RELAY_KEY` alone satisfies only the first half. It is
+/// `hash(launch arg)` (`remote::relay_session_id`), so two terminals running
+/// `croft remote host /same/path` derive the SAME key, and the second would
+/// evict the first — turning a ghost fix into a way to kick a colleague off.
+/// The launch key is therefore combined with `CROFT_CLIENT_NONCE`, which
+/// `remote::run_croft_session` mints once per client process, outside its
+/// reconnect loop: constant across every reattach that loop performs, and
+/// different in any other process.
+///
+/// Off the remote path both are absent and this returns empty, which
+/// displaces nothing. That is deliberate: a local attach has no ghost
+/// problem, because a dead unix socket reports EPIPE at once and is pruned
+/// on the next broadcast.
+pub(crate) fn client_identity() -> String {
+    compose_client_identity(
+        &std::env::var("CROFT_RELAY_KEY").unwrap_or_default(),
+        &std::env::var("CROFT_CLIENT_NONCE").unwrap_or_default(),
+    )
+}
+
+/// The composition rule behind [`client_identity`], split out so it can be
+/// tested directly: `set_var` races sibling test threads (#37), so the env
+/// read stays a one-liner and the logic worth asserting lives here.
+fn compose_client_identity(relay_key: &str, nonce: &str) -> String {
+    if relay_key.is_empty() || nonce.is_empty() {
+        return String::new();
+    }
+    format!("{relay_key}.{nonce}")
+}
+
 #[cfg(unix)]
 fn hostname() -> String {
     let mut buf = [0u8; 256];
@@ -1262,6 +1547,35 @@ mod tests {
             InnerChannel::from_env().is_none(),
             "a test-built App must not connect to the launching shell's session host"
         );
+    }
+
+    /// #229: the client identity must distinguish two terminals that opened
+    /// the SAME path. The relay key cannot do that alone — it is a pure hash
+    /// of the launch arg (`remote::relay_session_id`), so both launches
+    /// derive it identically and the host would read the second attach as
+    /// the first reconnecting and evict it: a ghost fix that kicks a real
+    /// participant off. The per-process nonce is what separates them.
+    #[test]
+    fn two_clients_sharing_a_launch_arg_get_distinct_identities() {
+        // Same relay key on purpose: this is the colliding case.
+        let key = "same-launch-arg-hash";
+        let a = compose_client_identity(key, &crate::remote::client_process_nonce());
+        let b = compose_client_identity(key, &crate::remote::client_process_nonce());
+        assert_ne!(
+            a, b,
+            "two client processes sharing one launch arg must not share an identity"
+        );
+        // Same process reconnecting: the nonce is minted once and carried,
+        // so the identity must be stable — that is what evicts the ghost.
+        let nonce = crate::remote::client_process_nonce();
+        assert_eq!(
+            compose_client_identity(key, &nonce),
+            compose_client_identity(key, &nonce),
+            "one client's identity must survive its own reconnects"
+        );
+        // Either half missing yields empty, which displaces nothing.
+        assert_eq!(compose_client_identity("", "nonce"), "");
+        assert_eq!(compose_client_identity(key, ""), "");
     }
 
     #[test]
@@ -1352,6 +1666,7 @@ mod tests {
             cols: 120,
             rows: 40,
             version: String::from(env!("CARGO_PKG_VERSION")),
+            client_id: String::from("relay-key-abc"),
         };
         let mut wire = encode_control_frame(&hello);
         wire.extend(encode_bytes_frame(b"ls\r"));
@@ -1451,6 +1766,12 @@ mod tests {
 
     impl TestClient {
         fn connect(socket: &Path, name: &str, cols: u16, rows: u16) -> Self {
+            Self::connect_as(socket, name, cols, rows, "")
+        }
+
+        /// Attach with an explicit `client_id`, the stable per-client-process
+        /// identity a reconnect reuses to displace its own ghost (#229).
+        fn connect_as(socket: &Path, name: &str, cols: u16, rows: u16, client_id: &str) -> Self {
             let stream = UnixStream::connect(socket).expect("connect");
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1464,12 +1785,32 @@ mod tests {
                 cols,
                 rows,
                 version: String::from(env!("CARGO_PKG_VERSION")),
+                client_id: String::from(client_id),
             }));
             c
         }
 
         fn send(&mut self, wire: &[u8]) {
             self.stream.write_all(wire).expect("send");
+        }
+
+        /// One best-effort read: the number of PTY bytes decoded, or None on
+        /// a timeout. Unlike [`Self::read_until`] a quiet socket is a
+        /// tolerable outcome, not a panic — used when the point of the test
+        /// is to measure how promptly output flows.
+        fn try_read_some(&mut self) -> Option<usize> {
+            let mut buf = [0u8; 4096];
+            let n = self.stream.read(&mut buf).ok()?;
+            Some(
+                self.reader
+                    .push(&buf[..n])
+                    .iter()
+                    .map(|f| match f {
+                        Frame::Bytes(b) => b.len(),
+                        _ => 0,
+                    })
+                    .sum(),
+            )
         }
 
         /// Read frames until `pred` matches one, returning everything seen.
@@ -1652,12 +1993,142 @@ mod tests {
         let old = br#"{"t":"hello","name":"v@mac","cols":120,"rows":40}"#;
         let parsed: Control = serde_json::from_slice(old).expect("old Hello parses");
         match parsed {
-            Control::Hello { version, name, .. } => {
+            Control::Hello {
+                version,
+                name,
+                client_id,
+                ..
+            } => {
                 assert_eq!(version, "", "the missing field defaults to empty");
                 assert_eq!(name, "v@mac");
+                // #229: the same tolerance covers client_id. An empty id
+                // must never displace a seated participant, or an old
+                // client attaching would kick every other old client off.
+                assert_eq!(client_id, "", "the missing field defaults to empty");
             }
             other => panic!("expected Hello, got {other:?}"),
         }
+    }
+
+    /// #229: a client reconnecting after a dead transport must displace its
+    /// OWN earlier registration. The stale entry is undetectably half-open
+    /// over SSH, so without this the roster shows a phantom second
+    /// participant and it pins the shared winsize forever.
+    #[test]
+    fn a_reconnecting_client_displaces_its_own_ghost() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut first = TestClient::connect_as(&socket, "owner", 80, 24, "relay-key-1");
+        first.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+
+        // The transport dies but the socket stays open and undrained: this
+        // is the ghost. The same client then reconnects with the same id.
+        let mut back = TestClient::connect_as(&socket, "owner", 120, 40, "relay-key-1");
+        // Take the last roster the server sends rather than waiting for a
+        // specific size: without eviction the roster never reaches 1, and
+        // the assertion below should be what reports that — naming the
+        // phantom participant — instead of an opaque read timeout.
+        let frames = back.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let ps = roster(&frames).expect("presence");
+        let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            ps.len(),
+            1,
+            "the reconnect must displace its ghost, not seat a second \
+             participant; roster is {names:?}"
+        );
+        // The survivor is the NEW connection, carrying its new size — proof
+        // the ghost no longer pins the shared winsize at 80x24.
+        assert_eq!(
+            (ps[0].cols, ps[0].rows),
+            (120, 40),
+            "the reconnected client's size must win once the ghost is gone"
+        );
+        assert!(
+            ps[0].control,
+            "a reconnecting owner must not be silently demoted to read-only"
+        );
+        drop(first);
+    }
+
+    /// #229 guard rail: eviction keys on the client id, so two genuinely
+    /// separate clients — including two terminals sharing a machine, which
+    /// have the same user@host name — must both stay seated. Only a client
+    /// with a MATCHING id displaces, and an empty id displaces nothing.
+    #[test]
+    fn distinct_clients_never_displace_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut a = TestClient::connect_as(&socket, "vitali@mac", 80, 24, "relay-key-a");
+        a.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        // Same human, same machine, different session: must NOT evict.
+        let mut b = TestClient::connect_as(&socket, "vitali@mac", 80, 24, "relay-key-b");
+        let frames = b.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        assert_eq!(roster(&frames).unwrap().len(), 2, "distinct ids coexist");
+
+        // Two id-less clients (pre-0.1.701, or a local attach) also coexist:
+        // an empty id must never match another empty id.
+        let mut c = TestClient::connect(&socket, "legacy", 80, 24);
+        c.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut d = TestClient::connect(&socket, "legacy", 80, 24);
+        let frames = d.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 4)
+        });
+        assert_eq!(
+            roster(&frames).unwrap().len(),
+            4,
+            "an empty client_id must never displace anything"
+        );
+    }
+
+    /// #228 unit: the outbox admits frames until it passes the limit, then
+    /// latches dead and drops its backlog rather than growing without bound.
+    #[test]
+    fn an_outbox_over_its_limit_latches_dead_and_frees_its_backlog() {
+        let outbox = Outbox::new();
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut accepted = 0;
+        while outbox.push(&chunk) {
+            accepted += 1;
+            assert!(accepted < 1000, "the outbox must not accept without bound");
+        }
+        assert!(
+            accepted >= CLIENT_QUEUE_LIMIT / chunk.len(),
+            "a healthy peer must be allowed to buffer up to the limit"
+        );
+        assert!(outbox.is_dead(), "passing the limit must latch dead");
+        assert_eq!(
+            outbox.queue.lock().unwrap().bytes,
+            0,
+            "a dead outbox must release its backlog"
+        );
+        assert!(!outbox.push(&chunk), "dead latches: it never revives");
+        assert!(
+            outbox.pop_blocking().is_none(),
+            "a dead outbox must release its writer thread"
+        );
+    }
+
+    /// #228 unit: a single frame larger than the whole limit still reaches a
+    /// healthy peer — one big repaint must not be mistaken for a wedge.
+    #[test]
+    fn an_outbox_delivers_a_frame_larger_than_its_limit() {
+        let outbox = Outbox::new();
+        let huge = vec![b'x'; CLIENT_QUEUE_LIMIT + 1];
+        assert!(outbox.push(&huge), "the oversized frame is admitted");
+        assert_eq!(
+            outbox.pop_blocking().map(|f| f.len()),
+            Some(huge.len()),
+            "and is delivered intact"
+        );
     }
 
     /// #53 part 1 compat, new server -> old client: the frame decoder must
@@ -1754,11 +2225,99 @@ mod tests {
         drop(server);
     }
 
-    /// #53 part 3: a client that stops draining (kill -STOP, a wedged
-    /// terminal) filled its socket buffer, and the plain `write_all` in
-    /// `broadcast` then blocked the PTY pump forever while holding the
-    /// clients lock — every other client starved. The bounded write must
-    /// evict the ghost at the deadline and the survivors keep flowing.
+    /// #228: the invariant that matters is not merely that a wedged client
+    /// is eventually evicted, but that the survivors NEVER STALL while it
+    /// is wedged. With the queue-per-client design the pump only enqueues,
+    /// so the owner's echo must keep arriving promptly from the very first
+    /// round — long before the ghost's queue overflows and it is dropped.
+    ///
+    /// The bounded-write version failed this: every broadcast paid up to
+    /// `WRITE_FRAME_DEADLINE` inline on the ghost while holding the clients
+    /// lock, so the owner's echo arrived in multi-second lurches.
+    #[test]
+    fn a_wedged_client_never_stalls_the_other_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let mut owner = TestClient::connect(&socket, "owner", 120, 40);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        // The ghost attaches and never reads again.
+        let ghost = TestClient::connect(&socket, "ghost", 80, 24);
+        let frames = owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        assert_eq!(roster(&frames).unwrap().len(), 2, "staging: ghost seated");
+
+        // First SATURATE the ghost's kernel socket buffer. Until it is full
+        // a write to the ghost still completes immediately, so the inline
+        // bounded-write design would look healthy here and this test would
+        // pass against the very bug it exists to catch. Push enough through
+        // `cat`'s echo to fill that buffer (a few hundred KB on Linux and
+        // macOS) while the owner drains its own side.
+        let filler = vec![b'x'; 32 * 1024];
+        let mut sender = owner.stream.try_clone().expect("clone owner socket");
+        let warm = std::thread::spawn(move || {
+            let frame = encode_bytes_frame(&filler);
+            for _ in 0..64 {
+                if sender.write_all(&frame).is_err() {
+                    break;
+                }
+            }
+        });
+        // Drain roughly what was sent so the owner never wedges itself.
+        // Reads are allowed to time out here: against a pump that IS blocked
+        // on the ghost (the bug this test catches) the echo dries up
+        // completely, and the timing assertions below are what should report
+        // that — not a panic out of the warm-up.
+        let mut drained = 0usize;
+        let warm_deadline = Instant::now() + Duration::from_secs(20);
+        while drained < 64 * 32 * 1024 && Instant::now() < warm_deadline {
+            match owner.try_read_some() {
+                Some(n) if n > 0 => drained += n,
+                // A read that decoded no PTY bytes yet — a control frame, or
+                // a frame still split across reads — is progress, not the
+                // end. Breaking here would leave the ghost's buffer
+                // unsaturated and quietly weaken the probe rounds below.
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        let _ = warm.join();
+
+        // NOW the ghost is genuinely wedged: its buffer is full and it is
+        // not reading. Every one of these round trips must still complete
+        // quickly, because the pump only enqueues — the ghost's dead socket
+        // never appears on the owner's critical path.
+        for round in 0..8 {
+            let probe = format!("probe-{round}\n");
+            let started = Instant::now();
+            owner.send(&encode_bytes_frame(probe.as_bytes()));
+            // Wait for ANY output to come back. A healthy pump answers in
+            // milliseconds; a pump blocked on the ghost answers only after
+            // the ghost's write deadline expires, or not at all within the
+            // socket's read timeout. Both show up as a large `elapsed`.
+            while started.elapsed() < WRITE_FRAME_DEADLINE * 2 {
+                match owner.try_read_some() {
+                    Some(n) if n > 0 => break,
+                    Some(_) => continue,
+                    None => break,
+                }
+            }
+            let elapsed = started.elapsed();
+            // Generous next to a blocked round (which pays the full
+            // WRITE_FRAME_DEADLINE, 5s) but far below it, so the two cases
+            // can never be confused by a slow CI machine.
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "round {round}: the owner waited {elapsed:?} behind a wedged peer; \
+                 the pump must never block on a client socket"
+            );
+        }
+        drop(ghost);
+    }
+
+    /// A client whose queue grows past [`CLIENT_QUEUE_LIMIT`] is undeliverable
+    /// and must be dropped, so a permanently wedged peer cannot pin the
+    /// shared winsize or grow the server's memory without bound.
     #[test]
     fn a_wedged_client_is_evicted_instead_of_freezing_the_pump() {
         let dir = tempfile::tempdir().unwrap();
@@ -1772,12 +2331,34 @@ mod tests {
         let frames = owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
         assert_eq!(roster(&frames).unwrap().len(), 2, "staging: ghost seated");
         // Flood: cat echoes everything back through broadcast; the ghost's
-        // socket buffer fills and the write deadline must evict it rather
-        // than wedge the pump. The owner keeps draining throughout.
+        // socket buffer fills, then its outbox grows past CLIENT_QUEUE_LIMIT
+        // and the ghost is dropped.
+        //
+        // The writes happen on their own thread and are NOT interleaved with
+        // the owner's reads. Alternating send/read would throttle the flood
+        // to one chunk in flight — the ghost's backlog could never build,
+        // because the sender would be rate-limited by its own draining. Here
+        // the owner drains continuously (so it never wedges too and is never
+        // itself evicted) while the flood runs ahead of the ghost.
         let chunk = vec![b'x'; 32 * 1024];
+        // Several times the limit: the ghost's kernel socket buffer swallows
+        // the first megabyte or so before any of it reaches the outbox.
+        let rounds = (CLIENT_QUEUE_LIMIT / chunk.len()) * 4;
+        // Only the owner holds write control, so only the owner's bytes
+        // reach the PTY and come back as echo. Clone its socket so the flood
+        // can run on its own thread while the reads continue below.
+        let mut sender = owner.stream.try_clone().expect("clone owner socket");
+        let flood = std::thread::spawn(move || {
+            let frame = encode_bytes_frame(&chunk);
+            for _ in 0..rounds {
+                if sender.write_all(&frame).is_err() {
+                    break;
+                }
+            }
+        });
         let mut evicted = false;
-        for _ in 0..64 {
-            owner.send(&encode_bytes_frame(&chunk));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
             let frames = owner.read_until(|f| {
                 matches!(f, Frame::Control(Control::Presence { .. }))
                     || matches!(f, Frame::Bytes(_))
@@ -1785,15 +2366,16 @@ mod tests {
             if frames
                 .iter()
                 .any(|f| matches!(f, Frame::Control(Control::Presence { .. })))
-                && roster(&frames).is_some_and(|ps| ps.len() == 1)
+                && roster(&frames).is_some_and(|ps| !ps.iter().any(|p| p.name == "ghost"))
             {
                 evicted = true;
                 break;
             }
         }
+        let _ = flood.join();
         assert!(
             evicted,
-            "the wedged ghost must be evicted and the roster shrink to the owner"
+            "the wedged ghost must be evicted once its backlog passes the limit"
         );
         drop(ghost);
     }
