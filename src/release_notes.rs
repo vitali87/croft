@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Stage and unstage selected lines: drag a selection inside a Source Control diff and S / U now act on exactly those lines instead of the whole hunk, so one mixed hunk can be split across several commits.",
+    kind: NoteKind::Fix,
+    summary: "Croft Light: the selected activity-bar icon no longer disappears. The icons are baked as images with a fixed tint, so on a light bar the selected one was painted white on white; the whole icon family now takes its ink from the theme, matching VS Code Light Modern.",
 }];

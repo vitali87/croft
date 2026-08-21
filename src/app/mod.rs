@@ -4153,6 +4153,15 @@ impl App {
         let w_cells = ACTIVITY_BAR_WIDTH;
         let h_cells = ACTIVITY_ICON_HEIGHT;
         let icon_bg = self.theme_bg_pixel();
+        // The bar background above is the theme's; so is the ink painted on
+        // it. A baked icon can't route its colors through `Theme::ui` the way
+        // a styled cell does, so the palette is resolved once here and rides
+        // into every compose call (issue #225).
+        let icon_ink = crate::iterm2_inline::IconInk::new(
+            self.theme.activity_icon_inactive_rgb(),
+            self.theme.activity_icon_active_rgb(),
+            self.theme.activity_icon_pill_rgb(),
+        );
         let protocol = self.inline_protocol;
         // The activity-bar icons are codicon SVGs, rasterised at the exact icon
         // pixel size (no multi-MB raster decode, crisp at any cell size). `id`
@@ -4165,7 +4174,7 @@ impl App {
                       id: u32|
          -> Option<String> {
             let baked = crate::iterm2_inline::compose_icon_svg(
-                src_svg, canvas_w, canvas_h, state, icon_bg, off_y_bias,
+                src_svg, canvas_w, canvas_h, state, icon_ink, icon_bg, off_y_bias,
             )?;
             // preserveAspectRatio=0: stretch to exactly fill 4×2 cells.
             // Since the canvas was composed at exactly that pixel size,
@@ -4209,6 +4218,7 @@ impl App {
                 layout_canvas_w,
                 layout_canvas_h,
                 state,
+                icon_ink,
                 icon_bg,
                 0,
             )?;
@@ -4333,6 +4343,7 @@ impl App {
             rd_icon_w_px,
             rd_icon_h_px,
             false,
+            icon_ink,
             icon_bg,
             0,
         ) && let Some(raw) = crate::iterm2_inline::build_inline_image(
@@ -10081,7 +10092,7 @@ impl App {
         if !self.overlays.activity.has_images() {
             frame.render_widget(ratatui::widgets::Block::default().style(bg), area);
         }
-        let active_bar = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
+        let active_bar = self.theme.activity_icon_pill();
         let bg_color = bg.bg.unwrap_or(Color::Reset);
         let explorer_block = activity_explorer_block(area);
         let search_block = activity_search_block(area);
@@ -10111,8 +10122,11 @@ impl App {
         let testing_hovered = hov == Some(ActivityIcon::Testing);
         let settings_hovered = hov == Some(ActivityIcon::Settings);
 
-        let active_color = self.theme.ui(Color::White);
-        let inactive_color = self.theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c));
+        // Same palette the baked icons use, so an image-less terminal renders
+        // the bar in the same colors as an image-capable one instead of a
+        // second, slightly-off set of greys.
+        let active_color = self.theme.activity_icon_active();
+        let inactive_color = self.theme.activity_icon_inactive();
         let glyph_x = activity_icon_glyph_x(area);
         let render_glyph = |frame: &mut ratatui::Frame,
                             block: Rect,

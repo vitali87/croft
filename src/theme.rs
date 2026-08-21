@@ -683,6 +683,53 @@ impl Theme {
     pub fn tab_close_pill_bg(self) -> Color {
         rgb(self.tab_pill)
     }
+
+    /// [`Theme::ui`] over raw sRGB bytes, for the inline-image bakes that
+    /// composite pixels instead of styling cells.
+    fn ui_rgb(self, dark: (u8, u8, u8)) -> (u8, u8, u8) {
+        match self.ui(rgb(dark)) {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => dark,
+        }
+    }
+
+    /// Resting ink of an unselected activity-bar icon (VS Code
+    /// `activityBar.inactiveForeground`, #616161 on Light Modern).
+    pub fn activity_icon_inactive_rgb(self) -> (u8, u8, u8) {
+        self.ui_rgb((0x9d, 0xa5, 0xb4))
+    }
+
+    /// Ink of the selected activity-bar icon, and of any icon under the
+    /// pointer (VS Code `activityBar.foreground`, #1f1f1f on Light Modern).
+    /// The dark chrome paints these white, which is exactly why the baked
+    /// icons cannot keep a hardcoded tint: on a light bar white ink is
+    /// invisible (issue #225).
+    pub fn activity_icon_active_rgb(self) -> (u8, u8, u8) {
+        self.ui_rgb((0xff, 0xff, 0xff))
+    }
+
+    /// The selection bar down the left edge of the selected icon (VS Code
+    /// `activityBar.activeBorder`, #005fb8 on Light Modern).
+    pub fn activity_icon_pill_rgb(self) -> (u8, u8, u8) {
+        self.ui_rgb((0x4e, 0x9a, 0xff))
+    }
+
+    /// [`Theme::activity_icon_inactive_rgb`] as a cell color, for the glyph
+    /// fallback the image-less terminals render. Both paths draw the same
+    /// bar, so they read their ink from the same place.
+    pub fn activity_icon_inactive(self) -> Color {
+        rgb(self.activity_icon_inactive_rgb())
+    }
+
+    /// [`Theme::activity_icon_active_rgb`] as a cell color.
+    pub fn activity_icon_active(self) -> Color {
+        rgb(self.activity_icon_active_rgb())
+    }
+
+    /// [`Theme::activity_icon_pill_rgb`] as a cell color.
+    pub fn activity_icon_pill(self) -> Color {
+        rgb(self.activity_icon_pill_rgb())
+    }
 }
 
 impl Default for Theme {
@@ -1059,5 +1106,56 @@ mod tests {
             Color::Rgb(0x8c, 0x8c, 0x8c),
             "black ignored grey unchanged"
         );
+    }
+
+    /// Issue #225: the activity-bar icons are baked as inline images with a
+    /// tint chosen away from the render call site, so the palette has to come
+    /// from the theme. On a light bar the dark chrome's white ink would paint
+    /// the selected icon invisible.
+    #[test]
+    fn light_activity_icon_ink_is_vs_code_light_modern() {
+        let l = Theme::from_id("light");
+        assert_eq!(
+            l.activity_icon_active_rgb(),
+            (0x1f, 0x1f, 0x1f),
+            "selected / hovered icon = activityBar.foreground"
+        );
+        assert_eq!(
+            l.activity_icon_inactive_rgb(),
+            (0x61, 0x61, 0x61),
+            "resting icon = activityBar.inactiveForeground"
+        );
+        assert_eq!(
+            l.activity_icon_pill_rgb(),
+            (0x00, 0x5f, 0xb8),
+            "selection bar = activityBar.activeBorder"
+        );
+        // Every ink must read against the bar it is painted on, and the
+        // selected icon must be darker than the resting ones so selection
+        // survives without relying on the pill alone.
+        let bar = luma(l.editor_bg_rgb());
+        for ink in [
+            l.activity_icon_active_rgb(),
+            l.activity_icon_inactive_rgb(),
+            l.activity_icon_pill_rgb(),
+        ] {
+            assert!(
+                bar - luma(ink) > 90.0,
+                "{ink:?} must contrast against the light activity bar"
+            );
+        }
+        assert!(
+            luma(l.activity_icon_active_rgb()) < luma(l.activity_icon_inactive_rgb()),
+            "the selected icon reads stronger than the resting ones"
+        );
+    }
+
+    #[test]
+    fn dark_activity_icon_ink_keeps_the_historical_chrome() {
+        for t in Theme::all().iter().filter(|t| !t.is_light()) {
+            assert_eq!(t.activity_icon_active_rgb(), (0xff, 0xff, 0xff));
+            assert_eq!(t.activity_icon_inactive_rgb(), (0x9d, 0xa5, 0xb4));
+            assert_eq!(t.activity_icon_pill_rgb(), (0x4e, 0x9a, 0xff));
+        }
     }
 }

@@ -11639,6 +11639,49 @@ fn quick_open_popup_follows_the_light_theme() {
     }
 }
 
+/// Issue #225: the selected activity-bar icon must stay visible on the light
+/// theme, and stay distinguishable from the unselected ones. Renders the bar
+/// (glyph fallback path) under Croft Light and reads the real cells: the
+/// selected Explorer glyph carries VS Code's `activityBar.foreground`, an
+/// unselected glyph the lighter `inactiveForeground`, and neither is the bar
+/// background.
+#[test]
+fn the_selected_activity_icon_is_visible_on_the_light_theme() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let light = crate::theme::Theme::from_id("light");
+    app.apply_theme(light);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let buf = term.backend().buffer();
+    let cell_of = |glyph: char| {
+        (0..40u16)
+            .flat_map(|y| (0..4u16).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == glyph.to_string())
+            .map(|(x, y)| buf[(x, y)].clone())
+            .unwrap_or_else(|| panic!("the activity bar must paint {glyph:?}"))
+    };
+    // Explorer is the sidebar view every workspace opens on, so it is the
+    // selected icon here; Search is not.
+    let selected = cell_of(crate::icons::ACTIVITY_EXPLORER);
+    let resting = cell_of(crate::icons::ACTIVITY_SEARCH);
+    assert_eq!(
+        selected.fg,
+        light.activity_icon_active(),
+        "the selected icon wears activityBar.foreground, not the white that vanishes on a light bar"
+    );
+    assert_eq!(resting.fg, light.activity_icon_inactive());
+    assert_ne!(
+        selected.fg, resting.fg,
+        "selection must be readable from the icon itself, not only from the pill"
+    );
+    assert_ne!(
+        selected.fg, selected.bg,
+        "the selected glyph must not be painted in the bar's own background"
+    );
+}
+
 /// Issue #217: the Explorer's file names were white-on-white under Croft
 /// Light (a bare `Color::White` that bypassed the theme adapter). Render
 /// the tree under the light theme and inspect the actual name cell: the
