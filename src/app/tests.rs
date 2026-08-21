@@ -22,6 +22,33 @@ fn probe_command(probe: &str) -> String {
     format!("printf '%s%s\\n' '{head}' '{tail}'\r")
 }
 
+/// How long the terminal end-to-end tests wait for their probe to come back
+/// through the PTY. Generous on purpose: a real shell has to start, run the
+/// command, and have the reader thread drain the bytes into the grid, and on
+/// a box running the whole suite in parallel that took longer than the three
+/// seconds this used to allow (issue #226).
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run the probe command in the app's embedded terminal and wait until the
+/// probe is on screen. Panics with the actual screen contents if it never
+/// arrives, so a failure says what the terminal was showing instead of
+/// unwrapping `None` several lines later.
+fn await_terminal_probe(app: &mut App, probe: &str) {
+    app.terminal_mut()
+        .write_input(probe_command(probe).as_bytes());
+    let started = std::time::Instant::now();
+    while started.elapsed() < PROBE_TIMEOUT {
+        if app.terminal().visible_text().contains(probe) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!(
+        "the shell never printed the probe {probe:?} within {PROBE_TIMEOUT:?}; terminal showed:\n{}",
+        app.terminal().visible_text()
+    );
+}
+
 #[test]
 fn minimap_rgba_paints_chars_skips_whitespace() {
     let mut e = crate::widgets::editor::Editor::new();
@@ -4702,18 +4729,7 @@ fn cmd_c_on_terminal_selection_lands_text_on_macos_clipboard() {
     term.draw(|f| app.render(f)).unwrap();
 
     let probe = format!("croft-terminal-cmdc-{}", std::process::id());
-    app.terminal_mut()
-        .write_input(probe_command(&probe).as_bytes());
-
-    // Wait for the shell to push bytes through the PTY and the
-    // background reader thread to drain them into the grid.
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(3000) {
-        if app.terminal().visible_text().contains(&probe) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    await_terminal_probe(&mut app, &probe);
     // Re-render to refresh `last_inner` after the grid has grown.
     term.draw(|f| app.render(f)).unwrap();
 
@@ -6122,15 +6138,7 @@ fn double_click_in_terminal_word_selects_in_split_and_maximised_layout() {
         }
         app.focus_pane(Pane::Terminal);
         let probe = format!("croft-dclick-{}", std::process::id());
-        app.terminal_mut()
-            .write_input(probe_command(&probe).as_bytes());
-        let started = std::time::Instant::now();
-        while started.elapsed() < std::time::Duration::from_millis(3000) {
-            if app.terminal().visible_text().contains(&probe) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        await_terminal_probe(&mut app, &probe);
         term.draw(|f| app.render(f)).unwrap();
         let snap = app.terminal().visible_text();
         let row_idx = snap
@@ -6180,15 +6188,7 @@ fn terminal_copy_paste_into_other_panes_works_in_split_and_maximised_layout() {
     // landed on the clipboard.
     fn copy_terminal_word(app: &mut App) -> String {
         let probe = format!("croft-e2e-{}", std::process::id());
-        app.terminal_mut()
-            .write_input(probe_command(&probe).as_bytes());
-        let started = std::time::Instant::now();
-        while started.elapsed() < std::time::Duration::from_millis(3000) {
-            if app.terminal().visible_text().contains(&probe) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        await_terminal_probe(app, &probe);
         let snap = app.terminal().visible_text();
         let row_idx = snap.lines().position(|l| l.contains(&probe)).unwrap();
         let line = snap.lines().nth(row_idx).unwrap();
@@ -6401,15 +6401,7 @@ fn terminal_cmd_c_copies_even_when_search_sidebar_is_open() {
     term.draw(|f| app.render(f)).unwrap();
 
     let probe = format!("croft-search-open-{}", std::process::id());
-    app.terminal_mut()
-        .write_input(probe_command(&probe).as_bytes());
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(3000) {
-        if app.terminal().visible_text().contains(&probe) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    await_terminal_probe(&mut app, &probe);
     term.draw(|f| app.render(f)).unwrap();
     let snap = app.terminal().visible_text();
     let row_idx = snap.lines().position(|l| l.contains(&probe)).unwrap();
