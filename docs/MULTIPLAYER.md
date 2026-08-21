@@ -223,6 +223,32 @@ tunneling (`src/remote.rs:1323`) is available if a socket ever needs to
 cross machines, but the design needs no case for it: the session always
 lives where the workspace lives.
 
+## Output delivery: one queue per client
+
+The PTY pump broadcasts to every client, so it must never wait on any one
+of them. Each client owns a bounded outbox (`CLIENT_QUEUE_LIMIT`) drained by
+its own writer thread; `broadcast` only enqueues. A client that stops
+draining fills its own queue and is dropped once the backlog passes the
+limit — its stall is absorbed by its own writer thread, never by the pump.
+
+This matters because a wedged peer is not hypothetical over SSH. When a
+transport dies the remote croft survives under the session host, but the
+half-open socket never returns EPIPE — it just silently stops accepting
+bytes. The earlier design wrote to each client inline with a
+`WRITE_FRAME_DEADLINE` bound, so every broadcast paid up to 5 seconds on
+that dead peer while holding the clients lock: the whole session froze for
+everyone until the ghost was pruned (#228).
+
+The ghost itself is prevented separately (#229): `hello` carries a
+`client_id`, the stable per-client-process identity (`CROFT_RELAY_KEY` on
+the remote path, which `remote::run_croft_session` holds constant across
+the reconnects in its retry loop). On attach the host evicts any client
+already registered under the same id, and the reconnecting client inherits
+the control its ghost held, so a dropped transport never demotes the owner
+to read-only. An empty id — pre-0.1.701 clients, and local attaches, which
+have no ghost problem because a dead unix socket reports EPIPE at once —
+matches nothing and displaces nothing.
+
 ## Presence and permissions
 
 - Identity: `hello` carries a name (default `$USER@hostname`, overridable
