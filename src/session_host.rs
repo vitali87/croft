@@ -1492,11 +1492,14 @@ mod tests {
             let mut seen = Vec::new();
             let mut buf = [0u8; 4096];
             let deadline = Instant::now() + budget;
-            self.stream
-                .set_read_timeout(Some(READ_POLL_INTERVAL))
-                .unwrap();
             loop {
-                assert!(Instant::now() < deadline, "timed out; saw {seen:?}");
+                // Never block past the budget: a read armed with the full poll
+                // interval a hair before the deadline would overshoot it.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "timed out; saw {seen:?}");
+                self.stream
+                    .set_read_timeout(Some(remaining.min(READ_POLL_INTERVAL)))
+                    .unwrap();
                 let n = match self.stream.read(&mut buf) {
                     Ok(n) => n,
                     Err(e)

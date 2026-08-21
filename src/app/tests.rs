@@ -6360,14 +6360,9 @@ fn the_terminal_probe_command_prints_the_probe_without_echoing_it() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     app.terminal_mut().focused = true;
     term.draw(|f| app.render(f)).unwrap();
-    app.terminal_mut().write_input(cmd.as_bytes());
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(3000) {
-        if app.terminal().visible_text().contains(&probe) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Runs the very command asserted on above, on the same budget every other
+    // probe site uses.
+    await_terminal_probe(&mut app, &probe);
     let snap = app.terminal().visible_text();
     let rows: Vec<&str> = snap.lines().filter(|l| l.contains(&probe)).collect();
     assert_eq!(
