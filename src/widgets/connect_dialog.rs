@@ -18,6 +18,10 @@ pub enum DialogPhase {
     AwaitingVerificationCode,
     AwaitingHostKeyConfirmation,
     AwaitingGeneric,
+    /// The fast cross-build path is unavailable; the user chooses between
+    /// the slow compile-on-remote fallback and aborting to run
+    /// `croft setup-cross` locally first.
+    AwaitingFallbackConfirmation,
     Installing,
     Authenticated,
     Failed,
@@ -32,6 +36,7 @@ impl DialogPhase {
                 | DialogPhase::AwaitingVerificationCode
                 | DialogPhase::AwaitingHostKeyConfirmation
                 | DialogPhase::AwaitingGeneric
+                | DialogPhase::AwaitingFallbackConfirmation
         )
     }
 
@@ -159,6 +164,18 @@ impl ConnectDialog {
         self.input.clear();
     }
 
+    /// The installer cannot use the fast cross-build path and asks whether
+    /// to compile on the remote box instead (slow) or abort so the user can
+    /// run `croft setup-cross` and reconnect for the fast install.
+    pub fn set_fallback_prompt(&mut self, reason: &str) {
+        self.phase = DialogPhase::AwaitingFallbackConfirmation;
+        self.prompt_text = format!("Fast install unavailable: {reason}");
+        self.status_line = default_status_for(&self.phase, &self.host);
+        self.input.clear();
+        self.submitted = false;
+        self.show_logs = true;
+    }
+
     pub fn set_installing(&mut self) {
         self.phase = DialogPhase::Installing;
         self.status_line = format!("Preparing remote croft on {}", self.host);
@@ -258,6 +275,10 @@ fn default_status_for(phase: &DialogPhase, host: &str) -> String {
             String::from("First-time host key, type yes to continue")
         }
         DialogPhase::AwaitingGeneric => String::from("Server prompt"),
+        DialogPhase::AwaitingFallbackConfirmation => format!(
+            "Compile on {} instead? Slow — quitting to run `croft setup-cross` once is much faster",
+            host
+        ),
         _ => String::new(),
     }
 }
@@ -330,6 +351,7 @@ impl Widget for &mut ConnectDialog {
             DialogPhase::AwaitingVerificationCode => "2FA",
             DialogPhase::AwaitingHostKeyConfirmation => "Host key",
             DialogPhase::AwaitingGeneric => "Prompt",
+            DialogPhase::AwaitingFallbackConfirmation => "Slow install?",
             DialogPhase::Installing => "Installing",
             DialogPhase::Authenticated => "Done",
             DialogPhase::Failed => "Failed",
@@ -433,6 +455,9 @@ impl Widget for &mut ConnectDialog {
                         "  type yes and press Enter to trust this host"
                     }
                     DialogPhase::AwaitingGeneric => "  type a response and press Enter",
+                    DialogPhase::AwaitingFallbackConfirmation => {
+                        "  y + Enter compiles on the remote; Enter alone cancels"
+                    }
                     _ => "",
                 };
                 if !placeholder.is_empty() {
@@ -494,6 +519,8 @@ impl Widget for &mut ConnectDialog {
             ""
         } else if matches!(self.phase, DialogPhase::AwaitingHostKeyConfirmation) {
             "[Enter] Continue"
+        } else if matches!(self.phase, DialogPhase::AwaitingFallbackConfirmation) {
+            "[y+Enter] Slow compile   [Enter] Cancel"
         } else {
             "[Enter] Submit"
         };
@@ -641,6 +668,25 @@ mod tests {
             "Are you sure you want to continue connecting (yes/no/[fingerprint])? ".into(),
         );
         assert_eq!(d.phase, DialogPhase::AwaitingHostKeyConfirmation);
+    }
+
+    // The 2026-08-09 gitcgr report: the installer slid into the slow
+    // compile-on-remote fallback without asking, so a missing
+    // `croft setup-cross` surfaced only as a stale remote version. The
+    // fallback now needs an explicit yes; an empty submit must decline.
+    #[test]
+    fn set_fallback_prompt_awaits_an_explicit_yes() {
+        let mut d = ConnectDialog::new("gitcgr".to_string());
+        d.set_fallback_prompt("`cargo-zigbuild` not found");
+        assert_eq!(d.phase, DialogPhase::AwaitingFallbackConfirmation);
+        assert!(d.phase.awaits_input());
+        assert!(d.prompt_text.contains("cargo-zigbuild"));
+        assert!(
+            d.input_for_submit().is_empty(),
+            "no auto-yes: an empty submit reads as a decline"
+        );
+        assert!(!d.input_is_secret());
+        assert!(d.show_logs, "the skip reason lives in the log panel");
     }
 
     #[test]

@@ -28556,3 +28556,68 @@ fn drag_target_over_the_sticky_band_is_the_pinned_directory() {
     );
     let _ = MouseEventKind::Down(MouseButton::Left); // silence unused import paths on some cfgs
 }
+
+// The 2026-08-09 gitcgr report: the installer slid into the slow
+// compile-on-remote fallback without asking. `answer_install_fallback` is the
+// decision point behind both the Enter and the click handler, so the y/yes
+// parsing and the decline teardown are pinned here rather than at each caller.
+#[test]
+fn install_fallback_proceeds_only_on_an_explicit_yes() {
+    let tmp = tempfile::tempdir().unwrap();
+    for reply in ["y", "Y", "yes", "YES", "  yes  "] {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.connect_dialog = Some(crate::widgets::connect_dialog::ConnectDialog::new(
+            "gitcgr".to_string(),
+        ));
+        app.answer_install_fallback(reply);
+        let dialog = app.connect_dialog.as_ref().unwrap_or_else(|| {
+            panic!("{reply:?} accepts the slow compile, so the dialog stays up")
+        });
+        assert_eq!(
+            dialog.phase,
+            crate::widgets::connect_dialog::DialogPhase::Installing,
+            "{reply:?} should hand over to the installing phase"
+        );
+    }
+}
+
+#[test]
+fn install_fallback_declines_and_tears_down_on_anything_else() {
+    let tmp = tempfile::tempdir().unwrap();
+    // An empty submit (bare Enter) is the important one: the footer offers it
+    // as Cancel, so it must never read as consent.
+    for reply in ["", "   ", "n", "no", "yep", "later"] {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.connect_dialog = Some(crate::widgets::connect_dialog::ConnectDialog::new(
+            "gitcgr".to_string(),
+        ));
+        app.pending_remote_launch_host = Some("gitcgr".to_string());
+        app.answer_install_fallback(reply);
+        assert!(
+            app.connect_dialog.is_none(),
+            "{reply:?} declines, which closes the dialog"
+        );
+        assert!(
+            app.pending_remote_launch_host.is_none(),
+            "{reply:?} declines, so the pending launch is torn down too"
+        );
+        assert!(
+            app.status.contains("setup-cross"),
+            "the decline must point at the fast-path fix, got {:?}",
+            app.status
+        );
+    }
+}
+
+#[test]
+fn install_fallback_without_a_dialog_does_not_panic() {
+    // The install thread can answer after the dialog is gone (user hit Esc
+    // while the prompt was in flight); both arms must tolerate the absence.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.answer_install_fallback("y");
+    assert!(app.connect_dialog.is_none());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.answer_install_fallback("");
+    assert!(app.connect_dialog.is_none());
+}

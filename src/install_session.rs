@@ -10,6 +10,15 @@ pub enum InstallEvent {
     /// dropped into it now while the (re)install continues in the
     /// background. Fired at most once, before `Done`.
     CanLaunch,
+    /// The fast cross-build path is unavailable and the installer wants to
+    /// compile on the remote box instead (slow). The UI must answer via
+    /// `respond_fallback`: `true` runs the remote compile, `false` aborts
+    /// the install so the user can run `croft setup-cross` and reconnect
+    /// for the fast path. Fired only while the install still blocks the
+    /// connect (never after `CanLaunch`).
+    FallbackPrompt {
+        reason: String,
+    },
     Done(Result<(), String>),
 }
 
@@ -18,6 +27,7 @@ pub struct InstallSession {
     pub path: Option<String>,
     pub adopted: Option<AdoptedMaster>,
     events_rx: Receiver<InstallEvent>,
+    fallback_answer_tx: Sender<bool>,
     _handle: Option<JoinHandle<()>>,
 }
 
@@ -47,12 +57,28 @@ impl InstallSession {
             });
             s
         };
+        let (fallback_answer_tx, fallback_answer_rx) = channel::<bool>();
+        let prompt_tx = tx.clone();
         let done_tx = tx.clone();
         let handle = std::thread::spawn(move || {
+            let mut confirm_fallback = move |reason: &str| {
+                if prompt_tx
+                    .send(InstallEvent::FallbackPrompt {
+                        reason: reason.to_string(),
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
+                // Blocks until the dialog answers. A torn-down dialog drops
+                // the answer sender, which reads as a decline.
+                fallback_answer_rx.recv().unwrap_or(false)
+            };
             let result = crate::remote::install_only_streaming(
                 adopted_for_thread,
                 log_tx_for_install,
                 can_launch_tx,
+                &mut confirm_fallback,
             );
             let payload = match result {
                 Ok(_) => Ok(()),
@@ -65,6 +91,7 @@ impl InstallSession {
             path,
             adopted: Some(adopted),
             events_rx: rx,
+            fallback_answer_tx,
             _handle: Some(handle),
         }
     }
@@ -79,6 +106,12 @@ impl InstallSession {
             }
         }
         out
+    }
+
+    /// Answer a pending `FallbackPrompt`: `true` proceeds with the slow
+    /// remote compile, `false` aborts the install.
+    pub fn respond_fallback(&self, proceed: bool) {
+        let _ = self.fallback_answer_tx.send(proceed);
     }
 
     pub fn take_adopted(&mut self) -> Option<AdoptedMaster> {
