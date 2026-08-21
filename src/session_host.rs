@@ -1474,12 +1474,46 @@ mod tests {
 
         /// Read frames until `pred` matches one, returning everything seen.
         fn read_until(&mut self, pred: impl Fn(&Frame) -> bool) -> Vec<Frame> {
+            self.read_until_within(READ_UNTIL_DEADLINE, pred)
+        }
+
+        /// [`Self::read_until`] with an explicit budget. The socket carries a
+        /// short read timeout and an expired read surfaces as `WouldBlock`
+        /// (`TimedOut` on some platforms), which is "nothing yet", not a
+        /// failure: unwrapping it turned a busy box into a panic reading
+        /// `read: Os { code: 11 }` with no clue what the client was waiting
+        /// for (issue #227). Only the budget below ends the wait, and it ends
+        /// it with the frames seen so far.
+        fn read_until_within(
+            &mut self,
+            budget: Duration,
+            pred: impl Fn(&Frame) -> bool,
+        ) -> Vec<Frame> {
             let mut seen = Vec::new();
             let mut buf = [0u8; 4096];
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + budget;
             loop {
-                assert!(Instant::now() < deadline, "timed out; saw {seen:?}");
-                let n = self.stream.read(&mut buf).expect("read");
+                // Never block past the budget: a read armed with the full poll
+                // interval a hair before the deadline would overshoot it.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "timed out; saw {seen:?}");
+                self.stream
+                    .set_read_timeout(Some(remaining.min(READ_POLL_INTERVAL)))
+                    .unwrap();
+                let n = match self.stream.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(e) => panic!("read failed: {e}; saw {seen:?}"),
+                };
                 assert!(n > 0, "server closed early; saw {seen:?}");
                 let frames = self.reader.push(&buf[..n]);
                 let done = frames.iter().any(&pred);
@@ -1489,6 +1523,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// How long a `read_until` waits for the frame it wants. Generous: the
+    /// flood tests push megabytes through a real PTY, and a loaded box (the
+    /// whole suite running in parallel) is exactly when the old ten seconds
+    /// ran out.
+    const READ_UNTIL_DEADLINE: Duration = Duration::from_secs(30);
+    /// How long a single `read` blocks before the loop re-checks the deadline.
+    const READ_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// Issue #227: a read that expires with nothing on the wire must keep
+    /// waiting until the budget runs out, and then report what the client was
+    /// waiting for. Waits for a frame the server never sends, on a budget far
+    /// shorter than one read timeout would have been, so the only way to reach
+    /// the timeout assert is by looping over `WouldBlock` instead of
+    /// unwrapping it.
+    #[test]
+    #[should_panic(expected = "timed out")]
+    fn read_until_waits_out_an_idle_socket_instead_of_unwrapping_would_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let mut c = TestClient::connect(&socket, "idle", 80, 24);
+        // `cat` echoes only what it is fed, and this client sends nothing, so
+        // no Bytes frame can ever arrive.
+        c.read_until_within(Duration::from_millis(300), |f| matches!(f, Frame::Bytes(_)));
     }
 
     fn output_text(frames: &[Frame]) -> String {

@@ -6,6 +6,49 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
 }
 
+/// Shell command that prints `probe` on its own line WITHOUT the typed
+/// command line spelling the probe out.
+///
+/// The terminal end-to-end tests find their probe by searching the rendered
+/// grid for it, but the shell echoes what was typed, so a literal
+/// `printf '<probe>\n'` puts two matching rows on screen. Under load the echo
+/// arrives first, the wait loop is satisfied by it, and the row search lands
+/// on the echoed command: its quoting shifts the columns, and the selection
+/// comes back as `"oft-e2e-638881\\n"` instead of the probe (issue #226).
+/// Splitting the probe across two printf arguments leaves the echo carrying
+/// only the fragments, so nothing but the OUTPUT can ever match.
+fn probe_command(probe: &str) -> String {
+    let (head, tail) = probe.split_at(1);
+    format!("printf '%s%s\\n' '{head}' '{tail}'\r")
+}
+
+/// How long the terminal end-to-end tests wait for their probe to come back
+/// through the PTY. Generous on purpose: a real shell has to start, run the
+/// command, and have the reader thread drain the bytes into the grid, and on
+/// a box running the whole suite in parallel that took longer than the three
+/// seconds this used to allow (issue #226).
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run the probe command in the app's embedded terminal and wait until the
+/// probe is on screen. Panics with the actual screen contents if it never
+/// arrives, so a failure says what the terminal was showing instead of
+/// unwrapping `None` several lines later.
+fn await_terminal_probe(app: &mut App, probe: &str) {
+    app.terminal_mut()
+        .write_input(probe_command(probe).as_bytes());
+    let started = std::time::Instant::now();
+    while started.elapsed() < PROBE_TIMEOUT {
+        if app.terminal().visible_text().contains(probe) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!(
+        "the shell never printed the probe {probe:?} within {PROBE_TIMEOUT:?}; terminal showed:\n{}",
+        app.terminal().visible_text()
+    );
+}
+
 #[test]
 fn minimap_rgba_paints_chars_skips_whitespace() {
     let mut e = crate::widgets::editor::Editor::new();
@@ -4686,18 +4729,7 @@ fn cmd_c_on_terminal_selection_lands_text_on_macos_clipboard() {
     term.draw(|f| app.render(f)).unwrap();
 
     let probe = format!("croft-terminal-cmdc-{}", std::process::id());
-    app.terminal_mut()
-        .write_input(format!("printf '{probe}\\n'\r").as_bytes());
-
-    // Wait for the shell to push bytes through the PTY and the
-    // background reader thread to drain them into the grid.
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(3000) {
-        if app.terminal().visible_text().contains(&probe) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    await_terminal_probe(&mut app, &probe);
     // Re-render to refresh `last_inner` after the grid has grown.
     term.draw(|f| app.render(f)).unwrap();
 
@@ -6106,15 +6138,7 @@ fn double_click_in_terminal_word_selects_in_split_and_maximised_layout() {
         }
         app.focus_pane(Pane::Terminal);
         let probe = format!("croft-dclick-{}", std::process::id());
-        app.terminal_mut()
-            .write_input(format!("printf '{probe}\\n'\r").as_bytes());
-        let started = std::time::Instant::now();
-        while started.elapsed() < std::time::Duration::from_millis(3000) {
-            if app.terminal().visible_text().contains(&probe) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        await_terminal_probe(&mut app, &probe);
         term.draw(|f| app.render(f)).unwrap();
         let snap = app.terminal().visible_text();
         let row_idx = snap
@@ -6164,15 +6188,7 @@ fn terminal_copy_paste_into_other_panes_works_in_split_and_maximised_layout() {
     // landed on the clipboard.
     fn copy_terminal_word(app: &mut App) -> String {
         let probe = format!("croft-e2e-{}", std::process::id());
-        app.terminal_mut()
-            .write_input(format!("printf '{probe}\\n'\r").as_bytes());
-        let started = std::time::Instant::now();
-        while started.elapsed() < std::time::Duration::from_millis(3000) {
-            if app.terminal().visible_text().contains(&probe) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        await_terminal_probe(app, &probe);
         let snap = app.terminal().visible_text();
         let row_idx = snap.lines().position(|l| l.contains(&probe)).unwrap();
         let line = snap.lines().nth(row_idx).unwrap();
@@ -6325,6 +6341,42 @@ fn terminal_copy_paste_into_other_panes_works_in_split_and_maximised_layout() {
     }
 }
 
+/// Issue #226: the probe command must not spell the probe out, or the
+/// shell's echo of it becomes a second row that matches the grid search
+/// (and wins the race under load). Pins both halves of `probe_command`:
+/// the echoed text can't contain the probe, and running it still puts the
+/// probe on screen.
+#[test]
+fn the_terminal_probe_command_prints_the_probe_without_echoing_it() {
+    let probe = format!("croft-probe-echo-{}", std::process::id());
+    let cmd = probe_command(&probe);
+    assert!(
+        !cmd.contains(&probe),
+        "the typed command line must not contain the probe verbatim, or the shell echo matches the grid search alongside the output; got {cmd:?}"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.terminal_mut().focused = true;
+    term.draw(|f| app.render(f)).unwrap();
+    // Runs the very command asserted on above, on the same budget every other
+    // probe site uses.
+    await_terminal_probe(&mut app, &probe);
+    let snap = app.terminal().visible_text();
+    let rows: Vec<&str> = snap.lines().filter(|l| l.contains(&probe)).collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one row may carry the probe (the command's output); got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].trim(),
+        probe,
+        "the matching row must be the printed probe alone, not a command line quoting it"
+    );
+}
+
 /// User-reported root cause: with the Search sidebar open, Cmd+C /
 /// Cmd+V in the terminal silently no-op because the search-editing
 /// shortcut guard fired on `focus != Editor`, swallowing the keys
@@ -6344,15 +6396,7 @@ fn terminal_cmd_c_copies_even_when_search_sidebar_is_open() {
     term.draw(|f| app.render(f)).unwrap();
 
     let probe = format!("croft-search-open-{}", std::process::id());
-    app.terminal_mut()
-        .write_input(format!("printf '{probe}\\n'\r").as_bytes());
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(3000) {
-        if app.terminal().visible_text().contains(&probe) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    await_terminal_probe(&mut app, &probe);
     term.draw(|f| app.render(f)).unwrap();
     let snap = app.terminal().visible_text();
     let row_idx = snap.lines().position(|l| l.contains(&probe)).unwrap();
