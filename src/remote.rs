@@ -2378,7 +2378,11 @@ CROFT_NICE=""
 if command -v nice >/dev/null 2>&1; then CROFT_NICE="nice -n 19"; fi
 CROFT_IONICE=""
 if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
-$CROFT_NICE $CROFT_IONICE cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked
+# eval, because this script runs under the remote user's login shell and
+# zsh does not word-split unquoted parameters: bare `$CROFT_NICE ...` would
+# try to run a command literally named "nice -n 19". eval re-parses the
+# assembled line, which splits correctly under both sh/bash and zsh.
+eval "$CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'
 mkdir -p "$HOME/.cache/croft"
 printf %s {stamp} > "$HOME/.cache/croft/install-stamp"
 rm -f "$HOME/.cache/croft/updating"
