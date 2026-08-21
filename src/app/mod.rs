@@ -20072,6 +20072,16 @@ impl App {
                     }
                 }
                 crate::install_session::InstallEvent::CanLaunch => can_launch = true,
+                crate::install_session::InstallEvent::FallbackPrompt { reason } => {
+                    if let Some(dialog) = self.connect_dialog.as_mut() {
+                        dialog.set_fallback_prompt(&reason);
+                    } else if let Some(session) = self.install_session.as_ref() {
+                        // No dialog to ask through: decline so the installer
+                        // errors out with the `croft setup-cross` guidance
+                        // instead of blocking forever on an answer.
+                        session.respond_fallback(false);
+                    }
+                }
                 crate::install_session::InstallEvent::Done(Ok(())) => done = true,
                 crate::install_session::InstallEvent::Done(Err(detail)) => {
                     failure = Some(detail);
@@ -20341,6 +20351,14 @@ impl App {
                 if !dialog.phase.awaits_input() {
                     return;
                 }
+                if matches!(
+                    dialog.phase,
+                    crate::widgets::connect_dialog::DialogPhase::AwaitingFallbackConfirmation
+                ) {
+                    let payload = dialog.input_for_submit();
+                    self.answer_install_fallback(&payload);
+                    return;
+                }
                 let payload = dialog.input_for_submit();
                 dialog.submitted = true;
                 dialog.status_line = format!("Verifying credentials with {}", dialog.host);
@@ -20373,6 +20391,14 @@ impl App {
             return true;
         }
         if rect_contains(dialog.submit_btn, col, row) && dialog.phase.awaits_input() {
+            if matches!(
+                dialog.phase,
+                crate::widgets::connect_dialog::DialogPhase::AwaitingFallbackConfirmation
+            ) {
+                let payload = dialog.input_for_submit();
+                self.answer_install_fallback(&payload);
+                return true;
+            }
             let payload = dialog.input_for_submit();
             dialog.submitted = true;
             dialog.status_line = format!(
@@ -20387,6 +20413,31 @@ impl App {
             return true;
         }
         rect_contains(dialog.last_area, col, row)
+    }
+
+    /// Resolve the connect dialog's slow-fallback question. "y"/"yes"
+    /// continues with the compile-on-remote install; anything else aborts
+    /// the connect so the user can run `croft setup-cross` and reconnect
+    /// for the seconds-fast prebuilt-binary path.
+    fn answer_install_fallback(&mut self, payload: &str) {
+        let proceed = matches!(payload.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+        if proceed {
+            if let Some(dialog) = self.connect_dialog.as_mut() {
+                dialog.set_installing();
+            }
+            if let Some(session) = self.install_session.as_ref() {
+                session.respond_fallback(true);
+            }
+            return;
+        }
+        if let Some(session) = self.install_session.as_ref() {
+            session.respond_fallback(false);
+        }
+        self.connect_dialog = None;
+        self.tear_down_connect_auth();
+        self.status = String::from(
+            "Connect cancelled — run `croft setup-cross`, then reconnect for a fast install",
+        );
     }
 
     fn open_ssh_config_in_editor(&mut self) {

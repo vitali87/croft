@@ -159,6 +159,7 @@ pub fn install_only_streaming(
     adopted: AdoptedMaster,
     log_tx: std::sync::mpsc::Sender<String>,
     can_launch_tx: std::sync::mpsc::Sender<()>,
+    confirm_fallback: &mut dyn FnMut(&str) -> bool,
 ) -> Result<AdoptedMaster> {
     let host_label = adopted.host.clone();
     // Mirror every line into ~/.cache/croft/install.log so the install
@@ -170,7 +171,8 @@ pub fn install_only_streaming(
     ));
     let _ = log_tx.send(format!("Adopting control socket for {host_label}"));
     let ssh = SshControl::adopt(adopted.clone());
-    let result = install_only_streaming_over(&ssh, &host_label, &log_tx, &can_launch_tx);
+    let result =
+        install_only_streaming_over(&ssh, &host_label, &log_tx, &can_launch_tx, confirm_fallback);
     // Never drop `ssh`: its Drop kills the shared control master, and by now
     // the user may already be attached through it (the launch signal fires
     // before any fallible work).
@@ -178,11 +180,21 @@ pub fn install_only_streaming(
     result.map(|_| adopted)
 }
 
+/// The body of `install_only_streaming`, split out so the SSH control
+/// master can be leaked on every exit path rather than dropped (its `Drop`
+/// kills the shared master the user may already be attached through).
+///
+/// Probes the remote first: an already-installed croft releases
+/// `can_launch_tx` within one SSH roundtrip and the (re)install continues
+/// behind the user's session, so `confirm_fallback` is bypassed in favour
+/// of an automatic decline — there is nobody left to ask, and an
+/// unrequested on-box compile would load a live session.
 fn install_only_streaming_over(
     ssh: &SshControl,
     host_label: &str,
     log_tx: &std::sync::mpsc::Sender<String>,
     can_launch_tx: &std::sync::mpsc::Sender<()>,
+    confirm_fallback: &mut dyn FnMut(&str) -> bool,
 ) -> Result<()> {
     // If a croft is already on the remote, the user gets dropped into it
     // immediately and the (re)install proceeds in the background. The
@@ -216,7 +228,23 @@ fn install_only_streaming_over(
         let _ = log_tx.send(msg);
     });
     let _ = log_tx.send(format!("Installing/updating Croft on {host_label}"));
-    if let Err(e) = install_remote_croft_streaming(ssh, &bulk.lane, &local_stamp, log_tx) {
+    // `present` means the user was already dropped into the running remote
+    // croft: there is nobody left to ask, and an unasked-for compile on the
+    // box would load their live session. Decline the slow path outright and
+    // log how to get the update fast; a fresh install (dialog still up)
+    // forwards the question to the caller's prompt.
+    let mut gate = |reason: &str| {
+        if present {
+            let _ = log_tx.send(format!(
+                "Update NOT installed: cross-build unavailable ({reason}). Run `croft setup-cross` on this machine, then reconnect — updates then ship a prebuilt binary in seconds."
+            ));
+            false
+        } else {
+            confirm_fallback(reason)
+        }
+    };
+    if let Err(e) = install_remote_croft_streaming(ssh, &bulk.lane, &local_stamp, log_tx, &mut gate)
+    {
         clear_remote_updating(ssh);
         return Err(e);
     }
@@ -434,21 +462,35 @@ fn run_command_streaming(
     Ok(status)
 }
 
+/// Ship croft to the remote, preferring the fast path: cross-build a
+/// static binary locally and rsync it over.
+///
+/// When that path is unavailable, `confirm_fallback` is asked — with the
+/// reason — whether to compile on the remote box instead. Declining is an
+/// error, not a silent skip, so the caller can point the user at
+/// `croft setup-cross`. The slow path never engages on its own.
 fn install_remote_croft_streaming(
     ssh: &SshControl,
     lane: &crate::remote_bulk::BulkLane,
     source_stamp: &str,
     log_tx: &std::sync::mpsc::Sender<String>,
+    confirm_fallback: &mut dyn FnMut(&str) -> bool,
 ) -> Result<()> {
-    match try_local_cross_install_streaming(ssh, lane, source_stamp, log_tx) {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
-        Err(e) => {
-            let _ = log_tx.send(format!(
-                "Local cross-build skipped ({e}); falling back to remote cargo install"
-            ));
-        }
+    let reason = match try_local_cross_install_streaming(ssh, lane, source_stamp, log_tx) {
+        Ok(None) => return Ok(()),
+        Ok(Some(reason)) => reason,
+        Err(e) => format!("local cross-build failed: {e:#}"),
+    };
+    // Never slide into the slow on-box compile silently: the caller decides
+    // (dialog prompt, tty prompt, or an automatic decline for background
+    // updates). The fix — `croft setup-cross` — is one command away and
+    // turns every future install into a seconds-long prebuilt-binary ship.
+    if !confirm_fallback(&reason) {
+        anyhow::bail!(
+            "cross-build unavailable ({reason}); remote compile declined — run `croft setup-cross`, then reconnect for the fast install"
+        );
     }
+    let _ = log_tx.send(format!("Falling back to remote cargo install ({reason})"));
     let _ = log_tx.send("Syncing source tree to remote".to_string());
     sync_local_source_to_remote_streaming(ssh, lane, log_tx)?;
     let _ = log_tx
@@ -464,24 +506,30 @@ fn install_remote_croft_streaming(
     Ok(())
 }
 
+/// `Ok(None)` = binary shipped via the fast path; `Ok(Some(reason))` = the
+/// fast path is unavailable (the reason feeds the fallback confirmation);
+/// `Err` = the fast path was attempted and broke.
 fn try_local_cross_install_streaming(
     ssh: &SshControl,
     lane: &crate::remote_bulk::BulkLane,
     source_stamp: &str,
     log_tx: &std::sync::mpsc::Sender<String>,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     if let Some(reason) = cross_compile_unavailable_reason() {
         let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(false);
+        return Ok(Some(reason));
     }
     let Some(triple) = remote_target_triple(ssh)? else {
-        return Ok(false);
+        let reason = String::from("could not detect the remote architecture");
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
     };
     if !rust_target_installed(triple) {
-        let _ = log_tx.send(format!(
-            "Local cross-build skipped: rustup target `{triple}` missing (run `rustup target add {triple}` once to enable the fast path)"
-        ));
-        return Ok(false);
+        let reason = format!(
+            "rustup target `{triple}` missing (run `rustup target add {triple}` once to enable the fast path)"
+        );
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
     }
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -554,9 +602,14 @@ fn try_local_cross_install_streaming(
         anyhow::bail!("remote activation exited with {act_status}");
     }
     let _ = log_tx.send("Installed croft on remote via local cross-build.".to_string());
-    Ok(true)
+    Ok(None)
 }
 
+/// Rsync the local source tree into `~/.cache/croft/source` on the remote,
+/// streaming rsync's progress through `log_tx`. Only needed for the slow
+/// compile-on-remote fallback; the fast path ships a built binary instead.
+/// Runs over `lane` so the bulk transfer never queues ahead of the user's
+/// keystrokes on the shared interactive master.
 fn sync_local_source_to_remote_streaming(
     ssh: &SshControl,
     lane: &crate::remote_bulk::BulkLane,
@@ -629,7 +682,10 @@ fn spawn_background_install(ssh: &SshControl) {
         // even with a disconnected downstream.
         let (log_tx, _) = std::sync::mpsc::channel();
         let (can_launch_tx, _) = std::sync::mpsc::channel();
-        let _ = install_only_streaming(adopted, log_tx, can_launch_tx);
+        // Unreachable: this thread only runs when a croft is already on the
+        // remote, and the installer auto-declines the slow fallback in that
+        // case (see the `present` gate in `install_only_streaming_over`).
+        let _ = install_only_streaming(adopted, log_tx, can_launch_tx, &mut |_| false);
     });
 }
 
@@ -1474,18 +1530,26 @@ fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Result<()> {
     // Fast path: cross-compile a static musl binary on the local Mac and
     // rsync it directly into the remote's ~/.cargo/bin. Skips the
     // crates.io index update, the dependency walk, and the release-mode
-    // codegen+link of the croft crate on the remote. Falls back to the
-    // legacy source-rsync + `cargo install` path when the tooling isn't
-    // present (zig + cargo-zigbuild + the matching rust target), when
-    // we can't detect the remote arch, or when the build fails for any
-    // reason — the user sees a one-line note and the slower install
-    // continues so the connect succeeds.
-    match try_local_cross_install(ssh, source_stamp) {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
+    // codegen+link of the croft crate on the remote. The legacy
+    // source-rsync + `cargo install` fallback still exists for when the
+    // tooling isn't present (zig + cargo-zigbuild + the matching rust
+    // target), the remote arch can't be detected, or the build fails —
+    // but it never engages silently: the user confirms it on the tty
+    // first, because quitting to run `croft setup-cross` once is almost
+    // always the better deal.
+    let reason = match try_local_cross_install(ssh, source_stamp) {
+        Ok(None) => return Ok(()),
+        Ok(Some(reason)) => reason,
         Err(e) => {
-            eprintln!("Local cross-build failed ({e}); falling back to remote `cargo install`");
+            eprintln!("Local cross-build failed ({e:#})");
+            format!("local cross-build failed: {e:#}")
         }
+    };
+    if !confirm_remote_compile_on_tty(&ssh.host, &reason) {
+        anyhow::bail!(
+            "cross-build unavailable ({reason}); remote compile declined — run `croft setup-cross`, then `croft remote {}` again for the fast install",
+            ssh.host
+        );
     }
     sync_local_source_to_remote(ssh)?;
     let status = ssh
@@ -1896,19 +1960,25 @@ fn rust_target_installed(triple: &str) -> bool {
         .any(|line| line.trim() == triple)
 }
 
-fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool> {
+/// `Ok(None)` = binary shipped via the fast path; `Ok(Some(reason))` = the
+/// fast path is unavailable (the reason feeds the fallback confirmation);
+/// `Err` = the fast path was attempted and broke.
+fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<Option<String>> {
     if let Some(reason) = cross_compile_unavailable_reason() {
         eprintln!("Local cross-build skipped: {reason}");
-        return Ok(false);
+        return Ok(Some(reason));
     }
     let Some(triple) = remote_target_triple(ssh)? else {
-        return Ok(false);
+        let reason = String::from("could not detect the remote architecture");
+        eprintln!("Local cross-build skipped: {reason}");
+        return Ok(Some(reason));
     };
     if !rust_target_installed(triple) {
-        eprintln!(
-            "Local cross-build skipped: rustup target `{triple}` not installed (run `rustup target add {triple}` once to enable the fast path)"
+        let reason = format!(
+            "rustup target `{triple}` not installed (run `rustup target add {triple}` once to enable the fast path)"
         );
-        return Ok(false);
+        eprintln!("Local cross-build skipped: {reason}");
+        return Ok(Some(reason));
     }
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1977,7 +2047,35 @@ fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<bool>
         anyhow::bail!("remote activation exited with {activate_status}");
     }
     println!("Installed croft on remote via local cross-build.");
-    Ok(true)
+    Ok(None)
+}
+
+/// Ask on the controlling terminal before the slow on-box compile. The
+/// answer defaults to "no": quitting to run `croft setup-cross` once turns
+/// every future install into a seconds-long prebuilt-binary ship, so the
+/// slow path must be an explicit choice, never a silent fallback.
+/// Non-interactive stdin (scripts, CI) declines for the same reason.
+fn confirm_remote_compile_on_tty(host: &str, reason: &str) -> bool {
+    use std::io::{IsTerminal as _, Write as _};
+    eprintln!("Fast install unavailable: {reason}");
+    eprintln!(
+        "Croft can compile itself on {host} instead; the first build can take several minutes and loads the box."
+    );
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "stdin is not a terminal; declining the remote compile. Run `croft setup-cross`, then retry."
+        );
+        return false;
+    }
+    eprint!(
+        "Compile on {host} anyway? [y/N] (N quits; run `croft setup-cross` once and reconnect — much faster) "
+    );
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 pub fn remote_croft_command(path: Option<&str>, env: &[(String, String)], solo: bool) -> String {
@@ -2378,7 +2476,11 @@ CROFT_NICE=""
 if command -v nice >/dev/null 2>&1; then CROFT_NICE="nice -n 19"; fi
 CROFT_IONICE=""
 if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
-$CROFT_NICE $CROFT_IONICE cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked
+# eval, because this script runs under the remote user's login shell and
+# zsh does not word-split unquoted parameters: bare `$CROFT_NICE ...` would
+# try to run a command literally named "nice -n 19". eval re-parses the
+# assembled line, which splits correctly under both sh/bash and zsh.
+eval "$CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'
 mkdir -p "$HOME/.cache/croft"
 printf %s {stamp} > "$HOME/.cache/croft/install-stamp"
 rm -f "$HOME/.cache/croft/updating"
