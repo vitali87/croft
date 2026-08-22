@@ -88,6 +88,15 @@ pub enum Control {
     /// pump exits as on a detach). Honored from a control-holding client or
     /// the inner channel.
     Kick { id: u64 },
+    /// A client asks for write control for itself, carrying no id: the host
+    /// resolves the requester, so a client never needs to learn its own id.
+    /// Granted only when NOBODY holds control (#235) — the claim exists so a
+    /// roster that rests all-read-only (the #234 lockout, however a bug
+    /// arrives at it) is recoverable from any attached client instead of
+    /// being a one-way door. The pump sends it on seeing a vacant Presence;
+    /// older hosts skip the unknown variant (the frame decoder drops
+    /// malformed control payloads without poisoning the stream).
+    Claim,
     /// Host to the registering client, directly after its Hello (#53):
     /// the server's crate version, so the client can detect skew against a
     /// long-lived server that survived binary upgrades. Pre-0.1.698
@@ -794,6 +803,11 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                 Frame::Control(Control::Kick { id: target }) => {
                     kick(host, privileged, my_id, target);
                 }
+                Frame::Control(Control::Claim) => {
+                    if let Some(id) = my_id {
+                        set_control(host, privileged, my_id, id, true);
+                    }
+                }
                 Frame::Control(Control::Detach) => break 'conn,
                 _ => {}
             }
@@ -842,12 +856,22 @@ fn announce_typing(host: &Host, id: u64) {
 
 /// Grant or revoke write control on `target`, but only when the requester
 /// is the privileged inner channel or itself holds control: read-only
-/// guests cannot promote themselves.
+/// guests cannot promote themselves — with one exception. When NOBODY holds
+/// control (the #234 lockout state, however a future bug arrives at it), any
+/// participant may claim control for themselves (#235): a vacant roster
+/// makes the self-claim safe, and without it the state is a one-way door
+/// that only a host kill reopens. Promoting *others* from the floor stays
+/// privileged.
 fn set_control(host: &Host, privileged: bool, requester: Option<u64>, target: u64, grant: bool) {
     let changed = {
         let mut clients = host.clients.lock().unwrap();
-        let allowed = privileged
-            || requester.is_some_and(|id| clients.iter().any(|c| c.id == id && c.control));
+        let allowed = control_change_allowed(
+            privileged,
+            requester,
+            target,
+            grant,
+            clients.iter().map(|c| (c.id, c.control)),
+        );
         if !allowed {
             false
         } else {
@@ -863,6 +887,46 @@ fn set_control(host: &Host, privileged: bool, requester: Option<u64>, target: u6
     if changed {
         update_presence(host);
     }
+}
+
+/// The permission rule of [`set_control`], over `(id, holds_control)` pairs
+/// so it is testable without a live host. The vacant-claim arm grants no
+/// privilege that a vacant roster does not already offer: a fresh attach
+/// when nobody holds control gains control by the registration rule, so a
+/// claim is the same acquisition without the detach/reattach churn.
+fn control_change_allowed(
+    privileged: bool,
+    requester: Option<u64>,
+    target: u64,
+    grant: bool,
+    roster: impl Iterator<Item = (u64, bool)> + Clone,
+) -> bool {
+    let vacant = !roster.clone().any(|(_, control)| control);
+    privileged
+        || requester.is_some_and(|id| roster.clone().any(|(cid, control)| cid == id && control))
+        || (grant && vacant && requester == Some(target))
+}
+
+/// #234 defense in depth: while at least one participant is attached,
+/// someone must hold write control. A roster resting all-read-only is a
+/// total lockout — read-only input is dropped server-side, and
+/// `set_control` normally requires a control holder, so no client could
+/// recover the session (observed live 2026-08-22: a single attached
+/// participant with `control: false`; only killing the host recovered it).
+/// Called after every roster mutation that can remove a holder; grants to
+/// the most recent attach (ids are monotonic).
+/// The pump's claim trigger: this client is the ONLY attached participant
+/// and holds no control — the #234 lockout state, where read-only input is
+/// dropped at the host and the participants UI (inner croft, behind that
+/// same gate) is unreachable, so no keystroke could ever recover the
+/// session. Sole-participant only, on purpose: with others attached,
+/// control transfer stays an explicit act (grant, or the fresh-attach rule
+/// — see `control_moves_to_next_attacher_after_holder_detaches`), and a
+/// guest's pump must never outrace a returning owner. A lone client
+/// receiving the roster IS its one participant, so no id bookkeeping is
+/// needed.
+fn sole_participant_lacks_control(participants: &[Participant]) -> bool {
+    matches!(participants, [p] if !p.control)
 }
 
 /// Disconnect participant `target` (privileged channel or a control holder
@@ -1254,8 +1318,23 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
                     out.flush().context("flushing terminal")?;
                 }
                 Frame::Control(Control::Exit { code }) => return Ok(PumpOutcome::Exit(code)),
-                // Roster changes surface inside the inner croft (which polls
-                // the presence sidecar), not in this thin pump.
+                // Alone on a roster with no control holder = the #234
+                // lockout (observed live 2026-08-22: one attached
+                // participant, control false, and no way to type). Claim
+                // control — the same right a detach/reattach already
+                // grants, without asking the user to know that trick.
+                // Bounded by arrival: one claim per matching Presence
+                // frame, and a refused claim produces no new Presence.
+                Frame::Control(Control::Presence { participants })
+                    if sole_participant_lacks_control(&participants) =>
+                {
+                    let _ = tx
+                        .lock()
+                        .unwrap()
+                        .write_all(&encode_control_frame(&Control::Claim));
+                }
+                // Other roster changes surface inside the inner croft (which
+                // polls the presence sidecar), not in this thin pump.
                 _ => {}
             }
         }
@@ -2685,5 +2764,177 @@ mod tests {
         });
         let ps = roster(&frames).unwrap();
         assert!(!ps.iter().find(|p| p.name == "guest").unwrap().control);
+    }
+
+    // 2026-08-22 (#234): a roster resting with no control holder froze the
+    // session — read-only input is dropped at the host, the participants UI
+    // lives in the inner croft behind that same gate, and set_control
+    // normally requires a holder, so the state was a one-way door. The
+    // escape hatch (#235): a client alone on a vacant roster claims control,
+    // the same acquisition a detach/reattach already grants.
+    #[test]
+    fn a_sole_readonly_survivor_recovers_control_by_claiming() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let mut owner = TestClient::connect(&socket, "owner", 120, 40);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut guest = TestClient::connect(&socket, "guest", 100, 50);
+        guest.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        owner.send(&encode_control_frame(&Control::Detach));
+        let frames = guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
+        });
+        let ps = roster(&frames).unwrap();
+        assert!(
+            sole_participant_lacks_control(&ps),
+            "precondition: the survivor rests read-only (control never moves implicitly)"
+        );
+        guest.send(&encode_control_frame(&Control::Claim));
+        let frames = guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.control))
+        });
+        let ps = roster(&frames).unwrap();
+        assert_eq!(ps.len(), 1);
+        assert!(
+            ps[0].control,
+            "a sole read-only survivor's claim must be granted"
+        );
+    }
+
+    // Revoking the last holder still legally rests the roster vacant
+    // (control never moves implicitly); the claim is the recovery there too.
+    #[test]
+    fn a_self_revoked_holder_can_reclaim_a_vacant_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let mut owner = TestClient::connect(&socket, "owner", 120, 40);
+        let frames = owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let owner_id = roster(&frames).unwrap()[0].id;
+        owner.send(&encode_control_frame(&Control::Revoke { id: owner_id }));
+        let frames = owner.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().all(|p| !p.control))
+        });
+        assert!(sole_participant_lacks_control(&roster(&frames).unwrap()));
+        owner.send(&encode_control_frame(&Control::Claim));
+        let frames = owner.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.control))
+        });
+        assert!(roster(&frames).unwrap()[0].control);
+    }
+
+    // The #235 escape hatch must not become a privilege escalation: a claim
+    // while someone holds control is refused. The resize after the claim is
+    // a sync barrier — it forces a Presence broadcast that reflects every
+    // frame the host processed before it.
+    #[test]
+    fn a_claim_while_control_is_held_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let mut owner = TestClient::connect(&socket, "owner", 120, 40);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut guest = TestClient::connect(&socket, "guest", 100, 50);
+        guest.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        guest.send(&encode_control_frame(&Control::Claim));
+        guest.send(&encode_control_frame(&Control::Resize {
+            cols: 101,
+            rows: 50,
+        }));
+        let frames = guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.cols == 101))
+        });
+        let ps = roster(&frames).unwrap();
+        assert!(
+            !ps.iter().find(|p| p.name == "guest").unwrap().control,
+            "a claim against a held roster must be refused"
+        );
+        assert!(ps.iter().find(|p| p.name == "owner").unwrap().control);
+    }
+
+    // The set_control permission rule, exhaustively. The vacant-claim arm's
+    // precondition is unreachable through the public protocol once
+    // restore_control_holder guards every mutation path, so it is pinned
+    // here at the function level.
+    #[test]
+    fn control_change_permission_rules() {
+        let held = [(1u64, true), (2u64, false)];
+        let vacant = [(1u64, false), (2u64, false)];
+        // The privileged inner channel may do anything.
+        assert!(control_change_allowed(
+            true,
+            None,
+            2,
+            true,
+            held.iter().copied()
+        ));
+        // A holder may grant others.
+        assert!(control_change_allowed(
+            false,
+            Some(1),
+            2,
+            true,
+            held.iter().copied()
+        ));
+        // A read-only guest may not grant itself while control is held...
+        assert!(!control_change_allowed(
+            false,
+            Some(2),
+            2,
+            true,
+            held.iter().copied()
+        ));
+        // ...nor grant OTHERS from a vacant floor...
+        assert!(!control_change_allowed(
+            false,
+            Some(2),
+            1,
+            true,
+            vacant.iter().copied()
+        ));
+        // ...nor revoke anything from a vacant floor.
+        assert!(!control_change_allowed(
+            false,
+            Some(2),
+            1,
+            false,
+            vacant.iter().copied()
+        ));
+        // The #235 escape hatch: self-grant when nobody holds control.
+        assert!(control_change_allowed(
+            false,
+            Some(2),
+            2,
+            true,
+            vacant.iter().copied()
+        ));
+    }
+
+    // The pump claims only when ALONE on a vacant roster: with others
+    // attached, control transfer stays explicit (a guest's pump must never
+    // outrace a returning owner), and an empty roster has nothing to
+    // recover.
+    #[test]
+    fn the_pump_claims_only_as_the_sole_readonly_participant() {
+        let p = |control| Participant {
+            id: 1,
+            name: String::from("x"),
+            cols: 80,
+            rows: 24,
+            control,
+        };
+        assert!(sole_participant_lacks_control(&[p(false)]));
+        assert!(!sole_participant_lacks_control(&[p(true)]));
+        assert!(!sole_participant_lacks_control(&[p(false), p(false)]));
+        assert!(!sole_participant_lacks_control(&[p(false), p(true)]));
+        assert!(!sole_participant_lacks_control(&[]));
     }
 }
