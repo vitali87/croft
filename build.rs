@@ -24,6 +24,17 @@
 // default behavior stands.
 fn main() {
     let root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    // git discovery walks UP from `-C`, so a crate unpacked inside some
+    // unrelated repo (`cargo publish --dry-run` verifying under
+    // `target/package/`, a registry snapshot under a $HOME that is itself a
+    // git repo) would happily bake that ANCESTOR's commit as provenance.
+    // Only a directory that is its own repo toplevel speaks for the source.
+    if !dir_is_repo_toplevel(&root) {
+        println!("cargo:rustc-env=CROFT_GIT_HASH=unknown");
+        println!("cargo:rustc-env=CROFT_GIT_HASH_FULL=unknown");
+        emit_build_time();
+        return;
+    }
     let suffix = if git_output(&root, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
         "-dirty"
     } else {
@@ -42,6 +53,22 @@ fn main() {
         .map(|h| format!("{h}{suffix}"))
         .unwrap_or_else(|| String::from("unknown"));
     println!("cargo:rustc-env=CROFT_GIT_HASH_FULL={full}");
+    emit_build_time();
+    watch_provenance_inputs(&root);
+}
+
+/// True only when `dir` is the working-tree root of its own repository —
+/// the one case where git's answers describe THIS source rather than some
+/// repository that merely contains the directory.
+fn dir_is_repo_toplevel(dir: &str) -> bool {
+    let Some(toplevel) = git_output(dir, &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    let canon = |p: &str| std::fs::canonicalize(p).ok();
+    canon(dir).is_some() && canon(dir) == canon(&toplevel)
+}
+
+fn emit_build_time() {
     let time = std::process::Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output()
@@ -51,7 +78,6 @@ fn main() {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| String::from("unknown"));
     println!("cargo:rustc-env=CROFT_BUILD_TIME={time}");
-    watch_provenance_inputs(&root);
 }
 
 /// Declares every input that can move `CROFT_GIT_HASH`: the git metadata the

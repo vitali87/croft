@@ -87,6 +87,16 @@ fn probe_drift(manifest_dir: &str, baked_full: &str) -> Option<String> {
     if baked_full == "unknown" {
         return None;
     }
+    // git discovery walks up from `-C`, so a manifest dir that merely sits
+    // INSIDE some repo (a snapshot unpacked under a $HOME that is itself a
+    // git repo) would be answered for by that ancestor — and the hint would
+    // then offer to `cargo install` an immutable snapshot over itself. Only
+    // a dir that is its own repo toplevel speaks for this source (mirrors
+    // the same guard in `build.rs`).
+    let toplevel = git_in(manifest_dir, &["rev-parse", "--show-toplevel"])?;
+    if std::fs::canonicalize(manifest_dir).ok() != std::fs::canonicalize(&toplevel).ok() {
+        return None;
+    }
     let head = git_in(manifest_dir, &["rev-parse", "HEAD"])?;
     let dirty = !git_in(manifest_dir, &["status", "--porcelain"])?.is_empty();
     drift_label(baked_full, &head, dirty)?;
@@ -324,6 +334,18 @@ mod tests {
         // A directory git can't answer for (deleted repo, moved tree) is
         // silence, never a false alarm.
         assert_eq!(probe_drift("/nonexistent-croft-drift-probe", "abc"), None);
+        // A directory merely INSIDE a repo is answered for by its ancestor
+        // (`cargo publish` verify under target/package/, a snapshot under a
+        // $HOME that is a git repo): that ancestor's commits say nothing
+        // about this source, so the probe must stay silent rather than
+        // offer to reinstall an immutable snapshot over itself.
+        let nested = dir.join("vendored").join("croft-software-0.1.758");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            probe_drift(nested.to_str().unwrap(), &"0".repeat(40)),
+            None,
+            "an ancestor repo must never supply drift provenance"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
