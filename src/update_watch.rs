@@ -198,34 +198,20 @@ fn parse_installed_binary(output: &str) -> Option<PathBuf> {
     })
 }
 
-/// True when `toml` declares `pkg` as its `[package]` name. Deliberately
-/// line-based (no toml dependency) but section-aware: a `name` under
-/// `[[bin]]` or a dependency table must not vouch for the package, and
-/// both TOML quote styles plus `name="x"` spacing are legal.
-fn manifest_declares_package(toml: &str, pkg: &str) -> bool {
-    let mut in_package = false;
-    for line in toml.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_package = line == "[package]";
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        let Some(value) = line
-            .strip_prefix("name")
-            .map(str::trim_start)
-            .and_then(|rest| rest.strip_prefix('='))
-        else {
-            continue;
-        };
-        let value = value.split('#').next().unwrap_or("").trim();
-        if value == format!("\"{pkg}\"") || value == format!("'{pkg}'") {
-            return true;
-        }
-    }
-    false
+/// True when the manifest declares `pkg` as its `[package]` name. Parsed
+/// semantically - a line scanner is fooled by multiline strings (a
+/// `description = \"\"\"...\"\"\"` can contain `[package]`/`name` lines), and a
+/// `name` under `[[bin]]` or a dependency table must not vouch for the
+/// package.
+fn manifest_declares_package(manifest: &str, pkg: &str) -> bool {
+    manifest
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|table| {
+            let name = table.get("package")?.get("name")?.as_str()?;
+            Some(name == pkg)
+        })
+        .unwrap_or(false)
 }
 
 /// Best-effort cleanup of per-process install logs, which otherwise
@@ -426,6 +412,13 @@ mod tests {
             "a name in another table must not vouch for the package"
         );
         assert!(!manifest_declares_package("", "croft-software"));
+        let multiline_trap = "[package]\nname = \"foreign\"\nversion = \"0.1.0\"\n\
+                              description = \"\"\"\n[package]\nname = \"croft-software\"\n\"\"\"\n";
+        assert!(
+            !manifest_declares_package(multiline_trap, "croft-software"),
+            "package/name lines inside a multiline string must not vouch for the package"
+        );
+        assert!(manifest_declares_package(multiline_trap, "foreign"));
     }
 
     #[test]
