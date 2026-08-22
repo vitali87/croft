@@ -24,14 +24,24 @@
 // default behavior stands.
 fn main() {
     let root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let suffix = if git_output(&root, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
+        "-dirty"
+    } else {
+        ""
+    };
+    // Two spellings of the same provenance: the short label for display
+    // (`--version`, splash badge) and the full commit ID for comparison —
+    // abbreviation length follows `core.abbrev`/repo size, so short labels
+    // for one commit can differ between builds and would read as false
+    // drift (see `probe_drift` in `src/update_watch.rs`).
     let hash = git_output(&root, &["rev-parse", "--short", "HEAD"])
-        .map(|h| {
-            let dirty =
-                git_output(&root, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
-            if dirty { format!("{h}-dirty") } else { h }
-        })
+        .map(|h| format!("{h}{suffix}"))
         .unwrap_or_else(|| String::from("unknown"));
     println!("cargo:rustc-env=CROFT_GIT_HASH={hash}");
+    let full = git_output(&root, &["rev-parse", "HEAD"])
+        .map(|h| format!("{h}{suffix}"))
+        .unwrap_or_else(|| String::from("unknown"));
+    println!("cargo:rustc-env=CROFT_GIT_HASH_FULL={full}");
     let time = std::process::Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output()

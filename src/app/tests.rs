@@ -28702,3 +28702,29 @@ fn drift_probe_verdict_arms_the_rebuild_hint() {
         app.status
     );
 }
+
+// CodeRabbit on #243: a failed rebuild used to strand the user — the drift
+// marker was cleared when the install started and nothing restored it, so
+// after a failure F9 silently reverted to its breakpoint meaning and only a
+// full relaunch re-probed. A failure must leave the hint armed for a retry.
+#[test]
+fn a_failed_reinstall_rearms_the_drift_hint_for_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.local_drift = Some(String::from("def456"));
+    app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[
+        crate::update_watch::UpdateEvent::InProgress,
+        crate::update_watch::UpdateEvent::Failed,
+    ]));
+    assert!(app.poll_update_watch());
+    assert_eq!(app.update_status, UpdateStatus::Idle);
+    assert!(
+        app.status.contains("self-install.log"),
+        "a failure must say where the build log is: {:?}",
+        app.status
+    );
+    assert!(
+        app.f9_update_armed(),
+        "the drift hint must survive a failed rebuild so F9 retries"
+    );
+}

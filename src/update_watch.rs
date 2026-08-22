@@ -59,40 +59,52 @@ pub struct DriftProbe {
 }
 
 impl DriftProbe {
-    /// `manifest_dir` is the baked `CARGO_MANIFEST_DIR`, `baked_hash` the
-    /// baked `CROFT_GIT_HASH`. The git calls run off-thread so a slow or
-    /// unreachable directory can never stall startup.
-    pub fn start(manifest_dir: String, baked_hash: String) -> Self {
+    /// `manifest_dir` is the baked `CARGO_MANIFEST_DIR`, `baked_full` the
+    /// baked `CROFT_GIT_HASH_FULL` — the full commit ID, because
+    /// abbreviation length follows `core.abbrev`/repo size and can differ
+    /// between build time and probe time for the same commit. The git
+    /// calls run off-thread so a slow or unreachable directory can never
+    /// stall startup.
+    pub fn start(manifest_dir: String, baked_full: String) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let _ = tx.send(probe_drift(&manifest_dir, &baked_hash));
+            let _ = tx.send(probe_drift(&manifest_dir, &baked_full));
         });
         Self { rx }
     }
 
     /// The probe's verdict once it lands: `Some(Some(hash))` = the repo has
-    /// moved to `hash`, `Some(None)` = no drift (or no way to tell),
-    /// `None` = still probing.
+    /// moved to `hash` (a short display label), `Some(None)` = no drift (or
+    /// no way to tell), `None` = still probing.
     pub fn take(&self) -> Option<Option<String>> {
         self.rx.try_recv().ok()
     }
 }
 
-fn probe_drift(manifest_dir: &str, baked_hash: &str) -> Option<String> {
+fn probe_drift(manifest_dir: &str, baked_full: &str) -> Option<String> {
     // `unknown` = built outside git (registry/git snapshot, tarball): the
     // source can never move, and the snapshot warning already covers it.
-    if baked_hash == "unknown" {
+    if baked_full == "unknown" {
         return None;
     }
-    let head = git_in(manifest_dir, &["rev-parse", "--short", "HEAD"])?;
+    let head = git_in(manifest_dir, &["rev-parse", "HEAD"])?;
     let dirty = !git_in(manifest_dir, &["status", "--porcelain"])?.is_empty();
-    drift_label(baked_hash, &head, dirty)
+    drift_label(baked_full, &head, dirty)?;
+    // Drift confirmed on full IDs; what surfaces in the status bar is the
+    // short label, matching how the baked hash is displayed.
+    let short = git_in(manifest_dir, &["rev-parse", "--short", "HEAD"])
+        .unwrap_or_else(|| head.chars().take(7).collect());
+    Some(if dirty {
+        format!("{short}-dirty")
+    } else {
+        short
+    })
 }
 
-/// Pure comparison mirroring how `build.rs` composes `CROFT_GIT_HASH`: the
-/// repo's current label is `<head>` or `<head>-dirty`, and any difference
-/// from the baked value means the binary predates its own source tree.
-/// (Same-hash-still-dirty edits are invisible here — content-precise
+/// Pure comparison mirroring how `build.rs` composes `CROFT_GIT_HASH_FULL`:
+/// the repo's current label is `<head>` or `<head>-dirty`, and any
+/// difference from the baked value means the binary predates its own source
+/// tree. (Same-hash-still-dirty edits are invisible here — content-precise
 /// comparison is the remote stamp's job; this is a hint, not a proof.)
 fn drift_label(baked_hash: &str, head: &str, dirty: bool) -> Option<String> {
     let current = if dirty {
@@ -162,6 +174,17 @@ impl SelfInstall {
             out.push(ev);
         }
         out
+    }
+
+    /// A finished install with a scripted outcome, for exercising the app's
+    /// event handling without running a real `cargo install`.
+    #[cfg(test)]
+    pub fn preloaded(events: &[UpdateEvent]) -> Self {
+        let (tx, rx) = channel();
+        for ev in events {
+            let _ = tx.send(*ev);
+        }
+        Self { rx }
     }
 }
 
@@ -275,18 +298,28 @@ mod tests {
             "-m",
             "one",
         ]);
-        let head = git(&["rev-parse", "--short", "HEAD"]);
+        let full = git(&["rev-parse", "HEAD"]);
+        let short = git(&["rev-parse", "--short", "HEAD"]);
 
-        assert_eq!(probe_drift(dir.to_str().unwrap(), &head), None);
+        assert_eq!(probe_drift(dir.to_str().unwrap(), &full), None);
         assert_eq!(probe_drift(dir.to_str().unwrap(), "unknown"), None);
+        // The comparison runs on full commit IDs, so an abbreviation-length
+        // change between build and probe (`core.abbrev` is auto-scaled by
+        // repo size) can never read as drift...
+        git(&["config", "core.abbrev", "12"]);
+        assert_eq!(probe_drift(dir.to_str().unwrap(), &full), None);
+        git(&["config", "--unset", "core.abbrev"]);
+        // ...and a baked short label must never be passed for comparison.
+        assert_ne!(probe_drift(dir.to_str().unwrap(), &short), None);
+        // Real drift surfaces the short display label, not the full ID.
         assert_eq!(
-            probe_drift(dir.to_str().unwrap(), "0000000"),
-            Some(head.clone())
+            probe_drift(dir.to_str().unwrap(), &"0".repeat(40)),
+            Some(short.clone())
         );
         std::fs::write(dir.join("scratch.txt"), "edit").unwrap();
         assert_eq!(
-            probe_drift(dir.to_str().unwrap(), &head),
-            Some(format!("{head}-dirty"))
+            probe_drift(dir.to_str().unwrap(), &full),
+            Some(format!("{short}-dirty"))
         );
         // A directory git can't answer for (deleted repo, moved tree) is
         // silence, never a false alarm.

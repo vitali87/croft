@@ -2746,8 +2746,10 @@ pub struct App {
     /// launcher instead. Dropped once its verdict is drained.
     drift_probe: Option<crate::update_watch::DriftProbe>,
     /// The repo's current hash label when the probe found drift ("def456",
-    /// "def456-dirty"). Arms the "F9 to rebuild" status-bar hint; cleared
-    /// when the rebuild starts.
+    /// "def456-dirty"). Arms the "F9 to rebuild" status-bar hint. Kept
+    /// through a running rebuild — the Idle guards hide the hint while it
+    /// runs, and a failure then re-arms F9 for a retry instead of
+    /// silently reverting the key to its breakpoint meaning.
     local_drift: Option<String>,
     /// Background `cargo install --path <repo>` reinstalling the local
     /// croft after the user pressed F9 on a drift hint. Reported through
@@ -20228,7 +20230,7 @@ impl App {
         }
         self.drift_probe = Some(crate::update_watch::DriftProbe::start(
             String::from(env!("CARGO_MANIFEST_DIR")),
-            String::from(env!("CROFT_GIT_HASH")),
+            String::from(env!("CROFT_GIT_HASH_FULL")),
         ));
     }
 
@@ -20258,7 +20260,6 @@ impl App {
     /// `cargo install` runs, then the same "F9 to relaunch" flow a remote
     /// background update uses.
     fn start_local_reinstall(&mut self) {
-        self.local_drift = None;
         self.self_install = Some(crate::update_watch::SelfInstall::start(
             String::from(env!("CARGO_MANIFEST_DIR")),
             croft_cache_dir().join("self-install.log"),
