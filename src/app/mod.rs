@@ -17992,20 +17992,33 @@ impl App {
     /// leaves in the status line and keeps an open participants picker live.
     fn poll_session_presence(&mut self) -> bool {
         const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-        let Some(channel) = self.session_channel.as_ref() else {
+        if self.session_channel.is_none() {
             return false;
-        };
+        }
         if self.last_session_presence_poll.elapsed() < INTERVAL {
             return false;
         }
+        // A host swap (#238) tears this privileged channel down while the
+        // session lives on under the successor host. The socket and token in
+        // the environment are still valid - the successor inherited both -
+        // so revival is just authenticating again, throttled by this poll's
+        // own interval.
+        if self.session_channel.as_ref().is_some_and(|c| c.is_dead())
+            && let Some(fresh) = crate::session_host::InnerChannel::from_env()
+        {
+            self.session_channel = Some(fresh);
+        }
+        let Some(channel) = self.session_channel.as_ref() else {
+            return false;
+        };
         self.last_session_presence_poll = std::time::Instant::now();
-        // #238: the serve wrapper cannot re-exec the way this inner croft
-        // does, so after a binary update it keeps running the old image —
-        // session-host fixes included. The host writes the marker when it
-        // notices; the one recovery is a fresh host, which a detach +
-        // reattach of the last participant produces. Checked before the
-        // presence-mtime early-return: a roster that never changes must not
-        // hide the hint.
+        // #238: the serve wrapper normally re-execs itself into an updated
+        // binary, carrying the session along - the marker appears only when
+        // that handoff could not happen (exec failed, no handoff fds), so
+        // the host is stuck on the old image and the one recovery is a
+        // fresh host, which a detach + reattach of the last participant
+        // produces. Checked before the presence-mtime early-return: a
+        // roster that never changes must not hide the hint.
         if !self.session_host_stale_seen && channel.stale_marker.exists() {
             self.session_host_stale_seen = true;
             self.status = String::from(
