@@ -355,8 +355,8 @@ pub fn attach(path: Option<PathBuf>, solo: bool) -> Result<()> {
 
 /// The live persistent sessions under `dir`, pruning any dead session
 /// sockets. One row per session: (id, workspace, uptime).
-fn session_rows(dir: &Path) -> Vec<(String, String, String)> {
-    let mut rows: Vec<(String, String, String)> = Vec::new();
+fn session_rows(dir: &Path) -> Vec<(String, String, String, bool)> {
+    let mut rows: Vec<(String, String, String, bool)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let socket = entry.path();
@@ -396,7 +396,10 @@ fn session_rows(dir: &Path) -> Vec<(String, String, String)> {
                 .as_ref()
                 .map(|m| humanize_age(now_unix().saturating_sub(m.created_unix)))
                 .unwrap_or_else(|| String::from("?"));
-            rows.push((id, workspace, uptime));
+            // #238: the host wrote its stale-image marker — it survived a
+            // binary update and keeps running the old code until restarted.
+            let stale = crate::session_host::stale_marker_path(&socket).exists();
+            rows.push((id, workspace, uptime, stale));
         }
     }
     rows
@@ -410,8 +413,13 @@ pub fn list() -> Result<()> {
         return Ok(());
     }
     println!("{:<10}  {:<44}  UPTIME", "SESSION", "WORKSPACE");
-    for (id, ws, up) in rows {
-        println!("{id:<10}  {ws:<44}  {up}");
+    for (id, ws, up, stale) in rows {
+        let hint = if stale {
+            "  (host pre-dates a binary update; reattach to refresh)"
+        } else {
+            ""
+        };
+        println!("{id:<10}  {ws:<44}  {up}{hint}");
     }
     Ok(())
 }

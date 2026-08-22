@@ -2913,6 +2913,9 @@ pub struct App {
     pub session_channel: Option<crate::session_host::InnerChannel>,
     /// Roster last read from the session host's presence sidecar.
     pub session_participants: Vec<crate::session_host::Participant>,
+    /// Whether the host's stale-image marker (#238) has already been
+    /// announced, so the status hint fires once per session, not per poll.
+    session_host_stale_seen: bool,
     /// Multiplayer: the participant whose keystrokes are currently flowing
     /// into this croft (from the host's typing attribution frames).
     session_typist: Option<u64>,
@@ -3962,6 +3965,7 @@ impl App {
             list_picker: None,
             session_channel: crate::session_host::InnerChannel::from_env(),
             session_participants: Vec::new(),
+            session_host_stale_seen: false,
             session_typist: None,
             session_carets: std::collections::HashMap::new(),
             session_presence_mtime: None,
@@ -17945,6 +17949,19 @@ impl App {
             return false;
         }
         self.last_session_presence_poll = std::time::Instant::now();
+        // #238: the serve wrapper cannot re-exec the way this inner croft
+        // does, so after a binary update it keeps running the old image —
+        // session-host fixes included. The host writes the marker when it
+        // notices; the one recovery is a fresh host, which a detach +
+        // reattach of the last participant produces. Checked before the
+        // presence-mtime early-return: a roster that never changes must not
+        // hide the hint.
+        if !self.session_host_stale_seen && channel.stale_marker.exists() {
+            self.session_host_stale_seen = true;
+            self.status = String::from(
+                "Session host runs a pre-update binary; detach and reattach (all participants) to pick up the update",
+            );
+        }
         let path = channel.presence.clone();
         let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         if mtime == self.session_presence_mtime {
