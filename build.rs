@@ -12,7 +12,11 @@
 // only, not forge-derived content. A tree without git (registry or git
 // snapshots, tarballs) builds as `unknown`, which is itself a signal: such
 // a build can never ship local changes (see `source_snapshot_warning` in
-// `src/remote.rs`).
+// `src/remote.rs`). A checkout tracked only as a subdirectory of a larger
+// repo also bakes `unknown` — telling that layout apart from a snapshot
+// unpacked inside an unrelated repo isn't worth the risk of baking an
+// ancestor's commit, so it deliberately trades provenance away (no warning
+// covers it; the snapshot warning is path-based and won't fire).
 //
 // Watching: cargo's default (rerun on any package-file change) misses moves
 // of HEAD with no source edit — commit, branch switch, stage — which left
@@ -24,6 +28,23 @@
 // default behavior stands.
 fn main() {
     let root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    // git discovery walks UP from `-C`, so a crate unpacked inside some
+    // unrelated repo (`cargo publish --dry-run` verifying under
+    // `target/package/`, a registry snapshot under a $HOME that is itself a
+    // git repo) would happily bake that ANCESTOR's commit as provenance.
+    // Only a directory that is its own repo toplevel speaks for the source.
+    if !dir_is_repo_toplevel(&root) {
+        println!("cargo:rustc-env=CROFT_GIT_HASH=unknown");
+        println!("cargo:rustc-env=CROFT_GIT_HASH_FULL=unknown");
+        emit_build_time();
+        // In this branch `.git` is absent (a dir with its own `.git` is its
+        // own toplevel), so declaring it forces a rerun every build: pure git
+        // operations touch no package file, and a later `git init`/adoption
+        // of the tree would otherwise leave `unknown` baked until an actual
+        // source edit.
+        println!("cargo:rerun-if-changed={root}/.git");
+        return;
+    }
     let suffix = if git_output(&root, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
         "-dirty"
     } else {
@@ -42,6 +63,22 @@ fn main() {
         .map(|h| format!("{h}{suffix}"))
         .unwrap_or_else(|| String::from("unknown"));
     println!("cargo:rustc-env=CROFT_GIT_HASH_FULL={full}");
+    emit_build_time();
+    watch_provenance_inputs(&root);
+}
+
+/// True only when `dir` is the working-tree root of its own repository —
+/// the one case where git's answers describe THIS source rather than some
+/// repository that merely contains the directory.
+fn dir_is_repo_toplevel(dir: &str) -> bool {
+    let Some(toplevel) = git_output(dir, &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    let canon = |p: &str| std::fs::canonicalize(p).ok();
+    canon(dir).is_some() && canon(dir) == canon(&toplevel)
+}
+
+fn emit_build_time() {
     let time = std::process::Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output()
@@ -51,7 +88,6 @@ fn main() {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| String::from("unknown"));
     println!("cargo:rustc-env=CROFT_BUILD_TIME={time}");
-    watch_provenance_inputs(&root);
 }
 
 /// Declares every input that can move `CROFT_GIT_HASH`: the git metadata the
@@ -95,9 +131,18 @@ fn watch_provenance_inputs(root: &str) {
 }
 
 fn git_output(root: &str, args: &[&str]) -> Option<String> {
+    // An inherited `GIT_DIR` (bare-dotfiles shells: `export GIT_DIR=~/.dotfiles`)
+    // makes git skip discovery and treat `-C`'s dir as the worktree toplevel:
+    // `--show-toplevel` then echoes the question back — satisfying the guard by
+    // construction — while HEAD answers from the foreign repo. Only filesystem
+    // discovery may speak for this source, so git's env overrides are dropped.
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
         .args(args)
         .output()
         .ok()?;
