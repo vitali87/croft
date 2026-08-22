@@ -12,7 +12,11 @@
 // only, not forge-derived content. A tree without git (registry or git
 // snapshots, tarballs) builds as `unknown`, which is itself a signal: such
 // a build can never ship local changes (see `source_snapshot_warning` in
-// `src/remote.rs`).
+// `src/remote.rs`). A checkout tracked only as a subdirectory of a larger
+// repo also bakes `unknown` — telling that layout apart from a snapshot
+// unpacked inside an unrelated repo isn't worth the risk of baking an
+// ancestor's commit, so it deliberately trades provenance away (no warning
+// covers it; the snapshot warning is path-based and won't fire).
 //
 // Watching: cargo's default (rerun on any package-file change) misses moves
 // of HEAD with no source edit — commit, branch switch, stage — which left
@@ -33,6 +37,12 @@ fn main() {
         println!("cargo:rustc-env=CROFT_GIT_HASH=unknown");
         println!("cargo:rustc-env=CROFT_GIT_HASH_FULL=unknown");
         emit_build_time();
+        // In this branch `.git` is absent (a dir with its own `.git` is its
+        // own toplevel), so declaring it forces a rerun every build: pure git
+        // operations touch no package file, and a later `git init`/adoption
+        // of the tree would otherwise leave `unknown` baked until an actual
+        // source edit.
+        println!("cargo:rerun-if-changed={root}/.git");
         return;
     }
     let suffix = if git_output(&root, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
@@ -121,9 +131,18 @@ fn watch_provenance_inputs(root: &str) {
 }
 
 fn git_output(root: &str, args: &[&str]) -> Option<String> {
+    // An inherited `GIT_DIR` (bare-dotfiles shells: `export GIT_DIR=~/.dotfiles`)
+    // makes git skip discovery and treat `-C`'s dir as the worktree toplevel:
+    // `--show-toplevel` then echoes the question back — satisfying the guard by
+    // construction — while HEAD answers from the foreign repo. Only filesystem
+    // discovery may speak for this source, so git's env overrides are dropped.
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
         .args(args)
         .output()
         .ok()?;

@@ -82,8 +82,9 @@ impl DriftProbe {
 }
 
 fn probe_drift(manifest_dir: &str, baked_full: &str) -> Option<String> {
-    // `unknown` = built outside git (registry/git snapshot, tarball): the
-    // source can never move, and the snapshot warning already covers it.
+    // `unknown` = built without its own repo (registry/git snapshot,
+    // tarball, or a checkout tracked only as a subdirectory of a larger
+    // repo): drift can't be judged, so the probe stays silent.
     if baked_full == "unknown" {
         return None;
     }
@@ -94,7 +95,8 @@ fn probe_drift(manifest_dir: &str, baked_full: &str) -> Option<String> {
     // a dir that is its own repo toplevel speaks for this source (mirrors
     // the same guard in `build.rs`).
     let toplevel = git_in(manifest_dir, &["rev-parse", "--show-toplevel"])?;
-    if std::fs::canonicalize(manifest_dir).ok() != std::fs::canonicalize(&toplevel).ok() {
+    let dir = std::fs::canonicalize(manifest_dir).ok()?;
+    if Some(dir) != std::fs::canonicalize(&toplevel).ok() {
         return None;
     }
     let head = git_in(manifest_dir, &["rev-parse", "HEAD"])?;
@@ -126,9 +128,17 @@ fn drift_label(baked_hash: &str, head: &str, dirty: bool) -> Option<String> {
 }
 
 fn git_in(dir: &str, args: &[&str]) -> Option<String> {
+    // Same env scrub as `git_output` in `build.rs`: an inherited `GIT_DIR`
+    // (without a worktree) makes git treat `-C`'s dir as the toplevel, which
+    // would satisfy the guard in `probe_drift` by construction while HEAD
+    // answers from the foreign repo — guaranteed false drift.
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
         .args(args)
         .output()
         .ok()?;
