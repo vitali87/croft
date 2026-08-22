@@ -566,6 +566,13 @@ impl Theme {
         self.blend_over_bg((0x88, 0x88, 0x88), 0.80)
     }
 
+    /// Background wash behind the cursor's line (VS Code
+    /// `editor.lineHighlightBackground`): the accent at a whisper (8%) over
+    /// the editor surface, spanning gutter through code (#248).
+    pub fn current_line_bg(self) -> Color {
+        self.blend_over_bg(self.accent, 0.08)
+    }
+
     /// Background tint under read occurrences of the symbol at the caret
     /// (VS Code `editor.wordHighlightBackground`, #575757 at 72% alpha on
     /// dark; a 25% wash on light so black text stays legible, matching VS
@@ -1067,6 +1074,19 @@ mod tests {
         // must stay LIGHT rather than be darkened as foregrounds.
         assert!(luma(l.ui(Color::Rgb(0xae, 0xc6, 0xff))) > 150.0);
         assert!(luma(l.ui(Color::Rgb(0xff, 0x8c, 0x2a))) > 150.0);
+    }
+
+    /// #248: the current-line wash is the accent at 8% — a whisper on the
+    /// Black theme, and near-white on Croft Light so black text keeps its
+    /// contrast.
+    #[test]
+    fn current_line_wash_is_a_whisper_of_the_accent() {
+        assert_eq!(Theme::BLACK.current_line_bg(), Color::Rgb(0x06, 0x0e, 0x0d));
+        let l = Theme::from_id("light");
+        let Color::Rgb(r, g, b) = l.current_line_bg() else {
+            panic!("expected Rgb")
+        };
+        assert!(0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b) > 230.0);
     }
 
     #[test]

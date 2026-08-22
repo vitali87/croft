@@ -9250,6 +9250,19 @@ impl Widget for &mut Editor {
                 }
                 VisRow::Text { line, start, end } => (line, start, end),
             };
+            // Current-line highlight (VS Code `editor.lineHighlightBackground`,
+            // #248): a whisper of the accent behind every visual row of the
+            // cursor's line, gutter through code. Focused editor only, and
+            // hidden while a selection is active so the two washes never stack
+            // — VS Code's `renderLineHighlight` behaves the same. Painted
+            // first: spans that carry their own background (selection, search,
+            // occurrences) patch over it, spans that don't inherit it.
+            if self.focused && line_idx == self.cursor_row && sel_norm.is_none() {
+                buf.set_style(
+                    Rect::new(inner.x, y, gutter_width + 1 + text_width, 1),
+                    Style::default().bg(self.theme.current_line_bg()),
+                );
+            }
             // The line number shows once per logical line - on its first visual
             // row; wrapped continuation rows get a blank gutter, like VS Code.
             if !wrap || row_start == 0 {
@@ -13384,6 +13397,41 @@ mod tests {
         (&mut e as &mut Editor).render(area, &mut buf);
         assert_eq!(buf[(0, 0)].symbol(), "\u{250c}");
         assert_eq!(buf[(0, 0)].fg, Color::Rgb(0x4e, 0x9a, 0xff));
+    }
+
+    /// #248: the cursor line wears the theme's accent wash (VS Code
+    /// `editor.lineHighlightBackground`), gutter through code, in the
+    /// focused editor only, and it follows the cursor.
+    #[test]
+    fn current_line_wash_tracks_the_cursor_and_focus() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 6,
+        };
+        let wash = e.theme.current_line_bg();
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        // Line 0 (rendered at y=1 inside the border) holds the cursor: its
+        // row wears the wash from the gutter through the code cells, and its
+        // neighbour does not.
+        assert_eq!(buf[(1, 1)].bg, wash, "gutter cell wears the wash");
+        assert_eq!(buf[(8, 1)].bg, wash, "code cell wears the wash");
+        assert_ne!(buf[(8, 2)].bg, wash, "the next row stays unwashed");
+        // The wash follows the cursor.
+        e.cursor_row = 2;
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        assert_ne!(buf[(8, 1)].bg, wash, "the old row is released");
+        assert_eq!(buf[(8, 3)].bg, wash, "the new cursor row is washed");
+        // An unfocused editor paints no wash at all.
+        e.focused = false;
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        assert_ne!(buf[(8, 3)].bg, wash, "no wash without focus");
     }
 
     fn inlay(line: u32, character: u32, label: &str) -> crate::lsp::manager::InlayHintItem {
