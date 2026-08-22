@@ -208,7 +208,13 @@ fn install_only_streaming_over(
     }
     let _ = log_tx.send("Hashing local source tree".to_string());
     let local_stamp = local_source_stamp()?;
-    let _ = log_tx.send(format!("Local source stamp: {local_stamp}"));
+    let _ = log_tx.send(format!(
+        "Local source stamp: {local_stamp} (source: {})",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    if let Some(warning) = source_snapshot_warning() {
+        let _ = log_tx.send(warning);
+    }
     if !remote_install_needed(ssh, &local_stamp)? {
         let _ = log_tx.send(format!("Croft on {host_label} is already up to date."));
         if !present {
@@ -418,6 +424,9 @@ fn run_croft_session(
             RemoteStatusClass::Exited => return Ok(RemoteOutcome::Exited),
             RemoteStatusClass::NotInstalled if !bootstrapped => {
                 println!("Croft is not installed on {host}; bootstrapping from local source");
+                if let Some(warning) = source_snapshot_warning() {
+                    eprintln!("{warning}");
+                }
                 install_remote_croft(&ssh, &local_source_stamp()?)?;
                 bootstrapped = true;
             }
@@ -676,6 +685,9 @@ pub fn launch_croft_with(
     } else {
         let local_stamp = local_source_stamp()?;
         println!("Installing Croft on {host}");
+        if let Some(warning) = source_snapshot_warning() {
+            eprintln!("{warning}");
+        }
         install_remote_croft(&ssh, &local_stamp)?;
     }
     let persistent = remote_has_session_supervisor(&ssh);
@@ -2582,6 +2594,32 @@ fn local_source_stamp() -> Result<String> {
     source_stamp_for(&PathBuf::from(env!("CARGO_MANIFEST_DIR")))
 }
 
+/// A croft installed with `cargo install` from a registry or git snapshot
+/// bakes that frozen checkout as its `CARGO_MANIFEST_DIR`, so the stamp it
+/// hashes can never change: "already up to date" then reports on a dead tree
+/// while the user's working repo drifts, and installs silently ship nothing.
+/// (2026-08-22: a session-host fix believed deployed was never shipped
+/// because of exactly this.) Every install path surfaces this warning so the
+/// no-op is loud instead of silent.
+fn source_snapshot_warning() -> Option<String> {
+    let dir = env!("CARGO_MANIFEST_DIR");
+    source_dir_is_snapshot(dir).then(|| {
+        format!(
+            "WARNING: this croft was installed from an immutable snapshot ({dir}); remote installs can never ship local changes. Reinstall with `cargo install --path <your repo>` to make installs track your tree."
+        )
+    })
+}
+
+/// The two places `cargo install` unpacks immutable sources: registry
+/// tarballs and git checkouts. Both are subtrees of `$CARGO_HOME`, and a
+/// custom `CARGO_HOME` need not contain `.cargo` anywhere in its path
+/// (`CARGO_HOME=/custom/cargo-home` unpacks to
+/// `/custom/cargo-home/registry/src/...`), so only the two layout-defining
+/// components are matched, with no assumption about the prefix.
+fn source_dir_is_snapshot(dir: &str) -> bool {
+    dir.contains("/registry/src/") || dir.contains("/git/checkouts/")
+}
+
 /// Names of the root entries that shape the shipped binary: the crate source,
 /// the embedded asset tree, and the build/toolchain pins. The stamp hashes
 /// exactly these, so build artifacts (`target`, `target.noindex`), `.git`,
@@ -3716,6 +3754,36 @@ Host !blocked *.internal
         assert_eq!(
             lock_version, toml_version,
             "Cargo.lock croft version {lock_version} drifted from Cargo.toml {toml_version}; run `cargo update -p croft-software`"
+        );
+    }
+
+    // 2026-08-22: a croft installed from `git#de1a7ab7` hashed its frozen
+    // ~/.cargo checkout, said "already up to date", and silently shipped
+    // nothing while the fix sat in the working repo. The snapshot warning
+    // exists so that no-op announces itself.
+    #[test]
+    fn snapshot_dirs_are_detected_and_real_repos_are_not() {
+        assert!(source_dir_is_snapshot(
+            "/Users/u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/croft-software-0.1.757"
+        ));
+        assert!(source_dir_is_snapshot(
+            "/home/u/.cargo/git/checkouts/croft-9a1f/de1a7ab"
+        ));
+        assert!(source_dir_is_snapshot(
+            "/custom/cargo-home/.cargo/git/checkouts/croft-9a1f/de1a7ab"
+        ));
+        // CARGO_HOME=/custom/cargo-home has no `.cargo` component at all
+        assert!(source_dir_is_snapshot(
+            "/custom/cargo-home/registry/src/index.crates.io-6f17d22bba15001f/croft-software-0.1.757"
+        ));
+        assert!(source_dir_is_snapshot(
+            "/custom/cargo-home/git/checkouts/croft-9a1f/de1a7ab"
+        ));
+        assert!(!source_dir_is_snapshot("/Users/u/Documents/croft"));
+        assert!(!source_dir_is_snapshot("/home/u/work/croft"));
+        assert!(
+            source_snapshot_warning().is_none(),
+            "the test build itself must come from a working tree, not a snapshot"
         );
     }
 }

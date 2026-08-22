@@ -10,8 +10,21 @@ const ITERM2_FONT_PS_NAME: &str = "MesloLGSNFM-Regular";
 const ITERM2_NONASCII_PS_NAME: &str = "SymbolsNFM";
 const ITERM2_FONT_SIZE: u32 = 13;
 
+/// Crate version plus build provenance (short git hash and UTC build time,
+/// from `build.rs`). Two builds can share a crate version — 0.1.758 was both
+/// the broken and the fixed binary in the 2026-08-22 session-host incident —
+/// and provenance is what lets `--version` tell them apart.
+const FULL_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("CROFT_GIT_HASH"),
+    ", built ",
+    env!("CROFT_BUILD_TIME"),
+    ")"
+);
+
 #[derive(Parser, Debug)]
-#[command(name = "croft", version, about = "Terminal-based VS Code replica")]
+#[command(name = "croft", version = FULL_VERSION, about = "Terminal-based VS Code replica")]
 pub struct Cli {
     /// Workspace folder to open (defaults to current directory). A file works
     /// too: the workspace roots at its parent and the file opens in the editor.
