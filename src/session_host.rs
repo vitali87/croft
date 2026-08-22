@@ -212,6 +212,56 @@ pub fn presence_path(socket: &Path) -> PathBuf {
     socket.with_file_name(name)
 }
 
+/// Sidecar the host writes when it notices its own binary was replaced on
+/// disk (#238): the serve wrapper outlives every attach by design and cannot
+/// re-exec the way the inner croft does, so after an update it keeps running
+/// the old image — including any session-host fixes the update carried. The
+/// marker lets the inner croft's status bar and `croft ls` say so instead of
+/// leaving the stale host undetectable (2026-08-22: a freshly shipped fix
+/// was resident nowhere until the host was killed by hand).
+pub fn stale_marker_path(socket: &Path) -> PathBuf {
+    let mut name = socket.file_name().unwrap_or_default().to_os_string();
+    name.push(".host-stale");
+    socket.with_file_name(name)
+}
+
+/// The (device, inode) pair that identifies the file currently at `path`.
+/// An updated install replaces the binary (rsync/cargo write a new file and
+/// rename it in), so the inode moving is the update signal — mtime alone
+/// would also fire on a plain `touch`.
+fn image_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// Watch this process's own binary path for replacement; write the stale
+/// marker once when it happens, then stop. Resolved at spawn time — on
+/// Linux `current_exe` reads /proc/self/exe, which is still the real path
+/// here because the watcher starts before any update could land.
+fn spawn_stale_image_watcher(socket: PathBuf) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(start) = image_identity(&exe) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            // A missing file (mid-replace) reads as "not yet": the next
+            // tick sees the settled state.
+            let Some(now) = image_identity(&exe) else {
+                continue;
+            };
+            if now != start {
+                let _ = std::fs::write(stale_marker_path(&socket), b"");
+                return;
+            }
+        }
+    });
+}
+
 /// How many bytes of undelivered output one client may accumulate before it
 /// is declared too slow to keep up. The PTY pump must never wait on a
 /// socket (#228), so a peer that stops draining cannot be allowed to apply
@@ -461,6 +511,10 @@ pub(crate) fn serve_with_token(
     if let Some(ws) = workspace {
         crate::session::write_meta_preserving_created(socket, ws)?;
     }
+    // A fresh host runs the binary currently on disk; any stale marker left
+    // by a predecessor is obsolete.
+    let _ = std::fs::remove_file(stale_marker_path(socket));
+    spawn_stale_image_watcher(socket.to_path_buf());
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -544,6 +598,7 @@ pub(crate) fn serve_with_token(
     broadcast(&host, &encode_control_frame(&Control::Exit { code }));
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(presence_path(socket));
+    let _ = std::fs::remove_file(stale_marker_path(socket));
     // Drop the meta sidecar too, or a later server for this workspace inherits
     // the dead session's created time and `croft ls` reports an inflated uptime.
     crate::session::remove_meta(socket);
@@ -1029,6 +1084,7 @@ fn kill_stale_server(socket: &Path) {
     if !crate::session::is_alive(socket) {
         let _ = std::fs::remove_file(socket);
         let _ = std::fs::remove_file(presence_path(socket));
+        let _ = std::fs::remove_file(stale_marker_path(socket));
         crate::session::remove_meta(socket);
     }
 }
@@ -1351,6 +1407,9 @@ pub struct InnerChannel {
     reader: FrameReader,
     /// The presence sidecar this session's host maintains.
     pub presence: PathBuf,
+    /// The host's stale-image marker (#238): present once the host noticed
+    /// its binary was replaced on disk while it kept running the old image.
+    pub stale_marker: PathBuf,
 }
 
 impl InnerChannel {
@@ -1387,6 +1446,7 @@ impl InnerChannel {
             stream,
             reader: FrameReader::new(),
             presence: presence_path(socket),
+            stale_marker: stale_marker_path(socket),
         })
     }
 
@@ -2936,5 +2996,55 @@ mod tests {
         assert!(!sole_participant_lacks_control(&[p(false), p(false)]));
         assert!(!sole_participant_lacks_control(&[p(false), p(true)]));
         assert!(!sole_participant_lacks_control(&[]));
+    }
+
+    // #238: the marker sits next to the socket like the presence sidecar,
+    // and the update signal is the binary's inode moving — a plain touch of
+    // the same file must not read as an update.
+    #[test]
+    fn stale_marker_sits_next_to_socket_and_replacement_moves_the_identity() {
+        let p = stale_marker_path(Path::new("/x/sessions/ab.mux.sock"));
+        assert_eq!(p, Path::new("/x/sessions/ab.mux.sock.host-stale"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("croft");
+        std::fs::write(&bin, b"v1").unwrap();
+        let start = image_identity(&bin).unwrap();
+        // touch-equivalent: rewriting in place keeps the inode
+        std::fs::write(&bin, b"v1-touched").unwrap();
+        assert_eq!(
+            image_identity(&bin).unwrap(),
+            start,
+            "an in-place rewrite is not a replacement"
+        );
+        // an install replaces: new file renamed over the old path
+        let staged = dir.path().join("croft.new");
+        std::fs::write(&staged, b"v2").unwrap();
+        std::fs::rename(&staged, &bin).unwrap();
+        assert_ne!(
+            image_identity(&bin).unwrap(),
+            start,
+            "a rename-over is a replacement and must change the identity"
+        );
+    }
+
+    // A fresh host must clear a predecessor's stale marker: the new host IS
+    // the update the marker pointed at.
+    #[test]
+    fn a_fresh_host_clears_a_predecessors_stale_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        std::fs::write(stale_marker_path(&socket), b"").unwrap();
+        let server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        assert!(
+            !stale_marker_path(&socket).exists(),
+            "the marker must not outlive the host it described"
+        );
+        let mut a = TestClient::connect(&socket, "owner", 80, 24);
+        a.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        a.send(&encode_bytes_frame(&[0x04]));
+        a.read_until(|f| matches!(f, Frame::Control(Control::Exit { .. })));
+        let _ = server.join();
     }
 }
