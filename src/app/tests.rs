@@ -28621,3 +28621,110 @@ fn install_fallback_without_a_dialog_does_not_panic() {
     app.answer_install_fallback("");
     assert!(app.connect_dialog.is_none());
 }
+
+// 2026-08-22 (#242): a Mac croft shipped a remote main @ 84a31a0 while itself
+// running an hour-old binary — locally, nothing ever compares the installed
+// croft against the repo it came from. The drift hint claims bare F9 only
+// while it is armed and no update is otherwise in flight, so the key keeps
+// its debugger meaning everywhere else.
+#[test]
+fn drift_hint_arms_f9_only_while_idle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        !app.f9_update_armed(),
+        "no drift, no landed update: F9 stays a breakpoint key"
+    );
+    app.local_drift = Some(String::from("def456"));
+    assert!(app.f9_update_armed(), "an armed drift hint claims F9");
+    app.update_status = UpdateStatus::InProgress;
+    assert!(
+        !app.f9_update_armed(),
+        "a running rebuild must not re-trigger on F9"
+    );
+    app.local_drift = None;
+    app.update_status = UpdateStatus::Ready;
+    assert!(
+        app.f9_update_armed(),
+        "a landed update claims F9 for the re-exec"
+    );
+}
+
+// The probe end-to-end against a real repo: a baked hash that differs from
+// the repo's HEAD must arm the hint and say how to act on it.
+#[test]
+fn drift_probe_verdict_arms_the_rebuild_hint() {
+    let repo = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "one",
+    ]);
+    let head = git(&["rev-parse", "--short", "HEAD"]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.drift_probe = Some(crate::update_watch::DriftProbe::start(
+        repo.path().to_string_lossy().into_owned(),
+        String::from("0000000"),
+    ));
+    let mut armed = false;
+    for _ in 0..50 {
+        if app.poll_drift_probe() {
+            armed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(armed, "the probe's verdict must arrive and report drift");
+    assert!(app.drift_probe.is_none(), "the probe answers exactly once");
+    assert_eq!(app.local_drift.as_deref(), Some(head.as_str()));
+    assert!(
+        app.status.contains("F9"),
+        "the status must say how to act on the drift: {:?}",
+        app.status
+    );
+}
+
+// CodeRabbit on #243: a failed rebuild used to strand the user — the drift
+// marker was cleared when the install started and nothing restored it, so
+// after a failure F9 silently reverted to its breakpoint meaning and only a
+// full relaunch re-probed. A failure must leave the hint armed for a retry.
+#[test]
+fn a_failed_reinstall_rearms_the_drift_hint_for_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.local_drift = Some(String::from("def456"));
+    app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[
+        crate::update_watch::UpdateEvent::InProgress,
+        crate::update_watch::UpdateEvent::Failed,
+    ]));
+    assert!(app.poll_update_watch());
+    assert_eq!(app.update_status, UpdateStatus::Idle);
+    assert!(
+        app.status.contains("self-install.log"),
+        "a failure must say where the build log is: {:?}",
+        app.status
+    );
+    assert!(
+        app.f9_update_armed(),
+        "the drift hint must survive a failed rebuild so F9 retries"
+    );
+}

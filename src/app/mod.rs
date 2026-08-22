@@ -2740,6 +2740,21 @@ pub struct App {
     /// the local cross-build writes when it finishes shipping a newer
     /// binary, so the running croft can re-exec into it in place.
     update_watch: Option<crate::update_watch::UpdateWatch>,
+    /// One-shot startup probe (#242): does the repo this binary was built
+    /// from now sit at a different commit/dirty state than the binary has
+    /// baked in? Local-only — a remote-launched croft is re-stamped by its
+    /// launcher instead. Dropped once its verdict is drained.
+    drift_probe: Option<crate::update_watch::DriftProbe>,
+    /// The repo's current hash label when the probe found drift ("def456",
+    /// "def456-dirty"). Arms the "F9 to rebuild" status-bar hint. Kept
+    /// through a running rebuild — the Idle guards hide the hint while it
+    /// runs, and a failure then re-arms F9 for a retry instead of
+    /// silently reverting the key to its breakpoint meaning.
+    local_drift: Option<String>,
+    /// Background `cargo install --path <repo>` reinstalling the local
+    /// croft after the user pressed F9 on a drift hint. Reported through
+    /// the same UpdateEvent lifecycle as the remote watcher.
+    self_install: Option<crate::update_watch::SelfInstall>,
     update_status: UpdateStatus,
     /// When a background self-update is in progress, the instant it started.
     /// Drives the spinning update glyph in the status bar (and the redraw
@@ -3881,6 +3896,9 @@ impl App {
             connect_auth: None,
             install_session: None,
             update_watch: None,
+            drift_probe: None,
+            local_drift: None,
+            self_install: None,
             update_status: UpdateStatus::Idle,
             update_spinner_start: None,
             pending_reexec: false,
@@ -12616,6 +12634,22 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        if let Some(current) = self.local_drift.as_ref()
+            && self.update_status == UpdateStatus::Idle
+        {
+            // Amber, persistent: the binary predates its own source tree
+            // (#242). One keypress rebuilds it in the background.
+            spans.push(Span::styled(
+                format!(
+                    " ⟳ croft {} < repo {current} - F9 to rebuild ",
+                    env!("CROFT_GIT_HASH")
+                ),
+                Style::default()
+                    .bg(self.theme.ui(Color::Rgb(0x8a, 0x60, 0x00)))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if self.update_status == UpdateStatus::InProgress {
             // Red + a spinning circular-arrow glyph to draw the eye to the
             // in-progress background update.
@@ -14606,9 +14640,7 @@ impl App {
             self.debug_pause();
             return Ok(());
         }
-        if matches!(key.code, KeyCode::F(9))
-            && !(terminal_owns_fkeys && self.update_status != UpdateStatus::Ready)
-        {
+        if matches!(key.code, KeyCode::F(9)) && !(terminal_owns_fkeys && !self.f9_update_armed()) {
             if key.modifiers.contains(KeyModifiers::SHIFT)
                 && key.modifiers.contains(KeyModifiers::ALT)
             {
@@ -14625,6 +14657,10 @@ impl App {
                 // A background update has landed: bare F9 re-execs into it.
                 self.pending_reexec = true;
                 self.quit = true;
+            } else if self.local_drift.is_some() && self.update_status == UpdateStatus::Idle {
+                // The drift hint is armed (#242): bare F9 rebuilds and
+                // reinstalls the local croft in the background.
+                self.start_local_reinstall();
             } else {
                 self.debug_toggle_breakpoint();
             }
@@ -20184,12 +20220,69 @@ impl App {
         ));
     }
 
-    pub fn poll_update_watch(&mut self) -> bool {
-        let Some(watch) = self.update_watch.as_ref() else {
+    /// Start the one-shot local drift probe (#242) on a locally-launched
+    /// croft. A remote-launched croft skips it: its binary is re-stamped by
+    /// the launching machine on every connect, and its baked manifest dir
+    /// points at a tree on another box anyway.
+    fn start_drift_probe_if_local(&mut self) {
+        if std::env::var_os("CROFT_REMOTE_AUTOUPDATE").is_some() {
+            return;
+        }
+        self.drift_probe = Some(crate::update_watch::DriftProbe::start(
+            String::from(env!("CARGO_MANIFEST_DIR")),
+            String::from(env!("CROFT_GIT_HASH_FULL")),
+        ));
+    }
+
+    /// Arm the rebuild hint when the drift probe's verdict lands. The probe
+    /// is dropped either way — it only ever answers once.
+    fn poll_drift_probe(&mut self) -> bool {
+        let Some(probe) = self.drift_probe.as_ref() else {
             return false;
         };
-        let mut changed = false;
-        for ev in watch.drain() {
+        let Some(verdict) = probe.take() else {
+            return false;
+        };
+        self.drift_probe = None;
+        let Some(current) = verdict else {
+            return false;
+        };
+        self.status = format!(
+            "This croft was built at {}, but its repo is now at {current} - press F9 to rebuild & reinstall in the background",
+            env!("CROFT_GIT_HASH"),
+        );
+        self.local_drift = Some(current);
+        true
+    }
+
+    /// Kick off the background reinstall the drift hint offered. The
+    /// existing update state machine takes it from here: spinner while
+    /// `cargo install` runs, then the same "F9 to relaunch" flow a remote
+    /// background update uses.
+    fn start_local_reinstall(&mut self) {
+        self.self_install = Some(crate::update_watch::SelfInstall::start(
+            String::from(env!("CARGO_MANIFEST_DIR")),
+            croft_cache_dir().join("self-install.log"),
+        ));
+    }
+
+    /// True when bare F9 is claimed by the update flow: either a landed
+    /// update waiting to re-exec, or an armed drift hint waiting to rebuild.
+    fn f9_update_armed(&self) -> bool {
+        self.update_status == UpdateStatus::Ready
+            || (self.local_drift.is_some() && self.update_status == UpdateStatus::Idle)
+    }
+
+    pub fn poll_update_watch(&mut self) -> bool {
+        let mut changed = self.poll_drift_probe();
+        let mut events: Vec<crate::update_watch::UpdateEvent> = Vec::new();
+        if let Some(watch) = self.update_watch.as_ref() {
+            events.extend(watch.drain());
+        }
+        if let Some(install) = self.self_install.as_ref() {
+            events.extend(install.drain());
+        }
+        for ev in events {
             changed = true;
             match ev {
                 crate::update_watch::UpdateEvent::InProgress => {
@@ -20202,8 +20295,13 @@ impl App {
                 crate::update_watch::UpdateEvent::Failed => {
                     self.update_status = UpdateStatus::Idle;
                     self.update_spinner_start = None;
-                    self.status =
-                        String::from("Background croft update failed; staying on current version");
+                    self.status = if self.self_install.take().is_some() {
+                        String::from(
+                            "croft rebuild failed - see ~/.cache/croft/self-install.log (still on the old binary)",
+                        )
+                    } else {
+                        String::from("Background croft update failed; staying on current version")
+                    };
                 }
                 crate::update_watch::UpdateEvent::Ready => {
                     self.update_spinner_start = None;
@@ -37108,6 +37206,7 @@ pub fn run(
         app.open_file_at_launch(file);
     }
     app.start_update_watch_if_remote();
+    app.start_drift_probe_if_local();
 
     enable_raw_mode().context("enable raw mode")?;
     // Sixel has no env var, so when neither iTerm2 nor Kitty was detected from
