@@ -167,11 +167,93 @@ fn install_bin_from(
     cargo_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    let root = install_root
-        .or(cargo_home)
+    // Cargo treats an empty env var as unset (home crate filters it);
+    // honoring one here would yield the RELATIVE path `bin/croft`, resolved
+    // against the workspace being edited - an arbitrary workspace file could
+    // then pass the exists() check and get exec'd as the "update".
+    let set = |v: Option<std::ffi::OsString>| v.filter(|v| !v.is_empty());
+    let root = set(install_root)
+        .or_else(|| set(cargo_home))
         .map(PathBuf::from)
-        .or_else(|| home.map(|h| PathBuf::from(h).join(".cargo")))?;
+        .or_else(|| set(home).map(|h| PathBuf::from(h).join(".cargo")))?;
     Some(root.join("bin").join("croft"))
+}
+
+/// The destination cargo itself reported (`Installing`/`Replacing <path>`
+/// in its output) - authoritative where env resolution is not: an
+/// `install.root` in cargo config is invisible to [`cargo_install_bin`],
+/// and re-execing the env-resolved guess would silently relaunch a stale
+/// `~/.cargo/bin/croft` forever. Package-progress lines ("Installing
+/// croft-software v…") are skipped by requiring an absolute path to the
+/// binary.
+fn parse_installed_binary(output: &str) -> Option<PathBuf> {
+    output.lines().rev().find_map(|line| {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("Installing ")
+            .or_else(|| line.strip_prefix("Replacing "))?;
+        let path = std::path::Path::new(rest.trim());
+        (path.is_absolute() && path.file_name() == Some(std::ffi::OsStr::new("croft")))
+            .then(|| path.to_path_buf())
+    })
+}
+
+/// True when `toml` declares `pkg` as its `[package]` name. Deliberately
+/// line-based (no toml dependency) but section-aware: a `name` under
+/// `[[bin]]` or a dependency table must not vouch for the package, and
+/// both TOML quote styles plus `name="x"` spacing are legal.
+fn manifest_declares_package(toml: &str, pkg: &str) -> bool {
+    let mut in_package = false;
+    for line in toml.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some(value) = line
+            .strip_prefix("name")
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix('='))
+        else {
+            continue;
+        };
+        let value = value.split('#').next().unwrap_or("").trim();
+        if value == format!("\"{pkg}\"") || value == format!("'{pkg}'") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best-effort cleanup of per-process install logs, which otherwise
+/// accumulate one file per croft run forever. A week keeps every recent
+/// diagnostic (including whatever a live sibling instance just wrote)
+/// while bounding the pile; the legacy shared `self-install.log` ages out
+/// under the same rule.
+fn prune_old_install_logs(dir: &std::path::Path, keep: &std::path::Path) {
+    const WEEK: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("self-install") || !name.ends_with(".log") || entry.path() == keep {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > WEEK);
+        if expired {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// A background `cargo install --path <repo> --locked` reinstalling the
@@ -181,6 +263,9 @@ fn install_bin_from(
 /// F9 re-execs into it) or `Failed` (old binary keeps running).
 pub struct SelfInstall {
     rx: Receiver<UpdateEvent>,
+    /// Where cargo said it wrote the binary, parsed from its output on
+    /// success; read by the F9 re-exec.
+    installed: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
 
 impl SelfInstall {
@@ -188,18 +273,26 @@ impl SelfInstall {
     /// without scrollback.
     pub fn start(manifest_dir: String, log_path: PathBuf) -> Self {
         let (tx, rx) = channel();
+        let installed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let installed_writer = std::sync::Arc::clone(&installed);
         std::thread::spawn(move || {
             let _ = tx.send(UpdateEvent::InProgress);
+            // The cache dir may not exist yet (nothing else in the local
+            // drift flow creates it), and for a refusal below the log is
+            // the only place the reason is recorded.
+            if let Some(dir) = log_path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+                prune_old_install_logs(dir, &log_path);
+            }
             // The manifest dir is a path baked at build time; nothing stops
             // the filesystem from hosting a different crate there by now.
             // `cargo install` would happily build that foreign package, exit
             // 0, and the app would announce a croft update that never
             // happened - so refuse unless the manifest still declares THIS
             // package (#245).
-            let expected = concat!("name = \"", env!("CARGO_PKG_NAME"), "\"");
             let manifest_ok =
                 std::fs::read_to_string(std::path::Path::new(&manifest_dir).join("Cargo.toml"))
-                    .is_ok_and(|s| s.lines().any(|l| l.trim() == expected));
+                    .is_ok_and(|s| manifest_declares_package(&s, env!("CARGO_PKG_NAME")));
             if !manifest_ok {
                 let _ = std::fs::write(
                     &log_path,
@@ -222,6 +315,9 @@ impl SelfInstall {
                     log.extend_from_slice(&out.stderr);
                     let _ = std::fs::write(&log_path, &log);
                     if out.status.success() {
+                        if let Ok(mut slot) = installed_writer.lock() {
+                            *slot = parse_installed_binary(&String::from_utf8_lossy(&log));
+                        }
                         UpdateEvent::Ready
                     } else {
                         UpdateEvent::Failed
@@ -234,7 +330,13 @@ impl SelfInstall {
             };
             let _ = tx.send(event);
         });
-        Self { rx }
+        Self { rx, installed }
+    }
+
+    /// The path cargo reported installing to, once `Ready` has been sent.
+    /// `None` before that, or when the output had no binary line.
+    pub fn installed_path(&self) -> Option<PathBuf> {
+        self.installed.lock().ok()?.clone()
     }
 
     pub fn drain(&self) -> Vec<UpdateEvent> {
@@ -253,7 +355,10 @@ impl SelfInstall {
         for ev in events {
             let _ = tx.send(*ev);
         }
-        Self { rx }
+        Self {
+            rx,
+            installed: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 }
 
@@ -298,6 +403,47 @@ mod tests {
     }
 
     #[test]
+    fn manifest_name_check_is_section_aware() {
+        let croft = "[package]\nname = \"croft-software\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"croft\"\n";
+        assert!(manifest_declares_package(croft, "croft-software"));
+        assert!(
+            !manifest_declares_package(croft, "croft"),
+            "a [[bin]] name must not vouch for the package"
+        );
+        assert!(
+            manifest_declares_package("[package]\nname=\"croft-software\"\n", "croft-software"),
+            "TOML does not require spaces around ="
+        );
+        assert!(
+            manifest_declares_package("[package]\nname = 'croft-software'\n", "croft-software"),
+            "single quotes are legal TOML"
+        );
+        assert!(
+            !manifest_declares_package(
+                "[package]\nname = \"other\"\n\n[dependencies.x]\nname = \"croft-software\"\n",
+                "croft-software"
+            ),
+            "a name in another table must not vouch for the package"
+        );
+        assert!(!manifest_declares_package("", "croft-software"));
+    }
+
+    #[test]
+    fn installed_binary_is_parsed_from_cargo_output_not_progress_lines() {
+        let output = "  Installing croft-software v0.1.758 (/repo)\n\
+                         Compiling croft-software v0.1.758\n\
+                        Finished `release` profile [optimized] target(s) in 57s\n\
+                       Replacing /custom/root/bin/croft\n\
+                        Replaced package `croft-software v0.1.758` with `croft-software v0.1.758`\n";
+        assert_eq!(
+            parse_installed_binary(output),
+            Some(PathBuf::from("/custom/root/bin/croft")),
+            "the binary line, not the package-progress line, names the destination"
+        );
+        assert_eq!(parse_installed_binary("nothing relevant"), None);
+    }
+
+    #[test]
     fn install_bin_follows_cargo_root_resolution() {
         let bin = |p: Option<&str>| p.map(std::ffi::OsString::from);
         assert_eq!(
@@ -320,6 +466,12 @@ mod tests {
             "default is ~/.cargo/bin"
         );
         assert_eq!(install_bin_from(None, None, None), None);
+        assert_eq!(
+            install_bin_from(bin(Some("")), bin(Some("")), bin(Some("/home/u"))),
+            Some(PathBuf::from("/home/u/.cargo/bin/croft")),
+            "empty env vars are unset (cargo's rule) - honoring one would \
+             yield a relative path resolved against the edited workspace"
+        );
     }
 
     // The baked manifest path can outlive the tree it pointed at; if some

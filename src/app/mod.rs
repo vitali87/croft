@@ -12636,6 +12636,7 @@ impl App {
         }
         if let Some(current) = self.local_drift.as_ref()
             && self.update_status == UpdateStatus::Idle
+            && self.self_install.is_none()
         {
             // Amber, persistent: the binary predates its own source tree
             // (#242). One keypress rebuilds it in the background.
@@ -14661,6 +14662,10 @@ impl App {
                 // The drift hint is armed (#242): bare F9 rebuilds and
                 // reinstalls the local croft in the background.
                 self.start_local_reinstall();
+            } else if self.self_install.is_some() {
+                // A rebuild is already in flight (second F9 of an input
+                // batch, or pressed again mid-install): swallow it -
+                // toggling a breakpoint here is never what was meant.
             } else {
                 self.debug_toggle_breakpoint();
             }
@@ -36594,13 +36599,17 @@ fn self_install_log_path() -> PathBuf {
 }
 
 /// Resolve the binary to re-exec into after an update. A local self-install
-/// lands wherever cargo's install root points (`CARGO_INSTALL_ROOT` /
-/// `CARGO_HOME` / `~/.cargo`); the remote installer always rsyncs to the
-/// literal `~/.cargo/bin/croft`. Either way the fresh file is preferred
-/// over `current_exe`, which may resolve to the now-replaced inode.
-fn reexec_binary_path(local_install: bool) -> PathBuf {
-    let installed = if local_install {
-        crate::update_watch::cargo_install_bin()
+/// re-execs the exact path cargo reported writing (which honors an
+/// `install.root` from cargo config that env resolution can't see), falling
+/// back to cargo's env-level root (`CARGO_INSTALL_ROOT` / `CARGO_HOME` /
+/// `~/.cargo`); the remote installer always rsyncs to the literal
+/// `~/.cargo/bin/croft`. Either way the fresh file is preferred over
+/// `current_exe`, which may resolve to the now-replaced inode.
+fn reexec_binary_path(local_install: Option<&crate::update_watch::SelfInstall>) -> PathBuf {
+    let installed = if let Some(install) = local_install {
+        install
+            .installed_path()
+            .or_else(crate::update_watch::cargo_install_bin)
     } else {
         std::env::var_os("HOME")
             .map(|home| PathBuf::from(home).join(".cargo").join("bin").join("croft"))
@@ -37366,7 +37375,7 @@ pub fn run(
         let session_path = crate::session_state::handoff_path();
         let _ = state.save(&session_path);
         use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new(reexec_binary_path(app.self_install.is_some()));
+        let mut cmd = std::process::Command::new(reexec_binary_path(app.self_install.as_ref()));
         cmd.arg(app.workspace_root())
             .arg("--restore-session")
             .arg(&session_path);
