@@ -2611,11 +2611,13 @@ fn source_snapshot_warning() -> Option<String> {
 }
 
 /// The two places `cargo install` unpacks immutable sources: registry
-/// tarballs and git checkouts. Both live under `$CARGO_HOME` (`~/.cargo` by
-/// default); a custom `CARGO_HOME` still uses these two subtrees, so the
-/// path fragments are matched without pinning the prefix.
+/// tarballs and git checkouts. Both are subtrees of `$CARGO_HOME`, and a
+/// custom `CARGO_HOME` need not contain `.cargo` anywhere in its path
+/// (`CARGO_HOME=/custom/cargo-home` unpacks to
+/// `/custom/cargo-home/registry/src/...`), so only the two layout-defining
+/// components are matched, with no assumption about the prefix.
 fn source_dir_is_snapshot(dir: &str) -> bool {
-    dir.contains(".cargo/registry/src/") || dir.contains(".cargo/git/checkouts/")
+    dir.contains("/registry/src/") || dir.contains("/git/checkouts/")
 }
 
 /// Names of the root entries that shape the shipped binary: the crate source,
@@ -3769,6 +3771,13 @@ Host !blocked *.internal
         ));
         assert!(source_dir_is_snapshot(
             "/custom/cargo-home/.cargo/git/checkouts/croft-9a1f/de1a7ab"
+        ));
+        // CARGO_HOME=/custom/cargo-home has no `.cargo` component at all
+        assert!(source_dir_is_snapshot(
+            "/custom/cargo-home/registry/src/index.crates.io-6f17d22bba15001f/croft-software-0.1.757"
+        ));
+        assert!(source_dir_is_snapshot(
+            "/custom/cargo-home/git/checkouts/croft-9a1f/de1a7ab"
         ));
         assert!(!source_dir_is_snapshot("/Users/u/Documents/croft"));
         assert!(!source_dir_is_snapshot("/home/u/work/croft"));
