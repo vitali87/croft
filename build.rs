@@ -14,9 +14,14 @@
 // a build can never ship local changes (see `source_snapshot_warning` in
 // `src/remote.rs`).
 //
-// No `cargo:rerun-if-changed` on purpose: cargo's default then reruns this
-// script whenever any package file changes, which keeps the `-dirty` flag
-// honest. The two git invocations cost milliseconds.
+// Watching: cargo's default (rerun on any package-file change) misses moves
+// of HEAD with no source edit — commit, branch switch, stage — which left
+// the baked hash stale. So the git metadata is watched explicitly (worktree
+// HEAD, index, refs, packed-refs via `--git-path`, which resolves worktree
+// layouts). Emitting any rerun-if-changed disables cargo's default watch,
+// so the package files that shape the binary (and flip `-dirty`) are
+// re-declared alongside. Outside a git tree nothing is emitted and cargo's
+// default behavior stands.
 fn main() {
     let root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     let hash = git_output(&root, &["rev-parse", "--short", "HEAD"])
@@ -36,6 +41,47 @@ fn main() {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| String::from("unknown"));
     println!("cargo:rustc-env=CROFT_BUILD_TIME={time}");
+    watch_provenance_inputs(&root);
+}
+
+/// Declares every input that can move `CROFT_GIT_HASH`: the git metadata the
+/// hash reads, and the package files whose edits flip `-dirty`. A path is
+/// only declared when it exists — a declared-but-missing path makes cargo
+/// rerun on every build (`packed-refs` is the usual absentee); if it appears
+/// later, the operation that creates it also rewrites `refs`, which is
+/// watched.
+fn watch_provenance_inputs(root: &str) {
+    let Some(git_paths) = git_output(
+        root,
+        &[
+            "rev-parse",
+            "--git-path",
+            "HEAD",
+            "--git-path",
+            "index",
+            "--git-path",
+            "refs",
+            "--git-path",
+            "packed-refs",
+        ],
+    ) else {
+        return;
+    };
+    let package_files = [
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "rust-toolchain.toml",
+        "src",
+        "assets",
+        "tests",
+    ];
+    for path in git_paths.lines().chain(package_files) {
+        let path = std::path::Path::new(root).join(path);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }
 
 fn git_output(root: &str, args: &[&str]) -> Option<String> {
