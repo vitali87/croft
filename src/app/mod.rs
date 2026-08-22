@@ -14657,7 +14657,7 @@ impl App {
                 // A background update has landed: bare F9 re-execs into it.
                 self.pending_reexec = true;
                 self.quit = true;
-            } else if self.local_drift.is_some() && self.update_status == UpdateStatus::Idle {
+            } else if self.f9_update_armed() && self.update_status == UpdateStatus::Idle {
                 // The drift hint is armed (#242): bare F9 rebuilds and
                 // reinstalls the local croft in the background.
                 self.start_local_reinstall();
@@ -20262,7 +20262,7 @@ impl App {
     fn start_local_reinstall(&mut self) {
         self.self_install = Some(crate::update_watch::SelfInstall::start(
             String::from(env!("CARGO_MANIFEST_DIR")),
-            croft_cache_dir().join("self-install.log"),
+            self_install_log_path(),
         ));
     }
 
@@ -20270,7 +20270,14 @@ impl App {
     /// update waiting to re-exec, or an armed drift hint waiting to rebuild.
     fn f9_update_armed(&self) -> bool {
         self.update_status == UpdateStatus::Ready
-            || (self.local_drift.is_some() && self.update_status == UpdateStatus::Idle)
+            || (self.local_drift.is_some()
+                && self.update_status == UpdateStatus::Idle
+                // `update_status` only leaves Idle when the InProgress event
+                // is drained - once per outer loop, BEFORE the input drain -
+                // so without this latch two F9s in one crossterm batch spawn
+                // two concurrent `cargo install`s racing cargo's locks
+                // (#245).
+                && self.self_install.is_none())
     }
 
     pub fn poll_update_watch(&mut self) -> bool {
@@ -20296,8 +20303,9 @@ impl App {
                     self.update_status = UpdateStatus::Idle;
                     self.update_spinner_start = None;
                     self.status = if self.self_install.take().is_some() {
-                        String::from(
-                            "croft rebuild failed - see ~/.cache/croft/self-install.log (still on the old binary)",
+                        format!(
+                            "croft rebuild failed - see {} (still on the old binary)",
+                            self_install_log_path().display()
                         )
                     } else {
                         String::from("Background croft update failed; staying on current version")
@@ -36579,16 +36587,28 @@ fn croft_cache_dir() -> PathBuf {
     home.join(".cache").join("croft")
 }
 
-/// Resolve the binary to re-exec into after an update. The remote install
-/// always lands at `~/.cargo/bin/croft`; preferring that path (over
-/// `current_exe`, which may resolve to the now-replaced inode) guarantees
-/// the swap picks up the freshly-shipped file.
-fn reexec_binary_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = PathBuf::from(home).join(".cargo").join("bin").join("croft");
-        if p.exists() {
-            return p;
-        }
+/// The per-process self-install log: two drift-armed croft instances on one
+/// machine must not overwrite each other's build diagnostics (#245).
+fn self_install_log_path() -> PathBuf {
+    croft_cache_dir().join(format!("self-install-{}.log", std::process::id()))
+}
+
+/// Resolve the binary to re-exec into after an update. A local self-install
+/// lands wherever cargo's install root points (`CARGO_INSTALL_ROOT` /
+/// `CARGO_HOME` / `~/.cargo`); the remote installer always rsyncs to the
+/// literal `~/.cargo/bin/croft`. Either way the fresh file is preferred
+/// over `current_exe`, which may resolve to the now-replaced inode.
+fn reexec_binary_path(local_install: bool) -> PathBuf {
+    let installed = if local_install {
+        crate::update_watch::cargo_install_bin()
+    } else {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".cargo").join("bin").join("croft"))
+    };
+    if let Some(p) = installed
+        && p.exists()
+    {
+        return p;
     }
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("croft"))
 }
@@ -37346,7 +37366,7 @@ pub fn run(
         let session_path = crate::session_state::handoff_path();
         let _ = state.save(&session_path);
         use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new(reexec_binary_path());
+        let mut cmd = std::process::Command::new(reexec_binary_path(app.self_install.is_some()));
         cmd.arg(app.workspace_root())
             .arg("--restore-session")
             .arg(&session_path);

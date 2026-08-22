@@ -148,6 +148,32 @@ fn git_in(dir: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8(out.stdout).ok()?.trim().to_string())
 }
 
+/// The `bin/croft` a local `cargo install` will actually write, mirroring
+/// cargo's own root resolution: `CARGO_INSTALL_ROOT`, then `CARGO_HOME`,
+/// then `~/.cargo`. (An `install.root` from cargo config files is not read
+/// here - best effort; #245.) The re-exec after a self-install must follow
+/// the same resolution, or a custom root leaves it relaunching a stale
+/// `~/.cargo/bin/croft` forever.
+pub fn cargo_install_bin() -> Option<PathBuf> {
+    install_bin_from(
+        std::env::var_os("CARGO_INSTALL_ROOT"),
+        std::env::var_os("CARGO_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn install_bin_from(
+    install_root: Option<std::ffi::OsString>,
+    cargo_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let root = install_root
+        .or(cargo_home)
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".cargo")))?;
+    Some(root.join("bin").join("croft"))
+}
+
 /// A background `cargo install --path <repo> --locked` reinstalling the
 /// local croft, reported through the same [`UpdateEvent`] lifecycle the
 /// remote watcher uses so the app consumes both with one state machine:
@@ -164,6 +190,29 @@ impl SelfInstall {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let _ = tx.send(UpdateEvent::InProgress);
+            // The manifest dir is a path baked at build time; nothing stops
+            // the filesystem from hosting a different crate there by now.
+            // `cargo install` would happily build that foreign package, exit
+            // 0, and the app would announce a croft update that never
+            // happened - so refuse unless the manifest still declares THIS
+            // package (#245).
+            let expected = concat!("name = \"", env!("CARGO_PKG_NAME"), "\"");
+            let manifest_ok =
+                std::fs::read_to_string(std::path::Path::new(&manifest_dir).join("Cargo.toml"))
+                    .is_ok_and(|s| s.lines().any(|l| l.trim() == expected));
+            if !manifest_ok {
+                let _ = std::fs::write(
+                    &log_path,
+                    format!(
+                        "refusing to install: {manifest_dir}/Cargo.toml no longer declares \
+                         package `{}` - the source tree this croft was built from has been \
+                         replaced",
+                        env!("CARGO_PKG_NAME")
+                    ),
+                );
+                let _ = tx.send(UpdateEvent::Failed);
+                return;
+            }
             let result = std::process::Command::new("cargo")
                 .args(["install", "--path", &manifest_dir, "--locked"])
                 .output();
@@ -246,6 +295,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn install_bin_follows_cargo_root_resolution() {
+        let bin = |p: Option<&str>| p.map(std::ffi::OsString::from);
+        assert_eq!(
+            install_bin_from(
+                bin(Some("/custom/root")),
+                bin(Some("/ch")),
+                bin(Some("/home/u"))
+            ),
+            Some(PathBuf::from("/custom/root/bin/croft")),
+            "CARGO_INSTALL_ROOT wins over everything"
+        );
+        assert_eq!(
+            install_bin_from(None, bin(Some("/ch")), bin(Some("/home/u"))),
+            Some(PathBuf::from("/ch/bin/croft")),
+            "CARGO_HOME beats the HOME default"
+        );
+        assert_eq!(
+            install_bin_from(None, None, bin(Some("/home/u"))),
+            Some(PathBuf::from("/home/u/.cargo/bin/croft")),
+            "default is ~/.cargo/bin"
+        );
+        assert_eq!(install_bin_from(None, None, None), None);
+    }
+
+    // The baked manifest path can outlive the tree it pointed at; if some
+    // OTHER crate lives there now, the install must refuse rather than
+    // build the foreign package and report a croft update that never
+    // happened.
+    #[test]
+    fn self_install_refuses_a_foreign_package_at_the_baked_path() {
+        let dir = scratch_dir("foreign-pkg");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"definitely-not-croft\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let log = dir.join("install.log");
+        let install = SelfInstall::start(dir.to_string_lossy().into_owned(), log.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        while std::time::Instant::now() < deadline {
+            events.extend(install.drain());
+            if events.contains(&UpdateEvent::Failed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            events,
+            vec![UpdateEvent::InProgress, UpdateEvent::Failed],
+            "a foreign package must fail the install, not build it"
+        );
+        let log = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            log.contains("refusing to install"),
+            "the log must say WHY nothing was built: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn wait_for(watch: &UpdateWatch, want: UpdateEvent) -> bool {
