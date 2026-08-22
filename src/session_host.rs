@@ -110,6 +110,13 @@ pub enum Control {
     /// can attribute the keystrokes it is about to receive and switch to
     /// that participant's caret (docs/MULTIPLAYER.md, attributed carets).
     Typing { id: u64 },
+    /// Host to clients: this host is about to replace its own process image
+    /// with the updated binary on disk (#238). Accepted connections cannot
+    /// ride through the exec, but the listening socket does - so the client
+    /// should reconnect and re-register instead of treating the coming EOF
+    /// as session end. Pre-swap clients skip the unknown variant and keep
+    /// the old behavior (EOF = detach), same tolerance as [`Control::Claim`].
+    HostSwap,
 }
 
 /// One attached client as reported in [`Control::Presence`].
@@ -212,13 +219,14 @@ pub fn presence_path(socket: &Path) -> PathBuf {
     socket.with_file_name(name)
 }
 
-/// Sidecar the host writes when it notices its own binary was replaced on
-/// disk (#238): the serve wrapper outlives every attach by design and cannot
-/// re-exec the way the inner croft does, so after an update it keeps running
-/// the old image — including any session-host fixes the update carried. The
-/// marker lets the inner croft's status bar and `croft ls` say so instead of
-/// leaving the stale host undetectable (2026-08-22: a freshly shipped fix
-/// was resident nowhere until the host was killed by hand).
+/// Sidecar the host writes when it noticed its binary was replaced on disk
+/// but could NOT re-exec into it (#238): the normal path is a live handoff
+/// (see [`swap_to_new_image`]) - the marker is the fallback when the exec
+/// fails or the handoff fds are unavailable, so the host is genuinely stuck
+/// on the old image. It lets the inner croft's status bar and `croft ls`
+/// say so instead of leaving the stale host undetectable (2026-08-22: a
+/// freshly shipped fix was resident nowhere until the host was killed by
+/// hand).
 pub fn stale_marker_path(socket: &Path) -> PathBuf {
     let mut name = socket.file_name().unwrap_or_default().to_os_string();
     name.push(".host-stale");
@@ -235,11 +243,13 @@ fn image_identity(path: &Path) -> Option<(u64, u64)> {
     Some((meta.dev(), meta.ino()))
 }
 
-/// Watch this process's own binary path for replacement; write the stale
-/// marker once when it happens, then stop. Resolved at spawn time — on
-/// Linux `current_exe` reads /proc/self/exe, which is still the real path
-/// here because the watcher starts before any update could land.
-fn spawn_stale_image_watcher(socket: PathBuf) {
+/// Watch this process's own binary path for replacement; when it happens,
+/// re-exec into the updated image carrying the live session along (#238),
+/// falling back to the #241 stale marker if the exec cannot happen. Resolved
+/// at spawn time — on Linux `current_exe` reads /proc/self/exe, which is
+/// still the real path here because the watcher starts before any update
+/// could land.
+fn spawn_stale_image_watcher(host: Arc<Host>, handoff: HandoffFds) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -255,11 +265,233 @@ fn spawn_stale_image_watcher(socket: PathBuf) {
                 continue;
             };
             if now != start {
+                let err = swap_to_new_image(&host, &exe, &handoff);
+                // Reached only when the exec failed: fall back to the
+                // visible marker so the staleness is at least surfaced.
+                let _ = std::fs::write(stale_marker_path(&host.socket), format!("{err:#}"));
+                return;
+            }
+        }
+    });
+}
+
+/// The #241 behavior, kept for hosts that cannot hand their session off
+/// (no raw master fd from the pty backend): watch for replacement and
+/// surface it via the marker only.
+fn spawn_marker_only_watcher(socket: PathBuf) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(start) = image_identity(&exe) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            let Some(now) = image_identity(&exe) else {
+                continue;
+            };
+            if now != start {
                 let _ = std::fs::write(stale_marker_path(&socket), b"");
                 return;
             }
         }
     });
+}
+
+/// Environment contract between a swapping host and its successor image:
+/// the inherited fds/pid ride through `exec` by number, and the token must
+/// survive so the inner croft's CROFT_SESSION_TOKEN still authenticates.
+const RESUME_LISTENER_ENV: &str = "CROFT_SESSION_RESUME_LISTENER";
+const RESUME_MASTER_ENV: &str = "CROFT_SESSION_RESUME_MASTER";
+const RESUME_CHILD_ENV: &str = "CROFT_SESSION_RESUME_CHILD";
+const RESUME_TOKEN_ENV: &str = "CROFT_SESSION_RESUME_TOKEN";
+
+/// The raw handles a serve wrapper must carry across its own exec: the
+/// listening socket (so the address never unbinds and reconnects queue in
+/// the backlog during the swap), the PTY master (so the inner croft never
+/// sees HUP), and the inner child's pid (exec preserves the parent/child
+/// relationship, so the successor can still wait on it).
+struct HandoffFds {
+    listener: std::os::fd::RawFd,
+    master: std::os::fd::RawFd,
+    child_pid: u32,
+}
+
+fn set_cloexec(fd: std::os::fd::RawFd, on: bool) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    anyhow::ensure!(flags != -1, "F_GETFD({fd}) failed");
+    let flags = if on {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags) };
+    anyhow::ensure!(rc != -1, "F_SETFD({fd}) failed");
+    Ok(())
+}
+
+/// Replace this serve wrapper's process image with the updated binary,
+/// keeping the session alive: fds ride through the exec, the successor
+/// adopts them (see [`resume_from`]) instead of binding and spawning anew,
+/// and clients are told to reconnect first - their accepted connections are
+/// the one thing that cannot survive. Returns only on failure.
+fn swap_to_new_image(host: &Host, exe: &Path, handoff: &HandoffFds) -> anyhow::Error {
+    broadcast(host, &encode_control_frame(&Control::HostSwap));
+    // Outboxes are drained by per-client writer threads; give the tiny
+    // frame a beat to flush before exec tears those threads down.
+    std::thread::sleep(Duration::from_millis(300));
+    if let Err(e) =
+        set_cloexec(handoff.listener, false).and_then(|()| set_cloexec(handoff.master, false))
+    {
+        return e;
+    }
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(std::env::args_os().skip(1))
+        .env(RESUME_LISTENER_ENV, handoff.listener.to_string())
+        .env(RESUME_MASTER_ENV, handoff.master.to_string())
+        .env(RESUME_CHILD_ENV, handoff.child_pid.to_string())
+        .env(RESUME_TOKEN_ENV, &host.token);
+    use std::os::unix::process::CommandExt;
+    // exec never returns on success; on failure re-arm CLOEXEC so a later
+    // unrelated spawn cannot leak the session fds.
+    let err = anyhow::Error::from(cmd.exec()).context("exec of updated binary");
+    let _ = set_cloexec(handoff.listener, true);
+    let _ = set_cloexec(handoff.master, true);
+    err
+}
+
+/// A session inherited from a predecessor image (#238).
+struct ResumedSession {
+    listener: std::os::unix::net::UnixListener,
+    master: std::os::fd::RawFd,
+    child_pid: u32,
+    token: String,
+}
+
+/// Adopt a predecessor's session from the resume environment. `Ok(None)`
+/// means a normal fresh start (no resume vars). Present-but-broken vars are
+/// an error, not a fresh start: falling through to bind-and-spawn while a
+/// predecessor's fds may still be open would run two hosts on one session.
+fn resume_from(var: impl Fn(&str) -> Option<String>) -> Result<Option<ResumedSession>> {
+    if var(RESUME_LISTENER_ENV).is_none() {
+        return Ok(None);
+    }
+    let parse_fd = |name: &str| -> Result<std::os::fd::RawFd> {
+        let raw = var(name).with_context(|| format!("resume var {name} missing"))?;
+        let fd: std::os::fd::RawFd = raw
+            .parse()
+            .with_context(|| format!("resume var {name}={raw} is not an fd"))?;
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        anyhow::ensure!(
+            flags != -1,
+            "resume fd {fd} ({name}) did not survive the exec"
+        );
+        Ok(fd)
+    };
+    let listener_fd = parse_fd(RESUME_LISTENER_ENV)?;
+    let master = parse_fd(RESUME_MASTER_ENV)?;
+    let child_pid: u32 = var(RESUME_CHILD_ENV)
+        .context("resume var CROFT_SESSION_RESUME_CHILD missing")?
+        .parse()
+        .context("resume child pid unparseable")?;
+    let token = var(RESUME_TOKEN_ENV).context("resume var CROFT_SESSION_RESUME_TOKEN missing")?;
+    // The fds were inherited without CLOEXEC by necessity; restore it so
+    // they stop leaking into anything this image ever execs.
+    set_cloexec(listener_fd, true)?;
+    set_cloexec(master, true)?;
+    use std::os::fd::FromRawFd;
+    // SAFETY: the fd number came from our predecessor image which owned the
+    // listener and cleared CLOEXEC on it expressly so it survives into this
+    // process; validated live by fcntl above. Nothing else in this process
+    // owns it (we are first: resume is checked before any other fd work).
+    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(listener_fd) };
+    Ok(Some(ResumedSession {
+        listener,
+        master,
+        child_pid,
+        token,
+    }))
+}
+
+/// The one master-side operation the host needs after startup (resize); a
+/// fresh host holds the portable-pty master, a resumed host only the raw
+/// master fd it inherited.
+enum MasterHandle {
+    Spawned(Box<dyn MasterPty + Send>),
+    Adopted(std::os::fd::RawFd),
+}
+
+impl MasterHandle {
+    fn resize(&self, size: PtySize) -> Result<()> {
+        match self {
+            Self::Spawned(master) => master.resize(size),
+            Self::Adopted(fd) => {
+                let ws = libc::winsize {
+                    ws_row: size.rows,
+                    ws_col: size.cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                let rc = unsafe { libc::ioctl(*fd, libc::TIOCSWINSZ, &ws) };
+                anyhow::ensure!(rc == 0, "TIOCSWINSZ({fd}) failed");
+                Ok(())
+            }
+        }
+    }
+
+    fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        match self {
+            Self::Spawned(master) => master.as_raw_fd(),
+            Self::Adopted(fd) => Some(*fd),
+        }
+    }
+}
+
+/// The inner command, waitable from either lifetime: the image that spawned
+/// it (portable-pty child) or a successor image that inherited it (raw pid -
+/// exec preserves the parent/child relationship, so waitpid still works).
+enum ChildHandle {
+    Spawned(Box<dyn portable_pty::Child + Send + Sync>),
+    Adopted(u32),
+}
+
+impl ChildHandle {
+    fn process_id(&self) -> Option<u32> {
+        match self {
+            Self::Spawned(child) => child.process_id(),
+            Self::Adopted(pid) => Some(*pid),
+        }
+    }
+
+    fn wait_code(&mut self) -> Result<i32> {
+        match self {
+            Self::Spawned(child) => Ok(child
+                .wait()
+                .context("waiting on inner command")?
+                .exit_code() as i32),
+            Self::Adopted(pid) => {
+                let pid = *pid as libc::pid_t;
+                loop {
+                    let mut status: libc::c_int = 0;
+                    let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+                    if rc == -1 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        anyhow::bail!("waitpid({pid}): {err}");
+                    }
+                    if libc::WIFEXITED(status) {
+                        return Ok(libc::WEXITSTATUS(status));
+                    }
+                    if libc::WIFSIGNALED(status) {
+                        return Ok(128 + libc::WTERMSIG(status));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// How many bytes of undelivered output one client may accumulate before it
@@ -435,7 +667,7 @@ struct Host {
     clients: Mutex<Vec<Client>>,
     next_id: AtomicU64,
     pty_input: Mutex<Box<dyn Write + Send>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    master: Mutex<MasterHandle>,
     last_size: Mutex<(u16, u16)>,
     socket: PathBuf,
     /// Shared secret for the inner croft's privileged control channel,
@@ -489,6 +721,13 @@ pub(crate) fn serve_with_token(
         !inner.is_empty(),
         "session-host needs an inner command after --"
     );
+    // A successor image after a host swap (#238): adopt the predecessor's
+    // listener, PTY master, and inner child instead of binding and spawning.
+    // The random token generated for this process is discarded in favor of
+    // the inherited one, which the running inner croft still holds.
+    if let Some(resumed) = resume_from(|name| std::env::var(name).ok())? {
+        return run_resumed(socket, resumed);
+    }
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -512,10 +751,8 @@ pub(crate) fn serve_with_token(
         crate::session::write_meta_preserving_created(socket, ws)?;
     }
     // A fresh host runs the binary currently on disk; any stale marker left
-    // by a predecessor is obsolete.
+    // by a predecessor is obsolete the moment the socket answers.
     let _ = std::fs::remove_file(stale_marker_path(socket));
-    spawn_stale_image_watcher(socket.to_path_buf());
-
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -543,27 +780,101 @@ pub(crate) fn serve_with_token(
         collab_socket_for_mux(socket).as_os_str(),
     );
     cmd.env("CROFT_COLLAB_ROLE", "owner");
-    let mut child = pair
+    let child = pair
         .slave
         .spawn_command(cmd)
         .context("spawning inner command")?;
     drop(pair.slave);
-    let mut reader = pair
+    let reader = pair
         .master
         .try_clone_reader()
         .context("cloning pty reader")?;
     let writer = pair.master.take_writer().context("taking pty writer")?;
+    run_host(
+        socket,
+        token,
+        listener,
+        Box::new(reader),
+        writer,
+        MasterHandle::Spawned(pair.master),
+        ChildHandle::Spawned(child),
+    )
+}
+
+/// Adopt a predecessor image's live session (#238): same socket (the fd
+/// never unbound), same PTY, same inner child - only the host process is
+/// new. Clients were told to reconnect; their re-Hellos rebuild the roster,
+/// so the predecessor's presence sidecar and stale marker are dropped as
+/// obsolete.
+fn run_resumed(socket: &Path, resumed: ResumedSession) -> Result<i32> {
+    let _ = std::fs::remove_file(presence_path(socket));
+    let _ = std::fs::remove_file(stale_marker_path(socket));
+    // Reader and writer are independent dups so each side owns its fd, same
+    // shape as the fresh path's clone_reader/take_writer.
+    let dup = |fd: std::os::fd::RawFd| -> Result<std::fs::File> {
+        let d = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        anyhow::ensure!(d != -1, "dup of inherited master fd {fd} failed");
+        use std::os::fd::FromRawFd;
+        // SAFETY: freshly dup'd above, owned by nothing else.
+        Ok(unsafe { std::fs::File::from_raw_fd(d) })
+    };
+    let reader = dup(resumed.master)?;
+    let writer = dup(resumed.master)?;
+    run_host(
+        socket,
+        &resumed.token,
+        resumed.listener,
+        Box::new(reader),
+        Box::new(writer),
+        MasterHandle::Adopted(resumed.master),
+        ChildHandle::Adopted(resumed.child_pid),
+    )
+}
+
+/// The host proper, agnostic of how its session came to be (freshly
+/// spawned or adopted across a self-exec): pump PTY output to clients,
+/// accept clients, arbitrate input, and wait on the inner command.
+fn run_host(
+    socket: &Path,
+    token: &str,
+    listener: std::os::unix::net::UnixListener,
+    mut reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    master: MasterHandle,
+    mut child: ChildHandle,
+) -> Result<i32> {
     let host = Arc::new(Host {
         clients: Mutex::new(Vec::new()),
         next_id: AtomicU64::new(0),
         pty_input: Mutex::new(writer),
-        master: Mutex::new(pair.master),
+        master: Mutex::new(master),
         last_size: Mutex::new((80, 24)),
         socket: socket.to_path_buf(),
         token: token.to_string(),
         privileged: Mutex::new(Vec::new()),
         last_writer: Mutex::new(None),
     });
+    // Everything a successor image needs if THIS image is replaced on disk
+    // in turn. Missing pieces (no master fd on some pty backend) fall back
+    // to marker-only staleness reporting inside the watcher.
+    {
+        use std::os::fd::AsRawFd;
+        let handoff = host
+            .master
+            .lock()
+            .unwrap()
+            .as_raw_fd()
+            .zip(child.process_id())
+            .map(|(master_fd, child_pid)| HandoffFds {
+                listener: listener.as_raw_fd(),
+                master: master_fd,
+                child_pid,
+            });
+        match handoff {
+            Some(handoff) => spawn_stale_image_watcher(Arc::clone(&host), handoff),
+            None => spawn_marker_only_watcher(socket.to_path_buf()),
+        }
+    }
 
     // PTY output -> every client, verbatim (byte-transparent broadcast).
     {
@@ -593,8 +904,7 @@ pub(crate) fn serve_with_token(
         });
     }
 
-    let status = child.wait().context("waiting on inner command")?;
-    let code = status.exit_code() as i32;
+    let code = child.wait_code()?;
     broadcast(&host, &encode_control_frame(&Control::Exit { code }));
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(presence_path(socket));
@@ -1025,6 +1335,10 @@ pub fn attach_or_create(socket: &Path, workspace: Option<&Path>, inner: &[String
             PumpOutcome::RestartRequested => {
                 kill_stale_server(socket);
             }
+            // attach_client resolves swap handovers internally and returns
+            // Exit when reconnection is exhausted; this arm is exhaustiveness
+            // only.
+            PumpOutcome::HostSwapped => return Ok(0),
         }
     }
 }
@@ -1135,9 +1449,14 @@ fn spawn_detached_server(socket: &Path, workspace: Option<&Path>, inner: &[Strin
 /// and passes through as bytes, exactly as under dtach.
 /// How one attach ended: the session finished (or the client detached),
 /// or the user chose to restart a version-skewed session (#53).
+#[derive(Debug)]
 pub enum PumpOutcome {
     Exit(i32),
     RestartRequested,
+    /// The host announced a self-exec into an updated binary (#238): the
+    /// connection is about to drop while the socket stays bound. Internal
+    /// to the attach loop, which reconnects; callers never see it.
+    HostSwapped,
 }
 
 /// How long the client waits for [`Control::ServerHello`] after its Hello.
@@ -1190,14 +1509,55 @@ pub fn attach_client(socket: &Path) -> Result<PumpOutcome> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connecting to {}", socket.display()))?;
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
-    let result = attach_client_pump(&mut stream);
+    let result = attach_client_loop(socket, &mut stream);
     let _ = crossterm::terminal::disable_raw_mode();
     result
 }
 
-fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+/// Pump the attach, reconnecting across host swaps (#238): a HostSwap frame
+/// means the host is re-execing into the updated binary and the socket
+/// stays bound, so the EOF that follows is a handover, not a session end.
+/// The stdin/resize forwarders are spawned once (first pump) and write
+/// through a shared handle that reconnection re-points at the new stream.
+fn attach_client_loop(socket: &Path, stream: &mut UnixStream) -> Result<PumpOutcome> {
     let tx = Arc::new(Mutex::new(stream.try_clone().context("cloning socket")?));
+    let mut first_attach = true;
+    loop {
+        match attach_client_pump(stream, &tx, first_attach)? {
+            PumpOutcome::HostSwapped => {
+                let Some(fresh) = reconnect_after_swap(socket) else {
+                    // The successor never came up: from here the session is
+                    // as gone as a killed server, which is an Exit(0) detach.
+                    return Ok(PumpOutcome::Exit(0));
+                };
+                *tx.lock().unwrap() = fresh.try_clone().context("cloning socket")?;
+                *stream = fresh;
+                first_attach = false;
+            }
+            outcome => return Ok(outcome),
+        }
+    }
+}
+
+/// The successor host inherits the bound socket fd, so a live handover
+/// answers within milliseconds - the window covers exec + adopt, not a
+/// rebind; connect attempts during the gap queue in the listener backlog.
+fn reconnect_after_swap(socket: &Path) -> Option<UnixStream> {
+    for _ in 0..25 {
+        std::thread::sleep(Duration::from_millis(200));
+        if let Ok(stream) = UnixStream::connect(socket) {
+            return Some(stream);
+        }
+    }
+    None
+}
+
+fn attach_client_pump(
+    stream: &mut UnixStream,
+    tx: &Arc<Mutex<UnixStream>>,
+    first_attach: bool,
+) -> Result<PumpOutcome> {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     tx.lock()
         .unwrap()
         .write_all(&encode_control_frame(&Control::Hello {
@@ -1224,9 +1584,10 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
             if remaining.is_zero() {
                 break;
             }
-            stream
-                .set_read_timeout(Some(remaining))
-                .context("setting read timeout")?;
+            // Best-effort for the same reason as the clear below: Darwin
+            // EINVALs setsockopt once the peer closed. Buffered frames and
+            // the EOF still arrive through read().
+            let _ = stream.set_read_timeout(Some(remaining));
             match stream.read(&mut buf) {
                 Ok(0) => return Ok(PumpOutcome::Exit(0)),
                 Ok(n) => {
@@ -1237,6 +1598,13 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
                             }
                             Frame::Control(Control::Exit { code }) => {
                                 return Ok(PumpOutcome::Exit(code));
+                            }
+                            // A swap can race an attach: coalesced with the
+                            // ServerHello in one read, the HostSwap would
+                            // fall to the catch-all and the following EOF
+                            // would read as session end.
+                            Frame::Control(Control::HostSwap) => {
+                                return Ok(PumpOutcome::HostSwapped);
                             }
                             Frame::Bytes(bytes) => pending.push(bytes),
                             _ => {}
@@ -1254,12 +1622,29 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
                 Err(_) => return Ok(PumpOutcome::Exit(0)),
             }
         }
-        stream
-            .set_read_timeout(None)
-            .context("clearing read timeout")?;
+        // Best-effort: Darwin refuses setsockopt (EINVAL) once the peer
+        // has closed - which is exactly the state a host swap (#238) leaves
+        // this socket in when the HostSwap frame raced the version phase.
+        // Any buffered frames still drain below; a timeout left armed is
+        // handled by the read loop tolerating WouldBlock.
+        let _ = stream.set_read_timeout(None);
     }
     let client_version = env!("CARGO_PKG_VERSION");
-    if server_version.as_deref() != Some(client_version) {
+    if server_version.as_deref() != Some(client_version) && !first_attach {
+        // Reconnected across a host swap: the server is now NEWER than this
+        // still-running attach client. A one-line notice, not the
+        // interactive banner - parking a live handover on a keypress would
+        // freeze the session for a formality.
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(
+            format!(
+                "\r\nsession host updated to croft {}; detach and reattach to update this client\r\n",
+                server_version.as_deref().unwrap_or("?")
+            )
+            .as_bytes(),
+        );
+        let _ = out.flush();
+    } else if server_version.as_deref() != Some(client_version) {
         let mut out = std::io::stdout().lock();
         out.write_all(mismatch_banner(server_version.as_deref(), client_version).as_bytes())
             .context("writing banner")?;
@@ -1296,8 +1681,11 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
 
     // stdin -> socket. The thread parks on a blocking read; it dies with the
     // process when the session ends (the CLI exits right after we return).
-    {
-        let tx = Arc::clone(&tx);
+    // Spawned once: on a swap reconnect (#238) the shared handle is
+    // re-pointed at the new stream, and a second forwarder would race the
+    // first for stdin bytes.
+    if first_attach {
+        let tx = Arc::clone(tx);
         std::thread::spawn(move || {
             let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; 16384];
@@ -1311,14 +1699,12 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
                         break;
                     }
                     Ok(n) => {
-                        if tx
-                            .lock()
-                            .unwrap()
-                            .write_all(&encode_bytes_frame(&buf[..n]))
-                            .is_err()
-                        {
-                            break;
-                        }
+                        // A write error is not fatal: mid-swap the socket is
+                        // dead only for the beat the successor host takes to
+                        // adopt, and the handle is re-pointed on reconnect.
+                        // The dropped bytes are what any dead transport
+                        // would lose.
+                        let _ = tx.lock().unwrap().write_all(&encode_bytes_frame(&buf[..n]));
                     }
                 }
             }
@@ -1329,8 +1715,8 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
     // handler keeps the client free of signal plumbing; the delay is
     // imperceptible against the terminal's own resize animation.
     // ponytail: poll, swap for signal_hook if 200ms ever reads as lag.
-    {
-        let tx = Arc::clone(&tx);
+    if first_attach {
+        let tx = Arc::clone(tx);
         let mut last = (cols, rows);
         std::thread::spawn(move || {
             loop {
@@ -1344,9 +1730,10 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
                         cols: size.0,
                         rows: size.1,
                     });
-                    if tx.lock().unwrap().write_all(&frame).is_err() {
-                        break;
-                    }
+                    // Swap-tolerant like the stdin forwarder: the handle is
+                    // re-pointed on reconnect, and the next size change
+                    // resends through it.
+                    let _ = tx.lock().unwrap().write_all(&frame);
                 }
             }
         });
@@ -1364,8 +1751,20 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
     let mut buf = [0u8; 65536];
     loop {
         let n = match stream.read(&mut buf) {
-            Ok(0) | Err(_) => return Ok(PumpOutcome::Exit(0)),
+            Ok(0) => return Ok(PumpOutcome::Exit(0)),
             Ok(n) => n,
+            // A read timeout can survive the version phase when clearing it
+            // failed (see above): an expiry on a quiet session is "nothing
+            // yet", never "session over".
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => return Ok(PumpOutcome::Exit(0)),
         };
         for frame in reader.push(&buf[..n]) {
             match frame {
@@ -1374,6 +1773,9 @@ fn attach_client_pump(stream: &mut UnixStream) -> Result<PumpOutcome> {
                     out.flush().context("flushing terminal")?;
                 }
                 Frame::Control(Control::Exit { code }) => return Ok(PumpOutcome::Exit(code)),
+                // The host is re-execing into an updated binary (#238): the
+                // EOF about to follow is a handover, not the session ending.
+                Frame::Control(Control::HostSwap) => return Ok(PumpOutcome::HostSwapped),
                 // Alone on a roster with no control holder = the #234
                 // lockout (observed live 2026-08-22: one attached
                 // participant, control false, and no way to type). Claim
@@ -1405,6 +1807,10 @@ pub struct InnerChannel {
     stream: UnixStream,
     /// Decoder for host frames (typing attribution) on this channel.
     reader: FrameReader,
+    /// The stream reported EOF or a fatal error: the host this channel
+    /// authenticated to is gone (killed, or swapped to a successor image,
+    /// #238). The app revives a dead channel by connecting again.
+    dead: bool,
     /// The presence sidecar this session's host maintains.
     pub presence: PathBuf,
     /// The host's stale-image marker (#238): present once the host noticed
@@ -1445,6 +1851,7 @@ impl InnerChannel {
         Some(Self {
             stream,
             reader: FrameReader::new(),
+            dead: false,
             presence: presence_path(socket),
             stale_marker: stale_marker_path(socket),
         })
@@ -1460,7 +1867,12 @@ impl InnerChannel {
         let mut buf = [0u8; 4096];
         loop {
             match self.stream.read(&mut buf) {
-                Ok(0) => break,
+                // EOF on a non-blocking socket means the peer closed: the
+                // host died or swapped to a successor image (#238).
+                Ok(0) => {
+                    self.dead = true;
+                    break;
+                }
                 Ok(n) => {
                     for frame in self.reader.push(&buf[..n]) {
                         if let Frame::Control(Control::Typing { id }) = frame
@@ -1470,10 +1882,22 @@ impl InnerChannel {
                         }
                     }
                 }
-                Err(_) => break,
+                // WouldBlock is the normal "nothing waiting" case; anything
+                // else is the connection failing under us.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    self.dead = true;
+                    break;
+                }
             }
         }
         typists
+    }
+
+    /// True once the host side of this channel is gone; the connection never
+    /// recovers by itself, so the owner should connect a fresh channel.
+    pub fn is_dead(&self) -> bool {
+        self.dead
     }
 
     pub fn set_control(&mut self, id: u64, grant: bool) -> bool {
@@ -1482,14 +1906,18 @@ impl InnerChannel {
         } else {
             Control::Revoke { id }
         };
-        write_frame_blocking(&mut self.stream, &encode_control_frame(&control))
+        let ok = write_frame_blocking(&mut self.stream, &encode_control_frame(&control));
+        self.dead |= !ok;
+        ok
     }
 
     pub fn kick(&mut self, id: u64) -> bool {
-        write_frame_blocking(
+        let ok = write_frame_blocking(
             &mut self.stream,
             &encode_control_frame(&Control::Kick { id }),
-        )
+        );
+        self.dead |= !ok;
+        ok
     }
 }
 
@@ -2614,6 +3042,167 @@ mod tests {
 
     /// A raw connection that authenticates as the inner croft's privileged
     /// control channel (no Hello, so it never becomes a participant).
+    // A successor image adopting a predecessor's session (#238): the resume
+    // plumbing must yield a fully working host over inherited raw fds - PTY
+    // pump, roster, input arbitration, winsize via the raw-fd ioctl path,
+    // and waitpid on an inner child this image never spawned.
+    #[test]
+    fn a_resumed_host_serves_the_inherited_session() {
+        use std::os::fd::IntoRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("r.mux.sock");
+        // Stand in for the predecessor image: spawn the inner command on a
+        // real PTY and bind the socket, then strip everything down to the
+        // raw fds/pid that actually ride through an exec.
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("cat"))
+            .unwrap();
+        drop(pair.slave);
+        let master_fd = pair.master.as_raw_fd().expect("master fd");
+        let child_pid = child.process_id().expect("child pid");
+        // The predecessor never drops its handles across the exec.
+        std::mem::forget(pair.master);
+        std::mem::forget(child);
+        let listener_fd = crate::session::bind_socket_0600(&socket)
+            .unwrap()
+            .into_raw_fd();
+
+        let resumed = resume_from(|name| {
+            [
+                (RESUME_LISTENER_ENV, listener_fd.to_string()),
+                (RESUME_MASTER_ENV, master_fd.to_string()),
+                (RESUME_CHILD_ENV, child_pid.to_string()),
+                (RESUME_TOKEN_ENV, String::from(TEST_TOKEN)),
+            ]
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.clone())
+        })
+        .expect("resume vars must parse")
+        .expect("resume vars are present");
+
+        let sock = socket.clone();
+        let server = std::thread::spawn(move || run_resumed(&sock, resumed).expect("resumed host"));
+        wait_alive(&socket);
+
+        let mut a = TestClient::connect(&socket, "owner", 120, 40);
+        let frames = a.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let ps = roster(&frames).unwrap();
+        assert!(
+            ps[0].control,
+            "the roster restarts empty after a swap, so the first re-Hello takes control"
+        );
+        // Input reaches the adopted PTY and its echo comes back.
+        a.send(&encode_bytes_frame(b"PING\n"));
+        a.read_until(|f| matches!(f, Frame::Bytes(b) if b.windows(4).any(|w| w == b"PING")));
+        // Resize travels the raw-fd ioctl path (fresh hosts use portable-pty).
+        a.send(&encode_control_frame(&Control::Resize {
+            cols: 100,
+            rows: 30,
+        }));
+
+        // The child predates this "image"; waitpid must still own its exit.
+        unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGTERM) };
+        let frames = a.read_until(|f| matches!(f, Frame::Control(Control::Exit { .. })));
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, Frame::Control(Control::Exit { code: 143 }))),
+            "SIGTERM on the inner child must surface as exit 143 to clients"
+        );
+        assert_eq!(server.join().unwrap(), 143);
+    }
+
+    // Resume vars: absent = fresh start; present-but-broken = hard error,
+    // because falling through to bind-and-spawn beside a predecessor's
+    // still-open fds would run two hosts on one session.
+    #[test]
+    fn resume_vars_absent_start_fresh_and_broken_vars_refuse() {
+        assert!(resume_from(|_| None).unwrap().is_none());
+        let only_listener =
+            |v: &'static str| move |n: &str| (n == RESUME_LISTENER_ENV).then(|| String::from(v));
+        assert!(
+            resume_from(only_listener("notanfd")).is_err(),
+            "an unparseable fd must refuse, not fresh-start"
+        );
+        assert!(
+            resume_from(only_listener("999999")).is_err(),
+            "an fd that did not survive the exec must refuse"
+        );
+    }
+
+    // The attach side of a host swap (#238): HostSwap followed by EOF must
+    // reconnect and re-Hello on the same socket, not exit; the session ends
+    // only on the successor's Exit frame.
+    #[test]
+    fn attach_reconnects_across_a_host_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("swap.mux.sock");
+        let listener = crate::session::bind_socket_0600(&socket).unwrap();
+        let re_helloed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&re_helloed);
+        let version = || String::from(env!("CARGO_PKG_VERSION"));
+        let server = std::thread::spawn(move || {
+            let read_hello = |stream: &mut UnixStream| -> bool {
+                let mut reader = FrameReader::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        return false;
+                    }
+                    for f in reader.push(&buf[..n]) {
+                        if matches!(f, Frame::Control(Control::Hello { .. })) {
+                            return true;
+                        }
+                    }
+                }
+            };
+            let (mut c1, _) = listener.accept().unwrap();
+            assert!(read_hello(&mut c1), "first attach must Hello");
+            c1.write_all(&encode_control_frame(&Control::ServerHello {
+                version: version(),
+            }))
+            .unwrap();
+            c1.write_all(&encode_bytes_frame(b"BEFORE")).unwrap();
+            c1.write_all(&encode_control_frame(&Control::HostSwap))
+                .unwrap();
+            // The exec: this connection dies, the socket stays bound.
+            drop(c1);
+            let (mut c2, _) = listener.accept().unwrap();
+            if read_hello(&mut c2) {
+                seen.store(true, Ordering::SeqCst);
+            }
+            c2.write_all(&encode_control_frame(&Control::ServerHello {
+                version: version(),
+            }))
+            .unwrap();
+            c2.write_all(&encode_bytes_frame(b"AFTER")).unwrap();
+            c2.write_all(&encode_control_frame(&Control::Exit { code: 7 }))
+                .unwrap();
+        });
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        let outcome = attach_client_loop(&socket, &mut stream).expect("attach loop");
+        assert!(
+            matches!(outcome, PumpOutcome::Exit(7)),
+            "the session must end on the SUCCESSOR's Exit, got {outcome:?}"
+        );
+        server.join().unwrap();
+        assert!(
+            re_helloed.load(Ordering::SeqCst),
+            "the client must re-register after the swap"
+        );
+    }
+
     fn connect_inner(socket: &Path, token: &str) -> UnixStream {
         let mut stream = UnixStream::connect(socket).expect("connect inner");
         stream
