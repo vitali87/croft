@@ -28637,6 +28637,13 @@ fn drift_hint_arms_f9_only_while_idle() {
     );
     app.local_drift = Some(String::from("def456"));
     assert!(app.f9_update_armed(), "an armed drift hint claims F9");
+    app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[]));
+    assert!(
+        !app.f9_update_armed(),
+        "a spawned install must latch F9 even before its InProgress event \
+         is drained - two F9s in one input batch must not double-spawn"
+    );
+    app.self_install = None;
     app.update_status = UpdateStatus::InProgress;
     assert!(
         !app.f9_update_armed(),
@@ -28719,8 +28726,9 @@ fn a_failed_reinstall_rearms_the_drift_hint_for_retry() {
     assert!(app.poll_update_watch());
     assert_eq!(app.update_status, UpdateStatus::Idle);
     assert!(
-        app.status.contains("self-install.log"),
-        "a failure must say where the build log is: {:?}",
+        app.status
+            .contains(&format!("self-install-{}.log", std::process::id())),
+        "a failure must say where THIS process's build log is: {:?}",
         app.status
     );
     assert!(
