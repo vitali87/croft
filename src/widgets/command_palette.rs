@@ -138,6 +138,8 @@ pub enum Command {
     KeyboardShortcuts,
     OpenSettings,
     OpenSettingsJson,
+    OpenWorkspaceSettingsJson,
+    OpenWorkspaceSettingsLocalJson,
     OpenKeybindingsJson,
     ConfigureSnippets,
     OpenTriggersJson,
@@ -290,6 +292,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::KeyboardShortcuts,
     Command::OpenSettings,
     Command::OpenSettingsJson,
+    Command::OpenWorkspaceSettingsJson,
+    Command::OpenWorkspaceSettingsLocalJson,
     Command::OpenKeybindingsJson,
     Command::ConfigureSnippets,
     Command::OpenTriggersJson,
@@ -425,6 +429,10 @@ impl Command {
             Command::KeyboardShortcuts => "Help: Keyboard Shortcuts Reference",
             Command::OpenSettings => "Preferences: Open Settings",
             Command::OpenSettingsJson => "Preferences: Open Settings (JSON)",
+            Command::OpenWorkspaceSettingsJson => "Preferences: Open Workspace Settings (JSON)",
+            Command::OpenWorkspaceSettingsLocalJson => {
+                "Preferences: Open Workspace Settings — Local (JSON)"
+            }
             Command::OpenKeybindingsJson => "Preferences: Open Keyboard Shortcuts (JSON)",
             Command::ConfigureSnippets => "Preferences: Configure User Snippets",
             Command::OpenTriggersJson => "Preferences: Open Terminal Triggers (JSON)",
@@ -564,6 +572,8 @@ impl Command {
             // Cmd+, -> open_settings as the example).
             Command::OpenSettings => "",
             Command::OpenSettingsJson => "",
+            Command::OpenWorkspaceSettingsJson => "",
+            Command::OpenWorkspaceSettingsLocalJson => "",
             Command::OpenKeybindingsJson => "",
             Command::ConfigureSnippets => "",
             Command::OpenTriggersJson => "",
@@ -700,6 +710,8 @@ impl Command {
             Command::KeyboardShortcuts => "keyboard_shortcuts",
             Command::OpenSettings => "open_settings",
             Command::OpenSettingsJson => "open_settings_json",
+            Command::OpenWorkspaceSettingsJson => "open_workspace_settings_json",
+            Command::OpenWorkspaceSettingsLocalJson => "open_workspace_settings_local_json",
             Command::OpenKeybindingsJson => "open_keybindings_json",
             Command::ConfigureSnippets => "configure_snippets",
             Command::OpenTriggersJson => "open_triggers_json",
