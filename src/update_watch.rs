@@ -242,6 +242,16 @@ fn prune_old_install_logs(dir: &std::path::Path, keep: &std::path::Path) {
     }
 }
 
+/// The `cargo install` invocation for the self-install, with cargo resolved
+/// to an absolute path: a GUI-launched croft inherits launchd's stripped
+/// `PATH`, where spawning a bare `cargo` fails with "No such file or
+/// directory" even though a terminal launch finds it.
+fn self_install_command(manifest_dir: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(crate::widgets::dependencies::cargo_binary());
+    cmd.args(["install", "--path", manifest_dir, "--locked"]);
+    cmd
+}
+
 /// A background `cargo install --path <repo> --locked` reinstalling the
 /// local croft, reported through the same [`UpdateEvent`] lifecycle the
 /// remote watcher uses so the app consumes both with one state machine:
@@ -292,9 +302,7 @@ impl SelfInstall {
                 let _ = tx.send(UpdateEvent::Failed);
                 return;
             }
-            let result = std::process::Command::new("cargo")
-                .args(["install", "--path", &manifest_dir, "--locked"])
-                .output();
+            let result = self_install_command(&manifest_dir).output();
             let event = match result {
                 Ok(out) => {
                     let mut log = out.stdout;
@@ -419,6 +427,20 @@ mod tests {
             "package/name lines inside a multiline string must not vouch for the package"
         );
         assert!(manifest_declares_package(multiline_trap, "foreign"));
+    }
+
+    #[test]
+    fn self_install_resolves_cargo_by_absolute_path() {
+        let cmd = self_install_command("/some/repo");
+        assert_eq!(
+            PathBuf::from(cmd.get_program()),
+            crate::widgets::dependencies::cargo_binary(),
+            "a GUI-launched croft inherits launchd's stripped PATH, so the \
+             self-install must resolve cargo the same way the dependencies \
+             widget does instead of spawning a bare `cargo`"
+        );
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_os_string()).collect();
+        assert_eq!(args, ["install", "--path", "/some/repo", "--locked"]);
     }
 
     #[test]
