@@ -3250,7 +3250,10 @@ fn clicking_the_position_readout_does_not_open_problems() {
     use ratatui::{Terminal, backend::TestBackend};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let mut term = Terminal::new(TestBackend::new(50, 20)).unwrap();
+    // 56 cols: the right cluster (51 cells with its │ dividers) fits, but its
+    // left edge still lands inside the diagnostics cluster, so the clip below
+    // is exercised.
+    let mut term = Terminal::new(TestBackend::new(56, 20)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
 
     // Find the status row and the column where the position readout paints.
@@ -27922,10 +27925,11 @@ fn status_elision_never_fires_on_a_message_that_fits() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     app.status = String::from("Quick select: type a label to copy, UPPERCASE pastes, Esc cancels");
-    // 150 cols: prefix (with the branch segment) + message + right cluster
-    // total 149, so the message fits and must paint verbatim — elision may
-    // only fire when the arithmetic says the message truly cannot fit.
-    let backend = ratatui::backend::TestBackend::new(150, 40);
+    // 153 cols: prefix (with the branch segment and zone dividers) + message
+    // + right cluster (with its │ seams) total 152, so the message fits and
+    // must paint verbatim — elision may only fire when the arithmetic says
+    // the message truly cannot fit.
+    let backend = ratatui::backend::TestBackend::new(153, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let buf = term.backend().buffer().clone();
@@ -27933,8 +27937,11 @@ fn status_elision_never_fires_on_a_message_that_fits() {
     let last_row: String = (a.x..a.x + a.width)
         .map(|x| buf[(x, a.y + a.height - 1)].symbol().to_string())
         .collect();
+    // The WHOLE message must be present: middle-elision keeps both ends, so a
+    // substring from one end would pass even after a regression elided the
+    // other.
     assert!(
-        last_row.contains("type a label to copy"),
+        last_row.contains(app.status.as_str()),
         "a transient that fits beside the right cluster must paint verbatim, \
          not elide; the bar showed: {last_row:?}"
     );
@@ -28809,4 +28816,160 @@ fn opening_workspace_local_settings_gitignores_it_first() {
     assert_eq!(app.editor.path.as_deref(), Some(local.as_path()));
     let seeded = std::fs::read_to_string(&local).unwrap();
     assert!(seeded.contains("settings overlay"), "{seeded}");
+}
+
+#[test]
+fn finished_settles_pending_matches_pane_and_command() {
+    assert!(finished_settles_pending(
+        7,
+        " cargo build\n",
+        7,
+        "cargo build"
+    ));
+    assert!(
+        !finished_settles_pending(8, "cargo build", 7, "cargo build"),
+        "wrong pane"
+    );
+    assert!(
+        !finished_settles_pending(7, "cargo test", 7, "cargo build"),
+        "different command"
+    );
+}
+
+#[test]
+fn lldb_program_resolves_against_the_session_cwd_not_crofts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir_all(cwd.join("target/debug")).unwrap();
+    std::fs::write(cwd.join("target/debug/app"), b"bin").unwrap();
+    let resolved = resolve_lldb_program("target/debug/app", &cwd).expect("exists under cwd");
+    assert_eq!(resolved, cwd.join("target/debug/app"));
+    assert!(resolved.is_absolute());
+    // A missing relative program errors with the RESOLVED path, so the
+    // message says where croft actually looked.
+    let err = resolve_lldb_program("target/release/app", &cwd).unwrap_err();
+    assert!(
+        err.contains(&cwd.join("target/release/app").display().to_string()),
+        "{err}"
+    );
+    // Absolute programs are taken as written.
+    let abs = cwd.join("target/debug/app");
+    let abs_str = abs.to_string_lossy().into_owned();
+    assert_eq!(
+        resolve_lldb_program(&abs_str, Path::new("/somewhere/else")).unwrap(),
+        abs
+    );
+}
+
+#[test]
+fn a_parked_launch_aborts_when_its_pane_dies_or_never_reports_a_mark() {
+    use std::time::Duration;
+    let quick = Duration::from_secs(1);
+    let over = PRELAUNCH_MARK_GRACE + Duration::from_secs(1);
+    assert!(
+        pending_abort_reason(false, false, quick).is_some(),
+        "a closed pane aborts immediately"
+    );
+    assert_eq!(
+        pending_abort_reason(true, false, over),
+        None,
+        "a busy pane (long build) waits indefinitely"
+    );
+    assert_eq!(
+        pending_abort_reason(true, true, quick),
+        None,
+        "an idle pane inside the grace window keeps waiting for the mark"
+    );
+    assert!(
+        pending_abort_reason(true, true, over).is_some(),
+        "idle past the grace with no mark = shell integration never reported; abort"
+    );
+}
+
+#[test]
+fn debug_config_picker_lists_configs_and_selection_drives_f5() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "API", "type": "python", "request": "launch", "program": "api.py" },
+            { "name": "Gopher", "type": "go", "program": "main.go" }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_debug_config_picker();
+    let picker = app.list_picker.as_ref().expect("picker open");
+    assert_eq!(picker.rows.len(), 3, "zero-config entry + the two configs");
+    assert!(picker.rows[0].label.contains("active file"));
+    assert!(picker.rows[1].label.contains("API"));
+
+    // Confirming a config remembers it as the F5 target. The unsupported
+    // type must surface a named error, not vanish from the picker silently.
+    app.list_picker.as_mut().unwrap().selected = 2;
+    app.confirm_list_picker();
+    assert_eq!(app.selected_debug_config.as_deref(), Some("Gopher"));
+    assert!(
+        app.run_debug.feedback_is_error,
+        "unsupported type is an error: {:?}",
+        app.run_debug.feedback
+    );
+    assert!(
+        app.status.contains("unsupported type \"go\""),
+        "{}",
+        app.status
+    );
+
+    // The zero-config entry clears the selection.
+    app.open_debug_config_picker();
+    app.list_picker.as_mut().unwrap().selected = 0;
+    app.confirm_list_picker();
+    assert_eq!(app.selected_debug_config, None);
+}
+
+#[test]
+fn missing_pre_launch_task_and_stale_selection_error_loudly() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"[ { "name": "Built", "type": "lldb", "program": "/nope/bin", "preLaunchTask": "make everything" } ]"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_debug_config_picker();
+    app.list_picker.as_mut().unwrap().selected = 1;
+    app.confirm_list_picker();
+    assert!(
+        app.status
+            .contains("preLaunchTask \"make everything\" not found"),
+        "{}",
+        app.status
+    );
+    assert!(
+        app.pending_debug_launch.is_none(),
+        "nothing parked on error"
+    );
+
+    // A selection whose config was deleted falls back to zero-config.
+    app.selected_debug_config = Some(String::from("Deleted"));
+    app.start_selected_debug();
+    assert_eq!(app.selected_debug_config, None, "stale selection cleared");
+}
+
+#[test]
+fn refresh_run_debug_syncs_the_config_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"[ { "name": "One", "type": "python", "program": "a.py" } ]"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.selected_debug_config = Some(String::from("One"));
+    app.refresh_run_debug();
+    assert_eq!(app.run_debug.config_count, 1);
+    assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
 }
