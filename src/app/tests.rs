@@ -27937,8 +27937,11 @@ fn status_elision_never_fires_on_a_message_that_fits() {
     let last_row: String = (a.x..a.x + a.width)
         .map(|x| buf[(x, a.y + a.height - 1)].symbol().to_string())
         .collect();
+    // The WHOLE message must be present: middle-elision keeps both ends, so a
+    // substring from one end would pass even after a regression elided the
+    // other.
     assert!(
-        last_row.contains("type a label to copy"),
+        last_row.contains(app.status.as_str()),
         "a transient that fits beside the right cluster must paint verbatim, \
          not elide; the bar showed: {last_row:?}"
     );

@@ -12787,14 +12787,17 @@ impl App {
         let diag_start_col: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
         // One cell between the counts, not three: the errors and warnings
         // read as a single health cluster (they already share one hit rect).
-        let diag_text = format!(" \u{ea87} {err_count} \u{ea6c} {warn_count} ");
-        let diag_len = diag_text.chars().count() as u16;
+        // diag_len is measured from the very strings that render, so the hit
+        // rect can never drift from the visible text.
+        let err_text = format!(" \u{ea87} {err_count}");
+        let warn_text = format!(" \u{ea6c} {warn_count} ");
+        let diag_len = (err_text.chars().count() + warn_text.chars().count()) as u16;
         spans.push(Span::styled(
-            format!(" \u{ea87} {err_count}"),
+            err_text,
             Style::default().fg(self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))),
         ));
         spans.push(Span::styled(
-            format!(" \u{ea6c} {warn_count} "),
+            warn_text,
             Style::default().fg(self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00))),
         ));
         // Transient status message (e.g. "Saved editor.rs"), no keybinding
