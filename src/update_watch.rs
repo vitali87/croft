@@ -247,7 +247,13 @@ fn prune_old_install_logs(dir: &std::path::Path, keep: &std::path::Path) {
 /// `PATH`, where spawning a bare `cargo` fails with "No such file or
 /// directory" even though a terminal launch finds it.
 fn self_install_command(manifest_dir: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new(crate::widgets::dependencies::cargo_binary());
+    self_install_command_with(crate::widgets::dependencies::cargo_binary(), manifest_dir)
+}
+
+/// Split from [`self_install_command`] so tests can inject a deterministic
+/// cargo path instead of comparing against the resolver's own answer.
+fn self_install_command_with(cargo: PathBuf, manifest_dir: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(cargo);
     cmd.args(["install", "--path", manifest_dir, "--locked"]);
     cmd
 }
@@ -430,17 +436,29 @@ mod tests {
     }
 
     #[test]
-    fn self_install_resolves_cargo_by_absolute_path() {
+    fn self_install_spawns_the_injected_cargo_verbatim() {
+        let cmd = self_install_command_with(PathBuf::from("/fake/toolchain/cargo"), "/some/repo");
+        assert_eq!(
+            PathBuf::from(cmd.get_program()),
+            PathBuf::from("/fake/toolchain/cargo")
+        );
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_os_string()).collect();
+        assert_eq!(args, ["install", "--path", "/some/repo", "--locked"]);
+    }
+
+    #[test]
+    fn self_install_wires_in_the_resolved_cargo() {
+        // A GUI-launched croft inherits launchd's stripped PATH, so the
+        // self-install must go through the dependencies widget's resolver
+        // instead of spawning a bare `cargo`. The resolver itself may fall
+        // back to a bare `cargo` on a machine with no toolchain at all;
+        // this test proves the wiring, the one above proves the command
+        // uses whatever path it is given.
         let cmd = self_install_command("/some/repo");
         assert_eq!(
             PathBuf::from(cmd.get_program()),
             crate::widgets::dependencies::cargo_binary(),
-            "a GUI-launched croft inherits launchd's stripped PATH, so the \
-             self-install must resolve cargo the same way the dependencies \
-             widget does instead of spawning a bare `cargo`"
         );
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_os_string()).collect();
-        assert_eq!(args, ["install", "--path", "/some/repo", "--locked"]);
     }
 
     #[test]
