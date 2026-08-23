@@ -28756,6 +28756,31 @@ fn finished_settles_pending_matches_pane_and_command() {
 }
 
 #[test]
+fn a_parked_launch_aborts_when_its_pane_dies_or_never_reports_a_mark() {
+    use std::time::Duration;
+    let quick = Duration::from_secs(1);
+    let over = PRELAUNCH_MARK_GRACE + Duration::from_secs(1);
+    assert!(
+        pending_abort_reason(false, false, quick).is_some(),
+        "a closed pane aborts immediately"
+    );
+    assert_eq!(
+        pending_abort_reason(true, false, over),
+        None,
+        "a busy pane (long build) waits indefinitely"
+    );
+    assert_eq!(
+        pending_abort_reason(true, true, quick),
+        None,
+        "an idle pane inside the grace window keeps waiting for the mark"
+    );
+    assert!(
+        pending_abort_reason(true, true, over).is_some(),
+        "idle past the grace with no mark = shell integration never reported; abort"
+    );
+}
+
+#[test]
 fn debug_config_picker_lists_configs_and_selection_drives_f5() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();

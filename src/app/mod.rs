@@ -1252,6 +1252,8 @@ struct PendingDebugLaunch {
     command: String,
     /// The fully resolved config, launched once the task exits 0.
     config: crate::dap::configs::ResolvedConfig,
+    /// When the task was written, for the no-command-mark fallback below.
+    started: std::time::Instant,
 }
 
 /// Whether a finished pane command settles the pending preLaunchTask: same
@@ -1259,6 +1261,31 @@ struct PendingDebugLaunch {
 /// it with surrounding whitespace). Pure, for tests.
 fn finished_settles_pending(pane: u64, cmd: &str, pending_pane: u64, pending_cmd: &str) -> bool {
     pane == pending_pane && cmd.trim() == pending_cmd.trim()
+}
+
+/// How long a parked launch waits before concluding the pane will never
+/// report a command mark. Only consulted while the pane's foreground is back
+/// to a plain shell — a long build keeps a non-shell foreground and waits
+/// indefinitely, exactly like the FinishedCommand path.
+const PRELAUNCH_MARK_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The FinishedCommand match is the settling signal for a parked launch, but
+/// it depends on OSC 133 shell-integration marks. This is the fallback for
+/// panes that will never produce one: the pane vanished, or its foreground
+/// returned to a plain shell (the task is over) and the grace period passed
+/// without a mark. Returns the abort reason, or `None` to keep waiting. Pure.
+fn pending_abort_reason(
+    pane_exists: bool,
+    foreground_is_shell: bool,
+    waited: std::time::Duration,
+) -> Option<&'static str> {
+    if !pane_exists {
+        return Some("its terminal pane closed");
+    }
+    if foreground_is_shell && waited > PRELAUNCH_MARK_GRACE {
+        return Some("the task produced no command mark (shell integration missing in that pane?)");
+    }
+    None
 }
 
 fn debug_end_message(had_breakpoints: bool, ever_stopped: bool) -> &'static str {
@@ -16440,9 +16467,8 @@ impl App {
     fn start_selected_debug(&mut self) {
         if let Some(name) = self.selected_debug_config.clone() {
             let root = self.active_workspace_root();
-            let configs = crate::dap::configs::discover_configs(&root);
-            if let Some(cfg) = configs.iter().find(|c| c.name == name).cloned() {
-                self.debug_configs = configs;
+            self.debug_configs = crate::dap::configs::discover_configs(&root);
+            if let Some(cfg) = self.debug_configs.iter().find(|c| c.name == name).cloned() {
                 self.launch_debug_config(&cfg);
                 return;
             }
@@ -16515,6 +16541,7 @@ impl App {
                 pane,
                 command,
                 config: rc,
+                started: std::time::Instant::now(),
             });
             self.run_debug.feedback = Some(format!("preLaunchTask \"{task_label}\" running…"));
             self.run_debug.feedback_is_error = false;
@@ -23831,13 +23858,34 @@ impl App {
                 ));
             }
         }
+        // Liveness fallback for a still-parked launch: the FinishedCommand
+        // match depends on OSC 133 marks, and a pane without integration (or
+        // one the user closed) would otherwise park the launch forever.
+        let mut pending_aborted = false;
+        if settled_launch.is_none()
+            && let Some(p) = self.pending_debug_launch.as_ref()
+        {
+            let pane = self.terminals.iter().find(|t| t.uid() == p.pane);
+            if let Some(reason) = pending_abort_reason(
+                pane.is_some(),
+                pane.is_some_and(|t| t.foreground_is_shell()),
+                p.started.elapsed(),
+            ) {
+                self.pending_debug_launch = None;
+                self.debug_error(format!(
+                    "preLaunchTask abandoned: {reason} — debug launch aborted"
+                ));
+                pending_aborted = true;
+            }
+        }
         let mut build_changed = false;
         for (pane, cwd, output) in build_scans {
             build_changed |= self.apply_build_scan(pane, cwd.as_deref(), &output);
         }
         // Captures collect silently (iTerm2's model: the panel is the
         // surface, not the status bar), but still trigger a redraw.
-        let had_captures = !captured.is_empty() || build_changed || settled_launch.is_some();
+        let had_captures =
+            !captured.is_empty() || build_changed || settled_launch.is_some() || pending_aborted;
         for c in captured {
             self.captures.push(c);
         }

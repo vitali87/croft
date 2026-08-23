@@ -283,10 +283,16 @@ pub fn js_launch_request(program: &Path, cwd: &Path, stop_on_entry: bool) -> Val
 /// vscode-js-debug hands back in its `startDebugging` reverse request. The
 /// configuration (carrying the `__pendingTargetId` that ties the child to the
 /// right target) is passed through verbatim as the arguments; the command
-/// follows the configuration's own `request` so an attach session's child
-/// attaches rather than launching.
-pub fn js_child_launch_request(configuration: &Value) -> Value {
-    let command = match configuration.get("request").and_then(Value::as_str) {
+/// follows the configuration's own `request`, falling back to the reverse
+/// request's outer `request` field (the DAP `startDebugging` shape carries it
+/// beside the configuration), so an attach session's child attaches rather
+/// than launching even when the inner configuration omits the field.
+pub fn js_child_launch_request(configuration: &Value, outer_request: Option<&str>) -> Value {
+    let command = match configuration
+        .get("request")
+        .and_then(Value::as_str)
+        .or(outer_request)
+    {
         Some("attach") => "attach",
         _ => "launch",
     };
@@ -299,11 +305,13 @@ pub fn js_child_launch_request(configuration: &Value) -> Value {
 
 /// A recognised `startDebugging` reverse request: vscode-js-debug asks the client
 /// to open a child session for `config` and the client must answer the request
-/// `request_seq`.
+/// `request_seq`. `request` is the outer `arguments.request` ("launch" /
+/// "attach"), kept separately because the inner configuration may omit its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartDebuggingRequest {
     pub request_seq: i64,
     pub config: Value,
+    pub request: Option<String>,
 }
 
 /// Recognise a vscode-js-debug `startDebugging` reverse request and pull out the
@@ -316,9 +324,14 @@ pub fn start_debugging_request(msg: &Value) -> Option<StartDebuggingRequest> {
     if msg.get("command")?.as_str()? != "startDebugging" {
         return None;
     }
+    let arguments = msg.get("arguments")?;
     Some(StartDebuggingRequest {
         request_seq: msg.get("seq")?.as_i64()?,
-        config: msg.get("arguments")?.get("configuration")?.clone(),
+        config: arguments.get("configuration")?.clone(),
+        request: arguments
+            .get("request")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -919,7 +932,7 @@ impl DapSession {
                     "startDebugging",
                     true,
                 ));
-                self.open_child_session(&req.config);
+                self.open_child_session(&req.config, req.request.as_deref());
             } else if let (Some(seq), Some(command)) = (
                 msg.get("seq").and_then(Value::as_i64),
                 msg.get("command").and_then(Value::as_str),
@@ -1076,14 +1089,14 @@ impl DapSession {
     /// Open the vscode-js-debug child session: connect a second socket to the
     /// same debug server and replay `initialize` + `launch` with the adapter-
     /// provided child configuration (which carries the `__pendingTargetId`).
-    fn open_child_session(&mut self, config: &Value) {
+    fn open_child_session(&mut self, config: &Value, outer_request: Option<&str>) {
         let Some((host, port)) = self.js_server.clone() else {
             return;
         };
         match DapTransport::connect_tcp(&host, port) {
             Ok(child) => {
                 let _ = child.send(initialize_request());
-                let _ = child.send(js_child_launch_request(config));
+                let _ = child.send(js_child_launch_request(config, outer_request));
                 self.child = Some(child);
             }
             Err(e) => {
@@ -1301,12 +1314,46 @@ mod tests {
     #[test]
     fn js_child_request_follows_the_configurations_request_kind() {
         let launch_cfg = json!({ "type": "pwa-node", "__pendingTargetId": "x" });
-        assert_eq!(js_child_launch_request(&launch_cfg)["command"], "launch");
+        assert_eq!(
+            js_child_launch_request(&launch_cfg, None)["command"],
+            "launch"
+        );
         let attach_cfg =
             json!({ "type": "pwa-node", "request": "attach", "__pendingTargetId": "x" });
-        let req = js_child_launch_request(&attach_cfg);
+        let req = js_child_launch_request(&attach_cfg, None);
         assert_eq!(req["command"], "attach");
         assert_eq!(req["arguments"]["__pendingTargetId"], "x");
+        // The inner configuration may omit `request`; the reverse request's
+        // outer field then decides, so attach children still attach.
+        let bare_cfg = json!({ "type": "pwa-node", "__pendingTargetId": "x" });
+        assert_eq!(
+            js_child_launch_request(&bare_cfg, Some("attach"))["command"],
+            "attach"
+        );
+        // An explicit inner request wins over the outer one.
+        assert_eq!(
+            js_child_launch_request(&attach_cfg, Some("launch"))["command"],
+            "attach"
+        );
+    }
+
+    #[test]
+    fn start_debugging_reverse_request_carries_the_outer_request_kind() {
+        let msg = json!({
+            "type": "request", "seq": 9, "command": "startDebugging",
+            "arguments": {
+                "request": "attach",
+                "configuration": { "type": "pwa-node", "__pendingTargetId": "t" }
+            }
+        });
+        let parsed = start_debugging_request(&msg).expect("recognised");
+        assert_eq!(parsed.request.as_deref(), Some("attach"));
+        // No outer request field parses to None rather than being rejected.
+        let bare = json!({
+            "type": "request", "seq": 10, "command": "startDebugging",
+            "arguments": { "configuration": { "type": "pwa-node" } }
+        });
+        assert_eq!(start_debugging_request(&bare).unwrap().request, None);
     }
 
     #[test]

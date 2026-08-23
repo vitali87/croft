@@ -312,7 +312,7 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         module: get_str("module"),
         args,
         env,
-        cwd: get_str("cwd").map(PathBuf::from),
+        cwd: get_str("cwd").map(|c| absolute_in(&c, &ctx.workspace_folder)),
         pre_launch_task: get_str("preLaunchTask"),
         stop_on_entry: obj
             .get("stopOnEntry")
@@ -657,6 +657,19 @@ mod tests {
         assert_eq!(rc.extra["justMyCode"], json!(true));
         assert_eq!(rc.extra["subProcess"], json!("proj"));
         assert!(!rc.extra.contains_key("program"));
+    }
+
+    #[test]
+    fn a_relative_cwd_resolves_against_the_workspace_folder() {
+        let cfg =
+            config(r#"[{ "name": "R", "type": "python", "program": "a.py", "cwd": "backend" }]"#);
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        assert_eq!(rc.cwd.as_deref(), Some(Path::new("/work/proj/backend")));
+        // An absolute cwd is kept as written.
+        let cfg =
+            config(r#"[{ "name": "R", "type": "python", "program": "a.py", "cwd": "/srv/app" }]"#);
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        assert_eq!(rc.cwd.as_deref(), Some(Path::new("/srv/app")));
     }
 
     #[test]
