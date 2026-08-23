@@ -28736,3 +28736,109 @@ fn a_failed_reinstall_rearms_the_drift_hint_for_retry() {
         "the drift hint must survive a failed rebuild so F9 retries"
     );
 }
+
+#[test]
+fn finished_settles_pending_matches_pane_and_command() {
+    assert!(finished_settles_pending(
+        7,
+        " cargo build\n",
+        7,
+        "cargo build"
+    ));
+    assert!(
+        !finished_settles_pending(8, "cargo build", 7, "cargo build"),
+        "wrong pane"
+    );
+    assert!(
+        !finished_settles_pending(7, "cargo test", 7, "cargo build"),
+        "different command"
+    );
+}
+
+#[test]
+fn debug_config_picker_lists_configs_and_selection_drives_f5() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "API", "type": "python", "request": "launch", "program": "api.py" },
+            { "name": "Gopher", "type": "go", "program": "main.go" }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_debug_config_picker();
+    let picker = app.list_picker.as_ref().expect("picker open");
+    assert_eq!(picker.rows.len(), 3, "zero-config entry + the two configs");
+    assert!(picker.rows[0].label.contains("active file"));
+    assert!(picker.rows[1].label.contains("API"));
+
+    // Confirming a config remembers it as the F5 target. The unsupported
+    // type must surface a named error, not vanish from the picker silently.
+    app.list_picker.as_mut().unwrap().selected = 2;
+    app.confirm_list_picker();
+    assert_eq!(app.selected_debug_config.as_deref(), Some("Gopher"));
+    assert!(
+        app.run_debug.feedback_is_error,
+        "unsupported type is an error: {:?}",
+        app.run_debug.feedback
+    );
+    assert!(
+        app.status.contains("unsupported type \"go\""),
+        "{}",
+        app.status
+    );
+
+    // The zero-config entry clears the selection.
+    app.open_debug_config_picker();
+    app.list_picker.as_mut().unwrap().selected = 0;
+    app.confirm_list_picker();
+    assert_eq!(app.selected_debug_config, None);
+}
+
+#[test]
+fn missing_pre_launch_task_and_stale_selection_error_loudly() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"[ { "name": "Built", "type": "lldb", "program": "/nope/bin", "preLaunchTask": "make everything" } ]"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_debug_config_picker();
+    app.list_picker.as_mut().unwrap().selected = 1;
+    app.confirm_list_picker();
+    assert!(
+        app.status
+            .contains("preLaunchTask \"make everything\" not found"),
+        "{}",
+        app.status
+    );
+    assert!(
+        app.pending_debug_launch.is_none(),
+        "nothing parked on error"
+    );
+
+    // A selection whose config was deleted falls back to zero-config.
+    app.selected_debug_config = Some(String::from("Deleted"));
+    app.start_selected_debug();
+    assert_eq!(app.selected_debug_config, None, "stale selection cleared");
+}
+
+#[test]
+fn refresh_run_debug_syncs_the_config_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"[ { "name": "One", "type": "python", "program": "a.py" } ]"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.selected_debug_config = Some(String::from("One"));
+    app.refresh_run_debug();
+    assert_eq!(app.run_debug.config_count, 1);
+    assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
+}

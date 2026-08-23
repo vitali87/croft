@@ -279,14 +279,20 @@ pub fn js_launch_request(program: &Path, cwd: &Path, stop_on_entry: bool) -> Val
     })
 }
 
-/// Build the child `launch` request from the configuration vscode-js-debug hands
-/// back in its `startDebugging` reverse request. The configuration (carrying the
-/// `__pendingTargetId` that ties the child to the right target) is passed
-/// through verbatim as the launch arguments.
+/// Build the child session-starting request from the configuration
+/// vscode-js-debug hands back in its `startDebugging` reverse request. The
+/// configuration (carrying the `__pendingTargetId` that ties the child to the
+/// right target) is passed through verbatim as the arguments; the command
+/// follows the configuration's own `request` so an attach session's child
+/// attaches rather than launching.
 pub fn js_child_launch_request(configuration: &Value) -> Value {
+    let command = match configuration.get("request").and_then(Value::as_str) {
+        Some("attach") => "attach",
+        _ => "launch",
+    };
     json!({
         "type": "request",
-        "command": "launch",
+        "command": command,
         "arguments": configuration,
     })
 }
@@ -716,6 +722,25 @@ impl DapSession {
         breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
         stop_on_entry: bool,
     ) -> Result<DapSession> {
+        Self::launch_js_with(
+            node,
+            server_js,
+            cwd,
+            js_launch_request(program, cwd, stop_on_entry),
+            breakpoints,
+        )
+    }
+
+    /// Like [`DapSession::launch_js`] but with a caller-built session-starting
+    /// request (a launch.json config's `launch` or `attach`), mirroring what
+    /// [`DapSession::launch_with`] is to the stdio adapters.
+    pub fn launch_js_with(
+        node: &str,
+        server_js: &Path,
+        cwd: &Path,
+        start_request: Value,
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    ) -> Result<DapSession> {
         let host = "127.0.0.1";
         let port = super::transport::free_port()?;
         let args = vec![
@@ -727,7 +752,7 @@ impl DapSession {
         let transport =
             DapTransport::connect_tcp_server(node, &args, cwd, host, port, node_dir.as_deref())?;
         transport.send(initialize_request())?;
-        transport.send(js_launch_request(program, cwd, stop_on_entry))?;
+        transport.send(start_request)?;
         Ok(Self::new_with_transport(
             transport,
             breakpoints,
@@ -1271,6 +1296,17 @@ mod tests {
             "dd35f91abc4e878814ccfee3"
         );
         assert_eq!(parsed.config["type"], "pwa-node");
+    }
+
+    #[test]
+    fn js_child_request_follows_the_configurations_request_kind() {
+        let launch_cfg = json!({ "type": "pwa-node", "__pendingTargetId": "x" });
+        assert_eq!(js_child_launch_request(&launch_cfg)["command"], "launch");
+        let attach_cfg =
+            json!({ "type": "pwa-node", "request": "attach", "__pendingTargetId": "x" });
+        let req = js_child_launch_request(&attach_cfg);
+        assert_eq!(req["command"], "attach");
+        assert_eq!(req["arguments"]["__pendingTargetId"], "x");
     }
 
     #[test]

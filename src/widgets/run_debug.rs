@@ -157,6 +157,14 @@ pub struct RunDebugPanel {
     pub run_is_debug: bool,
     pub last_area: Rect,
     pub last_button_area: Rect,
+    /// How many launch.json configurations the workspace declares (#250) and
+    /// which one F5 starts (`None` = zero-config active file). Set by the
+    /// app's `refresh_run_debug` sync; drives the config row under the button.
+    pub config_count: usize,
+    pub selected_config: Option<String>,
+    /// Hit area of the config row painted this frame; clicking it opens the
+    /// Debug Configuration picker. Default when no row was painted.
+    pub last_config_area: Rect,
     /// When a debug session is paused, the app fills these rows (call stack +
     /// variables) and sets `debug_active`; the panel then renders the tree
     /// instead of the empty-state Run button.
@@ -202,6 +210,9 @@ impl RunDebugPanel {
             run_is_debug: false,
             last_area: Rect::default(),
             last_button_area: Rect::default(),
+            config_count: 0,
+            selected_config: None,
+            last_config_area: Rect::default(),
             debug_active: false,
             watch_remove_rects: Vec::new(),
             debug_status: String::new(),
@@ -254,6 +265,27 @@ impl RunDebugPanel {
             && x < r.x + r.width
             && y >= r.y
             && y < r.y + r.height
+    }
+
+    /// Whether a click lands on the config row under the button (#250).
+    pub fn click_config(&self, x: u16, y: u16) -> bool {
+        let r = self.last_config_area;
+        r.width > 0
+            && r.height > 0
+            && x >= r.x
+            && x < r.x + r.width
+            && y >= r.y
+            && y < r.y + r.height
+    }
+
+    /// The config row's text: the selected configuration's name, or an
+    /// invitation when configs exist but none is selected.
+    fn config_row_label(&self) -> Option<String> {
+        match (&self.selected_config, self.config_count) {
+            (Some(name), _) => Some(format!("⚙ {name} ▾")),
+            (None, 0) => None,
+            (None, n) => Some(format!("⚙ {n} debug configs ▾")),
+        }
     }
 
     /// Render the paused-state tree (Variant A / Darcula): a status pill, the
@@ -687,6 +719,7 @@ impl Widget for &mut RunDebugPanel {
         }
         self.last_area = area;
         self.last_button_area = Rect::default();
+        self.last_config_area = Rect::default();
         self.last_icon_cell = None;
         self.last_debug_rows_shown = 0;
         if inner.height == 0 || inner.width == 0 {
@@ -857,6 +890,27 @@ impl Widget for &mut RunDebugPanel {
         );
 
         let mut next_y = button_area.y + button_area.height + 1;
+        // The launch.json config row (#250): which configuration F5 starts,
+        // clickable to open the Debug Configuration picker.
+        if let Some(label) = self.config_row_label()
+            && next_y < inner.y + inner.height
+        {
+            let shown: String = label
+                .chars()
+                .take(inner.width.saturating_sub(2) as usize)
+                .collect();
+            let w = shown.chars().count() as u16;
+            let x = inner.x + inner.width.saturating_sub(w) / 2;
+            let style = Style::default().fg(self.theme.ui(Color::Rgb(0x8f, 0xd9, 0xcf)));
+            buf.set_string(x, next_y, &shown, style);
+            self.last_config_area = Rect {
+                x,
+                y: next_y,
+                width: w,
+                height: 1,
+            };
+            next_y = next_y.saturating_add(1);
+        }
         if let Some(msg) = self.feedback.as_ref()
             && next_y < inner.y + inner.height
         {
@@ -1080,6 +1134,19 @@ mod tests {
         panel.set_active_file(Some(PathBuf::from("/work/main.rs")));
         panel.run_is_debug = true;
         assert_eq!(panel.button_label(), "Debug main.rs");
+    }
+
+    #[test]
+    fn config_row_label_names_the_selection_or_counts_the_configs() {
+        let mut panel = RunDebugPanel::new();
+        assert_eq!(panel.config_row_label(), None, "no configs, no row");
+        panel.config_count = 2;
+        assert_eq!(
+            panel.config_row_label().as_deref(),
+            Some("⚙ 2 debug configs ▾")
+        );
+        panel.selected_config = Some(String::from("Run API"));
+        assert_eq!(panel.config_row_label().as_deref(), Some("⚙ Run API ▾"));
     }
 
     #[test]
