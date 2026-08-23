@@ -169,7 +169,7 @@ pub fn load_merged_from(
     for (kind, path) in layers {
         chain.push(path.clone());
         let doc = if kind == LayerKind::VsCodeWorkspace {
-            load_vscode_subset(&path)
+            load_vscode_subset(&path, &mut warnings)
         } else {
             let mut visited = Vec::new();
             load_layer_document(&path, platform, &mut visited, &mut chain, &mut warnings)
@@ -197,9 +197,41 @@ pub fn load_merged_from(
     }
 }
 
+/// Largest layer file croft will read: layers are hand-written settings, so
+/// anything past this is a mistake (or a hostile `extends` target such as
+/// `/dev/zero`) and refusing beats an unbounded read.
+const LAYER_FILE_MAX: u64 = 1024 * 1024;
+
+/// Read a layer file's text, refusing non-regular files (a FIFO would block
+/// startup, a device file would read forever) and oversized ones, both with
+/// a warning. A missing file stays silent — absent layers are normal.
+fn read_layer_file(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        warnings.push(format!(
+            "{}: not a regular file — layer ignored",
+            path.display()
+        ));
+        return None;
+    }
+    if meta.len() > LAYER_FILE_MAX {
+        warnings.push(format!(
+            "{}: larger than {LAYER_FILE_MAX} bytes — layer ignored",
+            path.display()
+        ));
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// Read one croft layer file: JSONC-tolerant parse, `extends` resolution
 /// (depth-first, cycles warn and stop), then this platform's scope block
 /// merged over the flat keys. `None` when the file is absent or unreadable.
+///
+/// `visited` is the ACTIVE recursion stack, not a set of everything ever
+/// loaded: a base popped here may legitimately load again from a sibling
+/// branch (diamond inheritance re-applies the shared base at its later
+/// position); only a file already on the current stack is a true cycle.
 fn load_layer_document(
     path: &Path,
     platform: &str,
@@ -216,7 +248,19 @@ fn load_layer_document(
         return None;
     }
     visited.push(canonical);
-    let text = std::fs::read_to_string(path).ok()?;
+    let doc = load_layer_document_inner(path, platform, visited, chain, warnings);
+    visited.pop();
+    doc
+}
+
+fn load_layer_document_inner(
+    path: &Path,
+    platform: &str,
+    visited: &mut Vec<PathBuf>,
+    chain: &mut Vec<PathBuf>,
+    warnings: &mut Vec<String>,
+) -> Option<Map<String, Value>> {
+    let text = read_layer_file(path, warnings)?;
     let parsed: Value = match serde_json::from_str(&crate::tasks::strip_jsonc(&text)) {
         Ok(v) => v,
         Err(e) => {
@@ -328,11 +372,28 @@ fn deep_merge(base: &mut Value, over: &Value) {
 
 /// The mapped `.vscode/settings.json` subset: only settings with an exact
 /// croft equivalent, silently ignoring the rest (broad VS Code settings
-/// compatibility is explicitly a non-goal).
-fn load_vscode_subset(path: &Path) -> Option<Map<String, Value>> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let parsed: Value = serde_json::from_str(&crate::tasks::strip_jsonc(&text)).ok()?;
-    let obj = parsed.as_object()?;
+/// compatibility is explicitly a non-goal). A missing file is silent, but a
+/// present-yet-unparsable one warns — otherwise a malformed file is
+/// indistinguishable from an absent one.
+fn load_vscode_subset(path: &Path, warnings: &mut Vec<String>) -> Option<Map<String, Value>> {
+    let text = read_layer_file(path, warnings)?;
+    let parsed: Value = match serde_json::from_str(&crate::tasks::strip_jsonc(&text)) {
+        Ok(v) => v,
+        Err(e) => {
+            warnings.push(format!(
+                "{}: not valid JSON ({e}) — layer ignored",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    let Some(obj) = parsed.as_object() else {
+        warnings.push(format!(
+            "{}: expected a JSON object at the top level — layer ignored",
+            path.display()
+        ));
+        return None;
+    };
     let mut out = Map::new();
     if let Some(v) = obj.get("editor.formatOnSave").and_then(Value::as_bool) {
         out.insert("format_on_save".into(), Value::Bool(v));
@@ -385,20 +446,52 @@ fn deserialize_tolerantly(
 /// Make sure `<root>/.croft/.gitignore` ignores the workspace-local layer,
 /// creating the directory and file as needed. Called before the local layer
 /// is first opened for editing so it can never land in a commit by accident.
+///
+/// `.croft/` and `.gitignore` are repo-controlled paths, so a hostile clone
+/// could make either a symlink into the user's own config
+/// (`.croft/.gitignore → ~/.config/croft/config.json`) and turn this append
+/// into config corruption. Both components are therefore refused as
+/// symlinks, and the write itself opens with `O_NOFOLLOW` so a race cannot
+/// swap one in between the check and the write.
 pub fn ensure_workspace_local_ignored(root: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+
+    let no_follow = |what: &Path| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a symlink — refusing to write through it",
+                what.display()
+            ),
+        )
+    };
     let dir = root.join(".croft");
     std::fs::create_dir_all(&dir)?;
+    if std::fs::symlink_metadata(&dir)?.file_type().is_symlink() {
+        return Err(no_follow(&dir));
+    }
     let gi = dir.join(".gitignore");
-    let existing = std::fs::read_to_string(&gi).unwrap_or_default();
+    match std::fs::symlink_metadata(&gi) {
+        Ok(m) if m.file_type().is_symlink() => return Err(no_follow(&gi)),
+        Ok(_) | Err(_) => {}
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(&gi)?;
+    let mut existing = String::new();
+    f.read_to_string(&mut existing)?;
     if existing.lines().any(|l| l.trim() == "config.local.json") {
         return Ok(());
     }
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        f.write_all(b"\n")?;
     }
-    updated.push_str("config.local.json\n");
-    std::fs::write(&gi, updated)
+    f.write_all(b"config.local.json\n")
 }
 
 #[cfg(test)]
@@ -656,5 +749,128 @@ mod tests {
         let gi = std::fs::read_to_string(root.join(".croft/.gitignore")).unwrap();
         assert!(gi.contains("scratch/"));
         assert!(gi.contains("config.local.json"));
+    }
+
+    /// Diamond inheritance is not a cycle: two siblings extending the same
+    /// base both load it, so the shared base re-applies at its later
+    /// position (`b`'s inherited copy wins over `a`'s override).
+    #[test]
+    fn diamond_extends_loads_the_shared_base_from_both_branches() {
+        let (_tmp, user, root) = setup();
+        write(&user.join("common.json"), r#"{"theme":"nord"}"#);
+        write(
+            &user.join("a.json"),
+            r#"{"extends":"./common.json","theme":"black"}"#,
+        );
+        write(&user.join("b.json"), r#"{"extends":"./common.json"}"#);
+        write(
+            &user.join("config.json"),
+            r#"{"extends":["./a.json","./b.json"]}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(
+            m.warnings.is_empty(),
+            "a shared base is not a cycle: {:?}",
+            m.warnings
+        );
+        assert_eq!(
+            m.prefs.theme, "nord",
+            "b's inherited base merges after a's override, exactly as if \
+             its keys were written inline"
+        );
+        // A real cycle still warns and stops.
+        write(&user.join("x.json"), r#"{"extends":"./y.json"}"#);
+        write(&user.join("y.json"), r#"{"extends":"./x.json"}"#);
+        write(&user.join("config.json"), r#"{"extends":"./x.json"}"#);
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(
+            m.warnings.iter().any(|w| w.contains("cycle")),
+            "{:?}",
+            m.warnings
+        );
+    }
+
+    /// Layer reads are bounded and regular-file only: an `extends` target
+    /// that is a directory (or FIFO, device, …) is refused with a warning
+    /// instead of blocking or ballooning startup, and so is an absurdly
+    /// large file.
+    #[test]
+    fn non_regular_and_oversized_layer_files_are_refused() {
+        let (_tmp, user, root) = setup();
+        std::fs::create_dir_all(user.join("adir")).unwrap();
+        write(
+            &user.join("config.json"),
+            r#"{"extends":"./adir","theme":"black"}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(
+            m.warnings.iter().any(|w| w.contains("not a regular file")),
+            "{:?}",
+            m.warnings
+        );
+        assert_eq!(m.prefs.theme, "black", "the file's own keys still apply");
+
+        let huge = " ".repeat(LAYER_FILE_MAX as usize + 1);
+        write(&user.join("huge.json"), &huge);
+        write(&user.join("config.json"), r#"{"extends":"./huge.json"}"#);
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(
+            m.warnings.iter().any(|w| w.contains("larger than")),
+            "{:?}",
+            m.warnings
+        );
+    }
+
+    /// A present-but-broken .vscode/settings.json warns; an absent one is
+    /// silent (absent layers are the normal case).
+    #[test]
+    fn a_malformed_vscode_settings_file_warns_instead_of_vanishing() {
+        let (_tmp, user, root) = setup();
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        write(&root.join(".vscode/settings.json"), "{ definitely not json");
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(
+            m.warnings
+                .iter()
+                .any(|w| w.contains("settings.json") && w.contains("not valid JSON")),
+            "{:?}",
+            m.warnings
+        );
+        write(&root.join(".vscode/settings.json"), "[1,2,3]");
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(
+            m.warnings.iter().any(|w| w.contains("JSON object")),
+            "{:?}",
+            m.warnings
+        );
+    }
+
+    /// Repo-controlled symlinks must not redirect the gitignore write into
+    /// the user's own files (`.croft/.gitignore → ~/.config/croft/…`).
+    #[cfg(unix)]
+    #[test]
+    fn the_gitignore_write_refuses_symlinked_components() {
+        let (tmp, _user, root) = setup();
+        let victim = tmp.path().join("victim.json");
+        std::fs::write(&victim, "{\"precious\": true}\n").unwrap();
+        std::fs::create_dir_all(root.join(".croft")).unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(".croft/.gitignore")).unwrap();
+        let err = ensure_workspace_local_ignored(&root).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "{\"precious\": true}\n",
+            "the symlink target must be untouched"
+        );
+
+        // A symlinked .croft directory is refused the same way.
+        let root2 = tmp.path().join("repo2");
+        std::fs::create_dir_all(&root2).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root2.join(".croft")).unwrap();
+        let err = ensure_workspace_local_ignored(&root2).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
     }
 }
