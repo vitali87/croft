@@ -1269,6 +1269,22 @@ fn finished_settles_pending(pane: u64, cmd: &str, pending_pane: u64, pending_cmd
 /// indefinitely, exactly like the FinishedCommand path.
 const PRELAUNCH_MARK_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// An lldb launch's `program`, resolved against the session's cwd (VS Code's
+/// contract for relative programs, and NOT croft's own working directory) and
+/// checked for existence, so the validation and the adapter can never read a
+/// relative path differently. Returns the absolute path to hand the adapter.
+fn resolve_lldb_program(program: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let resolved = crate::dap::configs::absolute_in(program, cwd);
+    if resolved.exists() {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "program {} does not exist — does the preLaunchTask build it?",
+            resolved.display()
+        ))
+    }
+}
+
 /// The FinishedCommand match is the settling signal for a parked launch, but
 /// it depends on OSC 133 shell-integration marks. This is the fallback for
 /// panes that will never produce one: the pane vanished, or its foreground
@@ -16566,7 +16582,7 @@ impl App {
 
     /// Spawn the adapter for a resolved launch.json configuration and hand it
     /// the built launch/attach request.
-    fn launch_resolved_config(&mut self, rc: crate::dap::configs::ResolvedConfig) {
+    fn launch_resolved_config(&mut self, mut rc: crate::dap::configs::ResolvedConfig) {
         use crate::dap::configs::{self, RequestKind};
         use crate::dap::session::AdapterKind;
         let breakpoints = self.collect_editor_breakpoints();
@@ -16615,11 +16631,14 @@ impl App {
                             ));
                             return;
                         };
-                        if !Path::new(program).exists() {
-                            self.debug_error(format!(
-                                "config \"{name}\": program {program} does not exist — does the preLaunchTask build it?"
-                            ));
-                            return;
+                        match resolve_lldb_program(program, &cwd) {
+                            Ok(resolved) => {
+                                rc.program = Some(resolved.to_string_lossy().into_owned())
+                            }
+                            Err(e) => {
+                                self.debug_error(format!("config \"{name}\": {e}"));
+                                return;
+                            }
                         }
                     }
                     RequestKind::Attach => {

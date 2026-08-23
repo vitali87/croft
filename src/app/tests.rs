@@ -28756,6 +28756,31 @@ fn finished_settles_pending_matches_pane_and_command() {
 }
 
 #[test]
+fn lldb_program_resolves_against_the_session_cwd_not_crofts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir_all(cwd.join("target/debug")).unwrap();
+    std::fs::write(cwd.join("target/debug/app"), b"bin").unwrap();
+    let resolved = resolve_lldb_program("target/debug/app", &cwd).expect("exists under cwd");
+    assert_eq!(resolved, cwd.join("target/debug/app"));
+    assert!(resolved.is_absolute());
+    // A missing relative program errors with the RESOLVED path, so the
+    // message says where croft actually looked.
+    let err = resolve_lldb_program("target/release/app", &cwd).unwrap_err();
+    assert!(
+        err.contains(&cwd.join("target/release/app").display().to_string()),
+        "{err}"
+    );
+    // Absolute programs are taken as written.
+    let abs = cwd.join("target/debug/app");
+    let abs_str = abs.to_string_lossy().into_owned();
+    assert_eq!(
+        resolve_lldb_program(&abs_str, Path::new("/somewhere/else")).unwrap(),
+        abs
+    );
+}
+
+#[test]
 fn a_parked_launch_aborts_when_its_pane_dies_or_never_reports_a_mark() {
     use std::time::Duration;
     let quick = Duration::from_secs(1);
