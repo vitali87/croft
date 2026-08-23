@@ -1242,6 +1242,68 @@ fn menu_entry_width(entry: &MenuEntry) -> usize {
 /// exited without ever stopping, say so explicitly — that is the common "I set a
 /// breakpoint and nothing happened" confusion (e.g. running a library module
 /// whose breakpointed code is never called). Otherwise a plain end message.
+/// A launch.json config launch parked behind its `preLaunchTask` (#250): the
+/// task runs in a terminal pane, and the FinishedCommand sweep decides.
+struct PendingDebugLaunch {
+    /// Uid of the pane the task command was written to.
+    pane: u64,
+    /// The task's command line, matched against the pane's next finished
+    /// command (OSC 133 reports what actually ran).
+    command: String,
+    /// The fully resolved config, launched once the task exits 0.
+    config: crate::dap::configs::ResolvedConfig,
+    /// When the task was written, for the no-command-mark fallback below.
+    started: std::time::Instant,
+}
+
+/// Whether a finished pane command settles the pending preLaunchTask: same
+/// pane, and the captured command line is the task's (the shell may report
+/// it with surrounding whitespace). Pure, for tests.
+fn finished_settles_pending(pane: u64, cmd: &str, pending_pane: u64, pending_cmd: &str) -> bool {
+    pane == pending_pane && cmd.trim() == pending_cmd.trim()
+}
+
+/// How long a parked launch waits before concluding the pane will never
+/// report a command mark. Only consulted while the pane's foreground is back
+/// to a plain shell — a long build keeps a non-shell foreground and waits
+/// indefinitely, exactly like the FinishedCommand path.
+const PRELAUNCH_MARK_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// An lldb launch's `program`, resolved against the session's cwd (VS Code's
+/// contract for relative programs, and NOT croft's own working directory) and
+/// checked for existence, so the validation and the adapter can never read a
+/// relative path differently. Returns the absolute path to hand the adapter.
+fn resolve_lldb_program(program: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let resolved = crate::dap::configs::absolute_in(program, cwd);
+    if resolved.exists() {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "program {} does not exist — does the preLaunchTask build it?",
+            resolved.display()
+        ))
+    }
+}
+
+/// The FinishedCommand match is the settling signal for a parked launch, but
+/// it depends on OSC 133 shell-integration marks. This is the fallback for
+/// panes that will never produce one: the pane vanished, or its foreground
+/// returned to a plain shell (the task is over) and the grace period passed
+/// without a mark. Returns the abort reason, or `None` to keep waiting. Pure.
+fn pending_abort_reason(
+    pane_exists: bool,
+    foreground_is_shell: bool,
+    waited: std::time::Duration,
+) -> Option<&'static str> {
+    if !pane_exists {
+        return Some("its terminal pane closed");
+    }
+    if foreground_is_shell && waited > PRELAUNCH_MARK_GRACE {
+        return Some("the task produced no command mark (shell integration missing in that pane?)");
+    }
+    None
+}
+
 fn debug_end_message(had_breakpoints: bool, ever_stopped: bool) -> &'static str {
     if had_breakpoints && !ever_stopped {
         "Program exited without hitting a breakpoint"
@@ -2874,6 +2936,17 @@ pub struct App {
     /// Polled each frame by [`App::poll_dap`], which mirrors the paused location
     /// into `editor.stop_line`.
     pub dap_session: Option<crate::dap::session::DapSession>,
+    /// launch.json configurations discovered for the picker (#250); refreshed
+    /// on every picker open so edits are picked up without a restart.
+    debug_configs: Vec<crate::dap::configs::DebugConfig>,
+    /// Name of the launch.json configuration F5 starts. `None` = the
+    /// zero-config "Debug active file" behavior.
+    selected_debug_config: Option<String>,
+    /// A config launch parked behind its `preLaunchTask`: the task runs in
+    /// its pane, and the FinishedCommand sweep launches (exit 0) or aborts
+    /// (non-zero) when the matching command completes. Replaced by a newer
+    /// F5, so only one launch can be pending.
+    pending_debug_launch: Option<PendingDebugLaunch>,
     /// In-flight background `cargo test --no-run` for debug-a-test: the
     /// receiver yields the picked binary (or the build error) and the test
     /// name rides along for the launch. Drained per tick; a second request
@@ -3966,6 +4039,9 @@ impl App {
             mcp_busy_label: None,
             process_picker: None,
             dap_session: None,
+            debug_configs: Vec::new(),
+            selected_debug_config: None,
+            pending_debug_launch: None,
             pending_test_debug: None,
             debug_expanded: std::collections::HashSet::new(),
             watch_exprs: Vec::new(),
@@ -15873,6 +15949,11 @@ impl App {
         self.run_debug.set_active_file(path);
         self.run_debug.feedback = None;
         self.run_debug.feedback_is_error = false;
+        // The launch.json config row (#250): count + F5 selection. Discovery
+        // is two small file reads and this only runs on active-file changes.
+        self.run_debug.config_count =
+            crate::dap::configs::discover_configs(&self.active_workspace_root()).len();
+        self.run_debug.selected_config = self.selected_debug_config.clone();
     }
 
     /// Resolve how to run `file`: which command line to feed the PTY and
@@ -16435,7 +16516,240 @@ impl App {
             }
             return;
         }
+        self.start_selected_debug();
+    }
+
+    /// Start whatever F5 is pointed at: the selected launch.json
+    /// configuration when one is chosen, else the zero-config active file.
+    /// Configs are re-read here so an edited launch.json applies on the next
+    /// F5 without reopening the picker.
+    fn start_selected_debug(&mut self) {
+        if let Some(name) = self.selected_debug_config.clone() {
+            let root = self.active_workspace_root();
+            self.debug_configs = crate::dap::configs::discover_configs(&root);
+            if let Some(cfg) = self.debug_configs.iter().find(|c| c.name == name).cloned() {
+                self.launch_debug_config(&cfg);
+                return;
+            }
+            // The selection outlived its config (file edited/deleted): fall
+            // back to zero-config and say so rather than failing silently.
+            self.selected_debug_config = None;
+            self.run_debug.selected_config = None;
+            self.status = format!(
+                "Debug configuration \"{name}\" no longer exists — debugging the active file"
+            );
+        }
         self.start_debug_session();
+    }
+
+    /// Debug: Select and Start Debugging — the launch.json configurations
+    /// plus the synthesized zero-config entry.
+    pub fn open_debug_config_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let root = self.active_workspace_root();
+        self.debug_configs = crate::dap::configs::discover_configs(&root);
+        let mut rows = vec![ListRow {
+            id: String::from("active"),
+            label: String::from("Debug active file — no configuration"),
+        }];
+        rows.extend(self.debug_configs.iter().enumerate().map(|(i, c)| ListRow {
+            id: i.to_string(),
+            label: format!("{} — {} · {}", c.name, c.type_name, c.source),
+        }));
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::DebugConfig, "Debug Configuration", rows),
+            "No debug configurations (.croft/launch.json or .vscode/launch.json)",
+        );
+    }
+
+    /// Resolve and launch one launch.json configuration: substitution against
+    /// the active editor state, then either straight to the adapter or parked
+    /// behind its `preLaunchTask`.
+    fn launch_debug_config(&mut self, cfg: &crate::dap::configs::DebugConfig) {
+        use crate::dap::configs;
+        if self.dap_session.is_some() {
+            self.debug_stop();
+        }
+        self.pending_debug_launch = None;
+        let root = self.active_workspace_root();
+        let ctx = configs::SubstCtx {
+            workspace_folder: root.clone(),
+            file: self.editor.path.clone(),
+        };
+        let rc = match configs::resolve(cfg, &ctx) {
+            Ok(rc) => rc,
+            Err(e) => {
+                self.debug_error(e);
+                return;
+            }
+        };
+        if let Some(task_label) = rc.pre_launch_task.clone() {
+            let tasks = crate::tasks::discover_tasks(&root);
+            let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
+                self.debug_error(format!(
+                    "preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
+                ));
+                return;
+            };
+            let command = task.command.clone();
+            let Some(pane) = self.run_project_task(task) else {
+                // run_project_task already reported why the pane failed.
+                return;
+            };
+            self.pending_debug_launch = Some(PendingDebugLaunch {
+                pane,
+                command,
+                config: rc,
+                started: std::time::Instant::now(),
+            });
+            self.run_debug.feedback = Some(format!("preLaunchTask \"{task_label}\" running…"));
+            self.run_debug.feedback_is_error = false;
+            self.status =
+                format!("preLaunchTask \"{task_label}\" running — debug starts when it exits 0");
+            return;
+        }
+        self.launch_resolved_config(rc);
+    }
+
+    /// The editor's breakpoints in launch shape, shared by every session
+    /// starter (zero-config and launch.json alike).
+    fn collect_editor_breakpoints(
+        &self,
+    ) -> std::collections::BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> {
+        self.editor
+            .breakpoints
+            .iter()
+            .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
+            .collect()
+    }
+
+    /// Spawn the adapter for a resolved launch.json configuration and hand it
+    /// the built launch/attach request.
+    fn launch_resolved_config(&mut self, mut rc: crate::dap::configs::ResolvedConfig) {
+        use crate::dap::configs::{self, RequestKind};
+        use crate::dap::session::AdapterKind;
+        let breakpoints = self.collect_editor_breakpoints();
+        let cwd = rc
+            .cwd
+            .clone()
+            .unwrap_or_else(|| self.active_workspace_root());
+        let name = rc.name.clone();
+        let result = match rc.kind {
+            AdapterKind::Debugpy => {
+                if rc.request == RequestKind::Launch && rc.program.is_none() && rc.module.is_none()
+                {
+                    self.debug_error(format!(
+                        "config \"{name}\": a python launch needs a \"program\" or \"module\""
+                    ));
+                    return;
+                }
+                match crate::dap::install::ensure_debug_venv() {
+                    Ok(py) => {
+                        let adapter_args =
+                            vec![String::from("-m"), String::from("debugpy.adapter")];
+                        crate::dap::session::DapSession::launch_with(
+                            &py.to_string_lossy(),
+                            &adapter_args,
+                            &cwd,
+                            configs::debugpy_request(&rc, &py),
+                            breakpoints,
+                        )
+                    }
+                    Err(e) => {
+                        self.debug_error(format!("Debugger setup failed: {e}"));
+                        return;
+                    }
+                }
+            }
+            AdapterKind::LldbDap => {
+                let Some(adapter) = lldb_dap_path() else {
+                    self.debug_error(lldb_dap_missing_message());
+                    return;
+                };
+                match rc.request {
+                    RequestKind::Launch => {
+                        let Some(program) = rc.program.as_deref() else {
+                            self.debug_error(format!(
+                                "config \"{name}\": an lldb launch needs a \"program\" (the built binary)"
+                            ));
+                            return;
+                        };
+                        match resolve_lldb_program(program, &cwd) {
+                            Ok(resolved) => {
+                                rc.program = Some(resolved.to_string_lossy().into_owned())
+                            }
+                            Err(e) => {
+                                self.debug_error(format!("config \"{name}\": {e}"));
+                                return;
+                            }
+                        }
+                    }
+                    RequestKind::Attach => {
+                        if rc.process_id.is_none() {
+                            self.debug_error(format!(
+                                "config \"{name}\": an lldb attach needs a numeric \"processId\""
+                            ));
+                            return;
+                        }
+                    }
+                }
+                crate::dap::session::DapSession::launch_with(
+                    &adapter,
+                    &[],
+                    &cwd,
+                    configs::lldb_request(&rc),
+                    breakpoints,
+                )
+            }
+            AdapterKind::JsDebug => {
+                if rc.request == RequestKind::Launch && rc.program.is_none() {
+                    self.debug_error(format!(
+                        "config \"{name}\": a node launch needs a \"program\""
+                    ));
+                    return;
+                }
+                if rc.request == RequestKind::Attach && rc.port.is_none() {
+                    self.debug_error(format!("config \"{name}\": a node attach needs a \"port\""));
+                    return;
+                }
+                let node = match crate::dap::install::node_program() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.debug_error(format!("{e}"));
+                        return;
+                    }
+                };
+                let server = match crate::dap::install::ensure_js_debug() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.debug_error(format!("Debugger setup failed: {e}"));
+                        return;
+                    }
+                };
+                crate::dap::session::DapSession::launch_js_with(
+                    &node,
+                    &server,
+                    &cwd,
+                    configs::js_request(&rc),
+                    breakpoints,
+                )
+            }
+        };
+        match result {
+            Ok(session) => {
+                self.dap_session = Some(session);
+                let verb = match rc.request {
+                    RequestKind::Launch => "Debugging",
+                    RequestKind::Attach => "Attached:",
+                };
+                self.run_debug.feedback = Some(format!("{verb} {name}"));
+                self.run_debug.feedback_is_error = false;
+                self.status =
+                    format!("{verb} {name} — F5 continue · F10 step over · Shift+F5 stop");
+                self.reveal_debug_view();
+            }
+            Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
+        }
     }
 
     /// Launch a debug session for the active file, choosing the adapter by file
@@ -16443,7 +16757,6 @@ impl App {
     /// languages route to lldb-dap.
     fn start_debug_session(&mut self) {
         use crate::dap::session::AdapterKind;
-        use std::collections::BTreeMap;
         let Some(path) = self.editor.path.clone() else {
             self.debug_error(String::from("Open a file to debug"));
             return;
@@ -16489,12 +16802,7 @@ impl App {
                 return;
             }
         };
-        let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
-            .editor
-            .breakpoints
-            .iter()
-            .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
-            .collect();
+        let breakpoints = self.collect_editor_breakpoints();
         let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
         let py_str = py.to_string_lossy().into_owned();
         let debug_root = self
@@ -16534,7 +16842,6 @@ impl App {
     /// session machinery (which transparently spawns the parent + child
     /// connections js-debug requires). TypeScript binds via source maps.
     fn start_js_debug_session(&mut self, path: &Path) {
-        use std::collections::BTreeMap;
         let node = match crate::dap::install::node_program() {
             Ok(n) => n,
             Err(e) => {
@@ -16549,12 +16856,7 @@ impl App {
                 return;
             }
         };
-        let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
-            .editor
-            .breakpoints
-            .iter()
-            .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
-            .collect();
+        let breakpoints = self.collect_editor_breakpoints();
         let debug_root = self
             .roots
             .owning_root(path)
@@ -16616,17 +16918,11 @@ impl App {
     /// for a directly-debugged executable). Shared by the compiled-source path
     /// and the executable-binary path so neither duplicates the launch plumbing.
     fn launch_lldb(&mut self, binary: &Path, label_path: &Path) {
-        use std::collections::BTreeMap;
         let Some(adapter) = lldb_dap_path() else {
             self.debug_error(lldb_dap_missing_message());
             return;
         };
-        let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
-            .editor
-            .breakpoints
-            .iter()
-            .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
-            .collect();
+        let breakpoints = self.collect_editor_breakpoints();
         let cwd = label_path
             .parent()
             .unwrap_or(self.workspace_root())
@@ -16938,7 +17234,7 @@ impl App {
         if self.dap_session.is_some() {
             self.debug_stop();
         }
-        self.start_debug_session();
+        self.start_selected_debug();
     }
 
     /// Shift+F5: stop debugging and tear the session down.
@@ -19419,6 +19715,23 @@ impl App {
                     self.run_project_task(task);
                 }
             }
+            ListPurpose::DebugConfig => {
+                if row.id == "active" {
+                    self.selected_debug_config = None;
+                    self.run_debug.selected_config = None;
+                    self.start_selected_debug();
+                } else if let Some(cfg) = row
+                    .id
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| self.debug_configs.get(i))
+                    .cloned()
+                {
+                    self.selected_debug_config = Some(cfg.name.clone());
+                    self.run_debug.selected_config = Some(cfg.name.clone());
+                    self.launch_debug_config(&cfg);
+                }
+            }
             ListPurpose::SessionParticipant => {
                 if let Ok(id) = row.id.parse::<u64>() {
                     self.open_participant_actions(id);
@@ -19595,7 +19908,10 @@ impl App {
     /// Run `task` in its own named terminal pane. Rerunning a task whose
     /// pane sits idle at a prompt writes the command into that pane
     /// instead of stacking a new one; a busy pane gets a fresh sibling.
-    pub fn run_project_task(&mut self, task: crate::tasks::Task) {
+    /// Run a task in its named pane. Returns the pane's uid so a caller can
+    /// correlate the task's FinishedCommand (the preLaunchTask gate, #250);
+    /// `None` when no pane could be started (already reported in `status`).
+    pub fn run_project_task(&mut self, task: crate::tasks::Task) -> Option<u64> {
         let pane_name = format!("Task: {}", task.label);
         // Ctrl-E + Ctrl-U first: the idle shell's line editor may hold a
         // half-typed command that would otherwise concatenate and run
@@ -19619,17 +19935,20 @@ impl App {
             self.show_terminal = true;
             self.focus_pane(Pane::Terminal);
             self.status = format!("Running {}", task.label);
-            return;
+            return Some(self.terminals[idx].uid());
         }
         match crate::widgets::terminal::PtyTerminal::new(&self.active_workspace_root()) {
             Ok(mut term) => {
                 term.set_manual_name(Some(pane_name));
                 term.write_input(command.as_bytes());
+                let uid = term.uid();
                 self.insert_terminal(term);
                 self.status = format!("Running {}", task.label);
+                Some(uid)
             }
             Err(e) => {
                 self.status = format!("Could not start task pane: {e}");
+                None
             }
         }
     }
@@ -19640,7 +19959,9 @@ impl App {
     pub fn run_build_task(&mut self) {
         let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
         match crate::tasks::default_build_task(&tasks).cloned() {
-            Some(task) => self.run_project_task(task),
+            Some(task) => {
+                self.run_project_task(task);
+            }
             None => {
                 self.open_run_task_picker();
                 self.status = "No build task detected; pick one".to_string();
@@ -19651,7 +19972,9 @@ impl App {
     /// Tasks: Rerun Last Task.
     pub fn rerun_last_task(&mut self) {
         match self.last_task.clone() {
-            Some(task) => self.run_project_task(task),
+            Some(task) => {
+                self.run_project_task(task);
+            }
             None => self.status = "No task has run yet".to_string(),
         }
     }
@@ -23512,6 +23835,9 @@ impl App {
         // Finished-command outputs to run through the build matchers after
         // the immutable pane sweep (#119): (pane index, cwd, output).
         let mut build_scans: Vec<(u64, Option<PathBuf>, String)> = Vec::new();
+        // A preLaunchTask completing settles the parked debug launch (#250);
+        // recorded here and acted on after the sweep (launching mutates self).
+        let mut settled_launch: Option<Option<i32>> = None;
         for t in &self.terminals {
             // Keep every pane on the current trigger set, wherever it was
             // created (a ptr-eq no-op when already current).
@@ -23566,6 +23892,11 @@ impl App {
                             ts,
                         });
                 }
+                if let Some(p) = self.pending_debug_launch.as_ref()
+                    && finished_settles_pending(t.uid(), &f.cmd, p.pane, &p.command)
+                {
+                    settled_launch = Some(f.exit);
+                }
                 if t.focused || f.dur < LONG_COMMAND_NOTIFY {
                     continue;
                 }
@@ -23577,13 +23908,46 @@ impl App {
                 ));
             }
         }
+        if let Some(exit) = settled_launch
+            && let Some(pending) = self.pending_debug_launch.take()
+        {
+            if exit == Some(0) {
+                self.launch_resolved_config(pending.config);
+            } else {
+                let code = exit.map_or_else(|| String::from("?"), |c| c.to_string());
+                self.debug_error(format!(
+                    "preLaunchTask exited {code} — debug launch aborted (its pane has the output)"
+                ));
+            }
+        }
+        // Liveness fallback for a still-parked launch: the FinishedCommand
+        // match depends on OSC 133 marks, and a pane without integration (or
+        // one the user closed) would otherwise park the launch forever.
+        let mut pending_aborted = false;
+        if settled_launch.is_none()
+            && let Some(p) = self.pending_debug_launch.as_ref()
+        {
+            let pane = self.terminals.iter().find(|t| t.uid() == p.pane);
+            if let Some(reason) = pending_abort_reason(
+                pane.is_some(),
+                pane.is_some_and(|t| t.foreground_is_shell()),
+                p.started.elapsed(),
+            ) {
+                self.pending_debug_launch = None;
+                self.debug_error(format!(
+                    "preLaunchTask abandoned: {reason} — debug launch aborted"
+                ));
+                pending_aborted = true;
+            }
+        }
         let mut build_changed = false;
         for (pane, cwd, output) in build_scans {
             build_changed |= self.apply_build_scan(pane, cwd.as_deref(), &output);
         }
         // Captures collect silently (iTerm2's model: the panel is the
         // surface, not the status bar), but still trigger a redraw.
-        let had_captures = !captured.is_empty() || build_changed;
+        let had_captures =
+            !captured.is_empty() || build_changed || settled_launch.is_some() || pending_aborted;
         for c in captured {
             self.captures.push(c);
         }
@@ -25663,6 +26027,7 @@ impl App {
                 }
             },
             Cmd::StartDebugging => self.debug_start_or_continue(),
+            Cmd::SelectDebugConfig => self.open_debug_config_picker(),
             Cmd::StopDebugging => self.debug_stop(),
             Cmd::PauseDebugging => self.debug_pause(),
             Cmd::RestartDebugging => self.debug_restart(),
@@ -28941,6 +29306,8 @@ impl App {
                         }
                     } else if self.run_debug.click_button(m.column, m.row) {
                         self.run_debug_button_action();
+                    } else if self.run_debug.click_config(m.column, m.row) {
+                        self.open_debug_config_picker();
                     }
                     return;
                 }

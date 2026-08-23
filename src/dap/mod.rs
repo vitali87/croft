@@ -17,6 +17,7 @@
 //! Yama `ptrace_scope`. The elevation decision is therefore platform-aware; see
 //! [`remote_attach::elevation_required`].
 
+pub mod configs;
 pub mod discovery;
 pub mod install;
 pub mod log;
