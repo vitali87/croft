@@ -12713,8 +12713,20 @@ impl App {
             ));
             spans.push(Span::raw(" "));
         }
-        spans.extend(git_status_spans(&scm_status));
-        spans.push(Span::raw("  "));
+        // Hairline zone divider (│): fences the brand/git zone, the
+        // diagnostics cluster, and the transient message off from each other
+        // so the bar reads as segments instead of one run of text. Quiet on
+        // both the navy and near-black bars.
+        let zone_div = Style::default().fg(self.theme.ui(Color::Rgb(0x3a, 0x41, 0x50)));
+        let scm_spans = git_status_spans(&scm_status);
+        // The wordmark already ends in a space; the git spans don't, so buy
+        // the divider one cell of air only when the branch segment painted.
+        let scm_present = !scm_spans.is_empty();
+        spans.extend(scm_spans);
+        spans.push(Span::styled(
+            if scm_present { " \u{2502}" } else { "\u{2502}" },
+            zone_div,
+        ));
         // Persistent orange badge for a remote session with no dtach: it can't
         // survive a transport drop, so flag it for the whole session (rendered
         // before the transient status so a status update never hides it).
@@ -12773,10 +12785,12 @@ impl App {
         let err_count = self.problems.error_count();
         let warn_count = self.problems.warning_count();
         let diag_start_col: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
-        let diag_text = format!(" \u{ea87} {err_count}  \u{ea6c} {warn_count} ");
+        // One cell between the counts, not three: the errors and warnings
+        // read as a single health cluster (they already share one hit rect).
+        let diag_text = format!(" \u{ea87} {err_count} \u{ea6c} {warn_count} ");
         let diag_len = diag_text.chars().count() as u16;
         spans.push(Span::styled(
-            format!(" \u{ea87} {err_count} "),
+            format!(" \u{ea87} {err_count}"),
             Style::default().fg(self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))),
         ));
         spans.push(Span::styled(
@@ -12784,10 +12798,15 @@ impl App {
             Style::default().fg(self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00))),
         ));
         // Transient status message (e.g. "Saved editor.rs"), no keybinding
-        // cheat-sheet — those live in F1 / the Command Palette now.
+        // cheat-sheet — those live in F1 / the Command Palette now. Fenced
+        // behind a divider and dimmed so commentary reads apart from the
+        // clickable clusters around it.
         if !self.status.is_empty() {
-            spans.push(Span::raw("  "));
-            spans.push(Span::raw(self.status.clone()));
+            spans.push(Span::styled("\u{2502} ", zone_div));
+            spans.push(Span::styled(
+                self.status.clone(),
+                Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
+            ));
         }
 
         if let Some(osk) = self.osk.as_mut() {
@@ -12817,27 +12836,24 @@ impl App {
 
         // ---- Right cluster: document facts, right-justified. Indentation /
         // encoding / EOL / language are clickable to change (hit rects recorded
-        // below). ----
-        let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8)));
-        let right: Vec<Span> = vec![
-            Span::styled(
-                format!(
-                    " Ln {}, Col {} ",
-                    self.editor.cursor_row + 1,
-                    self.editor.cursor_col + 1
-                ),
-                dim,
+        // below). A hairline │ marks each seam so the segments read as
+        // separate controls, one shade brighter than the transient message so
+        // controls and commentary stop sharing a costume; the clickable ones
+        // take a hover fill under the pointer (spans are built after `rx` is
+        // known, below, so hover can be computed against this frame's rects).
+        let seg_texts: [String; 5] = [
+            format!(
+                " Ln {}, Col {} ",
+                self.editor.cursor_row + 1,
+                self.editor.cursor_col + 1
             ),
-            Span::styled(format!(" {} ", self.editor.indent_style().label()), dim),
-            Span::styled(format!(" {} ", self.editor.encoding.name()), dim),
-            Span::styled(format!(" {} ", self.editor.eol.label()), dim),
-            Span::styled(format!(" {} ", self.editor.language_label()), dim),
+            format!(" {} ", self.editor.indent_style().label()),
+            format!(" {} ", self.editor.encoding.name()),
+            format!(" {} ", self.editor.eol.label()),
+            format!(" {} ", self.editor.language_label()),
         ];
-        let widths: Vec<u16> = right
-            .iter()
-            .map(|s| s.content.chars().count() as u16)
-            .collect();
-        let right_total: u16 = widths.iter().sum();
+        let widths: Vec<u16> = seg_texts.iter().map(|s| s.chars().count() as u16).collect();
+        let right_total: u16 = widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1);
         // The right cluster paints OVER the left paragraph, so an over-long
         // transient loses exactly its tail — for "Opened <deep path>" that
         // was the filename, the one informative part (#100). Middle-elide
@@ -12856,7 +12872,9 @@ impl App {
             if let Some(last) = spans.last_mut()
                 && last.content.chars().count() as u16 > avail
             {
-                *last = Span::raw(elide_middle(&self.status, avail as usize));
+                // Keep the message's dim style through the elision so a
+                // truncated transient doesn't suddenly brighten.
+                *last = Span::styled(elide_middle(&self.status, avail as usize), last.style);
             }
         }
 
@@ -12892,6 +12910,46 @@ impl App {
             } else if self.status_diag_rect.right() > rx {
                 self.status_diag_rect.width = rx - self.status_diag_rect.x;
             }
+            // Build the spans now that x positions are known: segment fg one
+            // shade up from the transient's dim gray, │ dividers between, and
+            // a hover fill on the clickable segments (indices 1..=4) when the
+            // pointer rests on them — same affordance as the activity bar.
+            // Ln/Col (index 0) is a readout, not a control, so it never
+            // hovers. Hit rects recorded in the same pass.
+            let seg_style = Style::default().fg(self.theme.ui(Color::Rgb(0xc9, 0xd2, 0xe3)));
+            let hover_style = Style::default()
+                .bg(self.theme.ui(Color::Rgb(0x2a, 0x31, 0x40)))
+                .fg(self.theme.ui(Color::White));
+            let mut right: Vec<Span> = Vec::with_capacity(seg_texts.len() * 2 - 1);
+            let mut cx = rx;
+            for (i, text) in seg_texts.iter().enumerate() {
+                if i > 0 {
+                    right.push(Span::styled("\u{2502}", zone_div));
+                    cx = cx.saturating_add(1);
+                }
+                let r = Rect {
+                    x: cx,
+                    y: status_rect.y,
+                    width: widths[i],
+                    height: 1,
+                };
+                let hovered = i > 0
+                    && self
+                        .pointer_cell
+                        .is_some_and(|(pc, pr)| rect_contains(r, pc, pr));
+                right.push(Span::styled(
+                    text.clone(),
+                    if hovered { hover_style } else { seg_style },
+                ));
+                match i {
+                    1 => self.status_indent_rect = r,
+                    2 => self.status_encoding_rect = r,
+                    3 => self.status_eol_rect = r,
+                    4 => self.status_language_rect = r,
+                    _ => {}
+                }
+                cx = cx.saturating_add(widths[i]);
+            }
             frame.render_widget(
                 Paragraph::new(Line::from(right)).style(Style::default().bg(status_bg)),
                 Rect {
@@ -12901,24 +12959,6 @@ impl App {
                     height: status_rect.height,
                 },
             );
-            // Record hit rects: indices 1=indentation, 2=encoding, 3=EOL, 4=language.
-            let mut cx = rx;
-            for (i, w) in widths.iter().enumerate() {
-                let r = Rect {
-                    x: cx,
-                    y: status_rect.y,
-                    width: *w,
-                    height: 1,
-                };
-                match i {
-                    1 => self.status_indent_rect = r,
-                    2 => self.status_encoding_rect = r,
-                    3 => self.status_eol_rect = r,
-                    4 => self.status_language_rect = r,
-                    _ => {}
-                }
-                cx = cx.saturating_add(*w);
-            }
         }
 
         // Overlays render last so they sit on top of everything else. The port

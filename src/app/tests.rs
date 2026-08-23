@@ -3250,7 +3250,10 @@ fn clicking_the_position_readout_does_not_open_problems() {
     use ratatui::{Terminal, backend::TestBackend};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let mut term = Terminal::new(TestBackend::new(50, 20)).unwrap();
+    // 56 cols: the right cluster (51 cells with its │ dividers) fits, but its
+    // left edge still lands inside the diagnostics cluster, so the clip below
+    // is exercised.
+    let mut term = Terminal::new(TestBackend::new(56, 20)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
 
     // Find the status row and the column where the position readout paints.
@@ -27922,10 +27925,11 @@ fn status_elision_never_fires_on_a_message_that_fits() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     app.status = String::from("Quick select: type a label to copy, UPPERCASE pastes, Esc cancels");
-    // 150 cols: prefix (with the branch segment) + message + right cluster
-    // total 149, so the message fits and must paint verbatim — elision may
-    // only fire when the arithmetic says the message truly cannot fit.
-    let backend = ratatui::backend::TestBackend::new(150, 40);
+    // 153 cols: prefix (with the branch segment and zone dividers) + message
+    // + right cluster (with its │ seams) total 152, so the message fits and
+    // must paint verbatim — elision may only fire when the arithmetic says
+    // the message truly cannot fit.
+    let backend = ratatui::backend::TestBackend::new(153, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let buf = term.backend().buffer().clone();
