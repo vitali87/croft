@@ -34,6 +34,10 @@ pub struct Task {
     /// Task executes when several carry the build group. Always false for
     /// convention-derived sources (Makefile, Cargo, …).
     pub is_default: bool,
+    /// tasks.json `problemMatcher`, kept raw ("$name" string, object, or
+    /// array); `problem_matchers::from_tasks_json` translates it when the
+    /// task runs (#252). Always None for convention-derived sources.
+    pub problem_matcher: Option<serde_json::Value>,
 }
 
 /// Every task the workspace's manifests declare, in source priority
@@ -108,6 +112,7 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
                 source: "tasks.json".to_string(),
                 is_build,
                 is_default,
+                problem_matcher: t.get("problemMatcher").cloned(),
             })
         })
         .collect()
@@ -146,6 +151,7 @@ fn makefile_tasks(root: &Path) -> Vec<Task> {
             source: "Makefile".to_string(),
             is_build: name == "build" || name == "all",
             is_default: false,
+            problem_matcher: None,
         });
     }
     out
@@ -182,6 +188,7 @@ fn justfile_tasks(root: &Path) -> Vec<Task> {
             source: "justfile".to_string(),
             is_build: name == "build",
             is_default: false,
+            problem_matcher: None,
         });
     }
     out
@@ -215,6 +222,7 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
             source: "package.json".to_string(),
             is_build: name == "build",
             is_default: false,
+            problem_matcher: None,
         })
         .collect()
 }
@@ -236,6 +244,7 @@ fn cargo_tasks(root: &Path) -> Vec<Task> {
         source: "Cargo.toml".to_string(),
         is_build,
         is_default: false,
+        problem_matcher: None,
     })
     .collect()
 }
@@ -258,6 +267,7 @@ fn pyproject_tasks(root: &Path) -> Vec<Task> {
                 source: "pyproject.toml".to_string(),
                 is_build: false,
                 is_default: false,
+                problem_matcher: None,
             });
         }
     }
@@ -268,6 +278,7 @@ fn pyproject_tasks(root: &Path) -> Vec<Task> {
             source: "pyproject.toml".to_string(),
             is_build: false,
             is_default: false,
+            problem_matcher: None,
         });
     }
     out
@@ -451,6 +462,29 @@ mod tests {
                 .any(|t| t.command == "pnpm run build" && t.is_build),
             "the build script is the build task"
         );
+    }
+
+    #[test]
+    fn tasks_json_problem_matcher_rides_along_raw() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [
+  { "label": "cc", "command": "make", "problemMatcher": "$gcc" },
+  { "label": "plain", "command": "true" }
+] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let cc = tasks.iter().find(|t| t.label == "cc").unwrap();
+        assert_eq!(
+            cc.problem_matcher,
+            Some(serde_json::json!("$gcc")),
+            "the raw problemMatcher value travels with the task"
+        );
+        let plain = tasks.iter().find(|t| t.label == "plain").unwrap();
+        assert_eq!(plain.problem_matcher, None);
     }
 
     #[test]

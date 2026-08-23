@@ -28,7 +28,9 @@ pub struct BuildDiag {
     pub col: u32,
     pub severity: DiagnosticSeverity,
     pub message: String,
-    pub source: &'static str,
+    /// Which matcher produced it: a built-in tag (`rustc`, `tsc`, …) or a
+    /// user matcher's name (#252).
+    pub source: String,
 }
 
 fn severity(word: &str) -> DiagnosticSeverity {
@@ -85,7 +87,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                     col: zero(&c[3]),
                     severity: sev,
                     message: msg,
-                    source: "rustc",
+                    source: String::from("rustc"),
                 });
             }
             continue;
@@ -100,7 +102,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                 col: zero(&c[3]),
                 severity: severity(&c[4]),
                 message: format!("{}: {}", &c[5], &c[6]),
-                source: "tsc",
+                source: String::from("tsc"),
             });
             continue;
         }
@@ -116,7 +118,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                     col: 0,
                     severity: DiagnosticSeverity::Error,
                     message: line.trim().to_string(),
-                    source: "python",
+                    source: String::from("python"),
                 });
             }
             continue;
@@ -133,7 +135,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                     col: zero(&c[2]),
                     severity: severity(&c[3]),
                     message: c[4].trim().to_string(),
-                    source: "eslint",
+                    source: String::from("eslint"),
                 });
             }
             continue;
@@ -145,7 +147,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                 col: zero(&c[3]),
                 severity: severity(&c[4]),
                 message: c[5].to_string(),
-                source: "build",
+                source: String::from("build"),
             });
             continue;
         }

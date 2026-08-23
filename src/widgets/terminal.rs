@@ -617,6 +617,20 @@ pub struct PtyTerminal {
     /// Notify/bell trigger firings from the reader thread, awaiting the
     /// app's drain into the status bar.
     trigger_rx: std::sync::mpsc::Receiver<crate::triggers::TriggerHit>,
+    /// Background problem matchers (#252): the global watch-capable set
+    /// (from matchers.json, swapped whole like `triggers`) plus this pane's
+    /// task-assigned matcher, both read by the reader thread's watch
+    /// engine per chunk.
+    watch_set: Arc<std::sync::Mutex<std::sync::Arc<crate::problem_matchers::WatchSet>>>,
+    pane_watch:
+        Arc<std::sync::Mutex<Option<std::sync::Arc<crate::problem_matchers::CompiledMatcher>>>>,
+    /// Published watch batches (cwd at publish time + diagnostics),
+    /// awaiting the app's drain into PROBLEMS.
+    #[allow(clippy::type_complexity)]
+    watch_rx: std::sync::mpsc::Receiver<(
+        Option<std::path::PathBuf>,
+        Vec<crate::build_matchers::BuildDiag>,
+    )>,
     /// The theme's 16 ANSI colors; Named and Indexed 0-15 cell colors render
     /// through it so panes look the same on every host terminal (VS Code
     /// owns its terminal palette the same way). Synced by the app's theme
@@ -1319,6 +1333,38 @@ impl PtyTerminal {
         self.trigger_rx.try_iter().collect()
     }
 
+    /// Swap in the global background-matcher set (#252), same steady-state
+    /// no-op contract as [`Self::set_triggers`].
+    pub fn set_watch_set(&self, set: std::sync::Arc<crate::problem_matchers::WatchSet>) {
+        let mut cur = self.watch_set.lock().unwrap();
+        if std::sync::Arc::ptr_eq(&cur, &set) {
+            return;
+        }
+        *cur = set;
+    }
+
+    /// Assign (or clear) the task-specific background matcher for this
+    /// pane — the `problemMatcher` of the task running here.
+    pub fn set_pane_watch(
+        &self,
+        matcher: Option<std::sync::Arc<crate::problem_matchers::CompiledMatcher>>,
+    ) {
+        *self.pane_watch.lock().unwrap() = matcher;
+    }
+
+    /// Watch batches published by the reader thread since the last drain:
+    /// the pane cwd at publish time plus the cycle's diagnostics (possibly
+    /// empty — an empty batch is what clears fixed errors).
+    #[allow(clippy::type_complexity)]
+    pub fn drain_watch_batches(
+        &self,
+    ) -> Vec<(
+        Option<std::path::PathBuf>,
+        Vec<crate::build_matchers::BuildDiag>,
+    )> {
+        self.watch_rx.try_iter().collect()
+    }
+
     /// Swap the ANSI palette the render loop maps Named/Indexed 0-15 cell
     /// colors through (the theme sync calls this every pass; unchanged
     /// palettes are a no-op so the pane never dirties spuriously).
@@ -1495,6 +1541,18 @@ impl PtyTerminal {
         )));
         let triggers_for_thread = triggers.clone();
         let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<crate::triggers::TriggerHit>();
+        let watch_set = Arc::new(std::sync::Mutex::new(std::sync::Arc::new(
+            crate::problem_matchers::WatchSet::default(),
+        )));
+        let watch_set_for_thread = watch_set.clone();
+        let pane_watch = Arc::new(std::sync::Mutex::new(
+            None::<std::sync::Arc<crate::problem_matchers::CompiledMatcher>>,
+        ));
+        let pane_watch_for_thread = pane_watch.clone();
+        let (watch_tx, watch_rx) = std::sync::mpsc::channel::<(
+            Option<std::path::PathBuf>,
+            Vec<crate::build_matchers::BuildDiag>,
+        )>();
 
         // Shutdown pipe + master fd for the reader's poll gate: the reader
         // must be wakeable without depending on the pty ever reaching EOF.
@@ -1510,6 +1568,8 @@ impl PtyTerminal {
             let mut wipe_sniffer = WipeSniffer::default();
             let mut trigger_scanner = crate::triggers::TriggerScanner::new();
             let mut trigger_hits = Vec::new();
+            let mut watch_engine = crate::problem_matchers::WatchEngine::default();
+            let mut watch_lines: Vec<String> = Vec::new();
             // Per-pane monotonic id for captured inline images; the overlay
             // layout key uses it to tell a new picture from a moved one.
             let mut image_seq = 0u64;
@@ -1690,7 +1750,31 @@ impl PtyTerminal {
                         // its alt tracking and string state machine desync
                         // and skipped-gap output splices into phantom lines.
                         let trig = triggers_for_thread.lock().unwrap().clone();
-                        trigger_scanner.scan(&buf[..n], &trig, &mut trigger_hits);
+                        // Watch problem matchers (#252) ride the same
+                        // scanner: when any are configured, the completed
+                        // lines it already produces feed the per-pane watch
+                        // engine (no second byte scan over the stream).
+                        let wset = watch_set_for_thread.lock().unwrap().clone();
+                        let pwatch = pane_watch_for_thread.lock().unwrap().clone();
+                        if wset.matchers.is_empty() && pwatch.is_none() {
+                            trigger_scanner.scan(&buf[..n], &trig, &mut trigger_hits);
+                        } else {
+                            watch_lines.clear();
+                            trigger_scanner.scan_collect(
+                                &buf[..n],
+                                &trig,
+                                &mut trigger_hits,
+                                Some(&mut watch_lines),
+                            );
+                            for line in watch_lines.drain(..) {
+                                if let Some(batch) =
+                                    watch_engine.feed(&line, &wset, pwatch.as_ref())
+                                {
+                                    let cwd = osc7_for_thread.lock().unwrap().clone();
+                                    let _ = watch_tx.send((cwd, batch));
+                                }
+                            }
+                        }
                         for h in trigger_hits.drain(..) {
                             let _ = trigger_tx.send(h);
                         }
@@ -1764,6 +1848,9 @@ impl PtyTerminal {
             hints: None,
             triggers,
             trigger_rx,
+            watch_set,
+            pane_watch,
+            watch_rx,
             palette: crate::theme::VSCODE_ANSI,
             images,
             #[cfg(test)]
