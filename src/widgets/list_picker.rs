@@ -31,6 +31,10 @@ pub enum ListPurpose {
     /// Merge-conflict resolution: the rows are Accept Current / Incoming /
     /// Both for the conflict block at the cursor; `id` names the resolution.
     MergeConflict,
+    /// Change Color Presentation (#254): the rows are the server's
+    /// alternative spellings of the color at the cursor; `id` is an index
+    /// into the App's pending presentation edits.
+    ColorPresentation,
     /// Auto-detected project tasks (Tasks: Run Task): the rows are the
     /// commands discovered from the workspace's manifests; `id` is an
     /// index into the App's discovered-task list.

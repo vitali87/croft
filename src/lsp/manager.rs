@@ -373,6 +373,69 @@ pub struct InlayHintsUpdate {
     pub hints: Vec<InlayHintItem>,
 }
 
+/// One server fold span (#254), 0-based inclusive line indexes matching
+/// the editor's (header, end) fold model: collapsing hides
+/// `start_line + 1 ..= end_line`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldingRangeItem {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub kind: FoldRangeKind,
+}
+
+/// The LSP folding-range kind, `Other` for servers that send none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldRangeKind {
+    Comment,
+    Imports,
+    Region,
+    Other,
+}
+
+/// A complete fold-span set for one document; `seq` mirrors
+/// [`InlayHintsUpdate`]'s staleness contract.
+#[derive(Debug)]
+pub struct FoldingRangesUpdate {
+    pub path: PathBuf,
+    pub seq: u64,
+    pub ranges: Vec<FoldingRangeItem>,
+}
+
+/// One document color value (#254): the UTF-16 range of the literal and
+/// its decoded RGB (alpha dropped — terminal cells can't blend). The
+/// raw f32 channels ride along for the colorPresentation round trip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColorItem {
+    pub line: u32,
+    pub character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub raw: (f32, f32, f32, f32),
+}
+
+/// A fresh, complete color set for one document; same seq contract as
+/// [`InlayHintsUpdate`].
+#[derive(Debug)]
+pub struct DocumentColorsUpdate {
+    pub path: PathBuf,
+    pub seq: u64,
+    pub colors: Vec<ColorItem>,
+}
+
+/// The alternative spellings of one color value (#254), each with the
+/// char-indexed edits that rewrite the document to it. Answered for a
+/// user-initiated picker, so every early-out replies (`presentations`
+/// empty ⇒ nothing to offer).
+#[derive(Debug)]
+pub struct ColorPresentationsResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    pub presentations: Vec<(String, Vec<TextSpanEdit>)>,
+}
+
 /// One row of a call-hierarchy answer: a caller (incoming) or callee
 /// (outgoing), with the location the picker jumps to — the call expression
 /// for incoming calls when the server reports one, the callee's definition
@@ -432,6 +495,21 @@ pub struct LinkedEditingResult {
     pub path: PathBuf,
     /// `(start_line, start_char, end_line, end_char)` per span.
     pub ranges: Vec<(u32, u32, u32, u32)>,
+}
+
+/// One `textDocument/selectionRange` answer (#254): a strictly-ordered
+/// smallest-first chain of UTF-16 spans per requested position (the
+/// server's parent links flattened), index-aligned with the request's
+/// cursors. `unsupported` is true when the request could not be routed
+/// (untracked doc, or no server advertises the provider) so the app can
+/// fall back to tree-sitter ancestry immediately instead of waiting.
+#[derive(Debug)]
+pub struct SelectionRangesResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    pub unsupported: bool,
+    /// Per cursor: `(start_line, start_char, end_line, end_char)`.
+    pub chains: Vec<Vec<(u32, u32, u32, u32)>>,
 }
 
 /// Severity of a diagnostic, normalised off the LSP `DiagnosticSeverity`
@@ -522,6 +600,21 @@ enum Cmd {
         line_count: u32,
         seq: u64,
     },
+    RequestFoldingRanges {
+        path: PathBuf,
+        seq: u64,
+    },
+    RequestDocumentColors {
+        path: PathBuf,
+        seq: u64,
+    },
+    RequestColorPresentations {
+        request_id: u64,
+        path: PathBuf,
+        color: (f32, f32, f32, f32),
+        start: (u32, u32),
+        end: (u32, u32),
+    },
     ChangeDoc {
         path: PathBuf,
         text: String,
@@ -599,6 +692,11 @@ enum Cmd {
         path: PathBuf,
         line: u32,
         character: u32,
+    },
+    RequestSelectionRanges {
+        request_id: u64,
+        path: PathBuf,
+        positions: Vec<(u32, u32)>,
     },
     RequestCallHierarchy {
         request_id: u64,
@@ -681,6 +779,7 @@ pub struct LspManager {
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
     doc_highlights_rx: std_mpsc::Receiver<DocumentHighlightsResult>,
     linked_editing_rx: std_mpsc::Receiver<LinkedEditingResult>,
+    selection_ranges_rx: std_mpsc::Receiver<SelectionRangesResult>,
     calls_rx: std_mpsc::Receiver<CallHierarchyResult>,
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
@@ -688,6 +787,9 @@ pub struct LspManager {
     code_action_rx: std_mpsc::Receiver<CodeActionResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     inlay_rx: std_mpsc::Receiver<InlayHintsUpdate>,
+    folding_rx: std_mpsc::Receiver<FoldingRangesUpdate>,
+    colors_rx: std_mpsc::Receiver<DocumentColorsUpdate>,
+    color_presentations_rx: std_mpsc::Receiver<ColorPresentationsResult>,
     diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
     progress_rx: std_mpsc::Receiver<ProgressUpdate>,
     capability_support: CapabilitySupport,
@@ -729,6 +831,7 @@ impl LspManager {
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
         let (linked_editing_tx, linked_editing_rx) = std_mpsc::channel();
+        let (selection_ranges_tx, selection_ranges_rx) = std_mpsc::channel();
         let (calls_tx, calls_rx) = std_mpsc::channel();
         let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
@@ -736,6 +839,9 @@ impl LspManager {
         let (code_action_tx, code_action_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let (inlay_tx, inlay_rx) = std_mpsc::channel();
+        let (folding_tx, folding_rx) = std_mpsc::channel();
+        let (colors_tx, colors_rx) = std_mpsc::channel();
+        let (color_presentations_tx, color_presentations_rx) = std_mpsc::channel();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
         let (progress_tx, progress_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
@@ -775,6 +881,7 @@ impl LspManager {
                 references: ref_tx,
                 document_highlights: doc_highlights_tx,
                 linked_editing: linked_editing_tx,
+                selection_ranges: selection_ranges_tx,
                 call_hierarchy: calls_tx,
                 workspace_symbols: ws_symbols_tx,
                 rename: rename_tx,
@@ -782,6 +889,9 @@ impl LspManager {
                 code_action: code_action_tx,
                 semantic_tokens: semantic_tx,
                 inlay_hints: inlay_tx,
+                folding_ranges: folding_tx,
+                document_colors: colors_tx,
+                color_presentations: color_presentations_tx,
                 diagnostics: diagnostics_tx,
                 progress: progress_tx,
             },
@@ -803,6 +913,7 @@ impl LspManager {
             ref_rx,
             doc_highlights_rx,
             linked_editing_rx,
+            selection_ranges_rx,
             calls_rx,
             ws_symbols_rx,
             rename_rx,
@@ -810,6 +921,9 @@ impl LspManager {
             code_action_rx,
             semantic_rx,
             inlay_rx,
+            folding_rx,
+            colors_rx,
+            color_presentations_rx,
             diagnostics_rx,
             progress_rx,
             capability_support,
@@ -974,6 +1088,55 @@ impl LspManager {
 
     pub fn drain_inlay_hints(&self) -> Option<InlayHintsUpdate> {
         self.inlay_rx.try_recv().ok()
+    }
+
+    /// Ask the server for the document's fold spans (#254). Fire-and-forget
+    /// on the same open/change cadence as inlay hints; the reply lands in
+    /// [`drain_folding_ranges`] tagged with `seq`. A no-op when no spawned
+    /// server advertises a `foldingRangeProvider`, which is what keeps the
+    /// editor's indentation scan authoritative there.
+    pub fn request_folding_ranges(&self, path: PathBuf, seq: u64) {
+        let _ = self.cmd_tx.send(Cmd::RequestFoldingRanges { path, seq });
+    }
+
+    pub fn drain_folding_ranges(&self) -> Option<FoldingRangesUpdate> {
+        self.folding_rx.try_recv().ok()
+    }
+
+    /// Ask for the document's color values (#254); same fire-and-forget
+    /// seq contract as inlay hints, silent when no server advertises a
+    /// colorProvider — the swatches simply never appear.
+    pub fn request_document_colors(&self, path: PathBuf, seq: u64) {
+        let _ = self.cmd_tx.send(Cmd::RequestDocumentColors { path, seq });
+    }
+
+    pub fn drain_document_colors(&self) -> Option<DocumentColorsUpdate> {
+        self.colors_rx.try_recv().ok()
+    }
+
+    /// Ask for one color value's alternative spellings (#254); the reply
+    /// always arrives (a picker is waiting on it).
+    pub fn request_color_presentations(
+        &mut self,
+        path: PathBuf,
+        color: (f32, f32, f32, f32),
+        start: (u32, u32),
+        end: (u32, u32),
+    ) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestColorPresentations {
+            request_id: id,
+            path,
+            color,
+            start,
+            end,
+        });
+        id
+    }
+
+    pub fn drain_color_presentations(&self) -> Option<ColorPresentationsResult> {
+        self.color_presentations_rx.try_recv().ok()
     }
 
     /// Returns and clears the "a server asked us to re-request inlay hints"
@@ -1151,8 +1314,26 @@ impl LspManager {
         id
     }
 
+    /// Ask for the Expand Selection chains at every cursor (#254): one
+    /// request carries all positions, primary first. Returns the request
+    /// id the reply will echo.
+    pub fn request_selection_ranges(&mut self, path: PathBuf, positions: Vec<(u32, u32)>) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestSelectionRanges {
+            request_id: id,
+            path,
+            positions,
+        });
+        id
+    }
+
     pub fn drain_linked_editing(&self) -> Option<LinkedEditingResult> {
         self.linked_editing_rx.try_recv().ok()
+    }
+
+    pub fn drain_selection_ranges(&self) -> Option<SelectionRangesResult> {
+        self.selection_ranges_rx.try_recv().ok()
     }
 
     /// Fire a call-hierarchy expansion (callers when `incoming`, callees
@@ -1383,6 +1564,7 @@ struct ManagedClient {
     supports_references: bool,
     supports_document_highlight: bool,
     supports_linked_editing: bool,
+    supports_selection_range: bool,
     supports_call_hierarchy: bool,
     supports_workspace_symbols: bool,
     supports_rename: bool,
@@ -1402,6 +1584,8 @@ struct ManagedClient {
     /// Whether the server advertises an `inlayHintProvider`
     /// (rust-analyzer, vtsls, gopls do; ruff does not).
     supports_inlay_hints: bool,
+    supports_folding_range: bool,
+    supports_document_color: bool,
 }
 
 /// Servers are keyed by language AND the file's project root, not language
@@ -1457,6 +1641,7 @@ struct ResultSenders {
     references: std_mpsc::Sender<ReferencesResult>,
     document_highlights: std_mpsc::Sender<DocumentHighlightsResult>,
     linked_editing: std_mpsc::Sender<LinkedEditingResult>,
+    selection_ranges: std_mpsc::Sender<SelectionRangesResult>,
     call_hierarchy: std_mpsc::Sender<CallHierarchyResult>,
     workspace_symbols: std_mpsc::Sender<WorkspaceSymbolsResult>,
     rename: std_mpsc::Sender<RenameResult>,
@@ -1464,6 +1649,9 @@ struct ResultSenders {
     code_action: std_mpsc::Sender<CodeActionResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
     inlay_hints: std_mpsc::Sender<InlayHintsUpdate>,
+    folding_ranges: std_mpsc::Sender<FoldingRangesUpdate>,
+    document_colors: std_mpsc::Sender<DocumentColorsUpdate>,
+    color_presentations: std_mpsc::Sender<ColorPresentationsResult>,
     diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
     progress: std_mpsc::Sender<ProgressUpdate>,
 }
@@ -1579,6 +1767,34 @@ async fn worker_loop(
             } => {
                 state
                     .request_inlay_hints(path, line_count, seq, &tx.inlay_hints)
+                    .await
+            }
+            Cmd::RequestFoldingRanges { path, seq } => {
+                state
+                    .request_folding_ranges(path, seq, &tx.folding_ranges)
+                    .await
+            }
+            Cmd::RequestDocumentColors { path, seq } => {
+                state
+                    .request_document_colors(path, seq, &tx.document_colors)
+                    .await
+            }
+            Cmd::RequestColorPresentations {
+                request_id,
+                path,
+                color,
+                start,
+                end,
+            } => {
+                state
+                    .request_color_presentations(
+                        request_id,
+                        path,
+                        color,
+                        start,
+                        end,
+                        &tx.color_presentations,
+                    )
                     .await
             }
             Cmd::ChangeDoc { path, text } => state.change_doc(path, text).await,
@@ -1698,6 +1914,15 @@ async fn worker_loop(
             } => {
                 state
                     .request_linked_editing(request_id, path, line, character, &tx.linked_editing)
+                    .await
+            }
+            Cmd::RequestSelectionRanges {
+                request_id,
+                path,
+                positions,
+            } => {
+                state
+                    .request_selection_ranges(request_id, path, positions, &tx.selection_ranges)
                     .await
             }
             Cmd::RequestCallHierarchy {
@@ -1879,6 +2104,8 @@ impl WorkerState {
                             one_of_supported(&caps.document_highlight_provider);
                         let supports_linked_editing =
                             linked_editing_supported(&caps.linked_editing_range_provider);
+                        let supports_selection_range =
+                            selection_range_supported(&caps.selection_range_provider);
                         let supports_call_hierarchy =
                             call_hierarchy_supported(&caps.call_hierarchy_provider);
                         let supports_workspace_symbols =
@@ -1891,6 +2118,10 @@ impl WorkerState {
                         let semantic_legend = semantic_legend_of(caps).map(Arc::new);
                         let semantic_supports_range = semantic_tokens_range_supported(caps);
                         let supports_inlay_hints = one_of_supported(&caps.inlay_hint_provider);
+                        let supports_folding_range =
+                            folding_range_supported(&caps.folding_range_provider);
+                        let supports_document_color =
+                            color_provider_supported(&caps.color_provider);
                         log_file::log(&format!(
                             "lsp[{}] spawned, root={} supports_completion={supports} supports_signature_help={supports_signature_help} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_references={supports_references} supports_rename={supports_rename}",
                             config.name,
@@ -1910,6 +2141,7 @@ impl WorkerState {
                             supports_references,
                             supports_document_highlight,
                             supports_linked_editing,
+                            supports_selection_range,
                             supports_call_hierarchy,
                             supports_workspace_symbols,
                             supports_rename,
@@ -1918,6 +2150,8 @@ impl WorkerState {
                             semantic_legend,
                             semantic_supports_range,
                             supports_inlay_hints,
+                            supports_folding_range,
+                            supports_document_color,
                         });
                     }
                     Err(e) => {
@@ -2461,6 +2695,185 @@ impl WorkerState {
                 hints.len()
             ));
             let _ = tx.send(InlayHintsUpdate { path, seq, hints });
+        });
+    }
+
+    /// Fetch the document's fold spans (#254). Silent when the path is
+    /// untracked or no client advertises `foldingRangeProvider` — the app
+    /// falls back to its indentation/region scan by never hearing back.
+    async fn request_folding_ranges(
+        &mut self,
+        path: PathBuf,
+        seq: u64,
+        tx: &std_mpsc::Sender<FoldingRangesUpdate>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_folding_range)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.folding_ranges(uri).await;
+            drop(client);
+            let ranges = match resp {
+                Ok(Some(ranges)) => ranges
+                    .into_iter()
+                    .filter_map(normalise_folding_range)
+                    .collect(),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] folding_ranges error: {e}"));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(FoldingRangesUpdate { path, seq, ranges });
+        });
+    }
+
+    /// Document colors (#254): fire-and-forget, seq-gated, silent when
+    /// unsupported — the swatch decoration simply never appears.
+    async fn request_document_colors(
+        &mut self,
+        path: PathBuf,
+        seq: u64,
+        tx: &std_mpsc::Sender<DocumentColorsUpdate>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_document_color)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.document_color(uri).await;
+            drop(client);
+            let colors = match resp {
+                Ok(infos) => infos.iter().map(color_item).collect(),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] documentColor error: {e:#}"));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(DocumentColorsUpdate { path, seq, colors });
+        });
+    }
+
+    /// Color presentations (#254): always answers — a picker is waiting.
+    async fn request_color_presentations(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        color: (f32, f32, f32, f32),
+        start: (u32, u32),
+        end: (u32, u32),
+        tx: &std_mpsc::Sender<ColorPresentationsResult>,
+    ) {
+        let empty = |tx: &std_mpsc::Sender<ColorPresentationsResult>, path: PathBuf| {
+            let _ = tx.send(ColorPresentationsResult {
+                request_id,
+                path,
+                presentations: Vec::new(),
+            });
+        };
+        let Some(doc) = self.docs.get(&path) else {
+            empty(tx, path);
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            empty(tx, path);
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_document_color)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            empty(tx, path);
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            empty(tx, path);
+            return;
+        };
+        let lsp_color = lsp_types::Color {
+            red: color.0,
+            green: color.1,
+            blue: color.2,
+            alpha: color.3,
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.color_presentations(uri, lsp_color, start, end).await;
+            drop(client);
+            let presentations = match resp {
+                Ok(ps) => ps
+                    .into_iter()
+                    .map(|p| {
+                        // A presentation without an explicit edit means
+                        // "replace the color's range with the label".
+                        let mut edits: Vec<TextSpanEdit> = Vec::new();
+                        match &p.text_edit {
+                            Some(te) => edits.push(text_edit_to_span(te)),
+                            None => edits.push(TextSpanEdit {
+                                start: (start.0 as usize, start.1 as usize),
+                                end: (end.0 as usize, end.1 as usize),
+                                new_text: p.label.clone(),
+                            }),
+                        }
+                        for te in p.additional_text_edits.iter().flatten() {
+                            edits.push(text_edit_to_span(te));
+                        }
+                        (p.label, edits)
+                    })
+                    .collect(),
+                Err(e) => {
+                    log_file::log(&format!(
+                        "lsp[{server_name}] colorPresentation error: {e:#}"
+                    ));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(ColorPresentationsResult {
+                request_id,
+                path: path_clone,
+                presentations,
+            });
         });
     }
 
@@ -3102,6 +3515,78 @@ impl WorkerState {
         });
     }
 
+    /// Expand Selection chains (#254). UNLIKE occurrences, every early-out
+    /// answers with `unsupported: true` — the gesture is waiting on this
+    /// reply, and an unsupported verdict is what tells the app to grow the
+    /// selection from tree-sitter ancestry right now instead of never.
+    async fn request_selection_ranges(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        positions: Vec<(u32, u32)>,
+        tx: &std_mpsc::Sender<SelectionRangesResult>,
+    ) {
+        let unsupported = |tx: &std_mpsc::Sender<SelectionRangesResult>, path: PathBuf| {
+            let _ = tx.send(SelectionRangesResult {
+                request_id,
+                path,
+                unsupported: true,
+                chains: Vec::new(),
+            });
+        };
+        let Some(doc) = self.docs.get(&path) else {
+            unsupported(tx, path);
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            unsupported(tx, path);
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_selection_range)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            unsupported(tx, path);
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            unsupported(tx, path);
+            return;
+        };
+        let lsp_positions: Vec<lsp_types::Position> = positions
+            .iter()
+            .map(|&(line, character)| lsp_types::Position { line, character })
+            .collect();
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.selection_ranges(uri, lsp_positions).await;
+            drop(client);
+            let (unsupported, chains) = match resp {
+                Ok(Some(ranges)) => (false, ranges.iter().map(flatten_selection_chain).collect()),
+                // An empty answer is a real answer: nothing to grow to.
+                Ok(None) => (false, Vec::new()),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] selectionRange error: {e:#}"));
+                    // Treat a wire error like unsupported so the gesture
+                    // still resolves via the tree-sitter fallback.
+                    (true, Vec::new())
+                }
+            };
+            let _ = tx.send(SelectionRangesResult {
+                request_id,
+                path: path_clone,
+                unsupported,
+                chains,
+            });
+        });
+    }
+
     /// The two-step call-hierarchy flow: `prepareCallHierarchy` resolves the
     /// symbol at the caret into an item, then `incomingCalls` / `outgoingCalls`
     /// expands one level of it. One level per request — invoking again at a
@@ -3713,6 +4198,34 @@ fn hover_text(contents: &HoverContents) -> Option<String> {
 /// Whether the server advertises a usable `textDocument/codeAction` provider.
 /// `Simple(false)` and `None` are unsupported; `Simple(true)` or an options
 /// object (which may also declare `resolveProvider`) is supported.
+/// Whether the server advertises a usable `textDocument/documentColor`
+/// provider (#254). Same shape rules as `code_action_supported`.
+fn color_provider_supported(cap: &Option<lsp_types::ColorProviderCapability>) -> bool {
+    use lsp_types::ColorProviderCapability as C;
+    match cap {
+        Some(C::Simple(b)) => *b,
+        Some(C::ColorProvider(_)) | Some(C::Options(_)) => true,
+        None => false,
+    }
+}
+
+/// Wire → internal color value (#254): 0..=1 f32 channels scaled to u8
+/// for the swatch cell, the raw channels kept for the presentation
+/// round trip.
+fn color_item(ci: &lsp_types::ColorInformation) -> ColorItem {
+    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    ColorItem {
+        line: ci.range.start.line,
+        character: ci.range.start.character,
+        end_line: ci.range.end.line,
+        end_character: ci.range.end.character,
+        red: to8(ci.color.red),
+        green: to8(ci.color.green),
+        blue: to8(ci.color.blue),
+        raw: (ci.color.red, ci.color.green, ci.color.blue, ci.color.alpha),
+    }
+}
+
 fn code_action_supported(cap: &Option<CodeActionProviderCapability>) -> bool {
     match cap {
         Some(CodeActionProviderCapability::Simple(b)) => *b,
@@ -3728,6 +4241,50 @@ fn linked_editing_supported(cap: &Option<lsp_types::LinkedEditingRangeServerCapa
     match cap {
         Some(L::Simple(b)) => *b,
         Some(L::Options(_)) | Some(L::RegistrationOptions(_)) => true,
+        None => false,
+    }
+}
+
+/// Whether the server advertises a usable `textDocument/foldingRange`
+/// provider (#254). Same shape rules as `code_action_supported`.
+fn folding_range_supported(cap: &Option<lsp_types::FoldingRangeProviderCapability>) -> bool {
+    use lsp_types::FoldingRangeProviderCapability as F;
+    match cap {
+        Some(F::Simple(b)) => *b,
+        Some(F::FoldingProvider(_)) | Some(F::Options(_)) => true,
+        None => false,
+    }
+}
+
+/// Flatten one `SelectionRange` parent chain into smallest-first UTF-16
+/// spans, dropping non-growing links (some servers repeat a range).
+fn flatten_selection_chain(sr: &lsp_types::SelectionRange) -> Vec<(u32, u32, u32, u32)> {
+    let mut out = Vec::new();
+    let mut cur = Some(sr);
+    let mut last: Option<(u32, u32, u32, u32)> = None;
+    while let Some(r) = cur {
+        let span = (
+            r.range.start.line,
+            r.range.start.character,
+            r.range.end.line,
+            r.range.end.character,
+        );
+        if last != Some(span) {
+            out.push(span);
+            last = Some(span);
+        }
+        cur = r.parent.as_deref();
+    }
+    out
+}
+
+/// Whether the server advertises a usable `textDocument/selectionRange`
+/// provider (#254). Same shape rules as `code_action_supported`.
+fn selection_range_supported(cap: &Option<lsp_types::SelectionRangeProviderCapability>) -> bool {
+    use lsp_types::SelectionRangeProviderCapability as S;
+    match cap {
+        Some(S::Simple(b)) => *b,
+        Some(S::Options(_)) | Some(S::RegistrationOptions(_)) => true,
         None => false,
     }
 }
@@ -3806,6 +4363,28 @@ fn normalise_inlay_hint(h: lsp_types::InlayHint) -> InlayHintItem {
         character: h.position.character,
         label,
     }
+}
+
+/// Wire → internal fold span (#254). A range whose end does not extend past
+/// its start folds nothing and is dropped; `end_character` nuances are
+/// deliberately ignored — croft folds whole lines, like VS Code's default.
+fn normalise_folding_range(r: lsp_types::FoldingRange) -> Option<FoldingRangeItem> {
+    let start = r.start_line as usize;
+    let end = r.end_line as usize;
+    if end <= start {
+        return None;
+    }
+    let kind = match r.kind {
+        Some(lsp_types::FoldingRangeKind::Comment) => FoldRangeKind::Comment,
+        Some(lsp_types::FoldingRangeKind::Imports) => FoldRangeKind::Imports,
+        Some(lsp_types::FoldingRangeKind::Region) => FoldRangeKind::Region,
+        None => FoldRangeKind::Other,
+    };
+    Some(FoldingRangeItem {
+        start_line: start,
+        end_line: end,
+        kind,
+    })
 }
 
 fn call_hierarchy_supported(cap: &Option<lsp_types::CallHierarchyServerCapability>) -> bool {
@@ -4294,6 +4873,9 @@ fn build_client_capabilities() -> ClientCapabilities {
                 dynamic_registration: Some(false),
             }),
             linked_editing_range: Some(lsp_types::LinkedEditingRangeClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
+            selection_range: Some(lsp_types::SelectionRangeClientCapabilities {
                 dynamic_registration: Some(false),
             }),
             // Declare push-diagnostics support. Several servers gate
@@ -5737,6 +6319,228 @@ mod tests {
         assert!(linked_editing_supported(&Some(L::Options(
             lsp_types::LinkedEditingRangeOptions::default()
         ))));
+    }
+
+    #[test]
+    fn folding_range_capability_shapes_gate_correctly() {
+        use lsp_types::FoldingRangeProviderCapability as F;
+        assert!(!folding_range_supported(&None));
+        assert!(!folding_range_supported(&Some(F::Simple(false))));
+        assert!(folding_range_supported(&Some(F::Simple(true))));
+        assert!(folding_range_supported(&Some(F::FoldingProvider(
+            lsp_types::FoldingProviderOptions {}
+        ))));
+        assert!(folding_range_supported(&Some(F::Options(
+            lsp_types::StaticTextDocumentColorProviderOptions {
+                document_selector: None,
+                id: None,
+            }
+        ))));
+    }
+
+    #[test]
+    fn normalise_folding_range_drops_empty_spans_and_maps_kinds() {
+        let r = |start, end, kind| lsp_types::FoldingRange {
+            start_line: start,
+            start_character: None,
+            end_line: end,
+            end_character: None,
+            kind,
+            collapsed_text: None,
+        };
+        assert_eq!(normalise_folding_range(r(5, 5, None)), None);
+        assert_eq!(normalise_folding_range(r(5, 4, None)), None);
+        let got = normalise_folding_range(r(2, 9, Some(lsp_types::FoldingRangeKind::Region)))
+            .expect("a real span survives");
+        assert_eq!((got.start_line, got.end_line), (2, 9));
+        assert_eq!(got.kind, FoldRangeKind::Region);
+        assert_eq!(
+            normalise_folding_range(r(0, 1, None)).map(|g| g.kind),
+            Some(FoldRangeKind::Other)
+        );
+    }
+
+    /// An unroutable folding-range request is SILENT — no reply at all —
+    /// which is the two-phase contract: the editor keeps its
+    /// indentation/region fallback unless a capable server answers.
+    #[test]
+    fn an_unroutable_folding_request_sends_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let (fold_tx, fold_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry: ServerRegistry::new(),
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+        let never_opened = root.join("stray.py");
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .request_folding_ranges(never_opened, 3, &fold_tx)
+                .await;
+        });
+        assert!(
+            fold_rx.try_recv().is_err(),
+            "no reply may be sent for an untracked document"
+        );
+    }
+
+    #[test]
+    fn selection_range_capability_shapes_gate_correctly() {
+        use lsp_types::SelectionRangeProviderCapability as S;
+        assert!(!selection_range_supported(&None));
+        assert!(!selection_range_supported(&Some(S::Simple(false))));
+        assert!(selection_range_supported(&Some(S::Simple(true))));
+        assert!(selection_range_supported(&Some(S::Options(
+            lsp_types::SelectionRangeOptions {
+                work_done_progress_options: Default::default(),
+            }
+        ))));
+    }
+
+    #[test]
+    fn flatten_selection_chain_walks_parents_and_drops_repeats() {
+        let range = |sl, sc, el, ec| lsp_types::Range {
+            start: lsp_types::Position {
+                line: sl,
+                character: sc,
+            },
+            end: lsp_types::Position {
+                line: el,
+                character: ec,
+            },
+        };
+        let chain = lsp_types::SelectionRange {
+            range: range(1, 4, 1, 9),
+            parent: Some(Box::new(lsp_types::SelectionRange {
+                range: range(1, 4, 1, 9), // repeated link some servers emit
+                parent: Some(Box::new(lsp_types::SelectionRange {
+                    range: range(0, 0, 3, 0),
+                    parent: None,
+                })),
+            })),
+        };
+        assert_eq!(
+            flatten_selection_chain(&chain),
+            vec![(1, 4, 1, 9), (0, 0, 3, 0)]
+        );
+    }
+
+    /// An unroutable selectionRange request answers `unsupported` — the
+    /// gesture is waiting on the reply, and the verdict is what routes it
+    /// to the tree-sitter fallback instead of hanging.
+    #[test]
+    fn an_unroutable_selection_range_request_answers_unsupported() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let (sel_tx, sel_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry: ServerRegistry::new(),
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+        let never_opened = root.join("stray.py");
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .request_selection_ranges(9, never_opened.clone(), vec![(0, 0)], &sel_tx)
+                .await;
+        });
+        let reply = sel_rx
+            .try_recv()
+            .expect("an untracked document must still get a verdict");
+        assert_eq!(reply.request_id, 9);
+        assert!(reply.unsupported);
+        assert!(reply.chains.is_empty());
+    }
+
+    #[test]
+    fn color_capability_shapes_and_channel_scaling() {
+        use lsp_types::ColorProviderCapability as C;
+        assert!(!color_provider_supported(&None));
+        assert!(!color_provider_supported(&Some(C::Simple(false))));
+        assert!(color_provider_supported(&Some(C::Simple(true))));
+        let ci = lsp_types::ColorInformation {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 3,
+                    character: 7,
+                },
+                end: lsp_types::Position {
+                    line: 3,
+                    character: 14,
+                },
+            },
+            color: lsp_types::Color {
+                red: 1.0,
+                green: 0.5,
+                blue: 0.0,
+                alpha: 1.0,
+            },
+        };
+        let item = color_item(&ci);
+        assert_eq!((item.line, item.character), (3, 7));
+        assert_eq!((item.red, item.green, item.blue), (255, 128, 0));
+        assert_eq!(item.raw.3, 1.0);
+    }
+
+    /// The presentation picker defers on the reply, so an unroutable
+    /// request must still answer — with an empty offering (#254).
+    #[test]
+    fn an_unroutable_color_presentation_request_answers_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let (color_tx, color_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry: ServerRegistry::new(),
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+        let never_opened = root.join("stray.css");
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .request_color_presentations(
+                    31,
+                    never_opened.clone(),
+                    (1.0, 0.0, 0.0, 1.0),
+                    (0, 0),
+                    (0, 7),
+                    &color_tx,
+                )
+                .await;
+        });
+        let reply = color_rx.try_recv().expect("must answer");
+        assert_eq!(reply.request_id, 31);
+        assert!(reply.presentations.is_empty());
     }
 
     /// Minimal LSP server that answers `initialize` and appends every
