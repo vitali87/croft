@@ -70,7 +70,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | `Cmd+K` `Shift+H` | Show outgoing calls: everything the function at the caret calls, each entry jumping to the callee's definition |
 | `Cmd+K` `M` | Maximize the active terminal pane across the panel width (the other terminals move to a right-edge rail); press again to restore the even split |
 | `Cmd+K` `F` | Toggle Format on Save: when on, `Cmd+S` reformats through the language server before writing (also in the Command Palette) |
-| `Cmd+K` `Cmd+L` | Toggle the code fold at the cursor: collapse the enclosing block to its header line, or re-expand it. Fold ranges come from the language server (`textDocument/foldingRange`) when it advertises the capability — brace-on-own-line styles, multiline strings, and comment spans fold exactly — falling back to the indentation scan plus `#region` pairs and comment runs when no server has answered |
+| `Cmd+K` `Cmd+L` | Toggle the code fold at the cursor: collapse the enclosing block to its header line, or re-expand it. Fold ranges come from the language server (`textDocument/foldingRange`) when it advertises the capability — brace-on-own-line styles, multiline strings, and comment spans fold exactly — falling back to the indentation scan plus `#region` pairs and comment runs when no usable server ranges are available (no reply yet, or an empty one) |
 | `Cmd+K` `Cmd+0` | Fold All: collapse every foldable block in the buffer |
 | `Cmd+K` `Cmd+J` | Unfold All: expand every collapsed block |
 | `Cmd+K` `Cmd+/` | Fold All Block Comments: collapse every comment-kind fold (the server's comment spans, or runs of ≥2 full-line comments in the fallback) |
