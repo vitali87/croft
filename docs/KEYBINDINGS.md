@@ -228,6 +228,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `Cmd`+`Opt`+`Shift`+`A` / `D` | Sort the selected lines (or the whole file) Ascending / Descending |
 | `Cmd`+`Opt`+`Shift`+`W` | Trim Trailing Whitespace: strip trailing spaces and tabs from every line |
 | `Cmd`+`Opt`+`Shift`+`F` | Format Document: reformat the whole buffer through the language server (rustfmt, ruff, prettier, …); the edit lands as one undo step and leaves the tab dirty |
+| Command Palette "Change Color Presentation" | With the caret on a color value (the `■` swatch cells mark them, painted in the value's own color via `textDocument/documentColor`): pick an alternative spelling (`#rrggbb`, `rgb()`, `hsl()`, …) from the server's `colorPresentation` offerings; the pick applies the server's edit as one undo step. The swatch decoration follows the css-language-server family; languages without a colorProvider never show it |
 | `Cmd+K` `F` | Toggle Format on Save: when on, `Cmd+S` formats through the language server before writing (off by default, matching VS Code) |
 | Click a breadcrumb symbol | The breadcrumbs bar above the editor shows the file path and the enclosing symbol trail at the caret; clicking a symbol crumb jumps to it |
 | Click a sticky-scroll header | Sticky scroll pins the enclosing scope headers (class, function) to the top while you scroll; clicking one jumps to that line |

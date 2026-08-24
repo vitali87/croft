@@ -373,6 +373,41 @@ pub struct InlayHintsUpdate {
     pub hints: Vec<InlayHintItem>,
 }
 
+/// One document color value (#254): the UTF-16 range of the literal and
+/// its decoded RGB (alpha dropped — terminal cells can't blend). The
+/// raw f32 channels ride along for the colorPresentation round trip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColorItem {
+    pub line: u32,
+    pub character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub raw: (f32, f32, f32, f32),
+}
+
+/// A fresh, complete color set for one document; same seq contract as
+/// [`InlayHintsUpdate`].
+#[derive(Debug)]
+pub struct DocumentColorsUpdate {
+    pub path: PathBuf,
+    pub seq: u64,
+    pub colors: Vec<ColorItem>,
+}
+
+/// The alternative spellings of one color value (#254), each with the
+/// char-indexed edits that rewrite the document to it. Answered for a
+/// user-initiated picker, so every early-out replies (`presentations`
+/// empty ⇒ nothing to offer).
+#[derive(Debug)]
+pub struct ColorPresentationsResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    pub presentations: Vec<(String, Vec<TextSpanEdit>)>,
+}
+
 /// One row of a call-hierarchy answer: a caller (incoming) or callee
 /// (outgoing), with the location the picker jumps to — the call expression
 /// for incoming calls when the server reports one, the callee's definition
@@ -523,6 +558,17 @@ enum Cmd {
         path: PathBuf,
         line_count: u32,
         seq: u64,
+    },
+    RequestDocumentColors {
+        path: PathBuf,
+        seq: u64,
+    },
+    RequestColorPresentations {
+        request_id: u64,
+        path: PathBuf,
+        color: (f32, f32, f32, f32),
+        start: (u32, u32),
+        end: (u32, u32),
     },
     ChangeDoc {
         path: PathBuf,
@@ -689,6 +735,8 @@ pub struct LspManager {
     code_action_rx: std_mpsc::Receiver<CodeActionResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     inlay_rx: std_mpsc::Receiver<InlayHintsUpdate>,
+    colors_rx: std_mpsc::Receiver<DocumentColorsUpdate>,
+    color_presentations_rx: std_mpsc::Receiver<ColorPresentationsResult>,
     diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
     progress_rx: std_mpsc::Receiver<ProgressUpdate>,
     capability_support: CapabilitySupport,
@@ -737,6 +785,8 @@ impl LspManager {
         let (code_action_tx, code_action_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let (inlay_tx, inlay_rx) = std_mpsc::channel();
+        let (colors_tx, colors_rx) = std_mpsc::channel();
+        let (color_presentations_tx, color_presentations_rx) = std_mpsc::channel();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
         let (progress_tx, progress_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
@@ -783,6 +833,8 @@ impl LspManager {
                 code_action: code_action_tx,
                 semantic_tokens: semantic_tx,
                 inlay_hints: inlay_tx,
+                document_colors: colors_tx,
+                color_presentations: color_presentations_tx,
                 diagnostics: diagnostics_tx,
                 progress: progress_tx,
             },
@@ -811,6 +863,8 @@ impl LspManager {
             code_action_rx,
             semantic_rx,
             inlay_rx,
+            colors_rx,
+            color_presentations_rx,
             diagnostics_rx,
             progress_rx,
             capability_support,
@@ -975,6 +1029,42 @@ impl LspManager {
 
     pub fn drain_inlay_hints(&self) -> Option<InlayHintsUpdate> {
         self.inlay_rx.try_recv().ok()
+    }
+
+    /// Ask for the document's color values (#254); same fire-and-forget
+    /// seq contract as inlay hints, silent when no server advertises a
+    /// colorProvider — the swatches simply never appear.
+    pub fn request_document_colors(&self, path: PathBuf, seq: u64) {
+        let _ = self.cmd_tx.send(Cmd::RequestDocumentColors { path, seq });
+    }
+
+    pub fn drain_document_colors(&self) -> Option<DocumentColorsUpdate> {
+        self.colors_rx.try_recv().ok()
+    }
+
+    /// Ask for one color value's alternative spellings (#254); the reply
+    /// always arrives (a picker is waiting on it).
+    pub fn request_color_presentations(
+        &mut self,
+        path: PathBuf,
+        color: (f32, f32, f32, f32),
+        start: (u32, u32),
+        end: (u32, u32),
+    ) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestColorPresentations {
+            request_id: id,
+            path,
+            color,
+            start,
+            end,
+        });
+        id
+    }
+
+    pub fn drain_color_presentations(&self) -> Option<ColorPresentationsResult> {
+        self.color_presentations_rx.try_recv().ok()
     }
 
     /// Returns and clears the "a server asked us to re-request inlay hints"
@@ -1402,6 +1492,7 @@ struct ManagedClient {
     /// Whether the server advertises an `inlayHintProvider`
     /// (rust-analyzer, vtsls, gopls do; ruff does not).
     supports_inlay_hints: bool,
+    supports_document_color: bool,
 }
 
 /// Servers are keyed by language AND the file's project root, not language
@@ -1464,6 +1555,8 @@ struct ResultSenders {
     code_action: std_mpsc::Sender<CodeActionResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
     inlay_hints: std_mpsc::Sender<InlayHintsUpdate>,
+    document_colors: std_mpsc::Sender<DocumentColorsUpdate>,
+    color_presentations: std_mpsc::Sender<ColorPresentationsResult>,
     diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
     progress: std_mpsc::Sender<ProgressUpdate>,
 }
@@ -1579,6 +1672,29 @@ async fn worker_loop(
             } => {
                 state
                     .request_inlay_hints(path, line_count, seq, &tx.inlay_hints)
+                    .await
+            }
+            Cmd::RequestDocumentColors { path, seq } => {
+                state
+                    .request_document_colors(path, seq, &tx.document_colors)
+                    .await
+            }
+            Cmd::RequestColorPresentations {
+                request_id,
+                path,
+                color,
+                start,
+                end,
+            } => {
+                state
+                    .request_color_presentations(
+                        request_id,
+                        path,
+                        color,
+                        start,
+                        end,
+                        &tx.color_presentations,
+                    )
                     .await
             }
             Cmd::ChangeDoc { path, text } => state.change_doc(path, text).await,
@@ -1890,6 +2006,8 @@ impl WorkerState {
                         let semantic_legend = semantic_legend_of(caps).map(Arc::new);
                         let semantic_supports_range = semantic_tokens_range_supported(caps);
                         let supports_inlay_hints = one_of_supported(&caps.inlay_hint_provider);
+                        let supports_document_color =
+                            color_provider_supported(&caps.color_provider);
                         log_file::log(&format!(
                             "lsp[{}] spawned, root={} supports_completion={supports} supports_signature_help={supports_signature_help} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_references={supports_references} supports_rename={supports_rename}",
                             config.name,
@@ -1917,6 +2035,7 @@ impl WorkerState {
                             semantic_legend,
                             semantic_supports_range,
                             supports_inlay_hints,
+                            supports_document_color,
                         });
                     }
                     Err(e) => {
@@ -2460,6 +2579,137 @@ impl WorkerState {
                 hints.len()
             ));
             let _ = tx.send(InlayHintsUpdate { path, seq, hints });
+        });
+    }
+
+    /// Document colors (#254): fire-and-forget, seq-gated, silent when
+    /// unsupported — the swatch decoration simply never appears.
+    async fn request_document_colors(
+        &mut self,
+        path: PathBuf,
+        seq: u64,
+        tx: &std_mpsc::Sender<DocumentColorsUpdate>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_document_color)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.document_color(uri).await;
+            drop(client);
+            let colors = match resp {
+                Ok(infos) => infos.iter().map(color_item).collect(),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] documentColor error: {e:#}"));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(DocumentColorsUpdate { path, seq, colors });
+        });
+    }
+
+    /// Color presentations (#254): always answers — a picker is waiting.
+    async fn request_color_presentations(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        color: (f32, f32, f32, f32),
+        start: (u32, u32),
+        end: (u32, u32),
+        tx: &std_mpsc::Sender<ColorPresentationsResult>,
+    ) {
+        let empty = |tx: &std_mpsc::Sender<ColorPresentationsResult>, path: PathBuf| {
+            let _ = tx.send(ColorPresentationsResult {
+                request_id,
+                path,
+                presentations: Vec::new(),
+            });
+        };
+        let Some(doc) = self.docs.get(&path) else {
+            empty(tx, path);
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            empty(tx, path);
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_document_color)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            empty(tx, path);
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            empty(tx, path);
+            return;
+        };
+        let lsp_color = lsp_types::Color {
+            red: color.0,
+            green: color.1,
+            blue: color.2,
+            alpha: color.3,
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.color_presentations(uri, lsp_color, start, end).await;
+            drop(client);
+            let presentations = match resp {
+                Ok(ps) => ps
+                    .into_iter()
+                    .map(|p| {
+                        // A presentation without an explicit edit means
+                        // "replace the color's range with the label".
+                        let mut edits: Vec<TextSpanEdit> = Vec::new();
+                        match &p.text_edit {
+                            Some(te) => edits.push(text_edit_to_span(te)),
+                            None => edits.push(TextSpanEdit {
+                                start: (start.0 as usize, start.1 as usize),
+                                end: (end.0 as usize, end.1 as usize),
+                                new_text: p.label.clone(),
+                            }),
+                        }
+                        for te in p.additional_text_edits.iter().flatten() {
+                            edits.push(text_edit_to_span(te));
+                        }
+                        (p.label, edits)
+                    })
+                    .collect(),
+                Err(e) => {
+                    log_file::log(&format!(
+                        "lsp[{server_name}] colorPresentation error: {e:#}"
+                    ));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(ColorPresentationsResult {
+                request_id,
+                path: path_clone,
+                presentations,
+            });
         });
     }
 
@@ -3726,6 +3976,34 @@ fn hover_text(contents: &HoverContents) -> Option<String> {
 /// Whether the server advertises a usable `textDocument/codeAction` provider.
 /// `Simple(false)` and `None` are unsupported; `Simple(true)` or an options
 /// object (which may also declare `resolveProvider`) is supported.
+/// Whether the server advertises a usable `textDocument/documentColor`
+/// provider (#254). Same shape rules as `code_action_supported`.
+fn color_provider_supported(cap: &Option<lsp_types::ColorProviderCapability>) -> bool {
+    use lsp_types::ColorProviderCapability as C;
+    match cap {
+        Some(C::Simple(b)) => *b,
+        Some(C::ColorProvider(_)) | Some(C::Options(_)) => true,
+        None => false,
+    }
+}
+
+/// Wire → internal color value (#254): 0..=1 f32 channels scaled to u8
+/// for the swatch cell, the raw channels kept for the presentation
+/// round trip.
+fn color_item(ci: &lsp_types::ColorInformation) -> ColorItem {
+    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    ColorItem {
+        line: ci.range.start.line,
+        character: ci.range.start.character,
+        end_line: ci.range.end.line,
+        end_character: ci.range.end.character,
+        red: to8(ci.color.red),
+        green: to8(ci.color.green),
+        blue: to8(ci.color.blue),
+        raw: (ci.color.red, ci.color.green, ci.color.blue, ci.color.alpha),
+    }
+}
+
 fn code_action_supported(cap: &Option<CodeActionProviderCapability>) -> bool {
     match cap {
         Some(CodeActionProviderCapability::Simple(b)) => *b,
@@ -5839,6 +6117,76 @@ mod tests {
         assert_eq!(reply.request_id, 9);
         assert!(reply.unsupported);
         assert!(reply.chains.is_empty());
+    }
+
+    #[test]
+    fn color_capability_shapes_and_channel_scaling() {
+        use lsp_types::ColorProviderCapability as C;
+        assert!(!color_provider_supported(&None));
+        assert!(!color_provider_supported(&Some(C::Simple(false))));
+        assert!(color_provider_supported(&Some(C::Simple(true))));
+        let ci = lsp_types::ColorInformation {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 3,
+                    character: 7,
+                },
+                end: lsp_types::Position {
+                    line: 3,
+                    character: 14,
+                },
+            },
+            color: lsp_types::Color {
+                red: 1.0,
+                green: 0.5,
+                blue: 0.0,
+                alpha: 1.0,
+            },
+        };
+        let item = color_item(&ci);
+        assert_eq!((item.line, item.character), (3, 7));
+        assert_eq!((item.red, item.green, item.blue), (255, 128, 0));
+        assert_eq!(item.raw.3, 1.0);
+    }
+
+    /// The presentation picker defers on the reply, so an unroutable
+    /// request must still answer — with an empty offering (#254).
+    #[test]
+    fn an_unroutable_color_presentation_request_answers_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let (color_tx, color_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry: ServerRegistry::new(),
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+        let never_opened = root.join("stray.css");
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .request_color_presentations(
+                    31,
+                    never_opened.clone(),
+                    (1.0, 0.0, 0.0, 1.0),
+                    (0, 0),
+                    (0, 7),
+                    &color_tx,
+                )
+                .await;
+        });
+        let reply = color_rx.try_recv().expect("must answer");
+        assert_eq!(reply.request_id, 31);
+        assert!(reply.presentations.is_empty());
     }
 
     /// Minimal LSP server that answers `initialize` and appends every
