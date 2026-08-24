@@ -29023,3 +29023,41 @@ fn expand_selection_falls_back_to_tree_sitter_when_the_lsp_cannot_route() {
     app.run_command(crate::widgets::command_palette::Command::ShrinkSelection);
     assert!(app.editor.selection.is_none(), "back to the bare caret");
 }
+
+#[test]
+fn a_caret_move_between_selection_range_request_and_reply_drops_the_stale_chains() {
+    // #272 review: a click moves the caret WITHOUT bumping edit_seq, so
+    // the pending gate must also compare the cursor positions the
+    // request was fired for — the old caret's chains must not apply at
+    // the new spot.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("lib.rs"),
+        "fn main() {\n    let value = 1;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9;
+    app.run_command(crate::widgets::command_palette::Command::ExpandSelection);
+    assert!(app.selection_range_request.is_some(), "request in flight");
+    // A caret move (no edit) before the reply lands.
+    app.editor.clear_selection();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.selection_range_request.is_some() && std::time::Instant::now() < deadline {
+        app.drain_lsp_selection_ranges();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.selection_range_request.is_none(),
+        "the stale reply cleared the pending slot"
+    );
+    assert!(
+        app.editor.selection.is_none(),
+        "the old caret's chains were dropped, not applied at the new caret"
+    );
+}

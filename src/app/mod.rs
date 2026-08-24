@@ -218,6 +218,19 @@ pub(crate) enum QuickInputPosition {
     Center,
 }
 
+/// One in-flight `textDocument/selectionRange` request (#254): the
+/// Expand Selection gesture waiting on its chains. `positions` snapshots
+/// the exact cursors the request was fired for, so a reply (or a reuse
+/// attempt) after ANY caret movement is recognised as stale even though
+/// `edit_seq` did not move.
+struct PendingSelectionRanges {
+    id: u64,
+    path: PathBuf,
+    seq: u64,
+    presses: usize,
+    positions: Vec<(u32, u32)>,
+}
+
 /// Pre-Zen visibility snapshot, restored verbatim when Zen Mode is toggled
 /// off so the workspace returns to exactly the chrome it had before.
 #[derive(Clone, Copy, Debug)]
@@ -2761,11 +2774,14 @@ pub struct App {
     /// edit_seq) it was fired for so a reply for a caret or buffer state the
     /// editor has since left is dropped.
     occurrences_request: Option<(u64, PathBuf, usize, usize, u64)>,
-    /// In-flight Expand Selection request (#254): `(request id, path,
-    /// edit_seq, queued presses)`. Extra Shift+Alt+Right presses while
-    /// the chains are in flight stack up and apply together on drain; an
-    /// `unsupported` verdict resolves them via tree-sitter instead.
-    selection_range_request: Option<(u64, PathBuf, u64, usize)>,
+    /// In-flight Expand Selection request (#254). Extra Shift+Alt+Right
+    /// presses while the chains are in flight stack up and apply
+    /// together on drain; an `unsupported` verdict resolves them via
+    /// tree-sitter instead. The reply is gated on id + path + edit_seq
+    /// AND the exact cursor positions the request was fired for — a
+    /// caret move without an edit leaves `edit_seq` unchanged, and a
+    /// chain computed for the old caret must not apply at the new one.
+    selection_range_request: Option<PendingSelectionRanges>,
     /// The caret state `tick_occurrences` last observed, and when it changed.
     /// A caret resting on one spot for `OCCURRENCES_IDLE` fires one request.
     occ_observed: Option<(PathBuf, usize, usize, u64)>,
@@ -8131,17 +8147,26 @@ impl App {
             && let Some(path) = self.editor.path.clone()
         {
             let seq = self.editor.edit_seq;
-            if let Some((_, p, s, presses)) = self.selection_range_request.as_mut()
-                && *p == path
-                && *s == seq
+            let positions = self.editor.cursor_positions_utf16();
+            // Reuse the pending request only when it was fired for these
+            // exact cursors; a caret move re-fires for the new spot.
+            if let Some(pending) = self.selection_range_request.as_mut()
+                && pending.path == path
+                && pending.seq == seq
+                && pending.positions == positions
             {
-                *presses += 1;
+                pending.presses += 1;
                 return;
             }
-            let positions = self.editor.cursor_positions_utf16();
             if let Some(lsp) = self.lsp.as_mut() {
-                let id = lsp.request_selection_ranges(path.clone(), positions);
-                self.selection_range_request = Some((id, path, seq, 1));
+                let id = lsp.request_selection_ranges(path.clone(), positions.clone());
+                self.selection_range_request = Some(PendingSelectionRanges {
+                    id,
+                    path,
+                    seq,
+                    presses: 1,
+                    positions,
+                });
             }
             return;
         }
@@ -8173,15 +8198,24 @@ impl App {
         }
         let mut changed = false;
         for r in results {
-            let Some((id, path, seq, presses)) = self.selection_range_request.clone() else {
+            let Some(pending) = self.selection_range_request.as_ref() else {
                 continue;
             };
-            if r.request_id != id
-                || self.editor.path.as_deref() != Some(path.as_path())
-                || self.editor.edit_seq != seq
+            // Gate on id + path + edit_seq AND the cursors the request
+            // was fired for: a click between request and reply leaves
+            // `edit_seq` unchanged, but the chains describe the OLD
+            // caret and must not apply at the new one.
+            if r.request_id != pending.id
+                || self.editor.path.as_deref() != Some(pending.path.as_path())
+                || self.editor.edit_seq != pending.seq
+                || self.editor.cursor_positions_utf16() != pending.positions
             {
+                if r.request_id == pending.id {
+                    self.selection_range_request = None;
+                }
                 continue;
             }
+            let presses = pending.presses;
             self.selection_range_request = None;
             if r.unsupported || r.chains.is_empty() {
                 for _ in 0..presses {
