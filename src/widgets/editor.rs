@@ -9207,8 +9207,7 @@ impl Widget for &mut Editor {
         self.last_hscrollbar = Rect::default();
         self.merge_action_spans.clear();
 
-        let height = inner.height as usize;
-        if height == 0 {
+        if inner.height == 0 {
             return;
         }
         let cbg = canvas_bg(
@@ -9225,6 +9224,13 @@ impl Widget for &mut Editor {
             mv.sync_with_buffer(len, seq, row);
             inner = render_merge_panes(mv, inner, buf, theme);
             self.last_inner = inner;
+        }
+        // The Result height comes from the POST-carve rect: the merge
+        // panes above just shrank `inner`, and every row / scrollbar /
+        // cursor-visibility computation below must see what is left.
+        let height = inner.height as usize;
+        if height == 0 {
+            return;
         }
         if let Some(image) = self.image.as_ref() {
             let ibg = image_canvas_bg(

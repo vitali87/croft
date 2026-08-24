@@ -9468,15 +9468,19 @@ impl App {
                 let base = crate::git::read_file_at_stage(&canon_root, &rel, 1)
                     .map(&to_lines)
                     .unwrap_or_default();
-                Some((base, o.unwrap_or_default(), t.unwrap_or_default(), false))
+                Some((base, o.unwrap_or_default(), t.unwrap_or_default()))
             }
         };
-        let sides = sides.or_else(|| {
-            let text = std::fs::read_to_string(path).ok()?;
-            let lines: Vec<String> = text.lines().map(str::to_string).collect();
-            crate::merge_editor::synthesize_from_markers(&lines).map(|(b, o, t)| (b, o, t, true))
-        });
-        let Some((base, ours, theirs, from_markers)) = sides else {
+        let built = match sides {
+            Some((base, ours, theirs)) => Some(crate::merge_editor::MergeView::new(
+                base, ours, theirs, false,
+            )),
+            None => std::fs::read_to_string(path).ok().and_then(|text| {
+                let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                crate::merge_editor::view_from_markers(&lines)
+            }),
+        };
+        let Some((mut mv, result)) = built else {
             self.status = format!("{rel} has no merge conflicts");
             return false;
         };
@@ -9485,8 +9489,6 @@ impl App {
             return false;
         }
         self.focus_pane(Pane::Editor);
-        let (mut mv, result) =
-            crate::merge_editor::MergeView::new(base, ours, theirs, from_markers);
         let end = self.editor.lines.len();
         self.editor.splice_result_rows(0, end, result);
         mv.synced_len = self.editor.lines.len();

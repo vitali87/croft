@@ -461,15 +461,18 @@ fn apply_hunks(
     out
 }
 
-/// Synthesize (base, ours, theirs) from a marker-filled buffer, so the
-/// merge editor also works on a plain conflicted file outside any git
-/// merge. Context outside blocks is shared verbatim; inside a block each
-/// side gets its own section, and base gets the diff3 `|||||||` section
-/// when present (nothing otherwise, so both sides differ from base and
-/// the block stays a conflict). Returns None when there are no blocks.
-pub fn synthesize_from_markers(
-    lines: &[String],
-) -> Option<(Vec<String>, Vec<String>, Vec<String>)> {
+/// Build the view (plus the initial Result) straight from a marker-filled
+/// buffer, so the merge editor also works on a plain conflicted file
+/// outside any git merge. Context outside blocks is shared verbatim;
+/// inside a block each side gets its own section, base gets the diff3
+/// `|||||||` section when present, and the Result holds the base section
+/// until the block is acted on. Every block becomes a conflict BY
+/// CONSTRUCTION rather than by re-diffing the synthesized sides: markers
+/// mean git already judged the block unresolved, and a textual three-way
+/// cannot — a block with one empty section and no diff3 base makes that
+/// side indistinguishable from the (unknown) base, and the other side
+/// would silently auto-apply. Returns None when there are no blocks.
+pub fn view_from_markers(lines: &[String]) -> Option<(MergeView, Vec<String>)> {
     let blocks = crate::merge::find_conflicts(lines);
     if blocks.is_empty() {
         return None;
@@ -477,27 +480,63 @@ pub fn synthesize_from_markers(
     let mut base = Vec::new();
     let mut ours = Vec::new();
     let mut theirs = Vec::new();
+    let mut result = Vec::new();
+    let mut conflicts = Vec::new();
     let mut pos = 0usize;
     for b in &blocks {
         for l in &lines[pos..b.ours_start] {
             base.push(l.clone());
             ours.push(l.clone());
             theirs.push(l.clone());
+            result.push(l.clone());
         }
         let ours_end = b.base_start.unwrap_or(b.sep);
-        ours.extend(lines[b.ours_start + 1..ours_end].iter().cloned());
-        if let Some(bs) = b.base_start {
-            base.extend(lines[bs + 1..b.sep].iter().cloned());
-        }
-        theirs.extend(lines[b.sep + 1..b.theirs_end].iter().cloned());
+        let ours_sec = lines[b.ours_start + 1..ours_end].to_vec();
+        let base_sec = b
+            .base_start
+            .map(|bs| lines[bs + 1..b.sep].to_vec())
+            .unwrap_or_default();
+        let theirs_sec = lines[b.sep + 1..b.theirs_end].to_vec();
+        conflicts.push(MergeConflict {
+            base: base_sec.clone(),
+            ours: ours_sec.clone(),
+            theirs: theirs_sec.clone(),
+            base_start: base.len(),
+            ours_start: ours.len(),
+            theirs_start: theirs.len(),
+            result_start: result.len(),
+            result_len: base_sec.len(),
+            state: ConflictState::Unresolved,
+        });
+        base.extend(base_sec.iter().cloned());
+        ours.extend(ours_sec);
+        result.extend(base_sec);
+        theirs.extend(theirs_sec);
         pos = b.theirs_end + 1;
     }
     for l in &lines[pos..] {
         base.push(l.clone());
         ours.push(l.clone());
         theirs.push(l.clone());
+        result.push(l.clone());
     }
-    Some((base, ours, theirs))
+    let view = MergeView {
+        base,
+        ours,
+        theirs,
+        conflicts,
+        show_base: false,
+        active: 0,
+        ours_scroll: 0,
+        theirs_scroll: 0,
+        base_scroll: 0,
+        from_markers: true,
+        synced_len: result.len().max(1),
+        synced_seq: 0,
+        check_spans: Vec::new(),
+        last_panes_area: ratatui::layout::Rect::default(),
+    };
+    Some((view, result))
 }
 
 #[cfg(test)]
@@ -637,31 +676,49 @@ mod tests {
             ">>>>>>> feature",
             "bottom",
         ]);
-        let (base, ours, theirs) = synthesize_from_markers(&doc).unwrap();
-        assert_eq!(base, lines(&["top", "base line", "bottom"]));
-        assert_eq!(ours, lines(&["top", "ours line", "bottom"]));
-        assert_eq!(theirs, lines(&["top", "theirs line", "bottom"]));
-        // And the resulting three-way sees exactly one conflict.
-        let (view, _) = MergeView::new(base, ours, theirs, true);
+        let (view, _) = view_from_markers(&doc).unwrap();
+        assert_eq!(view.base, lines(&["top", "base line", "bottom"]));
+        assert_eq!(view.ours, lines(&["top", "ours line", "bottom"]));
+        assert_eq!(view.theirs, lines(&["top", "theirs line", "bottom"]));
         assert_eq!(view.conflicts.len(), 1);
+        assert_eq!(view.conflicts[0].base, lines(&["base line"]));
+        assert_eq!(
+            (view.conflicts[0].result_start, view.conflicts[0].result_len),
+            (1, 1)
+        );
         assert!(view.from_markers);
     }
 
     #[test]
     fn synthesize_without_a_diff3_section_leaves_base_empty_for_the_block() {
         let doc = lines(&["<<<<<<< HEAD", "mine", "=======", "yours", ">>>>>>> br"]);
-        let (base, ours, theirs) = synthesize_from_markers(&doc).unwrap();
-        assert!(base.is_empty());
-        assert_eq!(ours, lines(&["mine"]));
-        assert_eq!(theirs, lines(&["yours"]));
-        let (view, result) = MergeView::new(base, ours, theirs, true);
+        let (view, result) = view_from_markers(&doc).unwrap();
         assert_eq!(view.conflicts.len(), 1);
+        assert!(view.conflicts[0].base.is_empty());
+        assert_eq!(view.conflicts[0].ours, lines(&["mine"]));
+        assert_eq!(view.conflicts[0].theirs, lines(&["yours"]));
         assert!(result.is_empty(), "conflict region starts as (empty) base");
     }
 
     #[test]
+    fn a_marker_block_with_an_empty_side_still_asks_for_a_decision() {
+        // #253 review: an ours-only block with no diff3 section. A
+        // textual three-way cannot tell the empty side from the
+        // (unknown, also empty) base and would auto-apply "added by
+        // us"; block construction keeps the decision with the user.
+        let doc = lines(&["<<<<<<< HEAD", "added by us", "=======", ">>>>>>> br"]);
+        let (view, result) = view_from_markers(&doc).unwrap();
+        assert_eq!(view.conflicts.len(), 1);
+        assert_eq!(view.conflicts[0].ours, lines(&["added by us"]));
+        assert!(view.conflicts[0].theirs.is_empty());
+        assert_eq!(view.conflicts[0].state, ConflictState::Unresolved);
+        assert!(result.is_empty(), "nothing was auto-applied");
+        assert_eq!(view.unresolved_count(), 1);
+    }
+
+    #[test]
     fn a_marker_free_buffer_synthesizes_nothing() {
-        assert!(synthesize_from_markers(&lines(&["plain", "text"])).is_none());
+        assert!(view_from_markers(&lines(&["plain", "text"])).is_none());
     }
 
     #[test]
