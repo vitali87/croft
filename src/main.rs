@@ -6,6 +6,7 @@ mod clipboard;
 mod collab;
 mod collab_agent;
 mod command_history;
+mod config_layers;
 mod dap;
 mod docx;
 mod file_ref;
