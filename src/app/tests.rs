@@ -29165,6 +29165,34 @@ fn refresh_run_debug_syncs_the_config_row() {
 }
 
 #[test]
+fn format_selection_needs_a_selection_and_reports_unsupported_via_the_reply() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("lib.rs"), "fn main( ) {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    // No selection: refused up front with guidance.
+    app.run_command(crate::widgets::command_palette::Command::FormatSelection);
+    assert_eq!(app.status, "Select something to format");
+    // With a selection: the request fires; with no server spawned in
+    // tests, the worker's always-answer contract reports unsupported
+    // through the SAME drain as whole-document formatting, with
+    // selection-specific wording.
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (1, 1),
+    });
+    app.run_command(crate::widgets::command_palette::Command::FormatSelection);
+    assert_eq!(app.status, "Formatting selection");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.format_request_id.is_some() && std::time::Instant::now() < deadline {
+        app.drain_lsp_format();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.status, "No range formatter available for this file");
+}
+
+#[test]
 fn linked_editing_set_clears_when_the_caret_leaves_and_mirrors_through_handle_key() {
     // #254 item 3: keystrokes inside a linked range mirror to the pair
     // on the tick; moving the caret out of every range drops the set.
