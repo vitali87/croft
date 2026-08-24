@@ -282,6 +282,21 @@ impl TriggerScanner {
     /// Feed a raw PTY chunk; completed lines are matched against `set`'s
     /// event triggers and any firings appended to `out`.
     pub fn scan(&mut self, bytes: &[u8], set: &TriggerSet, out: &mut Vec<TriggerHit>) {
+        self.scan_collect(bytes, set, out, None);
+    }
+
+    /// Like [`scan`](Self::scan), additionally pushing every completed
+    /// primary-screen line (escape-stripped, blank ones included — batch
+    /// matchers care about section-ending blanks) into `lines`. The watch
+    /// problem matchers (#252) consume these instead of running a second
+    /// byte scanner over the same stream.
+    pub fn scan_collect(
+        &mut self,
+        bytes: &[u8],
+        set: &TriggerSet,
+        out: &mut Vec<TriggerHit>,
+        mut lines: Option<&mut Vec<String>>,
+    ) {
         for &b in bytes {
             // Resolve a pending `\r` now that its successor is known: CRLF is
             // the PTY line ending (complete), a lone CR rewrites the line in
@@ -290,7 +305,7 @@ impl TriggerScanner {
             if self.cr_pending && self.state == ScanState::Ground {
                 self.cr_pending = false;
                 if b == b'\n' {
-                    self.complete_line(set, out);
+                    self.complete_line(set, out, lines.as_deref_mut());
                     continue;
                 }
                 self.reset_line();
@@ -298,7 +313,7 @@ impl TriggerScanner {
             match self.state {
                 ScanState::Ground => match b {
                     0x1b => self.state = ScanState::Esc,
-                    b'\n' => self.complete_line(set, out),
+                    b'\n' => self.complete_line(set, out, lines.as_deref_mut()),
                     b'\r' => self.cr_pending = true,
                     0x00..=0x1f | 0x7f => {}
                     _ => {
@@ -385,10 +400,18 @@ impl TriggerScanner {
         self.line.clear();
     }
 
-    fn complete_line(&mut self, set: &TriggerSet, out: &mut Vec<TriggerHit>) {
+    fn complete_line(
+        &mut self,
+        set: &TriggerSet,
+        out: &mut Vec<TriggerHit>,
+        lines: Option<&mut Vec<String>>,
+    ) {
         if self.in_alt {
             self.reset_line();
             return;
+        }
+        if let Some(lines) = lines {
+            lines.push(String::from_utf8_lossy(&self.line).into_owned());
         }
         if !self.line.is_empty() {
             let line = String::from_utf8_lossy(&self.line);
