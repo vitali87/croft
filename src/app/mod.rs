@@ -218,6 +218,19 @@ pub(crate) enum QuickInputPosition {
     Center,
 }
 
+/// One in-flight `textDocument/selectionRange` request (#254): the
+/// Expand Selection gesture waiting on its chains. `positions` snapshots
+/// the exact cursors the request was fired for, so a reply (or a reuse
+/// attempt) after ANY caret movement is recognised as stale even though
+/// `edit_seq` did not move.
+struct PendingSelectionRanges {
+    id: u64,
+    path: PathBuf,
+    seq: u64,
+    presses: usize,
+    positions: Vec<(u32, u32)>,
+}
+
 /// Pre-Zen visibility snapshot, restored verbatim when Zen Mode is toggled
 /// off so the workspace returns to exactly the chrome it had before.
 #[derive(Clone, Copy, Debug)]
@@ -2761,6 +2774,14 @@ pub struct App {
     /// edit_seq) it was fired for so a reply for a caret or buffer state the
     /// editor has since left is dropped.
     occurrences_request: Option<(u64, PathBuf, usize, usize, u64)>,
+    /// In-flight Expand Selection request (#254). Extra Shift+Alt+Right
+    /// presses while the chains are in flight stack up and apply
+    /// together on drain; an `unsupported` verdict resolves them via
+    /// tree-sitter instead. The reply is gated on id + path + edit_seq
+    /// AND the exact cursor positions the request was fired for — a
+    /// caret move without an edit leaves `edit_seq` unchanged, and a
+    /// chain computed for the old caret must not apply at the new one.
+    selection_range_request: Option<PendingSelectionRanges>,
     /// The caret state `tick_occurrences` last observed, and when it changed.
     /// A caret resting on one spot for `OCCURRENCES_IDLE` fires one request.
     occ_observed: Option<(PathBuf, usize, usize, u64)>,
@@ -2775,6 +2796,15 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// The presentation edits behind the open Change Color Presentation
+    /// picker (#254), indexed by row id; cleared after a pick.
+    pending_color_presentations: Vec<(String, Vec<crate::widgets::editor::TextSpanEdit>)>,
+    /// The (path, edit_seq) the pending presentations were computed
+    /// against; a pick is refused when either moved while the picker was
+    /// open (an FS-sync reload bumps the seq without user edits).
+    pending_color_context: Option<(PathBuf, u64)>,
+    /// In-flight colorPresentation request: (id, path, edit_seq).
+    color_presentations_request: Option<(u64, PathBuf, u64)>,
     nav: NavHistory,
     editor_vim_chord: EditorVimChord,
     /// `Cmd+K` leader: armed when the user presses the prefix, holding the
@@ -4160,6 +4190,9 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            pending_color_presentations: Vec::new(),
+            pending_color_context: None,
+            color_presentations_request: None,
             hover: HoverDwell::default(),
             hover_popup: None,
             hover_request_id: None,
@@ -4184,6 +4217,7 @@ impl App {
             references_request_id: None,
             call_hierarchy_request_id: None,
             occurrences_request: None,
+            selection_range_request: None,
             occ_observed: None,
             occ_observed_at: std::time::Instant::now(),
             nav: NavHistory::default(),
@@ -6026,6 +6060,10 @@ impl App {
             // provider, which is what leaves the editor's indentation /
             // region fallback in charge.
             lsp.request_folding_ranges(path.clone(), seq);
+            // Document colors ride the same cadence (#254); the worker is
+            // silent when no server advertises a colorProvider, which is
+            // what keeps the swatches from ever appearing unadvertised.
+            lsp.request_document_colors(path.clone(), seq);
             self.lsp_last_seen.insert(path, seq);
         }
         let closed: Vec<PathBuf> = self
@@ -7028,6 +7066,119 @@ impl App {
                     changed = true;
                 }
             }
+        }
+        changed
+    }
+
+    /// Drain document-color batches (#254) into every editor showing the
+    /// file — the inlay-hints fan-out, seq gate included. An empty batch
+    /// clears the swatches (a stylesheet that lost its last color).
+    pub fn drain_lsp_document_colors(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut updates = Vec::new();
+        while let Some(u) = lsp.drain_document_colors() {
+            updates.push(u);
+        }
+        let mut changed = false;
+        for u in updates {
+            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+                continue;
+            }
+            if self.editor.path.as_deref() == Some(u.path.as_path()) {
+                self.editor
+                    .apply_document_colors(u.path.clone(), u.colors.clone());
+                changed = true;
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(u.path.as_path()) {
+                    group.apply_document_colors(u.path.clone(), u.colors.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// "Change Color Presentation" (#254): ask for the alternative
+    /// spellings of the color value at the cursor and defer the picker on
+    /// the reply.
+    fn change_color_presentation(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        let Some(item) = self.editor.color_at(row, col).cloned() else {
+            self.status = String::from("No color value at the cursor");
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let seq = self.editor.edit_seq;
+        let Some(lsp) = self.lsp.as_mut() else {
+            self.status = String::from("No language server for this file");
+            return;
+        };
+        let id = lsp.request_color_presentations(
+            path.clone(),
+            item.raw,
+            (item.line, item.character),
+            (item.end_line, item.end_character),
+        );
+        self.color_presentations_request = Some((id, path, seq));
+        self.status = String::from("Fetching color presentations…");
+    }
+
+    /// Open the presentation picker when the reply lands (#254); gated on
+    /// id + path + edit_seq like every deferred caret request.
+    pub fn drain_lsp_color_presentations(&mut self) -> bool {
+        let mut results = Vec::new();
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(r) = lsp.drain_color_presentations() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for result in results {
+            let Some((id, path, seq)) = self.color_presentations_request.clone() else {
+                continue;
+            };
+            if result.request_id != id {
+                continue;
+            }
+            self.color_presentations_request = None;
+            if self.editor.path.as_deref() != Some(path.as_path()) || self.editor.edit_seq != seq {
+                continue;
+            }
+            changed = true;
+            if result.presentations.is_empty() {
+                self.status = String::from("No color presentations offered here");
+                continue;
+            }
+            let rows: Vec<crate::widgets::list_picker::ListRow> = result
+                .presentations
+                .iter()
+                .enumerate()
+                .map(|(i, (label, _))| crate::widgets::list_picker::ListRow {
+                    id: i.to_string(),
+                    label: label.clone(),
+                })
+                .collect();
+            self.pending_color_presentations = result.presentations;
+            self.pending_color_context = Some((path.clone(), seq));
+            self.open_list_picker(
+                crate::widgets::list_picker::ListPicker::new(
+                    crate::widgets::list_picker::ListPurpose::ColorPresentation,
+                    "Change Color Presentation",
+                    rows,
+                ),
+                "No color presentations offered here",
+            );
         }
         changed
     }
@@ -8234,6 +8385,122 @@ impl App {
     /// `documentHighlight` request for it; the moment it moves (or the buffer
     /// edits), drop the painted set. Mirrors VS Code's word highlight, which
     /// follows the cursor with a small debounce rather than every keystroke.
+    /// Expand Selection (#254): grow every cursor to the next
+    /// semantically meaningful range. Cached chain steps apply
+    /// instantly; otherwise the LSP `selectionRange` chains are fetched
+    /// (one request, all cursors), with tree-sitter node ancestry as the
+    /// serverless fallback — so the gesture works with no LSP at all.
+    fn expand_selection(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        self.editor.validate_expand_stacks();
+        if self.editor.expand_selection_from_stack() {
+            return;
+        }
+        let lang_known = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+            .is_some();
+        if lang_known
+            && self.lsp.is_some()
+            && let Some(path) = self.editor.path.clone()
+        {
+            let seq = self.editor.edit_seq;
+            let positions = self.editor.cursor_positions_utf16();
+            // Reuse the pending request only when it was fired for these
+            // exact cursors; a caret move re-fires for the new spot.
+            if let Some(pending) = self.selection_range_request.as_mut()
+                && pending.path == path
+                && pending.seq == seq
+                && pending.positions == positions
+            {
+                pending.presses += 1;
+                return;
+            }
+            if let Some(lsp) = self.lsp.as_mut() {
+                let id = lsp.request_selection_ranges(path.clone(), positions.clone());
+                self.selection_range_request = Some(PendingSelectionRanges {
+                    id,
+                    path,
+                    seq,
+                    presses: 1,
+                    positions,
+                });
+            }
+            return;
+        }
+        if !self.editor.expand_selection_syntax() {
+            self.status = String::from("No larger range to select");
+        }
+    }
+
+    /// Shrink Selection: retrace the expand stack one step. Purely
+    /// local — the stack already remembers the exact ranges.
+    fn shrink_selection(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        self.editor.shrink_selection_step();
+    }
+
+    /// Drain `selectionRange` replies (#254): triple-gated like
+    /// occurrences (id + path + edit_seq), then either install the
+    /// server's chains or resolve the queued presses via tree-sitter
+    /// when the request came back unsupported/empty.
+    fn drain_lsp_selection_ranges(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut results = Vec::new();
+        while let Some(r) = lsp.drain_selection_ranges() {
+            results.push(r);
+        }
+        let mut changed = false;
+        for r in results {
+            let Some(pending) = self.selection_range_request.as_ref() else {
+                continue;
+            };
+            // Gate on id + path + edit_seq AND the cursors the request
+            // was fired for: a click between request and reply leaves
+            // `edit_seq` unchanged, but the chains describe the OLD
+            // caret and must not apply at the new one.
+            if r.request_id != pending.id
+                || self.editor.path.as_deref() != Some(pending.path.as_path())
+                || self.editor.edit_seq != pending.seq
+                || self.editor.cursor_positions_utf16() != pending.positions
+            {
+                if r.request_id == pending.id {
+                    self.selection_range_request = None;
+                }
+                continue;
+            }
+            let presses = pending.presses;
+            self.selection_range_request = None;
+            if r.unsupported || r.chains.is_empty() {
+                for _ in 0..presses {
+                    if !self.editor.expand_selection_syntax() {
+                        break;
+                    }
+                }
+                changed = true;
+                continue;
+            }
+            self.editor.install_selection_chains(r.chains);
+            for _ in 0..presses {
+                if !self.editor.expand_selection_from_stack() {
+                    break;
+                }
+            }
+            changed = true;
+        }
+        changed
+    }
+
     pub fn tick_occurrences(&mut self) -> bool {
         const OCCURRENCES_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
         let eligible = self.editor.diff.is_none()
@@ -19890,6 +20157,31 @@ impl App {
                 }
                 self.pending_code_actions.clear();
             }
+            ListPurpose::ColorPresentation => {
+                // The edits were computed against a specific buffer state;
+                // an external reload while the picker was open orphans
+                // them (#277 review) — refuse rather than splice at
+                // stale offsets.
+                let context_ok = self.pending_color_context.take().is_some_and(|(p, seq)| {
+                    self.editor.path.as_deref() == Some(p.as_path()) && self.editor.edit_seq == seq
+                });
+                if context_ok {
+                    if let Some((label, edits)) =
+                        self.pending_color_presentations.get(index).cloned()
+                    {
+                        let applied = self.editor.apply_span_edits(&edits);
+                        self.status = if applied > 0 {
+                            format!("Color rewritten as {label}")
+                        } else {
+                            String::from("The presentation's edit no longer applies")
+                        };
+                    }
+                } else {
+                    self.status =
+                        String::from("The buffer changed — re-run Change Color Presentation");
+                }
+                self.pending_color_presentations.clear();
+            }
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
                     self.run_project_task(task);
@@ -22137,6 +22429,18 @@ impl App {
                 KeyCode::Up => self.editor.duplicate_lines_up(),
                 KeyCode::Down => self.editor.duplicate_lines_down(),
                 _ => unreachable!(),
+            }
+            return;
+        }
+        // Expand / Shrink Selection (#254): Shift+Alt+Right/Left, VS Code's
+        // smart-select chords. This deliberately claims what used to be
+        // word-wise selection extension — the same collision VS Code
+        // resolves the same way.
+        if shift && alt && !cmd && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+            if key.code == KeyCode::Right {
+                self.expand_selection();
+            } else {
+                self.shrink_selection();
             }
             return;
         }
@@ -26039,6 +26343,8 @@ impl App {
                     self.status = String::from("Trimmed trailing whitespace");
                 }
             }
+            Cmd::ExpandSelection => self.expand_selection(),
+            Cmd::ShrinkSelection => self.shrink_selection(),
             Cmd::ToggleWordWrap => {
                 self.editor.toggle_wrap();
                 self.status = if self.editor.wrap_enabled() {
@@ -26070,6 +26376,7 @@ impl App {
                 self.status = String::from("Converted indentation to tabs");
             }
             Cmd::FormatDocument => self.start_format_document(),
+            Cmd::ChangeColorPresentation => self.change_color_presentation(),
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
@@ -38604,6 +38911,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let inlay_changed = app.drain_lsp_inlay_hints();
         let folds_changed = app.drain_lsp_folding_ranges();
+        let selection_ranges_changed = app.drain_lsp_selection_ranges();
+        let colors_changed = app.drain_lsp_document_colors();
+        let color_pres_changed = app.drain_lsp_color_presentations();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
@@ -38678,6 +38988,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || semantic_changed
             || inlay_changed
             || folds_changed
+            || selection_ranges_changed
+            || colors_changed
+            || color_pres_changed
             || diagnostics_changed
             || progress_changed
             || voice_changed

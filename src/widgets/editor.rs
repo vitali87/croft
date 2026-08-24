@@ -1374,6 +1374,22 @@ impl EditorSelection {
     }
 }
 
+/// The Expand/Shrink Selection state (#254): per-cursor step stacks.
+/// See the `select_expand` field doc for the validity contract.
+struct SelectExpandStacks {
+    /// The `edit_seq` the stacks were built against.
+    edit_seq: u64,
+    /// One stack per cursor: primary first, then `carets` in order.
+    stacks: Vec<ExpandStack>,
+}
+
+/// One cursor's selection-growth history, smallest step first.
+struct ExpandStack {
+    steps: Vec<EditorSelection>,
+    /// Index of the step the buffer currently shows.
+    pos: usize,
+}
+
 /// A single text replacement in char-indexed `(row, col)` coordinates, as
 /// produced by an LSP rename `WorkspaceEdit`. Applied by
 /// [`apply_span_edits_to_lines`] and [`Editor::apply_span_edits`].
@@ -1933,6 +1949,14 @@ pub struct Editor {
     /// Each entry is a full selection (anchor and head); head is that caret's
     /// cursor. Edits apply to the primary and all of these as one undo step.
     pub carets: Vec<EditorSelection>,
+    /// Expand/Shrink Selection stacks (#254): one per cursor (primary
+    /// first, then `carets` in order), each recording the selections the
+    /// gesture stepped through so shrink retraces exactly. Valid only
+    /// while `edit_seq` matches and every cursor's CURRENT selection
+    /// still equals its stack's current step — any edit, click, or
+    /// caret reshuffle fails the check and the next gesture rebuilds
+    /// from scratch (the `tick_occurrences` invalidation posture).
+    select_expand: Option<SelectExpandStacks>,
     /// Collaborators' caret positions in this file (multiplayer sessions,
     /// docs/MULTIPLAYER.md): (row, char col, participant color). Painted as
     /// colored block cells like secondary carets; the App rebuilds this
@@ -2108,11 +2132,19 @@ pub struct Editor {
     /// stale the moment the text changes — and replaced when the app's next
     /// idle-caret request answers.
     occurrences: Vec<(usize, usize, usize, bool)>,
-    /// Decoded per-logical-line hint runs `(char_col, label)`, sorted by
-    /// column. The render loop splices each label into the row as dim italic
-    /// virtual cells at its anchor; every overlay painter, the caret, and
-    /// mouse mapping translate buffer columns past them.
-    inlay_spans: Vec<Vec<(usize, String)>>,
+    /// Decoded per-logical-line virtual-cell runs `(char_col, label,
+    /// swatch)`, sorted by column: LSP inlay hints (swatch `None`, dim
+    /// italic) and document-color swatches (#254: a `■` whose fg IS the
+    /// color). The render loop splices each label into the row at its
+    /// anchor; every overlay painter, the caret, and mouse mapping
+    /// translate buffer columns past them.
+    inlay_spans: Vec<Vec<(usize, String, Option<Color>)>>,
+    /// The document's color values (#254): raw UTF-16 positions + RGB,
+    /// re-decoded like `inlay_hints`; feeds the `■` swatch spans and the
+    /// Change Color Presentation picker's range lookup.
+    color_infos: Vec<crate::lsp::manager::ColorItem>,
+    /// The file `color_infos` describes (same contract as `inlay_path`).
+    color_path: Option<PathBuf>,
     registry: LangRegistry,
     /// When set, every occurrence of this string in the visible portion of
     /// the buffer is overpainted with the search-match style after the
@@ -2257,6 +2289,7 @@ impl Editor {
             last_gutter_width: 0,
             selection: None,
             carets: Vec::new(),
+            select_expand: None,
             ghost_carets: Vec::new(),
             ghost_caret_labels: Vec::new(),
             stream_stop_line: None,
@@ -2303,6 +2336,8 @@ impl Editor {
             inlay_path: None,
             occurrences: Vec::new(),
             inlay_spans: Vec::new(),
+            color_infos: Vec::new(),
+            color_path: None,
             registry: LangRegistry::new(),
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -2723,7 +2758,7 @@ impl Editor {
                 let extra: usize = self
                     .inlay_spans
                     .get(i)
-                    .map(|hs| hs.iter().map(|(_, label)| label.chars().count()).sum())
+                    .map(|hs| hs.iter().map(|(_, label, _)| label.chars().count()).sum())
                     .unwrap_or(0);
                 l.chars().count() + extra
             })
@@ -3453,6 +3488,8 @@ impl Editor {
         // must never splice into this one.
         self.inlay_hints = Vec::new();
         self.inlay_path = None;
+        self.color_infos = Vec::new();
+        self.color_path = None;
         self.inlay_spans = Vec::new();
         self.recompute_highlights();
         // Notebooks auto-open rendered (#180): the JSON stays one
@@ -4292,6 +4329,43 @@ impl Editor {
         self.recompute_inlay_spans();
     }
 
+    /// Install the document's color values (#254): wholesale replace,
+    /// like inlay hints — an empty batch clears the swatches.
+    pub fn apply_document_colors(
+        &mut self,
+        path: PathBuf,
+        colors: Vec<crate::lsp::manager::ColorItem>,
+    ) {
+        self.color_path = Some(path);
+        self.color_infos = colors;
+        self.recompute_inlay_spans();
+    }
+
+    /// The color value whose range contains `(row, col)` — the Change
+    /// Color Presentation picker's target lookup.
+    pub fn color_at(&self, row: usize, col: usize) -> Option<&crate::lsp::manager::ColorItem> {
+        if self.color_path.as_deref() != self.path.as_deref() {
+            return None;
+        }
+        self.color_infos.iter().find(|c| {
+            let (sr, er) = (c.line as usize, c.end_line as usize);
+            if row < sr || row > er {
+                return false;
+            }
+            let sc = self.utf16_col_to_char_pub(sr, c.character);
+            let ec = self.utf16_col_to_char_pub(er, c.end_character);
+            (row > sr || col >= sc) && (row < er || col <= ec)
+        })
+    }
+
+    /// Public UTF-16 → char-column bridge for one row.
+    pub fn utf16_col_to_char_pub(&self, row: usize, character: u32) -> usize {
+        self.lines
+            .get(row)
+            .map(|l| utf16_to_char_col(l, character))
+            .unwrap_or(0)
+    }
+
     /// Install the occurrences of the symbol under the caret, converting the
     /// server's UTF-16 columns to character columns row by row. A multi-line
     /// occurrence (rare, but legal) tints its first row from the start column,
@@ -4346,20 +4420,41 @@ impl Editor {
         // Hint cells change the display width of their lines.
         self.hscroll_content_cols = None;
         let same_file = self.inlay_path.as_deref() == self.path.as_deref();
-        if !same_file || self.inlay_hints.is_empty() {
+        let colors_same_file = self.color_path.as_deref() == self.path.as_deref();
+        let hints_live = same_file && !self.inlay_hints.is_empty();
+        let colors_live = colors_same_file && !self.color_infos.is_empty();
+        if !hints_live && !colors_live {
             self.inlay_spans = Vec::new();
             return;
         }
-        let mut spans: Vec<Vec<(usize, String)>> = vec![Vec::new(); self.lines.len()];
-        for h in &self.inlay_hints {
-            let Some(text) = self.lines.get(h.line as usize) else {
-                continue;
-            };
-            let col = utf16_to_char_col(text, h.character).min(text.chars().count());
-            spans[h.line as usize].push((col, h.label.clone()));
+        let mut spans: Vec<Vec<(usize, String, Option<Color>)>> =
+            vec![Vec::new(); self.lines.len()];
+        if hints_live {
+            for h in &self.inlay_hints {
+                let Some(text) = self.lines.get(h.line as usize) else {
+                    continue;
+                };
+                let col = utf16_to_char_col(text, h.character).min(text.chars().count());
+                spans[h.line as usize].push((col, h.label.clone(), None));
+            }
+        }
+        // Document-color swatches (#254): a one-cell `■` virtual span
+        // whose foreground IS the color, anchored at the value's start.
+        if colors_live {
+            for c in &self.color_infos {
+                let Some(text) = self.lines.get(c.line as usize) else {
+                    continue;
+                };
+                let col = utf16_to_char_col(text, c.character).min(text.chars().count());
+                spans[c.line as usize].push((
+                    col,
+                    String::from("\u{25a0}"),
+                    Some(Color::Rgb(c.red, c.green, c.blue)),
+                ));
+            }
         }
         for line in &mut spans {
-            line.sort_by_key(|(c, _)| *c);
+            line.sort_by_key(|(c, _, _)| *c);
         }
         self.inlay_spans = spans;
     }
@@ -4368,7 +4463,7 @@ impl Editor {
     /// wrapped row segmentation knows nothing about hint cells.
     /// ponytail: hints skip wrap mode; code files don't wrap by default, and
     /// Markdown (the wrapping default) has no hint-serving server.
-    fn row_inlay_spans(&self, line: usize) -> &[(usize, String)] {
+    fn row_inlay_spans(&self, line: usize) -> &[(usize, String, Option<Color>)] {
         if self.wrap_enabled() {
             return &[];
         }
@@ -5411,6 +5506,270 @@ impl Editor {
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
+    }
+
+    // ---- Expand / Shrink Selection (#254) -------------------------------
+
+    /// Every cursor's current selection, primary first — a zero-area
+    /// selection at the caret when nothing is selected.
+    fn cursor_selections(&self) -> Vec<EditorSelection> {
+        let primary = self
+            .selection
+            .unwrap_or_else(|| EditorSelection::new(self.cursor_row, self.cursor_col));
+        std::iter::once(primary)
+            .chain(self.carets.iter().copied())
+            .collect()
+    }
+
+    /// Ensure the expand stacks describe the CURRENT cursors; rebuild
+    /// from scratch on any mismatch (edit, click, caret reshuffle). See
+    /// the `select_expand` field doc for why matching, not indexing, is
+    /// the validity test.
+    pub fn validate_expand_stacks(&mut self) {
+        let cur = self.cursor_selections();
+        let valid = self.select_expand.as_ref().is_some_and(|se| {
+            se.edit_seq == self.edit_seq
+                && se.stacks.len() == cur.len()
+                && se.stacks.iter().zip(&cur).all(|(st, c)| {
+                    st.steps
+                        .get(st.pos)
+                        .is_some_and(|s| s.normalised() == c.normalised())
+                })
+        });
+        if !valid {
+            self.select_expand = Some(SelectExpandStacks {
+                edit_seq: self.edit_seq,
+                stacks: cur
+                    .into_iter()
+                    .map(|c| ExpandStack {
+                        steps: vec![c],
+                        pos: 0,
+                    })
+                    .collect(),
+            });
+        }
+    }
+
+    /// Write every stack's current step back onto the cursors, keeping
+    /// the cursor-follows-head convention of every other selection setter.
+    fn apply_expand_steps(&mut self) {
+        let Some(se) = self.select_expand.as_ref() else {
+            return;
+        };
+        let sels: Vec<EditorSelection> = se.stacks.iter().map(|st| st.steps[st.pos]).collect();
+        let primary = sels[0];
+        self.selection = primary.has_area().then_some(primary);
+        self.cursor_row = primary.head.0.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = primary.head.1.min(self.line_char_len(self.cursor_row));
+        self.carets = sels[1..].to_vec();
+        self.ensure_cursor_col_visible();
+    }
+
+    /// Step every cursor one level up its cached chain. False when no
+    /// stack has a deeper step cached (the caller then computes one —
+    /// LSP chain or syntax ancestry).
+    pub fn expand_selection_from_stack(&mut self) -> bool {
+        let Some(se) = self.select_expand.as_mut() else {
+            return false;
+        };
+        let mut any = false;
+        for st in &mut se.stacks {
+            if st.pos + 1 < st.steps.len() {
+                st.pos += 1;
+                any = true;
+            }
+        }
+        if any {
+            self.apply_expand_steps();
+        }
+        any
+    }
+
+    /// Shrink Selection: retrace one step down the stack. False at the
+    /// bottom (the gesture's starting point).
+    pub fn shrink_selection_step(&mut self) -> bool {
+        self.validate_expand_stacks();
+        let Some(se) = self.select_expand.as_mut() else {
+            return false;
+        };
+        let mut any = false;
+        for st in &mut se.stacks {
+            if st.pos > 0 {
+                st.pos -= 1;
+                any = true;
+            }
+        }
+        if any {
+            self.apply_expand_steps();
+        }
+        any
+    }
+
+    /// Install per-cursor LSP `selectionRange` chains (#254): UTF-16
+    /// `(start_line, start_char, end_line, end_char)` spans, smallest
+    /// first, index-aligned with the cursors. Each stack's history above
+    /// its current step is replaced by the strictly-growing tail of its
+    /// chain; the caller then calls [`Self::expand_selection_from_stack`].
+    pub fn install_selection_chains(&mut self, chains: Vec<Vec<(u32, u32, u32, u32)>>) {
+        self.validate_expand_stacks();
+        // Convert before mutably borrowing the stacks.
+        let converted: Vec<Vec<EditorSelection>> = chains
+            .iter()
+            .map(|chain| {
+                chain
+                    .iter()
+                    .map(|&(sl, sc, el, ec)| {
+                        let sr = (sl as usize).min(self.lines.len().saturating_sub(1));
+                        let er = (el as usize).min(self.lines.len().saturating_sub(1));
+                        EditorSelection {
+                            anchor: (sr, utf16_to_char_col(&self.lines[sr], sc)),
+                            head: (er, utf16_to_char_col(&self.lines[er], ec)),
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let Some(se) = self.select_expand.as_mut() else {
+            return;
+        };
+        for (st, chain) in se.stacks.iter_mut().zip(converted) {
+            let cur = st.steps[st.pos].normalised();
+            st.steps.truncate(st.pos + 1);
+            let mut last = cur;
+            for sel in chain {
+                let n = sel.normalised();
+                // Keep only strictly-growing spans that still contain the
+                // current selection, so a chain answered for a slightly
+                // different anchor can't shrink or jump the gesture.
+                if n.0 <= last.0 && n.1 >= last.1 && n != last {
+                    st.steps.push(sel);
+                    last = n;
+                }
+            }
+        }
+    }
+
+    /// Grow every cursor's selection to the nearest strictly-larger
+    /// tree-sitter node (#254's serverless fallback). Without a grammar,
+    /// grows to the line span and then the whole buffer, so the command
+    /// always answers. Returns false when nothing could grow.
+    pub fn expand_selection_syntax(&mut self) -> bool {
+        self.validate_expand_stacks();
+        let tree = self.lang.map(crate::highlight::language_for).and_then(|l| {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&l).ok()?;
+            parser.parse(self.lines.join("\n"), None)
+        });
+        let Some(se) = self.select_expand.as_ref() else {
+            return false;
+        };
+        let mut grown: Vec<Option<EditorSelection>> = Vec::with_capacity(se.stacks.len());
+        for st in &se.stacks {
+            let cur = st.steps[st.pos].normalised();
+            let next = match &tree {
+                Some(t) => self.syntax_enclosing_range(t, cur),
+                None => self.textual_enclosing_range(cur),
+            };
+            grown.push(next);
+        }
+        let Some(se) = self.select_expand.as_mut() else {
+            return false;
+        };
+        let mut any = false;
+        for (st, next) in se.stacks.iter_mut().zip(grown) {
+            if let Some(sel) = next {
+                st.steps.truncate(st.pos + 1);
+                st.steps.push(sel);
+                st.pos += 1;
+                any = true;
+            }
+        }
+        if any {
+            self.apply_expand_steps();
+        }
+        any
+    }
+
+    /// The smallest tree-sitter node range strictly containing `cur`
+    /// (char coordinates), climbing `.parent()` past same-range wrappers.
+    fn syntax_enclosing_range(
+        &self,
+        tree: &tree_sitter::Tree,
+        cur: ((usize, usize), (usize, usize)),
+    ) -> Option<EditorSelection> {
+        let start_b = self.char_pos_to_byte(cur.0);
+        let end_b = self.char_pos_to_byte(cur.1);
+        let mut node = tree.root_node().descendant_for_byte_range(start_b, end_b)?;
+        loop {
+            let (ns, ne) = (node.start_byte(), node.end_byte());
+            let contains = ns <= start_b && ne >= end_b;
+            let strictly = contains && (ns < start_b || ne > end_b);
+            if strictly {
+                let anchor = self.ts_point_to_char(node.start_position());
+                let head = self.ts_point_to_char(node.end_position());
+                return Some(EditorSelection { anchor, head });
+            }
+            node = node.parent()?;
+        }
+    }
+
+    /// Grammar-less growth: the current line span, then the whole buffer.
+    fn textual_enclosing_range(
+        &self,
+        cur: ((usize, usize), (usize, usize)),
+    ) -> Option<EditorSelection> {
+        let (start, end) = cur;
+        let line_sel = EditorSelection {
+            anchor: (start.0, 0),
+            head: (end.0, self.line_char_len(end.0)),
+        };
+        let n = line_sel.normalised();
+        if n.0 < start || n.1 > end {
+            return Some(line_sel);
+        }
+        let last = self.lines.len().saturating_sub(1);
+        let all = EditorSelection {
+            anchor: (0, 0),
+            head: (last, self.line_char_len(last)),
+        };
+        let n = all.normalised();
+        (n.0 < start || n.1 > end).then_some(all)
+    }
+
+    /// Byte offset of char position `(row, col)` in the `\n`-joined text.
+    fn char_pos_to_byte(&self, pos: (usize, usize)) -> usize {
+        let mut off = 0usize;
+        for (i, l) in self.lines.iter().enumerate() {
+            if i == pos.0 {
+                return off + char_byte(l, pos.1.min(l.chars().count()));
+            }
+            off += l.len() + 1;
+        }
+        off.saturating_sub(1)
+    }
+
+    /// Tree-sitter `Point` (row + BYTE column) → editor `(row, char col)`.
+    fn ts_point_to_char(&self, p: tree_sitter::Point) -> (usize, usize) {
+        let row = p.row.min(self.lines.len().saturating_sub(1));
+        let line = &self.lines[row];
+        let col = line[..p.column.min(line.len())].chars().count();
+        (row, col)
+    }
+
+    /// The cursors' positions as LSP UTF-16 `(line, character)` pairs,
+    /// primary first — `textDocument/selectionRange`'s `positions` input.
+    pub fn cursor_positions_utf16(&self) -> Vec<(u32, u32)> {
+        self.cursor_selections()
+            .iter()
+            .map(|s| {
+                let (row, col) = s.head;
+                let row = row.min(self.lines.len().saturating_sub(1));
+                let line = &self.lines[row];
+                let byte = char_byte(line, col.min(line.chars().count()));
+                let u16col = line[..byte].encode_utf16().count() as u32;
+                (row as u32, u16col)
+            })
+            .collect()
     }
 
     pub fn select_all(&mut self) {
@@ -8315,8 +8674,8 @@ impl Editor {
         while c < line_len {
             let extra: usize = hints
                 .iter()
-                .filter(|(hc, _)| *hc >= self.scroll_col && *hc <= c)
-                .map(|(_, l)| l.chars().count())
+                .filter(|(hc, _, _)| *hc >= self.scroll_col && *hc <= c)
+                .map(|(_, l, _)| l.chars().count())
                 .sum();
             if c + extra >= display_col {
                 break;
@@ -9625,8 +9984,8 @@ impl Widget for &mut Editor {
             let hint_cells: Vec<(usize, usize)> = self
                 .row_inlay_spans(line_idx)
                 .iter()
-                .filter(|(hc, _)| *hc >= row_start && *hc <= hint_cap)
-                .map(|(hc, l)| (*hc, l.chars().count()))
+                .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
+                .map(|(hc, l, _)| (*hc, l.chars().count()))
                 .collect();
             let ex = |c: usize| inlay_cells_before(&hint_cells, c);
             // Caret placement uses the strictly-before rule instead: a
@@ -9658,15 +10017,21 @@ impl Widget for &mut Editor {
                     .add_modifier(Modifier::ITALIC);
                 let mut out: Vec<Span> = Vec::new();
                 let mut from = row_start;
-                for (hcol, label) in self
+                for (hcol, label, swatch) in self
                     .row_inlay_spans(line_idx)
                     .iter()
-                    .filter(|(hc, _)| *hc >= row_start && *hc <= hint_cap)
+                    .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
                 {
                     if *hcol > from {
                         out.extend(inlay_text_segment(raw, &merged, from, *hcol));
                     }
-                    out.push(Span::styled(label.clone(), hint_style));
+                    // A color swatch paints in ITS color (#254); plain
+                    // hints keep the dim italic Zed look.
+                    let style = match swatch {
+                        Some(c) => Style::default().fg(*c),
+                        None => hint_style,
+                    };
+                    out.push(Span::styled(label.clone(), style));
                     from = from.max(*hcol);
                 }
                 if row_end > from {
@@ -10119,8 +10484,8 @@ impl Widget for &mut Editor {
             let hint_cells: Vec<(usize, usize)> = self
                 .row_inlay_spans(*cl)
                 .iter()
-                .filter(|(hc, _)| *hc >= caret_start && *hc <= hint_cap)
-                .map(|(hc, l)| (*hc, l.chars().count()))
+                .filter(|(hc, _, _)| *hc >= caret_start && *hc <= hint_cap)
+                .map(|(hc, l, _)| (*hc, l.chars().count()))
                 .collect();
             let col_cells = cc + inlay_cells_before(&hint_cells, *cc);
             if col_cells < caret_start {
@@ -10457,8 +10822,8 @@ impl Editor {
     fn inlay_cells_before_cursor(&self, line: usize, scroll_col: usize) -> usize {
         self.row_inlay_spans(line)
             .iter()
-            .filter(|(hc, _)| *hc >= scroll_col && *hc < self.cursor_col)
-            .map(|(_, l)| l.chars().count())
+            .filter(|(hc, _, _)| *hc >= scroll_col && *hc < self.cursor_col)
+            .map(|(_, l, _)| l.chars().count())
             .sum()
     }
 
@@ -20188,6 +20553,162 @@ mod tests {
         e.cursor_col = 1;
         e.add_cursor_below();
         assert!(e.carets.is_empty());
+    }
+
+    #[test]
+    fn expand_selection_syntax_walks_rust_node_ancestry_and_shrink_retraces() {
+        let mut e = editor_with("fn main() {\n    let value = compute(1, 2);\n}");
+        e.set_language(Some(crate::highlight::LangKind::Rust));
+        // Caret inside `value`, nothing selected.
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.validate_expand_stacks();
+        assert!(e.expand_selection_syntax(), "first grow");
+        let first = e.selection.expect("a selection appeared").normalised();
+        assert!(
+            first.0 <= (1, 8) && first.1 >= (1, 13),
+            "the identifier (or more) is selected: {first:?}"
+        );
+        assert!(e.expand_selection_syntax(), "second grow");
+        let second = e.selection.unwrap().normalised();
+        assert!(
+            second.0 <= first.0 && second.1 >= first.1 && second != first,
+            "each step strictly grows: {first:?} -> {second:?}"
+        );
+        // Shrink retraces the EXACT ranges, then bottoms out.
+        assert!(e.shrink_selection_step());
+        assert_eq!(e.selection.unwrap().normalised(), first);
+        assert!(e.shrink_selection_step());
+        assert!(
+            e.selection.is_none(),
+            "the gesture's start was a zero-area caret"
+        );
+        assert!(!e.shrink_selection_step(), "bottom of the stack");
+    }
+
+    #[test]
+    fn expand_stack_rebuilds_after_an_edit_or_a_cursor_move() {
+        let mut e = editor_with("fn main() {\n    let value = 1;\n}");
+        e.set_language(Some(crate::highlight::LangKind::Rust));
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.validate_expand_stacks();
+        assert!(e.expand_selection_syntax());
+        // A manual cursor move away from the stack's step invalidates it:
+        // shrink from the new spot has nothing to retrace.
+        e.clear_selection();
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        assert!(!e.shrink_selection_step(), "stack rebuilt at the new spot");
+    }
+
+    #[test]
+    fn install_selection_chains_keeps_only_strictly_growing_containing_spans() {
+        let mut e = editor_with("alpha beta\ngamma");
+        e.cursor_row = 0;
+        e.cursor_col = 7; // inside "beta"
+        e.validate_expand_stacks();
+        // UTF-16 chain: the word, a NON-containing span (filtered), the
+        // line, a repeat of the line (filtered), both lines.
+        e.install_selection_chains(vec![vec![
+            (0, 6, 0, 10),
+            (0, 0, 0, 5),
+            (0, 0, 0, 10),
+            (0, 0, 0, 10),
+            (0, 0, 1, 5),
+        ]]);
+        assert!(e.expand_selection_from_stack());
+        assert_eq!(e.selection.unwrap().normalised(), ((0, 6), (0, 10)));
+        assert!(e.expand_selection_from_stack());
+        assert_eq!(e.selection.unwrap().normalised(), ((0, 0), (0, 10)));
+        assert!(e.expand_selection_from_stack());
+        assert_eq!(e.selection.unwrap().normalised(), ((0, 0), (1, 5)));
+        assert!(!e.expand_selection_from_stack(), "chain exhausted");
+    }
+
+    #[test]
+    fn textual_fallback_grows_to_line_then_whole_buffer_without_a_grammar() {
+        let mut e = editor_with("first line here\nsecond");
+        e.cursor_row = 0;
+        e.cursor_col = 6;
+        e.validate_expand_stacks();
+        assert!(e.expand_selection_syntax());
+        assert_eq!(
+            e.selection.unwrap().normalised(),
+            ((0, 0), (0, 15)),
+            "no grammar: the line first"
+        );
+        assert!(e.expand_selection_syntax());
+        assert_eq!(
+            e.selection.unwrap().normalised(),
+            ((0, 0), (1, 6)),
+            "then the whole buffer"
+        );
+        assert!(!e.expand_selection_syntax(), "nothing larger exists");
+    }
+
+    #[test]
+    fn expand_selection_grows_every_cursor_in_a_multi_cursor_set() {
+        let mut e = editor_with("let alpha = 1;\nlet beta = 2;");
+        e.set_language(Some(crate::highlight::LangKind::Rust));
+        e.cursor_row = 0;
+        e.cursor_col = 5; // inside alpha
+        e.carets = vec![EditorSelection::new(1, 5)]; // inside beta
+        e.validate_expand_stacks();
+        assert!(e.expand_selection_syntax());
+        let primary = e.selection.expect("primary grew").normalised();
+        assert_eq!(primary.0.0, 0, "primary stays on its own row");
+        assert_eq!(e.carets.len(), 1);
+        let caret = e.carets[0].normalised();
+        assert!(
+            caret.0.0 == 1 && caret.1.1 > caret.0.1,
+            "the secondary caret grew on ITS row: {caret:?}"
+        );
+    }
+
+    #[test]
+    fn document_colors_splice_a_swatch_cell_and_answer_color_at() {
+        use crate::lsp::manager::ColorItem;
+        let mut e = editor_with("a { color: #ff0000; }");
+        e.path = Some(std::path::PathBuf::from("/tmp/x.css"));
+        let item = ColorItem {
+            line: 0,
+            character: 11,
+            end_line: 0,
+            end_character: 18,
+            red: 255,
+            green: 0,
+            blue: 0,
+            raw: (1.0, 0.0, 0.0, 1.0),
+        };
+        e.apply_document_colors(std::path::PathBuf::from("/tmp/x.css"), vec![item]);
+        let spans = e.row_inlay_spans(0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0, 11, "anchored at the value's start");
+        assert_eq!(spans[0].1, "\u{25a0}");
+        assert_eq!(spans[0].2, Some(Color::Rgb(255, 0, 0)));
+        // Range lookup, inclusive of the end boundary.
+        assert!(e.color_at(0, 11).is_some());
+        assert!(e.color_at(0, 18).is_some());
+        assert!(e.color_at(0, 10).is_none());
+        assert!(e.color_at(0, 19).is_none());
+        // An empty batch clears the swatches.
+        e.apply_document_colors(std::path::PathBuf::from("/tmp/x.css"), Vec::new());
+        assert!(e.row_inlay_spans(0).is_empty());
+        // Colors for ANOTHER file never splice into this one.
+        let stale = ColorItem {
+            line: 0,
+            character: 0,
+            end_line: 0,
+            end_character: 1,
+            red: 1,
+            green: 2,
+            blue: 3,
+            raw: (0.0, 0.0, 0.0, 1.0),
+        };
+        e.apply_document_colors(std::path::PathBuf::from("/tmp/other.css"), vec![stale]);
+        assert!(e.row_inlay_spans(0).is_empty());
+        assert!(e.color_at(0, 0).is_none());
     }
 
     #[test]
