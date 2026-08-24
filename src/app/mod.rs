@@ -15194,15 +15194,7 @@ impl App {
             }
             // Cmd+K W: close all editor tabs.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'w') => {
-                let removed = self.editor.close_all();
-                self.sync_open_file_poll_mtime();
-                self.status = if removed == 1 {
-                    String::from("Closed 1 tab")
-                } else {
-                    format!("Closed {removed} tabs")
-                };
-                self.poke_cursor();
-                self.collapse_split_if_empty();
+                self.close_all_tabs();
                 true
             }
             // Cmd+K U: close all saved (non-dirty) editor tabs.
@@ -33136,17 +33128,7 @@ impl App {
                     self.poke_cursor();
                 }
             }
-            MenuAction::CloseAllTabs => {
-                let removed = self.editor.close_all();
-                self.sync_open_file_poll_mtime();
-                self.status = if removed == 1 {
-                    String::from("Closed 1 tab")
-                } else {
-                    format!("Closed {removed} tabs")
-                };
-                self.poke_cursor();
-                self.collapse_split_if_empty();
-            }
+            MenuAction::CloseAllTabs => self.close_all_tabs(),
             MenuAction::CloseSavedTabs => self.close_saved_tabs(),
             MenuAction::KeepTabOpen(idx) => {
                 if self.editor.keep_open(idx) {
@@ -33433,6 +33415,34 @@ impl App {
     /// Close every saved (non-dirty) editor tab, keeping any with unsaved
     /// changes. Shared by the tab context menu and the `Cmd+K U` chord so both
     /// surfaces produce the same status line and split-collapse behavior.
+    /// Cmd+K W / tab context "Close All": close every tab in EVERY editor
+    /// group, not just the focused one, collapsing any split back to a single
+    /// blank pane. A side-by-side layout (e.g. `cgr duplicates` diffs) would
+    /// otherwise only empty the clicked group and look like a single close
+    /// once the blank group collapsed away.
+    fn close_all_tabs(&mut self) {
+        let mut removed = self.editor.close_all();
+        if self.editor_layout.is_split() {
+            removed += self
+                .editor_layout
+                .inactive_groups()
+                .iter()
+                .map(|g| g.editors.len())
+                .sum::<usize>();
+            self.editor_layout = editor_layout::EditorLayout::single();
+            self.editor_seams.clear();
+            self.disable_editor_image(1);
+            self.sync_focus_flags();
+        }
+        self.sync_open_file_poll_mtime();
+        self.status = if removed == 1 {
+            String::from("Closed 1 tab")
+        } else {
+            format!("Closed {removed} tabs")
+        };
+        self.poke_cursor();
+    }
+
     fn close_saved_tabs(&mut self) {
         let removed = self.editor.close_saved();
         if removed == 0 {
