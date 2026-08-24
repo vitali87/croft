@@ -5535,6 +5535,17 @@ impl Editor {
             return false;
         }
         let new_len = new_len as usize;
+        // A boundary-adjacent backspace/delete-forward removes the
+        // delimiter OUTSIDE the range, not the range's own content, and
+        // leaves the caret outside the updated span. Reject that instead
+        // of writing a truncated word into the siblings.
+        if self.cursor_row != erow
+            || self.cursor_col < self.linked_ranges[i].start
+            || self.cursor_col > self.linked_ranges[i].start + new_len
+        {
+            self.clear_linked_ranges();
+            return false;
+        }
         let src = self.linked_ranges[i];
         let line = &self.lines[src.row];
         let from = char_byte(line, src.start);
@@ -20241,6 +20252,34 @@ mod tests {
         e2.insert_newline();
         assert!(!e2.mirror_linked_edit());
         assert!(!e2.has_linked_ranges());
+    }
+
+    #[test]
+    fn linked_editing_rejects_boundary_deletes_of_the_outside_delimiters() {
+        // Backspace with the caret AT the range start deletes the `<`
+        // BEFORE the range; the post-edit caret sits outside the span,
+        // so nothing may mirror (the old bug wrote "iv" into siblings).
+        let mut e = editor_with("<div>\n</div>");
+        e.set_linked_ranges(&[(0, 1, 0, 4), (1, 2, 1, 5)]);
+        e.cursor_row = 0;
+        e.cursor_col = 1;
+        e.backspace();
+        assert!(!e.mirror_linked_edit());
+        assert!(!e.has_linked_ranges());
+        assert_eq!(e.lines[0], "div>", "only the user's own edit landed");
+        assert_eq!(e.lines[1], "</div>", "the sibling was untouched");
+
+        // Delete-forward with the caret AT the range end deletes the `>`
+        // AFTER the range — same rejection, symmetric case.
+        let mut e2 = editor_with("<div>\n</div>");
+        e2.set_linked_ranges(&[(0, 1, 0, 4), (1, 2, 1, 5)]);
+        e2.cursor_row = 0;
+        e2.cursor_col = 4;
+        e2.delete_forward();
+        assert!(!e2.mirror_linked_edit());
+        assert!(!e2.has_linked_ranges());
+        assert_eq!(e2.lines[0], "<div");
+        assert_eq!(e2.lines[1], "</div>", "the sibling was untouched");
     }
 
     #[test]
