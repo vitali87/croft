@@ -29,6 +29,7 @@ mod markdown;
 mod mcp;
 mod media;
 mod merge;
+mod merge_editor;
 mod notebook;
 mod outline_syntax;
 mod output;
