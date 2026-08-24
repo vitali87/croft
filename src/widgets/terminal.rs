@@ -1570,6 +1570,10 @@ impl PtyTerminal {
             let mut trigger_hits = Vec::new();
             let mut watch_engine = crate::problem_matchers::WatchEngine::default();
             let mut watch_lines: Vec<String> = Vec::new();
+            // Last-seen matcher sources, for detecting a swap mid-window
+            // (Arc identity — the app only ever replaces them wholesale).
+            let mut last_wset = watch_set_for_thread.lock().unwrap().clone();
+            let mut last_pwatch = pane_watch_for_thread.lock().unwrap().clone();
             // Per-pane monotonic id for captured inline images; the overlay
             // layout key uses it to tell a new picture from a moved one.
             let mut image_seq = 0u64;
@@ -1756,6 +1760,21 @@ impl PtyTerminal {
                         // engine (no second byte scan over the stream).
                         let wset = watch_set_for_thread.lock().unwrap().clone();
                         let pwatch = pane_watch_for_thread.lock().unwrap().clone();
+                        // Matcher ownership changed since the last chunk
+                        // (matchers.json reload, task (re)assignment):
+                        // drop any half-open window, or its next `ends`
+                        // would scan stale lines with the OLD matcher and
+                        // publish a stale batch.
+                        let pwatch_same = match (&pwatch, &last_pwatch) {
+                            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        if !Arc::ptr_eq(&wset, &last_wset) || !pwatch_same {
+                            watch_engine.reset();
+                            last_wset = wset.clone();
+                            last_pwatch = pwatch.clone();
+                        }
                         if wset.matchers.is_empty() && pwatch.is_none() {
                             trigger_scanner.scan(&buf[..n], &trig, &mut trigger_hits);
                         } else {

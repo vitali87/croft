@@ -699,7 +699,17 @@ impl WatchEngine {
             }
             return None;
         }
-        for m in pane_matcher.into_iter().chain(&set.matchers) {
+        // An explicit task matcher is EXCLUSIVE for its pane (VS Code's
+        // model, same rule as the FinishedCommand scan): global watch
+        // matchers never open windows on task-owned output, or an
+        // unrelated global `begins` could claim the cycle and its publish
+        // would suppress the task matcher's own results.
+        let global = if pane_matcher.is_some() {
+            &[][..]
+        } else {
+            &set.matchers[..]
+        };
+        for m in pane_matcher.into_iter().chain(global) {
             if let Some(bg) = &m.background
                 && bg.begins.is_match(line)
             {
@@ -708,6 +718,13 @@ impl WatchEngine {
             }
         }
         None
+    }
+
+    /// Drop any half-open watch window. Called when matcher ownership
+    /// changes under the engine (config reload, task (re)assignment) so
+    /// the next `ends` can't scan stale lines with the old matcher.
+    pub fn reset(&mut self) {
+        self.active = None;
     }
 }
 
@@ -898,6 +915,41 @@ mod tests {
             "the restarted window dropped stale lines: {batch:?}"
         );
         assert_eq!(batch[0].file, "fresh.c");
+    }
+
+    #[test]
+    fn a_pane_matcher_excludes_global_watch_matchers_and_reset_drops_the_window() {
+        let set = MatcherSet::from_json(
+            r##"[ { "name": "globby",
+                   "pattern": "^(?P<file>\\S+): (?P<message>.+)$",
+                   "background": { "begins": "^GLOBAL START$", "ends": "^GLOBAL END$" } } ]"##,
+        );
+        let watch = set.watch_set();
+        let task = Arc::new(well_known("$tsc-watch").unwrap());
+        // Task-owned pane: a global begins must NOT open a window — the
+        // task matcher is exclusive, and a global publish would suppress
+        // the task's own FinishedCommand scan via the skip-once flag.
+        let mut engine = WatchEngine::default();
+        assert!(engine.feed("GLOBAL START", &watch, Some(&task)).is_none());
+        assert!(
+            engine.feed("stale.c: err", &watch, Some(&task)).is_none()
+                && engine.feed("GLOBAL END", &watch, Some(&task)).is_none(),
+            "no window ever opened on the task pane"
+        );
+        // Without a pane matcher the same lines publish normally.
+        let mut free = WatchEngine::default();
+        assert!(free.feed("GLOBAL START", &watch, None).is_none());
+        assert!(free.feed("a.c: boom", &watch, None).is_none());
+        assert_eq!(free.feed("GLOBAL END", &watch, None).unwrap().len(), 1);
+        // reset() mid-window: the interrupted cycle never publishes.
+        let mut resettable = WatchEngine::default();
+        assert!(resettable.feed("GLOBAL START", &watch, None).is_none());
+        assert!(resettable.feed("a.c: boom", &watch, None).is_none());
+        resettable.reset();
+        assert!(
+            resettable.feed("GLOBAL END", &watch, None).is_none(),
+            "the dropped window's ends must not scan stale lines"
+        );
     }
 
     #[test]

@@ -7081,12 +7081,20 @@ impl App {
     /// Re-read matchers.json (user + workspace) after a save, surfacing
     /// compile warnings once in OUTPUT · Matchers (#252).
     fn reload_matchers(&mut self) {
-        let set = crate::problem_matchers::MatcherSet::load(
-            &crate::problem_matchers::matchers_path(),
-            Some(&crate::problem_matchers::workspace_matchers_path(
-                self.workspace_root(),
-            )),
-        );
+        // Same isolation guard as App::new: the developer's real
+        // matchers.json must never steer app tests — a test that saves a
+        // path equal to the real matchers_path() would otherwise reload
+        // the runner's actual config here.
+        let set = if cfg!(test) {
+            crate::problem_matchers::MatcherSet::default()
+        } else {
+            crate::problem_matchers::MatcherSet::load(
+                &crate::problem_matchers::matchers_path(),
+                Some(&crate::problem_matchers::workspace_matchers_path(
+                    self.workspace_root(),
+                )),
+            )
+        };
         for w in &set.warnings {
             crate::output::push("Matchers", crate::output::OutputLevel::Warn, w);
         }

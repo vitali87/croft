@@ -50,7 +50,7 @@ Each entry:
   the matcher only scans commands it claims. Omit to scan everything.
 - **`background`** — `{ "begins": "…", "ends": "…" }` turns the matcher
   into a watch matcher (below).
-- **`enabled": false`** — keep an entry without running it.
+- **`"enabled": false`** — keep an entry without running it.
 
 Custom matchers run alongside the built-in table; a built-in row at the
 same file/line/column as a custom row is dropped, so a matcher for a
