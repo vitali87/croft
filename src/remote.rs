@@ -876,15 +876,23 @@ impl DropPump {
              : > \"$LOG\"; \
              printf '%s\\n%s\\n' \"$INBOX\" \"$LOG\""
         );
+        // Capture stderr rather than inheriting the tty: the caller folds a
+        // failure into its own message, and an inherited fd would let ssh
+        // scribble raw bytes over whatever the terminal is showing.
         let output = ssh
             .command()
             .arg(&ssh.host)
             .arg(&resolve)
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .output()
             .context("preparing remote drop relay")?;
         if !output.status.success() {
-            anyhow::bail!("remote relay setup failed with {}", output.status);
+            let err = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "remote relay setup failed with {}: {}",
+                output.status,
+                err.trim()
+            );
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut lines = stdout.lines();

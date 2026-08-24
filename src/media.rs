@@ -390,6 +390,10 @@ fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
         .args(["-frames:v", "1"])
         .arg(&tmp)
         .stdin(std::process::Stdio::null())
+        // Never the inherited tty: this runs mid-session, and anything a
+        // child writes there paints raw bytes over the TUI frame.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
