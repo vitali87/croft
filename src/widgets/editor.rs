@@ -633,6 +633,256 @@ fn render_sheet(
 /// Returns the hit-test rects of the prev / next change arrows painted
 /// in the diff header (in that order). Both are `Rect::default()` when
 /// the header was too narrow to allocate them.
+/// Render the merge editor's source panes (#253) into the TOP of `inner`
+/// and return the remaining rect for the ordinary text path — the
+/// editable Result pane. One header row carries the resolved counter,
+/// then Current | (Base) | Incoming as columns (stacked vertically when
+/// the terminal is narrow), then a separator row labelling the Result.
+/// Per-conflict checkboxes are painted in a small gutter on the region's
+/// first row and their hit rects recorded on the view for mouse routing.
+fn render_merge_panes(
+    mv: &mut crate::merge_editor::MergeView,
+    inner: Rect,
+    buf: &mut Buffer,
+    theme: crate::theme::Theme,
+) -> Rect {
+    use crate::merge_editor::{CheckSide, ConflictState};
+    mv.check_spans.clear();
+    mv.last_panes_area = Rect::default();
+    // Too small for source panes: the Result gets everything, and the
+    // commands (F7, accepts) still work off the tracked regions.
+    if inner.height < 9 || inner.width < 24 {
+        return inner;
+    }
+    let top_h = (inner.height / 2).min(inner.height - 4);
+    let sep_y = inner.y + top_h;
+    mv.last_panes_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: top_h + 1,
+    };
+
+    // Header: the acceptance counter plus the working chords.
+    let resolved = mv.resolved_count();
+    let total = mv.conflicts.len();
+    let head_style = Style::default()
+        .fg(Color::White)
+        .bg(theme.ui(Color::Rgb(0x09, 0x4d, 0x77)))
+        .add_modifier(Modifier::BOLD);
+    for x in inner.x..inner.x + inner.width {
+        buf[(x, inner.y)].set_style(head_style);
+        buf[(x, inner.y)].set_symbol(" ");
+    }
+    let src = if mv.from_markers {
+        "markers"
+    } else {
+        "git stages"
+    };
+    let header = format!(
+        " MERGE ({src})  {resolved}/{total} conflict{} resolved \u{2022} F7 next \u{2022} Alt+\u{2191}\u{2193} scroll sources ",
+        if total == 1 { "" } else { "s" }
+    );
+    buf.set_stringn(inner.x, inner.y, &header, inner.width as usize, head_style);
+
+    // Separator row above the Result.
+    let sep_style = Style::default()
+        .fg(theme.ui(Color::Rgb(0x9a, 0xa4, 0xb2)))
+        .bg(theme.ui(Color::Rgb(0x20, 0x24, 0x2c)));
+    for x in inner.x..inner.x + inner.width {
+        buf[(x, sep_y)].set_style(sep_style);
+        buf[(x, sep_y)].set_symbol(" ");
+    }
+    buf.set_stringn(
+        inner.x,
+        sep_y,
+        " RESULT (editable) \u{2014} \"Merge: Complete Merge\" stages the file ",
+        inner.width as usize,
+        sep_style,
+    );
+
+    // The panes: Current | (Base) | Incoming, or stacked when narrow.
+    struct Pane<'a> {
+        title: &'a str,
+        lines: &'a [String],
+        scroll: usize,
+        side: Option<CheckSide>,
+        // (start row in this pane's text, len, conflict idx, checked)
+        regions: Vec<(usize, usize, usize, bool)>,
+        tint: Color,
+        active_tint: Color,
+    }
+    let region = |start: usize, len: usize, idx: usize, checked: bool| (start, len, idx, checked);
+    let checked_cur = |s: ConflictState| {
+        matches!(
+            s,
+            ConflictState::Current | ConflictState::Both | ConflictState::BothReverse
+        )
+    };
+    let checked_inc = |s: ConflictState| {
+        matches!(
+            s,
+            ConflictState::Incoming | ConflictState::Both | ConflictState::BothReverse
+        )
+    };
+    let mut panes: Vec<Pane> = Vec::new();
+    panes.push(Pane {
+        title: "CURRENT (yours)",
+        lines: &mv.ours,
+        scroll: mv.ours_scroll,
+        side: Some(CheckSide::Current),
+        regions: mv
+            .conflicts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| region(c.ours_start, c.ours.len(), i, checked_cur(c.state)))
+            .collect(),
+        tint: theme.ui(Color::Rgb(0x1b, 0x33, 0x22)),
+        active_tint: theme.ui(Color::Rgb(0x2a, 0x4f, 0x33)),
+    });
+    if mv.show_base {
+        panes.push(Pane {
+            title: "BASE",
+            lines: &mv.base,
+            scroll: mv.base_scroll,
+            side: None,
+            regions: mv
+                .conflicts
+                .iter()
+                .enumerate()
+                .map(|(i, c)| region(c.base_start, c.base.len(), i, false))
+                .collect(),
+            tint: theme.ui(Color::Rgb(0x2a, 0x2a, 0x2a)),
+            active_tint: theme.ui(Color::Rgb(0x3a, 0x3a, 0x3a)),
+        });
+    }
+    panes.push(Pane {
+        title: "INCOMING (theirs)",
+        lines: &mv.theirs,
+        scroll: mv.theirs_scroll,
+        side: Some(CheckSide::Incoming),
+        regions: mv
+            .conflicts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| region(c.theirs_start, c.theirs.len(), i, checked_inc(c.state)))
+            .collect(),
+        tint: theme.ui(Color::Rgb(0x16, 0x2b, 0x44)),
+        active_tint: theme.ui(Color::Rgb(0x1f, 0x41, 0x66)),
+    });
+
+    let panes_top = inner.y + 1;
+    let panes_h = top_h.saturating_sub(1);
+    let n = panes.len() as u16;
+    let stacked = inner.width < 72;
+    let mut rects: Vec<Rect> = Vec::new();
+    if stacked {
+        // Vertical stack: each pane gets an equal share of the rows.
+        let share = panes_h / n;
+        for i in 0..n {
+            rects.push(Rect {
+                x: inner.x,
+                y: panes_top + i * share,
+                width: inner.width,
+                height: if i == n - 1 {
+                    panes_h - share * (n - 1)
+                } else {
+                    share
+                },
+            });
+        }
+    } else {
+        // Columns with a 1-cell seam between neighbours.
+        let w = (inner.width - (n - 1)) / n;
+        let mut x = inner.x;
+        for i in 0..n {
+            let width = if i == n - 1 {
+                inner.x + inner.width - x
+            } else {
+                w
+            };
+            rects.push(Rect {
+                x,
+                y: panes_top,
+                width,
+                height: panes_h,
+            });
+            x += w;
+            if i != n - 1 {
+                for y in panes_top..panes_top + panes_h {
+                    buf[(x, y)].set_symbol("\u{2502}");
+                    buf[(x, y)]
+                        .set_style(Style::default().fg(theme.ui(Color::Rgb(0x3a, 0x42, 0x52))));
+                }
+                x += 1;
+            }
+        }
+    }
+
+    let title_style = Style::default()
+        .fg(theme.ui(Color::Rgb(0xc8, 0xd0, 0xdc)))
+        .bg(theme.ui(Color::Rgb(0x20, 0x24, 0x2c)))
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(theme.ui(Color::Rgb(0xb6, 0xbd, 0xc8)));
+    let gutter = 4u16; // "[x] " on a region's first row
+    for (pane, rect) in panes.iter().zip(&rects) {
+        if rect.height < 2 || rect.width < gutter + 4 {
+            continue;
+        }
+        for x in rect.x..rect.x + rect.width {
+            buf[(x, rect.y)].set_style(title_style);
+            buf[(x, rect.y)].set_symbol(" ");
+        }
+        buf.set_stringn(
+            rect.x + 1,
+            rect.y,
+            pane.title,
+            rect.width.saturating_sub(1) as usize,
+            title_style,
+        );
+        let body_h = (rect.height - 1) as usize;
+        let text_w = (rect.width - gutter) as usize;
+        for vis in 0..body_h {
+            let idx = pane.scroll + vis;
+            let y = rect.y + 1 + vis as u16;
+            if idx >= pane.lines.len() {
+                break;
+            }
+            let in_region = pane
+                .regions
+                .iter()
+                .find(|(start, len, _, _)| *len > 0 && idx >= *start && idx < *start + *len);
+            let style = match in_region {
+                Some(&(_, _, ci, _)) if ci == mv.active => text_style.bg(pane.active_tint),
+                Some(_) => text_style.bg(pane.tint),
+                None => text_style,
+            };
+            if in_region.is_some() {
+                for x in rect.x..rect.x + rect.width {
+                    buf[(x, y)].set_style(style);
+                    buf[(x, y)].set_symbol(" ");
+                }
+            }
+            if let Some(&(start, _, ci, checked)) = in_region
+                && idx == start
+                && let Some(side) = pane.side
+            {
+                let mark = if checked { "[x]" } else { "[ ]" };
+                buf.set_stringn(rect.x, y, mark, 3, style.add_modifier(Modifier::BOLD));
+                mv.check_spans.push((y, rect.x..rect.x + 3, ci, side));
+            }
+            buf.set_stringn(rect.x + gutter, y, &pane.lines[idx], text_w, style);
+        }
+    }
+
+    Rect {
+        x: inner.x,
+        y: sep_y + 1,
+        width: inner.width,
+        height: inner.height - top_h - 1,
+    }
+}
+
 fn render_diff(
     diff: &mut crate::widgets::diff::DiffData,
     inner: Rect,
@@ -1374,6 +1624,30 @@ impl EditorSelection {
     }
 }
 
+/// One linked-editing span (#254): a single-line char-column range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinkedRange {
+    row: usize,
+    start: usize,
+    len: usize,
+}
+
+/// The Expand/Shrink Selection state (#254): per-cursor step stacks.
+/// See the `select_expand` field doc for the validity contract.
+struct SelectExpandStacks {
+    /// The `edit_seq` the stacks were built against.
+    edit_seq: u64,
+    /// One stack per cursor: primary first, then `carets` in order.
+    stacks: Vec<ExpandStack>,
+}
+
+/// One cursor's selection-growth history, smallest step first.
+struct ExpandStack {
+    steps: Vec<EditorSelection>,
+    /// Index of the step the buffer currently shows.
+    pos: usize,
+}
+
 /// A single text replacement in char-indexed `(row, col)` coordinates, as
 /// produced by an LSP rename `WorkspaceEdit`. Applied by
 /// [`apply_span_edits_to_lines`] and [`Editor::apply_span_edits`].
@@ -1933,6 +2207,31 @@ pub struct Editor {
     /// Each entry is a full selection (anchor and head); head is that caret's
     /// cursor. Edits apply to the primary and all of these as one undo step.
     pub carets: Vec<EditorSelection>,
+    /// Linked editing ranges (#254): equal-length single-line spans the
+    /// server says rename together (paired HTML/JSX tags). While the
+    /// caret edits inside one, `mirror_linked_edit` replays the change
+    /// onto the others; anything structurally surprising (multi-row
+    /// edit, invalid tag character, missed edits) drops the set — the
+    /// next caret-idle round trip re-establishes it.
+    linked_ranges: Vec<LinkedRange>,
+    /// Char-length snapshot of every row a linked range sits on, taken
+    /// when the set was installed/re-synced; the single changed row is
+    /// how the mirror finds the edit and its length delta.
+    linked_rows: Vec<(usize, usize)>,
+    /// The `edit_seq` the stored positions describe. The mirror only
+    /// trusts a single-step advance; anything else clears the set.
+    linked_seq: u64,
+    /// Cursor position at the last undo-push, i.e. where the last edit
+    /// began (pre-edit coordinates) — the mirror's edit locator.
+    pub last_edit_origin: (usize, usize),
+    /// Expand/Shrink Selection stacks (#254): one per cursor (primary
+    /// first, then `carets` in order), each recording the selections the
+    /// gesture stepped through so shrink retraces exactly. Valid only
+    /// while `edit_seq` matches and every cursor's CURRENT selection
+    /// still equals its stack's current step — any edit, click, or
+    /// caret reshuffle fails the check and the next gesture rebuilds
+    /// from scratch (the `tick_occurrences` invalidation posture).
+    select_expand: Option<SelectExpandStacks>,
     /// Collaborators' caret positions in this file (multiplayer sessions,
     /// docs/MULTIPLAYER.md): (row, char col, participant color). Painted as
     /// colored block cells like secondary carets; the App rebuilds this
@@ -1992,6 +2291,21 @@ pub struct Editor {
     /// wrong lines. ponytail: whole-buffer invalidation, not per-fold anchor
     /// tracking; upgrade to sticky anchors if folds-survive-edits is wanted.
     fold_epoch_lines: usize,
+    /// Server fold spans (#254), authoritative for `fold_range` while
+    /// present AND measured against the current line count. `None` (no
+    /// capable server, or none answered yet) keeps the indentation /
+    /// marker fallback in charge — the two-phase posture of the outline.
+    lsp_folds: Option<Vec<crate::lsp::manager::FoldingRangeItem>>,
+    /// `self.lines.len()` when `lsp_folds` was applied; a mismatch means
+    /// the spans predate an edit and are ignored until the next reply.
+    lsp_folds_lines: usize,
+    /// Fallback fold table beyond plain indentation: `#region` /
+    /// `// region` marker pairs (kind Region) and runs of full-line
+    /// comments (kind Comment). Rebuilt lazily per `edit_seq` by
+    /// `refresh_fold_tables`, read by `fold_range` / `fold_kind_at`.
+    fallback_kind_folds: Vec<(usize, usize, crate::lsp::manager::FoldRangeKind)>,
+    /// The `edit_seq` `fallback_kind_folds` was built for (`None` = never).
+    fallback_folds_seq: Option<u64>,
     /// True when this tab is the single replaceable "preview" slot. Single-
     /// click / plain-Enter opens replace the preview tab's contents in place;
     /// double-click / Ctrl+Enter / typing into the buffer pin the tab
@@ -2093,11 +2407,19 @@ pub struct Editor {
     /// stale the moment the text changes — and replaced when the app's next
     /// idle-caret request answers.
     occurrences: Vec<(usize, usize, usize, bool)>,
-    /// Decoded per-logical-line hint runs `(char_col, label)`, sorted by
-    /// column. The render loop splices each label into the row as dim italic
-    /// virtual cells at its anchor; every overlay painter, the caret, and
-    /// mouse mapping translate buffer columns past them.
-    inlay_spans: Vec<Vec<(usize, String)>>,
+    /// Decoded per-logical-line virtual-cell runs `(char_col, label,
+    /// swatch)`, sorted by column: LSP inlay hints (swatch `None`, dim
+    /// italic) and document-color swatches (#254: a `■` whose fg IS the
+    /// color). The render loop splices each label into the row at its
+    /// anchor; every overlay painter, the caret, and mouse mapping
+    /// translate buffer columns past them.
+    inlay_spans: Vec<Vec<(usize, String, Option<Color>)>>,
+    /// The document's color values (#254): raw UTF-16 positions + RGB,
+    /// re-decoded like `inlay_hints`; feeds the `■` swatch spans and the
+    /// Change Color Presentation picker's range lookup.
+    color_infos: Vec<crate::lsp::manager::ColorItem>,
+    /// The file `color_infos` describes (same contract as `inlay_path`).
+    color_path: Option<PathBuf>,
     registry: LangRegistry,
     /// When set, every occurrence of this string in the visible portion of
     /// the buffer is overpainted with the search-match style after the
@@ -2149,6 +2471,14 @@ pub struct Editor {
     /// archive; Enter extracts one member to scratch and opens it
     /// through the normal dispatch. Read-only.
     pub archive: Option<crate::archive::ArchiveView>,
+    /// Three-way merge editor (#253). UNLIKE the other view kinds this is
+    /// not read-only and not in `has_non_text_view`: `lines` holds the
+    /// editable Result and keeps the whole text path (LSP, undo, save);
+    /// the renderer only carves the source panes off the top of the area.
+    pub merge: Option<crate::merge_editor::MergeView>,
+    /// Cursor row at the last undo-push (i.e. where the last edit began);
+    /// the merge editor's region tracker keys its shift heuristic off it.
+    pub merge_edit_row: usize,
     /// Per-tab "Reopen as Text" override (#175): when set, `open` skips
     /// every preview route (extension and sniffed alike) and lands in
     /// the text editor — an SVG's XML source, a workbook's bytes (which
@@ -2242,6 +2572,11 @@ impl Editor {
             last_gutter_width: 0,
             selection: None,
             carets: Vec::new(),
+            linked_ranges: Vec::new(),
+            linked_rows: Vec::new(),
+            linked_seq: 0,
+            last_edit_origin: (0, 0),
+            select_expand: None,
             ghost_carets: Vec::new(),
             ghost_caret_labels: Vec::new(),
             stream_stop_line: None,
@@ -2254,6 +2589,10 @@ impl Editor {
             folded: std::collections::BTreeSet::new(),
             hidden_ranges: Vec::new(),
             fold_epoch_lines: 0,
+            lsp_folds: None,
+            lsp_folds_lines: 0,
+            fallback_kind_folds: Vec::new(),
+            fallback_folds_seq: None,
             preview: false,
             pinned: false,
             undo_stack: Vec::new(),
@@ -2284,6 +2623,8 @@ impl Editor {
             inlay_path: None,
             occurrences: Vec::new(),
             inlay_spans: Vec::new(),
+            color_infos: Vec::new(),
+            color_path: None,
             registry: LangRegistry::new(),
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -2295,6 +2636,8 @@ impl Editor {
             diff: None,
             hex: None,
             archive: None,
+            merge: None,
+            merge_edit_row: 0,
             force_text: false,
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
@@ -2624,6 +2967,27 @@ impl Editor {
         true
     }
 
+    /// Replace Result rows `[start, end)` with `replacement` as ONE undo
+    /// step — the merge editor's accept-action primitive (#253), and (with
+    /// the full range) the transform that turns a marker buffer into the
+    /// initial Result, leaving the markers one Undo away. Mirrors
+    /// `resolve_conflict_at`'s splice discipline.
+    pub fn splice_result_rows(&mut self, start: usize, end: usize, replacement: Vec<String>) {
+        let start = start.min(self.lines.len());
+        let end = end.clamp(start, self.lines.len());
+        self.pin_on_edit();
+        self.push_undo(EditKind::Replace);
+        self.clear_selection();
+        self.lines.splice(start..end, replacement);
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = start.min(self.lines.len() - 1);
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+    }
+
     /// Recompute the per-line git marks from the cached HEAD baseline if the
     /// buffer has changed since they were last built. Cheap no-op when the
     /// `edit_seq` is unchanged, so the render loop can call it every frame.
@@ -2704,7 +3068,7 @@ impl Editor {
                 let extra: usize = self
                     .inlay_spans
                     .get(i)
-                    .map(|hs| hs.iter().map(|(_, label)| label.chars().count()).sum())
+                    .map(|hs| hs.iter().map(|(_, label, _)| label.chars().count()).sum())
                     .unwrap_or(0);
                 l.chars().count() + extra
             })
@@ -3373,6 +3737,10 @@ impl Editor {
             self.folded.clear();
             self.hidden_ranges.clear();
             self.fold_epoch_lines = 0;
+            self.lsp_folds = None;
+            self.lsp_folds_lines = 0;
+            self.fallback_kind_folds.clear();
+            self.fallback_folds_seq = None;
             // Inline-value trailers are line numbers into the OLD file too
             // (#136 review): a reused preview tab must not dress the incoming
             // file in the previous one's debug state. The same-path reload
@@ -3402,6 +3770,7 @@ impl Editor {
         // A real file supersedes any diff view this editor was showing —
         // without this a restore-then-reload keeps rendering the stale diff.
         self.diff = None;
+        self.merge = None;
         self.status = format!("Opened {}", path.display());
         // The buffer now matches disk; bump the edit seq so the LSP doc sync
         // sees the new content (an external reload lands here too, and without
@@ -3430,6 +3799,8 @@ impl Editor {
         // must never splice into this one.
         self.inlay_hints = Vec::new();
         self.inlay_path = None;
+        self.color_infos = Vec::new();
+        self.color_path = None;
         self.inlay_spans = Vec::new();
         self.recompute_highlights();
         // Notebooks auto-open rendered (#180): the JSON stays one
@@ -3488,6 +3859,7 @@ impl Editor {
         // preview kept its label, caret, and CLICKABLE hunk arrows
         // (#187 review). Clear the state and the frame-truth rects here.
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
@@ -3535,6 +3907,7 @@ impl Editor {
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.image = None;
@@ -3600,6 +3973,7 @@ impl Editor {
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.image = None;
@@ -3648,6 +4022,7 @@ impl Editor {
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.image = None;
@@ -3698,6 +4073,7 @@ impl Editor {
         // preview kept its label, caret, and CLICKABLE hunk arrows
         // (#187 review). Clear the state and the frame-truth rects here.
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
@@ -3749,6 +4125,7 @@ impl Editor {
         // preview kept its label, caret, and CLICKABLE hunk arrows
         // (#187 review). Clear the state and the frame-truth rects here.
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.image = None;
@@ -3821,6 +4198,7 @@ impl Editor {
         // preview kept its label, caret, and CLICKABLE hunk arrows
         // (#187 review). Clear the state and the frame-truth rects here.
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
@@ -3905,6 +4283,7 @@ impl Editor {
         // preview kept its label, caret, and CLICKABLE hunk arrows
         // (#187 review). Clear the state and the frame-truth rects here.
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.image = None;
@@ -4269,6 +4648,43 @@ impl Editor {
         self.recompute_inlay_spans();
     }
 
+    /// Install the document's color values (#254): wholesale replace,
+    /// like inlay hints — an empty batch clears the swatches.
+    pub fn apply_document_colors(
+        &mut self,
+        path: PathBuf,
+        colors: Vec<crate::lsp::manager::ColorItem>,
+    ) {
+        self.color_path = Some(path);
+        self.color_infos = colors;
+        self.recompute_inlay_spans();
+    }
+
+    /// The color value whose range contains `(row, col)` — the Change
+    /// Color Presentation picker's target lookup.
+    pub fn color_at(&self, row: usize, col: usize) -> Option<&crate::lsp::manager::ColorItem> {
+        if self.color_path.as_deref() != self.path.as_deref() {
+            return None;
+        }
+        self.color_infos.iter().find(|c| {
+            let (sr, er) = (c.line as usize, c.end_line as usize);
+            if row < sr || row > er {
+                return false;
+            }
+            let sc = self.utf16_col_to_char_pub(sr, c.character);
+            let ec = self.utf16_col_to_char_pub(er, c.end_character);
+            (row > sr || col >= sc) && (row < er || col <= ec)
+        })
+    }
+
+    /// Public UTF-16 → char-column bridge for one row.
+    pub fn utf16_col_to_char_pub(&self, row: usize, character: u32) -> usize {
+        self.lines
+            .get(row)
+            .map(|l| utf16_to_char_col(l, character))
+            .unwrap_or(0)
+    }
+
     /// Install the occurrences of the symbol under the caret, converting the
     /// server's UTF-16 columns to character columns row by row. A multi-line
     /// occurrence (rare, but legal) tints its first row from the start column,
@@ -4323,20 +4739,41 @@ impl Editor {
         // Hint cells change the display width of their lines.
         self.hscroll_content_cols = None;
         let same_file = self.inlay_path.as_deref() == self.path.as_deref();
-        if !same_file || self.inlay_hints.is_empty() {
+        let colors_same_file = self.color_path.as_deref() == self.path.as_deref();
+        let hints_live = same_file && !self.inlay_hints.is_empty();
+        let colors_live = colors_same_file && !self.color_infos.is_empty();
+        if !hints_live && !colors_live {
             self.inlay_spans = Vec::new();
             return;
         }
-        let mut spans: Vec<Vec<(usize, String)>> = vec![Vec::new(); self.lines.len()];
-        for h in &self.inlay_hints {
-            let Some(text) = self.lines.get(h.line as usize) else {
-                continue;
-            };
-            let col = utf16_to_char_col(text, h.character).min(text.chars().count());
-            spans[h.line as usize].push((col, h.label.clone()));
+        let mut spans: Vec<Vec<(usize, String, Option<Color>)>> =
+            vec![Vec::new(); self.lines.len()];
+        if hints_live {
+            for h in &self.inlay_hints {
+                let Some(text) = self.lines.get(h.line as usize) else {
+                    continue;
+                };
+                let col = utf16_to_char_col(text, h.character).min(text.chars().count());
+                spans[h.line as usize].push((col, h.label.clone(), None));
+            }
+        }
+        // Document-color swatches (#254): a one-cell `■` virtual span
+        // whose foreground IS the color, anchored at the value's start.
+        if colors_live {
+            for c in &self.color_infos {
+                let Some(text) = self.lines.get(c.line as usize) else {
+                    continue;
+                };
+                let col = utf16_to_char_col(text, c.character).min(text.chars().count());
+                spans[c.line as usize].push((
+                    col,
+                    String::from("\u{25a0}"),
+                    Some(Color::Rgb(c.red, c.green, c.blue)),
+                ));
+            }
         }
         for line in &mut spans {
-            line.sort_by_key(|(c, _)| *c);
+            line.sort_by_key(|(c, _, _)| *c);
         }
         self.inlay_spans = spans;
     }
@@ -4345,7 +4782,7 @@ impl Editor {
     /// wrapped row segmentation knows nothing about hint cells.
     /// ponytail: hints skip wrap mode; code files don't wrap by default, and
     /// Markdown (the wrapping default) has no hint-serving server.
-    fn row_inlay_spans(&self, line: usize) -> &[(usize, String)] {
+    fn row_inlay_spans(&self, line: usize) -> &[(usize, String, Option<Color>)] {
         if self.wrap_enabled() {
             return &[];
         }
@@ -5398,6 +5835,454 @@ impl Editor {
         self.selection = None;
     }
 
+    // ---- Linked editing (#254) ------------------------------------------
+
+    /// Install the server's linked-editing set: UTF-16
+    /// `(start_line, start_char, end_line, end_char)` spans. Multi-line
+    /// spans (which the protocol forbids anyway) and sets smaller than a
+    /// pair are dropped. Positions are snapshotted against the current
+    /// buffer (`edit_seq` + per-row lengths).
+    pub fn set_linked_ranges(&mut self, spans: &[(u32, u32, u32, u32)]) {
+        let mut ranges: Vec<LinkedRange> = spans
+            .iter()
+            .filter(|&&(sl, _, el, _)| sl == el && (sl as usize) < self.lines.len())
+            .map(|&(sl, sc, _, ec)| {
+                let row = sl as usize;
+                let start = utf16_to_char_col(&self.lines[row], sc);
+                let end = utf16_to_char_col(&self.lines[row], ec);
+                LinkedRange {
+                    row,
+                    start,
+                    len: end.saturating_sub(start),
+                }
+            })
+            .collect();
+        ranges.sort_by_key(|r| (r.row, r.start));
+        if ranges.len() < 2 {
+            self.clear_linked_ranges();
+            return;
+        }
+        self.linked_ranges = ranges;
+        self.resnapshot_linked_rows();
+        self.linked_seq = self.edit_seq;
+    }
+
+    /// The primary caret as an LSP UTF-16 `(line, character)` pair.
+    pub fn cursor_position_utf16(&self) -> (u32, u32) {
+        let row = self.cursor_row.min(self.lines.len().saturating_sub(1));
+        let line = &self.lines[row];
+        let byte = char_byte(line, self.cursor_col.min(line.chars().count()));
+        (row as u32, line[..byte].encode_utf16().count() as u32)
+    }
+
+    pub fn clear_linked_ranges(&mut self) {
+        self.linked_ranges.clear();
+        self.linked_rows.clear();
+    }
+
+    pub fn has_linked_ranges(&self) -> bool {
+        !self.linked_ranges.is_empty()
+    }
+
+    /// True when `(row, col)` sits inside (or at the end boundary of) a
+    /// linked range — the caret positions where the set stays alive.
+    pub fn linked_ranges_contain(&self, row: usize, col: usize) -> bool {
+        self.linked_ranges
+            .iter()
+            .any(|r| r.row == row && col >= r.start && col <= r.start + r.len)
+    }
+
+    fn resnapshot_linked_rows(&mut self) {
+        let mut rows: Vec<usize> = self.linked_ranges.iter().map(|r| r.row).collect();
+        rows.dedup();
+        self.linked_rows = rows
+            .into_iter()
+            .map(|row| (row, self.lines[row].chars().count()))
+            .collect();
+    }
+
+    /// Replay the last edit across the sibling linked ranges (#254): the
+    /// paired-tag auto-rename. Called once per tick after key handling;
+    /// returns true when siblings were rewritten. Trusts only a clean
+    /// single-step, single-row edit that began inside one range and
+    /// keeps the content a plausible tag word — anything else clears
+    /// the set rather than corrupt text far from the caret.
+    pub fn mirror_linked_edit(&mut self) -> bool {
+        if self.linked_ranges.len() < 2 || self.edit_seq == self.linked_seq {
+            return false;
+        }
+        // A single edit advances the seq exactly once; a missed frame
+        // (paste burst, undo, reload) is not safely replayable.
+        if self.edit_seq != self.linked_seq.wrapping_add(1) {
+            self.clear_linked_ranges();
+            return false;
+        }
+        let (erow, ecol) = self.last_edit_origin;
+        // Exactly one linked row may have changed, by the edit's delta.
+        let changed: Vec<(usize, isize)> = self
+            .linked_rows
+            .iter()
+            .filter_map(|&(row, old_len)| {
+                let now = self.lines.get(row)?.chars().count() as isize;
+                let delta = now - old_len as isize;
+                (delta != 0).then_some((row, delta))
+            })
+            .collect();
+        let delta = match changed.as_slice() {
+            [] => 0isize,
+            [(row, delta)] if *row == erow => *delta,
+            _ => {
+                self.clear_linked_ranges();
+                return false;
+            }
+        };
+        // The edit must have begun inside one range on that row.
+        let Some(i) = self
+            .linked_ranges
+            .iter()
+            .position(|r| r.row == erow && ecol >= r.start && ecol <= r.start + r.len)
+        else {
+            self.clear_linked_ranges();
+            return false;
+        };
+        let new_len = self.linked_ranges[i].len as isize + delta;
+        if new_len < 0 {
+            self.clear_linked_ranges();
+            return false;
+        }
+        let new_len = new_len as usize;
+        // A boundary-adjacent backspace/delete-forward removes the
+        // delimiter OUTSIDE the range, not the range's own content, and
+        // leaves the caret outside the updated span. Reject that instead
+        // of writing a truncated word into the siblings.
+        if self.cursor_row != erow
+            || self.cursor_col < self.linked_ranges[i].start
+            || self.cursor_col > self.linked_ranges[i].start + new_len
+        {
+            self.clear_linked_ranges();
+            return false;
+        }
+        let src = self.linked_ranges[i];
+        let line = &self.lines[src.row];
+        let from = char_byte(line, src.start);
+        let to = char_byte(line, src.start + new_len);
+        let text: String = line[from..to].to_string();
+        // Keep it a plausible identifier/tag word; a delimiter means the
+        // user is doing something the mirror shouldn't propagate.
+        if text
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '<' | '>' | '/' | '"' | '\''))
+        {
+            self.clear_linked_ranges();
+            return false;
+        }
+        // Rewrite every sibling, rightmost-first per row so earlier
+        // starts stay valid while lengths change.
+        let mut order: Vec<usize> = (0..self.linked_ranges.len()).filter(|&j| j != i).collect();
+        order.sort_by_key(|&j| {
+            let r = &self.linked_ranges[j];
+            (r.row, std::cmp::Reverse(r.start))
+        });
+        for j in order {
+            let r = self.linked_ranges[j];
+            // Siblings after the edit on the edited row already shifted.
+            let start = if r.row == erow && r.start > ecol {
+                (r.start as isize + delta).max(0) as usize
+            } else {
+                r.start
+            };
+            let line = &mut self.lines[r.row];
+            let from = char_byte(line, start);
+            let to = char_byte(line, start + r.len);
+            line.replace_range(from..to, &text);
+        }
+        // Recompute stored positions: every range now has `new_len`; on
+        // each row, starts shift by the accumulated growth of preceding
+        // ranges (the edited range's own delta included).
+        let per = new_len as isize - src.len as isize;
+        let mut shift: std::collections::HashMap<usize, isize> = std::collections::HashMap::new();
+        for r in self.linked_ranges.iter_mut() {
+            let acc = shift.entry(r.row).or_insert(0);
+            r.start = (r.start as isize + *acc).max(0) as usize;
+            r.len = new_len;
+            *acc += per;
+        }
+        // The mirrors changed the buffer: bump the seq so highlights /
+        // LSP resync, and adopt it as the new baseline. Deliberately no
+        // undo push — the user's keystroke snapshot holds the whole
+        // pre-edit buffer, so one Undo reverts the keystroke AND the
+        // mirrors together (VS Code's model).
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.resnapshot_linked_rows();
+        self.linked_seq = self.edit_seq;
+        true
+    }
+
+    // ---- Expand / Shrink Selection (#254) -------------------------------
+
+    /// Every cursor's current selection, primary first — a zero-area
+    /// selection at the caret when nothing is selected.
+    fn cursor_selections(&self) -> Vec<EditorSelection> {
+        let primary = self
+            .selection
+            .unwrap_or_else(|| EditorSelection::new(self.cursor_row, self.cursor_col));
+        std::iter::once(primary)
+            .chain(self.carets.iter().copied())
+            .collect()
+    }
+
+    /// Ensure the expand stacks describe the CURRENT cursors; rebuild
+    /// from scratch on any mismatch (edit, click, caret reshuffle). See
+    /// the `select_expand` field doc for why matching, not indexing, is
+    /// the validity test.
+    pub fn validate_expand_stacks(&mut self) {
+        let cur = self.cursor_selections();
+        let valid = self.select_expand.as_ref().is_some_and(|se| {
+            se.edit_seq == self.edit_seq
+                && se.stacks.len() == cur.len()
+                && se.stacks.iter().zip(&cur).all(|(st, c)| {
+                    st.steps
+                        .get(st.pos)
+                        .is_some_and(|s| s.normalised() == c.normalised())
+                })
+        });
+        if !valid {
+            self.select_expand = Some(SelectExpandStacks {
+                edit_seq: self.edit_seq,
+                stacks: cur
+                    .into_iter()
+                    .map(|c| ExpandStack {
+                        steps: vec![c],
+                        pos: 0,
+                    })
+                    .collect(),
+            });
+        }
+    }
+
+    /// Write every stack's current step back onto the cursors, keeping
+    /// the cursor-follows-head convention of every other selection setter.
+    fn apply_expand_steps(&mut self) {
+        let Some(se) = self.select_expand.as_ref() else {
+            return;
+        };
+        let sels: Vec<EditorSelection> = se.stacks.iter().map(|st| st.steps[st.pos]).collect();
+        let primary = sels[0];
+        self.selection = primary.has_area().then_some(primary);
+        self.cursor_row = primary.head.0.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = primary.head.1.min(self.line_char_len(self.cursor_row));
+        self.carets = sels[1..].to_vec();
+        self.ensure_cursor_col_visible();
+    }
+
+    /// Step every cursor one level up its cached chain. False when no
+    /// stack has a deeper step cached (the caller then computes one —
+    /// LSP chain or syntax ancestry).
+    pub fn expand_selection_from_stack(&mut self) -> bool {
+        let Some(se) = self.select_expand.as_mut() else {
+            return false;
+        };
+        let mut any = false;
+        for st in &mut se.stacks {
+            if st.pos + 1 < st.steps.len() {
+                st.pos += 1;
+                any = true;
+            }
+        }
+        if any {
+            self.apply_expand_steps();
+        }
+        any
+    }
+
+    /// Shrink Selection: retrace one step down the stack. False at the
+    /// bottom (the gesture's starting point).
+    pub fn shrink_selection_step(&mut self) -> bool {
+        self.validate_expand_stacks();
+        let Some(se) = self.select_expand.as_mut() else {
+            return false;
+        };
+        let mut any = false;
+        for st in &mut se.stacks {
+            if st.pos > 0 {
+                st.pos -= 1;
+                any = true;
+            }
+        }
+        if any {
+            self.apply_expand_steps();
+        }
+        any
+    }
+
+    /// Install per-cursor LSP `selectionRange` chains (#254): UTF-16
+    /// `(start_line, start_char, end_line, end_char)` spans, smallest
+    /// first, index-aligned with the cursors. Each stack's history above
+    /// its current step is replaced by the strictly-growing tail of its
+    /// chain; the caller then calls [`Self::expand_selection_from_stack`].
+    pub fn install_selection_chains(&mut self, chains: Vec<Vec<(u32, u32, u32, u32)>>) {
+        self.validate_expand_stacks();
+        // Convert before mutably borrowing the stacks.
+        let converted: Vec<Vec<EditorSelection>> = chains
+            .iter()
+            .map(|chain| {
+                chain
+                    .iter()
+                    .map(|&(sl, sc, el, ec)| {
+                        let sr = (sl as usize).min(self.lines.len().saturating_sub(1));
+                        let er = (el as usize).min(self.lines.len().saturating_sub(1));
+                        EditorSelection {
+                            anchor: (sr, utf16_to_char_col(&self.lines[sr], sc)),
+                            head: (er, utf16_to_char_col(&self.lines[er], ec)),
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let Some(se) = self.select_expand.as_mut() else {
+            return;
+        };
+        for (st, chain) in se.stacks.iter_mut().zip(converted) {
+            let cur = st.steps[st.pos].normalised();
+            st.steps.truncate(st.pos + 1);
+            let mut last = cur;
+            for sel in chain {
+                let n = sel.normalised();
+                // Keep only strictly-growing spans that still contain the
+                // current selection, so a chain answered for a slightly
+                // different anchor can't shrink or jump the gesture.
+                if n.0 <= last.0 && n.1 >= last.1 && n != last {
+                    st.steps.push(sel);
+                    last = n;
+                }
+            }
+        }
+    }
+
+    /// Grow every cursor's selection to the nearest strictly-larger
+    /// tree-sitter node (#254's serverless fallback). Without a grammar,
+    /// grows to the line span and then the whole buffer, so the command
+    /// always answers. Returns false when nothing could grow.
+    pub fn expand_selection_syntax(&mut self) -> bool {
+        self.validate_expand_stacks();
+        let tree = self.lang.map(crate::highlight::language_for).and_then(|l| {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&l).ok()?;
+            parser.parse(self.lines.join("\n"), None)
+        });
+        let Some(se) = self.select_expand.as_ref() else {
+            return false;
+        };
+        let mut grown: Vec<Option<EditorSelection>> = Vec::with_capacity(se.stacks.len());
+        for st in &se.stacks {
+            let cur = st.steps[st.pos].normalised();
+            let next = match &tree {
+                Some(t) => self.syntax_enclosing_range(t, cur),
+                None => self.textual_enclosing_range(cur),
+            };
+            grown.push(next);
+        }
+        let Some(se) = self.select_expand.as_mut() else {
+            return false;
+        };
+        let mut any = false;
+        for (st, next) in se.stacks.iter_mut().zip(grown) {
+            if let Some(sel) = next {
+                st.steps.truncate(st.pos + 1);
+                st.steps.push(sel);
+                st.pos += 1;
+                any = true;
+            }
+        }
+        if any {
+            self.apply_expand_steps();
+        }
+        any
+    }
+
+    /// The smallest tree-sitter node range strictly containing `cur`
+    /// (char coordinates), climbing `.parent()` past same-range wrappers.
+    fn syntax_enclosing_range(
+        &self,
+        tree: &tree_sitter::Tree,
+        cur: ((usize, usize), (usize, usize)),
+    ) -> Option<EditorSelection> {
+        let start_b = self.char_pos_to_byte(cur.0);
+        let end_b = self.char_pos_to_byte(cur.1);
+        let mut node = tree.root_node().descendant_for_byte_range(start_b, end_b)?;
+        loop {
+            let (ns, ne) = (node.start_byte(), node.end_byte());
+            let contains = ns <= start_b && ne >= end_b;
+            let strictly = contains && (ns < start_b || ne > end_b);
+            if strictly {
+                let anchor = self.ts_point_to_char(node.start_position());
+                let head = self.ts_point_to_char(node.end_position());
+                return Some(EditorSelection { anchor, head });
+            }
+            node = node.parent()?;
+        }
+    }
+
+    /// Grammar-less growth: the current line span, then the whole buffer.
+    fn textual_enclosing_range(
+        &self,
+        cur: ((usize, usize), (usize, usize)),
+    ) -> Option<EditorSelection> {
+        let (start, end) = cur;
+        let line_sel = EditorSelection {
+            anchor: (start.0, 0),
+            head: (end.0, self.line_char_len(end.0)),
+        };
+        let n = line_sel.normalised();
+        if n.0 < start || n.1 > end {
+            return Some(line_sel);
+        }
+        let last = self.lines.len().saturating_sub(1);
+        let all = EditorSelection {
+            anchor: (0, 0),
+            head: (last, self.line_char_len(last)),
+        };
+        let n = all.normalised();
+        (n.0 < start || n.1 > end).then_some(all)
+    }
+
+    /// Byte offset of char position `(row, col)` in the `\n`-joined text.
+    fn char_pos_to_byte(&self, pos: (usize, usize)) -> usize {
+        let mut off = 0usize;
+        for (i, l) in self.lines.iter().enumerate() {
+            if i == pos.0 {
+                return off + char_byte(l, pos.1.min(l.chars().count()));
+            }
+            off += l.len() + 1;
+        }
+        off.saturating_sub(1)
+    }
+
+    /// Tree-sitter `Point` (row + BYTE column) → editor `(row, char col)`.
+    fn ts_point_to_char(&self, p: tree_sitter::Point) -> (usize, usize) {
+        let row = p.row.min(self.lines.len().saturating_sub(1));
+        let line = &self.lines[row];
+        let col = line[..p.column.min(line.len())].chars().count();
+        (row, col)
+    }
+
+    /// The cursors' positions as LSP UTF-16 `(line, character)` pairs,
+    /// primary first — `textDocument/selectionRange`'s `positions` input.
+    pub fn cursor_positions_utf16(&self) -> Vec<(u32, u32)> {
+        self.cursor_selections()
+            .iter()
+            .map(|s| {
+                let (row, col) = s.head;
+                let row = row.min(self.lines.len().saturating_sub(1));
+                let line = &self.lines[row];
+                let byte = char_byte(line, col.min(line.chars().count()));
+                let u16col = line[..byte].encode_utf16().count() as u32;
+                (row as u32, u16col)
+            })
+            .collect()
+    }
+
     pub fn select_all(&mut self) {
         if self.lines.is_empty() {
             self.selection = None;
@@ -5542,6 +6427,34 @@ impl Editor {
     /// indentation-based folding: a pure function of the text, no LSP or
     /// tree-sitter round-trip.
     pub fn fold_range(&self, line: usize) -> Option<(usize, usize)> {
+        // Server spans first (#254): while a capable server has answered
+        // for this exact line count, its ranges REPLACE the heuristics
+        // wholesale — VS Code's provider model. rust-analyzer and friends
+        // emit region markers and comment spans themselves.
+        if let Some(ranges) = self.lsp_folds_current() {
+            return ranges
+                .iter()
+                .filter(|r| r.start_line == line)
+                .map(|r| (line, r.end_line.min(self.lines.len().saturating_sub(1))))
+                .max_by_key(|&(_, end)| end);
+        }
+        // Fallback #1: the marker/comment table (`#region` pairs, comment
+        // runs) — folds indentation alone can't see.
+        if let Some(&(s, e, _)) = self
+            .fallback_kind_folds
+            .iter()
+            .find(|&&(s, _, _)| s == line)
+        {
+            return Some((s, e.min(self.lines.len().saturating_sub(1))));
+        }
+        // Fallback #2: the indentation scan.
+        self.indent_fold_range(line)
+    }
+
+    /// The plain indentation-based fold heuristic, a pure function of the
+    /// text — the last-resort scanner behind the server spans and the
+    /// marker/comment table.
+    fn indent_fold_range(&self, line: usize) -> Option<(usize, usize)> {
         let base = self.indent_width(line)?;
         let mut end = line;
         let mut i = line + 1;
@@ -5559,6 +6472,132 @@ impl Editor {
     /// Whether `line` heads a collapsible region.
     pub fn is_foldable(&self, line: usize) -> bool {
         self.fold_range(line).is_some()
+    }
+
+    /// Server fold spans, but only while they still describe this buffer:
+    /// an edit changes the line count and orphans them until the next
+    /// reply (same whole-buffer posture as `fold_epoch_lines`).
+    fn lsp_folds_current(&self) -> Option<&[crate::lsp::manager::FoldingRangeItem]> {
+        match &self.lsp_folds {
+            Some(ranges) if self.lsp_folds_lines == self.lines.len() => Some(ranges),
+            _ => None,
+        }
+    }
+
+    /// Install a server's fold-span set (#254). The caller (the app's LSP
+    /// drain) already seq-gated the reply; the line count is recorded so
+    /// later edits orphan the spans instead of folding the wrong lines.
+    pub fn set_lsp_folds(&mut self, ranges: Vec<crate::lsp::manager::FoldingRangeItem>) {
+        self.lsp_folds = Some(ranges);
+        self.lsp_folds_lines = self.lines.len();
+        // Spans under existing collapsed headers may have moved.
+        if !self.folded.is_empty() {
+            self.rebuild_hidden_ranges();
+        }
+    }
+
+    /// Rebuild the fallback marker/comment fold table when the buffer
+    /// changed. Cheap no-op per frame otherwise; called from the render
+    /// and from every fold command so headless callers agree with paint.
+    pub fn refresh_fold_tables(&mut self) {
+        if self.fallback_folds_seq == Some(self.edit_seq) {
+            return;
+        }
+        self.fallback_folds_seq = Some(self.edit_seq);
+        self.fallback_kind_folds.clear();
+        use crate::lsp::manager::FoldRangeKind;
+        // Region markers: a stack pairs nested #region/#endregion.
+        let mut stack: Vec<usize> = Vec::new();
+        for (i, l) in self.lines.iter().enumerate() {
+            match region_marker(l) {
+                Some(true) => stack.push(i),
+                Some(false) => {
+                    if let Some(start) = stack.pop()
+                        && i > start
+                    {
+                        self.fallback_kind_folds
+                            .push((start, i, FoldRangeKind::Region));
+                    }
+                }
+                None => {}
+            }
+        }
+        // Comment runs: ≥2 consecutive full-line comments fold as one
+        // block from the first line.
+        let mut run_start: Option<usize> = None;
+        for i in 0..=self.lines.len() {
+            let is_comment = self
+                .lines
+                .get(i)
+                .is_some_and(|l| comment_line(l) && region_marker(l).is_none());
+            match (run_start, is_comment) {
+                (None, true) => run_start = Some(i),
+                (Some(s), false) => {
+                    if i - s >= 2 {
+                        self.fallback_kind_folds
+                            .push((s, i - 1, FoldRangeKind::Comment));
+                    }
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        self.fallback_kind_folds
+            .sort_unstable_by_key(|&(s, e, _)| (s, e));
+    }
+
+    /// The fold kind at a header line, when one is known: the server's
+    /// kind, else the fallback table's. Plain indentation folds have no
+    /// kind — "Fold All Comments/Regions" skips them.
+    pub fn fold_kind_at(&self, line: usize) -> Option<crate::lsp::manager::FoldRangeKind> {
+        if let Some(ranges) = self.lsp_folds_current() {
+            return ranges
+                .iter()
+                .filter(|r| r.start_line == line)
+                .max_by_key(|r| r.end_line)
+                .map(|r| r.kind);
+        }
+        self.fallback_kind_folds
+            .iter()
+            .find(|&&(s, _, _)| s == line)
+            .map(|&(_, _, k)| k)
+    }
+
+    /// Collapse every fold of `kind` — "Fold All Comments" (Cmd+K Cmd+/) /
+    /// "Fold All Regions" (Cmd+K Cmd+8).
+    pub fn fold_all_of_kind(&mut self, kind: crate::lsp::manager::FoldRangeKind) {
+        self.refresh_fold_tables();
+        let headers: Vec<usize> = (0..self.lines.len())
+            .filter(|&l| self.fold_kind_at(l) == Some(kind) && self.is_foldable(l))
+            .collect();
+        if headers.is_empty() {
+            return;
+        }
+        self.folded.extend(headers);
+        self.fold_epoch_lines = self.lines.len();
+        self.rebuild_hidden_ranges();
+        while self.is_line_hidden(self.cursor_row) {
+            self.cursor_row = self.cursor_row.saturating_sub(1);
+        }
+    }
+
+    /// Expand every collapsed fold of `kind` — "Unfold All Regions"
+    /// (Cmd+K Cmd+9). The mirror of [`Self::fold_all_of_kind`].
+    pub fn unfold_all_of_kind(&mut self, kind: crate::lsp::manager::FoldRangeKind) {
+        self.refresh_fold_tables();
+        let drop: Vec<usize> = self
+            .folded
+            .iter()
+            .copied()
+            .filter(|&l| self.fold_kind_at(l) == Some(kind))
+            .collect();
+        if drop.is_empty() {
+            return;
+        }
+        for l in drop {
+            self.folded.remove(&l);
+        }
+        self.rebuild_hidden_ranges();
     }
 
     /// The OUTERMOST fold header whose region covers `line` — the function's
@@ -5821,6 +6860,7 @@ impl Editor {
     /// block that contains the cursor snaps the cursor up to the header so it
     /// never strands on a hidden line.
     pub fn toggle_fold(&mut self, line: usize) {
+        self.refresh_fold_tables();
         let Some(header) = self.enclosing_fold_header(line) else {
             return;
         };
@@ -5845,6 +6885,7 @@ impl Editor {
     /// Collapse every foldable region (VS Code "Fold All", Cmd+K Cmd+0),
     /// snapping the cursor up to the nearest visible line.
     pub fn fold_all(&mut self) {
+        self.refresh_fold_tables();
         self.folded = (0..self.lines.len())
             .filter(|&l| self.is_foldable(l))
             .collect();
@@ -5877,6 +6918,12 @@ impl Editor {
     /// Coalesces consecutive `InsertChar` ops into one step so a typing
     /// burst is undone as one unit; everything else opens a new step.
     fn push_undo(&mut self, kind: EditKind) {
+        // Where the edit about to happen begins — the linked-editing
+        // mirror reads this to locate the keystroke (#254).
+        self.last_edit_origin = (self.cursor_row, self.cursor_col);
+        // Where the edit about to happen begins — the merge editor's
+        // region tracker reads this when it reconciles (#253).
+        self.merge_edit_row = self.cursor_row;
         let coalesce =
             kind == EditKind::InsertChar && self.last_edit_kind == Some(EditKind::InsertChar);
         if !coalesce {
@@ -5930,6 +6977,11 @@ impl Editor {
         // means the restored text differs from disk: stay dirty so the next
         // sweep reconverges them instead of leaving a silent divergence.
         self.dirty = snap.dirty || self.save_seq != snap.save_seq;
+        // Undo/redo restored the WHOLE buffer, siblings included; the
+        // linked-editing mirror must not replay on top of that (#254).
+        self.linked_ranges.clear();
+        self.linked_rows.clear();
+        self.merge_edit_row = self.cursor_row;
         self.last_edit_kind = None;
         // A restore changes the buffer content, so bump the change counter (the
         // app resyncs the LSP / git gutter off `edit_seq`) and drop the wrap /
@@ -8144,8 +9196,8 @@ impl Editor {
         while c < line_len {
             let extra: usize = hints
                 .iter()
-                .filter(|(hc, _)| *hc >= self.scroll_col && *hc <= c)
-                .map(|(_, l)| l.chars().count())
+                .filter(|(hc, _, _)| *hc >= self.scroll_col && *hc <= c)
+                .map(|(_, l, _)| l.chars().count())
                 .sum();
             if c + extra >= display_col {
                 break;
@@ -8907,7 +9959,7 @@ impl Widget for &mut Editor {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(block_style);
-        let inner = block.inner(area);
+        let mut inner = block.inner(area);
         block.render(area, buf);
         // Black theme: replace the solid focus border with the orange→green
         // gradient that matches the welcome activity box. The editor has no
@@ -8921,14 +9973,31 @@ impl Widget for &mut Editor {
         self.last_hscrollbar = Rect::default();
         self.merge_action_spans.clear();
 
-        let height = inner.height as usize;
-        if height == 0 {
+        if inner.height == 0 {
             return;
         }
         let cbg = canvas_bg(
             crate::iterm2_inline::detect_iterm2_inline_support(),
             self.theme,
         );
+        // Merge editor (#253): reconcile the tracked regions with any
+        // manual edit since last frame, carve the source panes off the
+        // top, then FALL THROUGH to the text path with the remaining
+        // rect — the Result below is the ordinary text buffer.
+        let (len, seq, row) = (self.lines.len(), self.edit_seq, self.merge_edit_row);
+        let theme = self.theme;
+        if let Some(mv) = self.merge.as_mut() {
+            mv.sync_with_buffer(len, seq, row);
+            inner = render_merge_panes(mv, inner, buf, theme);
+            self.last_inner = inner;
+        }
+        // The Result height comes from the POST-carve rect: the merge
+        // panes above just shrank `inner`, and every row / scrollbar /
+        // cursor-visibility computation below must see what is left.
+        let height = inner.height as usize;
+        if height == 0 {
+            return;
+        }
         if let Some(image) = self.image.as_ref() {
             let ibg = image_canvas_bg(
                 crate::iterm2_inline::detect_inline_image_protocol(),
@@ -8975,6 +10044,9 @@ impl Widget for &mut Editor {
         // Rebuild the git-gutter marks if the buffer moved since last frame
         // (cheap no-op otherwise), so the bars below diff against HEAD.
         self.refresh_git_marks();
+        // Same cadence for the fallback fold table (#254): region markers
+        // and comment runs the gutter chevrons below consult.
+        self.refresh_fold_tables();
         // Rescan merge-conflict blocks on the same cadence so the region
         // tints below always match the buffer.
         self.conflicts();
@@ -9451,8 +10523,8 @@ impl Widget for &mut Editor {
             let hint_cells: Vec<(usize, usize)> = self
                 .row_inlay_spans(line_idx)
                 .iter()
-                .filter(|(hc, _)| *hc >= row_start && *hc <= hint_cap)
-                .map(|(hc, l)| (*hc, l.chars().count()))
+                .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
+                .map(|(hc, l, _)| (*hc, l.chars().count()))
                 .collect();
             let ex = |c: usize| inlay_cells_before(&hint_cells, c);
             // Caret placement uses the strictly-before rule instead: a
@@ -9484,15 +10556,21 @@ impl Widget for &mut Editor {
                     .add_modifier(Modifier::ITALIC);
                 let mut out: Vec<Span> = Vec::new();
                 let mut from = row_start;
-                for (hcol, label) in self
+                for (hcol, label, swatch) in self
                     .row_inlay_spans(line_idx)
                     .iter()
-                    .filter(|(hc, _)| *hc >= row_start && *hc <= hint_cap)
+                    .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
                 {
                     if *hcol > from {
                         out.extend(inlay_text_segment(raw, &merged, from, *hcol));
                     }
-                    out.push(Span::styled(label.clone(), hint_style));
+                    // A color swatch paints in ITS color (#254); plain
+                    // hints keep the dim italic Zed look.
+                    let style = match swatch {
+                        Some(c) => Style::default().fg(*c),
+                        None => hint_style,
+                    };
+                    out.push(Span::styled(label.clone(), style));
                     from = from.max(*hcol);
                 }
                 if row_end > from {
@@ -9945,8 +11023,8 @@ impl Widget for &mut Editor {
             let hint_cells: Vec<(usize, usize)> = self
                 .row_inlay_spans(*cl)
                 .iter()
-                .filter(|(hc, _)| *hc >= caret_start && *hc <= hint_cap)
-                .map(|(hc, l)| (*hc, l.chars().count()))
+                .filter(|(hc, _, _)| *hc >= caret_start && *hc <= hint_cap)
+                .map(|(hc, l, _)| (*hc, l.chars().count()))
                 .collect();
             let col_cells = cc + inlay_cells_before(&hint_cells, *cc);
             if col_cells < caret_start {
@@ -10283,8 +11361,8 @@ impl Editor {
     fn inlay_cells_before_cursor(&self, line: usize, scroll_col: usize) -> usize {
         self.row_inlay_spans(line)
             .iter()
-            .filter(|(hc, _)| *hc >= scroll_col && *hc < self.cursor_col)
-            .map(|(_, l)| l.chars().count())
+            .filter(|(hc, _, _)| *hc >= scroll_col && *hc < self.cursor_col)
+            .map(|(_, l, _)| l.chars().count())
             .sum()
     }
 
@@ -11941,6 +13019,47 @@ fn dir_suffix(path: &std::path::Path, depth: usize) -> String {
     comps.into_iter().rev().collect::<Vec<_>>().join("/")
 }
 
+/// Classify a line as a fold-region marker (#254): after leading
+/// whitespace and a comment introducer (`//`, `#`, `--`, `;`, `/*`, with
+/// an optional extra `#` as in `// #region`), the word `region`
+/// (Some(true)) or `endregion` (Some(false)) at a word boundary — the
+/// language-agnostic `#region` family VS Code folds.
+fn region_marker(line: &str) -> Option<bool> {
+    let trimmed = line.trim_start();
+    let mut rest = None;
+    for intro in ["//", "#", "--", ";", "/*"] {
+        if let Some(r) = trimmed.strip_prefix(intro) {
+            rest = Some(r);
+            break;
+        }
+    }
+    let s = rest?.trim_start();
+    let s = s.strip_prefix('#').unwrap_or(s);
+    let boundary = |r: &str| !r.starts_with(|c: char| c.is_alphanumeric() || c == '_');
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("endregion") {
+        return boundary(&s[9..]).then_some(false);
+    }
+    if lower.starts_with("region") {
+        return boundary(&s[6..]).then_some(true);
+    }
+    None
+}
+
+/// Whether a line is a full-line comment for the fallback comment-run
+/// scanner. Rust/C attributes (`#[...]`, `#![...]`) are code, not
+/// comments, despite the leading `#`.
+fn comment_line(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with("#[") || t.starts_with("#![") {
+        return false;
+    }
+    ["//", "#", "--", ";", "/*", "*/", "* "]
+        .iter()
+        .any(|intro| t.starts_with(intro))
+        || t == "*"
+}
+
 fn tab_label(e: &Editor) -> String {
     if let Some(diff) = e.diff.as_ref() {
         let l = diff
@@ -11970,6 +13089,13 @@ fn tab_label(e: &Editor) -> String {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| String::from("untitled")),
         None => String::from("untitled"),
+    };
+    // The merge editor is text underneath (dirty dot still applies), but
+    // the tab says which flavour of the file it is showing.
+    let name = if e.merge.is_some() {
+        format!("{name} (merge)")
+    } else {
+        name
     };
     if e.dirty {
         format!("\u{25cf} {name}")
@@ -19976,6 +21102,284 @@ mod tests {
     }
 
     #[test]
+    fn linked_editing_mirrors_typing_and_deletion_across_paired_tags() {
+        let mut e = editor_with("<title>\n  text\n</title>");
+        // Spans over both tag names, UTF-16 == char cols here.
+        e.set_linked_ranges(&[(0, 1, 0, 6), (2, 2, 2, 7)]);
+        assert!(e.has_linked_ranges());
+        // Type 's' at the end of the opening tag name.
+        e.cursor_row = 0;
+        e.cursor_col = 6;
+        e.insert_char('s');
+        assert!(e.mirror_linked_edit(), "the keystroke mirrors");
+        assert_eq!(e.lines[0], "<titles>");
+        assert_eq!(e.lines[2], "</titles>");
+        // Keep typing: positions were resynced, the set is still live.
+        e.insert_char('x');
+        assert!(e.mirror_linked_edit());
+        assert_eq!(e.lines[2], "</titlesx>");
+        // Backspace mirrors too.
+        e.backspace();
+        assert!(e.mirror_linked_edit());
+        assert_eq!(e.lines[0], "<titles>");
+        assert_eq!(e.lines[2], "</titles>");
+        // One Undo reverts the keystroke AND its mirror together, and
+        // the restore drops the set so nothing replays on top.
+        assert!(e.undo());
+        assert!(!e.mirror_linked_edit());
+        assert!(!e.has_linked_ranges());
+        assert_eq!(e.lines[0], e.lines[0].clone(), "no panic path");
+    }
+
+    #[test]
+    fn linked_editing_handles_a_same_row_pair_with_shifting_offsets() {
+        let mut e = editor_with("<b>hi</b>");
+        e.set_linked_ranges(&[(0, 1, 0, 2), (0, 7, 0, 8)]);
+        e.cursor_row = 0;
+        e.cursor_col = 2; // end of the opening tag name
+        e.insert_char('r');
+        assert!(e.mirror_linked_edit());
+        assert_eq!(e.lines[0], "<br>hi</br>");
+        // And again — the closing tag's start shifted and must resync.
+        e.insert_char('x');
+        assert!(e.mirror_linked_edit());
+        assert_eq!(e.lines[0], "<brx>hi</brx>");
+    }
+
+    #[test]
+    fn linked_editing_drops_the_set_on_delimiters_and_structural_edits() {
+        // A delimiter character must not propagate.
+        let mut e = editor_with("<div>\n</div>");
+        e.set_linked_ranges(&[(0, 1, 0, 4), (1, 2, 1, 5)]);
+        e.cursor_row = 0;
+        e.cursor_col = 4;
+        e.insert_char(' ');
+        assert!(!e.mirror_linked_edit());
+        assert!(!e.has_linked_ranges(), "a space cleared the set");
+        assert_eq!(e.lines[1], "</div>", "the sibling was untouched");
+
+        // A newline inside the range is a multi-row edit: clear.
+        let mut e2 = editor_with("<div>\n</div>");
+        e2.set_linked_ranges(&[(0, 1, 0, 4), (1, 2, 1, 5)]);
+        e2.cursor_row = 0;
+        e2.cursor_col = 3;
+        e2.insert_newline();
+        assert!(!e2.mirror_linked_edit());
+        assert!(!e2.has_linked_ranges());
+    }
+
+    #[test]
+    fn linked_editing_rejects_boundary_deletes_of_the_outside_delimiters() {
+        // Backspace with the caret AT the range start deletes the `<`
+        // BEFORE the range; the post-edit caret sits outside the span,
+        // so nothing may mirror (the old bug wrote "iv" into siblings).
+        let mut e = editor_with("<div>\n</div>");
+        e.set_linked_ranges(&[(0, 1, 0, 4), (1, 2, 1, 5)]);
+        e.cursor_row = 0;
+        e.cursor_col = 1;
+        e.backspace();
+        assert!(!e.mirror_linked_edit());
+        assert!(!e.has_linked_ranges());
+        assert_eq!(e.lines[0], "div>", "only the user's own edit landed");
+        assert_eq!(e.lines[1], "</div>", "the sibling was untouched");
+
+        // Delete-forward with the caret AT the range end deletes the `>`
+        // AFTER the range — same rejection, symmetric case.
+        let mut e2 = editor_with("<div>\n</div>");
+        e2.set_linked_ranges(&[(0, 1, 0, 4), (1, 2, 1, 5)]);
+        e2.cursor_row = 0;
+        e2.cursor_col = 4;
+        e2.delete_forward();
+        assert!(!e2.mirror_linked_edit());
+        assert!(!e2.has_linked_ranges());
+        assert_eq!(e2.lines[0], "<div");
+        assert_eq!(e2.lines[1], "</div>", "the sibling was untouched");
+    }
+
+    #[test]
+    fn linked_editing_ignores_edits_outside_every_range() {
+        let mut e = editor_with("<div>body</div>");
+        e.set_linked_ranges(&[(0, 1, 0, 4), (0, 11, 0, 14)]);
+        e.cursor_row = 0;
+        e.cursor_col = 7; // inside "body"
+        e.insert_char('!');
+        assert!(!e.mirror_linked_edit());
+        assert!(
+            !e.has_linked_ranges(),
+            "an edit outside the set clears it (positions may have shifted)"
+        );
+        assert_eq!(e.lines[0], "<div>bo!dy</div>");
+    }
+
+    #[test]
+    fn set_linked_ranges_rejects_multiline_and_singleton_sets() {
+        let mut e = editor_with("<a>\n</a>");
+        e.set_linked_ranges(&[(0, 1, 1, 2)]);
+        assert!(
+            !e.has_linked_ranges(),
+            "multi-line span filtered, pair too small"
+        );
+        e.set_linked_ranges(&[(0, 1, 0, 2)]);
+        assert!(!e.has_linked_ranges(), "a single range cannot mirror");
+    }
+
+    #[test]
+    fn expand_selection_syntax_walks_rust_node_ancestry_and_shrink_retraces() {
+        let mut e = editor_with("fn main() {\n    let value = compute(1, 2);\n}");
+        e.set_language(Some(crate::highlight::LangKind::Rust));
+        // Caret inside `value`, nothing selected.
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.validate_expand_stacks();
+        assert!(e.expand_selection_syntax(), "first grow");
+        let first = e.selection.expect("a selection appeared").normalised();
+        assert!(
+            first.0 <= (1, 8) && first.1 >= (1, 13),
+            "the identifier (or more) is selected: {first:?}"
+        );
+        assert!(e.expand_selection_syntax(), "second grow");
+        let second = e.selection.unwrap().normalised();
+        assert!(
+            second.0 <= first.0 && second.1 >= first.1 && second != first,
+            "each step strictly grows: {first:?} -> {second:?}"
+        );
+        // Shrink retraces the EXACT ranges, then bottoms out.
+        assert!(e.shrink_selection_step());
+        assert_eq!(e.selection.unwrap().normalised(), first);
+        assert!(e.shrink_selection_step());
+        assert!(
+            e.selection.is_none(),
+            "the gesture's start was a zero-area caret"
+        );
+        assert!(!e.shrink_selection_step(), "bottom of the stack");
+    }
+
+    #[test]
+    fn expand_stack_rebuilds_after_an_edit_or_a_cursor_move() {
+        let mut e = editor_with("fn main() {\n    let value = 1;\n}");
+        e.set_language(Some(crate::highlight::LangKind::Rust));
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.validate_expand_stacks();
+        assert!(e.expand_selection_syntax());
+        // A manual cursor move away from the stack's step invalidates it:
+        // shrink from the new spot has nothing to retrace.
+        e.clear_selection();
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        assert!(!e.shrink_selection_step(), "stack rebuilt at the new spot");
+    }
+
+    #[test]
+    fn install_selection_chains_keeps_only_strictly_growing_containing_spans() {
+        let mut e = editor_with("alpha beta\ngamma");
+        e.cursor_row = 0;
+        e.cursor_col = 7; // inside "beta"
+        e.validate_expand_stacks();
+        // UTF-16 chain: the word, a NON-containing span (filtered), the
+        // line, a repeat of the line (filtered), both lines.
+        e.install_selection_chains(vec![vec![
+            (0, 6, 0, 10),
+            (0, 0, 0, 5),
+            (0, 0, 0, 10),
+            (0, 0, 0, 10),
+            (0, 0, 1, 5),
+        ]]);
+        assert!(e.expand_selection_from_stack());
+        assert_eq!(e.selection.unwrap().normalised(), ((0, 6), (0, 10)));
+        assert!(e.expand_selection_from_stack());
+        assert_eq!(e.selection.unwrap().normalised(), ((0, 0), (0, 10)));
+        assert!(e.expand_selection_from_stack());
+        assert_eq!(e.selection.unwrap().normalised(), ((0, 0), (1, 5)));
+        assert!(!e.expand_selection_from_stack(), "chain exhausted");
+    }
+
+    #[test]
+    fn textual_fallback_grows_to_line_then_whole_buffer_without_a_grammar() {
+        let mut e = editor_with("first line here\nsecond");
+        e.cursor_row = 0;
+        e.cursor_col = 6;
+        e.validate_expand_stacks();
+        assert!(e.expand_selection_syntax());
+        assert_eq!(
+            e.selection.unwrap().normalised(),
+            ((0, 0), (0, 15)),
+            "no grammar: the line first"
+        );
+        assert!(e.expand_selection_syntax());
+        assert_eq!(
+            e.selection.unwrap().normalised(),
+            ((0, 0), (1, 6)),
+            "then the whole buffer"
+        );
+        assert!(!e.expand_selection_syntax(), "nothing larger exists");
+    }
+
+    #[test]
+    fn expand_selection_grows_every_cursor_in_a_multi_cursor_set() {
+        let mut e = editor_with("let alpha = 1;\nlet beta = 2;");
+        e.set_language(Some(crate::highlight::LangKind::Rust));
+        e.cursor_row = 0;
+        e.cursor_col = 5; // inside alpha
+        e.carets = vec![EditorSelection::new(1, 5)]; // inside beta
+        e.validate_expand_stacks();
+        assert!(e.expand_selection_syntax());
+        let primary = e.selection.expect("primary grew").normalised();
+        assert_eq!(primary.0.0, 0, "primary stays on its own row");
+        assert_eq!(e.carets.len(), 1);
+        let caret = e.carets[0].normalised();
+        assert!(
+            caret.0.0 == 1 && caret.1.1 > caret.0.1,
+            "the secondary caret grew on ITS row: {caret:?}"
+        );
+    }
+
+    #[test]
+    fn document_colors_splice_a_swatch_cell_and_answer_color_at() {
+        use crate::lsp::manager::ColorItem;
+        let mut e = editor_with("a { color: #ff0000; }");
+        e.path = Some(std::path::PathBuf::from("/tmp/x.css"));
+        let item = ColorItem {
+            line: 0,
+            character: 11,
+            end_line: 0,
+            end_character: 18,
+            red: 255,
+            green: 0,
+            blue: 0,
+            raw: (1.0, 0.0, 0.0, 1.0),
+        };
+        e.apply_document_colors(std::path::PathBuf::from("/tmp/x.css"), vec![item]);
+        let spans = e.row_inlay_spans(0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0, 11, "anchored at the value's start");
+        assert_eq!(spans[0].1, "\u{25a0}");
+        assert_eq!(spans[0].2, Some(Color::Rgb(255, 0, 0)));
+        // Range lookup, inclusive of the end boundary.
+        assert!(e.color_at(0, 11).is_some());
+        assert!(e.color_at(0, 18).is_some());
+        assert!(e.color_at(0, 10).is_none());
+        assert!(e.color_at(0, 19).is_none());
+        // An empty batch clears the swatches.
+        e.apply_document_colors(std::path::PathBuf::from("/tmp/x.css"), Vec::new());
+        assert!(e.row_inlay_spans(0).is_empty());
+        // Colors for ANOTHER file never splice into this one.
+        let stale = ColorItem {
+            line: 0,
+            character: 0,
+            end_line: 0,
+            end_character: 1,
+            red: 1,
+            green: 2,
+            blue: 3,
+            raw: (0.0, 0.0, 0.0, 1.0),
+        };
+        e.apply_document_colors(std::path::PathBuf::from("/tmp/other.css"), vec![stale]);
+        assert!(e.row_inlay_spans(0).is_empty());
+        assert!(e.color_at(0, 0).is_none());
+    }
+
+    #[test]
     fn select_next_occurrence_grows_selection_one_match_at_a_time() {
         let mut e = editor_with("foo bar foo baz foo");
         e.cursor_row = 0;
@@ -21210,6 +22614,82 @@ mod tests {
         // The interior blank (line 2) sits between two deeper lines, so it is
         // inside the region; the region ends at the last deeper line (3).
         assert_eq!(e.fold_range(0), Some((0, 3)));
+    }
+
+    #[test]
+    fn region_markers_fold_in_the_fallback_scanner_including_nesting() {
+        use crate::lsp::manager::FoldRangeKind;
+        let mut e = editor_with(
+            "top\n#region outer\na\n// region inner\nb\n// endregion\nc\n#endregion\ntail",
+        );
+        e.refresh_fold_tables();
+        assert_eq!(e.fold_range(1), Some((1, 7)), "outer #region pair");
+        assert_eq!(e.fold_range(3), Some((3, 5)), "nested // region pair");
+        assert_eq!(e.fold_kind_at(1), Some(FoldRangeKind::Region));
+        assert_eq!(e.fold_kind_at(0), None, "plain text has no kind");
+        // A line that merely CONTAINS the word is not a marker.
+        let mut e2 = editor_with("let region = 1;\nregional stuff\n#endregion");
+        e2.refresh_fold_tables();
+        assert_eq!(e2.fold_range(0), None);
+        assert_eq!(e2.fold_range(1), None);
+    }
+
+    #[test]
+    fn comment_runs_fold_but_rust_attributes_do_not_count_as_comments() {
+        use crate::lsp::manager::FoldRangeKind;
+        let mut e = editor_with(
+            "// docs line one\n// docs line two\n// docs line three\nfn a() {}\n#[derive(Debug)]\n#[cfg(test)]\nstruct S;",
+        );
+        e.refresh_fold_tables();
+        assert_eq!(e.fold_range(0), Some((0, 2)), "a 3-line comment run folds");
+        assert_eq!(e.fold_kind_at(0), Some(FoldRangeKind::Comment));
+        assert_eq!(
+            e.fold_kind_at(4),
+            None,
+            "attribute lines are code, not a comment run"
+        );
+        // A single comment line is not a run.
+        let mut e2 = editor_with("// alone\nfn a() {}");
+        e2.refresh_fold_tables();
+        assert_eq!(e2.fold_kind_at(0), None);
+    }
+
+    #[test]
+    fn server_fold_spans_replace_the_heuristics_until_the_buffer_moves() {
+        use crate::lsp::manager::{FoldRangeKind, FoldingRangeItem};
+        let mut e = editor_with("fn a() {\n    x\n    y\n}\nfn b() {}");
+        // Server says the whole item folds through its closing brace —
+        // something indentation cannot express.
+        e.set_lsp_folds(vec![FoldingRangeItem {
+            start_line: 0,
+            end_line: 3,
+            kind: FoldRangeKind::Other,
+        }]);
+        assert_eq!(e.fold_range(0), Some((0, 3)), "server span wins");
+        assert_eq!(
+            e.fold_range(4),
+            None,
+            "server authoritative: no indentation fallthrough"
+        );
+        // An edit that changes the line count orphans the spans; the
+        // indentation scan is back in charge until the next reply.
+        e.lines.push(String::from("tail"));
+        assert_eq!(e.fold_range(0), Some((0, 2)), "stale spans ignored");
+    }
+
+    #[test]
+    fn fold_all_regions_and_unfold_all_regions_round_trip() {
+        use crate::lsp::manager::FoldRangeKind;
+        let mut e = editor_with("#region a\nx\n#endregion\n// one\n// two\nfn f() {\n    body\n}");
+        e.fold_all_of_kind(FoldRangeKind::Region);
+        assert!(e.is_line_hidden(1), "the region body folded");
+        assert!(!e.is_line_hidden(4), "the comment run did not");
+        assert!(!e.is_line_hidden(6), "the indented block did not");
+        e.fold_all_of_kind(FoldRangeKind::Comment);
+        assert!(e.is_line_hidden(4), "now the comment run folded too");
+        e.unfold_all_of_kind(FoldRangeKind::Region);
+        assert!(!e.is_line_hidden(1), "regions expanded");
+        assert!(e.is_line_hidden(4), "comment folds untouched");
     }
 
     #[test]
