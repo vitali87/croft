@@ -155,8 +155,9 @@ fn find_terminator(bytes: &[u8], body_start: usize) -> Terminator {
     Terminator::NeedMore
 }
 
-/// Decode `%XX` escapes (OSC 7 file URLs percent-encode special chars).
-fn percent_decode(bytes: &[u8]) -> Vec<u8> {
+/// Decode `%XX` escapes (OSC 7 file URLs percent-encode special chars;
+/// `file_ref::editor_file_uri` reuses this for editor deep-link paths).
+pub(crate) fn percent_decode(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {

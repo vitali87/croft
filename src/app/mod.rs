@@ -25421,11 +25421,21 @@ impl App {
                 self.workspace_root().join(&path)
             }
         };
+        self.open_resolved_file_ref(&abs, fr.line, fr.column)
+    }
+
+    /// Jump the editor to an absolute `path:line[:col]`, recording where the
+    /// user was so Back returns to it, exactly like go-to-definition. False
+    /// when the file doesn't exist or won't open.
+    fn open_resolved_file_ref(
+        &mut self,
+        abs: &std::path::Path,
+        line: u32,
+        column: Option<u32>,
+    ) -> bool {
         if !abs.is_file() {
             return false;
         }
-        // Record where the user was so Back returns to it, exactly like
-        // go-to-definition.
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
                 path: from,
@@ -25433,11 +25443,11 @@ impl App {
                 col: self.editor.cursor_col,
             });
         }
-        let line0 = (fr.line as usize).saturating_sub(1);
-        let col0 = fr.column.map(|c| c as usize).unwrap_or(1).saturating_sub(1);
-        match self.open_at(&abs, line0, col0) {
+        let line0 = (line as usize).saturating_sub(1);
+        let col0 = column.map(|c| c as usize).unwrap_or(1).saturating_sub(1);
+        match self.open_at(abs, line0, col0) {
             Ok(()) => {
-                self.status = format!("{}:{}", self.status_path(&abs), fr.line);
+                self.status = format!("{}:{}", self.status_path(abs), line);
                 true
             }
             Err(_) => false,
@@ -25449,12 +25459,24 @@ impl App {
     /// local Mac through the drop relay (with the usual confirm gate). On a
     /// local session everything opens directly.
     ///
-    /// Web links only: an OSC 8 cell carries whatever URI the printing
-    /// program chose while showing unrelated text, so a file:// or
-    /// custom-scheme URI would hand `open`/`xdg-open` an arbitrary target
-    /// (app launch, protocol handler) off one disguised click. The refusal
-    /// surfaces the real destination in the status line.
+    /// Editor deep links (`vscode://file/…:line`, and the same shape from
+    /// Cursor/Windsurf/Zed, plus plain `file://`) name a file and line, and
+    /// Croft is an editor: they open in the editor pane right here, never
+    /// through the OS. Beyond those, web links only: an OSC 8 cell carries
+    /// whatever URI the printing program chose while showing unrelated text,
+    /// so any other custom-scheme URI would hand `open`/`xdg-open` an
+    /// arbitrary target (app launch, protocol handler) off one disguised
+    /// click. The refusal surfaces the real destination in the status line.
     fn open_detected_url(&mut self, url: &str) {
+        if let Some(fr) = crate::file_ref::editor_file_uri(url) {
+            // Absolute by construction; gated on is_file like every terminal
+            // file click. An unresolvable link falls through to the web-only
+            // rule so its refusal still shows the real URI.
+            let path = std::path::PathBuf::from(&fr.path);
+            if self.open_resolved_file_ref(&path, fr.line, fr.column) {
+                return;
+            }
+        }
         let scheme_ok = {
             let l = url.trim_start().to_ascii_lowercase();
             l.starts_with("http://") || l.starts_with("https://")

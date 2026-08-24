@@ -76,6 +76,67 @@ pub fn file_ref_at(text: &str, col: usize) -> Option<FileRef> {
     None
 }
 
+/// An editor deep-link URI carried by a terminal hyperlink:
+/// `scheme://file/<abs path>[:line[:col]]` (VS Code's shape, printed
+/// identically by Cursor, Windsurf, and Zed — VS Code's canonical form
+/// doubles the slash, `vscode://file//Users/…`, and the single-slash
+/// variant appears in the wild too) or a plain `file://<abs path>`.
+/// Croft is an editor, so these open here rather than launching the
+/// scheme's own app. The path is percent-decoded; line/column stay
+/// 1-based, defaulting to line 1 when the URI carries none.
+pub fn editor_file_uri(url: &str) -> Option<FileRef> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    if scheme.eq_ignore_ascii_case("file") {
+        // file://[host]/abs/path — the scheme has no line-suffix convention.
+        let path = decode_path(&rest[rest.find('/')?..])?;
+        return Some(FileRef {
+            path,
+            line: 1,
+            column: None,
+        });
+    }
+    let tail = rest.strip_prefix("file/")?;
+    let (raw_path, line, column) = split_line_suffix(tail);
+    let mut path = decode_path(raw_path)?;
+    if !path.starts_with('/') {
+        path.insert(0, '/');
+    }
+    Some(FileRef { path, line, column })
+}
+
+/// Split a trailing `:line[:col]` off an editor URI path. Digit runs are
+/// bounded like PATH_LINE_RE's, so an overlong run reads as path text.
+fn split_line_suffix(s: &str) -> (&str, u32, Option<u32>) {
+    let Some((head, last)) = numeric_suffix(s) else {
+        return (s, 1, None);
+    };
+    match numeric_suffix(head) {
+        Some((rest, line)) => (rest, line, Some(last)),
+        None => (head, last, None),
+    }
+}
+
+fn numeric_suffix(s: &str) -> Option<(&str, u32)> {
+    let (head, tail) = s.rsplit_once(':')?;
+    if tail.is_empty() || tail.len() > 7 || !tail.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((head, tail.parse().ok()?))
+}
+
+fn decode_path(raw: &str) -> Option<String> {
+    let decoded =
+        String::from_utf8(crate::shell_integration::percent_decode(raw.as_bytes())).ok()?;
+    (!decoded.is_empty()).then_some(decoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +193,52 @@ mod tests {
     fn grep_output_with_trailing_text_keeps_only_the_location() {
         let r = at("src/x.rs:12:some matched text", 3).unwrap();
         assert_eq!((r.path.as_str(), r.line, r.column), ("src/x.rs", 12, None));
+    }
+
+    #[test]
+    fn vscode_deep_link_with_doubled_slash_parses() {
+        let r = editor_file_uri("vscode://file//Users/me/repo/a.py:42").unwrap();
+        assert_eq!(
+            (r.path.as_str(), r.line, r.column),
+            ("/Users/me/repo/a.py", 42, None)
+        );
+    }
+
+    #[test]
+    fn single_slash_variant_and_column_parse() {
+        let r = editor_file_uri("cursor://file/Users/me/a.rs:12:7").unwrap();
+        assert_eq!(
+            (r.path.as_str(), r.line, r.column),
+            ("/Users/me/a.rs", 12, Some(7))
+        );
+    }
+
+    #[test]
+    fn lineless_deep_link_defaults_to_line_one() {
+        let r = editor_file_uri("zed://file//tmp/x.txt").unwrap();
+        assert_eq!((r.path.as_str(), r.line, r.column), ("/tmp/x.txt", 1, None));
+    }
+
+    #[test]
+    fn percent_encoded_spaces_decode() {
+        let r = editor_file_uri("vscode://file//My%20Repo/mod.py:7").unwrap();
+        assert_eq!((r.path.as_str(), r.line), ("/My Repo/mod.py", 7));
+    }
+
+    #[test]
+    fn plain_file_uri_parses_without_line() {
+        let r = editor_file_uri("file:///etc/hosts").unwrap();
+        assert_eq!((r.path.as_str(), r.line, r.column), ("/etc/hosts", 1, None));
+        // An authority component is skipped, not read as the path.
+        let r = editor_file_uri("file://localhost/etc/hosts").unwrap();
+        assert_eq!(r.path, "/etc/hosts");
+    }
+
+    #[test]
+    fn non_file_uris_are_refused() {
+        assert!(editor_file_uri("https://example.com/a.py:3").is_none());
+        assert!(editor_file_uri("vscode://settings/keybindings").is_none());
+        assert!(editor_file_uri("mailto:a@b.c").is_none());
+        assert!(editor_file_uri("vscode://file/").is_none());
     }
 }
