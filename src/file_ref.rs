@@ -111,6 +111,37 @@ pub fn editor_file_uri(url: &str) -> Option<FileRef> {
     Some(FileRef { path, line, column })
 }
 
+/// A two-file deep link from a report's group cell:
+/// `diff://open?left=<enc path[:line[:col]]>&right=<enc …>` (cgr duplicates
+/// emits this — single-file schemes like `vscode://file/` cannot carry a
+/// pair). Values are fully percent-encoded; both sides must decode to
+/// absolute paths.
+pub fn diff_uri(url: &str) -> Option<(FileRef, FileRef)> {
+    let rest = url.trim().strip_prefix("diff://")?;
+    let query = rest.split_once('?').map(|(_, q)| q).unwrap_or(rest);
+    let mut left = None;
+    let mut right = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        let decoded = decode_path(value)?;
+        let (path, line, column) = split_line_suffix(&decoded);
+        if !path.starts_with('/') {
+            return None;
+        }
+        let fr = FileRef {
+            path: path.to_string(),
+            line,
+            column,
+        };
+        match key {
+            "left" => left = Some(fr),
+            "right" => right = Some(fr),
+            _ => return None,
+        }
+    }
+    Some((left?, right?))
+}
+
 /// Split a trailing `:line[:col]` off an editor URI path. Digit runs are
 /// bounded like PATH_LINE_RE's, so an overlong run reads as path text.
 fn split_line_suffix(s: &str) -> (&str, u32, Option<u32>) {
@@ -240,5 +271,33 @@ mod tests {
         assert!(editor_file_uri("vscode://settings/keybindings").is_none());
         assert!(editor_file_uri("mailto:a@b.c").is_none());
         assert!(editor_file_uri("vscode://file/").is_none());
+    }
+
+    #[test]
+    fn diff_uri_parses_both_sides_with_lines() {
+        let url = "diff://open?left=%2Frepo%2Fa.py%3A5&right=%2Frepo%2Fb.py%3A8";
+        let (l, r) = diff_uri(url).unwrap();
+        assert_eq!((l.path.as_str(), l.line), ("/repo/a.py", 5));
+        assert_eq!((r.path.as_str(), r.line), ("/repo/b.py", 8));
+    }
+
+    #[test]
+    fn diff_uri_decodes_spaces_and_defaults_lines() {
+        let url = "diff://open?left=%2FMy%20Repo%2Fa.py&right=%2FMy%20Repo%2Fb.py";
+        let (l, r) = diff_uri(url).unwrap();
+        assert_eq!((l.path.as_str(), l.line), ("/My Repo/a.py", 1));
+        assert_eq!(r.path, "/My Repo/b.py");
+    }
+
+    #[test]
+    fn diff_uri_refuses_partial_relative_or_foreign_forms() {
+        // One side missing.
+        assert!(diff_uri("diff://open?left=%2Fa.py%3A1").is_none());
+        // Relative path.
+        assert!(diff_uri("diff://open?left=a.py%3A1&right=%2Fb.py%3A2").is_none());
+        // Unknown key.
+        assert!(diff_uri("diff://open?left=%2Fa&middle=%2Fm&right=%2Fb").is_none());
+        // Different scheme entirely.
+        assert!(diff_uri("vscode://file//a.py:1").is_none());
     }
 }

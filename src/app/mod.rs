@@ -25447,11 +25447,51 @@ impl App {
         let col0 = column.map(|c| c as usize).unwrap_or(1).saturating_sub(1);
         match self.open_at(abs, line0, col0) {
             Ok(()) => {
+                // `explorer.autoReveal` analogue, as quick-open does: sync
+                // the tree to the landed file without stealing editor focus.
+                self.tree.reveal_path(abs);
                 self.status = format!("{}:{}", self.status_path(abs), line);
                 true
             }
             Err(_) => false,
         }
+    }
+
+    /// Open a `diff://` group link's two files side by side: left lands in
+    /// the leftmost editor group, right in the rightmost — splitting first
+    /// when the editor is a single group, reusing the existing pair when it
+    /// is already split (so repeated clicks swap the comparison in place
+    /// instead of accreting columns).
+    fn open_side_by_side(
+        &mut self,
+        left: &crate::file_ref::FileRef,
+        right: &crate::file_ref::FileRef,
+    ) -> bool {
+        let lp = std::path::PathBuf::from(&left.path);
+        let rp = std::path::PathBuf::from(&right.path);
+        if !lp.is_file() || !rp.is_file() {
+            return false;
+        }
+        self.focus_editor_group(true);
+        if !self.open_resolved_file_ref(&lp, left.line, left.column) {
+            return false;
+        }
+        if self.editor_layout.is_split() {
+            self.focus_editor_group(false);
+        } else {
+            // The split duplicates the left file into the new focused group
+            // as a preview tab; opening the right file swaps into it.
+            self.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+        }
+        if !self.open_resolved_file_ref(&rp, right.line, right.column) {
+            return false;
+        }
+        self.status = format!(
+            "Side by side: {} | {}",
+            self.status_path(&lp),
+            self.status_path(&rp)
+        );
+        true
     }
 
     /// Open a URL discovered in the terminal. On a remote session a loopback
@@ -25468,6 +25508,14 @@ impl App {
     /// arbitrary target (app launch, protocol handler) off one disguised
     /// click. The refusal surfaces the real destination in the status line.
     fn open_detected_url(&mut self, url: &str) {
+        // A diff:// group link names two files; open them side by side.
+        // Same trust story as single-file deep links: consumed internally,
+        // gated on is_file, never handed to the OS.
+        if let Some((left, right)) = crate::file_ref::diff_uri(url)
+            && self.open_side_by_side(&left, &right)
+        {
+            return;
+        }
         if let Some(fr) = crate::file_ref::editor_file_uri(url) {
             // Absolute by construction; gated on is_file like every terminal
             // file click. An unresolvable link falls through to the web-only
