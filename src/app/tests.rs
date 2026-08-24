@@ -20358,14 +20358,13 @@ fn build_breadcrumbs_lists_path_segments_then_the_symbol_chain() {
 
 #[test]
 fn toggle_format_on_save_command_flips_the_pref_and_reports_it() {
-    use crate::widgets::command_palette::Command;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.format_on_save = false;
-    app.run_command(Command::ToggleFormatOnSave);
+    app.run_command(crate::widgets::command_palette::Command::ToggleFormatOnSave);
     assert!(app.format_on_save, "the command turns format-on-save on");
     assert!(app.status.contains("on") || app.status.contains("On"));
-    app.run_command(Command::ToggleFormatOnSave);
+    app.run_command(crate::widgets::command_palette::Command::ToggleFormatOnSave);
     assert!(!app.format_on_save, "the command toggles it back off");
 }
 
@@ -21520,13 +21519,12 @@ fn auto_save_sweeps_dirty_background_tabs() {
 
 #[test]
 fn toggle_auto_save_command_flips_the_pref_and_reports_it() {
-    use crate::widgets::command_palette::Command;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
-    app.run_command(Command::ToggleAutoSave);
+    app.run_command(crate::widgets::command_palette::Command::ToggleAutoSave);
     assert!(app.auto_save);
     assert_eq!(app.status, "Auto Save: on");
-    app.run_command(Command::ToggleAutoSave);
+    app.run_command(crate::widgets::command_palette::Command::ToggleAutoSave);
     assert!(!app.auto_save);
     assert_eq!(app.status, "Auto Save: off");
 }
@@ -25549,9 +25547,9 @@ fn palette_carries_the_navigator_commands() {
     app.pair_record_path = tmp.path().join("x.pair.json");
     app.open_file_at_launch(&file);
 
-    app.run_command(Command::AskNavigator);
+    app.run_command(crate::widgets::command_palette::Command::AskNavigator);
     assert!(app.status.to_lowercase().contains("not active"));
-    app.run_command(Command::YieldToNavigator);
+    app.run_command(crate::widgets::command_palette::Command::YieldToNavigator);
     assert!(app.status.to_lowercase().contains("not active"));
 
     app.navigator_notes
@@ -25561,15 +25559,15 @@ fn palette_carries_the_navigator_commands() {
         reply: String::new(),
         cursor: 0,
     });
-    app.run_command(Command::ClearNavigatorNotes);
+    app.run_command(crate::widgets::command_palette::Command::ClearNavigatorNotes);
     assert!(app.navigator_notes.is_empty());
     assert!(app.editor.comment_focus.is_none());
 
-    app.run_command(Command::ToggleNavigator);
+    app.run_command(crate::widgets::command_palette::Command::ToggleNavigator);
     let record =
         crate::session::read_pair_record(&app.pair_record_path).expect("toggle writes the record");
     assert!(record.enabled);
-    app.run_command(Command::ToggleNavigator);
+    app.run_command(crate::widgets::command_palette::Command::ToggleNavigator);
     let record = crate::session::read_pair_record(&app.pair_record_path).unwrap();
     assert!(!record.enabled);
 }
@@ -28045,7 +28043,7 @@ fn wait_for_conflicted_entry(app: &mut App) -> usize {
 }
 
 #[test]
-fn scm_click_on_a_conflicted_entry_opens_the_file_at_its_first_conflict() {
+fn scm_click_on_a_conflicted_entry_opens_the_merge_editor_on_the_stages() {
     let tmp = tempfile::tempdir().unwrap();
     conflicted_repo(tmp.path());
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -28056,15 +28054,32 @@ fn scm_click_on_a_conflicted_entry_opens_the_file_at_its_first_conflict() {
         Some(std::ffi::OsStr::new("shared.txt")),
         "the conflicted file must open"
     );
-    let first_header = app.editor.conflicts()[0].ours_start;
+    let mv = app.editor.merge.as_ref().expect("the merge editor is up");
+    assert!(!mv.from_markers, "git stages, not marker synthesis");
+    assert_eq!(mv.conflicts.len(), 2, "both overlapping hunks tracked");
+    // The base pane holds the stage-1 (common ancestor) content.
+    assert_eq!(mv.base[1], "base-one");
+    assert_eq!(mv.conflicts[0].ours, vec!["main-one".to_string()]);
+    assert_eq!(mv.conflicts[0].theirs, vec!["feature-one".to_string()]);
+    // The Result starts as base for conflict regions (nothing else
+    // differed in this fixture, so the whole buffer equals base).
+    assert_eq!(app.editor.lines[1], "base-one");
     assert_eq!(
-        app.editor.cursor_row, first_header,
-        "the cursor must land on the first conflict header, not row 0"
+        app.editor.cursor_row, mv.conflicts[0].result_start,
+        "the cursor lands on the first conflict region"
     );
     assert!(
         app.status.contains("2 conflicts"),
-        "the status must count the conflicts and name the flow; was {:?}",
+        "the status counts the conflicts; was {:?}",
         app.status
+    );
+    // "Reopen as Text" reaches the unchanged in-buffer marker flow.
+    app.run_command(crate::widgets::command_palette::Command::ReopenAsText);
+    assert!(app.editor.merge.is_none(), "back to a plain text tab");
+    assert_eq!(
+        app.editor.conflicts().len(),
+        2,
+        "the marker scan sees the on-disk conflict blocks again"
     );
 }
 
@@ -28132,12 +28147,20 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
         app.status
     );
 
-    app.resolve_all_merge(crate::merge::Resolution::Incoming);
-    assert!(app.editor.conflicts().is_empty(), "every block resolved");
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllIncoming);
+    assert_eq!(
+        app.editor
+            .merge
+            .as_ref()
+            .map(|mv| mv.unresolved_count())
+            .unwrap_or(usize::MAX),
+        0,
+        "every conflict resolved"
+    );
     assert_eq!(
         app.editor.lines.join("\n"),
         "alpha\nfeature-one\nm1\nm2\nm3\nm4\nm5\nfeature-two\nomega",
-        "the buffer keeps only the incoming side of both blocks"
+        "the Result keeps only the incoming side of both conflicts"
     );
 
     app.complete_merge();
@@ -28164,6 +28187,162 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
         line.starts_with("M "),
         "after staging, shared.txt must be index-modified (M ), not unmerged; was {line:?}"
     );
+}
+
+#[test]
+fn merge_editor_accepts_toggles_and_manual_edits_update_the_counter() {
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    assert!(app.editor.merge.is_some());
+
+    // Accept Current on conflict 1 (cursor already there).
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptCurrent);
+    assert_eq!(app.editor.lines[1], "main-one");
+    // F7 lands on conflict 2; Accept Combination (Incoming First).
+    app.merge_jump(false);
+    assert!(app.status.contains("Conflict 2 of 2"), "{:?}", app.status);
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptBothReverse);
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "alpha\nmain-one\nm1\nm2\nm3\nm4\nm5\nfeature-two\nmain-two\nomega",
+        "incoming-first combination splices theirs then ours"
+    );
+    assert_eq!(app.editor.merge.as_ref().unwrap().resolved_count(), 2);
+
+    // Checkbox toggling: unchecking the only accepted side reverts the
+    // region to base and the conflict back to unresolved.
+    use crate::merge_editor::{CheckSide, ConflictState};
+    app.merge_toggle_side(0, CheckSide::Incoming); // Current -> Both
+    assert_eq!(
+        app.editor.merge.as_ref().unwrap().conflicts[0].state,
+        ConflictState::Both
+    );
+    assert_eq!(app.editor.lines[1], "main-one");
+    assert_eq!(app.editor.lines[2], "feature-one");
+    app.merge_toggle_side(0, CheckSide::Current); // Both -> Incoming
+    app.merge_toggle_side(0, CheckSide::Incoming); // Incoming -> Unresolved
+    let mv = app.editor.merge.as_ref().unwrap();
+    assert_eq!(mv.conflicts[0].state, ConflictState::Unresolved);
+    assert_eq!(app.editor.lines[1], "base-one", "back to base text");
+    assert_eq!(mv.resolved_count(), 1);
+
+    // A manual edit inside the region marks it manually resolved.
+    let row = app.editor.merge.as_ref().unwrap().conflicts[0].result_start;
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.merge_view_sync();
+    let mv = app.editor.merge.as_ref().unwrap();
+    assert_eq!(mv.conflicts[0].state, ConflictState::Manual);
+    assert_eq!(mv.resolved_count(), 2, "manual edits count as resolved");
+
+    // Base pane toggle.
+    assert!(!app.editor.merge.as_ref().unwrap().show_base);
+    app.run_command(crate::widgets::command_palette::Command::MergeToggleBase);
+    assert!(app.editor.merge.as_ref().unwrap().show_base);
+    assert_eq!(app.status, "Base pane shown");
+}
+
+#[test]
+fn merge_editor_works_on_a_marker_only_file_outside_any_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("plain.txt"),
+        "top\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> other\nbottom\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("plain.txt"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.run_command(crate::widgets::command_palette::Command::MergeOpenEditor);
+    let mv = app.editor.merge.as_ref().expect("marker synthesis worked");
+    assert!(mv.from_markers);
+    assert_eq!(mv.conflicts.len(), 1);
+    assert_eq!(mv.conflicts[0].ours, vec!["mine".to_string()]);
+    assert_eq!(mv.conflicts[0].theirs, vec!["yours".to_string()]);
+    assert!(
+        !app.editor.lines.iter().any(|l| l.starts_with("<<<<<<<")),
+        "the Result holds no markers"
+    );
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptBoth);
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "top\nmine\nyours\nbottom",
+        "Accept Both keeps ours then theirs"
+    );
+    // Undo steps back through the accept and the initial transform to
+    // the marker text.
+    app.editor.undo();
+    app.editor.undo();
+    assert!(
+        app.editor.lines.iter().any(|l| l.starts_with("<<<<<<<")),
+        "the marker buffer is one undo chain away"
+    );
+}
+
+#[test]
+fn merge_editor_renders_source_panes_and_result_at_100_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("plain.txt"),
+        "top\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> other\nbottom\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("plain.txt"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.run_command(crate::widgets::command_palette::Command::MergeOpenEditor);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let a = buf.area;
+    let text: String = (a.y..a.y + a.height)
+        .map(|y| {
+            (a.x..a.x + a.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("MERGE"), "header row painted");
+    assert!(text.contains("0/1 conflict resolved"), "counter painted");
+    assert!(text.contains("CURRENT (yours)"), "current pane titled");
+    assert!(text.contains("INCOMING (theirs)"), "incoming pane titled");
+    assert!(
+        text.contains("RESULT (editable)"),
+        "result separator painted"
+    );
+    assert!(
+        text.contains("[ ]"),
+        "the unresolved conflict shows unchecked boxes"
+    );
+    let spans = app.editor.merge.as_ref().unwrap().check_spans.clone();
+    assert_eq!(spans.len(), 2, "one checkbox per source pane");
+    // Clicking the Current checkbox accepts that side.
+    let (y, xs, idx, _) = &spans[0];
+    let m = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: xs.start,
+        row: *y,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(m);
+    let mv = app.editor.merge.as_ref().unwrap();
+    assert_eq!(
+        mv.conflicts[*idx].state,
+        crate::merge_editor::ConflictState::Current,
+        "the checkbox click accepted Current"
+    );
+    assert_eq!(app.editor.lines[1], "mine");
 }
 
 #[test]

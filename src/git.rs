@@ -673,6 +673,36 @@ pub fn read_file_at_head(root: &Path, rel_path: &str) -> Result<String, String> 
     String::from_utf8(output.stdout).map_err(|_| format!("{rel_path} at HEAD is not UTF-8"))
 }
 
+/// Read one index stage of an unmerged path via `git show :N:<rel_path>`
+/// — 1 = common ancestor (base), 2 = ours, 3 = theirs. The merge
+/// editor's input source (#253). Errors when the stage does not exist
+/// (e.g. no base for an added-by-both conflict, or the path is not
+/// actually unmerged) or the blob is not UTF-8; the caller decides
+/// whether that's fatal or means "empty side".
+pub fn read_file_at_stage(root: &Path, rel_path: &str, stage: u8) -> Result<String, String> {
+    let path_str = root
+        .to_str()
+        .ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let spec = format!(":{stage}:{rel_path}");
+    let output = Command::new("git")
+        .args(["-C", path_str, "show", &spec])
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!(
+                "git show {spec} failed with code {:?}",
+                output.status.code()
+            )
+        } else {
+            stderr
+        });
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| format!("{rel_path} at stage {stage} is not UTF-8"))
+}
+
 /// Apply a unified-diff patch fed on stdin via `git apply`. `cached`
 /// targets the index (stage), `reverse` un-applies (`cached + reverse` =
 /// unstage, `reverse` alone = revert the working tree). Logged to the

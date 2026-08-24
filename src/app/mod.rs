@@ -9786,6 +9786,24 @@ impl App {
             self.status = String::from("Merge conflict actions need a text file");
             return;
         }
+        // Merge editor (#253): the Result has no markers, so the gate is
+        // the tracked regions, not the marker scan below.
+        if self.editor.merge.is_some() {
+            self.merge_view_sync();
+            let unresolved = self
+                .editor
+                .merge
+                .as_ref()
+                .map(|mv| mv.unresolved_count())
+                .unwrap_or(0);
+            if unresolved > 0 {
+                self.status = format!(
+                    "{unresolved} conflict{} still unresolved — F7 jumps to the next one",
+                    if unresolved == 1 { "" } else { "s" }
+                );
+                return;
+            }
+        }
         let left = self.editor.conflicts().len();
         if left > 0 {
             self.status = format!(
@@ -9801,19 +9819,256 @@ impl App {
         if self.editor.dirty {
             self.save();
         }
-        let rel = self.status_path(&path);
+        // Canonicalize before the relative-path strip: a workspace under
+        // a symlink (macOS /var → /private/var) otherwise falls back to
+        // the absolute path, which reads wrong in the status and would
+        // refuse in stricter git contexts.
         let merge_root = self
             .roots
             .owning_root(&path)
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf();
-        match crate::git::stage_path(&merge_root, &rel) {
+        let canon_root = std::fs::canonicalize(&merge_root).unwrap_or_else(|_| merge_root.clone());
+        let canon_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let rel = canon_path
+            .strip_prefix(&canon_root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.status_path(&path));
+        match crate::git::stage_path(&canon_root, &rel) {
             Ok(()) => {
                 self.refresh_source_control();
                 self.status = format!("Merge complete: staged {rel}");
             }
             Err(e) => self.status = format!("Stage failed: {e}"),
         }
+    }
+
+    /// Open the three-way merge editor (#253) for `path`. Inputs come
+    /// from the git index stages (`:1:` base, `:2:` ours, `:3:` theirs)
+    /// when the path is unmerged; otherwise the sides are synthesized
+    /// from conflict markers in the file itself, so the editor also
+    /// works on a plain marker file outside any merge. The tab is opened
+    /// through the normal text route first (language, LSP, undo all
+    /// attach), then the buffer is transformed into the initial Result
+    /// in one undo step — the marker text stays one Undo away.
+    fn open_merge_editor_for(&mut self, path: &Path) -> bool {
+        // Stage specs are repo-toplevel-relative (#139): see `repo_rel`.
+        let root = self.scm_root();
+        let canon_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let rel = self.repo_rel(path);
+        let to_lines = |s: String| -> Vec<String> { s.lines().map(str::to_string).collect() };
+        let ours = crate::git::read_file_at_stage(&canon_root, &rel, 2).map(to_lines);
+        let theirs = crate::git::read_file_at_stage(&canon_root, &rel, 3).map(to_lines);
+        let sides = match (ours, theirs) {
+            // Neither stage exists: the path is not unmerged in git at
+            // all — fall through to marker synthesis below.
+            (Err(_), Err(_)) => None,
+            // Unmerged: a missing single stage is a deleted side (DU/UD)
+            // and a missing base is added-by-both (AA) — both mean "that
+            // side is empty", not an error.
+            (o, t) => {
+                let base = crate::git::read_file_at_stage(&canon_root, &rel, 1)
+                    .map(&to_lines)
+                    .unwrap_or_default();
+                Some((base, o.unwrap_or_default(), t.unwrap_or_default()))
+            }
+        };
+        let built = match sides {
+            Some((base, ours, theirs)) => Some(crate::merge_editor::MergeView::new(
+                base, ours, theirs, false,
+            )),
+            None => std::fs::read_to_string(path).ok().and_then(|text| {
+                let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                crate::merge_editor::view_from_markers(&lines)
+            }),
+        };
+        let Some((mut mv, result)) = built else {
+            self.status = format!("{rel} has no merge conflicts");
+            return false;
+        };
+        if let Err(e) = self.editor.open_pinned(path) {
+            self.status = format!("Open failed: {e}");
+            return false;
+        }
+        self.focus_pane(Pane::Editor);
+        let end = self.editor.lines.len();
+        self.editor.splice_result_rows(0, end, result);
+        mv.synced_len = self.editor.lines.len();
+        mv.synced_seq = self.editor.edit_seq;
+        let n = mv.conflicts.len();
+        let first = mv.conflicts.first().map(|c| c.result_start);
+        mv.anchor_panes_on(0);
+        self.editor.merge = Some(mv);
+        if let Some(row) = first {
+            self.editor.clear_selection();
+            self.editor.cursor_row = row.min(self.editor.lines.len().saturating_sub(1));
+            self.editor.cursor_col = 0;
+            self.editor.ensure_cursor_col_visible();
+        }
+        self.status = format!(
+            "Merge editor: {n} conflict{} — F7 jumps, checkboxes or Merge commands accept, \"Reopen as Text\" for the marker flow",
+            if n == 1 { "" } else { "s" }
+        );
+        true
+    }
+
+    /// `path` relative to the repo toplevel, both sides canonicalized —
+    /// a workspace under a symlink (macOS /var → /private/var) otherwise
+    /// fails the strip and yields an absolute "relative" path, which git
+    /// stage specs refuse and status messages shouldn't show.
+    fn repo_rel(&self, path: &Path) -> String {
+        let root = self.scm_root();
+        let canon_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let canon_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        canon_path
+            .strip_prefix(&canon_root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.status_path(path))
+    }
+
+    /// Reconcile the merge view's tracked regions with any buffer edit it
+    /// has not seen yet (the render loop does this each frame; command
+    /// paths call it first so they also work headless, e.g. under test).
+    fn merge_view_sync(&mut self) {
+        let (len, seq, row) = (
+            self.editor.lines.len(),
+            self.editor.edit_seq,
+            self.editor.merge_edit_row,
+        );
+        if let Some(mv) = self.editor.merge.as_mut() {
+            mv.sync_with_buffer(len, seq, row);
+        }
+    }
+
+    /// The conflict an accept action targets: the one under the cursor,
+    /// else the one navigation last landed on.
+    fn merge_target_conflict(&self) -> Option<usize> {
+        let mv = self.editor.merge.as_ref()?;
+        mv.conflict_at_result_row(self.editor.cursor_row)
+            .or_else(|| (mv.active < mv.conflicts.len()).then_some(mv.active))
+    }
+
+    /// Set conflict `idx` to `state`, splicing its replacement into the
+    /// Result as one undo step and updating the tracked regions.
+    fn merge_set_conflict(&mut self, idx: usize, state: crate::merge_editor::ConflictState) {
+        self.merge_view_sync();
+        let Some(mv) = self.editor.merge.as_ref() else {
+            return;
+        };
+        let Some(c) = mv.conflicts.get(idx) else {
+            return;
+        };
+        let (start, end) = (c.result_start, c.result_start + c.result_len);
+        let repl = c.replacement(state);
+        let new_len = repl.len();
+        self.editor.splice_result_rows(start, end, repl);
+        let (len, seq) = (self.editor.lines.len(), self.editor.edit_seq);
+        let mv = self.editor.merge.as_mut().expect("checked above");
+        mv.note_accept(idx, new_len, state, len, seq);
+        let (resolved, total) = (mv.resolved_count(), mv.conflicts.len());
+        self.status = format!(
+            "Conflict {} of {total}: {} ({resolved}/{total} resolved)",
+            idx + 1,
+            match state {
+                crate::merge_editor::ConflictState::Current => "accepted current",
+                crate::merge_editor::ConflictState::Incoming => "accepted incoming",
+                crate::merge_editor::ConflictState::Both => "accepted both (current first)",
+                crate::merge_editor::ConflictState::BothReverse => "accepted both (incoming first)",
+                crate::merge_editor::ConflictState::Base => "kept base",
+                crate::merge_editor::ConflictState::Unresolved => "back to unresolved",
+                crate::merge_editor::ConflictState::Manual => "manual",
+            }
+        );
+    }
+
+    /// Accept-action entry for the palette commands: target the cursor's
+    /// conflict (falling back to the active one).
+    fn merge_apply(&mut self, state: crate::merge_editor::ConflictState) {
+        self.merge_view_sync();
+        match self.merge_target_conflict() {
+            Some(idx) => self.merge_set_conflict(idx, state),
+            None => self.status = String::from("No conflict at the cursor — F7 jumps to one"),
+        }
+    }
+
+    /// Accept every remaining unresolved conflict as `state` (the
+    /// Accept-All commands in the merge editor).
+    fn merge_accept_all(&mut self, state: crate::merge_editor::ConflictState) {
+        self.merge_view_sync();
+        let Some(mv) = self.editor.merge.as_ref() else {
+            return;
+        };
+        // Back-to-front so earlier indices' spans stay valid inside each
+        // splice's own bookkeeping (note_accept shifts only later ones).
+        let targets: Vec<usize> = (0..mv.conflicts.len())
+            .rev()
+            .filter(|&i| !mv.conflicts[i].state.resolved())
+            .collect();
+        let n = targets.len();
+        for idx in targets {
+            self.merge_set_conflict(idx, state);
+        }
+        let total = self
+            .editor
+            .merge
+            .as_ref()
+            .map(|m| m.conflicts.len())
+            .unwrap_or(0);
+        self.status = format!(
+            "Accepted {n} conflict{} ({total} total)",
+            if n == 1 { "" } else { "s" }
+        );
+    }
+
+    /// Checkbox click: toggle one side's inclusion, VS Code's model —
+    /// both checked is Accept Combination, neither reverts to base.
+    fn merge_toggle_side(&mut self, idx: usize, side: crate::merge_editor::CheckSide) {
+        use crate::merge_editor::{CheckSide, ConflictState as S};
+        let Some(mv) = self.editor.merge.as_ref() else {
+            return;
+        };
+        let Some(c) = mv.conflicts.get(idx) else {
+            return;
+        };
+        let (mut cur, mut inc) = match c.state {
+            S::Current => (true, false),
+            S::Incoming => (false, true),
+            S::Both | S::BothReverse => (true, true),
+            S::Unresolved | S::Base | S::Manual => (false, false),
+        };
+        match side {
+            CheckSide::Current => cur = !cur,
+            CheckSide::Incoming => inc = !inc,
+        }
+        let state = match (cur, inc) {
+            (true, false) => S::Current,
+            (false, true) => S::Incoming,
+            (true, true) => S::Both,
+            (false, false) => S::Unresolved,
+        };
+        self.merge_set_conflict(idx, state);
+    }
+
+    /// F7 / Shift+F7 in the merge editor: hop conflicts in the Result and
+    /// re-anchor every source pane on the same conflict.
+    fn merge_jump(&mut self, backwards: bool) {
+        self.merge_view_sync();
+        let row = self.editor.cursor_row;
+        let Some(mv) = self.editor.merge.as_mut() else {
+            return;
+        };
+        let Some(idx) = mv.next_conflict(row, backwards) else {
+            self.status = String::from("No conflicts");
+            return;
+        };
+        mv.anchor_panes_on(idx);
+        let target = mv.conflicts[idx].result_start;
+        let total = mv.conflicts.len();
+        self.editor.clear_selection();
+        self.editor.cursor_row = target.min(self.editor.lines.len().saturating_sub(1));
+        self.editor.cursor_col = 0;
+        self.editor.ensure_cursor_col_visible();
+        self.status = format!("Conflict {} of {total}", idx + 1);
     }
 
     fn start_code_action(&mut self) {
@@ -17784,31 +18039,40 @@ impl App {
         let scm_root = self.scm_root();
         let abs = scm_root.join(&entry.path);
         let opened = match entry.kind {
-            // A conflicted entry opens the WORKING file — a HEAD diff is
-            // meaningless against a marker-filled tree — parked on the first
-            // conflict, with the status naming the whole guided flow.
-            ChangeKind::Conflicted => match self.editor.open_pinned(&abs) {
-                Ok(()) => {
-                    self.focus_pane(Pane::Editor);
-                    let n = self.editor.conflicts().len();
-                    if let Some(block) = self.editor.conflicts().first().copied() {
-                        self.editor.clear_selection();
-                        self.editor.cursor_row = block.ours_start;
-                        self.editor.cursor_col = 0;
-                        self.editor.scroll_col = 0;
-                        self.editor.ensure_cursor_col_visible();
-                    }
-                    self.status = format!(
-                        "{n} conflict{} — F7 jumps, Cmd+. accepts, \"Merge: Complete Merge\" stages",
-                        if n == 1 { "" } else { "s" }
-                    );
+            // A conflicted entry opens the three-way MERGE EDITOR (#253)
+            // on the index stages — non-overlapping hunks pre-resolve,
+            // and "Reopen as Text" reaches the old in-buffer marker flow.
+            // If the stages are unreadable (e.g. binary), fall back to
+            // opening the working file with its markers, parked on the
+            // first conflict as before.
+            ChangeKind::Conflicted => {
+                if self.open_merge_editor_for(&abs) {
                     true
+                } else {
+                    match self.editor.open_pinned(&abs) {
+                        Ok(()) => {
+                            self.focus_pane(Pane::Editor);
+                            let n = self.editor.conflicts().len();
+                            if let Some(block) = self.editor.conflicts().first().copied() {
+                                self.editor.clear_selection();
+                                self.editor.cursor_row = block.ours_start;
+                                self.editor.cursor_col = 0;
+                                self.editor.scroll_col = 0;
+                                self.editor.ensure_cursor_col_visible();
+                            }
+                            self.status = format!(
+                                "{n} conflict{} — F7 jumps, Cmd+. accepts, \"Merge: Complete Merge\" stages",
+                                if n == 1 { "" } else { "s" }
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            self.status = format!("Open failed: {e}");
+                            false
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.status = format!("Open failed: {e}");
-                    false
-                }
-            },
+            }
             ChangeKind::Modified | ChangeKind::StagedModified => {
                 match crate::git::read_file_at_head(&scm_root, &entry.path) {
                     Ok(head_text) => {
@@ -21857,6 +22121,26 @@ impl App {
         if matches!(key.code, KeyCode::F(7)) && !self.editor.conflicts().is_empty() {
             self.jump_conflict(key.modifiers.contains(KeyModifiers::SHIFT));
             return;
+        }
+        // Merge editor (#253): F7 hops the tracked Result regions (the
+        // Result has no markers, so the arm above never claims it) and
+        // Alt+Up/Down scrolls the source panes together. Every other key
+        // falls through to the ordinary text path — the Result is a real
+        // buffer.
+        if self.editor.merge.is_some() {
+            if matches!(key.code, KeyCode::F(7)) {
+                self.merge_jump(key.modifiers.contains(KeyModifiers::SHIFT));
+                return;
+            }
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            {
+                let delta = if key.code == KeyCode::Up { -3 } else { 3 };
+                if let Some(mv) = self.editor.merge.as_mut() {
+                    mv.scroll_panes(delta);
+                }
+                return;
+            }
         }
         if is_editor_find_key(key) {
             self.open_editor_find();
@@ -26392,20 +26676,90 @@ impl App {
             Cmd::RestoreSnapshot => self.restore_history_snapshot(),
             Cmd::QuickFix => self.start_code_action(),
             Cmd::ReplaceInFile => self.open_editor_replace(),
+            // The accept/navigate commands serve both merge flows: the
+            // three-way merge editor when its view is up (#253), the
+            // in-buffer marker flow otherwise.
             Cmd::MergeAcceptCurrent => {
-                self.resolve_merge_at_cursor(crate::merge::Resolution::Current)
+                if self.editor.merge.is_some() {
+                    self.merge_apply(crate::merge_editor::ConflictState::Current);
+                } else {
+                    self.resolve_merge_at_cursor(crate::merge::Resolution::Current)
+                }
             }
             Cmd::MergeAcceptIncoming => {
-                self.resolve_merge_at_cursor(crate::merge::Resolution::Incoming)
+                if self.editor.merge.is_some() {
+                    self.merge_apply(crate::merge_editor::ConflictState::Incoming);
+                } else {
+                    self.resolve_merge_at_cursor(crate::merge::Resolution::Incoming)
+                }
             }
-            Cmd::MergeAcceptBoth => self.resolve_merge_at_cursor(crate::merge::Resolution::Both),
-            Cmd::MergeAcceptAllCurrent => self.resolve_all_merge(crate::merge::Resolution::Current),
+            Cmd::MergeAcceptBoth => {
+                if self.editor.merge.is_some() {
+                    self.merge_apply(crate::merge_editor::ConflictState::Both);
+                } else {
+                    self.resolve_merge_at_cursor(crate::merge::Resolution::Both)
+                }
+            }
+            Cmd::MergeAcceptBothReverse => {
+                if self.editor.merge.is_some() {
+                    self.merge_apply(crate::merge_editor::ConflictState::BothReverse);
+                } else {
+                    self.status = String::from("Incoming-first combination needs the merge editor");
+                }
+            }
+            Cmd::MergeIgnore => {
+                if self.editor.merge.is_some() {
+                    self.merge_apply(crate::merge_editor::ConflictState::Base);
+                } else {
+                    self.status = String::from("Ignore (keep base) needs the merge editor");
+                }
+            }
+            Cmd::MergeAcceptAllCurrent => {
+                if self.editor.merge.is_some() {
+                    self.merge_accept_all(crate::merge_editor::ConflictState::Current);
+                } else {
+                    self.resolve_all_merge(crate::merge::Resolution::Current)
+                }
+            }
             Cmd::MergeAcceptAllIncoming => {
-                self.resolve_all_merge(crate::merge::Resolution::Incoming)
+                if self.editor.merge.is_some() {
+                    self.merge_accept_all(crate::merge_editor::ConflictState::Incoming);
+                } else {
+                    self.resolve_all_merge(crate::merge::Resolution::Incoming)
+                }
             }
-            Cmd::MergeNextConflict => self.jump_conflict(false),
-            Cmd::MergePrevConflict => self.jump_conflict(true),
+            Cmd::MergeNextConflict => {
+                if self.editor.merge.is_some() {
+                    self.merge_jump(false);
+                } else {
+                    self.jump_conflict(false)
+                }
+            }
+            Cmd::MergePrevConflict => {
+                if self.editor.merge.is_some() {
+                    self.merge_jump(true);
+                } else {
+                    self.jump_conflict(true)
+                }
+            }
             Cmd::MergeComplete => self.complete_merge(),
+            Cmd::MergeOpenEditor => match self.editor.path.clone() {
+                Some(p) => {
+                    self.open_merge_editor_for(&p);
+                }
+                None => self.status = String::from("No file in the active tab"),
+            },
+            Cmd::MergeToggleBase => match self.editor.merge.as_mut() {
+                Some(mv) => {
+                    mv.show_base = !mv.show_base;
+                    self.status = if self.editor.merge.as_ref().is_some_and(|m| m.show_base) {
+                        String::from("Base pane shown")
+                    } else {
+                        String::from("Base pane hidden")
+                    };
+                }
+                None => self.status = String::from("Show Base needs the merge editor"),
+            },
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
             Cmd::ClearBuildDiagnostics => self.clear_build_diagnostics(),
@@ -26524,6 +26878,25 @@ impl App {
                 None => self.status = String::from("No file in the active tab"),
             },
             Cmd::ReopenAsText => match self.editor.path.clone() {
+                // Merge editor (#253): back to the in-buffer marker flow.
+                // The Result buffer is deliberately discarded — it was
+                // never saved, and the marker file on disk is the source
+                // of truth the old flow works on.
+                Some(p) if self.editor.merge.is_some() => {
+                    self.editor.merge = None;
+                    self.editor.dirty = false;
+                    self.editor.force_text = true;
+                    match self.editor.open(&p) {
+                        Ok(()) => {
+                            let n = self.editor.conflicts().len();
+                            self.status = format!(
+                                "Marker flow: {n} conflict{} — F7 jumps, Cmd+. accepts",
+                                if n == 1 { "" } else { "s" }
+                            );
+                        }
+                        Err(e) => self.status = format!("Reopen as text: {e}"),
+                    }
+                }
                 // A rendered notebook/markdown preview counts (#180): the
                 // command lands in the raw source.
                 Some(_)
@@ -29377,6 +29750,39 @@ impl App {
                         self.editor.cursor_row = row;
                         self.editor.cursor_col = 0;
                         self.resolve_merge_at_cursor(res);
+                        return;
+                    }
+                }
+                // Merge editor (#253): a click on a source pane's
+                // per-conflict checkbox toggles that side's inclusion
+                // (both checked = Accept Combination). Any other click in
+                // the source-pane area is swallowed — the panes are
+                // read-only; the Result below keeps normal click behavior.
+                if in_editor && self.editor.merge.is_some() {
+                    let (check_hit, in_panes) = self
+                        .editor
+                        .merge
+                        .as_ref()
+                        .map(|mv| {
+                            (
+                                mv.check_spans
+                                    .iter()
+                                    .find(|(y, xs, _, _)| *y == m.row && xs.contains(&m.column))
+                                    .map(|(_, _, idx, side)| (*idx, *side)),
+                                mv.last_panes_area.contains(ratatui::layout::Position {
+                                    x: m.column,
+                                    y: m.row,
+                                }),
+                            )
+                        })
+                        .unwrap_or((None, false));
+                    if let Some((idx, side)) = check_hit {
+                        self.focus_pane(Pane::Editor);
+                        self.merge_toggle_side(idx, side);
+                        return;
+                    }
+                    if in_panes {
+                        self.focus_pane(Pane::Editor);
                         return;
                     }
                 }

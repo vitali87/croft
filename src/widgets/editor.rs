@@ -633,6 +633,256 @@ fn render_sheet(
 /// Returns the hit-test rects of the prev / next change arrows painted
 /// in the diff header (in that order). Both are `Rect::default()` when
 /// the header was too narrow to allocate them.
+/// Render the merge editor's source panes (#253) into the TOP of `inner`
+/// and return the remaining rect for the ordinary text path — the
+/// editable Result pane. One header row carries the resolved counter,
+/// then Current | (Base) | Incoming as columns (stacked vertically when
+/// the terminal is narrow), then a separator row labelling the Result.
+/// Per-conflict checkboxes are painted in a small gutter on the region's
+/// first row and their hit rects recorded on the view for mouse routing.
+fn render_merge_panes(
+    mv: &mut crate::merge_editor::MergeView,
+    inner: Rect,
+    buf: &mut Buffer,
+    theme: crate::theme::Theme,
+) -> Rect {
+    use crate::merge_editor::{CheckSide, ConflictState};
+    mv.check_spans.clear();
+    mv.last_panes_area = Rect::default();
+    // Too small for source panes: the Result gets everything, and the
+    // commands (F7, accepts) still work off the tracked regions.
+    if inner.height < 9 || inner.width < 24 {
+        return inner;
+    }
+    let top_h = (inner.height / 2).min(inner.height - 4);
+    let sep_y = inner.y + top_h;
+    mv.last_panes_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: top_h + 1,
+    };
+
+    // Header: the acceptance counter plus the working chords.
+    let resolved = mv.resolved_count();
+    let total = mv.conflicts.len();
+    let head_style = Style::default()
+        .fg(Color::White)
+        .bg(theme.ui(Color::Rgb(0x09, 0x4d, 0x77)))
+        .add_modifier(Modifier::BOLD);
+    for x in inner.x..inner.x + inner.width {
+        buf[(x, inner.y)].set_style(head_style);
+        buf[(x, inner.y)].set_symbol(" ");
+    }
+    let src = if mv.from_markers {
+        "markers"
+    } else {
+        "git stages"
+    };
+    let header = format!(
+        " MERGE ({src})  {resolved}/{total} conflict{} resolved \u{2022} F7 next \u{2022} Alt+\u{2191}\u{2193} scroll sources ",
+        if total == 1 { "" } else { "s" }
+    );
+    buf.set_stringn(inner.x, inner.y, &header, inner.width as usize, head_style);
+
+    // Separator row above the Result.
+    let sep_style = Style::default()
+        .fg(theme.ui(Color::Rgb(0x9a, 0xa4, 0xb2)))
+        .bg(theme.ui(Color::Rgb(0x20, 0x24, 0x2c)));
+    for x in inner.x..inner.x + inner.width {
+        buf[(x, sep_y)].set_style(sep_style);
+        buf[(x, sep_y)].set_symbol(" ");
+    }
+    buf.set_stringn(
+        inner.x,
+        sep_y,
+        " RESULT (editable) \u{2014} \"Merge: Complete Merge\" stages the file ",
+        inner.width as usize,
+        sep_style,
+    );
+
+    // The panes: Current | (Base) | Incoming, or stacked when narrow.
+    struct Pane<'a> {
+        title: &'a str,
+        lines: &'a [String],
+        scroll: usize,
+        side: Option<CheckSide>,
+        // (start row in this pane's text, len, conflict idx, checked)
+        regions: Vec<(usize, usize, usize, bool)>,
+        tint: Color,
+        active_tint: Color,
+    }
+    let region = |start: usize, len: usize, idx: usize, checked: bool| (start, len, idx, checked);
+    let checked_cur = |s: ConflictState| {
+        matches!(
+            s,
+            ConflictState::Current | ConflictState::Both | ConflictState::BothReverse
+        )
+    };
+    let checked_inc = |s: ConflictState| {
+        matches!(
+            s,
+            ConflictState::Incoming | ConflictState::Both | ConflictState::BothReverse
+        )
+    };
+    let mut panes: Vec<Pane> = Vec::new();
+    panes.push(Pane {
+        title: "CURRENT (yours)",
+        lines: &mv.ours,
+        scroll: mv.ours_scroll,
+        side: Some(CheckSide::Current),
+        regions: mv
+            .conflicts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| region(c.ours_start, c.ours.len(), i, checked_cur(c.state)))
+            .collect(),
+        tint: theme.ui(Color::Rgb(0x1b, 0x33, 0x22)),
+        active_tint: theme.ui(Color::Rgb(0x2a, 0x4f, 0x33)),
+    });
+    if mv.show_base {
+        panes.push(Pane {
+            title: "BASE",
+            lines: &mv.base,
+            scroll: mv.base_scroll,
+            side: None,
+            regions: mv
+                .conflicts
+                .iter()
+                .enumerate()
+                .map(|(i, c)| region(c.base_start, c.base.len(), i, false))
+                .collect(),
+            tint: theme.ui(Color::Rgb(0x2a, 0x2a, 0x2a)),
+            active_tint: theme.ui(Color::Rgb(0x3a, 0x3a, 0x3a)),
+        });
+    }
+    panes.push(Pane {
+        title: "INCOMING (theirs)",
+        lines: &mv.theirs,
+        scroll: mv.theirs_scroll,
+        side: Some(CheckSide::Incoming),
+        regions: mv
+            .conflicts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| region(c.theirs_start, c.theirs.len(), i, checked_inc(c.state)))
+            .collect(),
+        tint: theme.ui(Color::Rgb(0x16, 0x2b, 0x44)),
+        active_tint: theme.ui(Color::Rgb(0x1f, 0x41, 0x66)),
+    });
+
+    let panes_top = inner.y + 1;
+    let panes_h = top_h.saturating_sub(1);
+    let n = panes.len() as u16;
+    let stacked = inner.width < 72;
+    let mut rects: Vec<Rect> = Vec::new();
+    if stacked {
+        // Vertical stack: each pane gets an equal share of the rows.
+        let share = panes_h / n;
+        for i in 0..n {
+            rects.push(Rect {
+                x: inner.x,
+                y: panes_top + i * share,
+                width: inner.width,
+                height: if i == n - 1 {
+                    panes_h - share * (n - 1)
+                } else {
+                    share
+                },
+            });
+        }
+    } else {
+        // Columns with a 1-cell seam between neighbours.
+        let w = (inner.width - (n - 1)) / n;
+        let mut x = inner.x;
+        for i in 0..n {
+            let width = if i == n - 1 {
+                inner.x + inner.width - x
+            } else {
+                w
+            };
+            rects.push(Rect {
+                x,
+                y: panes_top,
+                width,
+                height: panes_h,
+            });
+            x += w;
+            if i != n - 1 {
+                for y in panes_top..panes_top + panes_h {
+                    buf[(x, y)].set_symbol("\u{2502}");
+                    buf[(x, y)]
+                        .set_style(Style::default().fg(theme.ui(Color::Rgb(0x3a, 0x42, 0x52))));
+                }
+                x += 1;
+            }
+        }
+    }
+
+    let title_style = Style::default()
+        .fg(theme.ui(Color::Rgb(0xc8, 0xd0, 0xdc)))
+        .bg(theme.ui(Color::Rgb(0x20, 0x24, 0x2c)))
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(theme.ui(Color::Rgb(0xb6, 0xbd, 0xc8)));
+    let gutter = 4u16; // "[x] " on a region's first row
+    for (pane, rect) in panes.iter().zip(&rects) {
+        if rect.height < 2 || rect.width < gutter + 4 {
+            continue;
+        }
+        for x in rect.x..rect.x + rect.width {
+            buf[(x, rect.y)].set_style(title_style);
+            buf[(x, rect.y)].set_symbol(" ");
+        }
+        buf.set_stringn(
+            rect.x + 1,
+            rect.y,
+            pane.title,
+            rect.width.saturating_sub(1) as usize,
+            title_style,
+        );
+        let body_h = (rect.height - 1) as usize;
+        let text_w = (rect.width - gutter) as usize;
+        for vis in 0..body_h {
+            let idx = pane.scroll + vis;
+            let y = rect.y + 1 + vis as u16;
+            if idx >= pane.lines.len() {
+                break;
+            }
+            let in_region = pane
+                .regions
+                .iter()
+                .find(|(start, len, _, _)| *len > 0 && idx >= *start && idx < *start + *len);
+            let style = match in_region {
+                Some(&(_, _, ci, _)) if ci == mv.active => text_style.bg(pane.active_tint),
+                Some(_) => text_style.bg(pane.tint),
+                None => text_style,
+            };
+            if in_region.is_some() {
+                for x in rect.x..rect.x + rect.width {
+                    buf[(x, y)].set_style(style);
+                    buf[(x, y)].set_symbol(" ");
+                }
+            }
+            if let Some(&(start, _, ci, checked)) = in_region
+                && idx == start
+                && let Some(side) = pane.side
+            {
+                let mark = if checked { "[x]" } else { "[ ]" };
+                buf.set_stringn(rect.x, y, mark, 3, style.add_modifier(Modifier::BOLD));
+                mv.check_spans.push((y, rect.x..rect.x + 3, ci, side));
+            }
+            buf.set_stringn(rect.x + gutter, y, &pane.lines[idx], text_w, style);
+        }
+    }
+
+    Rect {
+        x: inner.x,
+        y: sep_y + 1,
+        width: inner.width,
+        height: inner.height - top_h - 1,
+    }
+}
+
 fn render_diff(
     diff: &mut crate::widgets::diff::DiffData,
     inner: Rect,
@@ -2196,6 +2446,14 @@ pub struct Editor {
     /// archive; Enter extracts one member to scratch and opens it
     /// through the normal dispatch. Read-only.
     pub archive: Option<crate::archive::ArchiveView>,
+    /// Three-way merge editor (#253). UNLIKE the other view kinds this is
+    /// not read-only and not in `has_non_text_view`: `lines` holds the
+    /// editable Result and keeps the whole text path (LSP, undo, save);
+    /// the renderer only carves the source panes off the top of the area.
+    pub merge: Option<crate::merge_editor::MergeView>,
+    /// Cursor row at the last undo-push (i.e. where the last edit began);
+    /// the merge editor's region tracker keys its shift heuristic off it.
+    pub merge_edit_row: usize,
     /// Per-tab "Reopen as Text" override (#175): when set, `open` skips
     /// every preview route (extension and sniffed alike) and lands in
     /// the text editor — an SVG's XML source, a workbook's bytes (which
@@ -2349,6 +2607,8 @@ impl Editor {
             diff: None,
             hex: None,
             archive: None,
+            merge: None,
+            merge_edit_row: 0,
             force_text: false,
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
@@ -2676,6 +2936,27 @@ impl Editor {
         self.mark_buffer_changed();
         self.recompute_highlights();
         true
+    }
+
+    /// Replace Result rows `[start, end)` with `replacement` as ONE undo
+    /// step — the merge editor's accept-action primitive (#253), and (with
+    /// the full range) the transform that turns a marker buffer into the
+    /// initial Result, leaving the markers one Undo away. Mirrors
+    /// `resolve_conflict_at`'s splice discipline.
+    pub fn splice_result_rows(&mut self, start: usize, end: usize, replacement: Vec<String>) {
+        let start = start.min(self.lines.len());
+        let end = end.clamp(start, self.lines.len());
+        self.pin_on_edit();
+        self.push_undo(EditKind::Replace);
+        self.clear_selection();
+        self.lines.splice(start..end, replacement);
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = start.min(self.lines.len() - 1);
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.mark_buffer_changed();
+        self.recompute_highlights();
     }
 
     /// Recompute the per-line git marks from the cached HEAD baseline if the
@@ -3460,6 +3741,7 @@ impl Editor {
         // A real file supersedes any diff view this editor was showing —
         // without this a restore-then-reload keeps rendering the stale diff.
         self.diff = None;
+        self.merge = None;
         self.status = format!("Opened {}", path.display());
         // The buffer now matches disk; bump the edit seq so the LSP doc sync
         // sees the new content (an external reload lands here too, and without
@@ -3548,6 +3830,7 @@ impl Editor {
         // preview kept its label, caret, and CLICKABLE hunk arrows
         // (#187 review). Clear the state and the frame-truth rects here.
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
@@ -3595,6 +3878,7 @@ impl Editor {
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.image = None;
@@ -3660,6 +3944,7 @@ impl Editor {
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.image = None;
@@ -3708,6 +3993,7 @@ impl Editor {
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.image = None;
@@ -3758,6 +4044,7 @@ impl Editor {
         // preview kept its label, caret, and CLICKABLE hunk arrows
         // (#187 review). Clear the state and the frame-truth rects here.
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
@@ -3809,6 +4096,7 @@ impl Editor {
         // preview kept its label, caret, and CLICKABLE hunk arrows
         // (#187 review). Clear the state and the frame-truth rects here.
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.image = None;
@@ -3881,6 +4169,7 @@ impl Editor {
         // preview kept its label, caret, and CLICKABLE hunk arrows
         // (#187 review). Clear the state and the frame-truth rects here.
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
@@ -3965,6 +4254,7 @@ impl Editor {
         // preview kept its label, caret, and CLICKABLE hunk arrows
         // (#187 review). Clear the state and the frame-truth rects here.
         self.diff = None;
+        self.merge = None;
         self.diff_prev_arrow = Rect::default();
         self.diff_next_arrow = Rect::default();
         self.image = None;
@@ -6407,6 +6697,9 @@ impl Editor {
     /// Coalesces consecutive `InsertChar` ops into one step so a typing
     /// burst is undone as one unit; everything else opens a new step.
     fn push_undo(&mut self, kind: EditKind) {
+        // Where the edit about to happen begins — the merge editor's
+        // region tracker reads this when it reconciles (#253).
+        self.merge_edit_row = self.cursor_row;
         let coalesce =
             kind == EditKind::InsertChar && self.last_edit_kind == Some(EditKind::InsertChar);
         if !coalesce {
@@ -6460,6 +6753,7 @@ impl Editor {
         // means the restored text differs from disk: stay dirty so the next
         // sweep reconverges them instead of leaving a silent divergence.
         self.dirty = snap.dirty || self.save_seq != snap.save_seq;
+        self.merge_edit_row = self.cursor_row;
         self.last_edit_kind = None;
         // A restore changes the buffer content, so bump the change counter (the
         // app resyncs the LSP / git gutter off `edit_seq`) and drop the wrap /
@@ -9437,7 +9731,7 @@ impl Widget for &mut Editor {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(block_style);
-        let inner = block.inner(area);
+        let mut inner = block.inner(area);
         block.render(area, buf);
         // Black theme: replace the solid focus border with the orange→green
         // gradient that matches the welcome activity box. The editor has no
@@ -9451,14 +9745,31 @@ impl Widget for &mut Editor {
         self.last_hscrollbar = Rect::default();
         self.merge_action_spans.clear();
 
-        let height = inner.height as usize;
-        if height == 0 {
+        if inner.height == 0 {
             return;
         }
         let cbg = canvas_bg(
             crate::iterm2_inline::detect_iterm2_inline_support(),
             self.theme,
         );
+        // Merge editor (#253): reconcile the tracked regions with any
+        // manual edit since last frame, carve the source panes off the
+        // top, then FALL THROUGH to the text path with the remaining
+        // rect — the Result below is the ordinary text buffer.
+        let (len, seq, row) = (self.lines.len(), self.edit_seq, self.merge_edit_row);
+        let theme = self.theme;
+        if let Some(mv) = self.merge.as_mut() {
+            mv.sync_with_buffer(len, seq, row);
+            inner = render_merge_panes(mv, inner, buf, theme);
+            self.last_inner = inner;
+        }
+        // The Result height comes from the POST-carve rect: the merge
+        // panes above just shrank `inner`, and every row / scrollbar /
+        // cursor-visibility computation below must see what is left.
+        let height = inner.height as usize;
+        if height == 0 {
+            return;
+        }
         if let Some(image) = self.image.as_ref() {
             let ibg = image_canvas_bg(
                 crate::iterm2_inline::detect_inline_image_protocol(),
@@ -12550,6 +12861,13 @@ fn tab_label(e: &Editor) -> String {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| String::from("untitled")),
         None => String::from("untitled"),
+    };
+    // The merge editor is text underneath (dirty dot still applies), but
+    // the tab says which flavour of the file it is showing.
+    let name = if e.merge.is_some() {
+        format!("{name} (merge)")
+    } else {
+        name
     };
     if e.dirty {
         format!("\u{25cf} {name}")
