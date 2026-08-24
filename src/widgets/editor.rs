@@ -1992,6 +1992,21 @@ pub struct Editor {
     /// wrong lines. ponytail: whole-buffer invalidation, not per-fold anchor
     /// tracking; upgrade to sticky anchors if folds-survive-edits is wanted.
     fold_epoch_lines: usize,
+    /// Server fold spans (#254), authoritative for `fold_range` while
+    /// present AND measured against the current line count. `None` (no
+    /// capable server, or none answered yet) keeps the indentation /
+    /// marker fallback in charge — the two-phase posture of the outline.
+    lsp_folds: Option<Vec<crate::lsp::manager::FoldingRangeItem>>,
+    /// `self.lines.len()` when `lsp_folds` was applied; a mismatch means
+    /// the spans predate an edit and are ignored until the next reply.
+    lsp_folds_lines: usize,
+    /// Fallback fold table beyond plain indentation: `#region` /
+    /// `// region` marker pairs (kind Region) and runs of full-line
+    /// comments (kind Comment). Rebuilt lazily per `edit_seq` by
+    /// `refresh_fold_tables`, read by `fold_range` / `fold_kind_at`.
+    fallback_kind_folds: Vec<(usize, usize, crate::lsp::manager::FoldRangeKind)>,
+    /// The `edit_seq` `fallback_kind_folds` was built for (`None` = never).
+    fallback_folds_seq: Option<u64>,
     /// True when this tab is the single replaceable "preview" slot. Single-
     /// click / plain-Enter opens replace the preview tab's contents in place;
     /// double-click / Ctrl+Enter / typing into the buffer pin the tab
@@ -2254,6 +2269,10 @@ impl Editor {
             folded: std::collections::BTreeSet::new(),
             hidden_ranges: Vec::new(),
             fold_epoch_lines: 0,
+            lsp_folds: None,
+            lsp_folds_lines: 0,
+            fallback_kind_folds: Vec::new(),
+            fallback_folds_seq: None,
             preview: false,
             pinned: false,
             undo_stack: Vec::new(),
@@ -3373,6 +3392,10 @@ impl Editor {
             self.folded.clear();
             self.hidden_ranges.clear();
             self.fold_epoch_lines = 0;
+            self.lsp_folds = None;
+            self.lsp_folds_lines = 0;
+            self.fallback_kind_folds.clear();
+            self.fallback_folds_seq = None;
             // Inline-value trailers are line numbers into the OLD file too
             // (#136 review): a reused preview tab must not dress the incoming
             // file in the previous one's debug state. The same-path reload
@@ -5534,6 +5557,34 @@ impl Editor {
     /// indentation-based folding: a pure function of the text, no LSP or
     /// tree-sitter round-trip.
     pub fn fold_range(&self, line: usize) -> Option<(usize, usize)> {
+        // Server spans first (#254): while a capable server has answered
+        // for this exact line count, its ranges REPLACE the heuristics
+        // wholesale — VS Code's provider model. rust-analyzer and friends
+        // emit region markers and comment spans themselves.
+        if let Some(ranges) = self.lsp_folds_current() {
+            return ranges
+                .iter()
+                .filter(|r| r.start_line == line)
+                .map(|r| (line, r.end_line.min(self.lines.len().saturating_sub(1))))
+                .max_by_key(|&(_, end)| end);
+        }
+        // Fallback #1: the marker/comment table (`#region` pairs, comment
+        // runs) — folds indentation alone can't see.
+        if let Some(&(s, e, _)) = self
+            .fallback_kind_folds
+            .iter()
+            .find(|&&(s, _, _)| s == line)
+        {
+            return Some((s, e.min(self.lines.len().saturating_sub(1))));
+        }
+        // Fallback #2: the indentation scan.
+        self.indent_fold_range(line)
+    }
+
+    /// The plain indentation-based fold heuristic, a pure function of the
+    /// text — the last-resort scanner behind the server spans and the
+    /// marker/comment table.
+    fn indent_fold_range(&self, line: usize) -> Option<(usize, usize)> {
         let base = self.indent_width(line)?;
         let mut end = line;
         let mut i = line + 1;
@@ -5551,6 +5602,132 @@ impl Editor {
     /// Whether `line` heads a collapsible region.
     pub fn is_foldable(&self, line: usize) -> bool {
         self.fold_range(line).is_some()
+    }
+
+    /// Server fold spans, but only while they still describe this buffer:
+    /// an edit changes the line count and orphans them until the next
+    /// reply (same whole-buffer posture as `fold_epoch_lines`).
+    fn lsp_folds_current(&self) -> Option<&[crate::lsp::manager::FoldingRangeItem]> {
+        match &self.lsp_folds {
+            Some(ranges) if self.lsp_folds_lines == self.lines.len() => Some(ranges),
+            _ => None,
+        }
+    }
+
+    /// Install a server's fold-span set (#254). The caller (the app's LSP
+    /// drain) already seq-gated the reply; the line count is recorded so
+    /// later edits orphan the spans instead of folding the wrong lines.
+    pub fn set_lsp_folds(&mut self, ranges: Vec<crate::lsp::manager::FoldingRangeItem>) {
+        self.lsp_folds = Some(ranges);
+        self.lsp_folds_lines = self.lines.len();
+        // Spans under existing collapsed headers may have moved.
+        if !self.folded.is_empty() {
+            self.rebuild_hidden_ranges();
+        }
+    }
+
+    /// Rebuild the fallback marker/comment fold table when the buffer
+    /// changed. Cheap no-op per frame otherwise; called from the render
+    /// and from every fold command so headless callers agree with paint.
+    pub fn refresh_fold_tables(&mut self) {
+        if self.fallback_folds_seq == Some(self.edit_seq) {
+            return;
+        }
+        self.fallback_folds_seq = Some(self.edit_seq);
+        self.fallback_kind_folds.clear();
+        use crate::lsp::manager::FoldRangeKind;
+        // Region markers: a stack pairs nested #region/#endregion.
+        let mut stack: Vec<usize> = Vec::new();
+        for (i, l) in self.lines.iter().enumerate() {
+            match region_marker(l) {
+                Some(true) => stack.push(i),
+                Some(false) => {
+                    if let Some(start) = stack.pop()
+                        && i > start
+                    {
+                        self.fallback_kind_folds
+                            .push((start, i, FoldRangeKind::Region));
+                    }
+                }
+                None => {}
+            }
+        }
+        // Comment runs: ≥2 consecutive full-line comments fold as one
+        // block from the first line.
+        let mut run_start: Option<usize> = None;
+        for i in 0..=self.lines.len() {
+            let is_comment = self
+                .lines
+                .get(i)
+                .is_some_and(|l| comment_line(l) && region_marker(l).is_none());
+            match (run_start, is_comment) {
+                (None, true) => run_start = Some(i),
+                (Some(s), false) => {
+                    if i - s >= 2 {
+                        self.fallback_kind_folds
+                            .push((s, i - 1, FoldRangeKind::Comment));
+                    }
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        self.fallback_kind_folds
+            .sort_unstable_by_key(|&(s, e, _)| (s, e));
+    }
+
+    /// The fold kind at a header line, when one is known: the server's
+    /// kind, else the fallback table's. Plain indentation folds have no
+    /// kind — "Fold All Comments/Regions" skips them.
+    pub fn fold_kind_at(&self, line: usize) -> Option<crate::lsp::manager::FoldRangeKind> {
+        if let Some(ranges) = self.lsp_folds_current() {
+            return ranges
+                .iter()
+                .filter(|r| r.start_line == line)
+                .max_by_key(|r| r.end_line)
+                .map(|r| r.kind);
+        }
+        self.fallback_kind_folds
+            .iter()
+            .find(|&&(s, _, _)| s == line)
+            .map(|&(_, _, k)| k)
+    }
+
+    /// Collapse every fold of `kind` — "Fold All Comments" (Cmd+K Cmd+/) /
+    /// "Fold All Regions" (Cmd+K Cmd+8).
+    pub fn fold_all_of_kind(&mut self, kind: crate::lsp::manager::FoldRangeKind) {
+        self.refresh_fold_tables();
+        let headers: Vec<usize> = (0..self.lines.len())
+            .filter(|&l| self.fold_kind_at(l) == Some(kind) && self.is_foldable(l))
+            .collect();
+        if headers.is_empty() {
+            return;
+        }
+        self.folded.extend(headers);
+        self.fold_epoch_lines = self.lines.len();
+        self.rebuild_hidden_ranges();
+        while self.is_line_hidden(self.cursor_row) {
+            self.cursor_row = self.cursor_row.saturating_sub(1);
+        }
+    }
+
+    /// Expand every collapsed fold of `kind` — "Unfold All Regions"
+    /// (Cmd+K Cmd+9). The mirror of [`Self::fold_all_of_kind`].
+    pub fn unfold_all_of_kind(&mut self, kind: crate::lsp::manager::FoldRangeKind) {
+        self.refresh_fold_tables();
+        let drop: Vec<usize> = self
+            .folded
+            .iter()
+            .copied()
+            .filter(|&l| self.fold_kind_at(l) == Some(kind))
+            .collect();
+        if drop.is_empty() {
+            return;
+        }
+        for l in drop {
+            self.folded.remove(&l);
+        }
+        self.rebuild_hidden_ranges();
     }
 
     /// The OUTERMOST fold header whose region covers `line` — the function's
@@ -5813,6 +5990,7 @@ impl Editor {
     /// block that contains the cursor snaps the cursor up to the header so it
     /// never strands on a hidden line.
     pub fn toggle_fold(&mut self, line: usize) {
+        self.refresh_fold_tables();
         let Some(header) = self.enclosing_fold_header(line) else {
             return;
         };
@@ -5837,6 +6015,7 @@ impl Editor {
     /// Collapse every foldable region (VS Code "Fold All", Cmd+K Cmd+0),
     /// snapping the cursor up to the nearest visible line.
     pub fn fold_all(&mut self) {
+        self.refresh_fold_tables();
         self.folded = (0..self.lines.len())
             .filter(|&l| self.is_foldable(l))
             .collect();
@@ -8967,6 +9146,9 @@ impl Widget for &mut Editor {
         // Rebuild the git-gutter marks if the buffer moved since last frame
         // (cheap no-op otherwise), so the bars below diff against HEAD.
         self.refresh_git_marks();
+        // Same cadence for the fallback fold table (#254): region markers
+        // and comment runs the gutter chevrons below consult.
+        self.refresh_fold_tables();
         // Rescan merge-conflict blocks on the same cadence so the region
         // tints below always match the buffer.
         self.conflicts();
@@ -11931,6 +12113,47 @@ fn dir_suffix(path: &std::path::Path, depth: usize) -> String {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
     comps.into_iter().rev().collect::<Vec<_>>().join("/")
+}
+
+/// Classify a line as a fold-region marker (#254): after leading
+/// whitespace and a comment introducer (`//`, `#`, `--`, `;`, `/*`, with
+/// an optional extra `#` as in `// #region`), the word `region`
+/// (Some(true)) or `endregion` (Some(false)) at a word boundary — the
+/// language-agnostic `#region` family VS Code folds.
+fn region_marker(line: &str) -> Option<bool> {
+    let trimmed = line.trim_start();
+    let mut rest = None;
+    for intro in ["//", "#", "--", ";", "/*"] {
+        if let Some(r) = trimmed.strip_prefix(intro) {
+            rest = Some(r);
+            break;
+        }
+    }
+    let s = rest?.trim_start();
+    let s = s.strip_prefix('#').unwrap_or(s);
+    let boundary = |r: &str| !r.starts_with(|c: char| c.is_alphanumeric() || c == '_');
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("endregion") {
+        return boundary(&s[9..]).then_some(false);
+    }
+    if lower.starts_with("region") {
+        return boundary(&s[6..]).then_some(true);
+    }
+    None
+}
+
+/// Whether a line is a full-line comment for the fallback comment-run
+/// scanner. Rust/C attributes (`#[...]`, `#![...]`) are code, not
+/// comments, despite the leading `#`.
+fn comment_line(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with("#[") || t.starts_with("#![") {
+        return false;
+    }
+    ["//", "#", "--", ";", "/*", "*/", "* "]
+        .iter()
+        .any(|intro| t.starts_with(intro))
+        || t == "*"
 }
 
 fn tab_label(e: &Editor) -> String {
@@ -21202,6 +21425,82 @@ mod tests {
         // The interior blank (line 2) sits between two deeper lines, so it is
         // inside the region; the region ends at the last deeper line (3).
         assert_eq!(e.fold_range(0), Some((0, 3)));
+    }
+
+    #[test]
+    fn region_markers_fold_in_the_fallback_scanner_including_nesting() {
+        use crate::lsp::manager::FoldRangeKind;
+        let mut e = editor_with(
+            "top\n#region outer\na\n// region inner\nb\n// endregion\nc\n#endregion\ntail",
+        );
+        e.refresh_fold_tables();
+        assert_eq!(e.fold_range(1), Some((1, 7)), "outer #region pair");
+        assert_eq!(e.fold_range(3), Some((3, 5)), "nested // region pair");
+        assert_eq!(e.fold_kind_at(1), Some(FoldRangeKind::Region));
+        assert_eq!(e.fold_kind_at(0), None, "plain text has no kind");
+        // A line that merely CONTAINS the word is not a marker.
+        let mut e2 = editor_with("let region = 1;\nregional stuff\n#endregion");
+        e2.refresh_fold_tables();
+        assert_eq!(e2.fold_range(0), None);
+        assert_eq!(e2.fold_range(1), None);
+    }
+
+    #[test]
+    fn comment_runs_fold_but_rust_attributes_do_not_count_as_comments() {
+        use crate::lsp::manager::FoldRangeKind;
+        let mut e = editor_with(
+            "// docs line one\n// docs line two\n// docs line three\nfn a() {}\n#[derive(Debug)]\n#[cfg(test)]\nstruct S;",
+        );
+        e.refresh_fold_tables();
+        assert_eq!(e.fold_range(0), Some((0, 2)), "a 3-line comment run folds");
+        assert_eq!(e.fold_kind_at(0), Some(FoldRangeKind::Comment));
+        assert_eq!(
+            e.fold_kind_at(4),
+            None,
+            "attribute lines are code, not a comment run"
+        );
+        // A single comment line is not a run.
+        let mut e2 = editor_with("// alone\nfn a() {}");
+        e2.refresh_fold_tables();
+        assert_eq!(e2.fold_kind_at(0), None);
+    }
+
+    #[test]
+    fn server_fold_spans_replace_the_heuristics_until_the_buffer_moves() {
+        use crate::lsp::manager::{FoldRangeKind, FoldingRangeItem};
+        let mut e = editor_with("fn a() {\n    x\n    y\n}\nfn b() {}");
+        // Server says the whole item folds through its closing brace —
+        // something indentation cannot express.
+        e.set_lsp_folds(vec![FoldingRangeItem {
+            start_line: 0,
+            end_line: 3,
+            kind: FoldRangeKind::Other,
+        }]);
+        assert_eq!(e.fold_range(0), Some((0, 3)), "server span wins");
+        assert_eq!(
+            e.fold_range(4),
+            None,
+            "server authoritative: no indentation fallthrough"
+        );
+        // An edit that changes the line count orphans the spans; the
+        // indentation scan is back in charge until the next reply.
+        e.lines.push(String::from("tail"));
+        assert_eq!(e.fold_range(0), Some((0, 2)), "stale spans ignored");
+    }
+
+    #[test]
+    fn fold_all_regions_and_unfold_all_regions_round_trip() {
+        use crate::lsp::manager::FoldRangeKind;
+        let mut e = editor_with("#region a\nx\n#endregion\n// one\n// two\nfn f() {\n    body\n}");
+        e.fold_all_of_kind(FoldRangeKind::Region);
+        assert!(e.is_line_hidden(1), "the region body folded");
+        assert!(!e.is_line_hidden(4), "the comment run did not");
+        assert!(!e.is_line_hidden(6), "the indented block did not");
+        e.fold_all_of_kind(FoldRangeKind::Comment);
+        assert!(e.is_line_hidden(4), "now the comment run folded too");
+        e.unfold_all_of_kind(FoldRangeKind::Region);
+        assert!(!e.is_line_hidden(1), "regions expanded");
+        assert!(e.is_line_hidden(4), "comment folds untouched");
     }
 
     #[test]

@@ -373,6 +373,34 @@ pub struct InlayHintsUpdate {
     pub hints: Vec<InlayHintItem>,
 }
 
+/// One server fold span (#254), 0-based inclusive line indexes matching
+/// the editor's (header, end) fold model: collapsing hides
+/// `start_line + 1 ..= end_line`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldingRangeItem {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub kind: FoldRangeKind,
+}
+
+/// The LSP folding-range kind, `Other` for servers that send none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldRangeKind {
+    Comment,
+    Imports,
+    Region,
+    Other,
+}
+
+/// A complete fold-span set for one document; `seq` mirrors
+/// [`InlayHintsUpdate`]'s staleness contract.
+#[derive(Debug)]
+pub struct FoldingRangesUpdate {
+    pub path: PathBuf,
+    pub seq: u64,
+    pub ranges: Vec<FoldingRangeItem>,
+}
+
 /// One row of a call-hierarchy answer: a caller (incoming) or callee
 /// (outgoing), with the location the picker jumps to — the call expression
 /// for incoming calls when the server reports one, the callee's definition
@@ -507,6 +535,10 @@ enum Cmd {
     RequestInlayHints {
         path: PathBuf,
         line_count: u32,
+        seq: u64,
+    },
+    RequestFoldingRanges {
+        path: PathBuf,
         seq: u64,
     },
     ChangeDoc {
@@ -668,6 +700,7 @@ pub struct LspManager {
     code_action_rx: std_mpsc::Receiver<CodeActionResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     inlay_rx: std_mpsc::Receiver<InlayHintsUpdate>,
+    folding_rx: std_mpsc::Receiver<FoldingRangesUpdate>,
     diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
     progress_rx: std_mpsc::Receiver<ProgressUpdate>,
     capability_support: CapabilitySupport,
@@ -715,6 +748,7 @@ impl LspManager {
         let (code_action_tx, code_action_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let (inlay_tx, inlay_rx) = std_mpsc::channel();
+        let (folding_tx, folding_rx) = std_mpsc::channel();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
         let (progress_tx, progress_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
@@ -760,6 +794,7 @@ impl LspManager {
                 code_action: code_action_tx,
                 semantic_tokens: semantic_tx,
                 inlay_hints: inlay_tx,
+                folding_ranges: folding_tx,
                 diagnostics: diagnostics_tx,
                 progress: progress_tx,
             },
@@ -787,6 +822,7 @@ impl LspManager {
             code_action_rx,
             semantic_rx,
             inlay_rx,
+            folding_rx,
             diagnostics_rx,
             progress_rx,
             capability_support,
@@ -951,6 +987,19 @@ impl LspManager {
 
     pub fn drain_inlay_hints(&self) -> Option<InlayHintsUpdate> {
         self.inlay_rx.try_recv().ok()
+    }
+
+    /// Ask the server for the document's fold spans (#254). Fire-and-forget
+    /// on the same open/change cadence as inlay hints; the reply lands in
+    /// [`drain_folding_ranges`] tagged with `seq`. A no-op when no spawned
+    /// server advertises a `foldingRangeProvider`, which is what keeps the
+    /// editor's indentation scan authoritative there.
+    pub fn request_folding_ranges(&self, path: PathBuf, seq: u64) {
+        let _ = self.cmd_tx.send(Cmd::RequestFoldingRanges { path, seq });
+    }
+
+    pub fn drain_folding_ranges(&self) -> Option<FoldingRangesUpdate> {
+        self.folding_rx.try_recv().ok()
     }
 
     /// Returns and clears the "a server asked us to re-request inlay hints"
@@ -1359,6 +1408,7 @@ struct ManagedClient {
     /// Whether the server advertises an `inlayHintProvider`
     /// (rust-analyzer, vtsls, gopls do; ruff does not).
     supports_inlay_hints: bool,
+    supports_folding_range: bool,
 }
 
 /// Servers are keyed by language AND the file's project root, not language
@@ -1420,6 +1470,7 @@ struct ResultSenders {
     code_action: std_mpsc::Sender<CodeActionResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
     inlay_hints: std_mpsc::Sender<InlayHintsUpdate>,
+    folding_ranges: std_mpsc::Sender<FoldingRangesUpdate>,
     diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
     progress: std_mpsc::Sender<ProgressUpdate>,
 }
@@ -1535,6 +1586,11 @@ async fn worker_loop(
             } => {
                 state
                     .request_inlay_hints(path, line_count, seq, &tx.inlay_hints)
+                    .await
+            }
+            Cmd::RequestFoldingRanges { path, seq } => {
+                state
+                    .request_folding_ranges(path, seq, &tx.folding_ranges)
                     .await
             }
             Cmd::ChangeDoc { path, text } => state.change_doc(path, text).await,
@@ -1835,6 +1891,8 @@ impl WorkerState {
                         let semantic_legend = semantic_legend_of(caps).map(Arc::new);
                         let semantic_supports_range = semantic_tokens_range_supported(caps);
                         let supports_inlay_hints = one_of_supported(&caps.inlay_hint_provider);
+                        let supports_folding_range =
+                            folding_range_supported(&caps.folding_range_provider);
                         log_file::log(&format!(
                             "lsp[{}] spawned, root={} supports_completion={supports} supports_signature_help={supports_signature_help} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_references={supports_references} supports_rename={supports_rename}",
                             config.name,
@@ -1861,6 +1919,7 @@ impl WorkerState {
                             semantic_legend,
                             semantic_supports_range,
                             supports_inlay_hints,
+                            supports_folding_range,
                         });
                     }
                     Err(e) => {
@@ -2404,6 +2463,54 @@ impl WorkerState {
                 hints.len()
             ));
             let _ = tx.send(InlayHintsUpdate { path, seq, hints });
+        });
+    }
+
+    /// Fetch the document's fold spans (#254). Silent when the path is
+    /// untracked or no client advertises `foldingRangeProvider` — the app
+    /// falls back to its indentation/region scan by never hearing back.
+    async fn request_folding_ranges(
+        &mut self,
+        path: PathBuf,
+        seq: u64,
+        tx: &std_mpsc::Sender<FoldingRangesUpdate>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_folding_range)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.folding_ranges(uri).await;
+            drop(client);
+            let ranges = match resp {
+                Ok(Some(ranges)) => ranges
+                    .into_iter()
+                    .filter_map(normalise_folding_range)
+                    .collect(),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] folding_ranges error: {e}"));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(FoldingRangesUpdate { path, seq, ranges });
         });
     }
 
@@ -3606,6 +3713,17 @@ fn code_action_supported(cap: &Option<CodeActionProviderCapability>) -> bool {
     }
 }
 
+/// Whether the server advertises a usable `textDocument/foldingRange`
+/// provider (#254). Same shape rules as `code_action_supported`.
+fn folding_range_supported(cap: &Option<lsp_types::FoldingRangeProviderCapability>) -> bool {
+    use lsp_types::FoldingRangeProviderCapability as F;
+    match cap {
+        Some(F::Simple(b)) => *b,
+        Some(F::FoldingProvider(_)) | Some(F::Options(_)) => true,
+        None => false,
+    }
+}
+
 /// Flatten a `workspace/symbol` response (either shape) into picker rows.
 /// Nested `WorkspaceSymbol`s may carry a range-less location (a bare URI);
 /// those land on line 0, which is still a useful jump target.
@@ -3680,6 +3798,28 @@ fn normalise_inlay_hint(h: lsp_types::InlayHint) -> InlayHintItem {
         character: h.position.character,
         label,
     }
+}
+
+/// Wire → internal fold span (#254). A range whose end does not extend past
+/// its start folds nothing and is dropped; `end_character` nuances are
+/// deliberately ignored — croft folds whole lines, like VS Code's default.
+fn normalise_folding_range(r: lsp_types::FoldingRange) -> Option<FoldingRangeItem> {
+    let start = r.start_line as usize;
+    let end = r.end_line as usize;
+    if end <= start {
+        return None;
+    }
+    let kind = match r.kind {
+        Some(lsp_types::FoldingRangeKind::Comment) => FoldRangeKind::Comment,
+        Some(lsp_types::FoldingRangeKind::Imports) => FoldRangeKind::Imports,
+        Some(lsp_types::FoldingRangeKind::Region) => FoldRangeKind::Region,
+        None => FoldRangeKind::Other,
+    };
+    Some(FoldingRangeItem {
+        start_line: start,
+        end_line: end,
+        kind,
+    })
 }
 
 fn call_hierarchy_supported(cap: &Option<lsp_types::CallHierarchyServerCapability>) -> bool {
@@ -5596,6 +5736,80 @@ mod tests {
         assert!(
             reply.unsupported,
             "the reply must tell the app no formatter is reachable"
+        );
+    }
+
+    #[test]
+    fn folding_range_capability_shapes_gate_correctly() {
+        use lsp_types::FoldingRangeProviderCapability as F;
+        assert!(!folding_range_supported(&None));
+        assert!(!folding_range_supported(&Some(F::Simple(false))));
+        assert!(folding_range_supported(&Some(F::Simple(true))));
+        assert!(folding_range_supported(&Some(F::FoldingProvider(
+            lsp_types::FoldingProviderOptions {}
+        ))));
+        assert!(folding_range_supported(&Some(F::Options(
+            lsp_types::StaticTextDocumentColorProviderOptions {
+                document_selector: None,
+                id: None,
+            }
+        ))));
+    }
+
+    #[test]
+    fn normalise_folding_range_drops_empty_spans_and_maps_kinds() {
+        let r = |start, end, kind| lsp_types::FoldingRange {
+            start_line: start,
+            start_character: None,
+            end_line: end,
+            end_character: None,
+            kind,
+            collapsed_text: None,
+        };
+        assert_eq!(normalise_folding_range(r(5, 5, None)), None);
+        assert_eq!(normalise_folding_range(r(5, 4, None)), None);
+        let got = normalise_folding_range(r(2, 9, Some(lsp_types::FoldingRangeKind::Region)))
+            .expect("a real span survives");
+        assert_eq!((got.start_line, got.end_line), (2, 9));
+        assert_eq!(got.kind, FoldRangeKind::Region);
+        assert_eq!(
+            normalise_folding_range(r(0, 1, None)).map(|g| g.kind),
+            Some(FoldRangeKind::Other)
+        );
+    }
+
+    /// An unroutable folding-range request is SILENT — no reply at all —
+    /// which is the two-phase contract: the editor keeps its
+    /// indentation/region fallback unless a capable server answers.
+    #[test]
+    fn an_unroutable_folding_request_sends_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let (fold_tx, fold_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry: ServerRegistry::new(),
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+        let never_opened = root.join("stray.py");
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .request_folding_ranges(never_opened, 3, &fold_tx)
+                .await;
+        });
+        assert!(
+            fold_rx.try_recv().is_err(),
+            "no reply may be sent for an untracked document"
         );
     }
 
