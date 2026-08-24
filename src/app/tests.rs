@@ -28973,3 +28973,47 @@ fn refresh_run_debug_syncs_the_config_row() {
     assert_eq!(app.run_debug.config_count, 1);
     assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
 }
+
+#[test]
+fn change_color_presentation_needs_a_color_and_defers_the_picker_on_the_reply() {
+    use crate::lsp::manager::ColorItem;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("style.css"), "a { color: #ff0000; }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("style.css"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    // No color at the cursor: refused up front.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 2;
+    app.run_command(crate::widgets::command_palette::Command::ChangeColorPresentation);
+    assert_eq!(app.status, "No color value at the cursor");
+    // Inject a color set (as a documentColor reply would) and ask on it.
+    let path = tmp.path().join("style.css");
+    app.editor.apply_document_colors(
+        path.clone(),
+        vec![ColorItem {
+            line: 0,
+            character: 11,
+            end_line: 0,
+            end_character: 18,
+            red: 255,
+            green: 0,
+            blue: 0,
+            raw: (1.0, 0.0, 0.0, 1.0),
+        }],
+    );
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 12;
+    app.run_command(crate::widgets::command_palette::Command::ChangeColorPresentation);
+    assert_eq!(app.status, "Fetching color presentations…");
+    // No server in tests: the worker's always-answer contract resolves
+    // the deferred picker to the empty-offering status.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.color_presentations_request.is_some() && std::time::Instant::now() < deadline {
+        app.drain_lsp_color_presentations();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.status, "No color presentations offered here");
+}
