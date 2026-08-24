@@ -1,0 +1,55 @@
+name: SonarQube Cloud
+
+# Static analysis on sonarcloud.io (free plan for public repos, #284).
+# Project binding lives in sonar-project.properties; the analysis is CI-based
+# (Rust needs a real `cargo clippy` run, which SonarQube Cloud's automatic
+# analysis cannot do), so Automatic Analysis must stay OFF in the SonarCloud
+# project settings or every scan fails with a conflict.
+#
+# Every step is gated on SONAR_TOKEN so the job is a green no-op on fork PRs
+# (secrets are withheld there) and on checkouts where the secret has not been
+# configured yet - analysis coverage degrades, CI does not break.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  sonarcloud:
+    name: SonarQube Cloud analysis
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Skip without a token
+        if: env.SONAR_TOKEN == ''
+        run: echo "::notice::SONAR_TOKEN is not available (fork PR, or the secret is not configured); skipping SonarQube Cloud analysis."
+      - uses: actions/checkout@v4
+        if: env.SONAR_TOKEN != ''
+        with:
+          # Full history: SonarQube Cloud needs blame data to attribute issues
+          # and to tell new code from old on PRs.
+          fetch-depth: 0
+      # rust-toolchain.toml is the single source of truth; `rustup show`
+      # installs exactly the pinned channel and its components (clippy
+      # included). The scanner's own Clippy execution is disabled in
+      # sonar-project.properties precisely so this pinned run is the only one.
+      - name: Install the pinned toolchain
+        if: env.SONAR_TOKEN != ''
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        if: env.SONAR_TOKEN != ''
+        with:
+          key: sonarcloud
+      - name: Generate the Clippy report
+        # No `-D warnings` here: the `clippy + tests` job in ci.yml is the
+        # gate. This run only produces the JSON report SonarQube imports, so
+        # warnings must land in the report, not kill the job.
+        run: cargo clippy --all-targets --message-format=json > clippy-report.json
+        if: env.SONAR_TOKEN != ''
+      - name: SonarQube Cloud scan
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
