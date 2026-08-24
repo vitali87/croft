@@ -5,6 +5,20 @@ Thanks for hacking on croft. Build, run, and platform setup live in the
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). This guide covers the day to day
 developer workflow concerns that do not belong in any of those.
 
+## Every shipped change is a release
+
+A PR that changes anything compiled into the binary (`src/`, `assets/`,
+`build.rs`, `Cargo.toml`, `Cargo.lock`) must also:
+
+* **bump `version` in `Cargo.toml`** — two different binaries must never share
+  a version and differ only in commit hash, and
+* **replace the highlights in `src/release_notes.rs`** — the welcome panel's
+  "IN THIS RELEASE" card describes the single version it is baked into, so a
+  stale list means the panel lies about what the running build ships.
+
+CI enforces both (the `version bump + release notes` job). Docs, CI, and
+test-only PRs (`src/app/tests.rs`, `tests/`) are exempt.
+
 ## Managing the `target/` directory
 
 croft is a large workspace with a deep dependency tree, and active development
