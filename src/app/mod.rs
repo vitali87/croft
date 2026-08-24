@@ -2761,6 +2761,11 @@ pub struct App {
     /// edit_seq) it was fired for so a reply for a caret or buffer state the
     /// editor has since left is dropped.
     occurrences_request: Option<(u64, PathBuf, usize, usize, u64)>,
+    /// In-flight Expand Selection request (#254): `(request id, path,
+    /// edit_seq, queued presses)`. Extra Shift+Alt+Right presses while
+    /// the chains are in flight stack up and apply together on drain; an
+    /// `unsupported` verdict resolves them via tree-sitter instead.
+    selection_range_request: Option<(u64, PathBuf, u64, usize)>,
     /// The caret state `tick_occurrences` last observed, and when it changed.
     /// A caret resting on one spot for `OCCURRENCES_IDLE` fires one request.
     occ_observed: Option<(PathBuf, usize, usize, u64)>,
@@ -4147,6 +4152,7 @@ impl App {
             references_request_id: None,
             call_hierarchy_request_id: None,
             occurrences_request: None,
+            selection_range_request: None,
             occ_observed: None,
             occ_observed_at: std::time::Instant::now(),
             nav: NavHistory::default(),
@@ -8099,6 +8105,104 @@ impl App {
     /// `documentHighlight` request for it; the moment it moves (or the buffer
     /// edits), drop the painted set. Mirrors VS Code's word highlight, which
     /// follows the cursor with a small debounce rather than every keystroke.
+    /// Expand Selection (#254): grow every cursor to the next
+    /// semantically meaningful range. Cached chain steps apply
+    /// instantly; otherwise the LSP `selectionRange` chains are fetched
+    /// (one request, all cursors), with tree-sitter node ancestry as the
+    /// serverless fallback — so the gesture works with no LSP at all.
+    fn expand_selection(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        self.editor.validate_expand_stacks();
+        if self.editor.expand_selection_from_stack() {
+            return;
+        }
+        let lang_known = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+            .is_some();
+        if lang_known
+            && self.lsp.is_some()
+            && let Some(path) = self.editor.path.clone()
+        {
+            let seq = self.editor.edit_seq;
+            if let Some((_, p, s, presses)) = self.selection_range_request.as_mut()
+                && *p == path
+                && *s == seq
+            {
+                *presses += 1;
+                return;
+            }
+            let positions = self.editor.cursor_positions_utf16();
+            if let Some(lsp) = self.lsp.as_mut() {
+                let id = lsp.request_selection_ranges(path.clone(), positions);
+                self.selection_range_request = Some((id, path, seq, 1));
+            }
+            return;
+        }
+        if !self.editor.expand_selection_syntax() {
+            self.status = String::from("No larger range to select");
+        }
+    }
+
+    /// Shrink Selection: retrace the expand stack one step. Purely
+    /// local — the stack already remembers the exact ranges.
+    fn shrink_selection(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        self.editor.shrink_selection_step();
+    }
+
+    /// Drain `selectionRange` replies (#254): triple-gated like
+    /// occurrences (id + path + edit_seq), then either install the
+    /// server's chains or resolve the queued presses via tree-sitter
+    /// when the request came back unsupported/empty.
+    fn drain_lsp_selection_ranges(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut results = Vec::new();
+        while let Some(r) = lsp.drain_selection_ranges() {
+            results.push(r);
+        }
+        let mut changed = false;
+        for r in results {
+            let Some((id, path, seq, presses)) = self.selection_range_request.clone() else {
+                continue;
+            };
+            if r.request_id != id
+                || self.editor.path.as_deref() != Some(path.as_path())
+                || self.editor.edit_seq != seq
+            {
+                continue;
+            }
+            self.selection_range_request = None;
+            if r.unsupported || r.chains.is_empty() {
+                for _ in 0..presses {
+                    if !self.editor.expand_selection_syntax() {
+                        break;
+                    }
+                }
+                changed = true;
+                continue;
+            }
+            self.editor.install_selection_chains(r.chains);
+            for _ in 0..presses {
+                if !self.editor.expand_selection_from_stack() {
+                    break;
+                }
+            }
+            changed = true;
+        }
+        changed
+    }
+
     pub fn tick_occurrences(&mut self) -> bool {
         const OCCURRENCES_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
         let eligible = self.editor.diff.is_none()
@@ -21947,6 +22051,18 @@ impl App {
             }
             return;
         }
+        // Expand / Shrink Selection (#254): Shift+Alt+Right/Left, VS Code's
+        // smart-select chords. This deliberately claims what used to be
+        // word-wise selection extension — the same collision VS Code
+        // resolves the same way.
+        if shift && alt && !cmd && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+            if key.code == KeyCode::Right {
+                self.expand_selection();
+            } else {
+                self.shrink_selection();
+            }
+            return;
+        }
         // VS Code "Move Line Up/Down" (Alt+Up / Alt+Down, no Shift, no Cmd).
         if alt && !shift && !cmd && matches!(key.code, KeyCode::Up | KeyCode::Down) {
             match key.code {
@@ -25831,6 +25947,8 @@ impl App {
                     self.status = String::from("Trimmed trailing whitespace");
                 }
             }
+            Cmd::ExpandSelection => self.expand_selection(),
+            Cmd::ShrinkSelection => self.shrink_selection(),
             Cmd::ToggleWordWrap => {
                 self.editor.toggle_wrap();
                 self.status = if self.editor.wrap_enabled() {
@@ -38373,6 +38491,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let code_action_changed = app.drain_lsp_code_actions();
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let inlay_changed = app.drain_lsp_inlay_hints();
+        let selection_ranges_changed = app.drain_lsp_selection_ranges();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
@@ -38446,6 +38565,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || code_action_changed
             || semantic_changed
             || inlay_changed
+            || selection_ranges_changed
             || diagnostics_changed
             || progress_changed
             || voice_changed

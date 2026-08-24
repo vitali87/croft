@@ -203,6 +203,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 |------|--------|
 | Arrows, Home, End | Navigate (clears any selection) |
 | `Shift`+arrows / `Home` / `End` / `PageUp` / `PageDown` | Extend the selection by the same motion |
+| `Shift`+`Alt`+`→` / `Shift`+`Alt`+`←` | Expand / Shrink Selection (VS Code's smart select): grow every cursor to the next semantically meaningful range and retrace back exactly. Ranges come from the language server (`textDocument/selectionRange`, one request covering all cursors) when it advertises the capability, else from tree-sitter node ancestry — so the gesture works with no LSP at all; a plain-text file grows word → line → buffer. Any edit, click, or caret change restarts the gesture |
 | `PageUp` / `PageDown` (`fn`+`↑` / `fn`+`↓` on Mac) | Scroll one viewport |
 | Two-finger horizontal swipe, or drag the bar | Pan long lines in code files; the cursor pans the view when it passes either edge |
 | Markdown soft-wrap | Markdown files wrap long lines onto the next visual row (no horizontal scrollbar); `↑`/`↓` move by visual row |

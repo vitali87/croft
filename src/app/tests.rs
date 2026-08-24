@@ -12629,7 +12629,11 @@ fn editor_alt_left_jumps_one_word_backward() {
 }
 
 #[test]
-fn editor_shift_alt_right_extends_selection_by_word() {
+fn editor_shift_alt_right_runs_expand_selection_not_word_extension() {
+    // #254 reassigned Shift+Alt+Right from word-wise extension to VS
+    // Code's Expand Selection (the same collision VS Code resolves the
+    // same way). With no path/language, the textual fallback grows to
+    // the line span immediately — no LSP round trip.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Editor);
@@ -12640,8 +12644,15 @@ fn editor_shift_alt_right_extends_selection_by_word() {
         .unwrap();
     assert_eq!(
         app.editor.selection_text(),
-        "hello",
-        "Shift+Option+Right should select from cursor to the next word boundary"
+        "hello world",
+        "Shift+Option+Right expands to the enclosing range (the line here)"
+    );
+    // Shift+Alt+Left retraces to the gesture's start.
+    app.handle_key(key(KeyCode::Left, KeyModifiers::ALT | KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(
+        app.editor.selection.is_none(),
+        "shrink retraced to the caret"
     );
 }
 
@@ -28972,4 +28983,43 @@ fn refresh_run_debug_syncs_the_config_row() {
     app.refresh_run_debug();
     assert_eq!(app.run_debug.config_count, 1);
     assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
+}
+
+#[test]
+fn expand_selection_falls_back_to_tree_sitter_when_the_lsp_cannot_route() {
+    // #254 item 2's serverless criterion, end to end: the worker answers
+    // `unsupported` for an untracked doc, and the drained verdict grows
+    // the selection from tree-sitter node ancestry — the gesture never
+    // hangs and never needs a real server.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("lib.rs"),
+        "fn main() {\n    let value = 1;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9; // inside `value`
+    app.run_command(crate::widgets::command_palette::Command::ExpandSelection);
+    // The request is in flight; the worker's unsupported verdict lands
+    // asynchronously. Drain until it resolves the queued press.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.editor.selection.is_none() && std::time::Instant::now() < deadline {
+        app.drain_lsp_selection_ranges();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let sel = app
+        .editor
+        .selection
+        .expect("the fallback grew a selection")
+        .normalised();
+    assert!(
+        sel.0 <= (1, 8) && sel.1 >= (1, 13),
+        "the identifier (or an enclosing node) is selected: {sel:?}"
+    );
+    // Shrink retraces locally, no LSP involved.
+    app.run_command(crate::widgets::command_palette::Command::ShrinkSelection);
+    assert!(app.editor.selection.is_none(), "back to the bare caret");
 }
