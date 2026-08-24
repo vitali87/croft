@@ -456,6 +456,21 @@ pub struct DocumentHighlightsResult {
     pub items: Vec<OccurrenceItem>,
 }
 
+/// One `textDocument/selectionRange` answer (#254): a strictly-ordered
+/// smallest-first chain of UTF-16 spans per requested position (the
+/// server's parent links flattened), index-aligned with the request's
+/// cursors. `unsupported` is true when the request could not be routed
+/// (untracked doc, or no server advertises the provider) so the app can
+/// fall back to tree-sitter ancestry immediately instead of waiting.
+#[derive(Debug)]
+pub struct SelectionRangesResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    pub unsupported: bool,
+    /// Per cursor: `(start_line, start_char, end_line, end_char)`.
+    pub chains: Vec<Vec<(u32, u32, u32, u32)>>,
+}
+
 /// Severity of a diagnostic, normalised off the LSP `DiagnosticSeverity`
 /// wire enum. Drives the underline colour the editor paints (VS Code: red
 /// for errors, yellow for warnings, blue/teal for info & hints).
@@ -627,6 +642,11 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestSelectionRanges {
+        request_id: u64,
+        path: PathBuf,
+        positions: Vec<(u32, u32)>,
+    },
     RequestCallHierarchy {
         request_id: u64,
         path: PathBuf,
@@ -707,6 +727,7 @@ pub struct LspManager {
     impl_rx: std_mpsc::Receiver<ImplementationResult>,
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
     doc_highlights_rx: std_mpsc::Receiver<DocumentHighlightsResult>,
+    selection_ranges_rx: std_mpsc::Receiver<SelectionRangesResult>,
     calls_rx: std_mpsc::Receiver<CallHierarchyResult>,
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
@@ -756,6 +777,7 @@ impl LspManager {
         let (impl_tx, impl_rx) = std_mpsc::channel();
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
+        let (selection_ranges_tx, selection_ranges_rx) = std_mpsc::channel();
         let (calls_tx, calls_rx) = std_mpsc::channel();
         let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
@@ -803,6 +825,7 @@ impl LspManager {
                 implementation: impl_tx,
                 references: ref_tx,
                 document_highlights: doc_highlights_tx,
+                selection_ranges: selection_ranges_tx,
                 call_hierarchy: calls_tx,
                 workspace_symbols: ws_symbols_tx,
                 rename: rename_tx,
@@ -832,6 +855,7 @@ impl LspManager {
             impl_rx,
             ref_rx,
             doc_highlights_rx,
+            selection_ranges_rx,
             calls_rx,
             ws_symbols_rx,
             rename_rx,
@@ -1203,6 +1227,24 @@ impl LspManager {
         self.doc_highlights_rx.try_recv().ok()
     }
 
+    /// Ask for the Expand Selection chains at every cursor (#254): one
+    /// request carries all positions, primary first. Returns the request
+    /// id the reply will echo.
+    pub fn request_selection_ranges(&mut self, path: PathBuf, positions: Vec<(u32, u32)>) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestSelectionRanges {
+            request_id: id,
+            path,
+            positions,
+        });
+        id
+    }
+
+    pub fn drain_selection_ranges(&self) -> Option<SelectionRangesResult> {
+        self.selection_ranges_rx.try_recv().ok()
+    }
+
     /// Fire a call-hierarchy expansion (callers when `incoming`, callees
     /// otherwise) for the symbol at the caret; the reply arrives via
     /// [`Self::drain_call_hierarchy`] tagged with the returned id.
@@ -1430,6 +1472,7 @@ struct ManagedClient {
     supports_implementation: bool,
     supports_references: bool,
     supports_document_highlight: bool,
+    supports_selection_range: bool,
     supports_call_hierarchy: bool,
     supports_workspace_symbols: bool,
     supports_rename: bool,
@@ -1504,6 +1547,7 @@ struct ResultSenders {
     implementation: std_mpsc::Sender<ImplementationResult>,
     references: std_mpsc::Sender<ReferencesResult>,
     document_highlights: std_mpsc::Sender<DocumentHighlightsResult>,
+    selection_ranges: std_mpsc::Sender<SelectionRangesResult>,
     call_hierarchy: std_mpsc::Sender<CallHierarchyResult>,
     workspace_symbols: std_mpsc::Sender<WorkspaceSymbolsResult>,
     rename: std_mpsc::Sender<RenameResult>,
@@ -1762,6 +1806,15 @@ async fn worker_loop(
                     )
                     .await
             }
+            Cmd::RequestSelectionRanges {
+                request_id,
+                path,
+                positions,
+            } => {
+                state
+                    .request_selection_ranges(request_id, path, positions, &tx.selection_ranges)
+                    .await
+            }
             Cmd::RequestCallHierarchy {
                 request_id,
                 path,
@@ -1939,6 +1992,8 @@ impl WorkerState {
                         let supports_references = one_of_supported(&caps.references_provider);
                         let supports_document_highlight =
                             one_of_supported(&caps.document_highlight_provider);
+                        let supports_selection_range =
+                            selection_range_supported(&caps.selection_range_provider);
                         let supports_call_hierarchy =
                             call_hierarchy_supported(&caps.call_hierarchy_provider);
                         let supports_workspace_symbols =
@@ -1971,6 +2026,7 @@ impl WorkerState {
                             supports_implementation,
                             supports_references,
                             supports_document_highlight,
+                            supports_selection_range,
                             supports_call_hierarchy,
                             supports_workspace_symbols,
                             supports_rename,
@@ -3237,6 +3293,78 @@ impl WorkerState {
         });
     }
 
+    /// Expand Selection chains (#254). UNLIKE occurrences, every early-out
+    /// answers with `unsupported: true` — the gesture is waiting on this
+    /// reply, and an unsupported verdict is what tells the app to grow the
+    /// selection from tree-sitter ancestry right now instead of never.
+    async fn request_selection_ranges(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        positions: Vec<(u32, u32)>,
+        tx: &std_mpsc::Sender<SelectionRangesResult>,
+    ) {
+        let unsupported = |tx: &std_mpsc::Sender<SelectionRangesResult>, path: PathBuf| {
+            let _ = tx.send(SelectionRangesResult {
+                request_id,
+                path,
+                unsupported: true,
+                chains: Vec::new(),
+            });
+        };
+        let Some(doc) = self.docs.get(&path) else {
+            unsupported(tx, path);
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            unsupported(tx, path);
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_selection_range)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            unsupported(tx, path);
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            unsupported(tx, path);
+            return;
+        };
+        let lsp_positions: Vec<lsp_types::Position> = positions
+            .iter()
+            .map(|&(line, character)| lsp_types::Position { line, character })
+            .collect();
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.selection_ranges(uri, lsp_positions).await;
+            drop(client);
+            let (unsupported, chains) = match resp {
+                Ok(Some(ranges)) => (false, ranges.iter().map(flatten_selection_chain).collect()),
+                // An empty answer is a real answer: nothing to grow to.
+                Ok(None) => (false, Vec::new()),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] selectionRange error: {e:#}"));
+                    // Treat a wire error like unsupported so the gesture
+                    // still resolves via the tree-sitter fallback.
+                    (true, Vec::new())
+                }
+            };
+            let _ = tx.send(SelectionRangesResult {
+                request_id,
+                path: path_clone,
+                unsupported,
+                chains,
+            });
+        });
+    }
+
     /// The two-step call-hierarchy flow: `prepareCallHierarchy` resolves the
     /// symbol at the caret into an item, then `incomingCalls` / `outgoingCalls`
     /// expands one level of it. One level per request — invoking again at a
@@ -3884,6 +4012,39 @@ fn code_action_supported(cap: &Option<CodeActionProviderCapability>) -> bool {
     }
 }
 
+/// Flatten one `SelectionRange` parent chain into smallest-first UTF-16
+/// spans, dropping non-growing links (some servers repeat a range).
+fn flatten_selection_chain(sr: &lsp_types::SelectionRange) -> Vec<(u32, u32, u32, u32)> {
+    let mut out = Vec::new();
+    let mut cur = Some(sr);
+    let mut last: Option<(u32, u32, u32, u32)> = None;
+    while let Some(r) = cur {
+        let span = (
+            r.range.start.line,
+            r.range.start.character,
+            r.range.end.line,
+            r.range.end.character,
+        );
+        if last != Some(span) {
+            out.push(span);
+            last = Some(span);
+        }
+        cur = r.parent.as_deref();
+    }
+    out
+}
+
+/// Whether the server advertises a usable `textDocument/selectionRange`
+/// provider (#254). Same shape rules as `code_action_supported`.
+fn selection_range_supported(cap: &Option<lsp_types::SelectionRangeProviderCapability>) -> bool {
+    use lsp_types::SelectionRangeProviderCapability as S;
+    match cap {
+        Some(S::Simple(b)) => *b,
+        Some(S::Options(_)) | Some(S::RegistrationOptions(_)) => true,
+        None => false,
+    }
+}
+
 /// Flatten a `workspace/symbol` response (either shape) into picker rows.
 /// Nested `WorkspaceSymbol`s may carry a range-less location (a bare URI);
 /// those land on line 0, which is still a useful jump target.
@@ -4443,6 +4604,9 @@ fn build_client_capabilities() -> ClientCapabilities {
                 dynamic_registration: Some(false),
             }),
             document_highlight: Some(lsp_types::DocumentHighlightClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
+            selection_range: Some(lsp_types::SelectionRangeClientCapabilities {
                 dynamic_registration: Some(false),
             }),
             // Declare push-diagnostics support. Several servers gate
@@ -5875,6 +6039,84 @@ mod tests {
             reply.unsupported,
             "the reply must tell the app no formatter is reachable"
         );
+    }
+
+    #[test]
+    fn selection_range_capability_shapes_gate_correctly() {
+        use lsp_types::SelectionRangeProviderCapability as S;
+        assert!(!selection_range_supported(&None));
+        assert!(!selection_range_supported(&Some(S::Simple(false))));
+        assert!(selection_range_supported(&Some(S::Simple(true))));
+        assert!(selection_range_supported(&Some(S::Options(
+            lsp_types::SelectionRangeOptions {
+                work_done_progress_options: Default::default(),
+            }
+        ))));
+    }
+
+    #[test]
+    fn flatten_selection_chain_walks_parents_and_drops_repeats() {
+        let range = |sl, sc, el, ec| lsp_types::Range {
+            start: lsp_types::Position {
+                line: sl,
+                character: sc,
+            },
+            end: lsp_types::Position {
+                line: el,
+                character: ec,
+            },
+        };
+        let chain = lsp_types::SelectionRange {
+            range: range(1, 4, 1, 9),
+            parent: Some(Box::new(lsp_types::SelectionRange {
+                range: range(1, 4, 1, 9), // repeated link some servers emit
+                parent: Some(Box::new(lsp_types::SelectionRange {
+                    range: range(0, 0, 3, 0),
+                    parent: None,
+                })),
+            })),
+        };
+        assert_eq!(
+            flatten_selection_chain(&chain),
+            vec![(1, 4, 1, 9), (0, 0, 3, 0)]
+        );
+    }
+
+    /// An unroutable selectionRange request answers `unsupported` — the
+    /// gesture is waiting on the reply, and the verdict is what routes it
+    /// to the tree-sitter fallback instead of hanging.
+    #[test]
+    fn an_unroutable_selection_range_request_answers_unsupported() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let (sel_tx, sel_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry: ServerRegistry::new(),
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+        let never_opened = root.join("stray.py");
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .request_selection_ranges(9, never_opened.clone(), vec![(0, 0)], &sel_tx)
+                .await;
+        });
+        let reply = sel_rx
+            .try_recv()
+            .expect("an untracked document must still get a verdict");
+        assert_eq!(reply.request_id, 9);
+        assert!(reply.unsupported);
+        assert!(reply.chains.is_empty());
     }
 
     #[test]

@@ -759,6 +759,25 @@ impl LspClient {
             .context("document_highlight")
     }
 
+    /// `textDocument/selectionRange`: per-position parent-linked chains of
+    /// semantically meaningful ranges — the whole Expand Selection ancestry
+    /// in one round trip, one chain per cursor (#254).
+    pub async fn selection_ranges(
+        &mut self,
+        uri: Url,
+        positions: Vec<Position>,
+    ) -> Result<Option<Vec<lsp_types::SelectionRange>>> {
+        self.server
+            .selection_range(lsp_types::SelectionRangeParams {
+                text_document: TextDocumentIdentifier { uri },
+                positions,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("selection_range")
+    }
+
     /// `textDocument/inlayHint` over the whole document (`line_count` caps the
     /// range end). VS Code requests per viewport and stitches; one whole-file
     /// request per edit-batch is simpler and matches how croft already pulls

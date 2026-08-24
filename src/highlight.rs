@@ -417,6 +417,31 @@ pub enum LangKind {
     Cpp,
 }
 
+/// The bare tree-sitter grammar handle for `kind` — the parser the
+/// expand-selection node-ancestry fallback walks (#254). Kept beside
+/// `build_config` so a new grammar joins highlighting and selection
+/// growth in one place.
+pub fn language_for(kind: LangKind) -> tree_sitter::Language {
+    match kind {
+        LangKind::Rust => tree_sitter_rust::LANGUAGE.into(),
+        LangKind::Python => tree_sitter_python::LANGUAGE.into(),
+        LangKind::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        LangKind::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        LangKind::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        LangKind::Json => tree_sitter_json::LANGUAGE.into(),
+        LangKind::Xml => tree_sitter_xml::LANGUAGE_XML.into(),
+        LangKind::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+        LangKind::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+        LangKind::Markdown => tree_sitter_md::LANGUAGE.into(),
+        LangKind::Go => tree_sitter_go::LANGUAGE.into(),
+        LangKind::Html => tree_sitter_html::LANGUAGE.into(),
+        LangKind::Css => tree_sitter_css::LANGUAGE.into(),
+        LangKind::Bash => tree_sitter_bash::LANGUAGE.into(),
+        LangKind::C => tree_sitter_c::LANGUAGE.into(),
+        LangKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+    }
+}
+
 pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
     Some(match ext {
         "rs" => LangKind::Rust,
