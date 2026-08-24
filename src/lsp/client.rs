@@ -759,6 +759,27 @@ impl LspClient {
             .context("document_highlight")
     }
 
+    /// `textDocument/linkedEditingRange`: the equal-content spans that
+    /// rename together with the one at the caret (paired HTML/JSX tags,
+    /// #254). Backs the editor's live tag mirroring.
+    pub async fn linked_editing_range(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<lsp_types::LinkedEditingRanges>> {
+        self.server
+            .linked_editing_range(lsp_types::LinkedEditingRangeParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("linked_editing_range")
+    }
+
     /// `textDocument/inlayHint` over the whole document (`line_count` caps the
     /// range end). VS Code requests per viewport and stitches; one whole-file
     /// request per edit-batch is simpler and matches how croft already pulls

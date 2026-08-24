@@ -1374,6 +1374,14 @@ impl EditorSelection {
     }
 }
 
+/// One linked-editing span (#254): a single-line char-column range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinkedRange {
+    row: usize,
+    start: usize,
+    len: usize,
+}
+
 /// A single text replacement in char-indexed `(row, col)` coordinates, as
 /// produced by an LSP rename `WorkspaceEdit`. Applied by
 /// [`apply_span_edits_to_lines`] and [`Editor::apply_span_edits`].
@@ -1933,6 +1941,23 @@ pub struct Editor {
     /// Each entry is a full selection (anchor and head); head is that caret's
     /// cursor. Edits apply to the primary and all of these as one undo step.
     pub carets: Vec<EditorSelection>,
+    /// Linked editing ranges (#254): equal-length single-line spans the
+    /// server says rename together (paired HTML/JSX tags). While the
+    /// caret edits inside one, `mirror_linked_edit` replays the change
+    /// onto the others; anything structurally surprising (multi-row
+    /// edit, invalid tag character, missed edits) drops the set — the
+    /// next caret-idle round trip re-establishes it.
+    linked_ranges: Vec<LinkedRange>,
+    /// Char-length snapshot of every row a linked range sits on, taken
+    /// when the set was installed/re-synced; the single changed row is
+    /// how the mirror finds the edit and its length delta.
+    linked_rows: Vec<(usize, usize)>,
+    /// The `edit_seq` the stored positions describe. The mirror only
+    /// trusts a single-step advance; anything else clears the set.
+    linked_seq: u64,
+    /// Cursor position at the last undo-push, i.e. where the last edit
+    /// began (pre-edit coordinates) — the mirror's edit locator.
+    pub last_edit_origin: (usize, usize),
     /// Collaborators' caret positions in this file (multiplayer sessions,
     /// docs/MULTIPLAYER.md): (row, char col, participant color). Painted as
     /// colored block cells like secondary carets; the App rebuilds this
@@ -2242,6 +2267,10 @@ impl Editor {
             last_gutter_width: 0,
             selection: None,
             carets: Vec::new(),
+            linked_ranges: Vec::new(),
+            linked_rows: Vec::new(),
+            linked_seq: 0,
+            last_edit_origin: (0, 0),
             ghost_carets: Vec::new(),
             ghost_caret_labels: Vec::new(),
             stream_stop_line: None,
@@ -5390,6 +5419,179 @@ impl Editor {
         self.selection = None;
     }
 
+    // ---- Linked editing (#254) ------------------------------------------
+
+    /// Install the server's linked-editing set: UTF-16
+    /// `(start_line, start_char, end_line, end_char)` spans. Multi-line
+    /// spans (which the protocol forbids anyway) and sets smaller than a
+    /// pair are dropped. Positions are snapshotted against the current
+    /// buffer (`edit_seq` + per-row lengths).
+    pub fn set_linked_ranges(&mut self, spans: &[(u32, u32, u32, u32)]) {
+        let mut ranges: Vec<LinkedRange> = spans
+            .iter()
+            .filter(|&&(sl, _, el, _)| sl == el && (sl as usize) < self.lines.len())
+            .map(|&(sl, sc, _, ec)| {
+                let row = sl as usize;
+                let start = utf16_to_char_col(&self.lines[row], sc);
+                let end = utf16_to_char_col(&self.lines[row], ec);
+                LinkedRange {
+                    row,
+                    start,
+                    len: end.saturating_sub(start),
+                }
+            })
+            .collect();
+        ranges.sort_by_key(|r| (r.row, r.start));
+        if ranges.len() < 2 {
+            self.clear_linked_ranges();
+            return;
+        }
+        self.linked_ranges = ranges;
+        self.resnapshot_linked_rows();
+        self.linked_seq = self.edit_seq;
+    }
+
+    /// The primary caret as an LSP UTF-16 `(line, character)` pair.
+    pub fn cursor_position_utf16(&self) -> (u32, u32) {
+        let row = self.cursor_row.min(self.lines.len().saturating_sub(1));
+        let line = &self.lines[row];
+        let byte = char_byte(line, self.cursor_col.min(line.chars().count()));
+        (row as u32, line[..byte].encode_utf16().count() as u32)
+    }
+
+    pub fn clear_linked_ranges(&mut self) {
+        self.linked_ranges.clear();
+        self.linked_rows.clear();
+    }
+
+    pub fn has_linked_ranges(&self) -> bool {
+        !self.linked_ranges.is_empty()
+    }
+
+    /// True when `(row, col)` sits inside (or at the end boundary of) a
+    /// linked range — the caret positions where the set stays alive.
+    pub fn linked_ranges_contain(&self, row: usize, col: usize) -> bool {
+        self.linked_ranges
+            .iter()
+            .any(|r| r.row == row && col >= r.start && col <= r.start + r.len)
+    }
+
+    fn resnapshot_linked_rows(&mut self) {
+        let mut rows: Vec<usize> = self.linked_ranges.iter().map(|r| r.row).collect();
+        rows.dedup();
+        self.linked_rows = rows
+            .into_iter()
+            .map(|row| (row, self.lines[row].chars().count()))
+            .collect();
+    }
+
+    /// Replay the last edit across the sibling linked ranges (#254): the
+    /// paired-tag auto-rename. Called once per tick after key handling;
+    /// returns true when siblings were rewritten. Trusts only a clean
+    /// single-step, single-row edit that began inside one range and
+    /// keeps the content a plausible tag word — anything else clears
+    /// the set rather than corrupt text far from the caret.
+    pub fn mirror_linked_edit(&mut self) -> bool {
+        if self.linked_ranges.len() < 2 || self.edit_seq == self.linked_seq {
+            return false;
+        }
+        // A single edit advances the seq exactly once; a missed frame
+        // (paste burst, undo, reload) is not safely replayable.
+        if self.edit_seq != self.linked_seq.wrapping_add(1) {
+            self.clear_linked_ranges();
+            return false;
+        }
+        let (erow, ecol) = self.last_edit_origin;
+        // Exactly one linked row may have changed, by the edit's delta.
+        let changed: Vec<(usize, isize)> = self
+            .linked_rows
+            .iter()
+            .filter_map(|&(row, old_len)| {
+                let now = self.lines.get(row)?.chars().count() as isize;
+                let delta = now - old_len as isize;
+                (delta != 0).then_some((row, delta))
+            })
+            .collect();
+        let delta = match changed.as_slice() {
+            [] => 0isize,
+            [(row, delta)] if *row == erow => *delta,
+            _ => {
+                self.clear_linked_ranges();
+                return false;
+            }
+        };
+        // The edit must have begun inside one range on that row.
+        let Some(i) = self
+            .linked_ranges
+            .iter()
+            .position(|r| r.row == erow && ecol >= r.start && ecol <= r.start + r.len)
+        else {
+            self.clear_linked_ranges();
+            return false;
+        };
+        let new_len = self.linked_ranges[i].len as isize + delta;
+        if new_len < 0 {
+            self.clear_linked_ranges();
+            return false;
+        }
+        let new_len = new_len as usize;
+        let src = self.linked_ranges[i];
+        let line = &self.lines[src.row];
+        let from = char_byte(line, src.start);
+        let to = char_byte(line, src.start + new_len);
+        let text: String = line[from..to].to_string();
+        // Keep it a plausible identifier/tag word; a delimiter means the
+        // user is doing something the mirror shouldn't propagate.
+        if text
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '<' | '>' | '/' | '"' | '\''))
+        {
+            self.clear_linked_ranges();
+            return false;
+        }
+        // Rewrite every sibling, rightmost-first per row so earlier
+        // starts stay valid while lengths change.
+        let mut order: Vec<usize> = (0..self.linked_ranges.len()).filter(|&j| j != i).collect();
+        order.sort_by_key(|&j| {
+            let r = &self.linked_ranges[j];
+            (r.row, std::cmp::Reverse(r.start))
+        });
+        for j in order {
+            let r = self.linked_ranges[j];
+            // Siblings after the edit on the edited row already shifted.
+            let start = if r.row == erow && r.start > ecol {
+                (r.start as isize + delta).max(0) as usize
+            } else {
+                r.start
+            };
+            let line = &mut self.lines[r.row];
+            let from = char_byte(line, start);
+            let to = char_byte(line, start + r.len);
+            line.replace_range(from..to, &text);
+        }
+        // Recompute stored positions: every range now has `new_len`; on
+        // each row, starts shift by the accumulated growth of preceding
+        // ranges (the edited range's own delta included).
+        let per = new_len as isize - src.len as isize;
+        let mut shift: std::collections::HashMap<usize, isize> = std::collections::HashMap::new();
+        for r in self.linked_ranges.iter_mut() {
+            let acc = shift.entry(r.row).or_insert(0);
+            r.start = (r.start as isize + *acc).max(0) as usize;
+            r.len = new_len;
+            *acc += per;
+        }
+        // The mirrors changed the buffer: bump the seq so highlights /
+        // LSP resync, and adopt it as the new baseline. Deliberately no
+        // undo push — the user's keystroke snapshot holds the whole
+        // pre-edit buffer, so one Undo reverts the keystroke AND the
+        // mirrors together (VS Code's model).
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.resnapshot_linked_rows();
+        self.linked_seq = self.edit_seq;
+        true
+    }
+
     pub fn select_all(&mut self) {
         if self.lines.is_empty() {
             self.selection = None;
@@ -5869,6 +6071,9 @@ impl Editor {
     /// Coalesces consecutive `InsertChar` ops into one step so a typing
     /// burst is undone as one unit; everything else opens a new step.
     fn push_undo(&mut self, kind: EditKind) {
+        // Where the edit about to happen begins — the linked-editing
+        // mirror reads this to locate the keystroke (#254).
+        self.last_edit_origin = (self.cursor_row, self.cursor_col);
         let coalesce =
             kind == EditKind::InsertChar && self.last_edit_kind == Some(EditKind::InsertChar);
         if !coalesce {
@@ -5922,6 +6127,10 @@ impl Editor {
         // means the restored text differs from disk: stay dirty so the next
         // sweep reconverges them instead of leaving a silent divergence.
         self.dirty = snap.dirty || self.save_seq != snap.save_seq;
+        // Undo/redo restored the WHOLE buffer, siblings included; the
+        // linked-editing mirror must not replay on top of that (#254).
+        self.linked_ranges.clear();
+        self.linked_rows.clear();
         self.last_edit_kind = None;
         // A restore changes the buffer content, so bump the change counter (the
         // app resyncs the LSP / git gutter off `edit_seq`) and drop the wrap /
@@ -19965,6 +20174,100 @@ mod tests {
         e.cursor_col = 1;
         e.add_cursor_below();
         assert!(e.carets.is_empty());
+    }
+
+    #[test]
+    fn linked_editing_mirrors_typing_and_deletion_across_paired_tags() {
+        let mut e = editor_with("<title>\n  text\n</title>");
+        // Spans over both tag names, UTF-16 == char cols here.
+        e.set_linked_ranges(&[(0, 1, 0, 6), (2, 2, 2, 7)]);
+        assert!(e.has_linked_ranges());
+        // Type 's' at the end of the opening tag name.
+        e.cursor_row = 0;
+        e.cursor_col = 6;
+        e.insert_char('s');
+        assert!(e.mirror_linked_edit(), "the keystroke mirrors");
+        assert_eq!(e.lines[0], "<titles>");
+        assert_eq!(e.lines[2], "</titles>");
+        // Keep typing: positions were resynced, the set is still live.
+        e.insert_char('x');
+        assert!(e.mirror_linked_edit());
+        assert_eq!(e.lines[2], "</titlesx>");
+        // Backspace mirrors too.
+        e.backspace();
+        assert!(e.mirror_linked_edit());
+        assert_eq!(e.lines[0], "<titles>");
+        assert_eq!(e.lines[2], "</titles>");
+        // One Undo reverts the keystroke AND its mirror together, and
+        // the restore drops the set so nothing replays on top.
+        assert!(e.undo());
+        assert!(!e.mirror_linked_edit());
+        assert!(!e.has_linked_ranges());
+        assert_eq!(e.lines[0], e.lines[0].clone(), "no panic path");
+    }
+
+    #[test]
+    fn linked_editing_handles_a_same_row_pair_with_shifting_offsets() {
+        let mut e = editor_with("<b>hi</b>");
+        e.set_linked_ranges(&[(0, 1, 0, 2), (0, 7, 0, 8)]);
+        e.cursor_row = 0;
+        e.cursor_col = 2; // end of the opening tag name
+        e.insert_char('r');
+        assert!(e.mirror_linked_edit());
+        assert_eq!(e.lines[0], "<br>hi</br>");
+        // And again — the closing tag's start shifted and must resync.
+        e.insert_char('x');
+        assert!(e.mirror_linked_edit());
+        assert_eq!(e.lines[0], "<brx>hi</brx>");
+    }
+
+    #[test]
+    fn linked_editing_drops_the_set_on_delimiters_and_structural_edits() {
+        // A delimiter character must not propagate.
+        let mut e = editor_with("<div>\n</div>");
+        e.set_linked_ranges(&[(0, 1, 0, 4), (1, 2, 1, 5)]);
+        e.cursor_row = 0;
+        e.cursor_col = 4;
+        e.insert_char(' ');
+        assert!(!e.mirror_linked_edit());
+        assert!(!e.has_linked_ranges(), "a space cleared the set");
+        assert_eq!(e.lines[1], "</div>", "the sibling was untouched");
+
+        // A newline inside the range is a multi-row edit: clear.
+        let mut e2 = editor_with("<div>\n</div>");
+        e2.set_linked_ranges(&[(0, 1, 0, 4), (1, 2, 1, 5)]);
+        e2.cursor_row = 0;
+        e2.cursor_col = 3;
+        e2.insert_newline();
+        assert!(!e2.mirror_linked_edit());
+        assert!(!e2.has_linked_ranges());
+    }
+
+    #[test]
+    fn linked_editing_ignores_edits_outside_every_range() {
+        let mut e = editor_with("<div>body</div>");
+        e.set_linked_ranges(&[(0, 1, 0, 4), (0, 11, 0, 14)]);
+        e.cursor_row = 0;
+        e.cursor_col = 7; // inside "body"
+        e.insert_char('!');
+        assert!(!e.mirror_linked_edit());
+        assert!(
+            !e.has_linked_ranges(),
+            "an edit outside the set clears it (positions may have shifted)"
+        );
+        assert_eq!(e.lines[0], "<div>bo!dy</div>");
+    }
+
+    #[test]
+    fn set_linked_ranges_rejects_multiline_and_singleton_sets() {
+        let mut e = editor_with("<a>\n</a>");
+        e.set_linked_ranges(&[(0, 1, 1, 2)]);
+        assert!(
+            !e.has_linked_ranges(),
+            "multi-line span filtered, pair too small"
+        );
+        e.set_linked_ranges(&[(0, 1, 0, 2)]);
+        assert!(!e.has_linked_ranges(), "a single range cannot mirror");
     }
 
     #[test]

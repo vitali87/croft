@@ -28973,3 +28973,34 @@ fn refresh_run_debug_syncs_the_config_row() {
     assert_eq!(app.run_debug.config_count, 1);
     assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
 }
+
+#[test]
+fn linked_editing_set_clears_when_the_caret_leaves_and_mirrors_through_handle_key() {
+    // #254 item 3: keystrokes inside a linked range mirror to the pair
+    // on the tick; moving the caret out of every range drops the set.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("page.html"), "<title>t</title>\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("page.html"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor
+        .set_linked_ranges(&[(0, 1, 0, 6), (0, 10, 0, 15)]);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 6;
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.tick_linked_editing(), "the keystroke mirrored");
+    assert_eq!(app.editor.lines[0], "<titles>t</titles>");
+    // Caret leaves the set: the next tick clears it.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 9; // inside the body text
+    app.tick_linked_editing();
+    assert!(!app.editor.has_linked_ranges());
+    // Typing there no longer mirrors.
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.tick_linked_editing());
+    assert_eq!(app.editor.lines[0], "<titles>tx</titles>");
+}

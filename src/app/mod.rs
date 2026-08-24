@@ -2761,6 +2761,12 @@ pub struct App {
     /// edit_seq) it was fired for so a reply for a caret or buffer state the
     /// editor has since left is dropped.
     occurrences_request: Option<(u64, PathBuf, usize, usize, u64)>,
+    /// In-flight linkedEditingRange request (#254): (id, path, edit_seq).
+    linked_request: Option<(u64, PathBuf, u64)>,
+    /// Last observed `(path, row, col, seq)` for the linked-editing
+    /// debounce, and when it settled — occurrences' idle pattern.
+    linked_observed: Option<(PathBuf, usize, usize, u64)>,
+    linked_observed_at: std::time::Instant,
     /// The caret state `tick_occurrences` last observed, and when it changed.
     /// A caret resting on one spot for `OCCURRENCES_IDLE` fires one request.
     occ_observed: Option<(PathBuf, usize, usize, u64)>,
@@ -4147,6 +4153,9 @@ impl App {
             references_request_id: None,
             call_hierarchy_request_id: None,
             occurrences_request: None,
+            linked_request: None,
+            linked_observed: None,
+            linked_observed_at: std::time::Instant::now(),
             occ_observed: None,
             occ_observed_at: std::time::Instant::now(),
             nav: NavHistory::default(),
@@ -8099,6 +8108,85 @@ impl App {
     /// `documentHighlight` request for it; the moment it moves (or the buffer
     /// edits), drop the painted set. Mirrors VS Code's word highlight, which
     /// follows the cursor with a small debounce rather than every keystroke.
+    /// Linked editing (#254): replay the last keystroke across the
+    /// sibling tag ranges, keep the set alive only while the caret
+    /// stays inside one, and (debounced on caret idle) ask the server
+    /// for the set at a new caret position. Never fires a request for a
+    /// language the LSP layer isn't tracking; a server without the
+    /// provider simply never answers, and the feature stays inert.
+    pub fn tick_linked_editing(&mut self) -> bool {
+        const LINKED_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
+        let mirrored = self.editor.mirror_linked_edit();
+        let eligible = self.editor_is_text() && self.lsp.is_some();
+        let Some(path) = self.editor.path.clone().filter(|_| eligible) else {
+            self.linked_observed = None;
+            self.linked_request = None;
+            self.editor.clear_linked_ranges();
+            return mirrored;
+        };
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        // While the caret stays inside the live set, keep it — the whole
+        // point is typing inside a range. (The mirror above re-synced
+        // positions for this frame's keystroke.)
+        if self.editor.has_linked_ranges() {
+            if self.editor.linked_ranges_contain(row, col) {
+                return mirrored;
+            }
+            self.editor.clear_linked_ranges();
+        }
+        let cur = (path, row, col, self.editor.edit_seq);
+        if self.linked_observed.as_ref() != Some(&cur) {
+            self.linked_observed = Some(cur);
+            self.linked_observed_at = std::time::Instant::now();
+            self.linked_request = None;
+            return mirrored;
+        }
+        let already = self
+            .linked_request
+            .as_ref()
+            .is_some_and(|(_, p, s)| (p, s) == (&cur.0, &cur.3));
+        if already || self.linked_observed_at.elapsed() < LINKED_IDLE {
+            return mirrored;
+        }
+        let (uline, uchar) = self.editor.cursor_position_utf16();
+        let Some(lsp) = self.lsp.as_mut() else {
+            return mirrored;
+        };
+        let id = lsp.request_linked_editing(cur.0.clone(), uline, uchar);
+        self.linked_request = Some((id, cur.0, cur.3));
+        mirrored
+    }
+
+    /// Install a linkedEditingRange reply, gated on the in-flight id,
+    /// the path, and the edit seq the spans were computed against.
+    pub fn drain_lsp_linked_editing(&mut self) -> bool {
+        let mut results = Vec::new();
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(r) = lsp.drain_linked_editing() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for result in results {
+            let Some((id, path, seq)) = self.linked_request.as_ref() else {
+                continue;
+            };
+            if result.request_id != *id
+                || self.editor.path.as_deref() != Some(path.as_path())
+                || self.editor.edit_seq != *seq
+            {
+                continue;
+            }
+            self.linked_request = None;
+            self.editor.set_linked_ranges(&result.ranges);
+            changed = true;
+        }
+        changed
+    }
+
     pub fn tick_occurrences(&mut self) -> bool {
         const OCCURRENCES_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
         let eligible = self.editor.diff.is_none()
@@ -38367,6 +38455,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let references_changed = app.drain_lsp_references();
         let call_hierarchy_changed = app.drain_lsp_call_hierarchy();
         let occ_tick_changed = app.tick_occurrences();
+        let linked_tick_changed = app.tick_linked_editing();
+        let linked_changed = app.drain_lsp_linked_editing();
         let occurrences_changed = app.drain_lsp_document_highlights();
         let rename_changed = app.drain_lsp_rename();
         let format_changed = app.drain_lsp_format();
@@ -38440,6 +38530,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || references_changed
             || call_hierarchy_changed
             || occ_tick_changed
+            || linked_tick_changed
+            || linked_changed
             || occurrences_changed
             || rename_changed
             || format_changed
