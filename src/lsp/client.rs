@@ -787,6 +787,50 @@ impl LspClient {
             .context("inlay_hint")
     }
 
+    /// `textDocument/documentColor`: every color value in the document
+    /// (#254) — the swatch decoration's data source.
+    pub async fn document_color(&mut self, uri: Url) -> Result<Vec<lsp_types::ColorInformation>> {
+        self.server
+            .document_color(lsp_types::DocumentColorParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("document_color")
+    }
+
+    /// `textDocument/colorPresentation`: the alternative spellings of one
+    /// color value (`#rrggbb`, `rgb()`, …), each carrying the edit that
+    /// rewrites the document to it (#254).
+    pub async fn color_presentations(
+        &mut self,
+        uri: Url,
+        color: lsp_types::Color,
+        start: (u32, u32),
+        end: (u32, u32),
+    ) -> Result<Vec<lsp_types::ColorPresentation>> {
+        self.server
+            .color_presentation(lsp_types::ColorPresentationParams {
+                text_document: TextDocumentIdentifier { uri },
+                color,
+                range: Range {
+                    start: Position {
+                        line: start.0,
+                        character: start.1,
+                    },
+                    end: Position {
+                        line: end.0,
+                        character: end.1,
+                    },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("color_presentation")
+    }
+
     pub async fn rename(
         &mut self,
         uri: Url,
