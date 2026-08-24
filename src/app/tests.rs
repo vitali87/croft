@@ -29017,3 +29017,47 @@ fn change_color_presentation_needs_a_color_and_defers_the_picker_on_the_reply() 
     }
     assert_eq!(app.status, "No color presentations offered here");
 }
+
+#[test]
+fn a_stale_color_presentation_pick_is_refused_after_a_buffer_change() {
+    use crate::widgets::editor::TextSpanEdit;
+    use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+    // #277 review: an external reload while the picker is open bumps
+    // edit_seq; the pick must refuse rather than splice stale offsets.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("style.css"), "a { color: #ff0000; }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("style.css");
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.pending_color_presentations = vec![(
+        String::from("rgb(255, 0, 0)"),
+        vec![TextSpanEdit {
+            start: (0, 11),
+            end: (0, 18),
+            new_text: String::from("rgb(255, 0, 0)"),
+        }],
+    )];
+    app.pending_color_context = Some((path.clone(), app.editor.edit_seq));
+    app.open_list_picker(
+        ListPicker::new(
+            ListPurpose::ColorPresentation,
+            "Change Color Presentation",
+            vec![ListRow {
+                id: String::from("0"),
+                label: String::from("rgb(255, 0, 0)"),
+            }],
+        ),
+        "empty",
+    );
+    // The buffer changes while the picker is open.
+    app.editor.insert_char('x');
+    let before = app.editor.lines[0].clone();
+    app.confirm_list_picker();
+    assert_eq!(app.editor.lines[0], before, "no stale edit applied");
+    assert_eq!(
+        app.status,
+        "The buffer changed — re-run Change Color Presentation"
+    );
+    assert!(app.pending_color_presentations.is_empty());
+}

@@ -2778,6 +2778,10 @@ pub struct App {
     /// The presentation edits behind the open Change Color Presentation
     /// picker (#254), indexed by row id; cleared after a pick.
     pending_color_presentations: Vec<(String, Vec<crate::widgets::editor::TextSpanEdit>)>,
+    /// The (path, edit_seq) the pending presentations were computed
+    /// against; a pick is refused when either moved while the picker was
+    /// open (an FS-sync reload bumps the seq without user edits).
+    pending_color_context: Option<(PathBuf, u64)>,
     /// In-flight colorPresentation request: (id, path, edit_seq).
     color_presentations_request: Option<(u64, PathBuf, u64)>,
     nav: NavHistory,
@@ -4129,6 +4133,7 @@ impl App {
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
             pending_color_presentations: Vec::new(),
+            pending_color_context: None,
             color_presentations_request: None,
             hover: HoverDwell::default(),
             hover_popup: None,
@@ -7067,6 +7072,7 @@ impl App {
                 })
                 .collect();
             self.pending_color_presentations = result.presentations;
+            self.pending_color_context = Some((path.clone(), seq));
             self.open_list_picker(
                 crate::widgets::list_picker::ListPicker::new(
                     crate::widgets::list_picker::ListPurpose::ColorPresentation,
@@ -19857,13 +19863,27 @@ impl App {
                 self.pending_code_actions.clear();
             }
             ListPurpose::ColorPresentation => {
-                if let Some((label, edits)) = self.pending_color_presentations.get(index).cloned() {
-                    let applied = self.editor.apply_span_edits(&edits);
-                    self.status = if applied > 0 {
-                        format!("Color rewritten as {label}")
-                    } else {
-                        String::from("The presentation's edit no longer applies")
-                    };
+                // The edits were computed against a specific buffer state;
+                // an external reload while the picker was open orphans
+                // them (#277 review) — refuse rather than splice at
+                // stale offsets.
+                let context_ok = self.pending_color_context.take().is_some_and(|(p, seq)| {
+                    self.editor.path.as_deref() == Some(p.as_path()) && self.editor.edit_seq == seq
+                });
+                if context_ok {
+                    if let Some((label, edits)) =
+                        self.pending_color_presentations.get(index).cloned()
+                    {
+                        let applied = self.editor.apply_span_edits(&edits);
+                        self.status = if applied > 0 {
+                            format!("Color rewritten as {label}")
+                        } else {
+                            String::from("The presentation's edit no longer applies")
+                        };
+                    }
+                } else {
+                    self.status =
+                        String::from("The buffer changed — re-run Change Color Presentation");
                 }
                 self.pending_color_presentations.clear();
             }
