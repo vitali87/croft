@@ -43,13 +43,15 @@ jobs:
         with:
           key: sonarcloud
       - name: Generate the Clippy report
+        if: env.SONAR_TOKEN != ''
         # No `-D warnings` here: the `clippy + tests` job in ci.yml is the
         # gate. This run only produces the JSON report SonarQube imports, so
         # warnings must land in the report, not kill the job.
-        run: cargo clippy --all-targets --message-format=json > clippy-report.json
-        if: env.SONAR_TOKEN != ''
+        #
+        # `|| true`: a compile error is already reported by ci.yml's gate job;
+        # failing here too would only add a second red X and skip the import
+        # of whatever diagnostics Clippy did emit before dying.
+        run: cargo clippy --all-targets --message-format=json > clippy-report.json || true
       - name: SonarQube Cloud scan
         if: env.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-scan-action@v8
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
