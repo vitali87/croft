@@ -29049,3 +29049,49 @@ fn a_task_problem_matcher_owns_its_pane_and_watch_publishes_win() {
         "without the task matcher both formats report"
     );
 }
+
+#[test]
+fn ctrl_click_follows_a_document_link_before_go_to_definition() {
+    use crate::lsp::manager::DocumentLinkItem;
+    // #254 item 8: a file:// link opens the target in the editor; the
+    // definition request is never fired for a linked range.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "// link here\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "fn target() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    let target = lsp_types::Url::from_file_path(tmp.path().join("b.rs")).unwrap();
+    app.editor.apply_document_links(
+        tmp.path().join("a.rs"),
+        vec![DocumentLinkItem {
+            line: 0,
+            character: 3,
+            end_line: 0,
+            end_character: 12,
+            target: target.to_string(),
+        }],
+    );
+    app.open_document_link(target.as_ref());
+    assert_eq!(
+        app.editor.path.as_deref().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("b.rs")),
+        "the file link opened in the editor"
+    );
+    // And the editor-side lookup that the click dispatch consults.
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.editor.apply_document_links(
+        tmp.path().join("a.rs"),
+        vec![DocumentLinkItem {
+            line: 0,
+            character: 3,
+            end_line: 0,
+            end_character: 12,
+            target: String::from("https://example.com"),
+        }],
+    );
+    assert_eq!(
+        app.editor.document_link_at(0, 5),
+        Some("https://example.com")
+    );
+}

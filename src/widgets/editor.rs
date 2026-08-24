@@ -2098,6 +2098,11 @@ pub struct Editor {
     /// virtual cells at its anchor; every overlay painter, the caret, and
     /// mouse mapping translate buffer columns past them.
     inlay_spans: Vec<Vec<(usize, String)>>,
+    /// The server's resolved document links (#254): raw UTF-16 ranges +
+    /// target URIs, path-stamped like `inlay_path`. Consulted by the
+    /// Ctrl+click dispatch BEFORE firing Go to Definition.
+    doc_links: Vec<crate::lsp::manager::DocumentLinkItem>,
+    doc_links_path: Option<PathBuf>,
     registry: LangRegistry,
     /// When set, every occurrence of this string in the visible portion of
     /// the buffer is overpainted with the search-match style after the
@@ -2284,6 +2289,8 @@ impl Editor {
             inlay_path: None,
             occurrences: Vec::new(),
             inlay_spans: Vec::new(),
+            doc_links: Vec::new(),
+            doc_links_path: None,
             registry: LangRegistry::new(),
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -3430,6 +3437,8 @@ impl Editor {
         // must never splice into this one.
         self.inlay_hints = Vec::new();
         self.inlay_path = None;
+        self.doc_links = Vec::new();
+        self.doc_links_path = None;
         self.inlay_spans = Vec::new();
         self.recompute_highlights();
         // Notebooks auto-open rendered (#180): the JSON stays one
@@ -4267,6 +4276,45 @@ impl Editor {
         self.inlay_path = Some(path);
         self.inlay_hints = hints;
         self.recompute_inlay_spans();
+    }
+
+    /// Install the server's link set (#254): wholesale replace.
+    pub fn apply_document_links(
+        &mut self,
+        path: PathBuf,
+        links: Vec<crate::lsp::manager::DocumentLinkItem>,
+    ) {
+        self.doc_links_path = Some(path);
+        self.doc_links = links;
+    }
+
+    /// The link target under `(row, col)` — the Ctrl+click dispatch's
+    /// lookup, valid only for the stamped file. Range ends are exclusive
+    /// like every LSP range.
+    pub fn document_link_at(&self, row: usize, col: usize) -> Option<&str> {
+        if self.doc_links_path.as_deref() != self.path.as_deref() {
+            return None;
+        }
+        self.doc_links
+            .iter()
+            .find(|l| {
+                let (sr, er) = (l.line as usize, l.end_line as usize);
+                if row < sr || row > er {
+                    return false;
+                }
+                let sc = self
+                    .lines
+                    .get(sr)
+                    .map(|t| utf16_to_char_col(t, l.character))
+                    .unwrap_or(0);
+                let ec = self
+                    .lines
+                    .get(er)
+                    .map(|t| utf16_to_char_col(t, l.end_character))
+                    .unwrap_or(0);
+                (row > sr || col >= sc) && (row < er || col < ec)
+            })
+            .map(|l| l.target.as_str())
     }
 
     /// Install the occurrences of the symbol under the caret, converting the
@@ -19965,6 +20013,30 @@ mod tests {
         e.cursor_col = 1;
         e.add_cursor_below();
         assert!(e.carets.is_empty());
+    }
+
+    #[test]
+    fn document_link_at_answers_inside_the_range_for_the_stamped_file_only() {
+        use crate::lsp::manager::DocumentLinkItem;
+        let mut e = editor_with("// see https://example.com/docs for more");
+        e.path = Some(std::path::PathBuf::from("/tmp/a.rs"));
+        e.apply_document_links(
+            std::path::PathBuf::from("/tmp/a.rs"),
+            vec![DocumentLinkItem {
+                line: 0,
+                character: 7,
+                end_line: 0,
+                end_character: 31,
+                target: String::from("https://example.com/docs"),
+            }],
+        );
+        assert_eq!(e.document_link_at(0, 7), Some("https://example.com/docs"));
+        assert_eq!(e.document_link_at(0, 30), Some("https://example.com/docs"));
+        assert_eq!(e.document_link_at(0, 31), None, "range end is exclusive");
+        assert_eq!(e.document_link_at(0, 6), None);
+        // A set stamped for another file never answers.
+        e.path = Some(std::path::PathBuf::from("/tmp/b.rs"));
+        assert_eq!(e.document_link_at(0, 10), None);
     }
 
     #[test]

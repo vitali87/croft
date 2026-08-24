@@ -373,6 +373,27 @@ pub struct InlayHintsUpdate {
     pub hints: Vec<InlayHintItem>,
 }
 
+/// One server-resolved document link (#254): a UTF-16 range plus its
+/// target URI string. Links the server left target-less are dropped at
+/// normalisation (resolving them needs another round trip croft skips).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentLinkItem {
+    pub line: u32,
+    pub character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub target: String,
+}
+
+/// A fresh, complete link set for one document; same seq contract as
+/// [`InlayHintsUpdate`].
+#[derive(Debug)]
+pub struct DocumentLinksUpdate {
+    pub path: PathBuf,
+    pub seq: u64,
+    pub links: Vec<DocumentLinkItem>,
+}
+
 /// One row of a call-hierarchy answer: a caller (incoming) or callee
 /// (outgoing), with the location the picker jumps to — the call expression
 /// for incoming calls when the server reports one, the callee's definition
@@ -507,6 +528,10 @@ enum Cmd {
     RequestInlayHints {
         path: PathBuf,
         line_count: u32,
+        seq: u64,
+    },
+    RequestDocumentLinks {
+        path: PathBuf,
         seq: u64,
     },
     ChangeDoc {
@@ -668,6 +693,7 @@ pub struct LspManager {
     code_action_rx: std_mpsc::Receiver<CodeActionResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     inlay_rx: std_mpsc::Receiver<InlayHintsUpdate>,
+    links_rx: std_mpsc::Receiver<DocumentLinksUpdate>,
     diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
     progress_rx: std_mpsc::Receiver<ProgressUpdate>,
     capability_support: CapabilitySupport,
@@ -715,6 +741,7 @@ impl LspManager {
         let (code_action_tx, code_action_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let (inlay_tx, inlay_rx) = std_mpsc::channel();
+        let (links_tx, links_rx) = std_mpsc::channel();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
         let (progress_tx, progress_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
@@ -760,6 +787,7 @@ impl LspManager {
                 code_action: code_action_tx,
                 semantic_tokens: semantic_tx,
                 inlay_hints: inlay_tx,
+                document_links: links_tx,
                 diagnostics: diagnostics_tx,
                 progress: progress_tx,
             },
@@ -787,6 +815,7 @@ impl LspManager {
             code_action_rx,
             semantic_rx,
             inlay_rx,
+            links_rx,
             diagnostics_rx,
             progress_rx,
             capability_support,
@@ -951,6 +980,17 @@ impl LspManager {
 
     pub fn drain_inlay_hints(&self) -> Option<InlayHintsUpdate> {
         self.inlay_rx.try_recv().ok()
+    }
+
+    /// Ask for the document's link set (#254); fire-and-forget on the
+    /// open/change cadence, silent when no server advertises a
+    /// documentLinkProvider.
+    pub fn request_document_links(&self, path: PathBuf, seq: u64) {
+        let _ = self.cmd_tx.send(Cmd::RequestDocumentLinks { path, seq });
+    }
+
+    pub fn drain_document_links(&self) -> Option<DocumentLinksUpdate> {
+        self.links_rx.try_recv().ok()
     }
 
     /// Returns and clears the "a server asked us to re-request inlay hints"
@@ -1359,6 +1399,7 @@ struct ManagedClient {
     /// Whether the server advertises an `inlayHintProvider`
     /// (rust-analyzer, vtsls, gopls do; ruff does not).
     supports_inlay_hints: bool,
+    supports_document_link: bool,
 }
 
 /// Servers are keyed by language AND the file's project root, not language
@@ -1420,6 +1461,7 @@ struct ResultSenders {
     code_action: std_mpsc::Sender<CodeActionResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
     inlay_hints: std_mpsc::Sender<InlayHintsUpdate>,
+    document_links: std_mpsc::Sender<DocumentLinksUpdate>,
     diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
     progress: std_mpsc::Sender<ProgressUpdate>,
 }
@@ -1535,6 +1577,11 @@ async fn worker_loop(
             } => {
                 state
                     .request_inlay_hints(path, line_count, seq, &tx.inlay_hints)
+                    .await
+            }
+            Cmd::RequestDocumentLinks { path, seq } => {
+                state
+                    .request_document_links(path, seq, &tx.document_links)
                     .await
             }
             Cmd::ChangeDoc { path, text } => state.change_doc(path, text).await,
@@ -1835,6 +1882,7 @@ impl WorkerState {
                         let semantic_legend = semantic_legend_of(caps).map(Arc::new);
                         let semantic_supports_range = semantic_tokens_range_supported(caps);
                         let supports_inlay_hints = one_of_supported(&caps.inlay_hint_provider);
+                        let supports_document_link = caps.document_link_provider.is_some();
                         log_file::log(&format!(
                             "lsp[{}] spawned, root={} supports_completion={supports} supports_signature_help={supports_signature_help} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_references={supports_references} supports_rename={supports_rename}",
                             config.name,
@@ -1861,6 +1909,7 @@ impl WorkerState {
                             semantic_legend,
                             semantic_supports_range,
                             supports_inlay_hints,
+                            supports_document_link,
                         });
                     }
                     Err(e) => {
@@ -2404,6 +2453,62 @@ impl WorkerState {
                 hints.len()
             ));
             let _ = tx.send(InlayHintsUpdate { path, seq, hints });
+        });
+    }
+
+    /// Document links (#254): fire-and-forget, seq-gated, silent when
+    /// unsupported — Ctrl+click simply keeps meaning Go to Definition.
+    async fn request_document_links(
+        &mut self,
+        path: PathBuf,
+        seq: u64,
+        tx: &std_mpsc::Sender<DocumentLinksUpdate>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_document_link)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.document_links(uri).await;
+            drop(client);
+            let links = match resp {
+                Ok(Some(ls)) => ls
+                    .iter()
+                    .filter_map(|l| {
+                        let target = l.target.as_ref()?;
+                        Some(DocumentLinkItem {
+                            line: l.range.start.line,
+                            character: l.range.start.character,
+                            end_line: l.range.end.line,
+                            end_character: l.range.end.character,
+                            target: target.to_string(),
+                        })
+                    })
+                    .collect(),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] documentLink error: {e:#}"));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(DocumentLinksUpdate { path, seq, links });
         });
     }
 

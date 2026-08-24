@@ -6021,6 +6021,10 @@ impl App {
             if self.inlay_hints_enabled {
                 lsp.request_inlay_hints(path.clone(), line_count, seq);
             }
+            // Document links ride the same cadence (#254); silent when no
+            // server advertises a documentLinkProvider, so Ctrl+click
+            // keeps meaning Go to Definition there.
+            lsp.request_document_links(path.clone(), seq);
             self.lsp_last_seen.insert(path, seq);
         }
         let closed: Vec<PathBuf> = self
@@ -6991,6 +6995,64 @@ impl App {
             }
         }
         changed
+    }
+
+    /// Drain document-link batches (#254) into every editor showing the
+    /// file — the inlay fan-out, seq gate included. Links change no
+    /// pixels, so this never asks for a redraw.
+    pub fn drain_lsp_document_links(&mut self) {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return;
+        };
+        let mut updates = Vec::new();
+        while let Some(u) = lsp.drain_document_links() {
+            updates.push(u);
+        }
+        for u in updates {
+            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+                continue;
+            }
+            if self.editor.path.as_deref() == Some(u.path.as_path()) {
+                self.editor
+                    .apply_document_links(u.path.clone(), u.links.clone());
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(u.path.as_path()) {
+                    group.apply_document_links(u.path.clone(), u.links.clone());
+                }
+            }
+        }
+    }
+
+    /// Follow a server-resolved document link (#254): `file://` targets
+    /// open in the editor, anything else goes to the system opener —
+    /// unless the session is remote, where handing a URL to a headless
+    /// host's opener would claim success invisibly.
+    fn open_document_link(&mut self, target: &str) {
+        if target.starts_with("file://") {
+            if let Ok(url) = lsp_types::Url::parse(target)
+                && let Ok(p) = url.to_file_path()
+            {
+                match self.editor.open_pinned(&p) {
+                    Ok(()) => {
+                        self.focus_pane(Pane::Editor);
+                        self.status = format!("Opened {}", self.status_path(&p));
+                    }
+                    Err(e) => self.status = format!("Open failed: {e}"),
+                }
+                return;
+            }
+            self.status = String::from("Malformed file link");
+            return;
+        }
+        if is_remote_session() {
+            self.status = format!("Running remotely: open {target} on your machine");
+            return;
+        }
+        self.status = match open_url(target) {
+            Ok(()) => format!("Opened {target}"),
+            Err(e) => format!("Open link failed: {e}"),
+        };
     }
 
     /// Flatten the per-server diagnostics stored for `path` into one list for
@@ -8936,6 +8998,14 @@ impl App {
         };
         self.editor.cursor_row = line;
         self.editor.cursor_col = c;
+        // A server-resolved document link outranks Go to Definition at
+        // this spot (#254): URLs in comments have no definition at all,
+        // and an import specifier's link and definition land in the same
+        // file anyway — VS Code follows the link too.
+        if let Some(target) = self.editor.document_link_at(line, c).map(str::to_string) {
+            self.open_document_link(&target);
+            return;
+        }
         let Some(path) = self.editor.path.clone() else {
             return;
         };
@@ -38533,6 +38603,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let code_action_changed = app.drain_lsp_code_actions();
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let inlay_changed = app.drain_lsp_inlay_hints();
+        app.drain_lsp_document_links();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
