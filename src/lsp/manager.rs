@@ -484,6 +484,19 @@ pub struct DocumentHighlightsResult {
     pub items: Vec<OccurrenceItem>,
 }
 
+/// One `textDocument/linkedEditingRange` answer (#254): the UTF-16
+/// spans that rename together with the caret's, or empty when the caret
+/// is not on a linked site. No `unsupported` flag — like occurrences,
+/// the feature is a silent decoration that simply never activates for a
+/// language without the provider.
+#[derive(Debug)]
+pub struct LinkedEditingResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    /// `(start_line, start_char, end_line, end_char)` per span.
+    pub ranges: Vec<(u32, u32, u32, u32)>,
+}
+
 /// One `textDocument/selectionRange` answer (#254): a strictly-ordered
 /// smallest-first chain of UTF-16 spans per requested position (the
 /// server's parent links flattened), index-aligned with the request's
@@ -674,6 +687,12 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestLinkedEditing {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
     RequestSelectionRanges {
         request_id: u64,
         path: PathBuf,
@@ -759,6 +778,7 @@ pub struct LspManager {
     impl_rx: std_mpsc::Receiver<ImplementationResult>,
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
     doc_highlights_rx: std_mpsc::Receiver<DocumentHighlightsResult>,
+    linked_editing_rx: std_mpsc::Receiver<LinkedEditingResult>,
     selection_ranges_rx: std_mpsc::Receiver<SelectionRangesResult>,
     calls_rx: std_mpsc::Receiver<CallHierarchyResult>,
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
@@ -810,6 +830,7 @@ impl LspManager {
         let (impl_tx, impl_rx) = std_mpsc::channel();
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
+        let (linked_editing_tx, linked_editing_rx) = std_mpsc::channel();
         let (selection_ranges_tx, selection_ranges_rx) = std_mpsc::channel();
         let (calls_tx, calls_rx) = std_mpsc::channel();
         let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
@@ -859,6 +880,7 @@ impl LspManager {
                 implementation: impl_tx,
                 references: ref_tx,
                 document_highlights: doc_highlights_tx,
+                linked_editing: linked_editing_tx,
                 selection_ranges: selection_ranges_tx,
                 call_hierarchy: calls_tx,
                 workspace_symbols: ws_symbols_tx,
@@ -890,6 +912,7 @@ impl LspManager {
             impl_rx,
             ref_rx,
             doc_highlights_rx,
+            linked_editing_rx,
             selection_ranges_rx,
             calls_rx,
             ws_symbols_rx,
@@ -1276,6 +1299,21 @@ impl LspManager {
         self.doc_highlights_rx.try_recv().ok()
     }
 
+    /// Ask which spans rename together with the caret's (#254). Same
+    /// fire-and-forget id contract as occurrences; no reply arrives for
+    /// a language without the provider.
+    pub fn request_linked_editing(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestLinkedEditing {
+            request_id: id,
+            path,
+            line,
+            character,
+        });
+        id
+    }
+
     /// Ask for the Expand Selection chains at every cursor (#254): one
     /// request carries all positions, primary first. Returns the request
     /// id the reply will echo.
@@ -1288,6 +1326,10 @@ impl LspManager {
             positions,
         });
         id
+    }
+
+    pub fn drain_linked_editing(&self) -> Option<LinkedEditingResult> {
+        self.linked_editing_rx.try_recv().ok()
     }
 
     pub fn drain_selection_ranges(&self) -> Option<SelectionRangesResult> {
@@ -1521,6 +1563,7 @@ struct ManagedClient {
     supports_implementation: bool,
     supports_references: bool,
     supports_document_highlight: bool,
+    supports_linked_editing: bool,
     supports_selection_range: bool,
     supports_call_hierarchy: bool,
     supports_workspace_symbols: bool,
@@ -1597,6 +1640,7 @@ struct ResultSenders {
     implementation: std_mpsc::Sender<ImplementationResult>,
     references: std_mpsc::Sender<ReferencesResult>,
     document_highlights: std_mpsc::Sender<DocumentHighlightsResult>,
+    linked_editing: std_mpsc::Sender<LinkedEditingResult>,
     selection_ranges: std_mpsc::Sender<SelectionRangesResult>,
     call_hierarchy: std_mpsc::Sender<CallHierarchyResult>,
     workspace_symbols: std_mpsc::Sender<WorkspaceSymbolsResult>,
@@ -1862,6 +1906,16 @@ async fn worker_loop(
                     )
                     .await
             }
+            Cmd::RequestLinkedEditing {
+                request_id,
+                path,
+                line,
+                character,
+            } => {
+                state
+                    .request_linked_editing(request_id, path, line, character, &tx.linked_editing)
+                    .await
+            }
             Cmd::RequestSelectionRanges {
                 request_id,
                 path,
@@ -2048,6 +2102,8 @@ impl WorkerState {
                         let supports_references = one_of_supported(&caps.references_provider);
                         let supports_document_highlight =
                             one_of_supported(&caps.document_highlight_provider);
+                        let supports_linked_editing =
+                            linked_editing_supported(&caps.linked_editing_range_provider);
                         let supports_selection_range =
                             selection_range_supported(&caps.selection_range_provider);
                         let supports_call_hierarchy =
@@ -2084,6 +2140,7 @@ impl WorkerState {
                             supports_implementation,
                             supports_references,
                             supports_document_highlight,
+                            supports_linked_editing,
                             supports_selection_range,
                             supports_call_hierarchy,
                             supports_workspace_symbols,
@@ -3400,6 +3457,64 @@ impl WorkerState {
         });
     }
 
+    /// Linked-editing spans at the caret (#254). Silent on every
+    /// early-out like occurrences: the mirror is a background behavior
+    /// that simply never engages for a language without the provider.
+    async fn request_linked_editing(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        tx: &std_mpsc::Sender<LinkedEditingResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_linked_editing)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.linked_editing_range(uri, line, character).await;
+            drop(client);
+            let ranges = match resp {
+                Ok(Some(l)) => l
+                    .ranges
+                    .iter()
+                    .map(|r| (r.start.line, r.start.character, r.end.line, r.end.character))
+                    .collect(),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log_file::log(&format!(
+                        "lsp[{server_name}] linkedEditingRange error: {e:#}"
+                    ));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(LinkedEditingResult {
+                request_id,
+                path: path_clone,
+                ranges,
+            });
+        });
+    }
+
     /// Expand Selection chains (#254). UNLIKE occurrences, every early-out
     /// answers with `unsupported: true` — the gesture is waiting on this
     /// reply, and an unsupported verdict is what tells the app to grow the
@@ -4119,6 +4234,17 @@ fn code_action_supported(cap: &Option<CodeActionProviderCapability>) -> bool {
     }
 }
 
+/// Whether the server advertises a usable `textDocument/linkedEditingRange`
+/// provider (#254). Same shape rules as `code_action_supported`.
+fn linked_editing_supported(cap: &Option<lsp_types::LinkedEditingRangeServerCapabilities>) -> bool {
+    use lsp_types::LinkedEditingRangeServerCapabilities as L;
+    match cap {
+        Some(L::Simple(b)) => *b,
+        Some(L::Options(_)) | Some(L::RegistrationOptions(_)) => true,
+        None => false,
+    }
+}
+
 /// Whether the server advertises a usable `textDocument/foldingRange`
 /// provider (#254). Same shape rules as `code_action_supported`.
 fn folding_range_supported(cap: &Option<lsp_types::FoldingRangeProviderCapability>) -> bool {
@@ -4744,6 +4870,9 @@ fn build_client_capabilities() -> ClientCapabilities {
                 dynamic_registration: Some(false),
             }),
             document_highlight: Some(lsp_types::DocumentHighlightClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
+            linked_editing_range: Some(lsp_types::LinkedEditingRangeClientCapabilities {
                 dynamic_registration: Some(false),
             }),
             selection_range: Some(lsp_types::SelectionRangeClientCapabilities {
@@ -6179,6 +6308,17 @@ mod tests {
             reply.unsupported,
             "the reply must tell the app no formatter is reachable"
         );
+    }
+
+    #[test]
+    fn linked_editing_capability_shapes_gate_correctly() {
+        use lsp_types::LinkedEditingRangeServerCapabilities as L;
+        assert!(!linked_editing_supported(&None));
+        assert!(!linked_editing_supported(&Some(L::Simple(false))));
+        assert!(linked_editing_supported(&Some(L::Simple(true))));
+        assert!(linked_editing_supported(&Some(L::Options(
+            lsp_types::LinkedEditingRangeOptions::default()
+        ))));
     }
 
     #[test]
