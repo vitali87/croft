@@ -2766,6 +2766,9 @@ pub struct App {
     occ_observed: Option<(PathBuf, usize, usize, u64)>,
     occ_observed_at: std::time::Instant,
     rename_request_id: Option<u64>,
+    /// In-flight prepareRename (#254): (id, path, row, col, edit_seq) —
+    /// the deferred rename prompt's context.
+    prepare_rename_request: Option<(u64, PathBuf, usize, usize, u64)>,
     format_request_id: Option<u64>,
     code_action_request_id: Option<u64>,
     /// True when the in-flight code-action request is a `codeAction/resolve`
@@ -4119,6 +4122,7 @@ impl App {
             signature_help_request_id: None,
             signature_help_anchor: None,
             rename_request_id: None,
+            prepare_rename_request: None,
             format_request_id: None,
             code_action_request_id: None,
             code_action_pending_resolve: false,
@@ -9111,16 +9115,35 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
-        let row = self.editor.cursor_row;
-        let col = self.editor.cursor_col;
-        let Some((start, end)) = self.editor.word_at(row, col) else {
-            self.status = String::from("No symbol under cursor");
-            return;
-        };
         if self.lsp.is_none() {
             self.status = String::from("No language server for this file");
             return;
         }
+        // Prepare-rename first (#254): the server validates the position
+        // and hands back the exact range + placeholder, so the prompt
+        // pre-fills the real symbol and an invalid position fails fast
+        // with the server's own message. The worker always answers;
+        // an `unsupported` verdict falls back to the word-under-cursor
+        // prompt below (today's behavior, kept for servers without the
+        // capability).
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        let (line, character) = self.editor.pos_to_utf16(row, col);
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_prepare_rename(path.clone(), line, character);
+        self.prepare_rename_request = Some((id, path, row, col, self.editor.edit_seq));
+        self.status = String::from("Preparing rename…");
+    }
+
+    /// The pre-#254 rename prompt: pre-fill with the word under the
+    /// cursor. The fallback when no server advertises `prepareProvider`
+    /// (or it answers "default behavior").
+    fn open_rename_prompt_fallback(&mut self, path: PathBuf, row: usize, col: usize) {
+        let Some((start, end)) = self.editor.word_at(row, col) else {
+            self.status = String::from("No symbol under cursor");
+            return;
+        };
         let word: String = self.editor.lines[row]
             .chars()
             .skip(start)
@@ -9133,6 +9156,79 @@ impl App {
             target_dir: PathBuf::new(),
             error: None,
         });
+    }
+
+    /// Resolve a prepare-rename verdict (#254) into the prompt, an
+    /// error, or the fallback. Gated on id + path + edit_seq like every
+    /// deferred caret request.
+    pub fn drain_lsp_prepare_rename(&mut self) -> bool {
+        let mut results = Vec::new();
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(r) = lsp.drain_prepare_rename() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for result in results {
+            let Some((id, path, row, col, seq)) = self.prepare_rename_request.clone() else {
+                continue;
+            };
+            if result.request_id != id {
+                continue;
+            }
+            self.prepare_rename_request = None;
+            if self.editor.path.as_deref() != Some(path.as_path()) || self.editor.edit_seq != seq {
+                continue;
+            }
+            changed = true;
+            if result.unsupported {
+                self.open_rename_prompt_fallback(path, row, col);
+                continue;
+            }
+            if let Some(msg) = result.error {
+                self.status = format!("Rename rejected: {msg}");
+                continue;
+            }
+            let Some(((sl, sc, el, ec), placeholder)) = result.target else {
+                self.status = String::from("Nothing renameable at the cursor");
+                continue;
+            };
+            // Placeholder wins; otherwise the validated range's text.
+            let word = placeholder.unwrap_or_else(|| {
+                let (sr, er) = (sl as usize, el as usize);
+                let scol = self.editor.utf16_col_to_char(sr, sc);
+                let ecol = self.editor.utf16_col_to_char(er, ec);
+                if sr == er {
+                    self.editor
+                        .lines
+                        .get(sr)
+                        .map(|l| {
+                            l.chars()
+                                .skip(scol)
+                                .take(ecol.saturating_sub(scol))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            });
+            if word.is_empty() {
+                self.open_rename_prompt_fallback(path, row, col);
+                continue;
+            }
+            self.prompt = Some(Prompt {
+                label: format!("Rename Symbol '{word}'"),
+                buffer: word,
+                kind: PromptKind::RenameSymbol { path, row, col },
+                target_dir: PathBuf::new(),
+                error: None,
+            });
+        }
+        changed
     }
 
     pub fn drain_lsp_rename(&mut self) -> bool {
@@ -38367,6 +38463,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let references_changed = app.drain_lsp_references();
         let call_hierarchy_changed = app.drain_lsp_call_hierarchy();
         let occ_tick_changed = app.tick_occurrences();
+        let prepare_rename_changed = app.drain_lsp_prepare_rename();
         let occurrences_changed = app.drain_lsp_document_highlights();
         let rename_changed = app.drain_lsp_rename();
         let format_changed = app.drain_lsp_format();
@@ -38440,6 +38537,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || references_changed
             || call_hierarchy_changed
             || occ_tick_changed
+            || prepare_rename_changed
             || occurrences_changed
             || rename_changed
             || format_changed

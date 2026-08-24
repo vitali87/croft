@@ -257,6 +257,23 @@ pub struct RenameResult {
     pub edits: Option<Vec<(PathBuf, Vec<TextSpanEdit>)>>,
 }
 
+/// A `textDocument/prepareRename` verdict (#254). Always answered — the
+/// rename prompt is waiting on it. `unsupported` routes the app to the
+/// plain word-under-cursor prompt; `error` carries the server's own
+/// refusal (fail fast with ITS message, not a generic one); otherwise
+/// `target` holds the validated UTF-16 range and optional placeholder,
+/// and `None` means the server said "nothing renameable here".
+#[derive(Debug)]
+pub struct PrepareRenameResult {
+    pub request_id: u64,
+    pub path: PathBuf,
+    pub unsupported: bool,
+    pub error: Option<String>,
+    /// `((start_line, start_char, end_line, end_char), placeholder)`.
+    #[allow(clippy::type_complexity)]
+    pub target: Option<((u32, u32, u32, u32), Option<String>)>,
+}
+
 /// A command to run after a code action's edits, via `workspace/executeCommand`
 /// (LSP's `Command`). Carries the opaque command id and its arguments verbatim.
 #[derive(Debug, Clone)]
@@ -595,6 +612,12 @@ enum Cmd {
         character: u32,
         new_name: String,
     },
+    RequestPrepareRename {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
     RequestFormatting {
         request_id: u64,
         path: PathBuf,
@@ -664,6 +687,7 @@ pub struct LspManager {
     calls_rx: std_mpsc::Receiver<CallHierarchyResult>,
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
+    prepare_rename_rx: std_mpsc::Receiver<PrepareRenameResult>,
     format_rx: std_mpsc::Receiver<FormatResult>,
     code_action_rx: std_mpsc::Receiver<CodeActionResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
@@ -711,6 +735,7 @@ impl LspManager {
         let (calls_tx, calls_rx) = std_mpsc::channel();
         let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
+        let (prepare_rename_tx, prepare_rename_rx) = std_mpsc::channel();
         let (format_tx, format_rx) = std_mpsc::channel();
         let (code_action_tx, code_action_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
@@ -756,6 +781,7 @@ impl LspManager {
                 call_hierarchy: calls_tx,
                 workspace_symbols: ws_symbols_tx,
                 rename: rename_tx,
+                prepare_rename: prepare_rename_tx,
                 formatting: format_tx,
                 code_action: code_action_tx,
                 semantic_tokens: semantic_tx,
@@ -783,6 +809,7 @@ impl LspManager {
             calls_rx,
             ws_symbols_rx,
             rename_rx,
+            prepare_rename_rx,
             format_rx,
             code_action_rx,
             semantic_rx,
@@ -1217,6 +1244,24 @@ impl LspManager {
         id
     }
 
+    /// Validate a rename position and fetch its placeholder (#254);
+    /// the reply always arrives via [`Self::drain_prepare_rename`].
+    pub fn request_prepare_rename(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestPrepareRename {
+            request_id: id,
+            path,
+            line,
+            character,
+        });
+        id
+    }
+
+    pub fn drain_prepare_rename(&self) -> Option<PrepareRenameResult> {
+        self.prepare_rename_rx.try_recv().ok()
+    }
+
     pub fn drain_rename(&self) -> Option<RenameResult> {
         self.rename_rx.try_recv().ok()
     }
@@ -1343,6 +1388,7 @@ struct ManagedClient {
     supports_call_hierarchy: bool,
     supports_workspace_symbols: bool,
     supports_rename: bool,
+    supports_prepare_rename: bool,
     supports_formatting: bool,
     supports_code_action: bool,
     /// The server's semantic-token legend (token-type names by index),
@@ -1416,6 +1462,7 @@ struct ResultSenders {
     call_hierarchy: std_mpsc::Sender<CallHierarchyResult>,
     workspace_symbols: std_mpsc::Sender<WorkspaceSymbolsResult>,
     rename: std_mpsc::Sender<RenameResult>,
+    prepare_rename: std_mpsc::Sender<PrepareRenameResult>,
     formatting: std_mpsc::Sender<FormatResult>,
     code_action: std_mpsc::Sender<CodeActionResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
@@ -1675,6 +1722,16 @@ async fn worker_loop(
                     .request_rename(request_id, path, line, character, new_name, &tx.rename)
                     .await
             }
+            Cmd::RequestPrepareRename {
+                request_id,
+                path,
+                line,
+                character,
+            } => {
+                state
+                    .request_prepare_rename(request_id, path, line, character, &tx.prepare_rename)
+                    .await
+            }
             Cmd::RequestFormatting {
                 request_id,
                 path,
@@ -1828,6 +1885,8 @@ impl WorkerState {
                         let supports_workspace_symbols =
                             one_of_supported(&caps.workspace_symbol_provider);
                         let supports_rename = one_of_supported(&caps.rename_provider);
+                        let supports_prepare_rename =
+                            prepare_rename_supported(&caps.rename_provider);
                         let supports_formatting =
                             one_of_supported(&caps.document_formatting_provider);
                         let supports_code_action =
@@ -1856,6 +1915,7 @@ impl WorkerState {
                             supports_call_hierarchy,
                             supports_workspace_symbols,
                             supports_rename,
+                            supports_prepare_rename,
                             supports_formatting,
                             supports_code_action,
                             semantic_legend,
@@ -3340,6 +3400,94 @@ impl WorkerState {
         });
     }
 
+    /// Prepare-rename (#254): always answers, because the rename prompt
+    /// is deferred on this verdict.
+    async fn request_prepare_rename(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        tx: &std_mpsc::Sender<PrepareRenameResult>,
+    ) {
+        let unsupported = |tx: &std_mpsc::Sender<PrepareRenameResult>, path: PathBuf| {
+            let _ = tx.send(PrepareRenameResult {
+                request_id,
+                path,
+                unsupported: true,
+                error: None,
+                target: None,
+            });
+        };
+        let Some(doc) = self.docs.get(&path) else {
+            unsupported(tx, path);
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            unsupported(tx, path);
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_prepare_rename)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            unsupported(tx, path);
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            unsupported(tx, path);
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.prepare_rename(uri, line, character).await;
+            drop(client);
+            let (error, target, fallback) = match resp {
+                Ok(Some(lsp_types::PrepareRenameResponse::Range(r))) => {
+                    (None, Some((range_tuple(&r), None)), false)
+                }
+                Ok(Some(lsp_types::PrepareRenameResponse::RangeWithPlaceholder {
+                    range,
+                    placeholder,
+                })) => (None, Some((range_tuple(&range), Some(placeholder))), false),
+                // "Default behavior": the server validates the position
+                // but wants the client's own word logic — route the app
+                // to its word-under-cursor prompt via `unsupported`.
+                Ok(Some(lsp_types::PrepareRenameResponse::DefaultBehavior { .. })) => {
+                    (None, None, true)
+                }
+                Ok(None) => (None, None, false),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] prepareRename error: {e:#}"));
+                    // Surface the server's own message: the fail-fast half
+                    // of prepare-rename. Trim the anyhow context chain to
+                    // the root cause line.
+                    let msg = e
+                        .root_cause()
+                        .to_string()
+                        .lines()
+                        .next()
+                        .unwrap_or("rename rejected")
+                        .to_string();
+                    (Some(msg), None, false)
+                }
+            };
+            let _ = tx.send(PrepareRenameResult {
+                request_id,
+                path: path_clone,
+                unsupported: fallback,
+                error,
+                target,
+            });
+        });
+    }
+
     async fn request_formatting(
         &mut self,
         request_id: u64,
@@ -3598,6 +3746,18 @@ fn hover_text(contents: &HoverContents) -> Option<String> {
 /// Whether the server advertises a usable `textDocument/codeAction` provider.
 /// `Simple(false)` and `None` are unsupported; `Simple(true)` or an options
 /// object (which may also declare `resolveProvider`) is supported.
+/// Whether the server's rename provider also validates positions via
+/// `prepareRename` (#254): only an options-shaped provider can carry
+/// `prepareProvider: true`.
+fn prepare_rename_supported(cap: &Option<OneOf<bool, lsp_types::RenameOptions>>) -> bool {
+    matches!(cap, Some(OneOf::Right(opts)) if opts.prepare_provider == Some(true))
+}
+
+/// A `Range` as the UTF-16 4-tuple the app-facing results carry.
+fn range_tuple(r: &lsp_types::Range) -> (u32, u32, u32, u32) {
+    (r.start.line, r.start.character, r.end.line, r.end.character)
+}
+
 fn code_action_supported(cap: &Option<CodeActionProviderCapability>) -> bool {
     match cap {
         Some(CodeActionProviderCapability::Simple(b)) => *b,
@@ -5597,6 +5757,59 @@ mod tests {
             reply.unsupported,
             "the reply must tell the app no formatter is reachable"
         );
+    }
+
+    #[test]
+    fn prepare_rename_capability_needs_an_options_shaped_provider() {
+        assert!(!prepare_rename_supported(&None));
+        assert!(!prepare_rename_supported(&Some(OneOf::Left(true))));
+        assert!(!prepare_rename_supported(&Some(OneOf::Right(
+            lsp_types::RenameOptions {
+                prepare_provider: None,
+                work_done_progress_options: Default::default(),
+            }
+        ))));
+        assert!(prepare_rename_supported(&Some(OneOf::Right(
+            lsp_types::RenameOptions {
+                prepare_provider: Some(true),
+                work_done_progress_options: Default::default(),
+            }
+        ))));
+    }
+
+    /// The rename prompt defers on this verdict, so an unroutable
+    /// prepare request must still answer (#254) — with `unsupported`,
+    /// which routes the app to the word-under-cursor fallback.
+    #[test]
+    fn an_unroutable_prepare_rename_answers_unsupported() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let (prep_tx, prep_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry: ServerRegistry::new(),
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+        let never_opened = root.join("stray.py");
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .request_prepare_rename(21, never_opened.clone(), 0, 0, &prep_tx)
+                .await;
+        });
+        let reply = prep_rx.try_recv().expect("must answer");
+        assert_eq!(reply.request_id, 21);
+        assert!(reply.unsupported);
+        assert!(reply.error.is_none() && reply.target.is_none());
     }
 
     /// Minimal LSP server that answers `initialize` and appends every

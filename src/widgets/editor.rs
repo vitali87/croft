@@ -5386,6 +5386,20 @@ impl Editor {
         }
     }
 
+    /// An editor `(row, char col)` as an LSP UTF-16 `(line, character)`.
+    pub fn pos_to_utf16(&self, row: usize, col: usize) -> (u32, u32) {
+        let row = row.min(self.lines.len().saturating_sub(1));
+        let line = &self.lines[row];
+        let byte = char_byte(line, col.min(line.chars().count()));
+        (row as u32, line[..byte].encode_utf16().count() as u32)
+    }
+
+    /// The inverse for one UTF-16 position on a known row.
+    pub fn utf16_col_to_char(&self, row: usize, character: u32) -> usize {
+        let row = row.min(self.lines.len().saturating_sub(1));
+        utf16_to_char_col(&self.lines[row], character)
+    }
+
     pub fn clear_selection(&mut self) {
         self.selection = None;
     }

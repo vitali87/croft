@@ -28973,3 +28973,32 @@ fn refresh_run_debug_syncs_the_config_row() {
     assert_eq!(app.run_debug.config_count, 1);
     assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
 }
+
+#[test]
+fn rename_symbol_defers_on_prepare_and_falls_back_to_the_word_prompt() {
+    // #254 item 6: F2 fires prepareRename first. With no server, the
+    // worker's unsupported verdict routes to the old word-under-cursor
+    // prompt — same UX as before, one async hop later.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("lib.rs"),
+        "fn main() {\n    let value = 1;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9; // inside `value`
+    app.start_rename_symbol();
+    assert!(app.prompt.is_none(), "the prompt waits on the verdict");
+    assert_eq!(app.status, "Preparing rename…");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.prompt.is_none() && std::time::Instant::now() < deadline {
+        app.drain_lsp_prepare_rename();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let prompt = app.prompt.as_ref().expect("the fallback prompt opened");
+    assert_eq!(prompt.buffer, "value", "pre-filled with the symbol");
+    assert!(prompt.label.contains("Rename Symbol 'value'"));
+}
