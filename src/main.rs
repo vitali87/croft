@@ -37,6 +37,7 @@ mod pair_host;
 mod pdf;
 mod port_detect;
 mod prefs;
+mod problem_matchers;
 mod quick_select;
 mod quickfix;
 mod release_notes;
