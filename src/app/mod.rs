@@ -2767,6 +2767,15 @@ pub struct App {
     occ_observed_at: std::time::Instant,
     rename_request_id: Option<u64>,
     format_request_id: Option<u64>,
+    /// VS Code's `editor.formatOnType` (#254): typing a server trigger
+    /// character runs onTypeFormatting at the spot. Off by default.
+    format_on_type: bool,
+    /// In-flight on-type request: (id, edit_seq it was computed against).
+    /// The reply applies only while the buffer has not moved since.
+    on_type_request: Option<(u64, u64)>,
+    /// The `edit_seq` the last on-type request fired for, so one typed
+    /// trigger fires exactly one request.
+    on_type_fired_seq: u64,
     code_action_request_id: Option<u64>,
     /// True when the in-flight code-action request is a `codeAction/resolve`
     /// (the reply is one resolved action to apply directly) rather than the
@@ -4120,6 +4129,9 @@ impl App {
             signature_help_anchor: None,
             rename_request_id: None,
             format_request_id: None,
+            format_on_type: loaded_prefs.format_on_type,
+            on_type_request: None,
+            on_type_fired_seq: 0,
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
@@ -8099,6 +8111,91 @@ impl App {
     /// `documentHighlight` request for it; the moment it moves (or the buffer
     /// edits), drop the painted set. Mirrors VS Code's word highlight, which
     /// follows the cursor with a small debounce rather than every keystroke.
+    /// On-type formatting (#254): when enabled and THE last edit was a
+    /// character in the server's advertised trigger set, fire
+    /// `textDocument/onTypeFormatting` at the caret — once per typed
+    /// trigger. Never fires unadvertised: the trigger set comes from the
+    /// capability the server declared, and `None` (no server probed, or
+    /// no provider) means stay inert.
+    pub fn tick_on_type_formatting(&mut self) {
+        if !self.format_on_type || !self.editor_is_text() {
+            return;
+        }
+        let Some((ch, seq)) = self.editor.last_typed else {
+            return;
+        };
+        if seq != self.editor.edit_seq || self.on_type_fired_seq == seq {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lang) = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+        else {
+            return;
+        };
+        let triggers = self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.language_on_type_triggers(lang));
+        if !triggers.is_some_and(|t| t.contains(ch)) {
+            return;
+        }
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
+        let (tab_size, insert_spaces) = self.editor.indent_preference();
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_on_type_formatting(path, line, character, ch, tab_size, insert_spaces);
+        self.on_type_request = Some((id, seq));
+        self.on_type_fired_seq = seq;
+    }
+
+    /// Apply an on-type formatting reply — quietly, and only while the
+    /// buffer has not moved since the request (the edits were computed
+    /// against exactly that text; continued typing makes them stale).
+    pub fn drain_lsp_on_type_format(&mut self) -> bool {
+        let mut results = Vec::new();
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(r) = lsp.drain_on_type_formatting() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for result in results {
+            let Some((id, seq)) = self.on_type_request else {
+                continue;
+            };
+            if result.request_id != id {
+                continue;
+            }
+            self.on_type_request = None;
+            if self.editor.edit_seq != seq
+                || self.editor.path.as_deref() != Some(result.path.as_path())
+            {
+                continue;
+            }
+            if let Some(edits) = result.edits.filter(|e| !e.is_empty())
+                && self
+                    .editor
+                    .apply_rename_to_open_tab(&result.path, &edits)
+                    .is_some()
+            {
+                self.editor.clamp_cursor();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn tick_occurrences(&mut self) -> bool {
         const OCCURRENCES_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
         let eligible = self.editor.diff.is_none()
@@ -19778,6 +19875,7 @@ impl App {
                     "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
+                    "toggle:format_on_type" => self.toggle_format_on_type(),
                     "cmd:color_theme" => {
                         self.open_theme_picker();
                         return;
@@ -19919,6 +20017,14 @@ impl App {
                     "Editor: Inlay Hints: {}{}",
                     on_off(self.inlay_hints_enabled),
                     prov("disable_inlay_hints")
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:format_on_type"),
+                label: format!(
+                    "Editor: Format on Type: {}{}",
+                    on_off(self.format_on_type),
+                    prov("format_on_type")
                 ),
             },
             ListRow {
@@ -25862,6 +25968,7 @@ impl App {
                 self.status = String::from("Converted indentation to tabs");
             }
             Cmd::FormatDocument => self.start_format_document(),
+            Cmd::ToggleFormatOnType => self.toggle_format_on_type(),
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
@@ -30874,6 +30981,20 @@ impl App {
             "Auto Closing Pairs: {}",
             if self.auto_close_pairs { "on" } else { "off" }
         );
+    }
+
+    /// VS Code's `editor.formatOnType` toggle (#254), persisted like the
+    /// other editor preferences.
+    fn toggle_format_on_type(&mut self) {
+        self.format_on_type = !self.format_on_type;
+        self.status = if self.format_on_type {
+            String::from("Format on Type: on")
+        } else {
+            String::from("Format on Type: off")
+        };
+        if !cfg!(test) {
+            let _ = crate::prefs::save_format_on_type(self.format_on_type);
+        }
     }
 
     fn toggle_format_on_save(&mut self) {
@@ -38367,6 +38488,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let references_changed = app.drain_lsp_references();
         let call_hierarchy_changed = app.drain_lsp_call_hierarchy();
         let occ_tick_changed = app.tick_occurrences();
+        app.tick_on_type_formatting();
+        let on_type_changed = app.drain_lsp_on_type_format();
         let occurrences_changed = app.drain_lsp_document_highlights();
         let rename_changed = app.drain_lsp_rename();
         let format_changed = app.drain_lsp_format();
@@ -38440,6 +38563,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || references_changed
             || call_hierarchy_changed
             || occ_tick_changed
+            || on_type_changed
             || occurrences_changed
             || rename_changed
             || format_changed

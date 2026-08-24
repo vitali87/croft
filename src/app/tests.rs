@@ -28973,3 +28973,34 @@ fn refresh_run_debug_syncs_the_config_row() {
     assert_eq!(app.run_debug.config_count, 1);
     assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
 }
+
+#[test]
+fn on_type_formatting_stays_inert_when_disabled_or_unadvertised() {
+    // #254 item 4: gated behind editor.format_on_type (default OFF,
+    // matching VS Code), and even when on, nothing fires unless a
+    // server advertised the trigger set for the language.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("lib.rs"), "fn main() {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert!(!app.format_on_type, "off by default");
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    app.tick_on_type_formatting();
+    assert!(app.on_type_request.is_none(), "disabled: nothing fires");
+    // Enable via the settings toggle; still inert because no server has
+    // advertised any trigger characters for Rust in this test.
+    app.toggle_format_on_type();
+    assert!(app.format_on_type);
+    assert_eq!(app.status, "Format on Type: on");
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    app.tick_on_type_formatting();
+    assert!(
+        app.on_type_request.is_none(),
+        "no advertised trigger set: the request is never sent"
+    );
+}

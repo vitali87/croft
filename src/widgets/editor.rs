@@ -1933,6 +1933,10 @@ pub struct Editor {
     /// Each entry is a full selection (anchor and head); head is that caret's
     /// cursor. Edits apply to the primary and all of these as one undo step.
     pub carets: Vec<EditorSelection>,
+    /// The last typed character and the `edit_seq` it produced — the
+    /// on-type formatting trigger detector (#254). Stale once any other
+    /// edit bumps the seq.
+    pub last_typed: Option<(char, u64)>,
     /// Collaborators' caret positions in this file (multiplayer sessions,
     /// docs/MULTIPLAYER.md): (row, char col, participant color). Painted as
     /// colored block cells like secondary carets; the App rebuilds this
@@ -2242,6 +2246,7 @@ impl Editor {
             last_gutter_width: 0,
             selection: None,
             carets: Vec::new(),
+            last_typed: None,
             ghost_carets: Vec::new(),
             ghost_caret_labels: Vec::new(),
             stream_stop_line: None,
@@ -4885,6 +4890,9 @@ impl Editor {
         self.lines[row].insert(byte, c);
         self.cursor_col += 1;
         self.mark_buffer_changed();
+        // On-type formatting (#254) reads this to know THE last edit was
+        // this character (seq must still match at the tick).
+        self.last_typed = Some((c, self.edit_seq));
     }
 
     /// The language id (VS Code identifier) of this buffer, for snippet scoping.
@@ -5034,6 +5042,8 @@ impl Editor {
         self.delete_selection_inner();
         self.smart_insert_newline_inner();
         self.recompute_highlights();
+        // Newline is an on-type trigger for several servers (#254).
+        self.last_typed = Some(('\n', self.edit_seq));
     }
 
     fn smart_insert_newline_inner(&mut self) {
@@ -5384,6 +5394,14 @@ impl Editor {
         } else {
             self.start_selection_at_cursor();
         }
+    }
+
+    /// An editor `(row, char col)` as an LSP UTF-16 `(line, character)`.
+    pub fn pos_to_utf16(&self, row: usize, col: usize) -> (u32, u32) {
+        let row = row.min(self.lines.len().saturating_sub(1));
+        let line = &self.lines[row];
+        let byte = char_byte(line, col.min(line.chars().count()));
+        (row as u32, line[..byte].encode_utf16().count() as u32)
     }
 
     pub fn clear_selection(&mut self) {
