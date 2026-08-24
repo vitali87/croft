@@ -6055,6 +6055,11 @@ impl App {
             if self.inlay_hints_enabled {
                 lsp.request_inlay_hints(path.clone(), line_count, seq);
             }
+            // Fold spans ride the same cadence (#254); the worker drops
+            // the request silently when no server advertises the
+            // provider, which is what leaves the editor's indentation /
+            // region fallback in charge.
+            lsp.request_folding_ranges(path.clone(), seq);
             // Document colors ride the same cadence (#254); the worker is
             // silent when no server advertises a colorProvider, which is
             // what keeps the swatches from ever appearing unadvertised.
@@ -7024,6 +7029,40 @@ impl App {
             for group in self.editor_layout.inactive_groups_mut() {
                 if group.path.as_deref() == Some(u.path.as_path()) {
                     group.apply_inlay_hints(u.path.clone(), u.hints.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Drain the LSP fold-span replies (#254) into every editor showing
+    /// the file. Seq-gated like inlay hints; an EMPTY reply is dropped so
+    /// a server that answers before indexing (or lacks real spans) never
+    /// erases the indentation/region fallback — the outline's guard.
+    pub fn drain_lsp_folding_ranges(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut updates = Vec::new();
+        while let Some(u) = lsp.drain_folding_ranges() {
+            updates.push(u);
+        }
+        let mut changed = false;
+        for u in updates {
+            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+                continue;
+            }
+            if u.ranges.is_empty() {
+                continue;
+            }
+            if self.editor.path.as_deref() == Some(u.path.as_path()) {
+                self.editor.set_lsp_folds(u.ranges.clone());
+                changed = true;
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(u.path.as_path()) {
+                    group.set_lsp_folds(u.ranges.clone());
                     changed = true;
                 }
             }
@@ -15185,6 +15224,28 @@ impl App {
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'l') => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
+                self.poke_cursor();
+                true
+            }
+            // Cmd+K Cmd+/ : collapse every comment block (VS Code
+            // "Fold All Block Comments", #254).
+            KeyCode::Char('/') if plain => {
+                self.editor
+                    .fold_all_of_kind(crate::lsp::manager::FoldRangeKind::Comment);
+                self.poke_cursor();
+                true
+            }
+            // Cmd+K Cmd+8 / Cmd+K Cmd+9: fold / unfold every #region
+            // (VS Code "Fold/Unfold All Regions", #254).
+            KeyCode::Char('8') if plain => {
+                self.editor
+                    .fold_all_of_kind(crate::lsp::manager::FoldRangeKind::Region);
+                self.poke_cursor();
+                true
+            }
+            KeyCode::Char('9') if plain => {
+                self.editor
+                    .unfold_all_of_kind(crate::lsp::manager::FoldRangeKind::Region);
                 self.poke_cursor();
                 true
             }
@@ -26721,6 +26782,15 @@ impl App {
             }
             Cmd::FoldAll => self.editor.fold_all(),
             Cmd::UnfoldAll => self.editor.unfold_all(),
+            Cmd::FoldAllComments => self
+                .editor
+                .fold_all_of_kind(crate::lsp::manager::FoldRangeKind::Comment),
+            Cmd::FoldAllRegions => self
+                .editor
+                .fold_all_of_kind(crate::lsp::manager::FoldRangeKind::Region),
+            Cmd::UnfoldAllRegions => self
+                .editor
+                .unfold_all_of_kind(crate::lsp::manager::FoldRangeKind::Region),
             Cmd::TrimFinalNewlines => {
                 if self.editor.trim_final_newlines() {
                     self.status = String::from("Trimmed final newlines");
@@ -39246,6 +39316,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let code_action_changed = app.drain_lsp_code_actions();
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let inlay_changed = app.drain_lsp_inlay_hints();
+        let folds_changed = app.drain_lsp_folding_ranges();
         let selection_ranges_changed = app.drain_lsp_selection_ranges();
         let colors_changed = app.drain_lsp_document_colors();
         let color_pres_changed = app.drain_lsp_color_presentations();
@@ -39322,6 +39393,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || code_action_changed
             || semantic_changed
             || inlay_changed
+            || folds_changed
             || selection_ranges_changed
             || colors_changed
             || color_pres_changed

@@ -806,6 +806,24 @@ impl LspClient {
             .context("inlay_hint")
     }
 
+    /// `textDocument/foldingRange`: the server's fold spans for the whole
+    /// document, with optional kinds (comment / imports / region). Backs
+    /// the editor's LSP-first folding (#254); the indentation scan stays
+    /// the fallback when the server lacks the provider.
+    pub async fn folding_ranges(
+        &mut self,
+        uri: Url,
+    ) -> Result<Option<Vec<lsp_types::FoldingRange>>> {
+        self.server
+            .folding_range(lsp_types::FoldingRangeParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("folding_range")
+    }
+
     /// `textDocument/documentColor`: every color value in the document
     /// (#254) — the swatch decoration's data source.
     pub async fn document_color(&mut self, uri: Url) -> Result<Vec<lsp_types::ColorInformation>> {

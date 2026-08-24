@@ -29165,6 +29165,28 @@ fn refresh_run_debug_syncs_the_config_row() {
 }
 
 #[test]
+fn fold_all_regions_command_works_with_no_language_server_attached() {
+    // #254's fallback criterion: region folding must work when no LSP
+    // ever answers — here the file's language has no server at all.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("notes.txt"),
+        "#region setup\nline a\nline b\n#endregion\nrest\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("notes.txt"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.run_command(crate::widgets::command_palette::Command::FoldAllRegions);
+    assert!(app.editor.is_line_hidden(1) && app.editor.is_line_hidden(2));
+    assert!(!app.editor.is_line_hidden(0) && !app.editor.is_line_hidden(4));
+    app.run_command(crate::widgets::command_palette::Command::UnfoldAllRegions);
+    assert!(!app.editor.is_line_hidden(1), "regions expanded again");
+}
+
+#[test]
 fn expand_selection_falls_back_to_tree_sitter_when_the_lsp_cannot_route() {
     // #254 item 2's serverless criterion, end to end: the worker answers
     // `unsupported` for an untracked doc, and the drained verdict grows
