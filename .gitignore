@@ -48,3 +48,7 @@ preview*.svg
 # Local secrets (Codeberg token, etc.) — never commit
 .env
 .env.*
+
+# SonarQube Cloud scan artifacts (see .github/workflows/sonarcloud.yml)
+/clippy-report.json
+/.scannerwork/
