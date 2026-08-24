@@ -601,6 +601,14 @@ enum Cmd {
         tab_size: u32,
         insert_spaces: bool,
     },
+    RequestRangeFormatting {
+        request_id: u64,
+        path: PathBuf,
+        start: (u32, u32),
+        end: (u32, u32),
+        tab_size: u32,
+        insert_spaces: bool,
+    },
     RequestCodeAction {
         request_id: u64,
         path: PathBuf,
@@ -1233,6 +1241,30 @@ impl LspManager {
         id
     }
 
+    /// Format only a UTF-16 span ("Format Selection", #254). Same reply
+    /// channel and unsupported contract as whole-document formatting;
+    /// the app tells the two apart by the returned id.
+    pub fn request_range_formatting(
+        &mut self,
+        path: PathBuf,
+        start: (u32, u32),
+        end: (u32, u32),
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestRangeFormatting {
+            request_id: id,
+            path,
+            start,
+            end,
+            tab_size,
+            insert_spaces,
+        });
+        id
+    }
+
     pub fn drain_formatting(&self) -> Option<FormatResult> {
         self.format_rx.try_recv().ok()
     }
@@ -1344,6 +1376,7 @@ struct ManagedClient {
     supports_workspace_symbols: bool,
     supports_rename: bool,
     supports_formatting: bool,
+    supports_range_formatting: bool,
     supports_code_action: bool,
     /// The server's semantic-token legend (token-type names by index),
     /// captured at spawn. `None` when the server advertises no
@@ -1685,6 +1718,26 @@ async fn worker_loop(
                     .request_formatting(request_id, path, tab_size, insert_spaces, &tx.formatting)
                     .await
             }
+            Cmd::RequestRangeFormatting {
+                request_id,
+                path,
+                start,
+                end,
+                tab_size,
+                insert_spaces,
+            } => {
+                state
+                    .request_range_formatting(
+                        request_id,
+                        path,
+                        start,
+                        end,
+                        tab_size,
+                        insert_spaces,
+                        &tx.formatting,
+                    )
+                    .await
+            }
             Cmd::RequestCodeAction {
                 request_id,
                 path,
@@ -1830,6 +1883,8 @@ impl WorkerState {
                         let supports_rename = one_of_supported(&caps.rename_provider);
                         let supports_formatting =
                             one_of_supported(&caps.document_formatting_provider);
+                        let supports_range_formatting =
+                            one_of_supported(&caps.document_range_formatting_provider);
                         let supports_code_action =
                             code_action_supported(&caps.code_action_provider);
                         let semantic_legend = semantic_legend_of(caps).map(Arc::new);
@@ -1857,6 +1912,7 @@ impl WorkerState {
                             supports_workspace_symbols,
                             supports_rename,
                             supports_formatting,
+                            supports_range_formatting,
                             supports_code_action,
                             semantic_legend,
                             semantic_supports_range,
@@ -3403,6 +3459,68 @@ impl WorkerState {
                 "formatting response id={request_id} server={server_name} edits={}",
                 edits.as_ref().map(Vec::len).unwrap_or(0)
             ));
+            let _ = tx.send(FormatResult {
+                request_id,
+                path: path_clone,
+                edits,
+                unsupported: false,
+            });
+        });
+    }
+
+    /// "Format Selection" (#254): `textDocument/rangeFormatting` over one
+    /// UTF-16 span. Same always-answer contract as whole-document
+    /// formatting — the app shows status off this reply.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_range_formatting(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        start: (u32, u32),
+        end: (u32, u32),
+        tab_size: u32,
+        insert_spaces: bool,
+        tx: &std_mpsc::Sender<FormatResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            answer_unsupported(tx, request_id, path);
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            answer_unsupported(tx, request_id, path);
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_range_formatting)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            answer_unsupported(tx, request_id, path);
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            answer_unsupported(tx, request_id, path);
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client
+                .range_formatting(uri, start.0, start.1, end.0, end.1, tab_size, insert_spaces)
+                .await;
+            drop(client);
+            let edits = match resp {
+                Ok(Some(tes)) => Some(tes.iter().map(text_edit_to_span).collect()),
+                Ok(None) => None,
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] range_formatting error: {e}"));
+                    None
+                }
+            };
             let _ = tx.send(FormatResult {
                 request_id,
                 path: path_clone,
@@ -5597,6 +5715,49 @@ mod tests {
             reply.unsupported,
             "the reply must tell the app no formatter is reachable"
         );
+    }
+
+    /// Format Selection keeps whole-document formatting's always-answer
+    /// contract (#254): an unroutable request still reports unsupported.
+    #[test]
+    fn an_unroutable_range_format_request_still_answers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let (fmt_tx, fmt_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry: ServerRegistry::new(),
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+        let never_opened = root.join("stray.py");
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .request_range_formatting(
+                    11,
+                    never_opened.clone(),
+                    (0, 0),
+                    (2, 0),
+                    4,
+                    true,
+                    &fmt_tx,
+                )
+                .await;
+        });
+        let reply = fmt_rx
+            .try_recv()
+            .expect("an untracked document must still get a reply");
+        assert_eq!(reply.request_id, 11);
+        assert!(reply.unsupported);
     }
 
     /// Minimal LSP server that answers `initialize` and appends every
