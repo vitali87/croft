@@ -2775,6 +2775,15 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// The presentation edits behind the open Change Color Presentation
+    /// picker (#254), indexed by row id; cleared after a pick.
+    pending_color_presentations: Vec<(String, Vec<crate::widgets::editor::TextSpanEdit>)>,
+    /// The (path, edit_seq) the pending presentations were computed
+    /// against; a pick is refused when either moved while the picker was
+    /// open (an FS-sync reload bumps the seq without user edits).
+    pending_color_context: Option<(PathBuf, u64)>,
+    /// In-flight colorPresentation request: (id, path, edit_seq).
+    color_presentations_request: Option<(u64, PathBuf, u64)>,
     nav: NavHistory,
     editor_vim_chord: EditorVimChord,
     /// `Cmd+K` leader: armed when the user presses the prefix, holding the
@@ -2883,6 +2892,24 @@ pub struct App {
     /// The user's terminal trigger set (`triggers.json`), pushed into every
     /// pane on the drain tick and swapped wholesale on config reload.
     pub triggers: std::sync::Arc<crate::triggers::TriggerSet>,
+    /// User-defined problem matchers (#252): `matchers.json` (user config
+    /// dir + workspace `.croft/`), batch-scanned at the FinishedCommand
+    /// boundary alongside the built-in table. Swapped wholesale on reload.
+    pub matchers: std::sync::Arc<crate::problem_matchers::MatcherSet>,
+    /// The background-capable subset of `matchers`, pushed into every pane
+    /// on the drain tick exactly like the trigger set.
+    pub watch_set: std::sync::Arc<crate::problem_matchers::WatchSet>,
+    /// tasks.json `problemMatcher` assignments: pane uid → the matcher the
+    /// task running there declared. Exclusive for that pane's batch scans
+    /// (VS Code's model: an explicit matcher replaces the defaults).
+    task_matcher_by_pane:
+        std::collections::HashMap<u64, std::sync::Arc<crate::problem_matchers::CompiledMatcher>>,
+    /// Panes whose PROBLEMS batch a watch matcher currently owns. The
+    /// watcher eventually exiting fires a FinishedCommand whose whole-
+    /// history rescan would resurrect every error of every past cycle, so
+    /// that one scan is skipped (the flag clears with it — the pane's next
+    /// ordinary command scans normally).
+    watch_published_panes: std::collections::HashSet<u64>,
     /// Broadcast input (Cmd+K I, iTerm2's Cmd+Opt+I): while on, shell-bound
     /// keystrokes and pastes in the terminal go to every pane instead of
     /// just the focused one. Session-scoped; never persisted.
@@ -3678,6 +3705,21 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         let loaded_prefs = merged_settings.prefs.clone();
+        // Problem matchers (#252). Under test an empty set: the developer's
+        // real matchers.json must never steer app tests; tests inject their
+        // own. Compile warnings surface once, in OUTPUT · Matchers.
+        let matchers = std::sync::Arc::new(if cfg!(test) {
+            crate::problem_matchers::MatcherSet::default()
+        } else {
+            crate::problem_matchers::MatcherSet::load(
+                &crate::problem_matchers::matchers_path(),
+                Some(&crate::problem_matchers::workspace_matchers_path(&root)),
+            )
+        });
+        for w in &matchers.warnings {
+            crate::output::push("Matchers", crate::output::OutputLevel::Warn, w);
+        }
+        let watch_set = std::sync::Arc::new(matchers.watch_set());
         let explorer_views = ExplorerViewVisibility::from_prefs(loaded_prefs.explorer_views);
         let disabled_extensions = loaded_prefs.disabled_extensions.clone();
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
@@ -4037,6 +4079,10 @@ impl App {
             triggers: std::sync::Arc::new(crate::triggers::TriggerSet::load(
                 &crate::triggers::triggers_path(),
             )),
+            matchers,
+            watch_set,
+            task_matcher_by_pane: std::collections::HashMap::new(),
+            watch_published_panes: std::collections::HashSet::new(),
             broadcast_input: false,
             pending_broadcast_enable: false,
             show_terminal_timestamps: false,
@@ -4123,6 +4169,9 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            pending_color_presentations: Vec::new(),
+            pending_color_context: None,
+            color_presentations_request: None,
             hover: HoverDwell::default(),
             hover_popup: None,
             hover_request_id: None,
@@ -5984,6 +6033,10 @@ impl App {
             if self.inlay_hints_enabled {
                 lsp.request_inlay_hints(path.clone(), line_count, seq);
             }
+            // Document colors ride the same cadence (#254); the worker is
+            // silent when no server advertises a colorProvider, which is
+            // what keeps the swatches from ever appearing unadvertised.
+            lsp.request_document_colors(path.clone(), seq);
             self.lsp_last_seen.insert(path, seq);
         }
         let closed: Vec<PathBuf> = self
@@ -6956,6 +7009,119 @@ impl App {
         changed
     }
 
+    /// Drain document-color batches (#254) into every editor showing the
+    /// file — the inlay-hints fan-out, seq gate included. An empty batch
+    /// clears the swatches (a stylesheet that lost its last color).
+    pub fn drain_lsp_document_colors(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut updates = Vec::new();
+        while let Some(u) = lsp.drain_document_colors() {
+            updates.push(u);
+        }
+        let mut changed = false;
+        for u in updates {
+            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+                continue;
+            }
+            if self.editor.path.as_deref() == Some(u.path.as_path()) {
+                self.editor
+                    .apply_document_colors(u.path.clone(), u.colors.clone());
+                changed = true;
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(u.path.as_path()) {
+                    group.apply_document_colors(u.path.clone(), u.colors.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// "Change Color Presentation" (#254): ask for the alternative
+    /// spellings of the color value at the cursor and defer the picker on
+    /// the reply.
+    fn change_color_presentation(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        let Some(item) = self.editor.color_at(row, col).cloned() else {
+            self.status = String::from("No color value at the cursor");
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let seq = self.editor.edit_seq;
+        let Some(lsp) = self.lsp.as_mut() else {
+            self.status = String::from("No language server for this file");
+            return;
+        };
+        let id = lsp.request_color_presentations(
+            path.clone(),
+            item.raw,
+            (item.line, item.character),
+            (item.end_line, item.end_character),
+        );
+        self.color_presentations_request = Some((id, path, seq));
+        self.status = String::from("Fetching color presentations…");
+    }
+
+    /// Open the presentation picker when the reply lands (#254); gated on
+    /// id + path + edit_seq like every deferred caret request.
+    pub fn drain_lsp_color_presentations(&mut self) -> bool {
+        let mut results = Vec::new();
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(r) = lsp.drain_color_presentations() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for result in results {
+            let Some((id, path, seq)) = self.color_presentations_request.clone() else {
+                continue;
+            };
+            if result.request_id != id {
+                continue;
+            }
+            self.color_presentations_request = None;
+            if self.editor.path.as_deref() != Some(path.as_path()) || self.editor.edit_seq != seq {
+                continue;
+            }
+            changed = true;
+            if result.presentations.is_empty() {
+                self.status = String::from("No color presentations offered here");
+                continue;
+            }
+            let rows: Vec<crate::widgets::list_picker::ListRow> = result
+                .presentations
+                .iter()
+                .enumerate()
+                .map(|(i, (label, _))| crate::widgets::list_picker::ListRow {
+                    id: i.to_string(),
+                    label: label.clone(),
+                })
+                .collect();
+            self.pending_color_presentations = result.presentations;
+            self.pending_color_context = Some((path.clone(), seq));
+            self.open_list_picker(
+                crate::widgets::list_picker::ListPicker::new(
+                    crate::widgets::list_picker::ListPurpose::ColorPresentation,
+                    "Change Color Presentation",
+                    rows,
+                ),
+                "No color presentations offered here",
+            );
+        }
+        changed
+    }
+
     /// Flatten the per-server diagnostics stored for `path` into one list for
     /// the editor. Servers are layered, not merged across (each owns its own
     /// findings), so this is a simple concatenation of every server's set.
@@ -6977,8 +7143,30 @@ impl App {
     /// against the command's cwd (falling back to the workspace root);
     /// resolution is lexical, no filesystem probe, so a path the tool
     /// printed oddly still gets a row even if navigation later misses.
-    fn apply_build_scan(&mut self, pane: u64, cwd: Option<&Path>, output: &str) -> bool {
-        let diags = crate::build_matchers::scan(output);
+    fn apply_build_scan(&mut self, pane: u64, cwd: Option<&Path>, cmd: &str, output: &str) -> bool {
+        // A watch matcher already published this pane's batch mid-run: the
+        // watcher's exit must not overwrite the last cycle with a rescan of
+        // its whole history. One skip only — the pane's next command scans.
+        if self.watch_published_panes.remove(&pane) {
+            return false;
+        }
+        // A task-declared problemMatcher is exclusive for its pane
+        // (VS Code's model); otherwise user matchers claiming the command
+        // run alongside the built-in table.
+        let diags = match self.task_matcher_by_pane.get(&pane) {
+            Some(m) => m.scan_batch(output),
+            None => self.matchers.scan_batch(output, cmd),
+        };
+        self.install_build_diags(pane, cwd, diags)
+    }
+
+    /// Install `diags` as pane `pane`'s PROBLEMS contribution (#119/#252).
+    fn install_build_diags(
+        &mut self,
+        pane: u64,
+        cwd: Option<&Path>,
+        diags: Vec<crate::build_matchers::BuildDiag>,
+    ) -> bool {
         let had_old = self
             .build_diag_files_by_pane
             .get(&pane)
@@ -7017,6 +7205,43 @@ impl App {
         self.build_diag_files_by_pane.insert(pane, touched);
         self.rebuild_problems();
         true
+    }
+
+    /// Re-read matchers.json (user + workspace) after a save, surfacing
+    /// compile warnings once in OUTPUT · Matchers (#252).
+    fn reload_matchers(&mut self) {
+        // Same isolation guard as App::new: the developer's real
+        // matchers.json must never steer app tests — a test that saves a
+        // path equal to the real matchers_path() would otherwise reload
+        // the runner's actual config here.
+        let set = if cfg!(test) {
+            crate::problem_matchers::MatcherSet::default()
+        } else {
+            crate::problem_matchers::MatcherSet::load(
+                &crate::problem_matchers::matchers_path(),
+                Some(&crate::problem_matchers::workspace_matchers_path(
+                    self.workspace_root(),
+                )),
+            )
+        };
+        for w in &set.warnings {
+            crate::output::push("Matchers", crate::output::OutputLevel::Warn, w);
+        }
+        let warned = set.warnings.len();
+        self.watch_set = std::sync::Arc::new(set.watch_set());
+        self.matchers = std::sync::Arc::new(set);
+        self.status = if warned == 0 {
+            format!(
+                "Problem matchers reloaded ({} active)",
+                self.matchers.matchers.len()
+            )
+        } else {
+            format!(
+                "Problem matchers reloaded ({} active, {warned} warning{} — see OUTPUT · Matchers)",
+                self.matchers.matchers.len(),
+                if warned == 1 { "" } else { "s" }
+            )
+        };
     }
 
     fn clear_build_diagnostics(&mut self) {
@@ -19997,6 +20222,31 @@ impl App {
                 }
                 self.pending_code_actions.clear();
             }
+            ListPurpose::ColorPresentation => {
+                // The edits were computed against a specific buffer state;
+                // an external reload while the picker was open orphans
+                // them (#277 review) — refuse rather than splice at
+                // stale offsets.
+                let context_ok = self.pending_color_context.take().is_some_and(|(p, seq)| {
+                    self.editor.path.as_deref() == Some(p.as_path()) && self.editor.edit_seq == seq
+                });
+                if context_ok {
+                    if let Some((label, edits)) =
+                        self.pending_color_presentations.get(index).cloned()
+                    {
+                        let applied = self.editor.apply_span_edits(&edits);
+                        self.status = if applied > 0 {
+                            format!("Color rewritten as {label}")
+                        } else {
+                            String::from("The presentation's edit no longer applies")
+                        };
+                    }
+                } else {
+                    self.status =
+                        String::from("The buffer changed — re-run Change Color Presentation");
+                }
+                self.pending_color_presentations.clear();
+            }
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
                     self.run_project_task(task);
@@ -20278,6 +20528,14 @@ impl App {
     /// `None` when no pane could be started (already reported in `status`).
     pub fn run_project_task(&mut self, task: crate::tasks::Task) -> Option<u64> {
         let pane_name = format!("Task: {}", task.label);
+        // The task's problemMatcher (#252), translated up front so both the
+        // reuse and fresh-pane paths assign the same thing (or clear a
+        // previous task's leftover).
+        let matcher = task
+            .problem_matcher
+            .as_ref()
+            .and_then(crate::problem_matchers::from_tasks_json)
+            .map(std::sync::Arc::new);
         // Ctrl-E + Ctrl-U first: the idle shell's line editor may hold a
         // half-typed command that would otherwise concatenate and run
         // (same rule `format_cd_command` pins for the cd seed).
@@ -20300,7 +20558,9 @@ impl App {
             self.show_terminal = true;
             self.focus_pane(Pane::Terminal);
             self.status = format!("Running {}", task.label);
-            return Some(self.terminals[idx].uid());
+            let uid = self.terminals[idx].uid();
+            self.assign_task_matcher(uid, matcher);
+            return Some(uid);
         }
         match crate::widgets::terminal::PtyTerminal::new(&self.active_workspace_root()) {
             Ok(mut term) => {
@@ -20308,6 +20568,7 @@ impl App {
                 term.write_input(command.as_bytes());
                 let uid = term.uid();
                 self.insert_terminal(term);
+                self.assign_task_matcher(uid, matcher);
                 self.status = format!("Running {}", task.label);
                 Some(uid)
             }
@@ -20315,6 +20576,31 @@ impl App {
                 self.status = format!("Could not start task pane: {e}");
                 None
             }
+        }
+    }
+
+    /// Record (or clear) the problemMatcher owning a task pane (#252): the
+    /// map drives the batch scan at the FinishedCommand boundary, the
+    /// pane's watch slot drives the mid-run engine when the matcher is a
+    /// background one. Rerunning a matcher-less task in a pane clears the
+    /// previous task's leftover, and either way the pane starts the new
+    /// run without a stale watch-published flag.
+    fn assign_task_matcher(
+        &mut self,
+        pane: u64,
+        matcher: Option<std::sync::Arc<crate::problem_matchers::CompiledMatcher>>,
+    ) {
+        self.watch_published_panes.remove(&pane);
+        match &matcher {
+            Some(m) => {
+                self.task_matcher_by_pane.insert(pane, m.clone());
+            }
+            None => {
+                self.task_matcher_by_pane.remove(&pane);
+            }
+        }
+        if let Some(t) = self.terminals.iter().find(|t| t.uid() == pane) {
+            t.set_pane_watch(matcher.filter(|m| m.background.is_some()));
         }
     }
 
@@ -24218,8 +24504,12 @@ impl App {
         let mut trigger_note: Option<String> = None;
         let mut captured: Vec<crate::widgets::captures::CapturedLine> = Vec::new();
         // Finished-command outputs to run through the build matchers after
-        // the immutable pane sweep (#119): (pane index, cwd, output).
-        let mut build_scans: Vec<(u64, Option<PathBuf>, String)> = Vec::new();
+        // the immutable pane sweep (#119): (pane uid, cwd, command, output).
+        let mut build_scans: Vec<(u64, Option<PathBuf>, String, String)> = Vec::new();
+        // Watch-matcher batches published mid-run (#252): (pane uid, cwd,
+        // the cycle's diagnostics — empty clears the pane's entries).
+        let mut watch_installs: Vec<(u64, Option<PathBuf>, Vec<crate::build_matchers::BuildDiag>)> =
+            Vec::new();
         // A preLaunchTask completing settles the parked debug launch (#250);
         // recorded here and acted on after the sweep (launching mutates self).
         let mut settled_launch: Option<Option<i32>> = None;
@@ -24227,6 +24517,10 @@ impl App {
             // Keep every pane on the current trigger set, wherever it was
             // created (a ptr-eq no-op when already current).
             t.set_triggers(self.triggers.clone());
+            t.set_watch_set(self.watch_set.clone());
+            for (cwd, batch) in t.drain_watch_batches() {
+                watch_installs.push((t.uid(), cwd, batch));
+            }
             for h in t.drain_trigger_hits() {
                 match h.action {
                     crate::triggers::TriggerAction::Capture => {
@@ -24253,7 +24547,7 @@ impl App {
             // Always drain so completions never pile up unseen.
             for f in t.drain_finished_commands() {
                 if !f.output.is_empty() {
-                    build_scans.push((t.uid(), f.cwd.clone(), f.output.clone()));
+                    build_scans.push((t.uid(), f.cwd.clone(), f.cmd.clone(), f.output.clone()));
                 }
                 // Durable command history: every finished command with a
                 // known text is recorded (cwd, exit, duration, timestamp)
@@ -24326,8 +24620,15 @@ impl App {
             }
         }
         let mut build_changed = false;
-        for (pane, cwd, output) in build_scans {
-            build_changed |= self.apply_build_scan(pane, cwd.as_deref(), &output);
+        // Watch publishes first: a batch replaces the pane's entries
+        // wholesale, and marks the pane so the watcher's own eventual
+        // FinishedCommand rescan cannot resurrect stale cycles.
+        for (pane, cwd, diags) in watch_installs {
+            self.watch_published_panes.insert(pane);
+            build_changed |= self.install_build_diags(pane, cwd.as_deref(), diags);
+        }
+        for (pane, cwd, cmd, output) in build_scans {
+            build_changed |= self.apply_build_scan(pane, cwd.as_deref(), &cmd, &output);
         }
         // Captures collect silently (iTerm2's model: the panel is the
         // surface, not the status bar), but still trigger a redraw.
@@ -26146,6 +26447,7 @@ impl App {
                 self.status = String::from("Converted indentation to tabs");
             }
             Cmd::FormatDocument => self.start_format_document(),
+            Cmd::ChangeColorPresentation => self.change_color_presentation(),
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
@@ -26553,6 +26855,10 @@ impl App {
                 crate::triggers::triggers_path(),
                 ConfigFileSeed::Triggers,
             ),
+            Cmd::OpenMatchersJson => self.open_config_file_in_editor(
+                crate::problem_matchers::matchers_path(),
+                ConfigFileSeed::Matchers,
+            ),
         }
     }
 
@@ -26573,6 +26879,7 @@ impl App {
                 ConfigFileSeed::Keybindings => crate::keymap::TEMPLATE.to_string(),
                 ConfigFileSeed::Snippets => crate::snippets::TEMPLATE.to_string(),
                 ConfigFileSeed::Triggers => crate::triggers::TEMPLATE.to_string(),
+                ConfigFileSeed::Matchers => crate::problem_matchers::TEMPLATE.to_string(),
             };
             if let Err(e) = std::fs::write(&path, contents) {
                 self.status = format!("Could not create {}: {e}", path.display());
@@ -26602,6 +26909,9 @@ impl App {
             }
             ConfigFileSeed::Triggers => {
                 String::from("Editing triggers.json — save to apply immediately")
+            }
+            ConfigFileSeed::Matchers => {
+                String::from("Editing matchers.json — save to apply immediately")
             }
         };
     }
@@ -31479,6 +31789,10 @@ impl App {
                 "Triggers reloaded ({} active)",
                 self.triggers.triggers.len()
             );
+        } else if path == crate::problem_matchers::matchers_path()
+            || path == crate::problem_matchers::workspace_matchers_path(self.workspace_root())
+        {
+            self.reload_matchers();
         } else if path == crate::prefs::config_path()
             || self.settings_chain.iter().any(|p| p == path)
         {
@@ -36467,6 +36781,7 @@ enum ConfigFileSeed {
     Keybindings,
     Snippets,
     Triggers,
+    Matchers,
 }
 
 /// Starter contents for a fresh settings overlay layer.
@@ -38779,6 +39094,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let code_action_changed = app.drain_lsp_code_actions();
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let inlay_changed = app.drain_lsp_inlay_hints();
+        let colors_changed = app.drain_lsp_document_colors();
+        let color_pres_changed = app.drain_lsp_color_presentations();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
@@ -38852,6 +39169,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || code_action_changed
             || semantic_changed
             || inlay_changed
+            || colors_changed
+            || color_pres_changed
             || diagnostics_changed
             || progress_changed
             || voice_changed

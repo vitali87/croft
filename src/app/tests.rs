@@ -28552,7 +28552,7 @@ fn build_scan_installs_problems_replaces_per_pane_and_merges_with_lsp() {
     std::fs::create_dir(&cwd).unwrap();
 
     let cargo_out = "error[E0308]: mismatched types\n  --> src/main.rs:12:5\n";
-    assert!(app.apply_build_scan(0, Some(&cwd), cargo_out));
+    assert!(app.apply_build_scan(0, Some(&cwd), "cargo build", cargo_out));
     let expected = cwd.join("src/main.rs");
     let groups = app.problems.groups().to_vec();
     let g = groups
@@ -28564,17 +28564,17 @@ fn build_scan_installs_problems_replaces_per_pane_and_merges_with_lsp() {
     assert_eq!((g.items[0].line, g.items[0].col), (11, 4));
 
     // A second pane contributes a different file; both coexist.
-    assert!(app.apply_build_scan(1, Some(&cwd), "main.c:7:3: error: boom\n"));
+    assert!(app.apply_build_scan(1, Some(&cwd), "make", "main.c:7:3: error: boom\n"));
     assert_eq!(app.problems.groups().len(), 2);
 
     // Pane 0 rebuilds clean: its contribution clears, pane 1's stays.
-    assert!(app.apply_build_scan(0, Some(&cwd), "   Finished dev profile\n"));
+    assert!(app.apply_build_scan(0, Some(&cwd), "cargo build", "   Finished dev profile\n"));
     let groups = app.problems.groups().to_vec();
     assert_eq!(groups.len(), 1, "pane 0's fixed errors must vanish");
     assert!(groups[0].path.ends_with("main.c"));
 
     // Clean output from a pane with no history is a no-op.
-    assert!(!app.apply_build_scan(5, Some(&cwd), "all good\n"));
+    assert!(!app.apply_build_scan(5, Some(&cwd), "true", "all good\n"));
 
     app.clear_build_diagnostics();
     assert!(app.problems.groups().is_empty());
@@ -29151,4 +29151,168 @@ fn refresh_run_debug_syncs_the_config_row() {
     app.refresh_run_debug();
     assert_eq!(app.run_debug.config_count, 1);
     assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
+}
+
+#[test]
+fn change_color_presentation_needs_a_color_and_defers_the_picker_on_the_reply() {
+    use crate::lsp::manager::ColorItem;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("style.css"), "a { color: #ff0000; }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("style.css"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    // No color at the cursor: refused up front.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 2;
+    app.run_command(crate::widgets::command_palette::Command::ChangeColorPresentation);
+    assert_eq!(app.status, "No color value at the cursor");
+    // Inject a color set (as a documentColor reply would) and ask on it.
+    let path = tmp.path().join("style.css");
+    app.editor.apply_document_colors(
+        path.clone(),
+        vec![ColorItem {
+            line: 0,
+            character: 11,
+            end_line: 0,
+            end_character: 18,
+            red: 255,
+            green: 0,
+            blue: 0,
+            raw: (1.0, 0.0, 0.0, 1.0),
+        }],
+    );
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 12;
+    app.run_command(crate::widgets::command_palette::Command::ChangeColorPresentation);
+    assert_eq!(app.status, "Fetching color presentations…");
+    // No server in tests: the worker's always-answer contract resolves
+    // the deferred picker to the empty-offering status.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.color_presentations_request.is_some() && std::time::Instant::now() < deadline {
+        app.drain_lsp_color_presentations();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.status, "No color presentations offered here");
+}
+
+#[test]
+fn a_stale_color_presentation_pick_is_refused_after_a_buffer_change() {
+    use crate::widgets::editor::TextSpanEdit;
+    use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+    // #277 review: an external reload while the picker is open bumps
+    // edit_seq; the pick must refuse rather than splice stale offsets.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("style.css"), "a { color: #ff0000; }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("style.css");
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.pending_color_presentations = vec![(
+        String::from("rgb(255, 0, 0)"),
+        vec![TextSpanEdit {
+            start: (0, 11),
+            end: (0, 18),
+            new_text: String::from("rgb(255, 0, 0)"),
+        }],
+    )];
+    app.pending_color_context = Some((path.clone(), app.editor.edit_seq));
+    app.open_list_picker(
+        ListPicker::new(
+            ListPurpose::ColorPresentation,
+            "Change Color Presentation",
+            vec![ListRow {
+                id: String::from("0"),
+                label: String::from("rgb(255, 0, 0)"),
+            }],
+        ),
+        "empty",
+    );
+    // The buffer changes while the picker is open.
+    app.editor.insert_char('x');
+    let before = app.editor.lines[0].clone();
+    app.confirm_list_picker();
+    assert_eq!(app.editor.lines[0], before, "no stale edit applied");
+    assert_eq!(
+        app.status,
+        "The buffer changed — re-run Change Color Presentation"
+    );
+    assert!(app.pending_color_presentations.is_empty());
+}
+
+#[test]
+fn a_custom_matcher_from_matchers_json_feeds_problems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.matchers = std::sync::Arc::new(crate::problem_matchers::MatcherSet::from_json(
+        r##"[ { "name": "mylint",
+               "pattern": "^(?P<file>\\S+):(?P<line>\\d+):(?P<col>\\d+) (?P<severity>\\w+) (?P<message>.+)$",
+               "severity_map": { "E": "error" },
+               "applies_to": "mylint*" } ]"##,
+    ));
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir(&cwd).unwrap();
+    let out = "src/a.py:12:5 E undefined name 'x'\n";
+    assert!(app.apply_build_scan(0, Some(&cwd), "mylint src/", out));
+    let groups = app.problems.groups().to_vec();
+    let g = groups
+        .iter()
+        .find(|g| g.path == cwd.join("src/a.py"))
+        .expect("the custom matcher's file must group in PROBLEMS");
+    assert_eq!(g.items.len(), 1);
+    assert_eq!(g.items[0].source, "mylint");
+    assert_eq!(
+        g.items[0].severity,
+        crate::lsp::manager::DiagnosticSeverity::Error,
+        "severity_map turns E into an error"
+    );
+    assert_eq!((g.items[0].line, g.items[0].col), (11, 4));
+
+    // The applies_to glob keeps the matcher off other commands: the same
+    // output under `cargo build` matches nothing, clearing the pane.
+    assert!(app.apply_build_scan(0, Some(&cwd), "cargo build", out));
+    assert!(app.problems.groups().is_empty(), "non-matching command");
+}
+
+#[test]
+fn a_task_problem_matcher_owns_its_pane_and_watch_publishes_win() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir(&cwd).unwrap();
+
+    // A tasks.json "$gcc" matcher is exclusive for its pane: gcc-shaped
+    // rows report, the tsc-shaped line in the same output does not
+    // (VS Code's model — an explicit matcher replaces the defaults).
+    let gcc = std::sync::Arc::new(crate::problem_matchers::well_known("$gcc").unwrap());
+    app.assign_task_matcher(7, Some(gcc));
+    let out = "main.c:7:3: error: expected ';'\nsrc/app.ts(4,10): error TS2322: nope\n";
+    assert!(app.apply_build_scan(7, Some(&cwd), "make", out));
+    let groups = app.problems.groups().to_vec();
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert!(groups[0].path.ends_with("main.c"));
+
+    // A watch publish replaces the pane's batch wholesale — and the
+    // watcher's own exit (a FinishedCommand rescan over its whole
+    // history) must not resurrect old cycles: that one scan is skipped.
+    assert!(app.install_build_diags(7, Some(&cwd), Vec::new()));
+    assert!(app.problems.groups().is_empty(), "empty batch clears");
+    app.watch_published_panes.insert(7);
+    assert!(
+        !app.apply_build_scan(7, Some(&cwd), "tsc --watch", out),
+        "the post-watch rescan is skipped"
+    );
+    // One skip only: the pane's next ordinary command scans normally.
+    assert!(app.apply_build_scan(7, Some(&cwd), "make", "main.c:1:1: error: x\n"));
+    assert_eq!(app.problems.groups().len(), 1);
+
+    // Clearing the assignment restores the built-in first-match scan.
+    app.assign_task_matcher(7, None);
+    assert!(app.apply_build_scan(7, Some(&cwd), "make", out));
+    assert_eq!(
+        app.problems.groups().len(),
+        2,
+        "without the task matcher both formats report"
+    );
 }

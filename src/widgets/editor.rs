@@ -2343,11 +2343,19 @@ pub struct Editor {
     /// stale the moment the text changes — and replaced when the app's next
     /// idle-caret request answers.
     occurrences: Vec<(usize, usize, usize, bool)>,
-    /// Decoded per-logical-line hint runs `(char_col, label)`, sorted by
-    /// column. The render loop splices each label into the row as dim italic
-    /// virtual cells at its anchor; every overlay painter, the caret, and
-    /// mouse mapping translate buffer columns past them.
-    inlay_spans: Vec<Vec<(usize, String)>>,
+    /// Decoded per-logical-line virtual-cell runs `(char_col, label,
+    /// swatch)`, sorted by column: LSP inlay hints (swatch `None`, dim
+    /// italic) and document-color swatches (#254: a `■` whose fg IS the
+    /// color). The render loop splices each label into the row at its
+    /// anchor; every overlay painter, the caret, and mouse mapping
+    /// translate buffer columns past them.
+    inlay_spans: Vec<Vec<(usize, String, Option<Color>)>>,
+    /// The document's color values (#254): raw UTF-16 positions + RGB,
+    /// re-decoded like `inlay_hints`; feeds the `■` swatch spans and the
+    /// Change Color Presentation picker's range lookup.
+    color_infos: Vec<crate::lsp::manager::ColorItem>,
+    /// The file `color_infos` describes (same contract as `inlay_path`).
+    color_path: Option<PathBuf>,
     registry: LangRegistry,
     /// When set, every occurrence of this string in the visible portion of
     /// the buffer is overpainted with the search-match style after the
@@ -2542,6 +2550,8 @@ impl Editor {
             inlay_path: None,
             occurrences: Vec::new(),
             inlay_spans: Vec::new(),
+            color_infos: Vec::new(),
+            color_path: None,
             registry: LangRegistry::new(),
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -2985,7 +2995,7 @@ impl Editor {
                 let extra: usize = self
                     .inlay_spans
                     .get(i)
-                    .map(|hs| hs.iter().map(|(_, label)| label.chars().count()).sum())
+                    .map(|hs| hs.iter().map(|(_, label, _)| label.chars().count()).sum())
                     .unwrap_or(0);
                 l.chars().count() + extra
             })
@@ -3712,6 +3722,8 @@ impl Editor {
         // must never splice into this one.
         self.inlay_hints = Vec::new();
         self.inlay_path = None;
+        self.color_infos = Vec::new();
+        self.color_path = None;
         self.inlay_spans = Vec::new();
         self.recompute_highlights();
         // Notebooks auto-open rendered (#180): the JSON stays one
@@ -4559,6 +4571,43 @@ impl Editor {
         self.recompute_inlay_spans();
     }
 
+    /// Install the document's color values (#254): wholesale replace,
+    /// like inlay hints — an empty batch clears the swatches.
+    pub fn apply_document_colors(
+        &mut self,
+        path: PathBuf,
+        colors: Vec<crate::lsp::manager::ColorItem>,
+    ) {
+        self.color_path = Some(path);
+        self.color_infos = colors;
+        self.recompute_inlay_spans();
+    }
+
+    /// The color value whose range contains `(row, col)` — the Change
+    /// Color Presentation picker's target lookup.
+    pub fn color_at(&self, row: usize, col: usize) -> Option<&crate::lsp::manager::ColorItem> {
+        if self.color_path.as_deref() != self.path.as_deref() {
+            return None;
+        }
+        self.color_infos.iter().find(|c| {
+            let (sr, er) = (c.line as usize, c.end_line as usize);
+            if row < sr || row > er {
+                return false;
+            }
+            let sc = self.utf16_col_to_char_pub(sr, c.character);
+            let ec = self.utf16_col_to_char_pub(er, c.end_character);
+            (row > sr || col >= sc) && (row < er || col <= ec)
+        })
+    }
+
+    /// Public UTF-16 → char-column bridge for one row.
+    pub fn utf16_col_to_char_pub(&self, row: usize, character: u32) -> usize {
+        self.lines
+            .get(row)
+            .map(|l| utf16_to_char_col(l, character))
+            .unwrap_or(0)
+    }
+
     /// Install the occurrences of the symbol under the caret, converting the
     /// server's UTF-16 columns to character columns row by row. A multi-line
     /// occurrence (rare, but legal) tints its first row from the start column,
@@ -4613,20 +4662,41 @@ impl Editor {
         // Hint cells change the display width of their lines.
         self.hscroll_content_cols = None;
         let same_file = self.inlay_path.as_deref() == self.path.as_deref();
-        if !same_file || self.inlay_hints.is_empty() {
+        let colors_same_file = self.color_path.as_deref() == self.path.as_deref();
+        let hints_live = same_file && !self.inlay_hints.is_empty();
+        let colors_live = colors_same_file && !self.color_infos.is_empty();
+        if !hints_live && !colors_live {
             self.inlay_spans = Vec::new();
             return;
         }
-        let mut spans: Vec<Vec<(usize, String)>> = vec![Vec::new(); self.lines.len()];
-        for h in &self.inlay_hints {
-            let Some(text) = self.lines.get(h.line as usize) else {
-                continue;
-            };
-            let col = utf16_to_char_col(text, h.character).min(text.chars().count());
-            spans[h.line as usize].push((col, h.label.clone()));
+        let mut spans: Vec<Vec<(usize, String, Option<Color>)>> =
+            vec![Vec::new(); self.lines.len()];
+        if hints_live {
+            for h in &self.inlay_hints {
+                let Some(text) = self.lines.get(h.line as usize) else {
+                    continue;
+                };
+                let col = utf16_to_char_col(text, h.character).min(text.chars().count());
+                spans[h.line as usize].push((col, h.label.clone(), None));
+            }
+        }
+        // Document-color swatches (#254): a one-cell `■` virtual span
+        // whose foreground IS the color, anchored at the value's start.
+        if colors_live {
+            for c in &self.color_infos {
+                let Some(text) = self.lines.get(c.line as usize) else {
+                    continue;
+                };
+                let col = utf16_to_char_col(text, c.character).min(text.chars().count());
+                spans[c.line as usize].push((
+                    col,
+                    String::from("\u{25a0}"),
+                    Some(Color::Rgb(c.red, c.green, c.blue)),
+                ));
+            }
         }
         for line in &mut spans {
-            line.sort_by_key(|(c, _)| *c);
+            line.sort_by_key(|(c, _, _)| *c);
         }
         self.inlay_spans = spans;
     }
@@ -4635,7 +4705,7 @@ impl Editor {
     /// wrapped row segmentation knows nothing about hint cells.
     /// ponytail: hints skip wrap mode; code files don't wrap by default, and
     /// Markdown (the wrapping default) has no hint-serving server.
-    fn row_inlay_spans(&self, line: usize) -> &[(usize, String)] {
+    fn row_inlay_spans(&self, line: usize) -> &[(usize, String, Option<Color>)] {
         if self.wrap_enabled() {
             return &[];
         }
@@ -8430,8 +8500,8 @@ impl Editor {
         while c < line_len {
             let extra: usize = hints
                 .iter()
-                .filter(|(hc, _)| *hc >= self.scroll_col && *hc <= c)
-                .map(|(_, l)| l.chars().count())
+                .filter(|(hc, _, _)| *hc >= self.scroll_col && *hc <= c)
+                .map(|(_, l, _)| l.chars().count())
                 .sum();
             if c + extra >= display_col {
                 break;
@@ -9754,8 +9824,8 @@ impl Widget for &mut Editor {
             let hint_cells: Vec<(usize, usize)> = self
                 .row_inlay_spans(line_idx)
                 .iter()
-                .filter(|(hc, _)| *hc >= row_start && *hc <= hint_cap)
-                .map(|(hc, l)| (*hc, l.chars().count()))
+                .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
+                .map(|(hc, l, _)| (*hc, l.chars().count()))
                 .collect();
             let ex = |c: usize| inlay_cells_before(&hint_cells, c);
             // Caret placement uses the strictly-before rule instead: a
@@ -9787,15 +9857,21 @@ impl Widget for &mut Editor {
                     .add_modifier(Modifier::ITALIC);
                 let mut out: Vec<Span> = Vec::new();
                 let mut from = row_start;
-                for (hcol, label) in self
+                for (hcol, label, swatch) in self
                     .row_inlay_spans(line_idx)
                     .iter()
-                    .filter(|(hc, _)| *hc >= row_start && *hc <= hint_cap)
+                    .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
                 {
                     if *hcol > from {
                         out.extend(inlay_text_segment(raw, &merged, from, *hcol));
                     }
-                    out.push(Span::styled(label.clone(), hint_style));
+                    // A color swatch paints in ITS color (#254); plain
+                    // hints keep the dim italic Zed look.
+                    let style = match swatch {
+                        Some(c) => Style::default().fg(*c),
+                        None => hint_style,
+                    };
+                    out.push(Span::styled(label.clone(), style));
                     from = from.max(*hcol);
                 }
                 if row_end > from {
@@ -10248,8 +10324,8 @@ impl Widget for &mut Editor {
             let hint_cells: Vec<(usize, usize)> = self
                 .row_inlay_spans(*cl)
                 .iter()
-                .filter(|(hc, _)| *hc >= caret_start && *hc <= hint_cap)
-                .map(|(hc, l)| (*hc, l.chars().count()))
+                .filter(|(hc, _, _)| *hc >= caret_start && *hc <= hint_cap)
+                .map(|(hc, l, _)| (*hc, l.chars().count()))
                 .collect();
             let col_cells = cc + inlay_cells_before(&hint_cells, *cc);
             if col_cells < caret_start {
@@ -10586,8 +10662,8 @@ impl Editor {
     fn inlay_cells_before_cursor(&self, line: usize, scroll_col: usize) -> usize {
         self.row_inlay_spans(line)
             .iter()
-            .filter(|(hc, _)| *hc >= scroll_col && *hc < self.cursor_col)
-            .map(|(_, l)| l.chars().count())
+            .filter(|(hc, _, _)| *hc >= scroll_col && *hc < self.cursor_col)
+            .map(|(_, l, _)| l.chars().count())
             .sum()
     }
 
@@ -20283,6 +20359,51 @@ mod tests {
         e.cursor_col = 1;
         e.add_cursor_below();
         assert!(e.carets.is_empty());
+    }
+
+    #[test]
+    fn document_colors_splice_a_swatch_cell_and_answer_color_at() {
+        use crate::lsp::manager::ColorItem;
+        let mut e = editor_with("a { color: #ff0000; }");
+        e.path = Some(std::path::PathBuf::from("/tmp/x.css"));
+        let item = ColorItem {
+            line: 0,
+            character: 11,
+            end_line: 0,
+            end_character: 18,
+            red: 255,
+            green: 0,
+            blue: 0,
+            raw: (1.0, 0.0, 0.0, 1.0),
+        };
+        e.apply_document_colors(std::path::PathBuf::from("/tmp/x.css"), vec![item]);
+        let spans = e.row_inlay_spans(0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0, 11, "anchored at the value's start");
+        assert_eq!(spans[0].1, "\u{25a0}");
+        assert_eq!(spans[0].2, Some(Color::Rgb(255, 0, 0)));
+        // Range lookup, inclusive of the end boundary.
+        assert!(e.color_at(0, 11).is_some());
+        assert!(e.color_at(0, 18).is_some());
+        assert!(e.color_at(0, 10).is_none());
+        assert!(e.color_at(0, 19).is_none());
+        // An empty batch clears the swatches.
+        e.apply_document_colors(std::path::PathBuf::from("/tmp/x.css"), Vec::new());
+        assert!(e.row_inlay_spans(0).is_empty());
+        // Colors for ANOTHER file never splice into this one.
+        let stale = ColorItem {
+            line: 0,
+            character: 0,
+            end_line: 0,
+            end_character: 1,
+            red: 1,
+            green: 2,
+            blue: 3,
+            raw: (0.0, 0.0, 0.0, 1.0),
+        };
+        e.apply_document_colors(std::path::PathBuf::from("/tmp/other.css"), vec![stale]);
+        assert!(e.row_inlay_spans(0).is_empty());
+        assert!(e.color_at(0, 0).is_none());
     }
 
     #[test]
