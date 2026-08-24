@@ -29059,6 +29059,7 @@ fn a_caret_move_between_selection_range_request_and_reply_drops_the_stale_chains
     assert!(
         app.editor.selection.is_none(),
         "the old caret's chains were dropped, not applied at the new caret"
+    );
 }
 
 #[test]
