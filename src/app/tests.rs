@@ -28745,6 +28745,80 @@ fn a_failed_reinstall_rearms_the_drift_hint_for_retry() {
 }
 
 #[test]
+fn workspace_settings_layer_applies_at_startup_and_reloads_live() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        r#"{"format_on_save":true,"disable_indent_guides":true}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The workspace layer is later in the chain than any user layer, so
+    // these hold regardless of the developer's real ~/.config contents.
+    assert!(app.format_on_save, "committed workspace setting applies");
+    assert!(!app.indent_guides_enabled);
+    assert_eq!(
+        crate::config_layers::layer_of(&app.settings_provenance, "format_on_save"),
+        crate::config_layers::LayerKind::Workspace
+    );
+    // Saving an edited layer file re-merges and applies live, no relaunch.
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        r#"{"format_on_save":false,"disable_indent_guides":true}"#,
+    )
+    .unwrap();
+    let layer = crate::config_layers::workspace_config_path(tmp.path());
+    app.reload_config_for_path(&layer);
+    assert!(!app.format_on_save, "the edit applied without a restart");
+    assert!(app.status.contains("Settings reloaded"), "{}", app.status);
+}
+
+#[test]
+fn settings_hub_shows_provenance_and_the_layer_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        r#"{"format_on_save":true}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_settings_view();
+    let rows = app.list_picker.as_ref().expect("hub open").rows.clone();
+    let fos = rows
+        .iter()
+        .find(|r| r.id == "toggle:format_on_save")
+        .unwrap();
+    assert!(
+        fos.label.contains("· workspace"),
+        "a workspace-won value says so: {}",
+        fos.label
+    );
+    for id in [
+        "cmd:open_settings_json",
+        "cmd:open_user_settings_local_json",
+        "cmd:open_workspace_settings_json",
+        "cmd:open_workspace_settings_local_json",
+    ] {
+        assert!(rows.iter().any(|r| r.id == id), "missing hub row {id}");
+    }
+}
+
+#[test]
+fn opening_workspace_local_settings_gitignores_it_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_workspace_settings(true);
+    let gi = std::fs::read_to_string(tmp.path().join(".croft/.gitignore")).unwrap();
+    assert!(gi.contains("config.local.json"), "{gi}");
+    let local = crate::config_layers::workspace_local_config_path(tmp.path());
+    assert_eq!(app.editor.path.as_deref(), Some(local.as_path()));
+    let seeded = std::fs::read_to_string(&local).unwrap();
+    assert!(seeded.contains("settings overlay"), "{seeded}");
+}
+
+#[test]
 fn finished_settles_pending_matches_pane_and_command() {
     assert!(finished_settles_pending(
         7,

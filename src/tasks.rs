@@ -277,7 +277,8 @@ fn pyproject_tasks(root: &Path) -> Vec<Task> {
 /// so VS Code's JSONC tasks.json parses with strict serde_json. Two
 /// passes: comments first, then trailing commas, so a comma followed by
 /// a comment followed by `}` still counts as trailing. Shared with
-/// `dap::configs`, which reads launch.json under the same tolerance.
+/// `dap::configs` (launch.json) and `config_layers` (settings layers),
+/// which read their files under the same tolerance.
 pub(crate) fn strip_jsonc(text: &str) -> String {
     let mut no_comments = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();

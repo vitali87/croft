@@ -2100,6 +2100,12 @@ pub struct App {
     dep_ecosystems: Vec<Ecosystem>,
     /// Which Explorer sub-views are shown, toggled from the ⋯ menu. Persisted.
     pub explorer_views: ExplorerViewVisibility,
+    /// Every file of the layered-settings chain (#251), for hot-reload
+    /// matching on save; rebuilt by `remerge_settings`.
+    settings_chain: Vec<PathBuf>,
+    /// Which layer set each top-level settings key, for the hub's
+    /// provenance suffix ("· workspace").
+    settings_provenance: std::collections::BTreeMap<String, crate::config_layers::LayerKind>,
     /// Extension ids the user has disabled in the Extensions panel. Loaded once
     /// from prefs at startup and persisted on every toggle, mirroring how
     /// `explorer_views` is held in memory rather than re-read each access. The
@@ -3664,7 +3670,14 @@ impl App {
         // first sync tick. Re-detected on every re-root (see sync_explorer_panels).
         let dep_ecosystems = crate::widgets::dependencies::detect_ecosystems(&root);
         dependencies.set_header(crate::widgets::dependencies::header_label(&dep_ecosystems));
-        let loaded_prefs = crate::prefs::Prefs::load_or_default();
+        // Layered settings (#251): defaults ← user ← user-local ← workspace
+        // layers of the primary root, one merged view. Warnings (refused
+        // workspace keys, parse errors) land in the Settings OUTPUT channel.
+        let merged_settings = crate::config_layers::load_merged(Some(&root));
+        for w in &merged_settings.warnings {
+            crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
+        }
+        let loaded_prefs = merged_settings.prefs.clone();
         let explorer_views = ExplorerViewVisibility::from_prefs(loaded_prefs.explorer_views);
         let disabled_extensions = loaded_prefs.disabled_extensions.clone();
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
@@ -3720,7 +3733,7 @@ impl App {
         let layout_prefs = if cfg!(test) {
             crate::prefs::LayoutPrefs::default()
         } else {
-            crate::prefs::Prefs::load_or_default().layout
+            loaded_prefs.layout
         };
         let mut app = Self {
             tree,
@@ -3751,6 +3764,8 @@ impl App {
             dependencies,
             dep_ecosystems,
             explorer_views,
+            settings_chain: merged_settings.chain,
+            settings_provenance: merged_settings.provenance,
             timeline_rx,
             timeline_tx,
             history_done_rx,
@@ -3801,7 +3816,7 @@ impl App {
             theme: if cfg!(test) {
                 crate::theme::Theme::default()
             } else {
-                crate::prefs::Prefs::load_or_default().theme()
+                loaded_prefs.theme()
             },
             focus: Pane::Tree,
             show_tree: true,
@@ -8640,6 +8655,20 @@ impl App {
     /// OSC-1337 icon PNGs against the new background, and drop the lazily-baked
     /// image overlays + arm a full clear so nothing ghosts the old background.
     fn apply_theme(&mut self, theme: crate::theme::Theme) {
+        self.apply_theme_visuals(theme);
+        // Persistence is best-effort: a write failure never blocks the
+        // in-session switch, which has already taken effect above. Skipped
+        // under test so the suite never clobbers the developer's real config.
+        // The layered-settings reload path calls `apply_theme_visuals`
+        // directly instead — a workspace-set theme must not be written back
+        // into the user's own config.
+        if !cfg!(test) {
+            let _ = crate::prefs::save_theme(theme);
+        }
+    }
+
+    /// Everything [`Self::apply_theme`] does except persisting the choice.
+    fn apply_theme_visuals(&mut self, theme: crate::theme::Theme) {
         self.theme = theme;
         // Push the theme's code palette into the highlighter and re-highlight
         // every open editor (across all split groups): cached spans carry baked
@@ -8661,12 +8690,6 @@ impl App {
         // Refresh the per-pane gradient-border flag for the new theme so the
         // focused box switches its highlight style on the very next frame.
         self.sync_focus_flags();
-        // Persistence is best-effort: a write failure never blocks the
-        // in-session switch, which has already taken effect above. Skipped
-        // under test so the suite never clobbers the developer's real config.
-        if !cfg!(test) {
-            let _ = crate::prefs::save_theme(theme);
-        }
         if !cfg!(test) {
             use std::io::Write;
             let mut out = stdout();
@@ -19766,6 +19789,21 @@ impl App {
                         );
                         return;
                     }
+                    "cmd:open_user_settings_local_json" => {
+                        self.open_config_file_in_editor(
+                            crate::config_layers::user_local_config_path(),
+                            ConfigFileSeed::SettingsLayer,
+                        );
+                        return;
+                    }
+                    "cmd:open_workspace_settings_json" => {
+                        self.open_workspace_settings(false);
+                        return;
+                    }
+                    "cmd:open_workspace_settings_local_json" => {
+                        self.open_workspace_settings(true);
+                        return;
+                    }
                     "cmd:open_keybindings_json" => {
                         self.open_config_file_in_editor(
                             crate::keymap::keybindings_path(),
@@ -19796,76 +19834,120 @@ impl App {
     pub fn open_settings_view(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let on_off = |b: bool| if b { "on" } else { "off" };
+        // Per-value provenance (#251): where a non-user layer set the backing
+        // key, say so — the usual "I toggled it and nothing changed" is a
+        // workspace layer winning the merge.
+        let prov = |key: &str| {
+            use crate::config_layers::LayerKind;
+            match crate::config_layers::layer_of(&self.settings_provenance, key) {
+                LayerKind::Default | LayerKind::User => String::new(),
+                other => format!("  · {}", other.label()),
+            }
+        };
         let rows = vec![
             ListRow {
                 id: String::from("toggle:auto_close_pairs"),
-                label: format!("Auto Closing Pairs: {}", on_off(self.auto_close_pairs)),
+                label: format!(
+                    "Auto Closing Pairs: {}{}",
+                    on_off(self.auto_close_pairs),
+                    prov("disable_auto_close_pairs")
+                ),
             },
             ListRow {
                 id: String::from("toggle:format_on_save"),
-                label: format!("Format on Save: {}", on_off(self.format_on_save)),
+                label: format!(
+                    "Format on Save: {}{}",
+                    on_off(self.format_on_save),
+                    prov("format_on_save")
+                ),
             },
             ListRow {
                 id: String::from("toggle:auto_save"),
-                label: format!("Auto Save: {}", on_off(self.auto_save)),
+                label: format!("Auto Save: {}{}", on_off(self.auto_save), prov("auto_save")),
             },
             ListRow {
                 id: String::from("toggle:auto_save_on_focus_change"),
                 label: format!(
-                    "Auto Save on Focus Change: {}",
-                    on_off(self.auto_save_on_focus_change)
+                    "Auto Save on Focus Change: {}{}",
+                    on_off(self.auto_save_on_focus_change),
+                    prov("auto_save_on_focus_change")
                 ),
             },
             ListRow {
                 id: String::from("toggle:inline_blame"),
-                label: format!("Git: Inline Blame: {}", on_off(self.inline_blame_enabled)),
+                label: format!(
+                    "Git: Inline Blame: {}{}",
+                    on_off(self.inline_blame_enabled),
+                    prov("disable_inline_blame")
+                ),
             },
             ListRow {
                 id: String::from("toggle:indent_guides"),
                 label: format!(
-                    "Editor: Indent Guides: {}",
-                    on_off(self.indent_guides_enabled)
+                    "Editor: Indent Guides: {}{}",
+                    on_off(self.indent_guides_enabled),
+                    prov("disable_indent_guides")
                 ),
             },
             ListRow {
                 id: String::from("toggle:bracket_colors"),
                 label: format!(
-                    "Editor: Bracket Pair Colorization: {}",
-                    on_off(self.bracket_colors_enabled)
+                    "Editor: Bracket Pair Colorization: {}{}",
+                    on_off(self.bracket_colors_enabled),
+                    prov("disable_bracket_colors")
                 ),
             },
             ListRow {
                 id: String::from("toggle:render_whitespace"),
                 label: format!(
-                    "Editor: Render Whitespace: {}",
-                    self.whitespace_mode.label()
+                    "Editor: Render Whitespace: {}{}",
+                    self.whitespace_mode.label(),
+                    prov("render_whitespace")
                 ),
             },
             ListRow {
                 id: String::from("toggle:inline_values"),
                 label: format!(
-                    "Debugger: Inline Values: {}",
-                    on_off(self.inline_values_enabled)
+                    "Debugger: Inline Values: {}{}",
+                    on_off(self.inline_values_enabled),
+                    prov("disable_inline_values")
                 ),
             },
             ListRow {
                 id: String::from("toggle:inlay_hints"),
-                label: format!("Editor: Inlay Hints: {}", on_off(self.inlay_hints_enabled)),
+                label: format!(
+                    "Editor: Inlay Hints: {}{}",
+                    on_off(self.inlay_hints_enabled),
+                    prov("disable_inlay_hints")
+                ),
             },
             ListRow {
                 id: String::from("toggle:copy_on_select"),
                 label: format!(
-                    "Terminal: Copy on Selection: {}",
-                    on_off(self.copy_on_select)
+                    "Terminal: Copy on Selection: {}{}",
+                    on_off(self.copy_on_select),
+                    prov("copy_on_select")
                 ),
             },
             ListRow {
                 id: String::from("cmd:color_theme"),
-                label: format!("Color Theme: {}", self.theme.label()),
+                label: format!("Color Theme: {}{}", self.theme.label(), prov("theme")),
             },
             ListRow {
                 id: String::from("cmd:open_settings_json"),
-                label: String::from("Open Settings (JSON)"),
+                label: String::from("Open User Settings (JSON)"),
+            },
+            ListRow {
+                id: String::from("cmd:open_user_settings_local_json"),
+                label: String::from("Open User Settings — Local (JSON, this machine only)"),
+            },
+            ListRow {
+                id: String::from("cmd:open_workspace_settings_json"),
+                label: String::from("Open Workspace Settings (JSON)"),
+            },
+            ListRow {
+                id: String::from("cmd:open_workspace_settings_local_json"),
+                label: String::from("Open Workspace Settings — Local (JSON, gitignored)"),
             },
             ListRow {
                 id: String::from("cmd:open_keybindings_json"),
@@ -19880,6 +19962,25 @@ impl App {
             ListPicker::new(ListPurpose::Settings, "Settings", rows),
             "No settings",
         );
+    }
+
+    /// Preferences: Open Workspace Settings (#251) — the committed
+    /// `.croft/config.json`, or with `local` the gitignored
+    /// `.croft/config.local.json`. Creating either ensures
+    /// `.croft/.gitignore` covers the local file first, so a personal
+    /// override can never land in a commit by accident.
+    pub fn open_workspace_settings(&mut self, local: bool) {
+        let root = self.roots.primary().to_path_buf();
+        if let Err(e) = crate::config_layers::ensure_workspace_local_ignored(&root) {
+            self.status = format!("Could not prepare .croft/: {e}");
+            return;
+        }
+        let path = if local {
+            crate::config_layers::workspace_local_config_path(&root)
+        } else {
+            crate::config_layers::workspace_config_path(&root)
+        };
+        self.open_config_file_in_editor(path, ConfigFileSeed::SettingsLayer);
     }
 
     /// Tasks: Run Task — discover the workspace's tasks and open the
@@ -26065,6 +26166,8 @@ impl App {
             Cmd::OpenSettings => self.open_settings_view(),
             Cmd::OpenSettingsJson => self
                 .open_config_file_in_editor(crate::prefs::config_path(), ConfigFileSeed::Settings),
+            Cmd::OpenWorkspaceSettingsJson => self.open_workspace_settings(false),
+            Cmd::OpenWorkspaceSettingsLocalJson => self.open_workspace_settings(true),
             Cmd::OpenKeybindingsJson => self.open_config_file_in_editor(
                 crate::keymap::keybindings_path(),
                 ConfigFileSeed::Keybindings,
@@ -26093,6 +26196,7 @@ impl App {
                     let prefs = crate::prefs::Prefs::load_or_default();
                     serde_json::to_string_pretty(&prefs).unwrap_or_else(|_| String::from("{}\n"))
                 }
+                ConfigFileSeed::SettingsLayer => SETTINGS_LAYER_TEMPLATE.to_string(),
                 ConfigFileSeed::Keybindings => crate::keymap::TEMPLATE.to_string(),
                 ConfigFileSeed::Snippets => crate::snippets::TEMPLATE.to_string(),
                 ConfigFileSeed::Triggers => crate::triggers::TEMPLATE.to_string(),
@@ -26112,7 +26216,10 @@ impl App {
         self.sync_open_file_poll_mtime();
         self.status = match seed {
             ConfigFileSeed::Settings => {
-                String::from("Editing settings.json — save to apply on next launch")
+                String::from("Editing settings — save to apply (theme and editor toggles live)")
+            }
+            ConfigFileSeed::SettingsLayer => {
+                String::from("Editing a settings layer — save to apply")
             }
             ConfigFileSeed::Keybindings => String::from(
                 "Editing keybindings.json — save, then reload keybindings from the palette",
@@ -30966,11 +31073,84 @@ impl App {
                 "Triggers reloaded ({} active)",
                 self.triggers.triggers.len()
             );
-        } else if path == crate::prefs::config_path() {
-            let rules = crate::prefs::Prefs::load_or_default().host_accents;
-            self.set_host_accents(&rules);
-            self.status = format!("Settings reloaded ({} host accent rules)", rules.len());
+        } else if path == crate::prefs::config_path()
+            || self.settings_chain.iter().any(|p| p == path)
+        {
+            self.remerge_settings();
         }
+    }
+
+    /// Re-run the layered settings merge (#251) and apply everything that can
+    /// apply live: theme, editor toggles, save behavior, host accents. Called
+    /// when any file of the chain is saved in the editor; layout and other
+    /// startup-read settings still say "next launch".
+    fn remerge_settings(&mut self) {
+        let merged = crate::config_layers::load_merged(Some(self.roots.primary()));
+        for w in &merged.warnings {
+            crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
+        }
+        self.settings_chain = merged.chain;
+        self.settings_provenance = merged.provenance;
+        self.apply_merged_settings(&merged.prefs);
+        self.status = if merged.warnings.is_empty() {
+            String::from("Settings reloaded")
+        } else {
+            format!(
+                "Settings reloaded with {} warning{} — see OUTPUT · Settings",
+                merged.warnings.len(),
+                if merged.warnings.len() == 1 { "" } else { "s" }
+            )
+        };
+    }
+
+    /// Apply a merged settings view to the live session. Mirrors what the
+    /// individual toggles do, minus their persistence (the values already
+    /// live in config files) and minus their status chatter.
+    fn apply_merged_settings(&mut self, p: &crate::prefs::Prefs) {
+        let theme = p.theme();
+        if theme != self.theme {
+            // Visuals only: a workspace-set theme must not be written back
+            // into the user's config.
+            self.apply_theme_visuals(theme);
+        }
+        self.format_on_save = p.format_on_save;
+        self.auto_save = p.auto_save;
+        self.auto_save_on_focus_change = p.auto_save_on_focus_change;
+        self.copy_on_select = p.copy_on_select;
+        self.auto_close_pairs = !p.disable_auto_close_pairs;
+        self.editor.auto_close_pairs = self.auto_close_pairs;
+        if !p.disable_inline_blame && !self.inline_blame_enabled {
+            // Re-enabling refetches, like toggle_inline_blame.
+            self.blame_fetched = None;
+        }
+        self.inline_blame_enabled = !p.disable_inline_blame;
+        self.editor.blame_enabled = self.inline_blame_enabled;
+        self.indent_guides_enabled = !p.disable_indent_guides;
+        self.editor.show_indent_guides = self.indent_guides_enabled;
+        self.bracket_colors_enabled = !p.disable_bracket_colors;
+        self.editor.show_bracket_colors = self.bracket_colors_enabled;
+        self.whitespace_mode =
+            crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
+        self.editor.whitespace_mode = self.whitespace_mode;
+        if !p.disable_inlay_hints && !self.inlay_hints_enabled {
+            self.inlay_hints_enabled = true;
+            self.request_inlay_hints_for_open_editors();
+        } else if p.disable_inlay_hints && self.inlay_hints_enabled {
+            self.inlay_hints_enabled = false;
+            self.editor.clear_inlay_hints();
+            for group in self.editor_layout.inactive_groups_mut() {
+                group.clear_inlay_hints();
+            }
+        }
+        if p.disable_inline_values && self.inline_values_enabled {
+            self.inline_values_enabled = false;
+            self.clear_inline_values();
+        } else if !p.disable_inline_values && !self.inline_values_enabled {
+            self.inline_values_enabled = true;
+            self.refresh_inline_values();
+        }
+        self.explorer_views = ExplorerViewVisibility::from_prefs(p.explorer_views);
+        self.set_host_accents(&p.host_accents);
     }
 
     /// Tell the language servers the focused file hit the disk. rust-analyzer
@@ -31647,6 +31827,13 @@ impl App {
         } else {
             String::new()
         };
+        // The workspace settings layers follow the primary root (#251): the
+        // old repo's .croft/config.json must stop applying and the new one
+        // start, without a relaunch. Runs after the root swap above so the
+        // merge reads the new primary. The status write below is deliberate:
+        // remerge_settings sets its own status, and the re-root message is
+        // the one that should win here.
+        self.remerge_settings();
         self.status = if shell_synced {
             format!("Workspace root: {display}{folders_note}")
         } else {
@@ -35866,10 +36053,25 @@ fn is_signature_help_trigger(c: char) -> bool {
 #[derive(Debug, Clone, Copy)]
 enum ConfigFileSeed {
     Settings,
+    /// A settings overlay layer (#251): `.croft/config.json`, its gitignored
+    /// `.local` sibling, or the machine-local user overlay. Seeded with a
+    /// commented template rather than a full prefs dump — overlays should
+    /// carry only the keys they actually set.
+    SettingsLayer,
     Keybindings,
     Snippets,
     Triggers,
 }
+
+/// Starter contents for a fresh settings overlay layer.
+const SETTINGS_LAYER_TEMPLATE: &str = r#"{
+  // A croft settings overlay: later layers win key-by-key over the user
+  // config (see docs/SETTINGS.md for the chain, "extends", and platform
+  // blocks). Workspace files may set appearance and editor/terminal
+  // behavior keys only; trust-related settings are user-config only and
+  // warn in OUTPUT · Settings.
+}
+"#;
 
 /// Build a completion-popup item for a user snippet: the row shows the prefix,
 /// filters on it, and carries the snippet body as `is_snippet` insertion text
