@@ -10,11 +10,20 @@ const ITERM2_FONT_PS_NAME: &str = "MesloLGSNFM-Regular";
 const ITERM2_NONASCII_PS_NAME: &str = "SymbolsNFM";
 const ITERM2_FONT_SIZE: u32 = 13;
 
-/// Crate version plus build provenance (short git hash and UTC build time,
-/// from `build.rs`). Two builds can share a crate version — 0.1.758 was both
-/// the broken and the fixed binary in the 2026-08-22 session-host incident —
-/// and provenance is what lets `--version` tell them apart.
-const FULL_VERSION: &str = concat!(
+/// What `croft --version` prints: the plain crate version (#282).
+///
+/// Provenance is NOT dropped — it moved to `--build-info`, and the
+/// drift machinery never read this string in the first place. `DriftProbe`
+/// compares the baked `CROFT_GIT_HASH_FULL` against the repo's current
+/// commit, so the fix that introduced the hash (a binary silently older than
+/// its own source tree) keeps working with the hash out of the common path.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Version plus build provenance, for `--build-info`. Two builds can
+/// share a crate version — 0.1.758 was both the broken and the fixed binary
+/// in the 2026-08-22 session-host incident — so provenance stays one flag
+/// away rather than in everybody's face.
+const VERBOSE_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
     env!("CROFT_GIT_HASH"),
@@ -24,12 +33,18 @@ const FULL_VERSION: &str = concat!(
 );
 
 #[derive(Parser, Debug)]
-#[command(name = "croft", version = FULL_VERSION, about = "Terminal-based VS Code replica")]
+#[command(name = "croft", version = VERSION, about = "Terminal-based VS Code replica")]
 pub struct Cli {
     /// Workspace folder to open (defaults to current directory). A file works
     /// too: the workspace roots at its parent and the file opens in the editor.
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
+
+    /// Print the version with build provenance (git hash and build time) and
+    /// exit. `--version` prints the plain `x.y.z`; this is the flag to quote
+    /// in a bug report, since two builds can share a version (#282).
+    #[arg(long)]
+    pub build_info: bool,
 
     /// Open this file in the editor on launch (the workspace stays rooted at
     /// PATH). Used by "Move/Copy into New Window", and handy on its own:
@@ -248,6 +263,12 @@ pub enum CliCommand {
 
 impl Cli {
     pub fn run(self) -> Result<()> {
+        // `--build-info` is a pure query: answer and exit before any setup,
+        // exactly as clap does for `--version`.
+        if self.build_info {
+            println!("croft {VERBOSE_VERSION}");
+            return Ok(());
+        }
         // Pure liveness probes answer before anything else runs: the remote
         // launch script fires them over SSH on every connect, and a remote
         // host handing SSH sessions a stripped PATH (macOS does) must not
@@ -980,6 +1001,29 @@ fn install_rust_target_if_missing(triple: &str) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// #282: `--version` is a plain `x.y.z`. The regression this guards is a
+    /// well-meaning one — re-adding provenance "so bug reports carry it" is
+    /// exactly how the hash got into the common path the first time.
+    #[test]
+    fn version_is_a_bare_semver_and_provenance_lives_behind_build_info() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(
+            !VERSION.contains(['(', ' ']),
+            "--version must stay a bare x.y.z, got {VERSION:?}"
+        );
+
+        // The provenance did not disappear, it moved.
+        assert!(VERBOSE_VERSION.starts_with(VERSION));
+        assert!(
+            VERBOSE_VERSION.contains(env!("CROFT_GIT_HASH")),
+            "--build-info still carries the short hash: {VERBOSE_VERSION:?}"
+        );
+
+        let cli = Cli::try_parse_from(["croft", "--build-info"]).unwrap();
+        assert!(cli.build_info);
+        assert!(!Cli::try_parse_from(["croft"]).unwrap().build_info);
+    }
 
     #[test]
     fn file_path_roots_the_workspace_at_its_parent_and_opens_it() {

@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "PROBLEMS can show the whole project: diagnostics for files you never opened now appear, and a scope toggle switches between Open Files and Whole Project — the status-bar count follows whichever you pick.",
+    kind: NoteKind::Fix,
+    summary: "`croft --version` prints a plain version number again: the build hash that used to trail it moved to the new `--build-info` flag, and the welcome badge shows just vX.Y.Z — the stale-binary warning still catches a build older than its source.",
 }];
