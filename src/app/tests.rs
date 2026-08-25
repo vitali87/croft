@@ -29577,7 +29577,10 @@ fn a_tab_switch_disarms_the_background_tabs_on_type_trigger() {
     app.editor.cursor_col = 0;
     app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
         .unwrap();
-    assert!(app.editor.last_typed.is_some(), "keystroke recorded on tab A");
+    assert!(
+        app.editor.last_typed.is_some(),
+        "keystroke recorded on tab A"
+    );
     // Switch to tab B before any tick runs, then tick with B active.
     app.editor.open_pinned(&tmp.path().join("b.rs")).unwrap();
     app.tick_on_type_formatting();

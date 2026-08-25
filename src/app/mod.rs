@@ -8482,10 +8482,7 @@ impl App {
     /// drain loop so the three-way decision is testable without a live
     /// server: the channel's sender lives inside the LSP worker, so a test
     /// cannot inject a `FormatResult` through it.
-    fn on_type_reply_disposition(
-        &self,
-        result: &crate::lsp::manager::FormatResult,
-    ) -> OnTypeReply {
+    fn on_type_reply_disposition(&self, result: &crate::lsp::manager::FormatResult) -> OnTypeReply {
         let Some((id, seq, ref requested)) = self.on_type_request else {
             return OnTypeReply::NotOurs;
         };
