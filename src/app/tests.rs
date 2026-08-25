@@ -1658,6 +1658,147 @@ fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
 }
 
 #[test]
+fn a_mouse_tracking_child_keeps_the_pointer_from_a_bound_gesture() {
+    // A terminal running a mouse-tracking TUI owns the pointer: croft must
+    // not steal a click the child asked for, and a user binding is no more
+    // entitled to it than a built-in. SHIFT is the documented override.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "quick_open", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // The child enables mouse tracking.
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.terminals[0].mouse_reporting(),
+        "the child is tracking the mouse"
+    );
+
+    let area = app.terminals[0].last_area;
+    let (col, row) = (area.x + 2, area.y + 1);
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+    assert!(
+        app.file_finder.is_none(),
+        "the child owns the pointer, so the binding must not fire"
+    );
+}
+
+/// The Shift half of the same rule, on its own app: the first click of the
+/// pair above is forwarded to the child, which starts a selection drag, and
+/// a drag in flight legitimately swallows the next press. Sequencing the two
+/// halves would test that interaction rather than the bypass.
+#[test]
+fn holding_shift_takes_the_pointer_back_from_a_tracking_child() {
+    // Shift is ALSO part of a gesture's identity, so the bypass selects a
+    // different row rather than rescuing the `ctrl+click` one: over a
+    // tracking TUI you must bind `ctrl+shift+click` for a gesture that fires.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+shift+click", "command": "quick_open", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(app.terminals[0].mouse_reporting(), "the child is tracking");
+
+    let area = app.terminals[0].last_area;
+    let mut shifted = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        area.y + 1,
+    );
+    shifted.modifiers = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    app.handle_mouse(shifted);
+    assert!(
+        app.file_finder.is_some(),
+        "Shift takes the pointer back and the ctrl+shift+click row fires"
+    );
+}
+
+#[test]
+fn a_tab_strip_binding_fires_only_on_the_strip() {
+    // `gesture_for` deliberately shares `editor_click` between the strip and
+    // the editor body. That is only safe because a double needs both clicks
+    // at the SAME cell and the two regions never overlap, so pin it.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+click", "command": "quick_open", "when": "tab_strip"}]"#,
+    );
+    let strip_y = app.editor.tab_strip_y_for_test();
+    let tab = app
+        .editor
+        .tab_at(app.editor.last_inner.x + 1, strip_y)
+        .map(|_| (app.editor.last_inner.x + 1, strip_y))
+        .expect("a rendered tab cell to aim at");
+
+    let mut on_strip = mouse(MouseEventKind::Down(MouseButton::Left), tab.0, tab.1);
+    on_strip.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(on_strip);
+    assert!(
+        app.file_finder.is_some(),
+        "the strip row fires on the strip"
+    );
+
+    // The body is a different region, so the same spelling must fall through
+    // to the built-in rather than firing the tab_strip row.
+    app.file_finder = None;
+    let body_row = app.editor.last_inner.y + 1;
+    assert_ne!(body_row, strip_y, "the strip and the body do not overlap");
+    let mut in_body = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        app.editor.last_inner.x + 4,
+        body_row,
+    );
+    in_body.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(in_body);
+    assert!(
+        app.file_finder.is_none(),
+        "a tab_strip binding must not fire in the editor body"
+    );
+}
+
+#[test]
+fn the_at_click_commands_refuse_a_keyboard_invocation() {
+    // Each reads the click through `last_mouse_pos`, which a palette or
+    // chord invocation leaves None. They must say so rather than guess at
+    // the caret and act somewhere the user never pointed.
+    use crate::widgets::command_palette::Command;
+    let (mut app, _tmp) = tree_app_with_keymap("[]");
+    for (cmd, want) in [
+        (
+            Command::MouseAddCursorAtClick,
+            "Mouse: Add Cursor at Click needs a mouse binding",
+        ),
+        (
+            Command::MouseGoToDefinitionAtClick,
+            "Mouse: Go to Definition at Click needs a mouse binding",
+        ),
+        (
+            Command::MouseOpenLinkAtClick,
+            "Mouse: Open Link at Click needs a mouse binding",
+        ),
+    ] {
+        app.last_mouse_pos = None;
+        app.status.clear();
+        app.run_command(cmd);
+        assert_eq!(app.status, want, "{cmd:?} must refuse a keyboard call");
+    }
+}
+
+#[test]
 fn a_modified_click_binding_does_not_arm_the_plain_double_click() {
     // `GestureKind::Click` covers `ctrl+click` too, and the built-ins read
     // their trackers without consulting modifiers. Recording a modified click

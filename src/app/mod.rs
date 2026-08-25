@@ -3786,15 +3786,20 @@ impl App {
         // command id, a gesture that can never fire, a reserved bare click)
         // used to vanish silently, which reads as croft being broken rather
         // than the binding being wrong (#259).
-        let loaded_keymap = crate::keymap::Keymap::load(&crate::keymap::keybindings_path());
-        // Not under test: `output::` is a process-global registry, so the
-        // developer's own refused rows would leak into every test that
-        // builds an `App` — the same reason the matcher set below is empty
-        // under test.
-        if !cfg!(test) {
-            for w in loaded_keymap.warnings() {
-                crate::output::push("Keybindings", crate::output::OutputLevel::Warn, w);
-            }
+        // Under test an empty keymap, exactly like the matcher set below: the
+        // developer's real keybindings.json must never steer app tests. That
+        // mattered less when a user keymap only rebound key chords, which no
+        // test dispatches; a mouse row now gates an early return at the top
+        // of `handle_mouse` that every mouse test flows through, so one line
+        // in a file the suite does not control could redirect thousands of
+        // tests. Tests that want a keymap assign `app.keymap` themselves.
+        let loaded_keymap = if cfg!(test) {
+            crate::keymap::Keymap::default()
+        } else {
+            crate::keymap::Keymap::load(&crate::keymap::keybindings_path())
+        };
+        for w in loaded_keymap.warnings() {
+            crate::output::push("Keybindings", crate::output::OutputLevel::Warn, w);
         }
         // Problem matchers (#252). Under test an empty set: the developer's
         // real matchers.json must never steer app tests; tests inject their
@@ -30448,6 +30453,32 @@ impl App {
                 self.ui_hover.clear();
                 self.ui_tooltip_label = None;
                 self.hover.clear();
+
+                // Termux: the tap still has to raise the on-screen keyboard.
+                // Skipping it leaves a device with no other keyboard unable
+                // to type into the field the tap just focused. Reachable
+                // despite bare clicks being reserved in editor/terminal: a
+                // bare `click` bound in `file_tree` fires over the Search
+                // input, and any MODIFIED click in the editor gets here too.
+                // `ctx` carries the region, so the built-in's in_editor /
+                // in_terminal / in_tree — computed below this block — are
+                // not needed to make the same decision.
+                if self.osk_auto
+                    && self.osk.is_none()
+                    && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                    && match ctx {
+                        crate::keymap::MouseContext::Editor
+                        | crate::keymap::MouseContext::Terminal => true,
+                        crate::keymap::MouseContext::FileTree => {
+                            self.sidebar_view == SidebarView::Search
+                        }
+                        crate::keymap::MouseContext::TabStrip => false,
+                    }
+                {
+                    let mut osk = crate::widgets::osk::Osk::new();
+                    osk.split = crate::prefs::Prefs::load_or_default().osk_split;
+                    self.osk = Some(osk);
+                }
 
                 // Position-carrying commands read the click through this,
                 // set before dispatch and cleared after so a keyboard

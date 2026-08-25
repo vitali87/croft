@@ -579,6 +579,7 @@ The CAPTURES tab collects output lines matched by `capture` triggers in `trigger
 Ghostty resolves its own keybinds (`new_tab`, `goto_tab`, ...) before it hands a key to croft, so by default `⌘T` opens a Ghostty tab and `⌘1`..`⌘9` switch Ghostty tabs instead of reaching croft. `croft setup-ghostty` adds a managed `keybind` block to your Ghostty config (`~/.config/ghostty/config`, or `~/Library/Application Support/com.mitchellh.ghostty/config`) that re-emits every croft chord as the same CSI-u sequence iTerm2 forwards, via Ghostty's `csi:` action. After running it, reload the config (`⌘⇧,`) or restart Ghostty.
 
 The chord set is identical to the [iTerm2 key mappings](#iterm2-key-mappings) above (`⌘T` / `⌘W` / `⌘[` / `⌘]`, `⌘1`..`⌘9` / `⌘0`, the editor / Explorer / Source Control chords, the `⌘F12` family, and so on), so croft behaves the same under both terminals. `⌘V` is left on Ghostty's native paste for the same reason it is under iTerm2. Only the block between croft's marker comments is rewritten on each run; the rest of your Ghostty config is preserved.
+
 ## Mouse bindings in `keybindings.json`
 
 Mouse gestures bind in the same array as keys, using a gesture name in `key`
@@ -625,4 +626,10 @@ macOS — for the same reporting reason.
 **In terminal panes**, a TUI that has asked for mouse tracking owns the
 pointer, so user bindings do not fire there; hold `shift` to bypass, the same
 rule croft's built-in scroll follows.
+
+Note that `shift` is *also* part of a gesture's identity, so bypassing selects
+a different row rather than rescuing the one you already have: over a tracking
+TUI, a `ctrl+click` binding stays silent no matter what, and the row that fires
+when you hold shift is `ctrl+shift+click`. Bind that spelling if you want a
+gesture that works over a full-screen TUI.
 
