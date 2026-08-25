@@ -327,17 +327,145 @@ pub(crate) fn strip_line_comments(src: &str) -> String {
     out
 }
 
-/// One `{ "key": ..., "command": ... }` row as written on disk.
+/// A mouse gesture bindable in `keybindings.json` (#259).
+///
+/// Deliberately NOT expressed as a [`Chord`]: a chord is a `KeyCode` plus
+/// modifiers, and a gesture has no key code. Keeping the two apart also keeps
+/// gestures out of [`Keymap::chords`], which drives the iTerm2/Ghostty
+/// forwarder pass — a terminal forwarder for a mouse gesture is meaningless.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GestureKind {
+    Click,
+    DoubleClick,
+    MiddleClick,
+    RightClick,
+    WheelUp,
+    WheelDown,
+}
+
+/// A gesture plus the modifiers held with it.
+///
+/// `cmd`/`super` parses but can never match: SGR mouse reporting carries no
+/// Super bit, which is why croft's own go-to-definition rides Ctrl rather than
+/// Cmd. Binding it produces a load warning instead of a binding that silently
+/// never fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Gesture {
+    pub kind: GestureKind,
+    pub mods: KeyModifiers,
+}
+
+impl Gesture {
+    /// Parse `"ctrl+click"`, `"middle_click"`, `"alt+wheel_up"`. Returns the
+    /// gesture and, when the spelling parses but cannot ever match, a warning
+    /// for the OUTPUT channel.
+    pub fn parse(s: &str) -> Option<(Gesture, Option<String>)> {
+        let mut mods = KeyModifiers::NONE;
+        let mut kind: Option<GestureKind> = None;
+        let mut warn = None;
+        for part in s.split('+') {
+            let p = part.trim().to_ascii_lowercase();
+            match p.as_str() {
+                "ctrl" | "control" => mods |= KeyModifiers::CONTROL,
+                "alt" | "opt" | "option" => mods |= KeyModifiers::ALT,
+                "shift" => mods |= KeyModifiers::SHIFT,
+                "cmd" | "command" | "super" | "meta" | "win" => {
+                    mods |= KeyModifiers::SUPER;
+                    warn = Some(format!(
+                        "{s}: terminals do not report Cmd/Super for mouse events, so this \
+                         binding can never fire - use ctrl or alt instead"
+                    ));
+                }
+                // `mod` is Cmd for KEYS on macOS, but no terminal reports Cmd
+                // for mouse, so it resolves to Ctrl on every platform here
+                // rather than becoming an unfirable binding.
+                "mod" => mods |= KeyModifiers::CONTROL,
+                other => {
+                    let k = match other {
+                        "click" => GestureKind::Click,
+                        "double_click" => GestureKind::DoubleClick,
+                        // Rejected on purpose: croft's click tracker
+                        // distinguishes single from double only, so a
+                        // triple_click binding would fire on the second
+                        // click. Better a load error than a gesture that
+                        // silently means something else.
+                        "triple_click" => return None,
+                        "middle_click" => GestureKind::MiddleClick,
+                        "right_click" => GestureKind::RightClick,
+                        "wheel_up" => GestureKind::WheelUp,
+                        "wheel_down" => GestureKind::WheelDown,
+                        _ => return None,
+                    };
+                    if kind.replace(k).is_some() {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some((
+            Gesture {
+                kind: kind?,
+                mods,
+            },
+            warn,
+        ))
+    }
+
+    /// True when this gesture would shadow primary selection. Binding these
+    /// is refused at load: rebinding a bare click or drag in the editor or
+    /// terminal leaves no way to place the caret or select text.
+    pub fn is_reserved_in(&self, ctx: MouseContext) -> bool {
+        self.mods.is_empty()
+            && matches!(self.kind, GestureKind::Click)
+            && matches!(ctx, MouseContext::Editor | MouseContext::Terminal)
+    }
+}
+
+/// Where a mouse binding applies. Omitted means the editor, which is where
+/// nearly every gesture is wanted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MouseContext {
+    #[default]
+    Editor,
+    Terminal,
+    FileTree,
+    TabStrip,
+}
+
+impl MouseContext {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "editor" => Self::Editor,
+            "terminal" => Self::Terminal,
+            "file_tree" | "filetree" => Self::FileTree,
+            "tab_strip" | "tabstrip" => Self::TabStrip,
+            _ => return None,
+        })
+    }
+}
+
+/// One `{ "key": ..., "command": ... }` row as written on disk. `when` scopes
+/// a MOUSE binding to a region and is ignored for key chords, which keep the
+/// existing focus-based rule (see the module note).
 #[derive(Debug, Deserialize)]
 struct Binding {
     key: String,
     command: String,
+    #[serde(default)]
+    when: Option<String>,
 }
 
-/// The resolved user keymap: a chord lookup table into [`Command`].
+/// The resolved user keymap: a chord table into [`Command`], plus a separate
+/// mouse-gesture table keyed by gesture AND context, since one gesture can be
+/// bound differently per region.
 #[derive(Debug, Clone, Default)]
 pub struct Keymap {
     bindings: HashMap<Chord, Command>,
+    mouse: HashMap<(Gesture, MouseContext), Command>,
+    /// Rows that parsed but were refused, for the OUTPUT channel. Silently
+    /// dropping these is what makes a mistyped binding feel like croft is
+    /// broken; the settings loader surfaces its warnings the same way.
+    warnings: Vec<String>,
 }
 
 impl Keymap {
@@ -355,16 +483,82 @@ impl Keymap {
         let rows: Vec<Binding> =
             serde_json::from_str(&strip_line_comments(json)).unwrap_or_default();
         let mut bindings = HashMap::new();
+        let mut mouse = HashMap::new();
+        let mut warnings = Vec::new();
         for row in rows {
-            if let (Some(chord), Some(cmd)) =
-                (Chord::parse(&row.key), Command::from_id(&row.command))
-            {
-                bindings.insert(chord, cmd);
+            let Some(cmd) = Command::from_id(&row.command) else {
+                warnings.push(format!(
+                    "{}: unknown command id \"{}\"",
+                    row.key, row.command
+                ));
+                continue;
+            };
+            // A gesture spelling wins over a chord spelling: `Gesture::parse`
+            // only accepts the seven gesture names, so nothing a chord could
+            // legitimately spell is captured here.
+            if let Some((gesture, warn)) = Gesture::parse(&row.key) {
+                if let Some(w) = warn {
+                    warnings.push(w);
+                }
+                let ctx = match row.when.as_deref() {
+                    None => MouseContext::default(),
+                    Some(w) => match MouseContext::parse(w) {
+                        Some(c) => c,
+                        None => {
+                            warnings.push(format!("{}: unknown \"when\" context \"{w}\"", row.key));
+                            continue;
+                        }
+                    },
+                };
+                if gesture.is_reserved_in(ctx) {
+                    warnings.push(format!(
+                        "{}: a bare click is reserved in the {} - rebinding it would leave no \
+                         way to place the caret or select text",
+                        row.key,
+                        match ctx {
+                            MouseContext::Terminal => "terminal",
+                            _ => "editor",
+                        }
+                    ));
+                    continue;
+                }
+                mouse.insert((gesture, ctx), cmd);
+                continue;
+            }
+            match Chord::parse(&row.key) {
+                Some(chord) => {
+                    bindings.insert(chord, cmd);
+                }
+                None => warnings.push(format!("{}: not a key chord or mouse gesture", row.key)),
             }
         }
-        Self { bindings }
+        Self {
+            bindings,
+            mouse,
+            warnings,
+        }
     }
 
+    /// Rows the loader refused, for the caller to surface. Empty is the
+    /// normal case.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// The command a mouse gesture is bound to in `ctx`, if any.
+    pub fn command_for_mouse(&self, gesture: Gesture, ctx: MouseContext) -> Option<Command> {
+        self.mouse.get(&(gesture, ctx)).copied()
+    }
+
+    /// True when no mouse gesture is bound, so `handle_mouse` can skip the
+    /// lookup entirely on the common path.
+    pub fn has_mouse_bindings(&self) -> bool {
+        !self.mouse.is_empty()
+    }
+
+    /// No KEY chords bound. Mouse gestures are asked about separately via
+    /// [`Self::has_mouse_bindings`], because the key path's caller uses this
+    /// to skip its lookup and must not be affected by mouse rows.
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
@@ -402,6 +596,124 @@ pub const TEMPLATE: &str = r#"// croft keyboard shortcuts. Rebind any palette co
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn gestures_parse_with_modifiers_and_reject_nonsense() {
+        use super::{Gesture, GestureKind};
+        let (g, warn) = Gesture::parse("ctrl+click").expect("ctrl+click parses");
+        assert_eq!(g.kind, GestureKind::Click);
+        assert_eq!(g.mods, KeyModifiers::CONTROL);
+        assert!(warn.is_none());
+
+        let (g, _) = Gesture::parse("middle_click").expect("bare gesture parses");
+        assert_eq!(g.kind, GestureKind::MiddleClick);
+        assert_eq!(g.mods, KeyModifiers::NONE);
+
+        let (g, _) = Gesture::parse("alt+shift+wheel_up").expect("two modifiers parse");
+        assert_eq!(g.kind, GestureKind::WheelUp);
+        assert_eq!(g.mods, KeyModifiers::ALT | KeyModifiers::SHIFT);
+
+        assert!(Gesture::parse("ctrl+f").is_none(), "a key chord is not a gesture");
+        assert!(
+            Gesture::parse("click+wheel_up").is_none(),
+            "two gestures in one binding is nonsense"
+        );
+        assert!(
+            Gesture::parse("triple_click").is_none(),
+            "triple click is refused: the click tracker counts to two, so the \
+             binding would fire on the second click"
+        );
+    }
+
+    #[test]
+    fn a_cmd_gesture_warns_because_terminals_never_report_super() {
+        use super::Gesture;
+        let (_, warn) = Gesture::parse("cmd+click").expect("it still parses");
+        let warn = warn.expect("but it warns");
+        assert!(
+            warn.contains("can never fire"),
+            "the warning says why, not just that: {warn}"
+        );
+        // `mod` resolves to Ctrl for mouse on every platform rather than
+        // becoming an unfirable Cmd binding.
+        let (g, warn) = Gesture::parse("mod+click").expect("mod parses");
+        assert_eq!(g.mods, KeyModifiers::CONTROL);
+        assert!(warn.is_none(), "and needs no warning");
+    }
+
+    #[test]
+    fn a_bare_click_is_refused_in_the_editor_and_terminal() {
+        let km = Keymap::from_json(
+            r#"[{"key": "click", "command": "save_file"},
+                {"key": "click", "command": "save_file", "when": "terminal"},
+                {"key": "click", "command": "save_file", "when": "file_tree"}]"#,
+        );
+        // Editor and terminal refuse; the file tree is fair game, since a
+        // click there is not how text gets selected.
+        assert_eq!(
+            km.warnings().len(),
+            2,
+            "both reserved contexts warn: {:?}",
+            km.warnings()
+        );
+        assert!(
+            km.warnings().iter().all(|w| w.contains("reserved")),
+            "and say why: {:?}",
+            km.warnings()
+        );
+        assert!(
+            km.command_for_mouse(
+                Gesture::parse("click").unwrap().0,
+                MouseContext::FileTree
+            )
+            .is_some(),
+            "the file-tree binding survived"
+        );
+    }
+
+    #[test]
+    fn one_gesture_binds_differently_per_context() {
+        let km = Keymap::from_json(
+            r#"[{"key": "ctrl+click", "command": "save_file", "when": "editor"},
+                {"key": "ctrl+click", "command": "quick_open", "when": "file_tree"}]"#,
+        );
+        let g = Gesture::parse("ctrl+click").unwrap().0;
+        assert_eq!(
+            km.command_for_mouse(g, MouseContext::Editor).map(|c| c.id()),
+            Some("save_file")
+        );
+        assert_eq!(
+            km.command_for_mouse(g, MouseContext::FileTree).map(|c| c.id()),
+            Some("quick_open"),
+            "the same gesture means something else in another region"
+        );
+        assert!(
+            km.command_for_mouse(g, MouseContext::Terminal).is_none(),
+            "and nothing at all where it was not bound"
+        );
+    }
+
+    #[test]
+    fn a_bad_row_warns_instead_of_vanishing() {
+        let km = Keymap::from_json(
+            r#"[{"key": "ctrl+click", "command": "no_such_command"},
+                {"key": "ctrl+click", "command": "save_file", "when": "nowhere"},
+                {"key": "not-a-thing", "command": "save_file"}]"#,
+        );
+        assert_eq!(km.warnings().len(), 3, "{:?}", km.warnings());
+        assert!(km.warnings()[0].contains("unknown command id"));
+        assert!(km.warnings()[1].contains("when"));
+        assert!(km.warnings()[2].contains("not a key chord or mouse gesture"));
+    }
+
+    #[test]
+    fn mouse_rows_do_not_make_the_key_map_look_non_empty() {
+        // `is_empty` gates the KEY lookup in handle_key; a mouse-only file
+        // must not make it start asking.
+        let km = Keymap::from_json(r#"[{"key": "ctrl+click", "command": "save_file"}]"#);
+        assert!(km.is_empty(), "no key chords bound");
+        assert!(km.has_mouse_bindings(), "but a gesture is");
+    }
     use super::*;
 
     fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {

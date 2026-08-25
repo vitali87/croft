@@ -2137,6 +2137,11 @@ pub struct App {
     /// User key bindings from `~/.config/croft/keybindings.json`, consulted
     /// ahead of the built-in chords so a rebind wins over the default.
     keymap: crate::keymap::Keymap,
+    /// The click a user mouse binding is running for (#259), set only for
+    /// the duration of that dispatch. Position-carrying commands read it;
+    /// `None` everywhere else, so a keyboard invocation of the same command
+    /// can never act on a stale click.
+    last_mouse_pos: Option<(u16, u16)>,
     /// User snippets from `~/.config/croft/snippets.json`. Typing a snippet's
     /// prefix and pressing Tab expands it with tab-stop navigation.
     snippets: crate::snippets::SnippetSet,
@@ -3758,6 +3763,14 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         let loaded_prefs = merged_settings.prefs.clone();
+        // Same treatment for keybindings: a row croft refused (an unknown
+        // command id, a gesture that can never fire, a reserved bare click)
+        // used to vanish silently, which reads as croft being broken rather
+        // than the binding being wrong (#259).
+        let loaded_keymap = crate::keymap::Keymap::load(&crate::keymap::keybindings_path());
+        for w in loaded_keymap.warnings() {
+            crate::output::push("Keybindings", crate::output::OutputLevel::Warn, w);
+        }
         // Problem matchers (#252). Under test an empty set: the developer's
         // real matchers.json must never steer app tests; tests inject their
         // own. Compile warnings surface once, in OUTPUT · Matchers.
@@ -3845,7 +3858,8 @@ impl App {
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             extensions,
             disabled_extensions,
-            keymap: crate::keymap::Keymap::load(&crate::keymap::keybindings_path()),
+            keymap: loaded_keymap,
+            last_mouse_pos: None,
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
@@ -27455,6 +27469,44 @@ impl App {
             },
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
+            // Position-carrying commands (#259). They read the click the
+            // dispatcher set, and do nothing from the keyboard: invoked from
+            // the palette there is no click to act on, and guessing the
+            // caret instead would make one command mean two things.
+            Cmd::MouseAddCursorAtClick => match self.last_mouse_pos {
+                Some((col, row)) => {
+                    if !self.editor.add_caret_at_screen(col, row) {
+                        self.status = String::from("No place for a cursor there");
+                    }
+                }
+                None => {
+                    self.status = String::from("Mouse: Add Cursor at Click needs a mouse binding")
+                }
+            },
+            Cmd::MouseGoToDefinitionAtClick => match self.last_mouse_pos {
+                Some((col, row)) => match self.editor.buffer_pos_at(col, row) {
+                    Some((line, col)) => {
+                        self.editor.cursor_row = line;
+                        self.editor.cursor_col = col;
+                        self.request_definition_at_cursor();
+                    }
+                    None => self.status = String::from("Nothing to define there"),
+                },
+                None => {
+                    self.status =
+                        String::from("Mouse: Go to Definition at Click needs a mouse binding")
+                }
+            },
+            Cmd::MouseOpenLinkAtClick => match self.last_mouse_pos {
+                Some((col, row)) => {
+                    if !self.terminal_url_click(col, row) && !self.terminal_file_click(col, row) {
+                        self.status = String::from("No link there");
+                    }
+                }
+                None => {
+                    self.status = String::from("Mouse: Open Link at Click needs a mouse binding")
+                }
+            },
             Cmd::ClearBuildDiagnostics => self.clear_build_diagnostics(),
             Cmd::DebugClearWatch => {
                 let n = self.watch_exprs.len();
@@ -29992,6 +30044,32 @@ impl App {
         let in_editor = rect_contains(self.editor.last_area, m.column, m.row);
         let terminal_hit = self.terminal_at_pos(m.column, m.row);
         let in_terminal = terminal_hit.is_some();
+        // User mouse bindings (#259) resolve before the built-in widget
+        // behaviour, mirroring how keybindings.json wins over default chords.
+        // Placed after the region predicates so a binding's `when` context is
+        // known, and above every built-in so rebinding one actually takes it
+        // over. A gesture croft has no binding for falls straight through.
+        if self.keymap.has_mouse_bindings()
+            && let Some(ctx) = mouse_context_for(&m, in_editor, in_terminal, in_tree, self)
+            && let Some(gesture) = gesture_for(&m, self, std::time::Instant::now())
+            && let Some(cmd) = self.keymap.command_for_mouse(gesture, ctx)
+        {
+            // A terminal running a mouse-tracking TUI owns the pointer, same
+            // rule the built-ins follow: croft must not steal a click the
+            // child asked for.
+            let child_owns_pointer = matches!(ctx, crate::keymap::MouseContext::Terminal)
+                && self.terminal().mouse_reporting()
+                && !m.modifiers.contains(KeyModifiers::SHIFT);
+            if !child_owns_pointer {
+                // Position-carrying commands read the click through this,
+                // set before dispatch and cleared after so a keyboard
+                // invocation of the same command never sees a stale click.
+                self.last_mouse_pos = Some((m.column, m.row));
+                self.run_command(cmd);
+                self.last_mouse_pos = None;
+                return;
+            }
+        }
         let in_problems = self.bottom_panel_tab == BottomPanelTab::Problems
             && rect_contains(self.problems.last_area, m.column, m.row);
         let in_output = self.bottom_panel_tab == BottomPanelTab::Output
@@ -32729,6 +32807,23 @@ impl App {
     fn reload_config_for_path(&mut self, path: &std::path::Path) {
         if path == crate::keymap::keybindings_path() {
             self.keymap = crate::keymap::Keymap::load(path);
+            // Refused rows used to vanish, which makes a mistyped binding
+            // feel like croft is broken. Same treatment the settings loader
+            // gives its warnings: OUTPUT for the detail, a status summary so
+            // the user knows to look (#259).
+            let warns = self.keymap.warnings().to_vec();
+            for w in &warns {
+                crate::output::push("Keybindings", crate::output::OutputLevel::Warn, w);
+            }
+            self.status = if warns.is_empty() {
+                String::from("Keybindings reloaded")
+            } else {
+                format!(
+                    "Keybindings reloaded with {} warning{} — see OUTPUT · Keybindings",
+                    warns.len(),
+                    if warns.len() == 1 { "" } else { "s" }
+                )
+            };
             self.status = String::from(
                 "Keybindings reloaded (for new Cmd chords, re-run croft setup-iterm2 / setup-ghostty)",
             );
@@ -37791,6 +37886,67 @@ fn snippet_completion_item(snip: &crate::snippets::Snippet) -> crate::lsp::Compl
 /// Shift-only chords (which are just typing) are excluded so the user keymap
 /// can never shadow plain text entry. Intentionally not named `is_*_key`: it is
 /// a gate, not a shortcut the F1 overlay documents.
+/// Which mouse region a binding's `when` context refers to, or `None` when
+/// the pointer is somewhere no context covers (a panel, a seam, the status
+/// bar) — a user binding must not fire there.
+fn mouse_context_for(
+    m: &MouseEvent,
+    in_editor: bool,
+    in_terminal: bool,
+    in_tree: bool,
+    app: &App,
+) -> Option<crate::keymap::MouseContext> {
+    use crate::keymap::MouseContext;
+    // The tab strip has no focus notion, so it is recognised positionally and
+    // checked first: it overlaps the editor pane's full area.
+    if app.editor.tab_at(m.column, m.row).is_some() {
+        return Some(MouseContext::TabStrip);
+    }
+    if in_terminal {
+        return Some(MouseContext::Terminal);
+    }
+    if in_tree {
+        return Some(MouseContext::FileTree);
+    }
+    if in_editor {
+        return Some(MouseContext::Editor);
+    }
+    None
+}
+
+/// The gesture a mouse event spells, or `None` for events that are not
+/// bindable (motion, drags, button releases).
+///
+/// A left press reports `DoubleClick` when croft's own click tracker already
+/// considers it one, so a binding agrees with the built-in select-word
+/// behaviour rather than disagreeing about the same physical click. Triple
+/// click is NOT reported: the tracker distinguishes single from double only,
+/// and inventing a third level here would make `triple_click` bindings fire
+/// on the second click. `Gesture::parse` therefore rejects it with a load
+/// warning rather than accepting a binding that could never behave.
+fn gesture_for(m: &MouseEvent, app: &App, now: std::time::Instant) -> Option<crate::keymap::Gesture> {
+    use crate::keymap::{Gesture, GestureKind};
+    let kind = match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if app.editor_click.is_double(now, m.column, m.row) {
+                GestureKind::DoubleClick
+            } else {
+                GestureKind::Click
+            }
+        }
+        MouseEventKind::Down(MouseButton::Middle) => GestureKind::MiddleClick,
+        MouseEventKind::Down(MouseButton::Right) => GestureKind::RightClick,
+        MouseEventKind::ScrollUp => GestureKind::WheelUp,
+        MouseEventKind::ScrollDown => GestureKind::WheelDown,
+        _ => return None,
+    };
+    // Only the three modifiers a terminal actually reports for mouse; Super
+    // is never present (see `Gesture::parse`).
+    let mods =
+        m.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+    Some(Gesture { kind, mods })
+}
+
 fn is_rebindable_chord(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::F(_))
         || key

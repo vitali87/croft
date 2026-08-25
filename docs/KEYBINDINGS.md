@@ -575,3 +575,50 @@ The CAPTURES tab collects output lines matched by `capture` triggers in `trigger
 Ghostty resolves its own keybinds (`new_tab`, `goto_tab`, ...) before it hands a key to croft, so by default `⌘T` opens a Ghostty tab and `⌘1`..`⌘9` switch Ghostty tabs instead of reaching croft. `croft setup-ghostty` adds a managed `keybind` block to your Ghostty config (`~/.config/ghostty/config`, or `~/Library/Application Support/com.mitchellh.ghostty/config`) that re-emits every croft chord as the same CSI-u sequence iTerm2 forwards, via Ghostty's `csi:` action. After running it, reload the config (`⌘⇧,`) or restart Ghostty.
 
 The chord set is identical to the [iTerm2 key mappings](#iterm2-key-mappings) above (`⌘T` / `⌘W` / `⌘[` / `⌘]`, `⌘1`..`⌘9` / `⌘0`, the editor / Explorer / Source Control chords, the `⌘F12` family, and so on), so croft behaves the same under both terminals. `⌘V` is left on Ghostty's native paste for the same reason it is under iTerm2. Only the block between croft's marker comments is rewritten on each run; the rest of your Ghostty config is preserved.
+## Mouse bindings in `keybindings.json`
+
+Mouse gestures bind in the same array as keys, using a gesture name in `key`
+and an optional `when` region:
+
+```jsonc
+[
+  { "key": "ctrl+click",       "command": "mouse_go_to_definition_at_click" },
+  { "key": "alt+click",        "command": "mouse_add_cursor_at_click" },
+  { "key": "middle_click",     "command": "paste",  "when": "terminal" },
+  { "key": "alt+wheel_up",     "command": "page_up" }
+]
+```
+
+**Gestures:** `click`, `double_click`, `middle_click`, `right_click`,
+`wheel_up`, `wheel_down`, each combinable with `ctrl`, `alt`, `shift`.
+
+**`when` regions:** `editor` (the default when omitted), `terminal`,
+`file_tree`, `tab_strip`. The same gesture can mean different things in
+different regions.
+
+User bindings resolve *before* the built-in behaviour, so rebinding one takes
+it over; a gesture with no binding falls through untouched.
+
+Three commands read the click position and are meaningless from the keyboard:
+`mouse_add_cursor_at_click`, `mouse_go_to_definition_at_click`, and
+`mouse_open_link_at_click`. Invoked from the palette they report that they
+need a mouse binding rather than guessing at the caret.
+
+### What croft refuses, and why
+
+A refused row is reported in **OUTPUT · Keybindings** and, on a live reload,
+summarised in the status bar — it never fails silently.
+
+| Refused | Why |
+|---|---|
+| `cmd+click` / `super+click` | Terminals do not report Cmd/Super with mouse events (SGR mouse reporting carries no Super bit), so the binding could never fire. Use `ctrl` or `alt`. This is also why croft's own Go to Definition rides Ctrl. |
+| `triple_click` | croft's click tracker distinguishes single from double only, so a triple binding would fire on the second click and mean something other than what it says. |
+| bare `click` in `editor` or `terminal` | It is how the caret is placed and text is selected; rebinding it leaves no way to do either. Bare `click` in `file_tree` or `tab_strip` is allowed. |
+
+`mod` means Ctrl for mouse on every platform, unlike keys where it is Cmd on
+macOS — for the same reporting reason.
+
+**In terminal panes**, a TUI that has asked for mouse tracking owns the
+pointer, so user bindings do not fire there; hold `shift` to bypass, the same
+rule croft's built-in scroll follows.
+
