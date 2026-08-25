@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Colour logs render in the editor: open a docker, pytest or cargo log and the ANSI colours paint through your theme's palette instead of showing raw escape codes — and because the view is windowed, a log far past the usual size limit opens instantly.",
+    summary: "Keyboard macros: record a burst of editing and replay it, with vim's q/@ registers or from the Command Palette. Counts work (3@a), one iteration never merges into the next, and named registers persist across restarts — the VS Code request open since 2016.",
 }];
