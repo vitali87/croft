@@ -402,13 +402,7 @@ impl Gesture {
                 }
             }
         }
-        Some((
-            Gesture {
-                kind: kind?,
-                mods,
-            },
-            warn,
-        ))
+        Some((Gesture { kind: kind?, mods }, warn))
     }
 
     /// True when this gesture would shadow primary selection. Binding these
@@ -613,7 +607,10 @@ mod tests {
         assert_eq!(g.kind, GestureKind::WheelUp);
         assert_eq!(g.mods, KeyModifiers::ALT | KeyModifiers::SHIFT);
 
-        assert!(Gesture::parse("ctrl+f").is_none(), "a key chord is not a gesture");
+        assert!(
+            Gesture::parse("ctrl+f").is_none(),
+            "a key chord is not a gesture"
+        );
         assert!(
             Gesture::parse("click+wheel_up").is_none(),
             "two gestures in one binding is nonsense"
@@ -662,11 +659,8 @@ mod tests {
             km.warnings()
         );
         assert!(
-            km.command_for_mouse(
-                Gesture::parse("click").unwrap().0,
-                MouseContext::FileTree
-            )
-            .is_some(),
+            km.command_for_mouse(Gesture::parse("click").unwrap().0, MouseContext::FileTree)
+                .is_some(),
             "the file-tree binding survived"
         );
     }
@@ -679,11 +673,13 @@ mod tests {
         );
         let g = Gesture::parse("ctrl+click").unwrap().0;
         assert_eq!(
-            km.command_for_mouse(g, MouseContext::Editor).map(|c| c.id()),
+            km.command_for_mouse(g, MouseContext::Editor)
+                .map(|c| c.id()),
             Some("save_file")
         );
         assert_eq!(
-            km.command_for_mouse(g, MouseContext::FileTree).map(|c| c.id()),
+            km.command_for_mouse(g, MouseContext::FileTree)
+                .map(|c| c.id()),
             Some("quick_open"),
             "the same gesture means something else in another region"
         );

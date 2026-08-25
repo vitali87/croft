@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Diffs can ignore whitespace: toggle indentation-only or all-whitespace changes out of the view so a reindented block stops burying the three lines that actually changed — staging always applies the real patch regardless of the view.",
+    summary: "Mouse gestures are yours to bind: keybindings.json now takes ctrl/alt/shift-modified clicks, middle click, right click and the wheel, scoped per region — VS Code's second-most-requested feature, open since 2016. A binding croft cannot honour says so in OUTPUT instead of failing silently.",
 }];
