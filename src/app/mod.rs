@@ -25486,10 +25486,24 @@ impl App {
         line: u32,
         column: Option<u32>,
     ) -> bool {
+        self.open_resolved_file_ref_inner(abs, line, column, true)
+    }
+
+    /// [`Self::open_resolved_file_ref`], but `record_nav` false skips the jump
+    /// history. A side-by-side open is ONE jump for the user even though it
+    /// opens two files, so it records the origin itself and opens both halves
+    /// without recording (otherwise the first Back lands on the left half).
+    fn open_resolved_file_ref_inner(
+        &mut self,
+        abs: &std::path::Path,
+        line: u32,
+        column: Option<u32>,
+        record_nav: bool,
+    ) -> bool {
         if !abs.is_file() {
             return false;
         }
-        if let Some(from) = self.editor.path.clone() {
+        if record_nav && let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
                 path: from,
                 row: self.editor.cursor_row,
@@ -25527,8 +25541,17 @@ impl App {
         if !lp.is_file() || !rp.is_file() {
             return false;
         }
+        // One click, one Back entry: record the origin once here, then open
+        // both halves with recording off.
+        if let Some(from) = self.editor.path.clone() {
+            self.nav.record(NavLoc {
+                path: from,
+                row: self.editor.cursor_row,
+                col: self.editor.cursor_col,
+            });
+        }
         self.focus_editor_group(true);
-        if !self.open_resolved_file_ref(&lp, left.line, left.column) {
+        if !self.open_resolved_file_ref_inner(&lp, left.line, left.column, false) {
             return false;
         }
         if self.editor_layout.is_split() {
@@ -25538,7 +25561,7 @@ impl App {
             // as a preview tab; opening the right file swaps into it.
             self.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
         }
-        if !self.open_resolved_file_ref(&rp, right.line, right.column) {
+        if !self.open_resolved_file_ref_inner(&rp, right.line, right.column, false) {
             return false;
         }
         self.status = format!(
