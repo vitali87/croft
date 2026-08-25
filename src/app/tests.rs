@@ -30466,3 +30466,115 @@ fn editing_drops_stale_document_links() {
         "the edit dropped the stale ranges"
     );
 }
+
+// ===== REVIEW PROBES (throwaway) =====
+#[test]
+fn probe_unknown_step_serialization_is_lossy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("macros.json");
+    std::fs::write(
+        &path,
+        r#"{"a":{"steps":[{"kind":"Text","text":"hi"}]},
+            "b":{"steps":[{"kind":"Mouse","button":"left","x":3}]}}"#,
+    )
+    .unwrap();
+    // Save an unrelated register -> read-modify-write of the whole file.
+    crate::macros::save_register(&path, "c", {
+        let mut m = crate::macros::Macro::default();
+        m.push_key(key(KeyCode::Char('z'), KeyModifiers::NONE));
+        m
+    })
+    .unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    eprintln!("PROBE-FILE-AFTER:\n{after}");
+    assert!(
+        after.contains("Mouse"),
+        "PROBE: register b's future step was DESTROYED by the round-trip"
+    );
+}
+
+#[test]
+fn probe_replay_times_keybinding_reenters_during_replay() {
+    let (mut app, tmp) = vim_app("one\ntwo\n");
+    app.macros_path = tmp.path().join("macros.json");
+    // Simulate a user keybinding bound to macro_replay_times, as keymap
+    // command_for -> run_command would reach it from handle_key_inner.
+    let mut m = crate::macros::Macro::default();
+    m.push_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+    app.macro_registers.insert("z".into(), m.clone());
+    app.macro_last = Some(m);
+    app.macro_replaying = true;
+    app.run_command(crate::widgets::command_palette::Command::MacroReplayTimes);
+    eprintln!("PROBE-PROMPT-OPEN-DURING-REPLAY: {}", app.input_prompt.is_some());
+    assert!(
+        app.input_prompt.is_none(),
+        "PROBE: MacroReplayTimes opened a prompt mid-replay (no guard)"
+    );
+}
+
+#[test]
+fn probe_pending_record_cleared_by_palette_start() {
+    let (mut app, tmp) = vim_app("one\ntwo\n");
+    app.macros_path = tmp.path().join("macros.json");
+    // User presses `q` (awaiting register), then a palette Start fires.
+    vim_feed(&mut app, 'q');
+    app.run_command(crate::widgets::command_palette::Command::MacroStartStopRecording);
+    assert!(app.macro_recording.is_some(), "palette started");
+    // Now type 'a'. If pending_record survived it would be eaten as a
+    // register name; set_recording(true) does NOT clear it.
+    vim_feed(&mut app, 'a');
+    eprintln!(
+        "PROBE-AFTER-q-then-paletteStart-then-a: recording={:?} mode={:?}",
+        app.macro_recording.as_ref().map(|r| r.register),
+        app.vim.mode_label()
+    );
+}
+
+#[test]
+fn probe_undo_count_for_mixed_macro() {
+    let (mut app, tmp) = vim_app("hello world\nsecond\n");
+    app.macros_path = tmp.path().join("macros.json");
+    // Record: x (delete char) then insert "Z" via i Z Esc
+    vim_feed_str(&mut app, "qa");
+    vim_feed_str(&mut app, "x");
+    vim_feed_str(&mut app, "iZ");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+    vim_feed(&mut app, 'q');
+    let after_record = app.editor.lines[0].clone();
+    eprintln!("PROBE-AFTER-RECORD: {after_record:?}");
+    let baseline = app.editor.lines[0].clone();
+    vim_feed_str(&mut app, "2@a");
+    let after_replay = app.editor.lines[0].clone();
+    eprintln!("PROBE-AFTER-2x-REPLAY: {after_replay:?}");
+    let mut undos = 0;
+    while app.editor.lines[0] != baseline && undos < 40 {
+        app.editor.undo();
+        undos += 1;
+    }
+    eprintln!("PROBE-UNDOS-TO-RESTORE-AFTER-2-ITERATIONS: {undos} (line now {:?})", app.editor.lines[0]);
+}
+
+#[test]
+fn probe_register_name_nonascii_and_budget() {
+    // key_events() on a big macro + saturating_mul behaviour
+    let mut m = crate::macros::Macro::default();
+    for _ in 0..10 {
+        m.push_key(key(KeyCode::Down, KeyModifiers::NONE));
+    }
+    eprintln!("PROBE-LEN {} KEYEVENTS {}", m.len(), m.key_events().len());
+    // usize::MAX count
+    let n = m.key_events().len().saturating_mul(usize::MAX);
+    eprintln!("PROBE-SATMUL {n}");
+}
+
+#[test]
+fn probe_desync_test_would_fail_if_reverted() {
+    // Does the palette-start->vim-q direction actually depend on set_recording?
+    let (mut app, tmp) = vim_app("one\ntwo\n");
+    app.macros_path = tmp.path().join("macros.json");
+    app.run_command(crate::widgets::command_palette::Command::MacroStartStopRecording);
+    assert!(app.macro_recording.is_some());
+    eprintln!("PROBE-vim-sees-recording-after-palette-start");
+    vim_feed(&mut app, 'q');
+    eprintln!("PROBE-AFTER-BARE-q: recording={:?}", app.macro_recording.is_some());
+}
