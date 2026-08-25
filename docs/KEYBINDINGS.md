@@ -594,8 +594,10 @@ and an optional `when` region:
 ]
 ```
 
-**Gestures:** `click`, `double_click`, `middle_click`, `right_click`,
-`wheel_up`, `wheel_down`, each combinable with `ctrl`, `alt`, `shift`.
+**Gestures (six bindable):** `click`, `double_click`, `middle_click`,
+`right_click`, `wheel_up`, `wheel_down`, each combinable with `ctrl`, `alt`,
+`shift`. A seventh name, `triple_click`, is recognised and refused with a
+warning rather than ignored — see the refusal table below.
 
 **`when` regions:** `editor` (the default when omitted), `terminal`,
 `file_tree`, `tab_strip`. The same gesture can mean different things in

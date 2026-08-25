@@ -1658,6 +1658,91 @@ fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
 }
 
 #[test]
+fn a_bound_wheel_gesture_fires_and_a_modified_wheel_does_not_match_the_bare_row() {
+    // The wheel is the one gesture family whose dispatch no other test drives
+    // end to end — the rest of the coverage stops at the parser. It is also
+    // the family where a regression is invisible: a wheel that silently falls
+    // through to the built-in scroll looks like ordinary scrolling.
+    //
+    // Modifiers are part of a gesture's identity, so a bare `wheel_up` row
+    // must not answer a ctrl+wheel_up. That is the same rule the shift test
+    // above pins for clicks, checked here for the wheel.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) =
+        tree_app_with_keymap(r#"[{"key": "wheel_up", "command": "quick_open", "when": "editor"}]"#);
+    let _ = MouseButton::Left;
+
+    let (col, row) = (app.editor.last_inner.x + 4, app.editor.last_inner.y + 1);
+    let mut modified = mouse(MouseEventKind::ScrollUp, col, row);
+    modified.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(modified);
+    assert!(
+        app.file_finder.is_none(),
+        "ctrl+wheel_up must not match a bare `wheel_up` row"
+    );
+
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, col, row));
+    assert!(
+        app.file_finder.is_some(),
+        "a bare wheel_up binding must fire through the dispatch"
+    );
+}
+
+#[test]
+fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one() {
+    // Splits make several terminals visible at once, and every terminal
+    // command reads the grid through `self.terminal()`, i.e. the ACTIVE
+    // pane. The built-in ctrl+click makes the clicked pane active before
+    // resolving the link; the binding dispatch returns above that point, so
+    // without its own activation a bound `mouse_open_link_at_click` inspects
+    // whichever pane happened to be focused and reports "No link there" over
+    // a URL the user can plainly see.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "mouse_open_link_at_click", "when": "terminal"}]"#,
+    );
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.terminals.len(), 2, "two panes are visible");
+
+    // The URL is printed into pane 0 only, while pane 1 holds focus.
+    app.terminals[0].feed_bytes_for_test(b"https://example.com/zero\r\n");
+    app.active_terminal = 1;
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Click directly on the URL — in pane 0, the pane that is NOT active.
+    // The pane's first row is its border, so the printed line lands on the
+    // next one. Assert the cell really holds the URL first: clicking an
+    // empty cell also yields "No link there", which would pass this test
+    // for entirely the wrong reason.
+    let area = app.terminals[0].last_area;
+    let (col, row) = (area.x + 2, area.y + 1);
+    assert!(
+        app.terminals[0]
+            .line_text_at(col, row)
+            .is_some_and(|(t, _)| t.trim_end() == "https://example.com/zero"),
+        "the click must land on the URL, or a refusal proves nothing"
+    );
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    assert_ne!(
+        app.status, "No link there",
+        "the bound command must resolve against the CLICKED pane; it read the active one"
+    );
+    assert_eq!(
+        app.active_terminal, 0,
+        "clicking a pane through a binding makes it active, as the built-in does"
+    );
+}
+
+#[test]
 fn a_mouse_tracking_child_keeps_the_pointer_from_a_bound_gesture() {
     // A terminal running a mouse-tracking TUI owns the pointer: croft must
     // not steal a click the child asked for, and a user binding is no more

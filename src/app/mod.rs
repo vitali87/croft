@@ -28851,6 +28851,45 @@ impl App {
         }
     }
 
+    /// Make pane `idx` the active terminal, tearing down the overlays that
+    /// were bound to the pane being left.
+    ///
+    /// Shared by the built-in click path and the bound-gesture dispatch so
+    /// the two cannot drift: every terminal helper reaches the grid through
+    /// `self.terminal()`, which indexes `active_terminal`, so a caller that
+    /// skips this reads a pane the user did not click. That is not
+    /// hypothetical — a bound `mouse_open_link_at_click` reported "No link
+    /// there" over a plainly visible URL in a split, because the dispatch
+    /// returned above the assignment the built-in makes.
+    fn activate_terminal_pane(&mut self, idx: usize) {
+        if self.active_terminal == idx {
+            return;
+        }
+        // Copy mode is bound to the pane it opened on; a click on a sibling
+        // pane leaves it, tmux-style, rather than hijacking the new pane's
+        // grid.
+        if self
+            .terminal_copy_mode
+            .as_ref()
+            .is_some_and(|st| st.pane != idx)
+        {
+            self.close_terminal_copy_mode();
+        }
+        // Quick-select labels are pane-bound the same way.
+        if self
+            .terminal_quick_select
+            .as_ref()
+            .is_some_and(|st| st.pane != idx)
+        {
+            self.close_terminal_quick_select();
+        }
+        // As is the find bar and its highlight.
+        if self.terminal_find.is_some() && self.terminal_find_pane != idx {
+            self.close_terminal_find();
+        }
+        self.active_terminal = idx;
+    }
+
     fn close_terminal_find(&mut self) {
         if self.terminal_find.take().is_some() {
             self.terminal_find_match = None;
@@ -30426,7 +30465,13 @@ impl App {
                 let tracker = match ctx {
                     crate::keymap::MouseContext::Terminal => &mut self.terminal_click,
                     crate::keymap::MouseContext::FileTree => &mut self.tree_click,
-                    _ => &mut self.editor_click,
+                    // The strip shares the editor's tracker, as `gesture_for`
+                    // does: a double-click is the same gesture whether it
+                    // lands on a tab or the text below it. Spelled out rather
+                    // than caught by `_` so a new variant has to choose.
+                    crate::keymap::MouseContext::Editor | crate::keymap::MouseContext::TabStrip => {
+                        &mut self.editor_click
+                    }
                 };
                 match gesture.kind {
                     crate::keymap::GestureKind::DoubleClick => tracker.clear(),
@@ -30478,6 +30523,19 @@ impl App {
                     let mut osk = crate::widgets::osk::Osk::new();
                     osk.split = crate::prefs::Prefs::load_or_default().osk_split;
                     self.osk = Some(osk);
+                }
+
+                // Every terminal command reads the grid through
+                // `self.terminal()`, i.e. `active_terminal`. The built-in
+                // click path makes the clicked pane active before it runs
+                // any of them; this early-returns above that, so it has to
+                // do the same or a bound command inspects whichever pane
+                // happened to be focused. Same helper, so the overlay
+                // teardown cannot drift between the two paths.
+                if matches!(ctx, crate::keymap::MouseContext::Terminal)
+                    && let Some(idx) = terminal_hit
+                {
+                    self.activate_terminal_pane(idx);
                 }
 
                 // Position-carrying commands read the click through this,
@@ -32082,31 +32140,7 @@ impl App {
                     }
                     self.poke_cursor();
                 } else if let Some(idx) = terminal_hit {
-                    if self.active_terminal != idx {
-                        // Copy mode is bound to the pane it opened on; a
-                        // click on a sibling pane leaves it, tmux-style,
-                        // rather than hijacking the new pane's grid.
-                        if self
-                            .terminal_copy_mode
-                            .as_ref()
-                            .is_some_and(|st| st.pane != idx)
-                        {
-                            self.close_terminal_copy_mode();
-                        }
-                        // Quick-select labels are pane-bound the same way.
-                        if self
-                            .terminal_quick_select
-                            .as_ref()
-                            .is_some_and(|st| st.pane != idx)
-                        {
-                            self.close_terminal_quick_select();
-                        }
-                        // As is the find bar and its highlight.
-                        if self.terminal_find.is_some() && self.terminal_find_pane != idx {
-                            self.close_terminal_find();
-                        }
-                        self.active_terminal = idx;
-                    }
+                    self.activate_terminal_pane(idx);
                     self.focus_pane(Pane::Terminal);
                     // Click on a gutter decoration dot (the pane's left
                     // border): open the command's action menu (VS Code's
