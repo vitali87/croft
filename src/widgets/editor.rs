@@ -12524,6 +12524,7 @@ impl EditorTabs {
             right_lines,
         );
         data.left_is_real_file = true;
+        data.set_whitespace_mode(self.diff_ws_default);
 
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
@@ -13513,6 +13514,44 @@ mod tests {
 
     /// Opening a real file into an editor showing a diff must drop the diff
     /// view, or a restore-then-reload keeps rendering the stale side-by-side.
+    /// #258: every diff opener must apply the configured default, not just
+    /// the HEAD-vs-working one. `open_diff` backs the Compare actions, and
+    /// missing the setter there meant Compare always started in `Off`
+    /// regardless of config (caught in review on #292).
+    #[test]
+    fn every_diff_opener_applies_the_configured_whitespace_default() {
+        use crate::widgets::diff::DiffWhitespace;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, "x = 1;\n").unwrap();
+        std::fs::write(&b, "    x = 1;\n").unwrap();
+
+        // The openers live on EditorTabs, which derefs to the active tab, so
+        // the default is read from the tab the app syncs it onto.
+        let mut tabs = EditorTabs::new();
+        tabs.editors[tabs.active].diff_ws_default = DiffWhitespace::Leading;
+
+        // Compare two explorer files.
+        tabs.open_diff(&a, &b).unwrap();
+        assert_eq!(
+            tabs.diff.as_ref().unwrap().ws_mode,
+            DiffWhitespace::Leading,
+            "open_diff (the Compare actions) must honour the default"
+        );
+
+        // HEAD-vs-working, the other user-facing entry point.
+        let mut t2 = EditorTabs::new();
+        t2.editors[t2.active].diff_ws_default = DiffWhitespace::All;
+        t2.open_head_diff_with_text(a.clone(), "x = 1;\n", &b, true)
+            .unwrap();
+        assert_eq!(
+            t2.diff.as_ref().unwrap().ws_mode,
+            DiffWhitespace::All,
+            "the HEAD diff must honour it too"
+        );
+    }
+
     #[test]
     fn opening_a_real_file_clears_a_stale_diff_view() {
         let tmp = tempfile::tempdir().unwrap();
