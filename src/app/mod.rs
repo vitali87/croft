@@ -7142,6 +7142,14 @@ impl App {
             self.status = String::from("Malformed file link");
             return;
         }
+        // Deliberately NOT delegated to `open_detected_url`, despite the
+        // duplicated guard below: that path first probes `diff://` and
+        // `editor_file_uri`, which resolves `vscode://file/<path>` (and the
+        // Cursor/Windsurf/Zed schemes) into a file open. A terminal link is
+        // text the user's own program printed; a document link's target is
+        // chosen by the language server, so letting it name an editor URI
+        // would hand a server the ability to open arbitrary paths from a
+        // click on unrelated-looking text.
         let scheme_ok = {
             let l = target.trim_start().to_ascii_lowercase();
             l.starts_with("http://") || l.starts_with("https://")
@@ -7150,8 +7158,10 @@ impl App {
             self.status = format!("Refused to open non-web link: {target}");
             return;
         }
-        if is_remote_session() {
-            self.status = format!("Running remotely: open {target} on your machine");
+        // Web link on a remote session: the relay can put it in front of the
+        // user's own browser, exactly like a terminal link.
+        if self.drop_relay_active() || is_remote_session() {
+            self.open_detected_url(target);
             return;
         }
         self.status = match open_url(target) {
