@@ -988,6 +988,44 @@ impl LspClient {
             .context("formatting")
     }
 
+    /// `textDocument/rangeFormatting`: format only the given UTF-16 span
+    /// ("Format Selection", #254). Same options contract as whole-document
+    /// formatting.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn range_formatting(
+        &mut self,
+        uri: Url,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.server
+            .range_formatting(lsp_types::DocumentRangeFormattingParams {
+                text_document: TextDocumentIdentifier { uri },
+                range: Range {
+                    start: Position {
+                        line: start_line,
+                        character: start_character,
+                    },
+                    end: Position {
+                        line: end_line,
+                        character: end_character,
+                    },
+                },
+                options: FormattingOptions {
+                    tab_size,
+                    insert_spaces,
+                    ..FormattingOptions::default()
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("range_formatting")
+    }
+
     pub async fn semantic_tokens_full(&mut self, uri: Url) -> Result<Option<SemanticTokensResult>> {
         self.server
             .semantic_tokens_full(SemanticTokensParams {
