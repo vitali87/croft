@@ -30796,6 +30796,267 @@ fn a_replayed_transcript_cannot_execute_control_sequences() {
     );
 }
 
+/// #260: with auto-hide on, moving focus to the editor collapses the sidebar,
+/// and a deliberate sidebar action brings it back and HOLDS it — the reveal
+/// must not be undone by the focus change it performs itself.
+#[test]
+fn auto_hide_collapses_on_editor_focus_and_deliberate_actions_restore_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    app.focus_pane(Pane::Editor);
+    assert!(!app.show_tree, "focusing the editor collapses the sidebar");
+
+    // An activity-bar view switch is a deliberate sidebar action: it reveals
+    // the sidebar AND lands focus there, so the pin it takes is released by
+    // that same focus move — the sidebar stays open because focus is in it,
+    // not because it is pinned.
+    app.set_sidebar_view(SidebarView::Search);
+    assert!(app.show_tree, "choosing a view reveals the sidebar");
+    assert!(app.focus == Pane::Tree, "and puts focus in it");
+    assert!(
+        !app.sidebar_pinned_open,
+        "focus landed in the sidebar, so the pin has done its job"
+    );
+
+    // Leaving again collapses.
+    app.focus_pane(Pane::Editor);
+    assert!(!app.show_tree, "leaving collapses it again");
+
+    // Terminal focus collapses too, not just the editor.
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Tree);
+    app.focus_pane(Pane::Terminal);
+    assert!(!app.show_tree, "a terminal is also 'not the sidebar'");
+}
+
+/// The flapping cases from #260: a seam drag, an open prompt or menu, and Zen
+/// Mode must all suppress the collapse. Each is a state where the sidebar is
+/// either being manipulated or deliberately borrowed.
+#[test]
+fn auto_hide_is_suppressed_while_dragging_prompting_or_in_zen_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+
+    // Baseline: it would collapse.
+    app.show_tree = true;
+    assert!(app.sidebar_auto_hide_allowed());
+
+    // Mid seam-drag the pointer is over the editor by definition; collapsing
+    // under the cursor is exactly the flapping the issue calls out.
+    app.splitter_drag = Some(SplitterDrag::Sidebar);
+    assert!(!app.sidebar_auto_hide_allowed(), "a drag suppresses it");
+    app.focus_pane(Pane::Editor);
+    assert!(app.show_tree, "and the sidebar survives the drag");
+    app.splitter_drag = None;
+
+    // Zen Mode already owns chrome visibility and wins, as it does today.
+    app.zen_mode = true;
+    assert!(!app.sidebar_auto_hide_allowed(), "zen mode wins");
+    app.zen_mode = false;
+
+    // Off by default: a user who never opted in never loses their sidebar.
+    app.sidebar_auto_hide = false;
+    assert!(!app.sidebar_auto_hide_allowed());
+    app.focus_pane(Pane::Editor);
+    assert!(app.show_tree, "opt-in only");
+}
+
+/// Reveal-in-explorer targets the sidebar, so it must work even when
+/// auto-hide has collapsed it — otherwise the command silently does nothing
+/// visible.
+#[test]
+fn reveal_in_explorer_shows_a_collapsed_sidebar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    app.focus_pane(Pane::Editor);
+    assert!(!app.show_tree, "collapsed first");
+
+    app.reveal_in_explorer(f);
+    assert!(
+        app.show_tree,
+        "a sidebar-targeting command reveals the sidebar"
+    );
+}
+
+/// The Customize Layout rows carry hardcoded re-open indices (each toggle
+/// reopens the menu with itself selected), so inserting a row in the middle
+/// silently mis-selects every row after it. #260's Auto-Hide row is appended
+/// after Minimap for that reason; this pins the positions so a future insert
+/// fails here rather than in someone's hands.
+#[test]
+fn customize_layout_toggle_rows_keep_their_reopen_indices() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    let items = app.customize_layout_items();
+    let label = |i: usize| match &items[i] {
+        MenuEntry::Item { label, .. } => label.clone(),
+        _ => panic!("row {i} is not an item"),
+    };
+    assert!(label(0).contains("Activity Bar"));
+    assert!(label(1).contains("Primary Side Bar"));
+    assert!(label(2).contains("Secondary Side Bar"));
+    assert!(label(3).contains("Panel"));
+    assert!(label(4).contains("Status Bar"));
+    assert!(label(5).contains("Minimap"));
+    assert!(
+        label(6).contains("Auto-Hide Side Bar"),
+        "the new row is appended, not inserted"
+    );
+}
+
+/// #294 review: the palette and menu toggles must not drift. Both funnel
+/// through one method, so they set the same state and report the same status;
+/// previously the menu route set neither the status nor any persistence.
+#[test]
+fn both_auto_hide_toggle_routes_agree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(!app.sidebar_auto_hide, "off by default");
+
+    app.toggle_sidebar_auto_hide();
+    assert!(app.sidebar_auto_hide);
+    assert!(
+        app.status.contains("on"),
+        "the toggle reports its new state: {}",
+        app.status
+    );
+    app.toggle_sidebar_auto_hide();
+    assert!(!app.sidebar_auto_hide);
+    assert!(
+        app.status.contains("off"),
+        "and reports off: {}",
+        app.status
+    );
+}
+
+/// #294 re-review found the blocker this pins: the pin was set only on the
+/// palette route, while a real Cmd+B keypress is handled earlier and returns
+/// before `Cmd` dispatch — so the headline reveal gesture revealed the panel
+/// and the very next click into the editor collapsed it again. Driving the
+/// key event is the whole point; every other test here sets the flag by hand
+/// and so could not see it.
+#[test]
+fn the_real_cmd_b_keypress_reveals_and_holds_the_sidebar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = false;
+
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.show_tree, "Cmd+B reveals the sidebar");
+
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.show_tree,
+        "and the reveal survives the next move to the editor"
+    );
+
+    // Still one-shot: the exemption is spent, so the following move collapses.
+    app.focus_pane(Pane::Tree);
+    app.focus_pane(Pane::Editor);
+    assert!(!app.show_tree, "the exemption was consumed, not sticky");
+
+    // Ctrl+B is the same gesture on the other platform convention.
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.show_tree);
+    app.focus_pane(Pane::Editor);
+    assert!(app.show_tree, "Ctrl+B pins exactly as Cmd+B does");
+}
+
+/// A pin taken while the feature is OFF must not be banked: it would sit
+/// unconsumed and silently eat the first collapse after the user turns
+/// auto-hide on, which reads as "the setting did nothing".
+#[test]
+fn a_reveal_while_auto_hide_is_off_does_not_bank_an_exemption() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = false;
+    app.show_tree = false;
+
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.show_tree);
+    assert!(
+        !app.sidebar_pinned_open,
+        "no pin is banked while the feature is off"
+    );
+
+    app.sidebar_auto_hide = true;
+    app.focus_pane(Pane::Editor);
+    assert!(
+        !app.show_tree,
+        "so the first collapse after enabling it actually happens"
+    );
+}
+
+/// #294 review: the reveal exemption is ONE-SHOT. Cmd+B reveals without
+/// moving focus, so a sticky flag would never be cleared (focus never lands
+/// on the tree) and auto-hide would be silently dead for the session.
+#[test]
+fn the_reveal_exemption_is_consumed_rather_than_sticky() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    // Cmd+B-style reveal: exempt the next collapse.
+    app.sidebar_pinned_open = true;
+    app.focus_pane(Pane::Editor);
+    assert!(app.show_tree, "the exemption protects this focus move");
+    assert!(
+        !app.sidebar_pinned_open,
+        "and is consumed rather than latching auto-hide off"
+    );
+
+    // The very next move collapses, proving the feature re-armed itself.
+    app.focus_pane(Pane::Editor);
+    assert!(!app.show_tree, "auto-hide is live again");
+}
+
+/// #294 review: the suppression list must cover the modal states the codebase
+/// already treats as modal — several are sidebar-targeting flows that are
+/// their own fields rather than `Prompt`s, so checking `prompt` alone missed
+/// exactly the ones the comment claimed were covered.
+#[test]
+fn auto_hide_yields_to_real_modal_overlays_and_explorer_drags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    assert!(app.sidebar_auto_hide_allowed(), "baseline collapses");
+
+    // A command palette is modal and may sit over sidebar space.
+    app.command_palette = Some(crate::widgets::command_palette::CommandPalette::new());
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "a modal overlay suppresses the collapse"
+    );
+    app.command_palette = None;
+
+    // With no activity bar there is no on-screen way back to a collapsed
+    // sidebar, so a mouse-only user would be stranded.
+    app.activity_bar_visible = false;
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "no reveal affordance means no auto-hide"
+    );
+    app.activity_bar_visible = true;
+
+    // A focus move the user did not ask for is not a reason to hide chrome.
+    app.without_auto_hide(|a| a.focus_pane(Pane::Editor));
+    assert!(app.show_tree, "programmatic focus leaves the sidebar alone");
+}
 /// #256 step 1: a server that publishes project-wide diagnostics (rust-analyzer
 /// does this from `cargo check`) names files the user never opened. The panel
 /// builds from the diagnostics store rather than from open buffers, so those

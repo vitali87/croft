@@ -129,6 +129,11 @@ pub struct Prefs {
     /// Visibility of the Explorer's stacked sub-views (⋯ menu toggles).
     #[serde(default)]
     pub explorer_views: ExplorerViewsPrefs,
+    /// Collapse the sidebar when focus moves to the editor or a terminal
+    /// (#260). Off by default: hiding chrome on focus surprises people who
+    /// did not ask for it, so this is opt-in.
+    #[serde(default)]
+    pub sidebar_auto_hide: bool,
     /// Which files the PROBLEMS panel lists (#256): `whole_project` (default,
     /// every file a server or build tool reported) or `open_files`.
     /// Unrecognised values read as `whole_project`, so a typo shows more
@@ -406,11 +411,49 @@ pub fn save_auto_save_on_focus_change(enabled: bool) -> Result<()> {
     prefs.save(&path)
 }
 
+/// Persist the auto-hide side bar choice (#260), preserving other settings.
+/// Best-effort, like [`save_auto_save`].
+pub fn save_sidebar_auto_hide(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = prefs_for_update(&path)?;
+    prefs.sidebar_auto_hide = enabled;
+    prefs.save(&path)
+}
+
+/// The prefs to mutate in a `save_*` helper: the file's contents, or defaults
+/// only when the file is genuinely ABSENT.
+///
+/// `Prefs::load` cannot tell "no config yet" from "config is malformed" —
+/// both are `Err` — so `unwrap_or_default()` on a corrupt file would write
+/// defaults over it and erase every unrelated setting the user had. A first
+/// run must still work, so absence maps to defaults; anything else refuses,
+/// leaving the file for the user to fix.
+fn prefs_for_update(path: &Path) -> Result<Prefs> {
+    match Prefs::load(path) {
+        Ok(p) => Ok(p),
+        // Branch on the error itself rather than a follow-up `path.exists()`:
+        // a dangling symlink at the config path reports "does not exist" while
+        // the open failed for a different reason, and defaults written through
+        // it would clobber whatever it points at. `load` wraps the io error in
+        // context, so the cause is in the chain rather than the top error.
+        Err(e) => {
+            let missing = e
+                .chain()
+                .filter_map(|c| c.downcast_ref::<std::io::Error>())
+                .any(|io| io.kind() == std::io::ErrorKind::NotFound);
+            if missing {
+                return Ok(Prefs::default());
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Persist the PROBLEMS scope (#256), preserving other settings.
 /// Best-effort, like [`save_auto_save`].
 pub fn save_problems_scope(mode: &str) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = prefs_for_update(&path)?;
     prefs.problems_scope = mode.to_string();
     prefs.save(&path)
 }
@@ -715,5 +758,44 @@ mod tests {
         let p = config_path();
         assert!(p.to_string_lossy().contains("croft"));
         assert_eq!(p.file_name().unwrap(), "config.json");
+    }
+
+    /// #294 review: a `save_*` helper must not overwrite a MALFORMED config
+    /// with defaults — that silently erases every unrelated setting the user
+    /// had. `Prefs::load` returns `Err` for both "absent" and "corrupt", so
+    /// the distinction has to be made explicitly.
+    #[test]
+    fn an_update_refuses_a_corrupt_config_but_defaults_when_absent() {
+        let dir = std::env::temp_dir().join(format!("croft-prefs-update-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        // Absent: a first run must still work.
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            prefs_for_update(&path).is_ok(),
+            "no config yet is not an error"
+        );
+
+        // Present but corrupt: refuse rather than clobber.
+        std::fs::write(&path, "{ this is not json").unwrap();
+        assert!(
+            prefs_for_update(&path).is_err(),
+            "a malformed config must not be replaced by defaults"
+        );
+        // The file is left exactly as the user wrote it.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ this is not json"
+        );
+
+        // Present and valid: the real contents come back.
+        let p = Prefs {
+            theme: String::from("some-theme"),
+            ..Default::default()
+        };
+        p.save(&path).unwrap();
+        assert_eq!(prefs_for_update(&path).unwrap().theme, "some-theme");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
