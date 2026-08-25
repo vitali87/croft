@@ -30336,15 +30336,23 @@ impl App {
                 && terminal_hit.is_some_and(|idx| self.terminals[idx].mouse_reporting())
                 && !m.modifiers.contains(KeyModifiers::SHIFT);
             if !child_owns_pointer {
-                // Every built-in pairs `is_double` with `record`/`clear` so the
-                // count resets. Without this a third click at the same cell
-                // still reads as a double and fires the binding again.
-                if gesture.kind == crate::keymap::GestureKind::DoubleClick {
-                    match ctx {
-                        crate::keymap::MouseContext::Terminal => self.terminal_click.clear(),
-                        crate::keymap::MouseContext::FileTree => self.tree_click.clear(),
-                        _ => self.editor_click.clear(),
-                    }
+                // Every built-in pairs `is_double` with `record`/`clear` so
+                // the count stays right. The early return below skips the
+                // built-in branch that would have recorded, so the dispatch
+                // has to keep the tracker itself: clear on a fired double
+                // (or a third click re-fires it), RECORD on a fired single
+                // (or a `click` binding starves the `double_click` binding
+                // beside it — `is_double` could never become true again).
+                let now = std::time::Instant::now();
+                let tracker = match ctx {
+                    crate::keymap::MouseContext::Terminal => &mut self.terminal_click,
+                    crate::keymap::MouseContext::FileTree => &mut self.tree_click,
+                    _ => &mut self.editor_click,
+                };
+                match gesture.kind {
+                    crate::keymap::GestureKind::DoubleClick => tracker.clear(),
+                    crate::keymap::GestureKind::Click => tracker.record(now, m.column, m.row),
+                    _ => {}
                 }
                 // Position-carrying commands read the click through this,
                 // set before dispatch and cleared after so a keyboard
@@ -33100,7 +33108,6 @@ impl App {
             for w in &warns {
                 crate::output::push("Keybindings", crate::output::OutputLevel::Warn, w);
             }
-            // (status set below, once, so the warning summary is not clobbered)
             self.status = if warns.is_empty() {
                 String::from(
                     "Keybindings reloaded (for new Cmd chords, re-run croft setup-iterm2 / setup-ghostty)",
@@ -38228,8 +38235,13 @@ fn gesture_for(
             let tracker = match ctx {
                 MouseContext::Terminal => &app.terminal_click,
                 MouseContext::FileTree => &app.tree_click,
-                // The tab strip is part of the editor pane and records there.
-                MouseContext::Editor | MouseContext::TabStrip => &app.editor_click,
+                MouseContext::Editor => &app.editor_click,
+                // The tab strip writes to no tracker of its own, so a double
+                // there can only be seen because the dispatch itself records
+                // into `editor_click` above. Sharing it with the editor body
+                // is acceptable: a double needs both clicks within 500ms at
+                // the SAME cell, and the strip and the body do not overlap.
+                MouseContext::TabStrip => &app.editor_click,
             };
             if tracker.is_double(now, m.column, m.row) {
                 GestureKind::DoubleClick

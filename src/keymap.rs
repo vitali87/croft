@@ -422,10 +422,14 @@ impl Gesture {
                 }
             }
         }
-        let kind = kind?;
+        // Checked BEFORE `kind?`: `"cmd"` or `"cmd+bogus"` has no gesture
+        // token, so returning early here would drop the Cmd-is-unreportable
+        // reason and fall through to a generic "not a key chord or mouse
+        // gesture" — losing exactly the explanation this path exists for.
         if refused {
             return Some((None, warn));
         }
+        let kind = kind?;
         Some((Some(Gesture { kind, mods }), warn))
     }
 

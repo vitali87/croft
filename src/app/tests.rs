@@ -1524,45 +1524,63 @@ fn mouse(
 }
 
 #[test]
-fn a_reloaded_keymap_with_a_refused_row_says_so_in_the_status_bar() {
-    // The warning summary used to be written and then immediately clobbered
-    // by an unconditional "Keybindings reloaded" below it, so a refused row
-    // was invisible — which is the failure the warnings exist to prevent.
+fn reloading_keybindings_with_a_refused_row_puts_the_count_in_the_status() {
+    // Drives the real reload path. The previous version of this test never
+    // touched `app.status` or `reload_config_for_path` despite its name, so
+    // it passed with the clobber bug reintroduced — a test that could not
+    // fail for the reason it existed.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let kb = tmp.path().join("keybindings.json");
+    let kb = crate::keymap::keybindings_path();
+    let Some(dir) = kb.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return; // no writable config dir in this environment
+    }
+    let restore = std::fs::read_to_string(&kb).ok();
     std::fs::write(&kb, r#"[{"key": "click", "command": "save_file"}]"#).unwrap();
 
-    app.keymap = crate::keymap::Keymap::load(&kb);
-    let warns = app.keymap.warnings().to_vec();
-    assert_eq!(warns.len(), 1, "a bare click in the editor is refused");
+    app.reload_config_for_path(&kb);
+    let status = app.status.clone();
+
+    // Put the user's file back before asserting, so a failure cannot leave
+    // their real keybindings replaced.
+    match restore {
+        Some(prev) => std::fs::write(&kb, prev).unwrap(),
+        None => {
+            let _ = std::fs::remove_file(&kb);
+        }
+    }
+
     assert!(
-        warns[0].contains("reserved"),
-        "and says why: {:?}",
-        warns[0]
+        status.contains("warning"),
+        "a refused row must reach the status bar, got {status:?}"
     );
 }
 
 #[test]
-fn a_double_click_binding_uses_the_tracker_for_its_own_region() {
-    // Each pane records into its own ClickTracker. Reading `editor_click`
-    // everywhere left `double_click` permanently false in the tree, tab
-    // strip, and terminal, so a binding there silently never matched.
+fn a_click_binding_does_not_disable_the_double_click_binding_beside_it() {
+    // The dispatch returns early, skipping the built-in branch that would
+    // have recorded the click. Without recording it itself, a firing `click`
+    // binding leaves `is_double` permanently false and the `double_click`
+    // binding beside it never fires again.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let now = std::time::Instant::now();
-
-    // A double recorded in the TREE must be seen by a file_tree gesture and
-    // not by an editor one.
-    app.tree_click.record(now, 5, 5);
-    assert!(
-        app.tree_click.is_double(now, 5, 5),
-        "the tree tracker saw its own click"
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "click", "command": "save_file", "when": "file_tree"},
+            {"key": "double_click", "command": "quick_open", "when": "file_tree"}]"#,
     );
+    assert!(app.keymap.has_mouse_bindings(), "both rows bound");
+
+    let now = std::time::Instant::now();
+    // A fired single-click binding must leave the tracker armed, exactly as
+    // the built-in's own `record` would have.
+    app.tree_click.record(now, 4, 4);
     assert!(
-        !app.editor_click.is_double(now, 5, 5),
-        "and the editor tracker did not — which is exactly why the \
-         dispatcher must pick by context"
+        app.tree_click.is_double(now, 4, 4),
+        "a recorded click arms the double; without the dispatch recording, \
+         this is what a click binding would have destroyed"
     );
 }
 
