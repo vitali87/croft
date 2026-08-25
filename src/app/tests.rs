@@ -22487,10 +22487,22 @@ fn repositories_overview_lists_every_folder_and_a_pin_overrides_the_follow() {
 
     // Anchor the focus in folder A first, then pin B: the pin wins for
     // as long as the focus stays inside A (further A files included).
-    let a_canon = a.canonicalize().unwrap();
+    //
+    // Compare against the root in the form the workspace holds it, not a
+    // canonicalised one: `App::new` stores the primary root verbatim, and
+    // on macOS a tempdir arrives as `/var/…` for a `/private/var/…`
+    // directory. The app is self-consistent — the follow root derives from
+    // the same workspace roots — so canonicalising only this side compares
+    // two spellings of one path and fails everywhere `/var` is a symlink.
+    let a_root = app
+        .roots
+        .iter()
+        .find(|r| r.ends_with("repa"))
+        .expect("folder A is in the workspace")
+        .to_path_buf();
     app.editor.open_pinned(&a.join("f.txt")).unwrap();
     let _ = app.drain_git_responses();
-    assert_eq!(app.active_scm_root, a_canon);
+    assert_eq!(app.active_scm_root, a_root);
     app.scm_pin = Some(b_canon.clone());
     let _ = app.drain_git_responses();
     assert_eq!(
@@ -22510,7 +22522,7 @@ fn repositories_overview_lists_every_folder_and_a_pin_overrides_the_follow() {
     app.editor.open_pinned(&a.join("f.txt")).unwrap();
     let _ = app.drain_git_responses();
     assert_eq!(
-        app.active_scm_root, a_canon,
+        app.active_scm_root, a_root,
         "after release the panel follows the focus again"
     );
 }

@@ -360,9 +360,19 @@ fn strip_jsonc(src: &str) -> String {
 pub fn write_workspace_file(path: &Path, folders: &[PathBuf]) -> Result<(), String> {
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    // Both sides must be canonical or neither: `relative_or_absolute` walks
+    // components, so a base under `/private/var` and a folder under `/var`
+    // (the same directory through macOS's symlink) share only the root and
+    // fall back to an absolute path — which is exactly the non-portable
+    // file this function exists to avoid. The primary workspace root
+    // reaches here uncanonicalised, so this is reachable from Save
+    // Workspace As whenever croft was opened at a symlinked path.
     let entries: Vec<serde_json::Value> = folders
         .iter()
-        .map(|f| serde_json::json!({ "path": relative_or_absolute(&base_canon, f) }))
+        .map(|f| {
+            let f_canon = f.canonicalize().unwrap_or_else(|_| f.clone());
+            serde_json::json!({ "path": relative_or_absolute(&base_canon, &f_canon) })
+        })
         .collect();
     let doc = serde_json::json!({ "folders": entries });
     let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
@@ -459,6 +469,42 @@ mod tests {
         assert!(ws.remove(Path::new("/w/b")), "a secondary root removes");
         assert!(!ws.is_multi());
         assert_eq!(ws.primary(), Path::new("/w/a"));
+    }
+
+    /// A folder reached through a symlink must still relativise. macOS
+    /// hands croft `/var/...` for a `/private/var/...` directory (and any
+    /// symlinked home does the same), so canonicalising only the base left
+    /// the two sharing just the root component — `relative_or_absolute`
+    /// then wrote an ABSOLUTE path and the workspace file stopped being
+    /// portable, which is the one thing it promises.
+    #[test]
+    fn a_symlinked_folder_still_writes_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alpha = real.join("alpha");
+        std::fs::create_dir(&alpha).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The caller passes the path it holds — through the symlink, and
+        // uncanonicalised, exactly as the primary workspace root arrives.
+        let file = link.join("proj.code-workspace");
+        write_workspace_file(&file, &[link.join("alpha")]).unwrap();
+        let raw = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            raw.contains("\"alpha\""),
+            "a symlinked folder relativises like any other: {raw}"
+        );
+        assert!(
+            !raw.contains("/alpha\""),
+            "and is not written absolute: {raw}"
+        );
+        assert_eq!(
+            parse_workspace_file(&file).unwrap(),
+            vec![alpha.canonicalize().unwrap()],
+            "and round-trips back to the real directory"
+        );
     }
 
     #[test]
