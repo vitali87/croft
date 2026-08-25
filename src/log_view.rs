@@ -86,11 +86,16 @@ impl LogView {
     }
 
     pub fn len(&self) -> usize {
+        // An empty file seeds one line-start but has no lines; the renderer
+        // reads `len()`, so it must not report a phantom row.
+        if self.file_len == 0 {
+            return 0;
+        }
         self.line_starts.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.file_len == 0
+        self.len() == 0
     }
 
     /// Byte range of one line, excluding its newline.
@@ -121,11 +126,28 @@ impl LogView {
         let (start, _) = self.line_range(first).unwrap_or((0, 0));
         let (_, end) = self.line_range(last - 1).unwrap_or((0, 0));
         let span = (end - start) as usize;
+        // Clamp the READ, but never cache a line whose bytes we did not fully
+        // read: a window that stops mid-line would otherwise cache a truncated
+        // line under a real line number, and the reader would see a cut-off
+        // log line as if it were the whole thing. Lines wider than the window
+        // are common (JSON logs, stack traces), so this is the normal case,
+        // not an exotic one.
         let mut buf = vec![0u8; span.min(WINDOW_BYTES)];
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(start))?;
         let n = file.read(&mut buf)?;
-        let text = String::from_utf8_lossy(&buf[..n]);
+        let complete = if (n as u64) < end - start {
+            // Short read: keep only through the last newline, so the final
+            // partial line is dropped rather than cached truncated.
+            match buf[..n].iter().rposition(|&b| b == b'\n') {
+                Some(nl) => &buf[..nl],
+                // Not even one full line fits; cache nothing rather than lie.
+                None => &buf[..0],
+            }
+        } else {
+            &buf[..n]
+        };
+        let text = String::from_utf8_lossy(complete);
 
         self.cache.clear();
         self.cache_start = first;

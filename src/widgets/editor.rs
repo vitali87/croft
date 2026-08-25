@@ -4384,6 +4384,9 @@ impl Editor {
             || self.image.is_some()
             || self.hex.is_some()
             || self.archive.is_some()
+            // A rendered log's text side is an empty stub, so a save would
+            // write one blank line over the file — the #185 truncation class.
+            || self.log.is_some()
             // A docx/odt preview's text side is a STUB (#200 review):
             // letting a save through would overwrite the document with
             // the placeholder, the exact #185 class.
@@ -4520,6 +4523,9 @@ impl Editor {
         self.sheet = None;
         self.markdown_preview = None;
         self.archive = None;
+        // The render dispatch checks `log` BEFORE `hex`, so a stale log would
+        // keep painting after "Reopen as Hex" reported success.
+        self.log = None;
         self.hex = Some(view);
         self.status = format!("Opened {} in the hex viewer", path.display());
         Ok(())
@@ -9035,6 +9041,12 @@ impl Editor {
     }
 
     pub fn scroll_up(&mut self, n: usize) {
+        // A rendered log scrolls by file line, ahead of the wrap/comment-box
+        // paths that assume an editable buffer (#257).
+        if self.log.is_some() {
+            self.scroll_view_to(self.scroll.saturating_sub(n));
+            return;
+        }
         if self.scroll_markdown_preview(-(n as i32)) {
             return;
         }
@@ -9052,6 +9064,10 @@ impl Editor {
     }
 
     pub fn scroll_down(&mut self, n: usize) {
+        if self.log.is_some() {
+            self.scroll_view_to(self.scroll.saturating_add(n));
+            return;
+        }
         if self.scroll_markdown_preview(n as i32) {
             return;
         }
@@ -9284,6 +9300,15 @@ impl Editor {
 
     fn scroll_view_to(&mut self, top: usize) {
         let viewport = self.last_inner.height as usize;
+        // A rendered log's text side is a one-line stub, so clamping against
+        // `lines` would pin scroll at 0 and the view could never move past its
+        // first screen (#257). Clamp against the log's own line count instead;
+        // its body area is one row shorter than the viewport (the header).
+        if let Some(log) = self.log.as_ref() {
+            let rows = viewport.saturating_sub(1).max(1);
+            self.scroll = top.min(log.len().saturating_sub(rows));
+            return;
+        }
         if viewport == 0 || self.lines.is_empty() {
             self.scroll = 0;
             self.cursor_row = 0;
@@ -14504,6 +14529,47 @@ mod tests {
             Some("ERROR first line"),
             "the first window parses without reading the whole file"
         );
+    }
+
+    /// #257 acceptance: the view must scroll past its first screen. It could
+    /// not before — `scroll_view_to` clamped against `lines`, which is a
+    /// one-line stub for a log, pinning scroll at 0 — so the windowing this
+    /// feature exists for was unreachable in the shipped UI.
+    #[test]
+    fn a_rendered_log_scrolls_past_the_first_screen() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("big.log");
+        let mut body = String::from("\u{1b}[31mstart\u{1b}[0m\n");
+        for i in 1..2_000 {
+            body.push_str(&format!("line{i}\n"));
+        }
+        std::fs::write(&p, body).unwrap();
+
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+        assert_eq!(e.scroll, 0);
+
+        e.scroll_down(500);
+        assert_eq!(e.scroll, 500, "the log scrolls by file line");
+        e.render(area, &mut buf);
+        let total = {
+            let log = e.log.as_ref().unwrap();
+            assert_eq!(
+                log.visible_text(500),
+                Some("line500"),
+                "and the window follows the viewport"
+            );
+            log.len()
+        };
+
+        // Clamped at the tail rather than scrolling into blank space.
+        e.scroll_down(usize::MAX / 2);
+        assert!(e.scroll < total, "scroll stays inside the file");
+        e.scroll_up(usize::MAX / 2);
+        assert_eq!(e.scroll, 0, "and back to the top");
     }
 
     /// Colours resolve through the ACTIVE theme's ANSI palette, so a rendered

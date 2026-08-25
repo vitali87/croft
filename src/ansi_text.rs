@@ -138,13 +138,53 @@ pub fn parse_line(raw: &str, style: &mut AnsiStyle) -> AnsiLine {
                 }
                 i = j;
             }
-            // Two-byte escapes (charset selection, RI, …): drop both bytes.
-            _ => i += 2,
+            // Three-byte forms: charset selection (`ESC ( B`) and friends.
+            b'(' | b')' | b'*' | b'+' | b'#' => i = next_boundary(raw, i + 3),
+            // DCS / SOS / PM / APC carry a payload terminated like OSC, so
+            // scanning to ST/BEL is the only way not to leak it as text.
+            b'P' | b'X' | b'^' | b'_' => {
+                let mut j = i + 2;
+                while j < bytes.len() {
+                    if bytes[j] == 0x07 {
+                        j += 1;
+                        break;
+                    }
+                    if bytes[j] == 0x1b && bytes.get(j + 1) == Some(&b'\\') {
+                        j += 2;
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            // A two-byte escape is `ESC` + one ASCII final byte (RI, NEL,
+            // DECSC…). If the byte after ESC is NOT ASCII, this is not an
+            // escape at all — it is a stray ESC in the text before a real
+            // character. Dropping just the ESC keeps the character, where
+            // advancing two bytes would swallow it (and, before the boundary
+            // guard, could land mid-character and panic on the next slice).
+            _ if next.is_ascii() => i += 2,
+            _ => {
+                out.text.push('\u{1b}');
+                i += 1;
+            }
         }
     }
     let end = out.text.len();
     close_run(&mut out, end, run_start, run_style);
     out
+}
+
+/// The next char boundary at or after `i`, clamped to the string's length.
+/// Escape-consuming arms advance by a fixed byte count, which can land inside
+/// a multi-byte character when a file carries a stray ESC before UTF-8 text;
+/// slicing there panics.
+fn next_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 /// Apply one SGR parameter string to `style`. Unknown parameters are ignored
@@ -406,5 +446,19 @@ mod tests {
         );
         assert!(!looks_like_ansi("no escapes here"));
         assert!(!looks_like_ansi("\u{1b}[31"), "truncated is not a match");
+    }
+
+    #[test]
+    fn an_escape_before_a_multibyte_char_does_not_panic() {
+        // The two-byte-escape arm advanced past ESC + one byte
+        // unconditionally, landing inside a multi-byte character and
+        // panicking on the next slice.
+        // ESC before a non-ASCII byte is not an escape sequence at all, so
+        // the ESC is kept as content (same rule as a trailing ESC) and the
+        // character survives — the old code swallowed it, or panicked.
+        assert_eq!(parse("\u{1b}\u{e9} tail").text, "\u{1b}\u{e9} tail");
+        assert_eq!(parse("\u{1b}\u{1F642} tail").text, "\u{1b}\u{1F642} tail");
+        // A real two-byte escape still disappears.
+        assert_eq!(parse("\u{1b}7saved").text, "saved");
     }
 }
