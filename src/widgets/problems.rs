@@ -105,9 +105,25 @@ impl ProblemScope {
         }
     }
 
+    /// The config token for this scope. Distinct from [`Self::label`], which
+    /// is display text ("Open Files") — writing that back would produce a
+    /// value `from_config` only accepts by accident.
+    pub fn to_config(self) -> &'static str {
+        match self {
+            Self::OpenFiles => "open_files",
+            Self::WholeProject => "whole_project",
+        }
+    }
+
     pub fn from_config(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
+        // Collapse whitespace so a user who pastes the palette label
+        // ("Open Files") gets what they plainly meant.
+        let norm = s.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        match norm.as_str() {
             "open" | "open_files" | "openfiles" => Self::OpenFiles,
+            "whole_project" | "wholeproject" | "project" | "all" => Self::WholeProject,
+            // Anything unrecognised shows MORE rather than silently hiding
+            // diagnostics, which is the safe direction for a typo.
             _ => Self::WholeProject,
         }
     }

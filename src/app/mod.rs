@@ -2707,6 +2707,11 @@ pub struct App {
     /// batch removes it). The merged value for the visible file is handed to
     /// the editor; the store outlives tab switches so re-focusing a file shows
     /// its squiggles again without waiting for the next server push.
+    /// Open-buffer paths as of the last PROBLEMS rebuild. Open Files scope
+    /// filters on this set, so the panel must refresh when the set changes —
+    /// not only when diagnostics do, or opening a file with stored
+    /// diagnostics would show nothing until unrelated churn happened by.
+    problems_open_set: std::collections::BTreeSet<PathBuf>,
     lsp_diagnostics: std::collections::HashMap<
         PathBuf,
         std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
@@ -4063,6 +4068,7 @@ impl App {
             },
             lsp_last_seen: std::collections::HashMap::new(),
             semantic_generation_seen: std::collections::HashMap::new(),
+            problems_open_set: std::collections::BTreeSet::new(),
             lsp_diagnostics: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
@@ -6131,8 +6137,19 @@ impl App {
             dropped_any |= self.lsp_diagnostics.remove(&p).is_some();
         }
         // A closed file's problems must leave the PROBLEMS panel too.
-        if dropped_any {
+        // Under Open Files scope the panel also depends on WHICH buffers are
+        // open, so a tab opening or closing changes the answer even when no
+        // diagnostic moved — rebuild when that set shifts (#256).
+        let open_now: std::collections::BTreeSet<PathBuf> = self.open_buffer_paths();
+        let open_changed = open_now != self.problems_open_set;
+        if open_changed {
+            self.problems_open_set = open_now;
+        }
+        let scope_depends_on_open_set =
+            self.problems.scope == crate::widgets::problems::ProblemScope::OpenFiles;
+        if dropped_any || (open_changed && scope_depends_on_open_set) {
             self.rebuild_problems();
+            self.refresh_problems_badge();
         }
         // Paint cached semantic colours onto the visible editor(s) now that the
         // immutable tab borrow above has ended. `is_full = true` so a later
@@ -7474,6 +7491,23 @@ impl App {
         );
     }
 
+    /// Every open buffer's path, across the active leaf and every inactive
+    /// one. `App::editor` is the hoisted active leaf and `inactive_leaf_tabs`
+    /// walks the rest, so together they cover each leaf exactly once.
+    fn open_buffer_paths(&self) -> std::collections::BTreeSet<PathBuf> {
+        self.editor
+            .editors
+            .iter()
+            .chain(
+                self.editor_layout
+                    .inactive_leaf_tabs()
+                    .into_iter()
+                    .flat_map(|g| g.editors.iter()),
+            )
+            .filter_map(|e| e.path.clone())
+            .collect()
+    }
+
     fn rebuild_problems(&mut self) -> bool {
         use crate::widgets::problems::{ProblemGroup, ProblemItem};
         let mut paths: Vec<&PathBuf> = self
@@ -7485,26 +7519,13 @@ impl App {
         paths.dedup();
         // Scope (#256): Open Files keeps only paths with a live buffer, so the
         // panel and the status-bar badge (which counts the same list) agree.
-        let open: std::collections::HashSet<PathBuf> =
-            if self.problems.scope == crate::widgets::problems::ProblemScope::OpenFiles {
-                self.editor
-                    .editors
-                    .iter()
-                    .chain(
-                        self.editor_layout
-                            .inactive_leaf_tabs()
-                            .into_iter()
-                            .flat_map(|g| g.editors.iter()),
-                    )
-                    .filter_map(|e| e.path.clone())
-                    .collect()
-            } else {
-                std::collections::HashSet::new()
-            };
-        let scoped_out = |p: &PathBuf| {
-            self.problems.scope == crate::widgets::problems::ProblemScope::OpenFiles
-                && !open.contains(p)
+        let scoped = self.problems.scope == crate::widgets::problems::ProblemScope::OpenFiles;
+        let open = if scoped {
+            self.open_buffer_paths()
+        } else {
+            std::collections::BTreeSet::new()
         };
+        let scoped_out = |p: &PathBuf| scoped && !open.contains(p);
         let mut groups = Vec::new();
         for path in paths {
             if scoped_out(path) {
@@ -27737,6 +27758,7 @@ impl App {
             Cmd::ToggleMinimap => self.toggle_minimap(),
             Cmd::ProblemsToggleScope => {
                 self.problems.scope = self.problems.scope.next();
+                let _ = crate::prefs::save_problems_scope(self.problems.scope.to_config());
                 // Rebuild rather than filter in the panel: the badge counts
                 // the same list, so both follow the scope from one place.
                 self.rebuild_problems();
