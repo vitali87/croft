@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Child processes stay off the screen: the ffmpeg that grabs a video poster frame can no longer paint raw bytes over the editor, and a failed remote drag-drop setup now reports ssh's own error instead of a bare exit code.",
+    kind: NoteKind::Feature,
+    summary: "Format on type: when a language server advertises trigger characters, typing one quietly reformats at the caret. Off by default like VS Code — toggle it in Settings, the Command Palette, or a workspace's editor.formatOnType.",
 }];
