@@ -409,9 +409,29 @@ pub fn save_auto_save_on_focus_change(enabled: bool) -> Result<()> {
 /// Best-effort, like [`save_auto_save`].
 pub fn save_sidebar_auto_hide(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = prefs_for_update(&path)?;
     prefs.sidebar_auto_hide = enabled;
     prefs.save(&path)
+}
+
+/// The prefs to mutate in a `save_*` helper: the file's contents, or defaults
+/// only when the file is genuinely ABSENT.
+///
+/// `Prefs::load` cannot tell "no config yet" from "config is malformed" —
+/// both are `Err` — so `unwrap_or_default()` on a corrupt file would write
+/// defaults over it and erase every unrelated setting the user had. A first
+/// run must still work, so absence maps to defaults; anything else refuses,
+/// leaving the file for the user to fix.
+fn prefs_for_update(path: &Path) -> Result<Prefs> {
+    match Prefs::load(path) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            if !path.exists() {
+                return Ok(Prefs::default());
+            }
+            Err(e)
+        }
+    }
 }
 
 pub fn save_inline_blame(enabled: bool) -> Result<()> {
@@ -714,5 +734,44 @@ mod tests {
         let p = config_path();
         assert!(p.to_string_lossy().contains("croft"));
         assert_eq!(p.file_name().unwrap(), "config.json");
+    }
+
+    /// #294 review: a `save_*` helper must not overwrite a MALFORMED config
+    /// with defaults — that silently erases every unrelated setting the user
+    /// had. `Prefs::load` returns `Err` for both "absent" and "corrupt", so
+    /// the distinction has to be made explicitly.
+    #[test]
+    fn an_update_refuses_a_corrupt_config_but_defaults_when_absent() {
+        let dir = std::env::temp_dir().join(format!("croft-prefs-update-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        // Absent: a first run must still work.
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            prefs_for_update(&path).is_ok(),
+            "no config yet is not an error"
+        );
+
+        // Present but corrupt: refuse rather than clobber.
+        std::fs::write(&path, "{ this is not json").unwrap();
+        assert!(
+            prefs_for_update(&path).is_err(),
+            "a malformed config must not be replaced by defaults"
+        );
+        // The file is left exactly as the user wrote it.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ this is not json"
+        );
+
+        // Present and valid: the real contents come back.
+        let p = Prefs {
+            theme: String::from("some-theme"),
+            ..Default::default()
+        };
+        p.save(&path).unwrap();
+        assert_eq!(prefs_for_update(&path).unwrap().theme, "some-theme");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
