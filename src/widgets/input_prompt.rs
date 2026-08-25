@@ -59,6 +59,10 @@ pub enum InputPurpose {
     McpArg {
         command_id: String,
     },
+    /// Collect a repeat count for "Macro: Replay N Times…" (#255). A value
+    /// that is not a positive number is refused rather than silently
+    /// replaying once.
+    MacroReplayCount,
     /// Confirm uninstalling an installed extension. Submitting (Enter) performs
     /// the removal; Esc keeps it. The submitted value is a sentinel, ignored.
     ExtensionUninstall {
