@@ -362,7 +362,7 @@ pub fn write_workspace_file(path: &Path, folders: &[PathBuf]) -> Result<(), Stri
     let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
     let entries: Vec<serde_json::Value> = folders
         .iter()
-        .map(|f| serde_json::json!({ "path": relative_or_absolute(&base_canon, f) }))
+        .map(|f| serde_json::json!({ "path": relative_to_base(base, &base_canon, f) }))
         .collect();
     let doc = serde_json::json!({ "folders": entries });
     let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
@@ -370,6 +370,35 @@ pub fn write_workspace_file(path: &Path, folders: &[PathBuf]) -> Result<(), Stri
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
     std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// One folder's entry for the workspace file: relative to the file's own
+/// directory when the two really are related, absolute when they are not.
+///
+/// Tries the caller's spelling first, so a folder the user deliberately
+/// added through a symlink (`~/work` → `~/projects/alpha`) is persisted as
+/// they named it — this file is shareable, and resolving the link would
+/// bake in a target the user never typed and cannot recover from the file.
+/// Only when that spelling shares no useful prefix does it retry through
+/// canonical forms, which is what rescues the case where the two name one
+/// directory differently (macOS hands croft `/var/…` for `/private/var/…`).
+/// A folder that does not exist on disk cannot be canonicalised and simply
+/// keeps the first answer.
+fn relative_to_base(base: &Path, base_canon: &Path, target: &Path) -> String {
+    let direct = relative_or_absolute(base, target);
+    if !Path::new(&direct).is_absolute() {
+        return direct;
+    }
+    let Ok(target_canon) = target.canonicalize() else {
+        return direct;
+    };
+    let via_canon = relative_or_absolute(base_canon, &target_canon);
+    if Path::new(&via_canon).is_absolute() {
+        // Genuinely unrelated (different mount points): keep the caller's
+        // spelling rather than swapping in a resolved one for no gain.
+        return direct;
+    }
+    via_canon
 }
 
 /// `target` relative to `base` with `..` steps where they help (the
@@ -459,6 +488,121 @@ mod tests {
         assert!(ws.remove(Path::new("/w/b")), "a secondary root removes");
         assert!(!ws.is_multi());
         assert_eq!(ws.primary(), Path::new("/w/a"));
+    }
+
+    /// A symlink the USER chose is theirs to keep. The file is shareable,
+    /// so resolving `~/work` into `~/projects/alpha` would bake in a target
+    /// they never typed and cannot recover from the file. Only a spelling
+    /// that would otherwise go absolute gets retried through canonical
+    /// forms.
+    #[test]
+    fn a_deliberate_folder_symlink_is_written_as_the_user_named_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap();
+        let alpha = real.join("alpha");
+        std::fs::create_dir(&alpha).unwrap();
+        let work = real.join("work");
+        std::os::unix::fs::symlink(&alpha, &work).unwrap();
+
+        let file = real.join("proj.code-workspace");
+        write_workspace_file(&file, std::slice::from_ref(&work)).unwrap();
+        let raw = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            raw.contains("\"work\""),
+            "the user's own spelling is persisted, not the link target: {raw}"
+        );
+        assert!(
+            !raw.contains("\"alpha\""),
+            "the symlink is not resolved away: {raw}"
+        );
+    }
+
+    /// A folder that is not on disk cannot be canonicalised. It must still
+    /// relativise off the caller's spelling rather than falling back to an
+    /// absolute path — the fix must not depend on the filesystem.
+    #[test]
+    fn a_missing_folder_still_relativises() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let file = base.join("proj.code-workspace");
+        write_workspace_file(&file, &[base.join("ghost")]).unwrap();
+        let raw = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            raw.contains("\"ghost\""),
+            "a folder that does not exist yet still writes relative: {raw}"
+        );
+    }
+
+    /// The written entry must RESOLVE to the right directory, not merely
+    /// look relative — including when the walk climbs out through a symlink
+    /// with `..`, where a lexical reading and the filesystem's disagree.
+    /// `parse_workspace_file` joins onto the file's own directory and then
+    /// canonicalises, so the OS resolves `..` after traversing the link,
+    /// which is what makes the round trip safe.
+    #[test]
+    fn a_relative_entry_resolves_through_a_symlinked_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let deep = root.join("deep");
+        std::fs::create_dir_all(deep.join("real")).unwrap();
+        // `shallow` reaches `deep/real` from a different depth.
+        let shallow = root.join("shallow");
+        std::os::unix::fs::symlink(deep.join("real"), &shallow).unwrap();
+        // Two same-named directories: the true target beside the link's
+        // resolved location, and a decoy beside the link itself. A lexical
+        // `..` would land on the decoy.
+        std::fs::create_dir(deep.join("sibling")).unwrap();
+        std::fs::write(deep.join("sibling").join("REAL"), "x").unwrap();
+        std::fs::create_dir(root.join("sibling")).unwrap();
+        std::fs::write(root.join("sibling").join("DECOY"), "x").unwrap();
+
+        let file = shallow.join("w.code-workspace");
+        write_workspace_file(&file, &[shallow.join("..").join("sibling")]).unwrap();
+        let parsed = parse_workspace_file(&file).unwrap();
+        assert!(
+            parsed[0].join("REAL").exists(),
+            "the entry resolves to the directory beside the link's TARGET: {parsed:?}"
+        );
+        assert!(
+            !parsed[0].join("DECOY").exists(),
+            "not the same-named one beside the link itself: {parsed:?}"
+        );
+    }
+
+    /// A folder reached through a symlink must still relativise. macOS
+    /// hands croft `/var/...` for a `/private/var/...` directory (and any
+    /// symlinked home does the same), so canonicalising only the base left
+    /// the two sharing just the root component — `relative_or_absolute`
+    /// then wrote an ABSOLUTE path and the workspace file stopped being
+    /// portable, which is the one thing it promises.
+    #[test]
+    fn a_symlinked_folder_still_writes_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alpha = real.join("alpha");
+        std::fs::create_dir(&alpha).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The caller passes the path it holds — through the symlink, and
+        // uncanonicalised, exactly as the primary workspace root arrives.
+        let file = link.join("proj.code-workspace");
+        write_workspace_file(&file, &[link.join("alpha")]).unwrap();
+        let raw = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            raw.contains("\"alpha\""),
+            "a symlinked folder relativises like any other: {raw}"
+        );
+        assert!(
+            !raw.contains("/alpha\""),
+            "and is not written absolute: {raw}"
+        );
+        assert_eq!(
+            parse_workspace_file(&file).unwrap(),
+            vec![alpha.canonicalize().unwrap()],
+            "and round-trips back to the real directory"
+        );
     }
 
     #[test]

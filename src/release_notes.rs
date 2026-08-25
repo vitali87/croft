@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Document links: Ctrl+click a URL, import, or path that the language server marks as a link and croft follows it — files open in the editor, web links in your browser. Non-web schemes are refused rather than handed to the system opener.",
+    kind: NoteKind::Fix,
+    summary: "Save Workspace As writes portable files again: a folder reached through a symlink (macOS hands croft /var for /private/var, and any symlinked home does the same) was written as an absolute path instead of a relative one, so the file stopped travelling — it kept working where it was written but not on another machine, another checkout, or a different layout.",
 }];
