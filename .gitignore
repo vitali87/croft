@@ -52,3 +52,6 @@ preview*.svg
 # SonarQube Cloud scan artifacts (see .github/workflows/sonarcloud.yml)
 /clippy-report.json
 /.scannerwork/
+
+# Agent instruction file: local to each clone, not shared through the repo
+CLAUDE.md
