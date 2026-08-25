@@ -7105,9 +7105,8 @@ impl App {
     }
 
     /// Follow a server-resolved document link (#254): `file://` targets
-    /// open in the editor, web links go to the system opener — unless the
-    /// session is remote, where handing a URL to a headless host's opener
-    /// would claim success invisibly.
+    /// open in the editor, web links go to the system opener — or, on a
+    /// relay-capable session, to the user's own browser through the relay.
     ///
     /// Web links only past the `file://` branch, matching
     /// `open_detected_url`: the target comes from a language server and the
@@ -7116,7 +7115,18 @@ impl App {
     /// (app launch, protocol handler) off one disguised Ctrl+click. The
     /// refusal surfaces the real destination in the status line.
     fn open_document_link(&mut self, target: &str) {
-        if target.starts_with("file://") {
+        // One normalisation for every branch below, so the string that is
+        // checked is the string that is forwarded: surrounding whitespace is
+        // dropped, a control character (which the relay's own validator
+        // rejects, and which has no business in a URI) refuses outright, and
+        // the scheme match is case-insensitive like `file_ref`'s.
+        let target = target.trim();
+        if target.chars().any(char::is_control) {
+            self.status = format!("Refused to open malformed link: {target:?}");
+            return;
+        }
+        let lower = target.to_ascii_lowercase();
+        if lower.starts_with("file://") {
             if let Ok(url) = lsp_types::Url::parse(target)
                 && let Ok(p) = url.to_file_path()
             {
@@ -7150,10 +7160,7 @@ impl App {
         // chosen by the language server, so letting it name an editor URI
         // would hand a server the ability to open arbitrary paths from a
         // click on unrelated-looking text.
-        let scheme_ok = {
-            let l = target.trim_start().to_ascii_lowercase();
-            l.starts_with("http://") || l.starts_with("https://")
-        };
+        let scheme_ok = lower.starts_with("http://") || lower.starts_with("https://");
         if !scheme_ok {
             self.status = format!("Refused to open non-web link: {target}");
             return;

@@ -30013,6 +30013,8 @@ fn a_document_link_refuses_a_non_web_scheme_and_records_nav_history() {
 
     for hostile in [
         "vscode://file/etc/passwd",
+        "VSCode://file/etc/passwd",
+        "cursor://file/etc/passwd",
         "javascript:alert(1)",
         "mailto:a@b.c",
         "ssh://host/x",
@@ -30022,6 +30024,20 @@ fn a_document_link_refuses_a_non_web_scheme_and_records_nav_history() {
         assert!(
             app.status.starts_with("Refused to open non-web link:"),
             "{hostile} must be refused, got {:?}",
+            app.status
+        );
+    }
+
+    // A control character never belongs in a URI, and the relay's own
+    // validator rejects one; refuse before anything downstream sees it.
+    for malformed in [
+        "https://example.com\nopen\tevil",
+        "https://exa\u{0}mple.com",
+    ] {
+        app.open_document_link(malformed);
+        assert!(
+            app.status.starts_with("Refused to open malformed link:"),
+            "{malformed:?} must be refused, got {:?}",
             app.status
         );
     }
@@ -30057,6 +30073,27 @@ fn a_document_link_refuses_a_non_web_scheme_and_records_nav_history() {
         "Back returns to the file the link was clicked in"
     );
     assert_eq!((back.row, back.col), (0, 4), "and to the click's caret");
+
+    // URI schemes are case-insensitive (RFC 3986) and `file_ref` already
+    // matches them that way; a server spelling it `FILE://` must open, not
+    // fall through to the web guard and get refused.
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    let upper = target.as_ref().replacen("file://", "FILE://", 1);
+    app.open_document_link(&upper);
+    assert_eq!(
+        app.editor.path.as_deref().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("b.rs")),
+        "an upper-case file scheme still opens in the editor"
+    );
+
+    // Surrounding whitespace is trimmed rather than smuggled downstream.
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.open_document_link(&format!("  {}  ", target.as_ref()));
+    assert_eq!(
+        app.editor.path.as_deref().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("b.rs")),
+        "a padded target is normalised, not refused"
+    );
 }
 
 #[test]
