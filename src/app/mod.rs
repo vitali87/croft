@@ -218,6 +218,19 @@ pub(crate) enum QuickInputPosition {
     Center,
 }
 
+/// One in-flight `textDocument/selectionRange` request (#254): the
+/// Expand Selection gesture waiting on its chains. `positions` snapshots
+/// the exact cursors the request was fired for, so a reply (or a reuse
+/// attempt) after ANY caret movement is recognised as stale even though
+/// `edit_seq` did not move.
+struct PendingSelectionRanges {
+    id: u64,
+    path: PathBuf,
+    seq: u64,
+    presses: usize,
+    positions: Vec<(u32, u32)>,
+}
+
 /// Pre-Zen visibility snapshot, restored verbatim when Zen Mode is toggled
 /// off so the workspace returns to exactly the chrome it had before.
 #[derive(Clone, Copy, Debug)]
@@ -833,6 +846,16 @@ enum UpdateStatus {
     Idle,
     InProgress,
     Ready,
+}
+
+/// What to do with one on-type formatting reply (#254). `NotOurs` leaves the
+/// armed request alone — a superseded reply must not disarm the newer one
+/// still in flight — while `Stale` and `Apply` both consume it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OnTypeReply {
+    NotOurs,
+    Stale,
+    Apply,
 }
 
 /// Rotating-arc frames for the in-progress update glyph. Cycled to read as a
@@ -2761,6 +2784,20 @@ pub struct App {
     /// edit_seq) it was fired for so a reply for a caret or buffer state the
     /// editor has since left is dropped.
     occurrences_request: Option<(u64, PathBuf, usize, usize, u64)>,
+    /// In-flight linkedEditingRange request (#254): (id, path, edit_seq).
+    linked_request: Option<(u64, PathBuf, u64)>,
+    /// Last observed `(path, row, col, seq)` for the linked-editing
+    /// debounce, and when it settled — occurrences' idle pattern.
+    linked_observed: Option<(PathBuf, usize, usize, u64)>,
+    linked_observed_at: std::time::Instant,
+    /// In-flight Expand Selection request (#254). Extra Shift+Alt+Right
+    /// presses while the chains are in flight stack up and apply
+    /// together on drain; an `unsupported` verdict resolves them via
+    /// tree-sitter instead. The reply is gated on id + path + edit_seq
+    /// AND the exact cursor positions the request was fired for — a
+    /// caret move without an edit leaves `edit_seq` unchanged, and a
+    /// chain computed for the old caret must not apply at the new one.
+    selection_range_request: Option<PendingSelectionRanges>,
     /// The caret state `tick_occurrences` last observed, and when it changed.
     /// A caret resting on one spot for `OCCURRENCES_IDLE` fires one request.
     occ_observed: Option<(PathBuf, usize, usize, u64)>,
@@ -2770,6 +2807,17 @@ pub struct App {
     /// the deferred rename prompt's context.
     prepare_rename_request: Option<(u64, PathBuf, usize, usize, u64)>,
     format_request_id: Option<u64>,
+    /// True when the in-flight format request is Format Selection (#254)
+    /// — the drain words its statuses accordingly.
+    format_request_selection: bool,
+    /// VS Code's `editor.formatOnType` (#254): typing a server trigger
+    /// character runs onTypeFormatting at the spot. Off by default.
+    format_on_type: bool,
+    /// In-flight on-type request: (id, the edit_seq it was computed
+    /// against, the tab's path). The reply applies only while that same
+    /// tab is active and its buffer has not moved since — `edit_seq` is
+    /// per-tab, so the seq alone cannot tell tabs apart.
+    on_type_request: Option<(u64, u64, PathBuf)>,
     code_action_request_id: Option<u64>,
     /// True when the in-flight code-action request is a `codeAction/resolve`
     /// (the reply is one resolved action to apply directly) rather than the
@@ -2778,6 +2826,15 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// The presentation edits behind the open Change Color Presentation
+    /// picker (#254), indexed by row id; cleared after a pick.
+    pending_color_presentations: Vec<(String, Vec<crate::widgets::editor::TextSpanEdit>)>,
+    /// The (path, edit_seq) the pending presentations were computed
+    /// against; a pick is refused when either moved while the picker was
+    /// open (an FS-sync reload bumps the seq without user edits).
+    pending_color_context: Option<(PathBuf, u64)>,
+    /// In-flight colorPresentation request: (id, path, edit_seq).
+    color_presentations_request: Option<(u64, PathBuf, u64)>,
     nav: NavHistory,
     editor_vim_chord: EditorVimChord,
     /// `Cmd+K` leader: armed when the user presses the prefix, holding the
@@ -4161,9 +4218,15 @@ impl App {
             rename_request_id: None,
             prepare_rename_request: None,
             format_request_id: None,
+            format_request_selection: false,
+            format_on_type: loaded_prefs.format_on_type,
+            on_type_request: None,
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            pending_color_presentations: Vec::new(),
+            pending_color_context: None,
+            color_presentations_request: None,
             hover: HoverDwell::default(),
             hover_popup: None,
             hover_request_id: None,
@@ -4188,6 +4251,10 @@ impl App {
             references_request_id: None,
             call_hierarchy_request_id: None,
             occurrences_request: None,
+            linked_request: None,
+            linked_observed: None,
+            linked_observed_at: std::time::Instant::now(),
+            selection_range_request: None,
             occ_observed: None,
             occ_observed_at: std::time::Instant::now(),
             nav: NavHistory::default(),
@@ -6025,6 +6092,15 @@ impl App {
             if self.inlay_hints_enabled {
                 lsp.request_inlay_hints(path.clone(), line_count, seq);
             }
+            // Fold spans ride the same cadence (#254); the worker drops
+            // the request silently when no server advertises the
+            // provider, which is what leaves the editor's indentation /
+            // region fallback in charge.
+            lsp.request_folding_ranges(path.clone(), seq);
+            // Document colors ride the same cadence (#254); the worker is
+            // silent when no server advertises a colorProvider, which is
+            // what keeps the swatches from ever appearing unadvertised.
+            lsp.request_document_colors(path.clone(), seq);
             self.lsp_last_seen.insert(path, seq);
         }
         let closed: Vec<PathBuf> = self
@@ -6993,6 +7069,153 @@ impl App {
                     changed = true;
                 }
             }
+        }
+        changed
+    }
+
+    /// Drain the LSP fold-span replies (#254) into every editor showing
+    /// the file. Seq-gated like inlay hints; an EMPTY reply is dropped so
+    /// a server that answers before indexing (or lacks real spans) never
+    /// erases the indentation/region fallback — the outline's guard.
+    pub fn drain_lsp_folding_ranges(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut updates = Vec::new();
+        while let Some(u) = lsp.drain_folding_ranges() {
+            updates.push(u);
+        }
+        let mut changed = false;
+        for u in updates {
+            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+                continue;
+            }
+            if u.ranges.is_empty() {
+                continue;
+            }
+            if self.editor.path.as_deref() == Some(u.path.as_path()) {
+                self.editor.set_lsp_folds(u.ranges.clone());
+                changed = true;
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(u.path.as_path()) {
+                    group.set_lsp_folds(u.ranges.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Drain document-color batches (#254) into every editor showing the
+    /// file — the inlay-hints fan-out, seq gate included. An empty batch
+    /// clears the swatches (a stylesheet that lost its last color).
+    pub fn drain_lsp_document_colors(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut updates = Vec::new();
+        while let Some(u) = lsp.drain_document_colors() {
+            updates.push(u);
+        }
+        let mut changed = false;
+        for u in updates {
+            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+                continue;
+            }
+            if self.editor.path.as_deref() == Some(u.path.as_path()) {
+                self.editor
+                    .apply_document_colors(u.path.clone(), u.colors.clone());
+                changed = true;
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(u.path.as_path()) {
+                    group.apply_document_colors(u.path.clone(), u.colors.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// "Change Color Presentation" (#254): ask for the alternative
+    /// spellings of the color value at the cursor and defer the picker on
+    /// the reply.
+    fn change_color_presentation(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        let Some(item) = self.editor.color_at(row, col).cloned() else {
+            self.status = String::from("No color value at the cursor");
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let seq = self.editor.edit_seq;
+        let Some(lsp) = self.lsp.as_mut() else {
+            self.status = String::from("No language server for this file");
+            return;
+        };
+        let id = lsp.request_color_presentations(
+            path.clone(),
+            item.raw,
+            (item.line, item.character),
+            (item.end_line, item.end_character),
+        );
+        self.color_presentations_request = Some((id, path, seq));
+        self.status = String::from("Fetching color presentations…");
+    }
+
+    /// Open the presentation picker when the reply lands (#254); gated on
+    /// id + path + edit_seq like every deferred caret request.
+    pub fn drain_lsp_color_presentations(&mut self) -> bool {
+        let mut results = Vec::new();
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(r) = lsp.drain_color_presentations() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for result in results {
+            let Some((id, path, seq)) = self.color_presentations_request.clone() else {
+                continue;
+            };
+            if result.request_id != id {
+                continue;
+            }
+            self.color_presentations_request = None;
+            if self.editor.path.as_deref() != Some(path.as_path()) || self.editor.edit_seq != seq {
+                continue;
+            }
+            changed = true;
+            if result.presentations.is_empty() {
+                self.status = String::from("No color presentations offered here");
+                continue;
+            }
+            let rows: Vec<crate::widgets::list_picker::ListRow> = result
+                .presentations
+                .iter()
+                .enumerate()
+                .map(|(i, (label, _))| crate::widgets::list_picker::ListRow {
+                    id: i.to_string(),
+                    label: label.clone(),
+                })
+                .collect();
+            self.pending_color_presentations = result.presentations;
+            self.pending_color_context = Some((path.clone(), seq));
+            self.open_list_picker(
+                crate::widgets::list_picker::ListPicker::new(
+                    crate::widgets::list_picker::ListPurpose::ColorPresentation,
+                    "Change Color Presentation",
+                    rows,
+                ),
+                "No color presentations offered here",
+            );
         }
         changed
     }
@@ -8194,11 +8417,337 @@ impl App {
             .unwrap_or(false)
     }
 
+    /// On-type formatting (#254), run once per frame: when enabled and the
+    /// last edit was a keystroke in the server's advertised trigger set,
+    /// fire `textDocument/onTypeFormatting` at the caret. The typed record
+    /// is consumed here — examined exactly once, on the frame right after
+    /// the keystroke — so a later tab switch or settings toggle can never
+    /// replay a stale trigger. Never fires unadvertised: the trigger set
+    /// comes from the capability the server declared, and `None` (no server
+    /// probed, or no provider) means stay inert.
+    pub fn tick_on_type_formatting(&mut self) {
+        let taken = self.editor.last_typed.take();
+        // A keystroke and a tab switch can arrive in the same input burst,
+        // draining before this tick runs — the record is then armed on a tab
+        // that is no longer active, and nothing else ever clears it. Sweep
+        // every editor in every group (the active one is already drained by
+        // the `take` above) so a trigger can only ever fire from the tab
+        // that was active at its tick.
+        let groups =
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        for ed in groups.flat_map(|g| g.editors.iter_mut()) {
+            ed.last_typed = None;
+        }
+        let Some((ch, seq)) = taken else {
+            return;
+        };
+        if !self.format_on_type || !self.editor_is_text() {
+            return;
+        }
+        if seq != self.editor.edit_seq {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lang) = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+        else {
+            return;
+        };
+        let triggers = self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.language_on_type_triggers(lang));
+        if !triggers.is_some_and(|t| t.contains(ch)) {
+            return;
+        }
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
+        let (tab_size, insert_spaces) = self.editor.indent_preference();
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_on_type_formatting(
+            path.clone(),
+            line,
+            character,
+            ch,
+            tab_size,
+            insert_spaces,
+        );
+        self.on_type_request = Some((id, seq, path));
+    }
+
+    /// What to do with one on-type formatting reply. Extracted from the
+    /// drain loop so the three-way decision is testable without a live
+    /// server: the channel's sender lives inside the LSP worker, so a test
+    /// cannot inject a `FormatResult` through it.
+    fn on_type_reply_disposition(&self, result: &crate::lsp::manager::FormatResult) -> OnTypeReply {
+        let Some((id, seq, ref requested)) = self.on_type_request else {
+            return OnTypeReply::NotOurs;
+        };
+        // A superseded reply must NOT clear the armed request: a newer one
+        // is in flight and its own reply still has to apply.
+        if result.request_id != id {
+            return OnTypeReply::NotOurs;
+        }
+        // `edit_seq` is per-tab, so the counter comparison only means
+        // "buffer unchanged" when the active tab is still the one the
+        // request was computed against — require the path to match too.
+        // Content-unchanged is also the whole test on purpose: caret-only
+        // motion (arrow keys, auto-pair type-over) leaves the counter
+        // alone, and that is correct — the server's edits are document
+        // edits computed against text that is still byte-identical, so
+        // they apply cleanly wherever the caret has wandered.
+        if self.editor.edit_seq != seq
+            || requested != &result.path
+            || self.editor.path.as_deref() != Some(result.path.as_path())
+        {
+            return OnTypeReply::Stale;
+        }
+        OnTypeReply::Apply
+    }
+
+    /// Apply an on-type formatting reply — quietly, and only while the
+    /// buffer has not moved since the request (the edits were computed
+    /// against exactly that text; continued typing makes them stale).
+    pub fn drain_lsp_on_type_format(&mut self) -> bool {
+        let mut results = Vec::new();
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(r) = lsp.drain_on_type_formatting() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for result in results {
+            match self.on_type_reply_disposition(&result) {
+                OnTypeReply::NotOurs => continue,
+                OnTypeReply::Stale => {
+                    self.on_type_request = None;
+                    continue;
+                }
+                OnTypeReply::Apply => self.on_type_request = None,
+            }
+            if let Some(edits) = result.edits.filter(|e| !e.is_empty())
+                && self
+                    .editor
+                    .apply_rename_to_open_tab(&result.path, &edits)
+                    .is_some()
+            {
+                self.editor.clamp_cursor();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Idle-caret occurrences trigger, run once per frame: when the caret has
     /// rested on one buffer position for `OCCURRENCES_IDLE`, fire ONE
     /// `documentHighlight` request for it; the moment it moves (or the buffer
     /// edits), drop the painted set. Mirrors VS Code's word highlight, which
     /// follows the cursor with a small debounce rather than every keystroke.
+    /// Linked editing (#254): replay the last keystroke across the
+    /// sibling tag ranges, keep the set alive only while the caret
+    /// stays inside one, and (debounced on caret idle) ask the server
+    /// for the set at a new caret position. Never fires a request for a
+    /// language the LSP layer isn't tracking; a server without the
+    /// provider simply never answers, and the feature stays inert.
+    pub fn tick_linked_editing(&mut self) -> bool {
+        const LINKED_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
+        let mirrored = self.editor.mirror_linked_edit();
+        let eligible = self.editor_is_text() && self.lsp.is_some();
+        let Some(path) = self.editor.path.clone().filter(|_| eligible) else {
+            self.linked_observed = None;
+            self.linked_request = None;
+            self.editor.clear_linked_ranges();
+            return mirrored;
+        };
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        // While the caret stays inside the live set, keep it — the whole
+        // point is typing inside a range. (The mirror above re-synced
+        // positions for this frame's keystroke.)
+        if self.editor.has_linked_ranges() {
+            if self.editor.linked_ranges_contain(row, col) {
+                return mirrored;
+            }
+            self.editor.clear_linked_ranges();
+        }
+        let cur = (path, row, col, self.editor.edit_seq);
+        if self.linked_observed.as_ref() != Some(&cur) {
+            self.linked_observed = Some(cur);
+            self.linked_observed_at = std::time::Instant::now();
+            self.linked_request = None;
+            return mirrored;
+        }
+        let already = self
+            .linked_request
+            .as_ref()
+            .is_some_and(|(_, p, s)| (p, s) == (&cur.0, &cur.3));
+        if already || self.linked_observed_at.elapsed() < LINKED_IDLE {
+            return mirrored;
+        }
+        let (uline, uchar) = self.editor.cursor_position_utf16();
+        let Some(lsp) = self.lsp.as_mut() else {
+            return mirrored;
+        };
+        let id = lsp.request_linked_editing(cur.0.clone(), uline, uchar);
+        self.linked_request = Some((id, cur.0, cur.3));
+        mirrored
+    }
+
+    /// Install a linkedEditingRange reply, gated on the in-flight id,
+    /// the path, and the edit seq the spans were computed against.
+    pub fn drain_lsp_linked_editing(&mut self) -> bool {
+        let mut results = Vec::new();
+        {
+            let Some(lsp) = self.lsp.as_ref() else {
+                return false;
+            };
+            while let Some(r) = lsp.drain_linked_editing() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for result in results {
+            let Some((id, path, seq)) = self.linked_request.as_ref() else {
+                continue;
+            };
+            if result.request_id != *id
+                || self.editor.path.as_deref() != Some(path.as_path())
+                || self.editor.edit_seq != *seq
+            {
+                continue;
+            }
+            self.linked_request = None;
+            self.editor.set_linked_ranges(&result.ranges);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Expand Selection (#254): grow every cursor to the next
+    /// semantically meaningful range. Cached chain steps apply
+    /// instantly; otherwise the LSP `selectionRange` chains are fetched
+    /// (one request, all cursors), with tree-sitter node ancestry as the
+    /// serverless fallback — so the gesture works with no LSP at all.
+    fn expand_selection(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        self.editor.validate_expand_stacks();
+        if self.editor.expand_selection_from_stack() {
+            return;
+        }
+        let lang_known = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+            .is_some();
+        if lang_known
+            && self.lsp.is_some()
+            && let Some(path) = self.editor.path.clone()
+        {
+            let seq = self.editor.edit_seq;
+            let positions = self.editor.cursor_positions_utf16();
+            // Reuse the pending request only when it was fired for these
+            // exact cursors; a caret move re-fires for the new spot.
+            if let Some(pending) = self.selection_range_request.as_mut()
+                && pending.path == path
+                && pending.seq == seq
+                && pending.positions == positions
+            {
+                pending.presses += 1;
+                return;
+            }
+            if let Some(lsp) = self.lsp.as_mut() {
+                let id = lsp.request_selection_ranges(path.clone(), positions.clone());
+                self.selection_range_request = Some(PendingSelectionRanges {
+                    id,
+                    path,
+                    seq,
+                    presses: 1,
+                    positions,
+                });
+            }
+            return;
+        }
+        if !self.editor.expand_selection_syntax() {
+            self.status = String::from("No larger range to select");
+        }
+    }
+
+    /// Shrink Selection: retrace the expand stack one step. Purely
+    /// local — the stack already remembers the exact ranges.
+    fn shrink_selection(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        self.editor.shrink_selection_step();
+    }
+
+    /// Drain `selectionRange` replies (#254): triple-gated like
+    /// occurrences (id + path + edit_seq), then either install the
+    /// server's chains or resolve the queued presses via tree-sitter
+    /// when the request came back unsupported/empty.
+    fn drain_lsp_selection_ranges(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut results = Vec::new();
+        while let Some(r) = lsp.drain_selection_ranges() {
+            results.push(r);
+        }
+        let mut changed = false;
+        for r in results {
+            let Some(pending) = self.selection_range_request.as_ref() else {
+                continue;
+            };
+            // Gate on id + path + edit_seq AND the cursors the request
+            // was fired for: a click between request and reply leaves
+            // `edit_seq` unchanged, but the chains describe the OLD
+            // caret and must not apply at the new one.
+            if r.request_id != pending.id
+                || self.editor.path.as_deref() != Some(pending.path.as_path())
+                || self.editor.edit_seq != pending.seq
+                || self.editor.cursor_positions_utf16() != pending.positions
+            {
+                if r.request_id == pending.id {
+                    self.selection_range_request = None;
+                }
+                continue;
+            }
+            let presses = pending.presses;
+            self.selection_range_request = None;
+            if r.unsupported || r.chains.is_empty() {
+                for _ in 0..presses {
+                    if !self.editor.expand_selection_syntax() {
+                        break;
+                    }
+                }
+                changed = true;
+                continue;
+            }
+            self.editor.install_selection_chains(r.chains);
+            for _ in 0..presses {
+                if !self.editor.expand_selection_from_stack() {
+                    break;
+                }
+            }
+            changed = true;
+        }
+        changed
+    }
+
     pub fn tick_occurrences(&mut self) -> bool {
         const OCCURRENCES_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
         let eligible = self.editor.diff.is_none()
@@ -9269,34 +9818,53 @@ impl App {
         }
         let mut changed = false;
         for result in results {
+            changed |= self.apply_prepare_rename_verdict(result);
+        }
+        changed
+    }
+
+    /// Resolve one prepare-rename verdict into the prompt, a status, or the
+    /// word-under-cursor fallback. Split out of the drain loop so the four
+    /// verdict shapes are testable: the reply channel's sender lives inside
+    /// the LSP worker, so a test cannot inject a `PrepareRenameResult`
+    /// through it. Returns whether the screen needs a repaint.
+    fn apply_prepare_rename_verdict(
+        &mut self,
+        result: crate::lsp::manager::PrepareRenameResult,
+    ) -> bool {
+        {
             let Some((id, path, row, col, seq)) = self.prepare_rename_request.clone() else {
-                continue;
+                return false;
             };
             if result.request_id != id {
-                continue;
+                return false;
             }
             self.prepare_rename_request = None;
             if self.editor.path.as_deref() != Some(path.as_path()) || self.editor.edit_seq != seq {
-                continue;
+                // The caret moved on (an edit, or a tab switch — which also
+                // bumps edit_seq). Say so: bailing silently would strand
+                // "Preparing rename…" on screen with no way to tell the
+                // rename died.
+                self.status = String::from("Rename cancelled");
+                return true;
             }
-            changed = true;
             if result.unsupported {
                 self.open_rename_prompt_fallback(path, row, col);
-                continue;
+                return true;
             }
             if let Some(msg) = result.error {
                 self.status = format!("Rename rejected: {msg}");
-                continue;
+                return true;
             }
             let Some(((sl, sc, el, ec), placeholder)) = result.target else {
                 self.status = String::from("Nothing renameable at the cursor");
-                continue;
+                return true;
             };
             // Placeholder wins; otherwise the validated range's text.
             let word = placeholder.unwrap_or_else(|| {
                 let (sr, er) = (sl as usize, el as usize);
-                let scol = self.editor.utf16_col_to_char(sr, sc);
-                let ecol = self.editor.utf16_col_to_char(er, ec);
+                let scol = self.editor.utf16_col_to_char_pub(sr, sc);
+                let ecol = self.editor.utf16_col_to_char_pub(er, ec);
                 if sr == er {
                     self.editor
                         .lines
@@ -9314,7 +9882,7 @@ impl App {
             });
             if word.is_empty() {
                 self.open_rename_prompt_fallback(path, row, col);
-                continue;
+                return true;
             }
             self.prompt = Some(Prompt {
                 label: format!("Rename Symbol '{word}'"),
@@ -9323,8 +9891,8 @@ impl App {
                 target_dir: PathBuf::new(),
                 error: None,
             });
+            true
         }
-        changed
     }
 
     pub fn drain_lsp_rename(&mut self) -> bool {
@@ -9412,7 +9980,37 @@ impl App {
         let (tab_size, insert_spaces) = self.editor.indent_preference();
         let id = lsp.request_formatting(path, tab_size, insert_spaces);
         self.format_request_id = Some(id);
+        self.format_request_selection = false;
         self.status = String::from("Formatting document");
+    }
+
+    /// "Format Selection" (#254): `textDocument/rangeFormatting` over the
+    /// primary selection, applied through the same reply path as
+    /// whole-document formatting.
+    fn format_selection(&mut self) {
+        if self.editor.has_non_text_view() {
+            return;
+        }
+        let Some(sel) = self.editor.selection.filter(|s| s.has_area()) else {
+            self.status = String::from("Select something to format");
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file open");
+            return;
+        };
+        let ((sr, sc), (er, ec)) = sel.normalised();
+        let start = self.editor.pos_to_utf16(sr, sc);
+        let end = self.editor.pos_to_utf16(er, ec);
+        let (tab_size, insert_spaces) = self.editor.indent_preference();
+        let Some(lsp) = self.lsp.as_mut() else {
+            self.status = String::from("No language server for this file");
+            return;
+        };
+        let id = lsp.request_range_formatting(path, start, end, tab_size, insert_spaces);
+        self.format_request_id = Some(id);
+        self.format_request_selection = true;
+        self.status = String::from("Formatting selection");
     }
 
     pub fn drain_lsp_format(&mut self) -> bool {
@@ -9438,8 +10036,13 @@ impl App {
             return false;
         }
         self.format_request_id = None;
+        let selection = std::mem::take(&mut self.format_request_selection);
         if unsupported {
-            self.status = String::from("No formatter available for this file");
+            self.status = if selection {
+                String::from("No range formatter available for this file")
+            } else {
+                String::from("No formatter available for this file")
+            };
             self.complete_pending_save();
             return true;
         }
@@ -9448,12 +10051,22 @@ impl App {
                 match self.editor.apply_rename_to_open_tab(&path, &edits) {
                     Some(_) => {
                         self.editor.clamp_cursor();
-                        self.status = String::from("Formatted document");
+                        self.status = if selection {
+                            String::from("Formatted selection")
+                        } else {
+                            String::from("Formatted document")
+                        };
                     }
                     None => self.status = String::from("Format failed: document not open"),
                 }
             }
-            _ => self.status = String::from("Document already formatted"),
+            _ => {
+                self.status = if selection {
+                    String::from("Selection already formatted")
+                } else {
+                    String::from("Document already formatted")
+                }
+            }
         }
         // A format-on-save write is deferred until now so the disk file gets the
         // formatted text in one go.
@@ -9576,6 +10189,24 @@ impl App {
             self.status = String::from("Merge conflict actions need a text file");
             return;
         }
+        // Merge editor (#253): the Result has no markers, so the gate is
+        // the tracked regions, not the marker scan below.
+        if self.editor.merge.is_some() {
+            self.merge_view_sync();
+            let unresolved = self
+                .editor
+                .merge
+                .as_ref()
+                .map(|mv| mv.unresolved_count())
+                .unwrap_or(0);
+            if unresolved > 0 {
+                self.status = format!(
+                    "{unresolved} conflict{} still unresolved — F7 jumps to the next one",
+                    if unresolved == 1 { "" } else { "s" }
+                );
+                return;
+            }
+        }
         let left = self.editor.conflicts().len();
         if left > 0 {
             self.status = format!(
@@ -9591,19 +10222,256 @@ impl App {
         if self.editor.dirty {
             self.save();
         }
-        let rel = self.status_path(&path);
+        // Canonicalize before the relative-path strip: a workspace under
+        // a symlink (macOS /var → /private/var) otherwise falls back to
+        // the absolute path, which reads wrong in the status and would
+        // refuse in stricter git contexts.
         let merge_root = self
             .roots
             .owning_root(&path)
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf();
-        match crate::git::stage_path(&merge_root, &rel) {
+        let canon_root = std::fs::canonicalize(&merge_root).unwrap_or_else(|_| merge_root.clone());
+        let canon_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let rel = canon_path
+            .strip_prefix(&canon_root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.status_path(&path));
+        match crate::git::stage_path(&canon_root, &rel) {
             Ok(()) => {
                 self.refresh_source_control();
                 self.status = format!("Merge complete: staged {rel}");
             }
             Err(e) => self.status = format!("Stage failed: {e}"),
         }
+    }
+
+    /// Open the three-way merge editor (#253) for `path`. Inputs come
+    /// from the git index stages (`:1:` base, `:2:` ours, `:3:` theirs)
+    /// when the path is unmerged; otherwise the sides are synthesized
+    /// from conflict markers in the file itself, so the editor also
+    /// works on a plain marker file outside any merge. The tab is opened
+    /// through the normal text route first (language, LSP, undo all
+    /// attach), then the buffer is transformed into the initial Result
+    /// in one undo step — the marker text stays one Undo away.
+    fn open_merge_editor_for(&mut self, path: &Path) -> bool {
+        // Stage specs are repo-toplevel-relative (#139): see `repo_rel`.
+        let root = self.scm_root();
+        let canon_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let rel = self.repo_rel(path);
+        let to_lines = |s: String| -> Vec<String> { s.lines().map(str::to_string).collect() };
+        let ours = crate::git::read_file_at_stage(&canon_root, &rel, 2).map(to_lines);
+        let theirs = crate::git::read_file_at_stage(&canon_root, &rel, 3).map(to_lines);
+        let sides = match (ours, theirs) {
+            // Neither stage exists: the path is not unmerged in git at
+            // all — fall through to marker synthesis below.
+            (Err(_), Err(_)) => None,
+            // Unmerged: a missing single stage is a deleted side (DU/UD)
+            // and a missing base is added-by-both (AA) — both mean "that
+            // side is empty", not an error.
+            (o, t) => {
+                let base = crate::git::read_file_at_stage(&canon_root, &rel, 1)
+                    .map(&to_lines)
+                    .unwrap_or_default();
+                Some((base, o.unwrap_or_default(), t.unwrap_or_default()))
+            }
+        };
+        let built = match sides {
+            Some((base, ours, theirs)) => Some(crate::merge_editor::MergeView::new(
+                base, ours, theirs, false,
+            )),
+            None => std::fs::read_to_string(path).ok().and_then(|text| {
+                let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                crate::merge_editor::view_from_markers(&lines)
+            }),
+        };
+        let Some((mut mv, result)) = built else {
+            self.status = format!("{rel} has no merge conflicts");
+            return false;
+        };
+        if let Err(e) = self.editor.open_pinned(path) {
+            self.status = format!("Open failed: {e}");
+            return false;
+        }
+        self.focus_pane(Pane::Editor);
+        let end = self.editor.lines.len();
+        self.editor.splice_result_rows(0, end, result);
+        mv.synced_len = self.editor.lines.len();
+        mv.synced_seq = self.editor.edit_seq;
+        let n = mv.conflicts.len();
+        let first = mv.conflicts.first().map(|c| c.result_start);
+        mv.anchor_panes_on(0);
+        self.editor.merge = Some(mv);
+        if let Some(row) = first {
+            self.editor.clear_selection();
+            self.editor.cursor_row = row.min(self.editor.lines.len().saturating_sub(1));
+            self.editor.cursor_col = 0;
+            self.editor.ensure_cursor_col_visible();
+        }
+        self.status = format!(
+            "Merge editor: {n} conflict{} — F7 jumps, checkboxes or Merge commands accept, \"Reopen as Text\" for the marker flow",
+            if n == 1 { "" } else { "s" }
+        );
+        true
+    }
+
+    /// `path` relative to the repo toplevel, both sides canonicalized —
+    /// a workspace under a symlink (macOS /var → /private/var) otherwise
+    /// fails the strip and yields an absolute "relative" path, which git
+    /// stage specs refuse and status messages shouldn't show.
+    fn repo_rel(&self, path: &Path) -> String {
+        let root = self.scm_root();
+        let canon_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let canon_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        canon_path
+            .strip_prefix(&canon_root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.status_path(path))
+    }
+
+    /// Reconcile the merge view's tracked regions with any buffer edit it
+    /// has not seen yet (the render loop does this each frame; command
+    /// paths call it first so they also work headless, e.g. under test).
+    fn merge_view_sync(&mut self) {
+        let (len, seq, row) = (
+            self.editor.lines.len(),
+            self.editor.edit_seq,
+            self.editor.merge_edit_row,
+        );
+        if let Some(mv) = self.editor.merge.as_mut() {
+            mv.sync_with_buffer(len, seq, row);
+        }
+    }
+
+    /// The conflict an accept action targets: the one under the cursor,
+    /// else the one navigation last landed on.
+    fn merge_target_conflict(&self) -> Option<usize> {
+        let mv = self.editor.merge.as_ref()?;
+        mv.conflict_at_result_row(self.editor.cursor_row)
+            .or_else(|| (mv.active < mv.conflicts.len()).then_some(mv.active))
+    }
+
+    /// Set conflict `idx` to `state`, splicing its replacement into the
+    /// Result as one undo step and updating the tracked regions.
+    fn merge_set_conflict(&mut self, idx: usize, state: crate::merge_editor::ConflictState) {
+        self.merge_view_sync();
+        let Some(mv) = self.editor.merge.as_ref() else {
+            return;
+        };
+        let Some(c) = mv.conflicts.get(idx) else {
+            return;
+        };
+        let (start, end) = (c.result_start, c.result_start + c.result_len);
+        let repl = c.replacement(state);
+        let new_len = repl.len();
+        self.editor.splice_result_rows(start, end, repl);
+        let (len, seq) = (self.editor.lines.len(), self.editor.edit_seq);
+        let mv = self.editor.merge.as_mut().expect("checked above");
+        mv.note_accept(idx, new_len, state, len, seq);
+        let (resolved, total) = (mv.resolved_count(), mv.conflicts.len());
+        self.status = format!(
+            "Conflict {} of {total}: {} ({resolved}/{total} resolved)",
+            idx + 1,
+            match state {
+                crate::merge_editor::ConflictState::Current => "accepted current",
+                crate::merge_editor::ConflictState::Incoming => "accepted incoming",
+                crate::merge_editor::ConflictState::Both => "accepted both (current first)",
+                crate::merge_editor::ConflictState::BothReverse => "accepted both (incoming first)",
+                crate::merge_editor::ConflictState::Base => "kept base",
+                crate::merge_editor::ConflictState::Unresolved => "back to unresolved",
+                crate::merge_editor::ConflictState::Manual => "manual",
+            }
+        );
+    }
+
+    /// Accept-action entry for the palette commands: target the cursor's
+    /// conflict (falling back to the active one).
+    fn merge_apply(&mut self, state: crate::merge_editor::ConflictState) {
+        self.merge_view_sync();
+        match self.merge_target_conflict() {
+            Some(idx) => self.merge_set_conflict(idx, state),
+            None => self.status = String::from("No conflict at the cursor — F7 jumps to one"),
+        }
+    }
+
+    /// Accept every remaining unresolved conflict as `state` (the
+    /// Accept-All commands in the merge editor).
+    fn merge_accept_all(&mut self, state: crate::merge_editor::ConflictState) {
+        self.merge_view_sync();
+        let Some(mv) = self.editor.merge.as_ref() else {
+            return;
+        };
+        // Back-to-front so earlier indices' spans stay valid inside each
+        // splice's own bookkeeping (note_accept shifts only later ones).
+        let targets: Vec<usize> = (0..mv.conflicts.len())
+            .rev()
+            .filter(|&i| !mv.conflicts[i].state.resolved())
+            .collect();
+        let n = targets.len();
+        for idx in targets {
+            self.merge_set_conflict(idx, state);
+        }
+        let total = self
+            .editor
+            .merge
+            .as_ref()
+            .map(|m| m.conflicts.len())
+            .unwrap_or(0);
+        self.status = format!(
+            "Accepted {n} conflict{} ({total} total)",
+            if n == 1 { "" } else { "s" }
+        );
+    }
+
+    /// Checkbox click: toggle one side's inclusion, VS Code's model —
+    /// both checked is Accept Combination, neither reverts to base.
+    fn merge_toggle_side(&mut self, idx: usize, side: crate::merge_editor::CheckSide) {
+        use crate::merge_editor::{CheckSide, ConflictState as S};
+        let Some(mv) = self.editor.merge.as_ref() else {
+            return;
+        };
+        let Some(c) = mv.conflicts.get(idx) else {
+            return;
+        };
+        let (mut cur, mut inc) = match c.state {
+            S::Current => (true, false),
+            S::Incoming => (false, true),
+            S::Both | S::BothReverse => (true, true),
+            S::Unresolved | S::Base | S::Manual => (false, false),
+        };
+        match side {
+            CheckSide::Current => cur = !cur,
+            CheckSide::Incoming => inc = !inc,
+        }
+        let state = match (cur, inc) {
+            (true, false) => S::Current,
+            (false, true) => S::Incoming,
+            (true, true) => S::Both,
+            (false, false) => S::Unresolved,
+        };
+        self.merge_set_conflict(idx, state);
+    }
+
+    /// F7 / Shift+F7 in the merge editor: hop conflicts in the Result and
+    /// re-anchor every source pane on the same conflict.
+    fn merge_jump(&mut self, backwards: bool) {
+        self.merge_view_sync();
+        let row = self.editor.cursor_row;
+        let Some(mv) = self.editor.merge.as_mut() else {
+            return;
+        };
+        let Some(idx) = mv.next_conflict(row, backwards) else {
+            self.status = String::from("No conflicts");
+            return;
+        };
+        mv.anchor_panes_on(idx);
+        let target = mv.conflicts[idx].result_start;
+        let total = mv.conflicts.len();
+        self.editor.clear_selection();
+        self.editor.cursor_row = target.min(self.editor.lines.len().saturating_sub(1));
+        self.editor.cursor_col = 0;
+        self.editor.ensure_cursor_col_visible();
+        self.status = format!("Conflict {} of {total}", idx + 1);
     }
 
     fn start_code_action(&mut self) {
@@ -14592,15 +15460,7 @@ impl App {
             }
             // Cmd+K W: close all editor tabs.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'w') => {
-                let removed = self.editor.close_all();
-                self.sync_open_file_poll_mtime();
-                self.status = if removed == 1 {
-                    String::from("Closed 1 tab")
-                } else {
-                    format!("Closed {removed} tabs")
-                };
-                self.poke_cursor();
-                self.collapse_split_if_empty();
+                self.close_all_tabs();
                 true
             }
             // Cmd+K U: close all saved (non-dirty) editor tabs.
@@ -14666,6 +15526,18 @@ impl App {
             // Cmd+K Z: toggle Zen Mode (VS Code's binding).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'z') => {
                 self.toggle_zen_mode();
+                true
+            }
+            // Cmd+K Cmd+F (SUPER/CTRL held on the second key): Format
+            // Selection, VS Code's binding (#254). Must precede the plain
+            // Cmd+K F arm, which keeps croft's format-on-save toggle.
+            KeyCode::Char(c)
+                if plain
+                    && c.eq_ignore_ascii_case(&'f')
+                    && (key.modifiers.contains(KeyModifiers::SUPER)
+                        || key.modifiers.contains(KeyModifiers::CONTROL)) =>
+            {
+                self.format_selection();
                 true
             }
             // Cmd+K F: toggle Format on Save (croft binding; VS Code leaves this
@@ -14759,6 +15631,28 @@ impl App {
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'l') => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
+                self.poke_cursor();
+                true
+            }
+            // Cmd+K Cmd+/ : collapse every comment block (VS Code
+            // "Fold All Block Comments", #254).
+            KeyCode::Char('/') if plain => {
+                self.editor
+                    .fold_all_of_kind(crate::lsp::manager::FoldRangeKind::Comment);
+                self.poke_cursor();
+                true
+            }
+            // Cmd+K Cmd+8 / Cmd+K Cmd+9: fold / unfold every #region
+            // (VS Code "Fold/Unfold All Regions", #254).
+            KeyCode::Char('8') if plain => {
+                self.editor
+                    .fold_all_of_kind(crate::lsp::manager::FoldRangeKind::Region);
+                self.poke_cursor();
+                true
+            }
+            KeyCode::Char('9') if plain => {
+                self.editor
+                    .unfold_all_of_kind(crate::lsp::manager::FoldRangeKind::Region);
                 self.poke_cursor();
                 true
             }
@@ -17552,31 +18446,40 @@ impl App {
         let scm_root = self.scm_root();
         let abs = scm_root.join(&entry.path);
         let opened = match entry.kind {
-            // A conflicted entry opens the WORKING file — a HEAD diff is
-            // meaningless against a marker-filled tree — parked on the first
-            // conflict, with the status naming the whole guided flow.
-            ChangeKind::Conflicted => match self.editor.open_pinned(&abs) {
-                Ok(()) => {
-                    self.focus_pane(Pane::Editor);
-                    let n = self.editor.conflicts().len();
-                    if let Some(block) = self.editor.conflicts().first().copied() {
-                        self.editor.clear_selection();
-                        self.editor.cursor_row = block.ours_start;
-                        self.editor.cursor_col = 0;
-                        self.editor.scroll_col = 0;
-                        self.editor.ensure_cursor_col_visible();
-                    }
-                    self.status = format!(
-                        "{n} conflict{} — F7 jumps, Cmd+. accepts, \"Merge: Complete Merge\" stages",
-                        if n == 1 { "" } else { "s" }
-                    );
+            // A conflicted entry opens the three-way MERGE EDITOR (#253)
+            // on the index stages — non-overlapping hunks pre-resolve,
+            // and "Reopen as Text" reaches the old in-buffer marker flow.
+            // If the stages are unreadable (e.g. binary), fall back to
+            // opening the working file with its markers, parked on the
+            // first conflict as before.
+            ChangeKind::Conflicted => {
+                if self.open_merge_editor_for(&abs) {
                     true
+                } else {
+                    match self.editor.open_pinned(&abs) {
+                        Ok(()) => {
+                            self.focus_pane(Pane::Editor);
+                            let n = self.editor.conflicts().len();
+                            if let Some(block) = self.editor.conflicts().first().copied() {
+                                self.editor.clear_selection();
+                                self.editor.cursor_row = block.ours_start;
+                                self.editor.cursor_col = 0;
+                                self.editor.scroll_col = 0;
+                                self.editor.ensure_cursor_col_visible();
+                            }
+                            self.status = format!(
+                                "{n} conflict{} — F7 jumps, Cmd+. accepts, \"Merge: Complete Merge\" stages",
+                                if n == 1 { "" } else { "s" }
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            self.status = format!("Open failed: {e}");
+                            false
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.status = format!("Open failed: {e}");
-                    false
-                }
-            },
+            }
             ChangeKind::Modified | ChangeKind::StagedModified => {
                 match crate::git::read_file_at_head(&scm_root, &entry.path) {
                     Ok(head_text) => {
@@ -19925,6 +20828,31 @@ impl App {
                 }
                 self.pending_code_actions.clear();
             }
+            ListPurpose::ColorPresentation => {
+                // The edits were computed against a specific buffer state;
+                // an external reload while the picker was open orphans
+                // them (#277 review) — refuse rather than splice at
+                // stale offsets.
+                let context_ok = self.pending_color_context.take().is_some_and(|(p, seq)| {
+                    self.editor.path.as_deref() == Some(p.as_path()) && self.editor.edit_seq == seq
+                });
+                if context_ok {
+                    if let Some((label, edits)) =
+                        self.pending_color_presentations.get(index).cloned()
+                    {
+                        let applied = self.editor.apply_span_edits(&edits);
+                        self.status = if applied > 0 {
+                            format!("Color rewritten as {label}")
+                        } else {
+                            String::from("The presentation's edit no longer applies")
+                        };
+                    }
+                } else {
+                    self.status =
+                        String::from("The buffer changed — re-run Change Color Presentation");
+                }
+                self.pending_color_presentations.clear();
+            }
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
                     self.run_project_task(task);
@@ -19970,6 +20898,7 @@ impl App {
                     "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
+                    "toggle:format_on_type" => self.toggle_format_on_type(),
                     "cmd:color_theme" => {
                         self.open_theme_picker();
                         return;
@@ -20111,6 +21040,14 @@ impl App {
                     "Editor: Inlay Hints: {}{}",
                     on_off(self.inlay_hints_enabled),
                     prov("disable_inlay_hints")
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:format_on_type"),
+                label: format!(
+                    "Editor: Format on Type: {}{}",
+                    on_off(self.format_on_type),
+                    prov("format_on_type")
                 ),
             },
             ListRow {
@@ -21601,6 +22538,26 @@ impl App {
             self.jump_conflict(key.modifiers.contains(KeyModifiers::SHIFT));
             return;
         }
+        // Merge editor (#253): F7 hops the tracked Result regions (the
+        // Result has no markers, so the arm above never claims it) and
+        // Alt+Up/Down scrolls the source panes together. Every other key
+        // falls through to the ordinary text path — the Result is a real
+        // buffer.
+        if self.editor.merge.is_some() {
+            if matches!(key.code, KeyCode::F(7)) {
+                self.merge_jump(key.modifiers.contains(KeyModifiers::SHIFT));
+                return;
+            }
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            {
+                let delta = if key.code == KeyCode::Up { -3 } else { 3 };
+                if let Some(mv) = self.editor.merge.as_mut() {
+                    mv.scroll_panes(delta);
+                }
+                return;
+            }
+        }
         if is_editor_find_key(key) {
             self.open_editor_find();
             return;
@@ -22172,6 +23129,18 @@ impl App {
                 KeyCode::Up => self.editor.duplicate_lines_up(),
                 KeyCode::Down => self.editor.duplicate_lines_down(),
                 _ => unreachable!(),
+            }
+            return;
+        }
+        // Expand / Shrink Selection (#254): Shift+Alt+Right/Left, VS Code's
+        // smart-select chords. This deliberately claims what used to be
+        // word-wise selection extension — the same collision VS Code
+        // resolves the same way.
+        if shift && alt && !cmd && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+            if key.code == KeyCode::Right {
+                self.expand_selection();
+            } else {
+                self.shrink_selection();
             }
             return;
         }
@@ -24780,11 +25749,75 @@ impl App {
                 self.workspace_root().join(&path)
             }
         };
+        self.open_resolved_file_ref(&abs, fr.line, fr.column)
+    }
+
+    /// Jump the editor to an absolute `path:line[:col]`, recording where the
+    /// user was so Back returns to it, exactly like go-to-definition. False
+    /// when the file doesn't exist or won't open.
+    fn open_resolved_file_ref(
+        &mut self,
+        abs: &std::path::Path,
+        line: u32,
+        column: Option<u32>,
+    ) -> bool {
+        self.open_resolved_file_ref_inner(abs, line, column, true)
+    }
+
+    /// [`Self::open_resolved_file_ref`], but `record_nav` false skips the jump
+    /// history. A side-by-side open is ONE jump for the user even though it
+    /// opens two files, so it records the origin itself and opens both halves
+    /// without recording (otherwise the first Back lands on the left half).
+    fn open_resolved_file_ref_inner(
+        &mut self,
+        abs: &std::path::Path,
+        line: u32,
+        column: Option<u32>,
+        record_nav: bool,
+    ) -> bool {
         if !abs.is_file() {
             return false;
         }
-        // Record where the user was so Back returns to it, exactly like
-        // go-to-definition.
+        if record_nav && let Some(from) = self.editor.path.clone() {
+            self.nav.record(NavLoc {
+                path: from,
+                row: self.editor.cursor_row,
+                col: self.editor.cursor_col,
+            });
+        }
+        let line0 = (line as usize).saturating_sub(1);
+        let col0 = column.map(|c| c as usize).unwrap_or(1).saturating_sub(1);
+        match self.open_at(abs, line0, col0) {
+            Ok(()) => {
+                // `explorer.autoReveal` analogue, as quick-open does: sync
+                // the tree to the landed file without stealing editor focus.
+                self.tree.reveal_path(abs);
+                self.status = format!("{}:{}", self.status_path(abs), line);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Open a `diff://` group link's two files side by side: left lands in
+    /// the leftmost editor group, right in the rightmost — splitting first
+    /// when the editor is a single group, reusing the existing pair when it
+    /// is already split (so repeated clicks swap the comparison in place
+    /// instead of accreting columns).
+    fn open_side_by_side(
+        &mut self,
+        left: &crate::file_ref::FileRef,
+        right: &crate::file_ref::FileRef,
+    ) -> bool {
+        // Both sides absolute by construction (diff_uri refuses relative
+        // paths); gated on is_file like every terminal file click.
+        let lp = std::path::PathBuf::from(&left.path);
+        let rp = std::path::PathBuf::from(&right.path);
+        if !lp.is_file() || !rp.is_file() {
+            return false;
+        }
+        // One click, one Back entry: record the origin once here, then open
+        // both halves with recording off.
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
                 path: from,
@@ -24792,15 +25825,26 @@ impl App {
                 col: self.editor.cursor_col,
             });
         }
-        let line0 = (fr.line as usize).saturating_sub(1);
-        let col0 = fr.column.map(|c| c as usize).unwrap_or(1).saturating_sub(1);
-        match self.open_at(&abs, line0, col0) {
-            Ok(()) => {
-                self.status = format!("{}:{}", self.status_path(&abs), fr.line);
-                true
-            }
-            Err(_) => false,
+        self.focus_editor_group(true);
+        if !self.open_resolved_file_ref_inner(&lp, left.line, left.column, false) {
+            return false;
         }
+        if self.editor_layout.is_split() {
+            self.focus_editor_group(false);
+        } else {
+            // The split duplicates the left file into the new focused group
+            // as a preview tab; opening the right file swaps into it.
+            self.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+        }
+        if !self.open_resolved_file_ref_inner(&rp, right.line, right.column, false) {
+            return false;
+        }
+        self.status = format!(
+            "Side by side: {} | {}",
+            self.status_path(&lp),
+            self.status_path(&rp)
+        );
+        true
     }
 
     /// Open a URL discovered in the terminal. On a remote session a loopback
@@ -24808,12 +25852,32 @@ impl App {
     /// local Mac through the drop relay (with the usual confirm gate). On a
     /// local session everything opens directly.
     ///
-    /// Web links only: an OSC 8 cell carries whatever URI the printing
-    /// program chose while showing unrelated text, so a file:// or
-    /// custom-scheme URI would hand `open`/`xdg-open` an arbitrary target
-    /// (app launch, protocol handler) off one disguised click. The refusal
-    /// surfaces the real destination in the status line.
+    /// Editor deep links (`vscode://file/…:line`, and the same shape from
+    /// Cursor/Windsurf/Zed, plus plain `file://`) name a file and line, and
+    /// Croft is an editor: they open in the editor pane right here, never
+    /// through the OS. Beyond those, web links only: an OSC 8 cell carries
+    /// whatever URI the printing program chose while showing unrelated text,
+    /// so any other custom-scheme URI would hand `open`/`xdg-open` an
+    /// arbitrary target (app launch, protocol handler) off one disguised
+    /// click. The refusal surfaces the real destination in the status line.
     fn open_detected_url(&mut self, url: &str) {
+        // A diff:// group link names two files; open them side by side.
+        // Same trust story as single-file deep links: consumed internally,
+        // gated on is_file, never handed to the OS.
+        if let Some((left, right)) = crate::file_ref::diff_uri(url)
+            && self.open_side_by_side(&left, &right)
+        {
+            return;
+        }
+        if let Some(fr) = crate::file_ref::editor_file_uri(url) {
+            // Absolute by construction; gated on is_file like every terminal
+            // file click. An unresolvable link falls through to the web-only
+            // rule so its refusal still shows the real URI.
+            let path = std::path::PathBuf::from(&fr.path);
+            if self.open_resolved_file_ref(&path, fr.line, fr.column) {
+                return;
+            }
+        }
         let scheme_ok = {
             let l = url.trim_start().to_ascii_lowercase();
             l.starts_with("http://") || l.starts_with("https://")
@@ -26074,6 +27138,8 @@ impl App {
                     self.status = String::from("Trimmed trailing whitespace");
                 }
             }
+            Cmd::ExpandSelection => self.expand_selection(),
+            Cmd::ShrinkSelection => self.shrink_selection(),
             Cmd::ToggleWordWrap => {
                 self.editor.toggle_wrap();
                 self.status = if self.editor.wrap_enabled() {
@@ -26105,6 +27171,9 @@ impl App {
                 self.status = String::from("Converted indentation to tabs");
             }
             Cmd::FormatDocument => self.start_format_document(),
+            Cmd::FormatSelection => self.format_selection(),
+            Cmd::ChangeColorPresentation => self.change_color_presentation(),
+            Cmd::ToggleFormatOnType => self.toggle_format_on_type(),
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
@@ -26120,20 +27189,90 @@ impl App {
             Cmd::RestoreSnapshot => self.restore_history_snapshot(),
             Cmd::QuickFix => self.start_code_action(),
             Cmd::ReplaceInFile => self.open_editor_replace(),
+            // The accept/navigate commands serve both merge flows: the
+            // three-way merge editor when its view is up (#253), the
+            // in-buffer marker flow otherwise.
             Cmd::MergeAcceptCurrent => {
-                self.resolve_merge_at_cursor(crate::merge::Resolution::Current)
+                if self.editor.merge.is_some() {
+                    self.merge_apply(crate::merge_editor::ConflictState::Current);
+                } else {
+                    self.resolve_merge_at_cursor(crate::merge::Resolution::Current)
+                }
             }
             Cmd::MergeAcceptIncoming => {
-                self.resolve_merge_at_cursor(crate::merge::Resolution::Incoming)
+                if self.editor.merge.is_some() {
+                    self.merge_apply(crate::merge_editor::ConflictState::Incoming);
+                } else {
+                    self.resolve_merge_at_cursor(crate::merge::Resolution::Incoming)
+                }
             }
-            Cmd::MergeAcceptBoth => self.resolve_merge_at_cursor(crate::merge::Resolution::Both),
-            Cmd::MergeAcceptAllCurrent => self.resolve_all_merge(crate::merge::Resolution::Current),
+            Cmd::MergeAcceptBoth => {
+                if self.editor.merge.is_some() {
+                    self.merge_apply(crate::merge_editor::ConflictState::Both);
+                } else {
+                    self.resolve_merge_at_cursor(crate::merge::Resolution::Both)
+                }
+            }
+            Cmd::MergeAcceptBothReverse => {
+                if self.editor.merge.is_some() {
+                    self.merge_apply(crate::merge_editor::ConflictState::BothReverse);
+                } else {
+                    self.status = String::from("Incoming-first combination needs the merge editor");
+                }
+            }
+            Cmd::MergeIgnore => {
+                if self.editor.merge.is_some() {
+                    self.merge_apply(crate::merge_editor::ConflictState::Base);
+                } else {
+                    self.status = String::from("Ignore (keep base) needs the merge editor");
+                }
+            }
+            Cmd::MergeAcceptAllCurrent => {
+                if self.editor.merge.is_some() {
+                    self.merge_accept_all(crate::merge_editor::ConflictState::Current);
+                } else {
+                    self.resolve_all_merge(crate::merge::Resolution::Current)
+                }
+            }
             Cmd::MergeAcceptAllIncoming => {
-                self.resolve_all_merge(crate::merge::Resolution::Incoming)
+                if self.editor.merge.is_some() {
+                    self.merge_accept_all(crate::merge_editor::ConflictState::Incoming);
+                } else {
+                    self.resolve_all_merge(crate::merge::Resolution::Incoming)
+                }
             }
-            Cmd::MergeNextConflict => self.jump_conflict(false),
-            Cmd::MergePrevConflict => self.jump_conflict(true),
+            Cmd::MergeNextConflict => {
+                if self.editor.merge.is_some() {
+                    self.merge_jump(false);
+                } else {
+                    self.jump_conflict(false)
+                }
+            }
+            Cmd::MergePrevConflict => {
+                if self.editor.merge.is_some() {
+                    self.merge_jump(true);
+                } else {
+                    self.jump_conflict(true)
+                }
+            }
             Cmd::MergeComplete => self.complete_merge(),
+            Cmd::MergeOpenEditor => match self.editor.path.clone() {
+                Some(p) => {
+                    self.open_merge_editor_for(&p);
+                }
+                None => self.status = String::from("No file in the active tab"),
+            },
+            Cmd::MergeToggleBase => match self.editor.merge.as_mut() {
+                Some(mv) => {
+                    mv.show_base = !mv.show_base;
+                    self.status = if self.editor.merge.as_ref().is_some_and(|m| m.show_base) {
+                        String::from("Base pane shown")
+                    } else {
+                        String::from("Base pane hidden")
+                    };
+                }
+                None => self.status = String::from("Show Base needs the merge editor"),
+            },
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
             Cmd::ClearBuildDiagnostics => self.clear_build_diagnostics(),
@@ -26156,6 +27295,15 @@ impl App {
             }
             Cmd::FoldAll => self.editor.fold_all(),
             Cmd::UnfoldAll => self.editor.unfold_all(),
+            Cmd::FoldAllComments => self
+                .editor
+                .fold_all_of_kind(crate::lsp::manager::FoldRangeKind::Comment),
+            Cmd::FoldAllRegions => self
+                .editor
+                .fold_all_of_kind(crate::lsp::manager::FoldRangeKind::Region),
+            Cmd::UnfoldAllRegions => self
+                .editor
+                .unfold_all_of_kind(crate::lsp::manager::FoldRangeKind::Region),
             Cmd::TrimFinalNewlines => {
                 if self.editor.trim_final_newlines() {
                     self.status = String::from("Trimmed final newlines");
@@ -26243,6 +27391,25 @@ impl App {
                 None => self.status = String::from("No file in the active tab"),
             },
             Cmd::ReopenAsText => match self.editor.path.clone() {
+                // Merge editor (#253): back to the in-buffer marker flow.
+                // The Result buffer is deliberately discarded — it was
+                // never saved, and the marker file on disk is the source
+                // of truth the old flow works on.
+                Some(p) if self.editor.merge.is_some() => {
+                    self.editor.merge = None;
+                    self.editor.dirty = false;
+                    self.editor.force_text = true;
+                    match self.editor.open(&p) {
+                        Ok(()) => {
+                            let n = self.editor.conflicts().len();
+                            self.status = format!(
+                                "Marker flow: {n} conflict{} — F7 jumps, Cmd+. accepts",
+                                if n == 1 { "" } else { "s" }
+                            );
+                        }
+                        Err(e) => self.status = format!("Reopen as text: {e}"),
+                    }
+                }
                 // A rendered notebook/markdown preview counts (#180): the
                 // command lands in the raw source.
                 Some(_)
@@ -29099,6 +30266,39 @@ impl App {
                         return;
                     }
                 }
+                // Merge editor (#253): a click on a source pane's
+                // per-conflict checkbox toggles that side's inclusion
+                // (both checked = Accept Combination). Any other click in
+                // the source-pane area is swallowed — the panes are
+                // read-only; the Result below keeps normal click behavior.
+                if in_editor && self.editor.merge.is_some() {
+                    let (check_hit, in_panes) = self
+                        .editor
+                        .merge
+                        .as_ref()
+                        .map(|mv| {
+                            (
+                                mv.check_spans
+                                    .iter()
+                                    .find(|(y, xs, _, _)| *y == m.row && xs.contains(&m.column))
+                                    .map(|(_, _, idx, side)| (*idx, *side)),
+                                mv.last_panes_area.contains(ratatui::layout::Position {
+                                    x: m.column,
+                                    y: m.row,
+                                }),
+                            )
+                        })
+                        .unwrap_or((None, false));
+                    if let Some((idx, side)) = check_hit {
+                        self.focus_pane(Pane::Editor);
+                        self.merge_toggle_side(idx, side);
+                        return;
+                    }
+                    if in_panes {
+                        self.focus_pane(Pane::Editor);
+                        return;
+                    }
+                }
                 if !in_editor {
                     self.editor_click.clear();
                 }
@@ -31127,6 +32327,20 @@ impl App {
         );
     }
 
+    /// VS Code's `editor.formatOnType` toggle (#254), persisted like the
+    /// other editor preferences.
+    fn toggle_format_on_type(&mut self) {
+        self.format_on_type = !self.format_on_type;
+        self.status = if self.format_on_type {
+            String::from("Format on Type: on")
+        } else {
+            String::from("Format on Type: off")
+        };
+        if !cfg!(test) {
+            let _ = crate::prefs::save_format_on_type(self.format_on_type);
+        }
+    }
+
     fn toggle_format_on_save(&mut self) {
         self.format_on_save = !self.format_on_save;
         self.status = if self.format_on_save {
@@ -31369,6 +32583,7 @@ impl App {
             self.apply_theme_visuals(theme);
         }
         self.format_on_save = p.format_on_save;
+        self.format_on_type = p.format_on_type;
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
@@ -32299,17 +33514,7 @@ impl App {
                     self.poke_cursor();
                 }
             }
-            MenuAction::CloseAllTabs => {
-                let removed = self.editor.close_all();
-                self.sync_open_file_poll_mtime();
-                self.status = if removed == 1 {
-                    String::from("Closed 1 tab")
-                } else {
-                    format!("Closed {removed} tabs")
-                };
-                self.poke_cursor();
-                self.collapse_split_if_empty();
-            }
+            MenuAction::CloseAllTabs => self.close_all_tabs(),
             MenuAction::CloseSavedTabs => self.close_saved_tabs(),
             MenuAction::KeepTabOpen(idx) => {
                 if self.editor.keep_open(idx) {
@@ -32596,6 +33801,34 @@ impl App {
     /// Close every saved (non-dirty) editor tab, keeping any with unsaved
     /// changes. Shared by the tab context menu and the `Cmd+K U` chord so both
     /// surfaces produce the same status line and split-collapse behavior.
+    /// Cmd+K W / tab context "Close All": close every tab in EVERY editor
+    /// group, not just the focused one, collapsing any split back to a single
+    /// blank pane. A side-by-side layout (e.g. `cgr duplicates` diffs) would
+    /// otherwise only empty the clicked group and look like a single close
+    /// once the blank group collapsed away.
+    fn close_all_tabs(&mut self) {
+        let mut removed = self.editor.close_all();
+        if self.editor_layout.is_split() {
+            removed += self
+                .editor_layout
+                .inactive_groups()
+                .iter()
+                .map(|g| g.editors.len())
+                .sum::<usize>();
+            self.editor_layout = editor_layout::EditorLayout::single();
+            self.editor_seams.clear();
+            self.disable_editor_image(1);
+            self.sync_focus_flags();
+        }
+        self.sync_open_file_poll_mtime();
+        self.status = if removed == 1 {
+            String::from("Closed 1 tab")
+        } else {
+            format!("Closed {removed} tabs")
+        };
+        self.poke_cursor();
+    }
+
     fn close_saved_tabs(&mut self) {
         let removed = self.editor.close_saved();
         if removed == 0 {
@@ -38623,6 +39856,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let references_changed = app.drain_lsp_references();
         let call_hierarchy_changed = app.drain_lsp_call_hierarchy();
         let occ_tick_changed = app.tick_occurrences();
+        let linked_tick_changed = app.tick_linked_editing();
+        let linked_changed = app.drain_lsp_linked_editing();
+        app.tick_on_type_formatting();
+        let on_type_changed = app.drain_lsp_on_type_format();
         let prepare_rename_changed = app.drain_lsp_prepare_rename();
         let occurrences_changed = app.drain_lsp_document_highlights();
         let rename_changed = app.drain_lsp_rename();
@@ -38630,6 +39867,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let code_action_changed = app.drain_lsp_code_actions();
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let inlay_changed = app.drain_lsp_inlay_hints();
+        let folds_changed = app.drain_lsp_folding_ranges();
+        let selection_ranges_changed = app.drain_lsp_selection_ranges();
+        let colors_changed = app.drain_lsp_document_colors();
+        let color_pres_changed = app.drain_lsp_color_presentations();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
@@ -38697,6 +39938,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || references_changed
             || call_hierarchy_changed
             || occ_tick_changed
+            || linked_tick_changed
+            || linked_changed
+            || on_type_changed
             || prepare_rename_changed
             || occurrences_changed
             || rename_changed
@@ -38704,6 +39948,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || code_action_changed
             || semantic_changed
             || inlay_changed
+            || folds_changed
+            || selection_ranges_changed
+            || colors_changed
+            || color_pres_changed
             || diagnostics_changed
             || progress_changed
             || voice_changed

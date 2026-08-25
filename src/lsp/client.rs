@@ -759,6 +759,46 @@ impl LspClient {
             .context("document_highlight")
     }
 
+    /// `textDocument/linkedEditingRange`: the equal-content spans that
+    /// rename together with the one at the caret (paired HTML/JSX tags,
+    /// #254). Backs the editor's live tag mirroring.
+    pub async fn linked_editing_range(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<lsp_types::LinkedEditingRanges>> {
+        self.server
+            .linked_editing_range(lsp_types::LinkedEditingRangeParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("linked_editing_range")
+    }
+
+    /// `textDocument/selectionRange`: per-position parent-linked chains of
+    /// semantically meaningful ranges — the whole Expand Selection ancestry
+    /// in one round trip, one chain per cursor (#254).
+    pub async fn selection_ranges(
+        &mut self,
+        uri: Url,
+        positions: Vec<Position>,
+    ) -> Result<Option<Vec<lsp_types::SelectionRange>>> {
+        self.server
+            .selection_range(lsp_types::SelectionRangeParams {
+                text_document: TextDocumentIdentifier { uri },
+                positions,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("selection_range")
+    }
+
     /// `textDocument/inlayHint` over the whole document (`line_count` caps the
     /// range end). VS Code requests per viewport and stitches; one whole-file
     /// request per edit-batch is simpler and matches how croft already pulls
@@ -785,6 +825,68 @@ impl LspClient {
             })
             .await
             .context("inlay_hint")
+    }
+
+    /// `textDocument/foldingRange`: the server's fold spans for the whole
+    /// document, with optional kinds (comment / imports / region). Backs
+    /// the editor's LSP-first folding (#254); the indentation scan stays
+    /// the fallback when the server lacks the provider.
+    pub async fn folding_ranges(
+        &mut self,
+        uri: Url,
+    ) -> Result<Option<Vec<lsp_types::FoldingRange>>> {
+        self.server
+            .folding_range(lsp_types::FoldingRangeParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("folding_range")
+    }
+
+    /// `textDocument/documentColor`: every color value in the document
+    /// (#254) — the swatch decoration's data source.
+    pub async fn document_color(&mut self, uri: Url) -> Result<Vec<lsp_types::ColorInformation>> {
+        self.server
+            .document_color(lsp_types::DocumentColorParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("document_color")
+    }
+
+    /// `textDocument/colorPresentation`: the alternative spellings of one
+    /// color value (`#rrggbb`, `rgb()`, …), each carrying the edit that
+    /// rewrites the document to it (#254).
+    pub async fn color_presentations(
+        &mut self,
+        uri: Url,
+        color: lsp_types::Color,
+        start: (u32, u32),
+        end: (u32, u32),
+    ) -> Result<Vec<lsp_types::ColorPresentation>> {
+        self.server
+            .color_presentation(lsp_types::ColorPresentationParams {
+                text_document: TextDocumentIdentifier { uri },
+                color,
+                range: Range {
+                    start: Position {
+                        line: start.0,
+                        character: start.1,
+                    },
+                    end: Position {
+                        line: end.0,
+                        character: end.1,
+                    },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("color_presentation")
     }
 
     pub async fn rename(
@@ -903,6 +1005,73 @@ impl LspClient {
             })
             .await
             .context("formatting")
+    }
+
+    /// `textDocument/rangeFormatting`: format only the given UTF-16 span
+    /// ("Format Selection", #254). Same options contract as whole-document
+    /// formatting.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn range_formatting(
+        &mut self,
+        uri: Url,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.server
+            .range_formatting(lsp_types::DocumentRangeFormattingParams {
+                text_document: TextDocumentIdentifier { uri },
+                range: Range {
+                    start: Position {
+                        line: start_line,
+                        character: start_character,
+                    },
+                    end: Position {
+                        line: end_line,
+                        character: end_character,
+                    },
+                },
+                options: FormattingOptions {
+                    tab_size,
+                    insert_spaces,
+                    ..FormattingOptions::default()
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("range_formatting")
+    }
+
+    /// `textDocument/onTypeFormatting`: the server's formatting reaction
+    /// to one just-typed trigger character (#254).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn on_type_formatting(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+        ch: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.server
+            .on_type_formatting(lsp_types::DocumentOnTypeFormattingParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                ch,
+                options: FormattingOptions {
+                    tab_size,
+                    insert_spaces,
+                    ..FormattingOptions::default()
+                },
+            })
+            .await
+            .context("on_type_formatting")
     }
 
     pub async fn semantic_tokens_full(&mut self, uri: Url) -> Result<Option<SemanticTokensResult>> {

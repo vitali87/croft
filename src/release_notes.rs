@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Croft Light: the selected activity-bar icon no longer disappears. The icons are baked as images with a fixed tint, so on a light bar the selected one was painted white on white; the whole icon family now takes its ink from the theme, matching VS Code Light Modern.",
+    kind: NoteKind::Feature,
+    summary: "Rename (F2) now asks the language server first: the prompt pre-fills the server's own validated name, and renaming somewhere the server refuses fails immediately with its reason instead of opening a prompt that cannot succeed.",
 }];

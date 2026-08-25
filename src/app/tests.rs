@@ -2035,6 +2035,48 @@ fn go_back_returns_to_the_location_before_a_definition_jump() {
     );
 }
 
+/// A `diff://` link opens two files but is ONE jump for the user, so Back
+/// must return to where the click happened — not to the left half of the
+/// diff on the way there.
+#[test]
+fn side_by_side_diff_link_records_one_go_back_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.rs");
+    let left = tmp.path().join("left.rs");
+    let right = tmp.path().join("right.rs");
+    std::fs::write(&origin, "fn main() {}\nlet x = 1;\n").unwrap();
+    std::fs::write(&left, "fn left() {}\n").unwrap();
+    std::fs::write(&right, "fn right() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&origin).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 4;
+
+    let lref = crate::file_ref::FileRef {
+        path: left.to_string_lossy().into_owned(),
+        line: 1,
+        column: None,
+    };
+    let rref = crate::file_ref::FileRef {
+        path: right.to_string_lossy().into_owned(),
+        line: 1,
+        column: None,
+    };
+    assert!(app.open_side_by_side(&lref, &rref), "both sides open");
+
+    app.nav_back();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(origin.as_path()),
+        "one Back returns to the clicked location, not the left half"
+    );
+    assert_eq!(app.editor.cursor_row, 1, "caret returns to the click row");
+    assert_eq!(
+        app.editor.cursor_col, 4,
+        "caret returns to the click column"
+    );
+}
+
 /// #31: navigate-back rested entirely on the Ctrl+Shift+click mouse chord.
 /// The VS Code keyboard chord (Ctrl+-) and the palette command are the
 /// fallbacks that work when the host terminal never delivers that chord.
@@ -8301,6 +8343,39 @@ fn close_others_records_the_dropped_tabs_for_reopen() {
     assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
 }
 
+/// Tab context "Close All" must close the tabs in EVERY split group, not
+/// just the clicked one. With files open side by side (e.g. `cgr
+/// duplicates`), it used to empty only the focused group, whose blank pane
+/// then collapsed away and promoted the other group — so it looked like a
+/// single tab closed.
+#[test]
+fn close_all_closes_every_split_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    for f in [&a, &b] {
+        std::fs::write(f, "x\n").unwrap();
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.split_editor(); // right group (focused) duplicates a.rs
+    app.editor.open_pinned(&b).unwrap();
+    assert!(app.editor_layout.is_split(), "two groups before Close All");
+    let total: usize = std::iter::once(&app.editor)
+        .chain(app.editor_layout.inactive_groups())
+        .map(|g| g.editors.len())
+        .sum();
+    assert!(total >= 2, "tabs are spread over both groups");
+    app.dispatch_menu_action(MenuAction::CloseAllTabs, tmp.path().to_path_buf());
+    assert!(
+        !app.editor_layout.is_split(),
+        "Close All collapses the split back to a single group"
+    );
+    assert_eq!(app.editor.tab_count(), 1, "a single blank pane remains");
+    assert_eq!(app.editor.path, None, "no file stays open in any group");
+    assert_eq!(app.status, format!("Closed {total} tabs"));
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
@@ -12629,7 +12704,11 @@ fn editor_alt_left_jumps_one_word_backward() {
 }
 
 #[test]
-fn editor_shift_alt_right_extends_selection_by_word() {
+fn editor_shift_alt_right_runs_expand_selection_not_word_extension() {
+    // #254 reassigned Shift+Alt+Right from word-wise extension to VS
+    // Code's Expand Selection (the same collision VS Code resolves the
+    // same way). With no path/language, the textual fallback grows to
+    // the line span immediately — no LSP round trip.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Editor);
@@ -12640,8 +12719,15 @@ fn editor_shift_alt_right_extends_selection_by_word() {
         .unwrap();
     assert_eq!(
         app.editor.selection_text(),
-        "hello",
-        "Shift+Option+Right should select from cursor to the next word boundary"
+        "hello world",
+        "Shift+Option+Right expands to the enclosing range (the line here)"
+    );
+    // Shift+Alt+Left retraces to the gesture's start.
+    app.handle_key(key(KeyCode::Left, KeyModifiers::ALT | KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(
+        app.editor.selection.is_none(),
+        "shrink retraced to the caret"
     );
 }
 
@@ -20347,14 +20433,13 @@ fn build_breadcrumbs_lists_path_segments_then_the_symbol_chain() {
 
 #[test]
 fn toggle_format_on_save_command_flips_the_pref_and_reports_it() {
-    use crate::widgets::command_palette::Command;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.format_on_save = false;
-    app.run_command(Command::ToggleFormatOnSave);
+    app.run_command(crate::widgets::command_palette::Command::ToggleFormatOnSave);
     assert!(app.format_on_save, "the command turns format-on-save on");
     assert!(app.status.contains("on") || app.status.contains("On"));
-    app.run_command(Command::ToggleFormatOnSave);
+    app.run_command(crate::widgets::command_palette::Command::ToggleFormatOnSave);
     assert!(!app.format_on_save, "the command toggles it back off");
 }
 
@@ -21509,13 +21594,12 @@ fn auto_save_sweeps_dirty_background_tabs() {
 
 #[test]
 fn toggle_auto_save_command_flips_the_pref_and_reports_it() {
-    use crate::widgets::command_palette::Command;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
-    app.run_command(Command::ToggleAutoSave);
+    app.run_command(crate::widgets::command_palette::Command::ToggleAutoSave);
     assert!(app.auto_save);
     assert_eq!(app.status, "Auto Save: on");
-    app.run_command(Command::ToggleAutoSave);
+    app.run_command(crate::widgets::command_palette::Command::ToggleAutoSave);
     assert!(!app.auto_save);
     assert_eq!(app.status, "Auto Save: off");
 }
@@ -25538,9 +25622,9 @@ fn palette_carries_the_navigator_commands() {
     app.pair_record_path = tmp.path().join("x.pair.json");
     app.open_file_at_launch(&file);
 
-    app.run_command(Command::AskNavigator);
+    app.run_command(crate::widgets::command_palette::Command::AskNavigator);
     assert!(app.status.to_lowercase().contains("not active"));
-    app.run_command(Command::YieldToNavigator);
+    app.run_command(crate::widgets::command_palette::Command::YieldToNavigator);
     assert!(app.status.to_lowercase().contains("not active"));
 
     app.navigator_notes
@@ -25550,15 +25634,15 @@ fn palette_carries_the_navigator_commands() {
         reply: String::new(),
         cursor: 0,
     });
-    app.run_command(Command::ClearNavigatorNotes);
+    app.run_command(crate::widgets::command_palette::Command::ClearNavigatorNotes);
     assert!(app.navigator_notes.is_empty());
     assert!(app.editor.comment_focus.is_none());
 
-    app.run_command(Command::ToggleNavigator);
+    app.run_command(crate::widgets::command_palette::Command::ToggleNavigator);
     let record =
         crate::session::read_pair_record(&app.pair_record_path).expect("toggle writes the record");
     assert!(record.enabled);
-    app.run_command(Command::ToggleNavigator);
+    app.run_command(crate::widgets::command_palette::Command::ToggleNavigator);
     let record = crate::session::read_pair_record(&app.pair_record_path).unwrap();
     assert!(!record.enabled);
 }
@@ -28034,7 +28118,7 @@ fn wait_for_conflicted_entry(app: &mut App) -> usize {
 }
 
 #[test]
-fn scm_click_on_a_conflicted_entry_opens_the_file_at_its_first_conflict() {
+fn scm_click_on_a_conflicted_entry_opens_the_merge_editor_on_the_stages() {
     let tmp = tempfile::tempdir().unwrap();
     conflicted_repo(tmp.path());
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -28045,15 +28129,32 @@ fn scm_click_on_a_conflicted_entry_opens_the_file_at_its_first_conflict() {
         Some(std::ffi::OsStr::new("shared.txt")),
         "the conflicted file must open"
     );
-    let first_header = app.editor.conflicts()[0].ours_start;
+    let mv = app.editor.merge.as_ref().expect("the merge editor is up");
+    assert!(!mv.from_markers, "git stages, not marker synthesis");
+    assert_eq!(mv.conflicts.len(), 2, "both overlapping hunks tracked");
+    // The base pane holds the stage-1 (common ancestor) content.
+    assert_eq!(mv.base[1], "base-one");
+    assert_eq!(mv.conflicts[0].ours, vec!["main-one".to_string()]);
+    assert_eq!(mv.conflicts[0].theirs, vec!["feature-one".to_string()]);
+    // The Result starts as base for conflict regions (nothing else
+    // differed in this fixture, so the whole buffer equals base).
+    assert_eq!(app.editor.lines[1], "base-one");
     assert_eq!(
-        app.editor.cursor_row, first_header,
-        "the cursor must land on the first conflict header, not row 0"
+        app.editor.cursor_row, mv.conflicts[0].result_start,
+        "the cursor lands on the first conflict region"
     );
     assert!(
         app.status.contains("2 conflicts"),
-        "the status must count the conflicts and name the flow; was {:?}",
+        "the status counts the conflicts; was {:?}",
         app.status
+    );
+    // "Reopen as Text" reaches the unchanged in-buffer marker flow.
+    app.run_command(crate::widgets::command_palette::Command::ReopenAsText);
+    assert!(app.editor.merge.is_none(), "back to a plain text tab");
+    assert_eq!(
+        app.editor.conflicts().len(),
+        2,
+        "the marker scan sees the on-disk conflict blocks again"
     );
 }
 
@@ -28121,12 +28222,20 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
         app.status
     );
 
-    app.resolve_all_merge(crate::merge::Resolution::Incoming);
-    assert!(app.editor.conflicts().is_empty(), "every block resolved");
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllIncoming);
+    assert_eq!(
+        app.editor
+            .merge
+            .as_ref()
+            .map(|mv| mv.unresolved_count())
+            .unwrap_or(usize::MAX),
+        0,
+        "every conflict resolved"
+    );
     assert_eq!(
         app.editor.lines.join("\n"),
         "alpha\nfeature-one\nm1\nm2\nm3\nm4\nm5\nfeature-two\nomega",
-        "the buffer keeps only the incoming side of both blocks"
+        "the Result keeps only the incoming side of both conflicts"
     );
 
     app.complete_merge();
@@ -28153,6 +28262,162 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
         line.starts_with("M "),
         "after staging, shared.txt must be index-modified (M ), not unmerged; was {line:?}"
     );
+}
+
+#[test]
+fn merge_editor_accepts_toggles_and_manual_edits_update_the_counter() {
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    assert!(app.editor.merge.is_some());
+
+    // Accept Current on conflict 1 (cursor already there).
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptCurrent);
+    assert_eq!(app.editor.lines[1], "main-one");
+    // F7 lands on conflict 2; Accept Combination (Incoming First).
+    app.merge_jump(false);
+    assert!(app.status.contains("Conflict 2 of 2"), "{:?}", app.status);
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptBothReverse);
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "alpha\nmain-one\nm1\nm2\nm3\nm4\nm5\nfeature-two\nmain-two\nomega",
+        "incoming-first combination splices theirs then ours"
+    );
+    assert_eq!(app.editor.merge.as_ref().unwrap().resolved_count(), 2);
+
+    // Checkbox toggling: unchecking the only accepted side reverts the
+    // region to base and the conflict back to unresolved.
+    use crate::merge_editor::{CheckSide, ConflictState};
+    app.merge_toggle_side(0, CheckSide::Incoming); // Current -> Both
+    assert_eq!(
+        app.editor.merge.as_ref().unwrap().conflicts[0].state,
+        ConflictState::Both
+    );
+    assert_eq!(app.editor.lines[1], "main-one");
+    assert_eq!(app.editor.lines[2], "feature-one");
+    app.merge_toggle_side(0, CheckSide::Current); // Both -> Incoming
+    app.merge_toggle_side(0, CheckSide::Incoming); // Incoming -> Unresolved
+    let mv = app.editor.merge.as_ref().unwrap();
+    assert_eq!(mv.conflicts[0].state, ConflictState::Unresolved);
+    assert_eq!(app.editor.lines[1], "base-one", "back to base text");
+    assert_eq!(mv.resolved_count(), 1);
+
+    // A manual edit inside the region marks it manually resolved.
+    let row = app.editor.merge.as_ref().unwrap().conflicts[0].result_start;
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.merge_view_sync();
+    let mv = app.editor.merge.as_ref().unwrap();
+    assert_eq!(mv.conflicts[0].state, ConflictState::Manual);
+    assert_eq!(mv.resolved_count(), 2, "manual edits count as resolved");
+
+    // Base pane toggle.
+    assert!(!app.editor.merge.as_ref().unwrap().show_base);
+    app.run_command(crate::widgets::command_palette::Command::MergeToggleBase);
+    assert!(app.editor.merge.as_ref().unwrap().show_base);
+    assert_eq!(app.status, "Base pane shown");
+}
+
+#[test]
+fn merge_editor_works_on_a_marker_only_file_outside_any_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("plain.txt"),
+        "top\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> other\nbottom\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("plain.txt"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.run_command(crate::widgets::command_palette::Command::MergeOpenEditor);
+    let mv = app.editor.merge.as_ref().expect("marker synthesis worked");
+    assert!(mv.from_markers);
+    assert_eq!(mv.conflicts.len(), 1);
+    assert_eq!(mv.conflicts[0].ours, vec!["mine".to_string()]);
+    assert_eq!(mv.conflicts[0].theirs, vec!["yours".to_string()]);
+    assert!(
+        !app.editor.lines.iter().any(|l| l.starts_with("<<<<<<<")),
+        "the Result holds no markers"
+    );
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptBoth);
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "top\nmine\nyours\nbottom",
+        "Accept Both keeps ours then theirs"
+    );
+    // Undo steps back through the accept and the initial transform to
+    // the marker text.
+    app.editor.undo();
+    app.editor.undo();
+    assert!(
+        app.editor.lines.iter().any(|l| l.starts_with("<<<<<<<")),
+        "the marker buffer is one undo chain away"
+    );
+}
+
+#[test]
+fn merge_editor_renders_source_panes_and_result_at_100_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("plain.txt"),
+        "top\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> other\nbottom\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("plain.txt"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.run_command(crate::widgets::command_palette::Command::MergeOpenEditor);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let a = buf.area;
+    let text: String = (a.y..a.y + a.height)
+        .map(|y| {
+            (a.x..a.x + a.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("MERGE"), "header row painted");
+    assert!(text.contains("0/1 conflict resolved"), "counter painted");
+    assert!(text.contains("CURRENT (yours)"), "current pane titled");
+    assert!(text.contains("INCOMING (theirs)"), "incoming pane titled");
+    assert!(
+        text.contains("RESULT (editable)"),
+        "result separator painted"
+    );
+    assert!(
+        text.contains("[ ]"),
+        "the unresolved conflict shows unchecked boxes"
+    );
+    let spans = app.editor.merge.as_ref().unwrap().check_spans.clone();
+    assert_eq!(spans.len(), 2, "one checkbox per source pane");
+    // Clicking the Current checkbox accepts that side.
+    let (y, xs, idx, _) = &spans[0];
+    let m = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: xs.start,
+        row: *y,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(m);
+    let mv = app.editor.merge.as_ref().unwrap();
+    assert_eq!(
+        mv.conflicts[*idx].state,
+        crate::merge_editor::ConflictState::Current,
+        "the checkbox click accepted Current"
+    );
+    assert_eq!(app.editor.lines[1], "mine");
 }
 
 #[test]
@@ -28975,10 +29240,13 @@ fn refresh_run_debug_syncs_the_config_row() {
 }
 
 #[test]
-fn rename_symbol_defers_on_prepare_and_falls_back_to_the_word_prompt() {
-    // #254 item 6: F2 fires prepareRename first. With no server, the
-    // worker's unsupported verdict routes to the old word-under-cursor
-    // prompt — same UX as before, one async hop later.
+fn rename_symbol_defers_the_prompt_until_a_verdict_arrives() {
+    // #254 item 6: F2 no longer opens the prompt straight away — it fires
+    // prepareRename and parks, so the prompt can pre-fill the server's own
+    // validated name. (The document here was never opened through the LSP
+    // layer, so the worker's answer is the unknown-document `unsupported`
+    // verdict; the verdict shapes themselves are covered by
+    // `a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback`.)
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("lib.rs"),
@@ -28993,14 +29261,358 @@ fn rename_symbol_defers_on_prepare_and_falls_back_to_the_word_prompt() {
     app.start_rename_symbol();
     assert!(app.prompt.is_none(), "the prompt waits on the verdict");
     assert_eq!(app.status, "Preparing rename…");
+    assert!(
+        app.prepare_rename_request.is_some(),
+        "the request is armed for the verdict to match against"
+    );
+}
+
+#[test]
+fn a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback() {
+    // Every shape the server can answer with (#254 item 6). The reply
+    // channel's sender lives inside the LSP worker, so these drive the
+    // verdict handler the drain loop delegates to.
+    use crate::lsp::manager::PrepareRenameResult;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("lib.rs");
+    std::fs::write(&path, "fn main() {\n    let value = 1;\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9; // inside `value`
+
+    let verdict = |target, error, unsupported| PrepareRenameResult {
+        request_id: 4,
+        path: path.clone(),
+        unsupported,
+        error,
+        target,
+    };
+    let arm = |app: &mut App| {
+        app.prepare_rename_request = Some((4, path.clone(), 1, 9, app.editor.edit_seq));
+        app.prompt = None;
+        app.status = String::from("Preparing rename…");
+    };
+
+    // A placeholder wins over the range text.
+    arm(&mut app);
+    assert!(app.apply_prepare_rename_verdict(verdict(
+        Some(((1, 8, 1, 13), Some(String::from("renamed")))),
+        None,
+        false
+    )));
+    assert_eq!(
+        app.prompt.as_ref().expect("prompt opened").buffer,
+        "renamed",
+        "the server's placeholder pre-fills the prompt"
+    );
+
+    // No placeholder: the validated range's own text.
+    arm(&mut app);
+    assert!(app.apply_prepare_rename_verdict(verdict(Some(((1, 8, 1, 13), None)), None, false)));
+    assert_eq!(
+        app.prompt.as_ref().expect("prompt opened").buffer,
+        "value",
+        "the range text pre-fills when no placeholder is offered"
+    );
+
+    // The server refused the position.
+    arm(&mut app);
+    assert!(app.apply_prepare_rename_verdict(verdict(
+        None,
+        Some(String::from("cannot rename a keyword")),
+        false
+    )));
+    assert_eq!(app.status, "Rename rejected: cannot rename a keyword");
+    assert!(app.prompt.is_none(), "a refusal opens no prompt");
+
+    // The server answered "nothing here".
+    arm(&mut app);
+    assert!(app.apply_prepare_rename_verdict(verdict(None, None, false)));
+    assert_eq!(app.status, "Nothing renameable at the cursor");
+    assert!(app.prompt.is_none());
+
+    // No prepare support: the word-under-cursor fallback.
+    arm(&mut app);
+    assert!(app.apply_prepare_rename_verdict(verdict(None, None, true)));
+    assert_eq!(
+        app.prompt.as_ref().expect("fallback prompt opened").buffer,
+        "value"
+    );
+
+    // The buffer moved under the in-flight request: say so rather than
+    // leaving "Preparing rename…" wedged on screen forever.
+    arm(&mut app);
+    app.editor.edit_seq += 1;
+    assert!(app.apply_prepare_rename_verdict(verdict(
+        Some(((1, 8, 1, 13), Some(String::from("renamed")))),
+        None,
+        false
+    )));
+    assert_eq!(app.status, "Rename cancelled");
+    assert!(app.prompt.is_none(), "a stale verdict opens no prompt");
+
+    // A superseded reply must not disarm the newer in-flight request.
+    arm(&mut app);
+    let stale = PrepareRenameResult {
+        request_id: 3,
+        path: path.clone(),
+        unsupported: false,
+        error: None,
+        target: None,
+    };
+    assert!(!app.apply_prepare_rename_verdict(stale));
+    assert!(
+        app.prepare_rename_request.is_some(),
+        "the armed request survives an older reply"
+    );
+}
+
+#[test]
+fn format_selection_needs_a_selection_and_reports_unsupported_via_the_reply() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("lib.rs"), "fn main( ) {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    // No selection: refused up front with guidance.
+    app.run_command(crate::widgets::command_palette::Command::FormatSelection);
+    assert_eq!(app.status, "Select something to format");
+    // With a selection: the request fires; with no server spawned in
+    // tests, the worker's always-answer contract reports unsupported
+    // through the SAME drain as whole-document formatting, with
+    // selection-specific wording.
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (1, 1),
+    });
+    app.run_command(crate::widgets::command_palette::Command::FormatSelection);
+    assert_eq!(app.status, "Formatting selection");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.prompt.is_none() && std::time::Instant::now() < deadline {
-        app.drain_lsp_prepare_rename();
+    while app.format_request_id.is_some() && std::time::Instant::now() < deadline {
+        app.drain_lsp_format();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let prompt = app.prompt.as_ref().expect("the fallback prompt opened");
-    assert_eq!(prompt.buffer, "value", "pre-filled with the symbol");
-    assert!(prompt.label.contains("Rename Symbol 'value'"));
+    assert_eq!(app.status, "No range formatter available for this file");
+}
+
+#[test]
+fn linked_editing_set_clears_when_the_caret_leaves_and_mirrors_through_handle_key() {
+    // #254 item 3: keystrokes inside a linked range mirror to the pair
+    // on the tick; moving the caret out of every range drops the set.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("page.html"), "<title>t</title>\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("page.html"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor
+        .set_linked_ranges(&[(0, 1, 0, 6), (0, 10, 0, 15)]);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 6;
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.tick_linked_editing(), "the keystroke mirrored");
+    assert_eq!(app.editor.lines[0], "<titles>t</titles>");
+    // Caret leaves the set: the next tick clears it.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 9; // inside the body text
+    app.tick_linked_editing();
+    assert!(!app.editor.has_linked_ranges());
+    // Typing there no longer mirrors.
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.tick_linked_editing());
+    assert_eq!(app.editor.lines[0], "<titles>tx</titles>");
+}
+
+#[test]
+fn fold_all_regions_command_works_with_no_language_server_attached() {
+    // #254's fallback criterion: region folding must work when no LSP
+    // ever answers — here the file's language has no server at all.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("notes.txt"),
+        "#region setup\nline a\nline b\n#endregion\nrest\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("notes.txt"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.run_command(crate::widgets::command_palette::Command::FoldAllRegions);
+    assert!(app.editor.is_line_hidden(1) && app.editor.is_line_hidden(2));
+    assert!(!app.editor.is_line_hidden(0) && !app.editor.is_line_hidden(4));
+    app.run_command(crate::widgets::command_palette::Command::UnfoldAllRegions);
+    assert!(!app.editor.is_line_hidden(1), "regions expanded again");
+}
+
+#[test]
+fn expand_selection_falls_back_to_tree_sitter_when_the_lsp_cannot_route() {
+    // #254 item 2's serverless criterion, end to end: the worker answers
+    // `unsupported` for an untracked doc, and the drained verdict grows
+    // the selection from tree-sitter node ancestry — the gesture never
+    // hangs and never needs a real server.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("lib.rs"),
+        "fn main() {\n    let value = 1;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9; // inside `value`
+    app.run_command(crate::widgets::command_palette::Command::ExpandSelection);
+    // The request is in flight; the worker's unsupported verdict lands
+    // asynchronously. Drain until it resolves the queued press.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.editor.selection.is_none() && std::time::Instant::now() < deadline {
+        app.drain_lsp_selection_ranges();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let sel = app
+        .editor
+        .selection
+        .expect("the fallback grew a selection")
+        .normalised();
+    assert!(
+        sel.0 <= (1, 8) && sel.1 >= (1, 13),
+        "the identifier (or an enclosing node) is selected: {sel:?}"
+    );
+    // Shrink retraces locally, no LSP involved.
+    app.run_command(crate::widgets::command_palette::Command::ShrinkSelection);
+    assert!(app.editor.selection.is_none(), "back to the bare caret");
+}
+
+#[test]
+fn a_caret_move_between_selection_range_request_and_reply_drops_the_stale_chains() {
+    // #272 review: a click moves the caret WITHOUT bumping edit_seq, so
+    // the pending gate must also compare the cursor positions the
+    // request was fired for — the old caret's chains must not apply at
+    // the new spot.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("lib.rs"),
+        "fn main() {\n    let value = 1;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9;
+    app.run_command(crate::widgets::command_palette::Command::ExpandSelection);
+    assert!(app.selection_range_request.is_some(), "request in flight");
+    // A caret move (no edit) before the reply lands.
+    app.editor.clear_selection();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.selection_range_request.is_some() && std::time::Instant::now() < deadline {
+        app.drain_lsp_selection_ranges();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.selection_range_request.is_none(),
+        "the stale reply cleared the pending slot"
+    );
+    assert!(
+        app.editor.selection.is_none(),
+        "the old caret's chains were dropped, not applied at the new caret"
+    );
+}
+
+#[test]
+fn change_color_presentation_needs_a_color_and_defers_the_picker_on_the_reply() {
+    use crate::lsp::manager::ColorItem;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("style.css"), "a { color: #ff0000; }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("style.css"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    // No color at the cursor: refused up front.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 2;
+    app.run_command(crate::widgets::command_palette::Command::ChangeColorPresentation);
+    assert_eq!(app.status, "No color value at the cursor");
+    // Inject a color set (as a documentColor reply would) and ask on it.
+    let path = tmp.path().join("style.css");
+    app.editor.apply_document_colors(
+        path.clone(),
+        vec![ColorItem {
+            line: 0,
+            character: 11,
+            end_line: 0,
+            end_character: 18,
+            red: 255,
+            green: 0,
+            blue: 0,
+            raw: (1.0, 0.0, 0.0, 1.0),
+        }],
+    );
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 12;
+    app.run_command(crate::widgets::command_palette::Command::ChangeColorPresentation);
+    assert_eq!(app.status, "Fetching color presentations…");
+    // No server in tests: the worker's always-answer contract resolves
+    // the deferred picker to the empty-offering status.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.color_presentations_request.is_some() && std::time::Instant::now() < deadline {
+        app.drain_lsp_color_presentations();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.status, "No color presentations offered here");
+}
+
+#[test]
+fn a_stale_color_presentation_pick_is_refused_after_a_buffer_change() {
+    use crate::widgets::editor::TextSpanEdit;
+    use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+    // #277 review: an external reload while the picker is open bumps
+    // edit_seq; the pick must refuse rather than splice stale offsets.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("style.css"), "a { color: #ff0000; }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("style.css");
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.pending_color_presentations = vec![(
+        String::from("rgb(255, 0, 0)"),
+        vec![TextSpanEdit {
+            start: (0, 11),
+            end: (0, 18),
+            new_text: String::from("rgb(255, 0, 0)"),
+        }],
+    )];
+    app.pending_color_context = Some((path.clone(), app.editor.edit_seq));
+    app.open_list_picker(
+        ListPicker::new(
+            ListPurpose::ColorPresentation,
+            "Change Color Presentation",
+            vec![ListRow {
+                id: String::from("0"),
+                label: String::from("rgb(255, 0, 0)"),
+            }],
+        ),
+        "empty",
+    );
+    // The buffer changes while the picker is open.
+    app.editor.insert_char('x');
+    let before = app.editor.lines[0].clone();
+    app.confirm_list_picker();
+    assert_eq!(app.editor.lines[0], before, "no stale edit applied");
+    assert_eq!(
+        app.status,
+        "The buffer changed — re-run Change Color Presentation"
+    );
+    assert!(app.pending_color_presentations.is_empty());
 }
 
 #[test]
@@ -29076,5 +29688,188 @@ fn a_task_problem_matcher_owns_its_pane_and_watch_publishes_win() {
         app.problems.groups().len(),
         2,
         "without the task matcher both formats report"
+    );
+}
+
+#[test]
+fn on_type_formatting_stays_inert_when_disabled_or_unadvertised() {
+    // #254 item 4: gated behind editor.format_on_type (default OFF,
+    // matching VS Code), and even when on, nothing fires unless a
+    // server advertised the trigger set for the language.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("lib.rs"), "fn main() {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert!(!app.format_on_type, "off by default");
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    app.tick_on_type_formatting();
+    assert!(app.on_type_request.is_none(), "disabled: nothing fires");
+    assert!(
+        app.editor.last_typed.is_none(),
+        "the tick consumes the record even while disabled, so enabling \
+         the setting later cannot replay a stale trigger"
+    );
+    // Enable via the settings toggle; still inert because no server has
+    // advertised any trigger characters for Rust in this test.
+    app.toggle_format_on_type();
+    assert!(app.format_on_type);
+    assert_eq!(app.status, "Format on Type: on");
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    app.tick_on_type_formatting();
+    assert!(
+        app.on_type_request.is_none(),
+        "no advertised trigger set: the request is never sent"
+    );
+    assert!(
+        app.editor.last_typed.is_none(),
+        "each keystroke is examined exactly once"
+    );
+}
+
+#[test]
+fn a_tab_switch_disarms_the_background_tabs_on_type_trigger() {
+    // A keystroke and a tab switch can drain in the same input burst, so
+    // the tick can run with a different tab active than the one that
+    // typed. The record on the now-background tab must be swept, or
+    // returning to it minutes later would fire a request for a long-dead
+    // keystroke — its per-tab edit_seq still matches, nothing having been
+    // edited in between.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "fn a() {\n}\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "fn b() {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.last_typed.is_some(),
+        "keystroke recorded on tab A"
+    );
+    // Switch to tab B before any tick runs, then tick with B active.
+    app.editor.open_pinned(&tmp.path().join("b.rs")).unwrap();
+    app.tick_on_type_formatting();
+    // Return to tab A: the armed record must be gone.
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    assert!(
+        app.editor.last_typed.is_none(),
+        "the sweep disarms background tabs — returning to one must not \
+         replay the pre-switch keystroke"
+    );
+
+    // Same hazard one level out: the typing tab is in a split group that
+    // loses focus before the tick runs.
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.last_typed.is_some(), "keystroke recorded again");
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    assert_eq!(app.editor_layout.leaf_count(), 2, "really split");
+    app.tick_on_type_formatting();
+    let armed = app
+        .editor_layout
+        .inactive_groups_mut()
+        .iter()
+        .any(|g| g.editors.iter().any(|e| e.last_typed.is_some()));
+    assert!(
+        !armed,
+        "the sweep reaches editors in inactive split groups too"
+    );
+}
+
+#[test]
+fn a_settings_reload_applies_format_on_type_live() {
+    // The live-reload path (save a config file inside croft →
+    // remerge_settings → apply_merged_settings) must carry the key like
+    // every other allowlisted preference; startup-only application would
+    // leave the Settings row showing a provenance whose value is not in
+    // force until the next launch.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(!app.format_on_type, "off by default");
+    let p = crate::prefs::Prefs {
+        format_on_type: true,
+        ..Default::default()
+    };
+    app.apply_merged_settings(&p);
+    assert!(app.format_on_type, "a reloaded merge turns it on");
+    app.apply_merged_settings(&crate::prefs::Prefs::default());
+    assert!(!app.format_on_type, "and back off");
+}
+
+#[test]
+fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
+    // The four dispositions of a reply. The channel's sender lives in the
+    // LSP worker, so the decision is tested through the pure helper the
+    // drain loop delegates to.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn a() {\n}\n").unwrap();
+    std::fs::write(&b, "fn b() {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    let reply = |id: u64, path: &std::path::Path| crate::lsp::manager::FormatResult {
+        request_id: id,
+        path: path.to_path_buf(),
+        edits: Some(Vec::new()),
+        unsupported: false,
+    };
+
+    // Nothing armed: any reply is a leftover.
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(1, &a)),
+        OnTypeReply::NotOurs
+    );
+
+    // Armed and everything matches.
+    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &a)),
+        OnTypeReply::Apply
+    );
+
+    // A superseded id must NOT disarm the newer in-flight request.
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(6, &a)),
+        OnTypeReply::NotOurs,
+        "an older reply is ignored without consuming the armed request"
+    );
+    assert!(
+        app.on_type_request.is_some(),
+        "the helper never clears; the newer request stays armed"
+    );
+
+    // Buffer moved since the request.
+    app.on_type_request = Some((7, app.editor.edit_seq.wrapping_sub(1), a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &a)),
+        OnTypeReply::Stale,
+        "edits computed against text that has since changed are dropped"
+    );
+
+    // Reply is for a different file than the one requested.
+    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &b)),
+        OnTypeReply::Stale,
+        "a reply for another path never applies to this tab"
+    );
+
+    // The requested tab is no longer active: edit_seq is per-tab, so the
+    // counter alone would compare two unrelated buffers.
+    app.editor.open_pinned(&b).unwrap();
+    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &a)),
+        OnTypeReply::Stale,
+        "the tab that typed must still be the active one"
     );
 }

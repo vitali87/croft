@@ -92,6 +92,7 @@ pub fn layer_of(provenance: &BTreeMap<String, LayerKind>, key: &str) -> LayerKin
 pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "theme",
     "format_on_save",
+    "format_on_type",
     "auto_save",
     "auto_save_on_focus_change",
     "render_whitespace",
@@ -398,6 +399,9 @@ fn load_vscode_subset(path: &Path, warnings: &mut Vec<String>) -> Option<Map<Str
     if let Some(v) = obj.get("editor.formatOnSave").and_then(Value::as_bool) {
         out.insert("format_on_save".into(), Value::Bool(v));
     }
+    if let Some(v) = obj.get("editor.formatOnType").and_then(Value::as_bool) {
+        out.insert("format_on_type".into(), Value::Bool(v));
+    }
     match obj.get("files.autoSave").and_then(Value::as_str) {
         Some("afterDelay") => {
             out.insert("auto_save".into(), Value::Bool(true));
@@ -655,12 +659,18 @@ mod tests {
             r#"{
   // JSONC is fine here too
   "editor.formatOnSave": true,
+  "editor.formatOnType": true,
   "files.autoSave": "afterDelay",
   "editor.fontSize": 13,
 }"#,
         );
         let m = load_merged_from(&user, Some(&root), "macos");
         assert!(m.prefs.format_on_save);
+        assert!(m.prefs.format_on_type);
+        assert_eq!(
+            layer_of(&m.provenance, "format_on_type"),
+            LayerKind::VsCodeWorkspace
+        );
         assert!(m.prefs.auto_save);
         assert_eq!(
             layer_of(&m.provenance, "format_on_save"),
