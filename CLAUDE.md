@@ -86,12 +86,19 @@ any earlier read stale.
 Query both `.comments[]` and `.reviews[]`: they carry different artifacts, not
 duplicates, and an entry can be present with an empty body — a container for
 inline threads rather than a verdict. Require the body to be non-empty *and* to
-carry the verdict you are looking for; presence alone is not evidence. Exclude
-the PR author, whose own inline replies land there as empty entries too,
-otherwise a PR looks more reviewed the more diligently its author answers
-feedback. And do not assume the shape is stable: the same bots on the same repo
-produce an empty `reviews[]` on one PR and dozens of entries on another, so
-"here the verdict lives in field X" is never a safe shortcut.
+carry the verdict you are looking for; presence alone is not evidence.
+
+**Filter on content, not on author.** It is tempting to just exclude the PR
+author, since their inline replies land there as empty entries and make a PR
+look more reviewed the more diligently its author answers feedback. But that is
+not sufficient: on one measured PR, excluding the author left 23 entries of
+which 17 were still empty bot containers — roughly a fourfold overstatement
+against the 6 entries that actually carried content. Author-exclusion narrows
+the error; only requiring a non-empty body with the verdict token removes it.
+
+And do not assume the shape is stable: the same bots on the same repo produce an
+empty `reviews[]` on one PR and dozens of entries on another, so "here the
+verdict lives in field X" is never a safe shortcut.
 
 Anchor it to the head SHA. If the artifact names a commit other than the head
 you are about to merge, the review is stale and does not count, however good it
@@ -103,5 +110,14 @@ Everything above is a habit, and a hurried session can skip a habit. The sibling
 code-graph-rag repo enforces the equivalent mechanically instead: a required
 `Greptile 5/5 Gate` job polls until a scored review names the exact head SHA,
 and fails on a stale, missing, or lower-scored one, so the merge is blocked
-rather than merely discouraged. croft has no such gate today. If these rules
-keep costing attention, porting it is the fix worth making.
+rather than merely discouraged. **croft has no such gate today** — do not treat
+this paragraph as a protection that exists here. If these rules keep costing
+attention, porting it is the fix worth making.
+
+Worth reading that job before reinventing any of this. Each of its decisions —
+reading the issue comments rather than the review objects, filtering to the bot
+login, requiring the score token rather than mere presence, walking candidates
+newest-first so a late edit to an old review cannot mask a valid one, resolving
+abbreviated commit refs to full SHAs for exact equality — is the fix for a
+specific trap above. The defences get reinvented because the traps are common;
+reading an existing gate is faster than rediscovering them.
