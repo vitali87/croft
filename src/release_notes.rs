@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "PROBLEMS can show the whole project: diagnostics for files you never opened now appear, and a scope toggle switches between Open Files and Whole Project — the status-bar count follows whichever you pick.",
+    summary: "The sidebar can get out of your way: turn on Auto-Hide Side Bar and it collapses when you move to the editor or a terminal, returning the moment you reach for it — an activity-bar icon, Cmd+B, or a command like Reveal in Explorer.",
 }];
