@@ -1,0 +1,62 @@
+# Working on croft as an agent
+
+Notes for AI agents (and anyone else) working this repo. Contributor workflow —
+the release gate, `target/` hygiene, test layout — lives in
+[CONTRIBUTING.md](CONTRIBUTING.md); this file covers what is specific to
+several agents working the same repo at once.
+
+## Claim work before you start: the `claimed` label
+
+Several sessions often work this repo in parallel, in separate clones and
+worktrees, with no shared view of each other. Two of them picking up the same
+PR means duplicated review rounds, conflicting pushes, and — in the worst case
+— one session force-pushing over another's work.
+
+**Before starting on a PR or an issue, check for the `claimed` label. If it is
+there, someone is already on it: leave it alone.** Ask the user before taking
+over anything that carries it.
+
+**When you start work, add the label. When you stop, remove it.**
+
+```bash
+gh pr view <n> --json labels --jq '[.labels[].name]'   # check first
+gh pr edit <n> --add-label claimed                     # claiming
+gh pr edit <n> --remove-label claimed                  # done, or handing off
+```
+
+Use `gh issue view` / `gh issue edit` for issues. To see everything currently
+claimed: `gh pr list --label claimed` and `gh issue list --label claimed`.
+
+Where to put it: **claim the PR once one exists**, since that is where the
+contended work happens — pushes, review rounds, the merge. Claim the issue only
+for work that has no PR yet, and move the claim to the PR when you open it.
+
+### Releasing it
+
+The label is a lock, and a lock nobody releases is worse than no lock. Remove it
+when you merge, when you stop working, and when you hand off. Merging usually
+deletes the branch but **not** the label, so drop it as part of the merge.
+
+It deliberately records no owner, so it cannot tell you *who* holds a claim or
+*when* they took it. That keeps it cheap, at the cost of being unable to
+distinguish an active claim from an abandoned one. If a claim looks stale, do
+not just assume it — the sessions working this repo can talk to each other, so
+ask the holder first, and ask the user if you cannot reach them.
+
+## Coordinating with other sessions
+
+Claiming is the cheap signal, not a substitute for talking. Peer sessions on the
+same machine are discoverable and can be messaged directly, which resolves
+ownership questions far more reliably than guessing from timestamps or commit
+authorship — every session commits under the same user identity, so neither one
+tells you which session did the work.
+
+Two habits that avoid the common collisions:
+
+* **Re-check state immediately before you act on it.** Both the version bump and
+  the pre-merge review sweep have been broken by state moving during the window
+  between deciding and merging. Re-read rather than reusing a value you fetched
+  minutes ago.
+* **Never rewrite a branch you do not hold.** No force-pushes to another
+  session's PR. If a branch needs main, merge main into it — that is the
+  convention here, and it keeps the push a fast-forward.
