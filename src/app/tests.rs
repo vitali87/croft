@@ -23345,10 +23345,12 @@ fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: None,
+                    transcript: Vec::new(),
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b_sub.display().to_string(),
                     name: Some(String::from("srv")),
+                    transcript: Vec::new(),
                 },
             ],
             active: 1,
@@ -23387,10 +23389,12 @@ fn restoring_a_workspaces_layout_drops_pane_bound_state_from_the_outgoing_panel(
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: None,
+                    transcript: Vec::new(),
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: Some(String::from("srv")),
+                    transcript: Vec::new(),
                 },
             ],
             active: 0,
@@ -23439,10 +23443,12 @@ fn change_workspace_root_keeps_live_panes_when_the_terminal_was_touched() {
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: None,
+                    transcript: Vec::new(),
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: Some(String::from("srv")),
+                    transcript: Vec::new(),
                 },
             ],
             active: 0,
@@ -30613,6 +30619,180 @@ fn editing_drops_stale_document_links() {
         app.editor.document_link_at(0, 5),
         None,
         "the edit dropped the stale ranges"
+    );
+}
+
+/// #249: after a restart the panes came back in the right directories with
+/// the right names — and completely BLANK, which is what the report means by
+/// "opens all old terminals empty". The pane's own output is now carried in
+/// the session store and repainted above the fresh prompt.
+///
+/// A real panel (two panes) is used deliberately: a lone unnamed pane at the
+/// workspace root is still pruned as the default layout, so that the store
+/// does not grow for every directory a shell was ever run in.
+#[test]
+fn a_restored_terminal_pane_shows_the_output_it_had_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_path = tmp.path().join("sessions.json");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_session_path = session_path.clone();
+    app.split_terminal().unwrap();
+
+    // Pin an explicit geometry so the assertions below do not depend on the
+    // spawn default. (A pane is born 80x24, so this is not waking a
+    // zero-column grid — an earlier comment here claimed that and was wrong.)
+    app.terminals[0].resize(80, 24);
+    // Put a recognisable line on the pane, as the child would have printed.
+    app.terminals[0].feed_bytes_for_test(b"unique-marker-249\r\n");
+    app.save_terminal_session();
+    let raw = std::fs::read_to_string(&session_path).unwrap();
+    assert!(
+        raw.contains("unique-marker-249"),
+        "the store carries the pane's output: {raw}"
+    );
+
+    // A fresh app restores the panel; the marker must be on screen.
+    let mut app2 = App::new(tmp.path().to_path_buf()).unwrap();
+    app2.terminal_session_path = session_path.clone();
+    app2.restore_terminal_session();
+    app2.terminals[0].resize(80, 24);
+    let (lines, _) = app2.terminals[0].grid_lines();
+    assert!(
+        lines.iter().any(|l| l.contains("unique-marker-249")),
+        "the restored pane repaints its previous output: {lines:?}"
+    );
+}
+
+/// #298 review: the restored output must sit ABOVE the new shell's prompt.
+/// Asserting only that the marker is somewhere on screen passes whether the
+/// transcript landed above the prompt, below it, or interleaved — which is
+/// exactly what the replay-after-spawn race produced. Painting the preamble
+/// before the reader thread starts is what makes the ordering deterministic.
+#[test]
+fn restored_output_is_painted_above_the_new_prompt() {
+    use crate::widgets::terminal::PtyTerminal;
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript: Vec<String> = (1..=3).map(|i| format!("restored-line-{i}")).collect();
+    let t = PtyTerminal::new_with_transcript(tmp.path(), &transcript).unwrap();
+
+    // The preamble is in the grid before the child can write a byte, so the
+    // rows are readable immediately — no waiting on the shell.
+    let (lines, _) = t.grid_lines();
+    let row_of = |needle: &str| lines.iter().position(|l| l.contains(needle));
+    let first = row_of("restored-line-1").expect("first restored line is on screen");
+    let last = row_of("restored-line-3").expect("last restored line is on screen");
+    assert!(
+        first < last,
+        "the transcript keeps its order: {first} then {last} in {lines:?}"
+    );
+
+    // Whatever the shell prints lands on a later row than the restored text.
+    let after: Vec<&String> = lines.iter().skip(last + 1).collect();
+    assert!(
+        after.iter().all(|l| !l.contains("restored-line")),
+        "nothing restored appears below the last restored line: {after:?}"
+    );
+}
+
+/// #298 review: a full-screen program's frame is not scrollback. Quitting
+/// with vim or htop open used to persist that frame and replay it as inert
+/// text above the next prompt — the alternate screen exists precisely so its
+/// contents vanish on exit.
+#[test]
+fn an_alt_screen_frame_is_not_persisted_as_scrollback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_path = tmp.path().join("sessions.json");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_session_path = session_path.clone();
+    app.split_terminal().unwrap();
+    app.terminals[0].resize(80, 24);
+
+    // Real scrollback first, then a full-screen program takes over.
+    app.terminals[0].feed_bytes_for_test(b"real-scrollback-line\r\n");
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1049h");
+    app.terminals[0].feed_bytes_for_test(b"FULLSCREEN-TUI-FRAME\r\n");
+    assert!(
+        app.terminals[0].alt_screen(),
+        "the pane is on the alternate screen"
+    );
+
+    app.save_terminal_session();
+    let raw = std::fs::read_to_string(&session_path).unwrap();
+    assert!(
+        !raw.contains("FULLSCREEN-TUI-FRAME"),
+        "the TUI's frame must not reach the store: {raw}"
+    );
+}
+
+/// The window keeps the NEWEST lines. An inverted slice would still be
+/// bounded and still look right in a small test, so pin the direction.
+#[test]
+fn the_transcript_window_keeps_the_newest_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_path = tmp.path().join("sessions.json");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_session_path = session_path.clone();
+    app.split_terminal().unwrap();
+    app.terminals[0].resize(80, 24);
+
+    let n = crate::terminal_session::TRANSCRIPT_LINES + 50;
+    for i in 1..=n {
+        app.terminals[0].feed_bytes_for_test(format!("line-{i}\r\n").as_bytes());
+    }
+    app.save_terminal_session();
+
+    // The store is keyed by workspace root; read it back through the module's
+    // own loader rather than reparsing its shape here.
+    let store = crate::terminal_session::load(&session_path);
+    let rec = store
+        .values()
+        .next()
+        .expect("a session record for this workspace");
+
+    let t = &rec.panes[0].transcript;
+    assert!(
+        t.len() <= crate::terminal_session::TRANSCRIPT_LINES,
+        "bounded to the window: {}",
+        t.len()
+    );
+    let joined = t.join("\n");
+    assert!(
+        joined.contains(&format!("line-{n}")),
+        "the newest line survives"
+    );
+    assert!(
+        !joined.contains("line-1\n") && !joined.ends_with("line-1"),
+        "the oldest line was dropped, not the newest"
+    );
+}
+
+/// A store written before transcripts existed must still load: `serde(default)`
+/// is the mechanism, and nothing else pins it.
+#[test]
+fn a_pane_record_without_a_transcript_still_parses() {
+    let rec: crate::terminal_session::PaneRecord =
+        serde_json::from_str(r#"{"cwd":"/tmp","name":null}"#).unwrap();
+    assert!(rec.transcript.is_empty());
+}
+
+/// The transcript is plain text by design: a replay must not be able to
+/// re-run a cursor move or a screen clear that the original output carried.
+#[test]
+fn a_replayed_transcript_cannot_execute_control_sequences() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A hostile line: were this fed raw, the erase would wipe the screen and
+    // the cursor move would scramble the layout.
+    app.terminals[0].replay_transcript(&[String::from("before\u{1b}[2J\u{1b}[Hafter")]);
+    let (lines, _) = app.terminals[0].grid_lines();
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("before") && joined.contains("after"),
+        "the text survives: {joined:?}"
+    );
+    assert!(
+        !joined.contains('\u{1b}'),
+        "and no escape byte reaches the grid: {joined:?}"
     );
 }
 

@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "The sidebar can get out of your way: turn on Auto-Hide Side Bar and it collapses when you move to the editor or a terminal, returning the moment you reach for it — an activity-bar icon, Cmd+B, or a command like Reveal in Explorer.",
+    kind: NoteKind::Fix,
+    summary: "Your terminals come back with their output after an update: a self-update used to reopen the panes blank, and a multi-pane panel now replays each pane's recent scrollback above a fresh prompt (the shells themselves are new — a relaunch cannot adopt the old processes).",
 }];
