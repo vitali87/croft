@@ -29015,6 +29015,57 @@ fn on_type_formatting_stays_inert_when_disabled_or_unadvertised() {
 }
 
 #[test]
+fn a_tab_switch_disarms_the_background_tabs_on_type_trigger() {
+    // A keystroke and a tab switch can drain in the same input burst, so
+    // the tick can run with a different tab active than the one that
+    // typed. The record on the now-background tab must be swept, or
+    // returning to it minutes later would fire a request for a long-dead
+    // keystroke — its per-tab edit_seq still matches, nothing having been
+    // edited in between.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "fn a() {\n}\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "fn b() {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.last_typed.is_some(), "keystroke recorded on tab A");
+    // Switch to tab B before any tick runs, then tick with B active.
+    app.editor.open_pinned(&tmp.path().join("b.rs")).unwrap();
+    app.tick_on_type_formatting();
+    // Return to tab A: the armed record must be gone.
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    assert!(
+        app.editor.last_typed.is_none(),
+        "the sweep disarms background tabs — returning to one must not \
+         replay the pre-switch keystroke"
+    );
+}
+
+#[test]
+fn a_settings_reload_applies_format_on_type_live() {
+    // The live-reload path (save a config file inside croft →
+    // remerge_settings → apply_merged_settings) must carry the key like
+    // every other allowlisted preference; startup-only application would
+    // leave the Settings row showing a provenance whose value is not in
+    // force until the next launch.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(!app.format_on_type, "off by default");
+    let p = crate::prefs::Prefs {
+        format_on_type: true,
+        ..Default::default()
+    };
+    app.apply_merged_settings(&p);
+    assert!(app.format_on_type, "a reloaded merge turns it on");
+    app.apply_merged_settings(&crate::prefs::Prefs::default());
+    assert!(!app.format_on_type, "and back off");
+}
+
+#[test]
 fn a_custom_matcher_from_matchers_json_feeds_problems() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

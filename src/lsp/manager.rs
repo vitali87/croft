@@ -1988,7 +1988,12 @@ impl WorkerState {
                     .collect();
                 // No entry when nothing advertises the provider — a missing
                 // entry is the documented "no server carries it" answer.
-                if !triggers.is_empty() {
+                // Removed (not skipped) on the empty case so a re-probe of
+                // the same language overwrites last-write-wins, like every
+                // sibling capability map above.
+                if triggers.is_empty() {
+                    support.on_type_triggers.remove(&lang);
+                } else {
                     support.on_type_triggers.insert(lang, triggers);
                 }
                 support.code_action.insert(lang, supports_code_action);
@@ -3520,7 +3525,10 @@ impl WorkerState {
     /// trigger character. Silent on every early-out — this is a
     /// background behavior with no status line waiting on it, and the
     /// app pre-checks the trigger set so an unroutable request means a
-    /// race (doc closed), not a misconfiguration.
+    /// race (doc closed), not a misconfiguration. This deliberately
+    /// diverges from `request_formatting`'s "every bail must still
+    /// answer" invariant: nothing blocks on this reply, so an unanswered
+    /// bail costs nothing.
     #[allow(clippy::too_many_arguments)]
     async fn request_on_type_formatting(
         &mut self,

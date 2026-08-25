@@ -12059,6 +12059,21 @@ mod tests {
             Some(('(', e.edit_seq)),
             "an auto-paired opener is still a keystroke"
         );
+        // Typing the closer over the auto-inserted one moves the caret but
+        // changes no content, so the seq deliberately stays put: `edit_seq`
+        // means "buffer content unchanged", and an in-flight formatting
+        // reply computed against byte-identical text is still safe to apply.
+        let seq_before_typeover = e.edit_seq;
+        e.insert_char(')');
+        assert_eq!(
+            e.last_typed,
+            Some((')', seq_before_typeover)),
+            "a type-over records the keystroke against the unchanged seq"
+        );
+        assert_eq!(
+            e.edit_seq, seq_before_typeover,
+            "caret-only motion must not masquerade as a buffer edit"
+        );
         let before = e.last_typed;
         e.insert_str("let x = 1;");
         assert_eq!(e.last_typed, before, "paste must not count as typing");

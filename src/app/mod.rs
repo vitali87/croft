@@ -8209,7 +8209,22 @@ impl App {
     /// comes from the capability the server declared, and `None` (no server
     /// probed, or no provider) means stay inert.
     pub fn tick_on_type_formatting(&mut self) {
-        let Some((ch, seq)) = self.editor.last_typed.take() else {
+        let taken = self.editor.last_typed.take();
+        // A keystroke and a tab switch can arrive in the same input burst,
+        // draining before this tick runs — the record is then armed on a tab
+        // that is no longer active, and nothing else ever clears it. Sweep
+        // every editor (the active one is already drained by the `take`) so
+        // a trigger can only ever fire from the tab that was active at its
+        // tick.
+        for ed in &mut self.editor.editors {
+            ed.last_typed = None;
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in &mut group.editors {
+                ed.last_typed = None;
+            }
+        }
+        let Some((ch, seq)) = taken else {
             return;
         };
         if !self.format_on_type || !self.editor_is_text() {
@@ -8277,6 +8292,11 @@ impl App {
             // `edit_seq` is per-tab, so the counter comparison only means
             // "buffer unchanged" when the active tab is still the one the
             // request was computed against — require the path to match too.
+            // Content-unchanged is also the whole test on purpose: caret-only
+            // motion (arrow keys, auto-pair type-over) leaves the counter
+            // alone, and that is correct — the server's edits are document
+            // edits computed against text that is still byte-identical, so
+            // they apply cleanly wherever the caret has wandered.
             let stale = self.editor.edit_seq != seq
                 || requested != &result.path
                 || self.editor.path.as_deref() != Some(result.path.as_path());
@@ -31404,6 +31424,7 @@ impl App {
             self.apply_theme_visuals(theme);
         }
         self.format_on_save = p.format_on_save;
+        self.format_on_type = p.format_on_type;
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
