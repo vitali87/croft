@@ -8,6 +8,63 @@ use crate::widgets::search::SearchOpts;
 /// sync with the plain editor's constant of the same purpose.
 const SELECTION_HIGHLIGHT_MAX_LEN: usize = 200;
 
+/// How the diff view treats whitespace-only differences (VS Code's
+/// `diffEditor.ignoreTrimWhitespace`, made explicit with two levels).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiffWhitespace {
+    /// Every byte counts; the diff is exactly what git reports.
+    #[default]
+    Off,
+    /// Ignore indentation: lines that differ only in their leading
+    /// whitespace read as unchanged. The common case — a block wrapped in
+    /// an `if`, or a function extracted and re-indented.
+    Leading,
+    /// Ignore all whitespace: leading, trailing, and internal runs.
+    All,
+}
+
+impl DiffWhitespace {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Leading => "leading",
+            Self::All => "all",
+        }
+    }
+
+    /// Cycle for the header toggle and the palette command.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Leading,
+            Self::Leading => Self::All,
+            Self::All => Self::Off,
+        }
+    }
+
+    pub fn from_config(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "leading" => Self::Leading,
+            "all" => Self::All,
+            _ => Self::Off,
+        }
+    }
+
+    /// The comparison key for one line under this mode. Two lines are
+    /// "the same" to the differ exactly when their keys match.
+    fn key(self, line: &str) -> String {
+        match self {
+            // `Off` never reaches here (no normalised pass is run), but map
+            // it to identity so the function is total.
+            Self::Off => line.to_string(),
+            Self::Leading => line.trim_start().to_string(),
+            // Collapse every whitespace run to a single space and trim the
+            // ends, so `a  +  b` and `a+b` compare equal while `ab` does not
+            // collapse into `a b`.
+            Self::All => line.split_whitespace().collect::<Vec<_>>().join(" "),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffData {
     pub left_path: PathBuf,
@@ -20,7 +77,25 @@ pub struct DiffData {
     pub left_is_real_file: bool,
     pub left_lines: Vec<String>,
     pub right_lines: Vec<String>,
+    /// The REAL diff: rows computed from the untouched line text. This is the
+    /// single source of truth for staging — `hunk_range_at` and `hunk_patch`
+    /// read it and nothing else, so what reaches the index never depends on
+    /// how the view is currently classified. See [`Self::display_rows`].
     pub rows: Vec<DiffRow>,
+    /// How the view classifies whitespace-only differences. Affects rendering
+    /// and hunk *navigation* only; never staging.
+    pub ws_mode: DiffWhitespace,
+    /// Rows recomputed over whitespace-normalised text, present only when
+    /// `ws_mode` is not `Off`. A line that differs from its counterpart only
+    /// under the active normalisation classifies `Equal` here and paints as
+    /// unchanged, while `rows` still records the real change.
+    ///
+    /// Deliberately a SEPARATE field rather than an in-place reclassification:
+    /// `hunk_patch` emits an `Equal` row as a context line taken from the LEFT
+    /// side, so folding a real change into `Equal` in the staging input would
+    /// emit HEAD's bytes as context for a line the working tree spells
+    /// differently — a patch `git apply` rejects or, worse, misapplies.
+    display_rows: Option<Vec<DiffRow>>,
     /// Top-most row index visible in the viewport. Mirrors `Editor.scroll_y`
     /// for non-diff tabs.
     pub scroll: usize,
@@ -213,6 +288,8 @@ impl DiffData {
             left_lines,
             right_lines,
             rows,
+            ws_mode: DiffWhitespace::Off,
+            display_rows: None,
             scroll: 0,
             scroll_x: 0,
             bytes_differ_but_lines_equal,
@@ -244,6 +321,8 @@ impl DiffData {
             left_lines,
             right_lines: Vec::new(),
             rows,
+            ws_mode: DiffWhitespace::Off,
+            display_rows: None,
             scroll: 0,
             scroll_x: 0,
             bytes_differ_but_lines_equal: false,
@@ -294,6 +373,8 @@ impl DiffData {
                 left_lines,
                 right_lines,
                 rows,
+                ws_mode: DiffWhitespace::Off,
+                display_rows: None,
                 scroll: 0,
                 scroll_x: 0,
                 bytes_differ_but_lines_equal: false,
@@ -378,6 +459,8 @@ impl DiffData {
             left_lines,
             right_lines,
             rows,
+            ws_mode: DiffWhitespace::Off,
+            display_rows: None,
             scroll: 0,
             scroll_x: 0,
             bytes_differ_but_lines_equal: false,
@@ -812,7 +895,10 @@ impl DiffData {
     pub fn hunk_starts(&self) -> Vec<usize> {
         let mut out = Vec::new();
         let mut in_hunk = false;
-        for (i, r) in self.rows.iter().enumerate() {
+        // Navigation follows the VIEW: with ignore-whitespace on, `›` should
+        // skip the hunks the user cannot see. Staging is unaffected — it reads
+        // `self.rows` directly.
+        for (i, r) in self.display_rows().iter().enumerate() {
             let is_change = !matches!(r, DiffRow::Equal { .. });
             if is_change && !in_hunk {
                 out.push(i);
@@ -920,6 +1006,57 @@ impl DiffData {
     /// a stale off-screen caret must never pick the hunk `R` destroys.
     pub fn action_row(&self) -> usize {
         self.nav_anchor.unwrap_or(self.scroll)
+    }
+
+    /// The rows the VIEW should paint and navigate: the whitespace-normalised
+    /// classification when the toggle is on, the real diff otherwise. Row
+    /// indices line up with [`Self::rows`] one-to-one — normalisation only
+    /// changes each row's variant, never how many rows there are or which
+    /// line each one points at — so a row index means the same thing to both.
+    pub fn display_rows(&self) -> &[DiffRow] {
+        self.display_rows.as_deref().unwrap_or(&self.rows)
+    }
+
+    /// Switch whitespace mode, recomputing the display classification.
+    /// [`Self::rows`] is never touched, so staging is unaffected.
+    pub fn set_whitespace_mode(&mut self, mode: DiffWhitespace) {
+        self.ws_mode = mode;
+        self.display_rows =
+            Self::normalised_rows(&self.rows, &self.left_lines, &self.right_lines, mode);
+    }
+
+    /// Reclassify each real row under `mode`. A `Replaced` row whose two
+    /// lines share a normalised key becomes `Equal`; everything else is
+    /// carried through untouched, so `Added`/`Removed` rows (a line with no
+    /// counterpart) always keep showing — an added blank line is a real
+    /// change, not a whitespace difference.
+    fn normalised_rows(
+        rows: &[DiffRow],
+        left: &[String],
+        right: &[String],
+        mode: DiffWhitespace,
+    ) -> Option<Vec<DiffRow>> {
+        if mode == DiffWhitespace::Off {
+            return None;
+        }
+        Some(
+            rows.iter()
+                .map(|row| match *row {
+                    DiffRow::Replaced { left: l, right: r } => {
+                        let same = match (left.get(l), right.get(r)) {
+                            (Some(a), Some(b)) => mode.key(a) == mode.key(b),
+                            _ => false,
+                        };
+                        if same {
+                            DiffRow::Equal { left: l, right: r }
+                        } else {
+                            *row
+                        }
+                    }
+                    other => other,
+                })
+                .collect(),
+        )
     }
 
     /// Inclusive row range of the contiguous change hunk containing
@@ -1678,6 +1815,112 @@ mod tests {
             Some(head),
             Some(work),
         )
+    }
+
+    /// #258: the headline case. A block that only changed indentation shows
+    /// zero changed rows with the toggle on, while a real edit inside the
+    /// reindented block still shows.
+    #[test]
+    fn reindented_block_reads_as_unchanged_but_real_edits_still_show() {
+        let head: Vec<String> = (0..20)
+            .map(|i| {
+                if i == 7 {
+                    "let x = 1;".into()
+                } else {
+                    format!("line{i};")
+                }
+            })
+            .collect();
+        // Every line gains one indent level; line 7 also changes for real.
+        let work: Vec<String> = head
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 7 {
+                    "    let x = 2;".to_string()
+                } else {
+                    format!("    {l}")
+                }
+            })
+            .collect();
+        let mut d = DiffData::build(PathBuf::from("HEAD"), PathBuf::from("f.rs"), head, work);
+        let changed = |rows: &[DiffRow]| {
+            rows.iter()
+                .filter(|r| !matches!(r, DiffRow::Equal { .. }))
+                .count()
+        };
+        assert_eq!(changed(&d.rows), 20, "every line differs byte-wise");
+
+        d.set_whitespace_mode(DiffWhitespace::Leading);
+        assert_eq!(
+            changed(d.display_rows()),
+            1,
+            "only the real edit survives ignoring indentation"
+        );
+        assert_eq!(
+            changed(&d.rows),
+            20,
+            "the REAL rows are untouched, so staging still sees every line"
+        );
+    }
+
+    /// Trailing-whitespace-only differences vanish under `All` but not under
+    /// `Leading`, which is the distinction between the two modes.
+    #[test]
+    fn all_mode_ignores_trailing_and_internal_whitespace_leading_does_not() {
+        let head = vec!["let a = 1;".to_string(), "let b  =  2;".to_string()];
+        let work = vec!["let a = 1;   ".to_string(), "let b = 2;".to_string()];
+        let mut d = DiffData::build(PathBuf::from("HEAD"), PathBuf::from("f.rs"), head, work);
+        let changed = |rows: &[DiffRow]| {
+            rows.iter()
+                .filter(|r| !matches!(r, DiffRow::Equal { .. }))
+                .count()
+        };
+        d.set_whitespace_mode(DiffWhitespace::Leading);
+        assert_eq!(
+            changed(d.display_rows()),
+            2,
+            "leading-only normalisation keeps trailing and internal changes"
+        );
+        d.set_whitespace_mode(DiffWhitespace::All);
+        assert_eq!(changed(d.display_rows()), 0, "all whitespace collapses");
+        d.set_whitespace_mode(DiffWhitespace::Off);
+        assert_eq!(
+            changed(d.display_rows()),
+            2,
+            "turning it off restores the real diff"
+        );
+    }
+
+    /// The hard requirement from #258: what reaches the index must not depend
+    /// on the view. A hunk that is part whitespace-only and part real edit
+    /// must stage byte-identically with the toggle on or off, and git must
+    /// accept the patch.
+    #[test]
+    fn staging_is_byte_identical_with_ignore_whitespace_on_or_off() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let head = "fn main() {\nlet a = 1;\nlet b = 2;\nlet c = 3;\n}\n";
+        // Body reindented (whitespace-only) AND `b` genuinely changed.
+        let work = "fn main() {\n    let a = 1;\n    let b = 22;\n    let c = 3;\n}\n";
+        git_repo_with(&root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+
+        let mut d = head_diff(&root, head, work);
+        let range = d.hunk_range_at(0).expect("a change hunk exists");
+        let patch_off = d.hunk_patch("f.txt", range);
+
+        d.set_whitespace_mode(DiffWhitespace::All);
+        let range_on = d.hunk_range_at(0).expect("the REAL hunk is still there");
+        let patch_on = d.hunk_patch("f.txt", range_on);
+
+        assert_eq!(
+            patch_off, patch_on,
+            "the staged patch must not depend on the view's whitespace mode"
+        );
+        if let Err(e) = git_apply_check(&root, &patch_on) {
+            panic!("git apply rejected the patch:\n{patch_on}\n{e}");
+        }
     }
 
     #[test]
