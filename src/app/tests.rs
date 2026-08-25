@@ -29560,3 +29560,186 @@ fn a_task_problem_matcher_owns_its_pane_and_watch_publishes_win() {
         "without the task matcher both formats report"
     );
 }
+
+#[test]
+fn on_type_formatting_stays_inert_when_disabled_or_unadvertised() {
+    // #254 item 4: gated behind editor.format_on_type (default OFF,
+    // matching VS Code), and even when on, nothing fires unless a
+    // server advertised the trigger set for the language.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("lib.rs"), "fn main() {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert!(!app.format_on_type, "off by default");
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    app.tick_on_type_formatting();
+    assert!(app.on_type_request.is_none(), "disabled: nothing fires");
+    assert!(
+        app.editor.last_typed.is_none(),
+        "the tick consumes the record even while disabled, so enabling \
+         the setting later cannot replay a stale trigger"
+    );
+    // Enable via the settings toggle; still inert because no server has
+    // advertised any trigger characters for Rust in this test.
+    app.toggle_format_on_type();
+    assert!(app.format_on_type);
+    assert_eq!(app.status, "Format on Type: on");
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    app.tick_on_type_formatting();
+    assert!(
+        app.on_type_request.is_none(),
+        "no advertised trigger set: the request is never sent"
+    );
+    assert!(
+        app.editor.last_typed.is_none(),
+        "each keystroke is examined exactly once"
+    );
+}
+
+#[test]
+fn a_tab_switch_disarms_the_background_tabs_on_type_trigger() {
+    // A keystroke and a tab switch can drain in the same input burst, so
+    // the tick can run with a different tab active than the one that
+    // typed. The record on the now-background tab must be swept, or
+    // returning to it minutes later would fire a request for a long-dead
+    // keystroke — its per-tab edit_seq still matches, nothing having been
+    // edited in between.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "fn a() {\n}\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "fn b() {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.last_typed.is_some(),
+        "keystroke recorded on tab A"
+    );
+    // Switch to tab B before any tick runs, then tick with B active.
+    app.editor.open_pinned(&tmp.path().join("b.rs")).unwrap();
+    app.tick_on_type_formatting();
+    // Return to tab A: the armed record must be gone.
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    assert!(
+        app.editor.last_typed.is_none(),
+        "the sweep disarms background tabs — returning to one must not \
+         replay the pre-switch keystroke"
+    );
+
+    // Same hazard one level out: the typing tab is in a split group that
+    // loses focus before the tick runs.
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.last_typed.is_some(), "keystroke recorded again");
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    assert_eq!(app.editor_layout.leaf_count(), 2, "really split");
+    app.tick_on_type_formatting();
+    let armed = app
+        .editor_layout
+        .inactive_groups_mut()
+        .iter()
+        .any(|g| g.editors.iter().any(|e| e.last_typed.is_some()));
+    assert!(
+        !armed,
+        "the sweep reaches editors in inactive split groups too"
+    );
+}
+
+#[test]
+fn a_settings_reload_applies_format_on_type_live() {
+    // The live-reload path (save a config file inside croft →
+    // remerge_settings → apply_merged_settings) must carry the key like
+    // every other allowlisted preference; startup-only application would
+    // leave the Settings row showing a provenance whose value is not in
+    // force until the next launch.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(!app.format_on_type, "off by default");
+    let p = crate::prefs::Prefs {
+        format_on_type: true,
+        ..Default::default()
+    };
+    app.apply_merged_settings(&p);
+    assert!(app.format_on_type, "a reloaded merge turns it on");
+    app.apply_merged_settings(&crate::prefs::Prefs::default());
+    assert!(!app.format_on_type, "and back off");
+}
+
+#[test]
+fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
+    // The four dispositions of a reply. The channel's sender lives in the
+    // LSP worker, so the decision is tested through the pure helper the
+    // drain loop delegates to.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn a() {\n}\n").unwrap();
+    std::fs::write(&b, "fn b() {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    let reply = |id: u64, path: &std::path::Path| crate::lsp::manager::FormatResult {
+        request_id: id,
+        path: path.to_path_buf(),
+        edits: Some(Vec::new()),
+        unsupported: false,
+    };
+
+    // Nothing armed: any reply is a leftover.
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(1, &a)),
+        OnTypeReply::NotOurs
+    );
+
+    // Armed and everything matches.
+    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &a)),
+        OnTypeReply::Apply
+    );
+
+    // A superseded id must NOT disarm the newer in-flight request.
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(6, &a)),
+        OnTypeReply::NotOurs,
+        "an older reply is ignored without consuming the armed request"
+    );
+    assert!(
+        app.on_type_request.is_some(),
+        "the helper never clears; the newer request stays armed"
+    );
+
+    // Buffer moved since the request.
+    app.on_type_request = Some((7, app.editor.edit_seq.wrapping_sub(1), a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &a)),
+        OnTypeReply::Stale,
+        "edits computed against text that has since changed are dropped"
+    );
+
+    // Reply is for a different file than the one requested.
+    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &b)),
+        OnTypeReply::Stale,
+        "a reply for another path never applies to this tab"
+    );
+
+    // The requested tab is no longer active: edit_seq is per-tab, so the
+    // counter alone would compare two unrelated buffers.
+    app.editor.open_pinned(&b).unwrap();
+    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &a)),
+        OnTypeReply::Stale,
+        "the tab that typed must still be the active one"
+    );
+}

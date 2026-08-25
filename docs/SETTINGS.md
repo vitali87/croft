@@ -81,7 +81,7 @@ Workspace files (4–6 above) are repo-controlled input: cloning a repo must
 never change what croft trusts or executes. They are limited to an explicit
 allowlist — appearance and editor/terminal behavior:
 
-`theme`, `format_on_save`, `auto_save`, `auto_save_on_focus_change`,
+`theme`, `format_on_save`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
 `render_whitespace`, `disable_inline_blame`, `disable_auto_close_pairs`,
 `disable_inline_values`, `disable_bracket_colors`, `disable_indent_guides`,
 `disable_inlay_hints`, `copy_on_select`, `explorer_views`.
@@ -99,6 +99,7 @@ VS Code settings compatibility is a non-goal):
 | VS Code | croft |
 |---------|-------|
 | `editor.formatOnSave` | `format_on_save` |
+| `editor.formatOnType` | `format_on_type` |
 | `files.autoSave: "afterDelay"` | `auto_save: true` |
 | `files.autoSave: "onFocusChange"` | `auto_save_on_focus_change: true` |
 | `files.autoSave: "off"` | both auto-save modes off |

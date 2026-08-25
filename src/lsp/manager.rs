@@ -718,6 +718,15 @@ enum Cmd {
         tab_size: u32,
         insert_spaces: bool,
     },
+    RequestOnTypeFormatting {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        ch: char,
+        tab_size: u32,
+        insert_spaces: bool,
+    },
     RequestRangeFormatting {
         request_id: u64,
         path: PathBuf,
@@ -764,6 +773,9 @@ struct LangCapabilitySupport {
     formatting: HashMap<Language, bool>,
     code_action: HashMap<Language, bool>,
     call_hierarchy: HashMap<Language, bool>,
+    /// Concatenated on-type trigger characters per language (#254);
+    /// a missing entry means "not probed yet".
+    on_type_triggers: HashMap<Language, String>,
 }
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
@@ -792,6 +804,7 @@ pub struct LspManager {
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
     format_rx: std_mpsc::Receiver<FormatResult>,
+    on_type_rx: std_mpsc::Receiver<FormatResult>,
     code_action_rx: std_mpsc::Receiver<CodeActionResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     inlay_rx: std_mpsc::Receiver<InlayHintsUpdate>,
@@ -844,6 +857,7 @@ impl LspManager {
         let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
         let (format_tx, format_rx) = std_mpsc::channel();
+        let (on_type_tx, on_type_rx) = std_mpsc::channel();
         let (code_action_tx, code_action_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let (inlay_tx, inlay_rx) = std_mpsc::channel();
@@ -894,6 +908,7 @@ impl LspManager {
                 workspace_symbols: ws_symbols_tx,
                 rename: rename_tx,
                 formatting: format_tx,
+                on_type_formatting: on_type_tx,
                 code_action: code_action_tx,
                 semantic_tokens: semantic_tx,
                 inlay_hints: inlay_tx,
@@ -926,6 +941,7 @@ impl LspManager {
             ws_symbols_rx,
             rename_rx,
             format_rx,
+            on_type_rx,
             code_action_rx,
             semantic_rx,
             inlay_rx,
@@ -1464,6 +1480,50 @@ impl LspManager {
         id
     }
 
+    /// Fire `textDocument/onTypeFormatting` for the just-typed trigger
+    /// character (#254). Silent for a language without the provider —
+    /// on-type formatting is a background behavior, not a command.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_on_type_formatting(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        ch: char,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestOnTypeFormatting {
+            request_id: id,
+            path,
+            line,
+            character,
+            ch,
+            tab_size,
+            insert_spaces,
+        });
+        id
+    }
+
+    pub fn drain_on_type_formatting(&self) -> Option<FormatResult> {
+        self.on_type_rx.try_recv().ok()
+    }
+
+    /// The on-type trigger characters some spawned server advertises for
+    /// `lang` — `None` until a server for the language has been probed,
+    /// or when none carries the provider. The app consults this before
+    /// firing, so nothing is ever sent unadvertised.
+    pub fn language_on_type_triggers(&self, lang: crate::lsp::Language) -> Option<String> {
+        self.capability_support
+            .lock()
+            .ok()?
+            .on_type_triggers
+            .get(&lang)
+            .cloned()
+    }
+
     /// Format only a UTF-16 span ("Format Selection", #254). Same reply
     /// channel and unsupported contract as whole-document formatting;
     /// the app tells the two apart by the returned id.
@@ -1601,6 +1661,9 @@ struct ManagedClient {
     supports_workspace_symbols: bool,
     supports_rename: bool,
     supports_formatting: bool,
+    /// The server's on-type formatting trigger characters, when it
+    /// advertises the provider (#254).
+    on_type_triggers: Option<String>,
     supports_range_formatting: bool,
     supports_code_action: bool,
     /// The server's semantic-token legend (token-type names by index),
@@ -1679,6 +1742,7 @@ struct ResultSenders {
     workspace_symbols: std_mpsc::Sender<WorkspaceSymbolsResult>,
     rename: std_mpsc::Sender<RenameResult>,
     formatting: std_mpsc::Sender<FormatResult>,
+    on_type_formatting: std_mpsc::Sender<FormatResult>,
     code_action: std_mpsc::Sender<CodeActionResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
     inlay_hints: std_mpsc::Sender<InlayHintsUpdate>,
@@ -1997,6 +2061,28 @@ async fn worker_loop(
                     .request_formatting(request_id, path, tab_size, insert_spaces, &tx.formatting)
                     .await
             }
+            Cmd::RequestOnTypeFormatting {
+                request_id,
+                path,
+                line,
+                character,
+                ch,
+                tab_size,
+                insert_spaces,
+            } => {
+                state
+                    .request_on_type_formatting(
+                        request_id,
+                        path,
+                        line,
+                        character,
+                        ch,
+                        tab_size,
+                        insert_spaces,
+                        &tx.on_type_formatting,
+                    )
+                    .await
+            }
             Cmd::RequestRangeFormatting {
                 request_id,
                 path,
@@ -2166,6 +2252,14 @@ impl WorkerState {
                         let supports_rename = one_of_supported(&caps.rename_provider);
                         let supports_formatting =
                             one_of_supported(&caps.document_formatting_provider);
+                        let on_type_triggers =
+                            caps.document_on_type_formatting_provider.as_ref().map(|o| {
+                                let mut t = o.first_trigger_character.clone();
+                                for more in o.more_trigger_character.iter().flatten() {
+                                    t.push_str(more);
+                                }
+                                t
+                            });
                         let supports_range_formatting =
                             one_of_supported(&caps.document_range_formatting_provider);
                         let supports_code_action =
@@ -2201,6 +2295,7 @@ impl WorkerState {
                             supports_workspace_symbols,
                             supports_rename,
                             supports_formatting,
+                            on_type_triggers,
                             supports_range_formatting,
                             supports_code_action,
                             semantic_legend,
@@ -2234,6 +2329,20 @@ impl WorkerState {
                 support.implementation.insert(lang, supports_implementation);
                 support.references.insert(lang, supports_references);
                 support.formatting.insert(lang, supports_formatting);
+                let triggers: String = spawned
+                    .iter()
+                    .filter_map(|c| c.on_type_triggers.as_deref())
+                    .collect();
+                // No entry when nothing advertises the provider — a missing
+                // entry is the documented "no server carries it" answer.
+                // Removed (not skipped) on the empty case so a re-probe of
+                // the same language overwrites last-write-wins, like every
+                // sibling capability map above.
+                if triggers.is_empty() {
+                    support.on_type_triggers.remove(&lang);
+                } else {
+                    support.on_type_triggers.insert(lang, triggers);
+                }
                 support.code_action.insert(lang, supports_code_action);
                 support.call_hierarchy.insert(lang, supports_call_hierarchy);
             }
@@ -4059,6 +4168,77 @@ impl WorkerState {
                 "formatting response id={request_id} server={server_name} edits={}",
                 edits.as_ref().map(Vec::len).unwrap_or(0)
             ));
+            let _ = tx.send(FormatResult {
+                request_id,
+                path: path_clone,
+                edits,
+                unsupported: false,
+            });
+        });
+    }
+
+    /// On-type formatting (#254): the server's reaction to one just-typed
+    /// trigger character. Silent on every early-out — this is a
+    /// background behavior with no status line waiting on it, and the
+    /// app pre-checks the trigger set so an unroutable request means a
+    /// race (doc closed), not a misconfiguration. This deliberately
+    /// diverges from `request_formatting`'s "every bail must still
+    /// answer" invariant: nothing blocks on this reply, so an unanswered
+    /// bail costs nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_on_type_formatting(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        ch: char,
+        tab_size: u32,
+        insert_spaces: bool,
+        tx: &std_mpsc::Sender<FormatResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.on_type_triggers.as_ref().is_some_and(|t| t.contains(ch)))
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client
+                .on_type_formatting(
+                    uri,
+                    line,
+                    character,
+                    ch.to_string(),
+                    tab_size,
+                    insert_spaces,
+                )
+                .await;
+            drop(client);
+            let edits = match resp {
+                Ok(Some(tes)) => Some(tes.iter().map(text_edit_to_span).collect()),
+                Ok(None) => None,
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] onTypeFormatting error: {e}"));
+                    None
+                }
+            };
             let _ = tx.send(FormatResult {
                 request_id,
                 path: path_clone,

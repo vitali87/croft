@@ -1026,6 +1026,35 @@ impl LspClient {
             .context("range_formatting")
     }
 
+    /// `textDocument/onTypeFormatting`: the server's formatting reaction
+    /// to one just-typed trigger character (#254).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn on_type_formatting(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+        ch: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.server
+            .on_type_formatting(lsp_types::DocumentOnTypeFormattingParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                ch,
+                options: FormattingOptions {
+                    tab_size,
+                    insert_spaces,
+                    ..FormattingOptions::default()
+                },
+            })
+            .await
+            .context("on_type_formatting")
+    }
+
     pub async fn semantic_tokens_full(&mut self, uri: Url) -> Result<Option<SemanticTokensResult>> {
         self.server
             .semantic_tokens_full(SemanticTokensParams {

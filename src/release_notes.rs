@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Editor deep links open in croft: Ctrl+click a vscode://file/<path>:line:col style hyperlink in the terminal (VS Code, Cursor, Windsurf, or Zed scheme) and the file opens right here instead of launching the other editor.",
+    summary: "Format on type: when a language server advertises trigger characters, typing one quietly reformats at the caret. Off by default like VS Code — toggle it in Settings, the Command Palette, or a workspace's editor.formatOnType.",
 }];
