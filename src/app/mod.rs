@@ -27896,6 +27896,16 @@ impl App {
         if let Some(path) = path {
             let add = self.zoxide_add_folder;
             self.close_zoxide_jump();
+            // A zoxide row is a bare line from its database, so it can name a
+            // directory in a spelling nothing else in croft uses (a symlinked
+            // `/var/…` for `/private/var/…`). Normalise it here, where the
+            // untrusted path enters, so both branches agree: the folder store
+            // keys on `roots.primary().display()`, and two spellings of one
+            // directory would file and restore under different keys.
+            // `add_workspace_folder` canonicalises internally; the re-root
+            // path must not, since its callers rely on the root being exactly
+            // what they passed.
+            let path = path.canonicalize().unwrap_or(path);
             if add {
                 self.add_workspace_folder(path);
             } else {
