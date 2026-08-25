@@ -88,10 +88,14 @@ impl<'de> serde::Deserialize<'de> for Step {
                     .get("code")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| D::Error::missing_field("code"))?;
-                let mods = obj
-                    .get("mods")
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or_else(|| D::Error::missing_field("mods"))?;
+                let mods = match obj.get("mods") {
+                    None => return Err(D::Error::missing_field("mods")),
+                    // Reported apart from "missing" so a negative or huge
+                    // value says what is actually wrong with it.
+                    Some(v) => v
+                        .as_u64()
+                        .ok_or_else(|| D::Error::custom("mods must be a non-negative integer"))?,
+                };
                 Ok(Step::Key {
                     code: code.to_string(),
                     mods: u8::try_from(mods).map_err(|_| D::Error::custom("mods out of range"))?,
@@ -108,22 +112,29 @@ impl serde::Serialize for Step {
     where
         S: serde::Serializer,
     {
+        use serde::ser::SerializeStruct as _;
         match self {
             // An unknown step writes back exactly the fields it arrived with,
             // so a save from this build does not damage a newer one's macro.
             Step::Unknown(obj) => obj.serialize(s),
+            // Emitted through `serialize_struct` rather than a
+            // `serde_json::Map`, which is a BTreeMap here and would sort the
+            // keys — `code` ahead of `kind`. That still LOADS fine, but it
+            // rewrites every line of every existing macros.json on first
+            // save, so the on-disk shape stays exactly what the old derive
+            // wrote. `a_known_step_keeps_the_on_disk_shape` pins it.
             Step::Text { text } => {
-                let mut m = serde_json::Map::new();
-                m.insert("kind".into(), "Text".into());
-                m.insert("text".into(), text.clone().into());
-                m.serialize(s)
+                let mut st = s.serialize_struct("Step", 2)?;
+                st.serialize_field("kind", "Text")?;
+                st.serialize_field("text", text)?;
+                st.end()
             }
             Step::Key { code, mods } => {
-                let mut m = serde_json::Map::new();
-                m.insert("kind".into(), "Key".into());
-                m.insert("code".into(), code.clone().into());
-                m.insert("mods".into(), (*mods).into());
-                m.serialize(s)
+                let mut st = s.serialize_struct("Step", 3)?;
+                st.serialize_field("kind", "Key")?;
+                st.serialize_field("code", code)?;
+                st.serialize_field("mods", mods)?;
+                st.end()
             }
         }
     }
@@ -423,6 +434,33 @@ mod tests {
         // An empty macro prunes its key rather than persisting a no-op.
         save_register(&path, "a", Macro::default()).unwrap();
         assert!(!load(&path).contains_key("a"), "the register was removed");
+    }
+
+    #[test]
+    fn a_known_step_keeps_the_on_disk_shape() {
+        // The hand-written serialiser must emit exactly what the old derive
+        // did. A `serde_json::Map` is a BTreeMap here and would sort `code`
+        // ahead of `kind` — harmless to load, but it rewrites every line of
+        // every existing macros.json on first save.
+        let key = Step::Key {
+            code: "char:z".into(),
+            mods: 0,
+        };
+        assert_eq!(
+            serde_json::to_string(&key).unwrap(),
+            r#"{"kind":"Key","code":"char:z","mods":0}"#,
+            "field order matches what shipped before"
+        );
+        let text = Step::Text { text: "hi".into() };
+        assert_eq!(
+            serde_json::to_string(&text).unwrap(),
+            r#"{"kind":"Text","text":"hi"}"#
+        );
+        // And both still round-trip.
+        for step in [key, text] {
+            let raw = serde_json::to_string(&step).unwrap();
+            assert_eq!(serde_json::from_str::<Step>(&raw).unwrap(), step);
+        }
     }
 
     #[test]

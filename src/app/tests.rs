@@ -16916,6 +16916,28 @@ fn a_replay_aborts_visibly_and_keeps_earlier_iterations() {
 }
 
 #[test]
+fn a_count_before_a_closing_q_is_discarded_too() {
+    // The stop gesture takes the `'q'` arm rather than the register branch,
+    // so it needs its own take_count(): `3q` while recording must stop and
+    // discard the 3, not leave it to retarget the next motion.
+    let (mut app, tmp) = vim_app("aaaa\nbbbb\ncccc\ndddd\neeee\n");
+    app.macros_path = tmp.path().join("macros.json");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    vim_feed_str(&mut app, "qa");
+    vim_feed_str(&mut app, "3q");
+    assert!(
+        app.macro_recording.is_none(),
+        "3q still stops the recording"
+    );
+    vim_feed(&mut app, 'j');
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "the discarded 3 must not make the next j move three rows"
+    );
+}
+
+#[test]
 fn a_count_before_q_does_not_leak_into_the_recording() {
     // Vim discards a count on `q`. Keeping it would silently retarget the
     // recording's FIRST key — `3qa` then `j` moves three rows instead of one,

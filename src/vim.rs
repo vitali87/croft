@@ -624,12 +624,13 @@ impl VimState {
             // what gets captured. A user cannot see a pending count, so the
             // corruption is invisible until replay.
             let _ = self.take_count();
+            // Alphanumeric, not just a-z: `A-Z` and `0-9` are ordinary
+            // registers here. Vim reserves 0-9 as read-only yank registers
+            // and treats `qA` as append-to-`a`; croft's namespace is flat,
+            // so each names its own register.
             if c.is_ascii_alphanumeric() {
                 return VimKeyResult::Consumed(vec![VimAction::MacroRecord(Some(c))]);
             }
-            // Digits are accepted as register names too (`q1`). Vim reserves
-            // 0-9 as read-only yank registers; croft's namespace is flat, so
-            // they are ordinary registers here.
             // Not a register name: swallow, like every other bad gesture.
             return VimKeyResult::Consumed(vec![]);
         }

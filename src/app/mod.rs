@@ -15880,8 +15880,20 @@ impl App {
         // the terminal would otherwise be recorded while everything after it
         // is dropped, producing a macro that replays a focus change and then
         // silently loses its payload.
-        if capture && self.macro_recording.is_some() && self.focus == Pane::Editor {
-            self.record_macro_key(key);
+        if capture && self.macro_recording.is_some() {
+            if self.focus == Pane::Editor {
+                self.record_macro_key(key);
+            } else {
+                // The issue asks for skipped keys to be logged rather than
+                // vanishing: a macro that quietly stopped recording halfway
+                // is otherwise indistinguishable from one that recorded
+                // everything.
+                crate::output::push(
+                    "Macros",
+                    crate::output::OutputLevel::Info,
+                    &format!("skipped {key:?}: recording captures the editor pane only"),
+                );
+            }
         }
         result
     }
