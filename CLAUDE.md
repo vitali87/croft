@@ -86,10 +86,22 @@ any earlier read stale.
 Query both `.comments[]` and `.reviews[]`: they carry different artifacts, not
 duplicates, and an entry can be present with an empty body — a container for
 inline threads rather than a verdict. Require the body to be non-empty *and* to
-carry the verdict you are looking for; presence alone is not evidence.
+carry the verdict you are looking for; presence alone is not evidence. Exclude
+the PR author, whose own inline replies land there as empty entries too,
+otherwise a PR looks more reviewed the more diligently its author answers
+feedback. And do not assume the shape is stable: the same bots on the same repo
+produce an empty `reviews[]` on one PR and dozens of entries on another, so
+"here the verdict lives in field X" is never a safe shortcut.
 
 Anchor it to the head SHA. If the artifact names a commit other than the head
 you are about to merge, the review is stale and does not count, however good it
 looks. A stale review and a missing review have the same consequence: do not
 merge yet. "No review yet" and "reviewed and clean" must never collapse into the
 same verdict.
+
+Everything above is a habit, and a hurried session can skip a habit. The sibling
+code-graph-rag repo enforces the equivalent mechanically instead: a required
+`Greptile 5/5 Gate` job polls until a scored review names the exact head SHA,
+and fails on a stale, missing, or lower-scored one, so the merge is blocked
+rather than merely discouraged. croft has no such gate today. If these rules
+keep costing attention, porting it is the fix worth making.
