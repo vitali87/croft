@@ -17,10 +17,11 @@ preview*.svg
 
 /target
 
-# Per-machine cargo parallelism cap; local-only, never committed. Capping
-# jobs/test threads (half the cores is a reasonable default) keeps a run from
-# pinning a shared machine, but the right number is per-machine, so it stays
-# ignored rather than committed.
+# Per-machine cargo build-jobs cap; local-only, never committed. Capping jobs
+# (half the cores is a reasonable default) keeps a build from pinning a shared
+# machine, but the right number is per-machine, so it stays ignored rather than
+# committed. Test threads are separate: RUST_TEST_THREADS for `cargo test`,
+# /.config/nextest.toml for nextest. See CONTRIBUTING.md.
 /.cargo/config.toml
 
 # Per-machine nextest thread cap; same rule as /.cargo/config.toml above

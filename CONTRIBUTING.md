@@ -141,6 +141,29 @@ name ends in `.noindex`, which Spotlight ignores. See
 one line setup. With it applied your build directory is `target.noindex/` rather
 than `target/`.
 
+## Running the suite: cap your thread count
+
+The suite spawns PTYs and real shells, so a slice of it is timing-sensitive and
+starves under contention. Run it flat out on a many-core machine and you get
+failures that have nothing to do with your change — terminal, clipboard and
+pairing tests that pass fine on an idle box. CI pins `RUST_TEST_THREADS: 4` for
+exactly this reason.
+
+Half your cores is a reasonable default:
+
+```bash
+RUST_TEST_THREADS=$(( ($(getconf _NPROCESSORS_ONLN) + 1) / 2 )) cargo test
+```
+
+To make it permanent, the right number is per-machine, so both files are
+gitignored rather than committed: `/.cargo/config.toml` caps build jobs
+(`[build] jobs = N`), and `/.config/nextest.toml` caps nextest's threads —
+nextest reads them from there, not from `RUST_TEST_THREADS`.
+
+Before you blame your change for a terminal or clipboard failure, re-run it
+against an untouched `origin/main` checkout. These flake under load, and
+baselining is faster than bisecting.
+
 ## Bumping the Rust toolchain
 
 `rust-toolchain.toml` is the single source of truth for the channel, and
