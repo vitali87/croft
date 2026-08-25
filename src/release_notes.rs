@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Save Workspace As writes portable files again: a folder reached through a symlink (macOS hands croft /var for /private/var, and any symlinked home does the same) was written as an absolute path instead of a relative one, so the workspace file broke as soon as it moved.",
+    summary: "Save Workspace As writes portable files again: a folder reached through a symlink (macOS hands croft /var for /private/var, and any symlinked home does the same) was written as an absolute path instead of a relative one, so the file stopped travelling — it kept working where it was written but not on another machine, another checkout, or a different layout.",
 }];

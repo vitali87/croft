@@ -533,6 +533,42 @@ mod tests {
         );
     }
 
+    /// The written entry must RESOLVE to the right directory, not merely
+    /// look relative — including when the walk climbs out through a symlink
+    /// with `..`, where a lexical reading and the filesystem's disagree.
+    /// `parse_workspace_file` joins onto the file's own directory and then
+    /// canonicalises, so the OS resolves `..` after traversing the link,
+    /// which is what makes the round trip safe.
+    #[test]
+    fn a_relative_entry_resolves_through_a_symlinked_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let deep = root.join("deep");
+        std::fs::create_dir_all(deep.join("real")).unwrap();
+        // `shallow` reaches `deep/real` from a different depth.
+        let shallow = root.join("shallow");
+        std::os::unix::fs::symlink(deep.join("real"), &shallow).unwrap();
+        // Two same-named directories: the true target beside the link's
+        // resolved location, and a decoy beside the link itself. A lexical
+        // `..` would land on the decoy.
+        std::fs::create_dir(deep.join("sibling")).unwrap();
+        std::fs::write(deep.join("sibling").join("REAL"), "x").unwrap();
+        std::fs::create_dir(root.join("sibling")).unwrap();
+        std::fs::write(root.join("sibling").join("DECOY"), "x").unwrap();
+
+        let file = shallow.join("w.code-workspace");
+        write_workspace_file(&file, &[shallow.join("..").join("sibling")]).unwrap();
+        let parsed = parse_workspace_file(&file).unwrap();
+        assert!(
+            parsed[0].join("REAL").exists(),
+            "the entry resolves to the directory beside the link's TARGET: {parsed:?}"
+        );
+        assert!(
+            !parsed[0].join("DECOY").exists(),
+            "not the same-named one beside the link itself: {parsed:?}"
+        );
+    }
+
     /// A folder reached through a symlink must still relativise. macOS
     /// hands croft `/var/...` for a `/private/var/...` directory (and any
     /// symlinked home does the same), so canonicalising only the base left
