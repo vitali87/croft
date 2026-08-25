@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Colour logs render in the editor: open a docker, pytest or cargo log and the ANSI colours paint through your theme's palette instead of showing raw escape codes — and because the view is windowed, a log far past the usual size limit opens instantly.",
+    kind: NoteKind::Fix,
+    summary: "Your terminals come back after an update: a self-update used to relaunch with every terminal pane gone, and now reopens the same panes in the same directories (the shells themselves are new — a relaunch cannot adopt the old processes).",
 }];

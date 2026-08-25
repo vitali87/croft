@@ -22222,6 +22222,17 @@ impl App {
                 unsaved_text,
             });
         }
+        // Terminals (#249): the shell processes cannot survive an execve, so
+        // capture where each pane STOOD. Prefer the shell-integration cwd and
+        // fall back to the kernel's, which needs no integration; a remote
+        // pane answers neither and reopens at the workspace root.
+        let terminals: Vec<crate::session_state::TerminalPaneState> = self
+            .terminals
+            .iter()
+            .map(|t| crate::session_state::TerminalPaneState {
+                cwd: t.shell_cwd().or_else(|| t.kernel_shell_cwd()),
+            })
+            .collect();
         crate::session_state::SessionState {
             workspace_root: self.workspace_root().to_path_buf(),
             tabs,
@@ -22229,6 +22240,8 @@ impl App {
             sidebar_view: sidebar_view_label(self.sidebar_view).to_string(),
             sidebar_width: self.sidebar_width,
             terminal_height: self.terminal_height,
+            terminals,
+            active_terminal: self.active_terminal,
             focus_editor: self.focus == Pane::Editor,
         }
     }
@@ -22273,11 +22286,57 @@ impl App {
         }
         self.sidebar_width = state.sidebar_width;
         self.terminal_height = state.terminal_height;
+        self.restore_terminal_panes(state);
         self.focus = if state.focus_editor {
             Pane::Editor
         } else {
             Pane::Tree
         };
+    }
+
+    /// Reopen the terminal panes a re-exec left behind (#249), each in the
+    /// directory its shell stood in.
+    ///
+    /// The processes themselves cannot come back: `execve` replaces croft's
+    /// image and the child shells are orphaned, so "replicate the old
+    /// environment exactly" is not achievable through this path. What IS
+    /// achievable — and what makes the difference between "my terminals came
+    /// back" and "my terminals are gone" — is the same NUMBER of panes, in
+    /// the same order, each sitting where it was.
+    ///
+    /// A pane whose directory no longer exists (a deleted worktree, an
+    /// unmounted volume) falls back to the workspace root rather than failing
+    /// the restore: losing the directory is not a reason to lose the pane.
+    fn restore_terminal_panes(&mut self, state: &crate::session_state::SessionState) {
+        // The first pane already exists from startup; steer it rather than
+        // adding a duplicate.
+        let Some(first) = state.terminals.first() else {
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let dir_for = |c: &Option<PathBuf>| -> PathBuf {
+            c.as_ref()
+                .filter(|p| p.is_dir())
+                .cloned()
+                .unwrap_or_else(|| root.clone())
+        };
+        if let Ok(t) = PtyTerminal::new(&dir_for(&first.cwd)) {
+            if self.terminals.is_empty() {
+                self.terminals.push(t);
+            } else {
+                self.terminals[0] = t;
+            }
+        }
+        for pane in state.terminals.iter().skip(1) {
+            match PtyTerminal::new(&dir_for(&pane.cwd)) {
+                Ok(t) => self.terminals.push(t),
+                // One pane failing to spawn must not abandon the rest.
+                Err(_) => continue,
+            }
+        }
+        self.active_terminal = state
+            .active_terminal
+            .min(self.terminals.len().saturating_sub(1));
     }
 
     fn tear_down_connect_auth(&mut self) {
