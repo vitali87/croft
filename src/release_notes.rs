@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Your terminals come back after an update: a self-update used to relaunch with every terminal pane gone, and now reopens the same panes in the same directories (the shells themselves are new — a relaunch cannot adopt the old processes).",
+    summary: "Your terminals come back with their output after an update: a self-update used to reopen the panes blank, and a multi-pane panel now replays each pane's recent scrollback above a fresh prompt (the shells themselves are new — a relaunch cannot adopt the old processes).",
 }];
