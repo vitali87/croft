@@ -13,8 +13,8 @@ PR means duplicated review rounds, conflicting pushes, and — in the worst case
 — one session force-pushing over another's work.
 
 **Before starting on a PR or an issue, check for the `claimed` label. If it is
-there, someone is already on it: leave it alone.** Ask the user before taking
-over anything that carries it.
+there, someone is already on it: leave it alone.** If you think you need it
+anyway, ask the holder first and the user if you cannot reach them.
 
 **When you start work, add the label. When you stop, remove it.**
 
@@ -37,6 +37,11 @@ The label is a lock, and a lock nobody releases is worse than no lock. Remove it
 when you merge, when you stop working, and when you hand off. Merging usually
 deletes the branch but **not** the label, so drop it as part of the merge.
 
+The two failure modes are not symmetric, which is why releasing belongs in the
+merge rather than in a follow-up step: forgetting to *claim* costs you one
+possible collision, while forgetting to *release* blocks the work indefinitely,
+and nothing about an abandoned claim distinguishes it from an active one.
+
 It deliberately records no owner, so it cannot tell you *who* holds a claim or
 *when* they took it. That keeps it cheap, at the cost of being unable to
 distinguish an active claim from an abandoned one. If a claim looks stale, do
@@ -57,6 +62,14 @@ Two habits that avoid the common collisions:
   the pre-merge review sweep have been broken by state moving during the window
   between deciding and merging. Re-read rather than reusing a value you fetched
   minutes ago.
+
+  For the version specifically, note that the release gate **cannot** catch a
+  collision itself — it is answering a different question. It compares your head
+  against the merge base, so it passes as long as your branch is above main *at
+  that point*, which means two branches can both pass legitimately and only the
+  second one to merge conflicts. Running the gate later would not help. Re-read
+  `git show origin/main:Cargo.toml` in the same breath as the final
+  `gh pr checks`, and bump again if main has moved.
 * **Never rewrite a branch you do not hold.** No force-pushes to another
   session's PR. If a branch needs main, merge main into it — that is the
   convention here, and it keeps the push a fast-forward.
