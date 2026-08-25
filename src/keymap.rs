@@ -359,10 +359,14 @@ impl Gesture {
     /// Parse `"ctrl+click"`, `"middle_click"`, `"alt+wheel_up"`. Returns the
     /// gesture and, when the spelling parses but cannot ever match, a warning
     /// for the OUTPUT channel.
-    pub fn parse(s: &str) -> Option<(Gesture, Option<String>)> {
+    /// `None` — not a gesture spelling; the caller should try it as a key
+    /// chord. `Some((None, Some(reason)))` — a gesture croft understands but
+    /// refuses to bind, with the reason. `Some((Some(g), warn))` — bind it.
+    pub fn parse(s: &str) -> Option<(Option<Gesture>, Option<String>)> {
         let mut mods = KeyModifiers::NONE;
         let mut kind: Option<GestureKind> = None;
         let mut warn = None;
+        let mut refused = false;
         for part in s.split('+') {
             let p = part.trim().to_ascii_lowercase();
             match p.as_str() {
@@ -370,7 +374,11 @@ impl Gesture {
                 "alt" | "opt" | "option" => mods |= KeyModifiers::ALT,
                 "shift" => mods |= KeyModifiers::SHIFT,
                 "cmd" | "command" | "super" | "meta" | "win" => {
-                    mods |= KeyModifiers::SUPER;
+                    // Warned AND refused: `gesture_for` masks Super off, so a
+                    // bound entry could never be looked up, yet it would make
+                    // `has_mouse_bindings()` true and let `cmd+click` dodge
+                    // the reserved bare-click check by being a different key.
+                    refused = true;
                     warn = Some(format!(
                         "{s}: terminals do not report Cmd/Super for mouse events, so this \
                          binding can never fire - use ctrl or alt instead"
@@ -384,12 +392,24 @@ impl Gesture {
                     let k = match other {
                         "click" => GestureKind::Click,
                         "double_click" => GestureKind::DoubleClick,
-                        // Rejected on purpose: croft's click tracker
-                        // distinguishes single from double only, so a
-                        // triple_click binding would fire on the second
-                        // click. Better a load error than a gesture that
-                        // silently means something else.
-                        "triple_click" => return None,
+                        // Rejected on purpose, but with its own reason: a
+                        // bare `None` falls through to `Chord::parse` and
+                        // reports "not a key chord or mouse gesture", which
+                        // reads like a typo rather than a deliberate refusal.
+                        // Refused with its own reason. A bare `None` would
+                        // fall through to `Chord::parse` and report "not a
+                        // key chord or mouse gesture", which reads like a
+                        // typo rather than a deliberate refusal.
+                        "triple_click" => {
+                            return Some((
+                                None,
+                                Some(String::from(
+                                    "triple_click: croft's click tracker counts single and \
+                                     double only, so a triple binding would fire on the second \
+                                     click — refused",
+                                )),
+                            ));
+                        }
                         "middle_click" => GestureKind::MiddleClick,
                         "right_click" => GestureKind::RightClick,
                         "wheel_up" => GestureKind::WheelUp,
@@ -402,7 +422,11 @@ impl Gesture {
                 }
             }
         }
-        Some((Gesture { kind: kind?, mods }, warn))
+        let kind = kind?;
+        if refused {
+            return Some((None, warn));
+        }
+        Some((Some(Gesture { kind, mods }), warn))
     }
 
     /// True when this gesture would shadow primary selection. Binding these
@@ -494,6 +518,9 @@ impl Keymap {
                 if let Some(w) = warn {
                     warnings.push(w);
                 }
+                let Some(gesture) = gesture else {
+                    continue;
+                };
                 let ctx = match row.when.as_deref() {
                     None => MouseContext::default(),
                     Some(w) => match MouseContext::parse(w) {
@@ -595,15 +622,18 @@ mod tests {
     fn gestures_parse_with_modifiers_and_reject_nonsense() {
         use super::{Gesture, GestureKind};
         let (g, warn) = Gesture::parse("ctrl+click").expect("ctrl+click parses");
+        let g = g.expect("and binds");
         assert_eq!(g.kind, GestureKind::Click);
         assert_eq!(g.mods, KeyModifiers::CONTROL);
         assert!(warn.is_none());
 
         let (g, _) = Gesture::parse("middle_click").expect("bare gesture parses");
+        let g = g.expect("and binds");
         assert_eq!(g.kind, GestureKind::MiddleClick);
         assert_eq!(g.mods, KeyModifiers::NONE);
 
         let (g, _) = Gesture::parse("alt+shift+wheel_up").expect("two modifiers parse");
+        let g = g.expect("and binds");
         assert_eq!(g.kind, GestureKind::WheelUp);
         assert_eq!(g.mods, KeyModifiers::ALT | KeyModifiers::SHIFT);
 
@@ -615,17 +645,19 @@ mod tests {
             Gesture::parse("click+wheel_up").is_none(),
             "two gestures in one binding is nonsense"
         );
+        let (g, warn) = Gesture::parse("triple_click").expect("it is recognised");
+        assert!(g.is_none(), "but refused rather than bound");
         assert!(
-            Gesture::parse("triple_click").is_none(),
-            "triple click is refused: the click tracker counts to two, so the \
-             binding would fire on the second click"
+            warn.expect("with a reason").contains("second click"),
+            "the reason names the real problem, not a typo"
         );
     }
 
     #[test]
     fn a_cmd_gesture_warns_because_terminals_never_report_super() {
         use super::Gesture;
-        let (_, warn) = Gesture::parse("cmd+click").expect("it still parses");
+        let (g, warn) = Gesture::parse("cmd+click").expect("it still parses");
+        assert!(g.is_none(), "and is refused, not bound to a dead entry");
         let warn = warn.expect("but it warns");
         assert!(
             warn.contains("can never fire"),
@@ -634,7 +666,7 @@ mod tests {
         // `mod` resolves to Ctrl for mouse on every platform rather than
         // becoming an unfirable Cmd binding.
         let (g, warn) = Gesture::parse("mod+click").expect("mod parses");
-        assert_eq!(g.mods, KeyModifiers::CONTROL);
+        assert_eq!(g.expect("and binds").mods, KeyModifiers::CONTROL);
         assert!(warn.is_none(), "and needs no warning");
     }
 
@@ -659,8 +691,11 @@ mod tests {
             km.warnings()
         );
         assert!(
-            km.command_for_mouse(Gesture::parse("click").unwrap().0, MouseContext::FileTree)
-                .is_some(),
+            km.command_for_mouse(
+                Gesture::parse("click").unwrap().0.unwrap(),
+                MouseContext::FileTree
+            )
+            .is_some(),
             "the file-tree binding survived"
         );
     }
@@ -671,7 +706,7 @@ mod tests {
             r#"[{"key": "ctrl+click", "command": "save_file", "when": "editor"},
                 {"key": "ctrl+click", "command": "quick_open", "when": "file_tree"}]"#,
         );
-        let g = Gesture::parse("ctrl+click").unwrap().0;
+        let g = Gesture::parse("ctrl+click").unwrap().0.unwrap();
         assert_eq!(
             km.command_for_mouse(g, MouseContext::Editor)
                 .map(|c| c.id()),

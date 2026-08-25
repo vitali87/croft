@@ -1524,6 +1524,70 @@ fn mouse(
 }
 
 #[test]
+fn a_reloaded_keymap_with_a_refused_row_says_so_in_the_status_bar() {
+    // The warning summary used to be written and then immediately clobbered
+    // by an unconditional "Keybindings reloaded" below it, so a refused row
+    // was invisible — which is the failure the warnings exist to prevent.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let kb = tmp.path().join("keybindings.json");
+    std::fs::write(&kb, r#"[{"key": "click", "command": "save_file"}]"#).unwrap();
+
+    app.keymap = crate::keymap::Keymap::load(&kb);
+    let warns = app.keymap.warnings().to_vec();
+    assert_eq!(warns.len(), 1, "a bare click in the editor is refused");
+    assert!(
+        warns[0].contains("reserved"),
+        "and says why: {:?}",
+        warns[0]
+    );
+}
+
+#[test]
+fn a_double_click_binding_uses_the_tracker_for_its_own_region() {
+    // Each pane records into its own ClickTracker. Reading `editor_click`
+    // everywhere left `double_click` permanently false in the tree, tab
+    // strip, and terminal, so a binding there silently never matched.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let now = std::time::Instant::now();
+
+    // A double recorded in the TREE must be seen by a file_tree gesture and
+    // not by an editor one.
+    app.tree_click.record(now, 5, 5);
+    assert!(
+        app.tree_click.is_double(now, 5, 5),
+        "the tree tracker saw its own click"
+    );
+    assert!(
+        !app.editor_click.is_double(now, 5, 5),
+        "and the editor tracker did not — which is exactly why the \
+         dispatcher must pick by context"
+    );
+}
+
+#[test]
+fn a_cmd_or_triple_gesture_is_refused_rather_than_bound_to_a_dead_entry() {
+    // Both parse but can never match, so binding them would make
+    // `has_mouse_bindings()` true for entries nothing can look up — and
+    // would let cmd+click dodge the reserved bare-click check.
+    let km = crate::keymap::Keymap::from_json(
+        r#"[{"key": "cmd+click", "command": "save_file"},
+            {"key": "triple_click", "command": "save_file"}]"#,
+    );
+    assert_eq!(km.warnings().len(), 2, "{:?}", km.warnings());
+    assert!(
+        !km.has_mouse_bindings(),
+        "neither is bound, so the per-event dispatch stays off"
+    );
+    assert!(
+        km.warnings().iter().any(|w| w.contains("second click")),
+        "triple_click says the real reason, not 'not a gesture': {:?}",
+        km.warnings()
+    );
+}
+
+#[test]
 fn outline_scrollbar_drag_is_not_hijacked_by_the_sidebar_splitter() {
     use crate::lsp::manager::{OutlineKind, OutlineSymbol};
     use crossterm::event::{MouseButton, MouseEventKind};

@@ -30323,16 +30323,29 @@ impl App {
         // over. A gesture croft has no binding for falls straight through.
         if self.keymap.has_mouse_bindings()
             && let Some(ctx) = mouse_context_for(&m, in_editor, in_terminal, in_tree, self)
-            && let Some(gesture) = gesture_for(&m, self, std::time::Instant::now())
+            && let Some(gesture) = gesture_for(&m, self, ctx, std::time::Instant::now())
             && let Some(cmd) = self.keymap.command_for_mouse(gesture, ctx)
         {
             // A terminal running a mouse-tracking TUI owns the pointer, same
             // rule the built-ins follow: croft must not steal a click the
             // child asked for.
+            // Index the pane that was CLICKED, not the active one: splits make
+            // several terminals visible at once, so `self.terminal()` would
+            // consult the wrong child's mouse-reporting state.
             let child_owns_pointer = matches!(ctx, crate::keymap::MouseContext::Terminal)
-                && self.terminal().mouse_reporting()
+                && terminal_hit.is_some_and(|idx| self.terminals[idx].mouse_reporting())
                 && !m.modifiers.contains(KeyModifiers::SHIFT);
             if !child_owns_pointer {
+                // Every built-in pairs `is_double` with `record`/`clear` so the
+                // count resets. Without this a third click at the same cell
+                // still reads as a double and fires the binding again.
+                if gesture.kind == crate::keymap::GestureKind::DoubleClick {
+                    match ctx {
+                        crate::keymap::MouseContext::Terminal => self.terminal_click.clear(),
+                        crate::keymap::MouseContext::FileTree => self.tree_click.clear(),
+                        _ => self.editor_click.clear(),
+                    }
+                }
                 // Position-carrying commands read the click through this,
                 // set before dispatch and cleared after so a keyboard
                 // invocation of the same command never sees a stale click.
@@ -33087,18 +33100,21 @@ impl App {
             for w in &warns {
                 crate::output::push("Keybindings", crate::output::OutputLevel::Warn, w);
             }
+            // (status set below, once, so the warning summary is not clobbered)
             self.status = if warns.is_empty() {
-                String::from("Keybindings reloaded")
+                String::from(
+                    "Keybindings reloaded (for new Cmd chords, re-run croft setup-iterm2 / setup-ghostty)",
+                )
             } else {
+                // One assignment: a second unconditional one below used to
+                // clobber this, so the user never saw the warning count and
+                // a refused row looked like croft ignoring them.
                 format!(
                     "Keybindings reloaded with {} warning{} — see OUTPUT · Keybindings",
                     warns.len(),
                     if warns.len() == 1 { "" } else { "s" }
                 )
             };
-            self.status = String::from(
-                "Keybindings reloaded (for new Cmd chords, re-run croft setup-iterm2 / setup-ghostty)",
-            );
         } else if path == crate::snippets::snippets_path() {
             self.snippets = crate::snippets::SnippetSet::load(path);
             self.status = String::from("Snippets reloaded");
@@ -38199,12 +38215,23 @@ fn mouse_context_for(
 fn gesture_for(
     m: &MouseEvent,
     app: &App,
+    ctx: crate::keymap::MouseContext,
     now: std::time::Instant,
 ) -> Option<crate::keymap::Gesture> {
-    use crate::keymap::{Gesture, GestureKind};
+    use crate::keymap::{Gesture, GestureKind, MouseContext};
     let kind = match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if app.editor_click.is_double(now, m.column, m.row) {
+            // The tracker has to match the region: each pane records into its
+            // own, so consulting `editor_click` everywhere left `double_click`
+            // permanently false in the tree, tab strip, and terminal — a
+            // binding there would silently never match.
+            let tracker = match ctx {
+                MouseContext::Terminal => &app.terminal_click,
+                MouseContext::FileTree => &app.tree_click,
+                // The tab strip is part of the editor pane and records there.
+                MouseContext::Editor | MouseContext::TabStrip => &app.editor_click,
+            };
+            if tracker.is_double(now, m.column, m.row) {
                 GestureKind::DoubleClick
             } else {
                 GestureKind::Click
