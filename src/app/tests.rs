@@ -16938,6 +16938,33 @@ fn a_count_before_a_closing_q_is_discarded_too() {
 }
 
 #[test]
+fn a_non_register_key_after_q_aborts_the_gesture() {
+    // The per-character handlers only see plain chars, so an arrow key after
+    // `q` used to return at the motion arms with `pending_record` still set —
+    // and the next letter typed would silently start a recording nobody
+    // asked for. Vim aborts the gesture on a non-register key.
+    let (mut app, tmp) = vim_app("one\ntwo\nthree\n");
+    app.macros_path = tmp.path().join("macros.json");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+
+    vim_feed(&mut app, 'q');
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.macro_recording.is_none(),
+        "the arrow key aborts the pending register gesture"
+    );
+
+    // The following letter must be an ordinary motion, not a register name.
+    vim_feed(&mut app, 'j');
+    assert!(
+        app.macro_recording.is_none(),
+        "and does not retroactively start a recording"
+    );
+}
+
+#[test]
 fn a_count_before_q_does_not_leak_into_the_recording() {
     // Vim discards a count on `q`. Keeping it would silently retarget the
     // recording's FIRST key — `3qa` then `j` moves three rows instead of one,

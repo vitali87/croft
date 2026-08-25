@@ -468,6 +468,19 @@ impl VimState {
             return VimKeyResult::Consumed(vec![]);
         }
 
+        // A pending register letter must consume the NEXT key whatever it is.
+        // The per-character handlers below only see plain `Char`s, so without
+        // this an arrow key after `q` returns at the motion arms and leaves
+        // `pending_record` set — the next letter would then silently start a
+        // recording the user never asked for. Vim aborts the gesture on a
+        // non-register key, so consume it and clear.
+        if (self.pending_record || self.pending_replay) && !matches!(key.code, KeyCode::Char(_)) {
+            self.pending_record = false;
+            self.pending_replay = false;
+            let _ = self.take_count();
+            return VimKeyResult::Consumed(vec![]);
+        }
+
         match key.code {
             KeyCode::Esc => {
                 if matches!(self.mode, VimMode::Visual | VimMode::VisualLine) {
