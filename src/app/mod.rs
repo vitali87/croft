@@ -3787,8 +3787,14 @@ impl App {
         // used to vanish silently, which reads as croft being broken rather
         // than the binding being wrong (#259).
         let loaded_keymap = crate::keymap::Keymap::load(&crate::keymap::keybindings_path());
-        for w in loaded_keymap.warnings() {
-            crate::output::push("Keybindings", crate::output::OutputLevel::Warn, w);
+        // Not under test: `output::` is a process-global registry, so the
+        // developer's own refused rows would leak into every test that
+        // builds an `App` — the same reason the matcher set below is empty
+        // under test.
+        if !cfg!(test) {
+            for w in loaded_keymap.warnings() {
+                crate::output::push("Keybindings", crate::output::OutputLevel::Warn, w);
+            }
         }
         // Problem matchers (#252). Under test an empty set: the developer's
         // real matchers.json must never steer app tests; tests inject their
@@ -30424,6 +30430,25 @@ impl App {
                     }
                     _ => {}
                 }
+                // The early return below skips the teardown every other
+                // press path runs, so do it here: a fired binding changes
+                // the state underneath these popups, and leaving them up
+                // paints a hover, a tab tooltip or a button hint describing
+                // what was there before the command ran. The dwell timer is
+                // cleared for the same reason — it is armed at coordinates
+                // whose meaning the command just changed.
+                if !matches!(m.kind, MouseEventKind::Up(_)) {
+                    self.hover_popup = None;
+                    self.hover_diagnostic = None;
+                }
+                self.tab_tooltip = None;
+                self.tab_hover.clear();
+                self.tab_hover_idx = None;
+                self.ui_tooltip = None;
+                self.ui_hover.clear();
+                self.ui_tooltip_label = None;
+                self.hover.clear();
+
                 // Position-carrying commands read the click through this,
                 // set before dispatch and cleared after so a keyboard
                 // invocation of the same command never sees a stale click.
@@ -37729,13 +37754,6 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
     has_shift && has_ctrl_or_super
 }
 
-/// `Cmd+B` (macOS) / `Ctrl+B` (Linux): toggle the primary side bar (left
-/// pane) visibility, mirroring VS Code's "View: Toggle Primary Side Bar".
-/// Accepts SUPER *or* CONTROL so the chord behaves identically whether
-/// iTerm2 forwards `Cmd+B` as the CSI-u Super sequence (see `src/iterm2.rs`)
-/// or a raw `Ctrl+B` control byte arrives on a remote Linux session. SHIFT
-/// and ALT must not be held, so it never collides with a future bracketed
-/// or word-motion chord on `b`.
 /// The status line shown after a keybindings reload.
 ///
 /// Split out of `reload_config_for_path` so it can be tested against a keymap
@@ -37760,6 +37778,13 @@ fn keybindings_reload_status(warns: &[String]) -> String {
     }
 }
 
+/// `Cmd+B` (macOS) / `Ctrl+B` (Linux): toggle the primary side bar (left
+/// pane) visibility, mirroring VS Code's "View: Toggle Primary Side Bar".
+/// Accepts SUPER *or* CONTROL so the chord behaves identically whether
+/// iTerm2 forwards `Cmd+B` as the CSI-u Super sequence (see `src/iterm2.rs`)
+/// or a raw `Ctrl+B` control byte arrives on a remote Linux session. SHIFT
+/// and ALT must not be held, so it never collides with a future bracketed
+/// or word-motion chord on `b`.
 fn is_sidebar_toggle_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -38257,11 +38282,6 @@ fn snippet_completion_item(snip: &crate::snippets::Snippet) -> crate::lsp::Compl
     }
 }
 
-/// A chord eligible for a user rebind: it carries a real modifier
-/// (Ctrl/Alt/Super) or is a function key. Bare keys, unmodified letters, and
-/// Shift-only chords (which are just typing) are excluded so the user keymap
-/// can never shadow plain text entry. Intentionally not named `is_*_key`: it is
-/// a gate, not a shortcut the F1 overlay documents.
 /// Which mouse region a binding's `when` context refers to, or `None` when
 /// the pointer is somewhere no context covers (a panel, a seam, the status
 /// bar) — a user binding must not fire there.
@@ -38342,6 +38362,11 @@ fn gesture_for(
     Some(Gesture { kind, mods })
 }
 
+/// A chord eligible for a user rebind: it carries a real modifier
+/// (Ctrl/Alt/Super) or is a function key. Bare keys, unmodified letters, and
+/// Shift-only chords (which are just typing) are excluded so the user keymap
+/// can never shadow plain text entry. Intentionally not named `is_*_key`: it is
+/// a gate, not a shortcut the F1 overlay documents.
 fn is_rebindable_chord(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::F(_))
         || key

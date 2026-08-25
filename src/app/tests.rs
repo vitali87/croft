@@ -1623,6 +1623,41 @@ fn a_click_binding_does_not_disable_the_double_click_binding_beside_it() {
 }
 
 #[test]
+fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
+    // The dispatch returns early, above the teardown every other left-press
+    // path runs. Without doing it itself, a fired binding leaves a hover or
+    // tab tooltip painted over state the command just changed — describing
+    // what was there before it ran.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+click", "command": "quick_open", "when": "editor"}]"#,
+    );
+    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+        String::from("stale hover"),
+        (1, 1),
+    ));
+    app.tab_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new(
+        String::from("stale tab tooltip"),
+        (1, 1),
+    ));
+
+    let mut ev = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        app.editor.last_inner.x + 4,
+        app.editor.last_inner.y + 1,
+    );
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    assert!(app.file_finder.is_some(), "the binding fired");
+    assert!(
+        app.hover_popup.is_none(),
+        "a fired binding must dismiss the hover it painted over"
+    );
+    assert!(app.tab_tooltip.is_none(), "and the tab tooltip with it");
+}
+
+#[test]
 fn a_modified_click_binding_does_not_arm_the_plain_double_click() {
     // `GestureKind::Click` covers `ctrl+click` too, and the built-ins read
     // their trackers without consulting modifiers. Recording a modified click
