@@ -163,6 +163,131 @@ fn render_image_placeholder(
     );
 }
 
+/// Resolve one parsed ANSI colour against the active theme, so the rendered
+/// log matches what a terminal pane would show under the same theme. The low
+/// 16 stay symbolic until here precisely so a theme switch recolours without
+/// reparsing the file.
+fn ansi_color_to_tui(c: crate::ansi_text::AnsiColor, theme: crate::theme::Theme) -> Color {
+    use crate::ansi_text::AnsiColor;
+    match c {
+        AnsiColor::Indexed(i) => {
+            let p = theme.ansi();
+            let (r, g, b) = p[(i as usize).min(15)];
+            Color::Rgb(r, g, b)
+        }
+        // The 6x6x6 cube and the 24-step greyscale ramp are fixed by the
+        // xterm spec, not by the theme, so they are computed rather than
+        // looked up.
+        AnsiColor::Palette256(i) => {
+            let i = i as u16;
+            if i < 232 {
+                let n = i - 16;
+                let lvl = |v: u16| -> u8 { if v == 0 { 0 } else { (55 + v * 40) as u8 } };
+                Color::Rgb(lvl(n / 36), lvl((n / 6) % 6), lvl(n % 6))
+            } else {
+                let v = (8 + (i - 232) * 10) as u8;
+                Color::Rgb(v, v, v)
+            }
+        }
+        AnsiColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// Paint a rendered ANSI log tab (#257): one buffer line per file line, with
+/// SGR spans resolved through the theme palette. Mutates the view because the
+/// window is refilled around the viewport — the file is never held whole.
+fn render_log(
+    view: &mut crate::log_view::LogView,
+    path: Option<&Path>,
+    inner: Rect,
+    buf: &mut Buffer,
+    bg: Color,
+    theme: crate::theme::Theme,
+    scroll: usize,
+) {
+    let bg_style = Style::default().bg(bg);
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            buf[(x, y)].set_style(bg_style);
+            buf[(x, y)].set_symbol(" ");
+        }
+    }
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let name = path
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("log"));
+    let truncated = view.truncated;
+    let total = view.len();
+    let header = if truncated {
+        format!(" {name} — rendered log, {total} lines shown (file truncated at the index cap) ")
+    } else {
+        format!(" {name} — rendered log, {total} lines ")
+    };
+    let head_style = Style::default()
+        .fg(Color::White)
+        .bg(theme.ui(Color::Rgb(0x09, 0x4d, 0x77)));
+    buf.set_stringn(
+        inner.x,
+        inner.y,
+        format!("{header:width$}", width = inner.width as usize),
+        inner.width as usize,
+        head_style,
+    );
+    let body_top = inner.y + 1;
+    let rows = inner.height.saturating_sub(1) as usize;
+    if rows == 0 {
+        return;
+    }
+    // Refill the window around the viewport: one bounded read per scroll.
+    let _ = view.ensure(scroll, rows);
+    for r in 0..rows {
+        let idx = scroll + r;
+        let Some(line) = view.line(idx) else { break };
+        let y = body_top + r as u16;
+        let mut x = inner.x;
+        for span in &line.spans {
+            if x >= inner.x + inner.width {
+                break;
+            }
+            let text = &line.text[span.start..span.end];
+            let mut style = Style::default().bg(bg);
+            let (fg, sbg) = if span.style.inverse {
+                // Swap against the theme's default pair, which the parser
+                // deliberately does not know.
+                (span.style.bg, span.style.fg)
+            } else {
+                (span.style.fg, span.style.bg)
+            };
+            if let Some(c) = fg {
+                style = style.fg(ansi_color_to_tui(c, theme));
+            } else if span.style.inverse {
+                style = style.fg(bg);
+            }
+            if let Some(c) = sbg {
+                style = style.bg(ansi_color_to_tui(c, theme));
+            }
+            if span.style.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if span.style.dim {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            if span.style.italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if span.style.underline {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            let room = (inner.x + inner.width).saturating_sub(x) as usize;
+            buf.set_stringn(x, y, text, room, style);
+            x = x.saturating_add(text.chars().count().min(room) as u16);
+        }
+    }
+}
+
 /// Paint a hex tab (#172): header row, `offset  hex  |ascii|` body rows,
 /// and a status row with the cursor offset. Mutates the view: the window
 /// is refilled around the viewport, and the chosen bytes-per-row plus the
@@ -2476,6 +2601,11 @@ pub struct Editor {
     /// target. Mutually exclusive with the text path and the other
     /// preview kinds; windowed IO, so the file is never loaded whole.
     pub hex: Option<crate::hex::HexView>,
+    /// Rendered ANSI log view (#257): colour-bearing logs paint with the
+    /// theme's ANSI palette instead of showing raw escapes. Windowed like
+    /// [`crate::hex`], so a multi-gigabyte log opens instantly. Read-only;
+    /// "Reopen as Text" (`force_text`) shows the raw bytes.
+    pub log: Option<crate::log_view::LogView>,
     /// Archive browser (#179): the member list of a zip/jar/whl/tar
     /// archive; Enter extracts one member to scratch and opens it
     /// through the normal dispatch. Read-only.
@@ -2647,6 +2777,7 @@ impl Editor {
             sheet: None,
             diff: None,
             hex: None,
+            log: None,
             archive: None,
             merge: None,
             merge_edit_row: 0,
@@ -3527,6 +3658,13 @@ impl Editor {
             self.force_text = false;
         }
         if !self.force_text {
+            // Rendered ANSI log (#257): a colour-bearing log paints through
+            // the theme palette instead of showing raw escapes. Sniffed, so a
+            // plain .txt with pytest output routes here too; a failure falls
+            // through to the normal text path.
+            if Self::should_open_as_log(path) && self.open_log(path).is_ok() {
+                return Ok(());
+            }
             // Media (#183): header-probed info card; junk with a media
             // extension falls through to the binary path.
             if crate::media::extension_is_media(ext) && self.open_media_preview(path).is_ok() {
@@ -3783,6 +3921,7 @@ impl Editor {
         self.sheet = None;
         self.markdown_preview = None;
         self.hex = None;
+        self.log = None;
         self.archive = None;
         // A real file supersedes any diff view this editor was showing —
         // without this a restore-then-reload keeps rendering the stale diff.
@@ -3883,6 +4022,7 @@ impl Editor {
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
         self.hex = None;
+        self.log = None;
         self.archive = None;
         self.status = format!("Opened image {}", path.display());
         Ok(())
@@ -3932,6 +4072,7 @@ impl Editor {
         self.image = None;
         self.sheet = None;
         self.hex = None;
+        self.log = None;
         self.archive = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
@@ -3998,6 +4139,7 @@ impl Editor {
         self.image = None;
         self.sheet = None;
         self.hex = None;
+        self.log = None;
         self.archive = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
@@ -4047,6 +4189,7 @@ impl Editor {
         self.image = None;
         self.sheet = None;
         self.hex = None;
+        self.log = None;
         self.markdown_preview = None;
         self.archive = Some(view);
         self.status = format!("Opened archive {}", path.display());
@@ -4097,6 +4240,7 @@ impl Editor {
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
         self.hex = None;
+        self.log = None;
         self.archive = None;
         self.markdown_preview = None;
         self.image = Some(ImageView {
@@ -4149,6 +4293,7 @@ impl Editor {
         self.diff_next_arrow = Rect::default();
         self.image = None;
         self.hex = None;
+        self.log = None;
         self.archive = None;
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
@@ -4222,6 +4367,7 @@ impl Editor {
         self.diff_next_arrow = Rect::default();
         self.sheet = None;
         self.hex = None;
+        self.log = None;
         self.archive = None;
         self.status = format!("Opened PDF {}", path.display());
         Ok(())
@@ -4251,6 +4397,71 @@ impl Editor {
     /// fallback for files the text heuristic rejects, and the target of
     /// the explicit "Reopen as Hex" command. `pub` for that command's
     /// dispatch; extension routing never needs to call it directly.
+    /// Open `path` as a rendered ANSI log (#257): colours paint through the
+    /// theme's palette and escapes never reach the text. Windowed, so the
+    /// file is not read whole. Fails (and the caller falls through to the
+    /// normal text path) when the file cannot be indexed.
+    pub fn open_log(&mut self, path: &Path) -> Result<()> {
+        let view = crate::log_view::LogView::open(path)
+            .map_err(|e| anyhow::anyhow!("Log open failed: {e}"))?;
+        self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
+        self.lines = vec![String::new()];
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.lang = None;
+        self.scroll = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty = false;
+        self.selection = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit_kind = None;
+        self.highlights = vec![Vec::new()];
+        // Same supersede-every-other-kind reset the other preview openers do.
+        self.diff = None;
+        self.merge = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
+        self.image = None;
+        self.sheet = None;
+        self.markdown_preview = None;
+        self.archive = None;
+        self.hex = None;
+        self.log = Some(view);
+        self.status = format!("Opened {} as a rendered log", path.display());
+        Ok(())
+    }
+
+    /// Whether `path` should open as a rendered log: a log-ish extension, or
+    /// any extension at all if the first bytes carry an SGR sequence. The
+    /// content sniff is what catches `foo.txt` holding pytest output; the
+    /// extension list is what avoids sniffing every file on open.
+    pub fn should_open_as_log(path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "log" | "ansi" | "out" | "txt" | "") {
+            return false;
+        }
+        // Sniff a bounded prefix: a colour log announces itself immediately,
+        // and reading more would tax every plain .txt open.
+        let Ok(mut f) = std::fs::File::open(path) else {
+            return false;
+        };
+        use std::io::Read;
+        let mut buf = [0u8; 8192];
+        let Ok(n) = f.read(&mut buf) else {
+            return false;
+        };
+        crate::ansi_text::looks_like_ansi(&String::from_utf8_lossy(&buf[..n]))
+    }
+
     pub fn open_hex(&mut self, path: &Path) -> Result<()> {
         // `open` is also the same-path reload behind the FS-sync sweep:
         // refresh the existing view in place so the reader keeps their
@@ -10089,6 +10300,18 @@ impl Widget for &mut Editor {
             render_archive(view, self.path.as_deref(), inner, buf, cbg, self.theme);
             return;
         }
+        if let Some(view) = self.log.as_mut() {
+            render_log(
+                view,
+                self.path.as_deref(),
+                inner,
+                buf,
+                cbg,
+                self.theme,
+                self.scroll,
+            );
+            return;
+        }
         if let Some(view) = self.hex.as_mut() {
             render_hex(view, self.path.as_deref(), inner, buf, cbg, self.theme);
             return;
@@ -14184,6 +14407,139 @@ mod tests {
         std::fs::copy(&p, &q).unwrap();
         e.open(&q).unwrap();
         assert!(e.image.is_some(), "a path change resets force_text");
+    }
+
+    /// #257: a colour-bearing log opens rendered, escapes never reach the
+    /// text, and "Reopen as Text" round-trips back to the raw bytes.
+    #[test]
+    fn a_color_log_opens_rendered_and_reopen_as_text_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("build.log");
+        std::fs::write(
+            &p,
+            "plain\n\u{1b}[31mERROR\u{1b}[0m boom\n\u{1b}[32mok\u{1b}[0m\n",
+        )
+        .unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+
+        let log = e.log.as_mut().expect("a colour log opens rendered");
+        assert_eq!(log.len(), 3);
+        log.ensure(0, 3).unwrap();
+        assert_eq!(
+            log.visible_text(1),
+            Some("ERROR boom"),
+            "escapes are stripped from what the user sees"
+        );
+        assert_eq!(
+            log.line(1).unwrap().spans[0].style.fg,
+            Some(crate::ansi_text::AnsiColor::Indexed(1)),
+            "the theme palette resolves the colour, so it stays symbolic"
+        );
+
+        // Reopen as Text: raw escapes, and the override sticks across the
+        // same-path reload the FS sweep performs.
+        e.force_text = true;
+        e.open(&p).unwrap();
+        assert!(e.log.is_none());
+        assert!(
+            e.lines[1].contains('\u{1b}'),
+            "the text view shows the real bytes"
+        );
+        e.open(&p).unwrap();
+        assert!(e.log.is_none(), "the override survives a same-path reload");
+        e.force_text = false;
+        e.open(&p).unwrap();
+        assert!(e.log.is_some(), "clearing the override renders again");
+    }
+
+    /// The sniff must not hijack ordinary files: a plain log routes to text,
+    /// while ANSI inside a `.txt` still renders. Extension alone is not the
+    /// signal, and neither is the mere presence of an escape byte.
+    #[test]
+    fn only_files_carrying_sgr_sequences_route_to_the_log_view() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plain = tmp.path().join("plain.log");
+        std::fs::write(&plain, "no colours here\njust text\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&plain).unwrap();
+        assert!(
+            e.log.is_none(),
+            "a log without colours is an ordinary editable file"
+        );
+
+        let txt = tmp.path().join("pytest.txt");
+        std::fs::write(&txt, "\u{1b}[32mPASSED\u{1b}[0m\n").unwrap();
+        e.open(&txt).unwrap();
+        assert!(e.log.is_some(), "the sniff catches ANSI under a .txt name");
+
+        // A screen recording (cursor movement, no SGR) is not a colour log.
+        let rec = tmp.path().join("session.log");
+        std::fs::write(&rec, "\u{1b}[2J\u{1b}[10;1Hmoved\n").unwrap();
+        e.open(&rec).unwrap();
+        assert!(e.log.is_none(), "cursor movement alone does not render");
+    }
+
+    /// #257 acceptance: a log far past the text size guard still opens,
+    /// because the view is windowed rather than loaded whole. Under the old
+    /// route this exact file was a "File too large" dead end.
+    #[test]
+    fn a_huge_color_log_opens_rendered_instead_of_hitting_the_size_guard() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("huge-color.log");
+        // Real colour bytes up front so the sniff fires, then a sparse tail
+        // that pushes the file well past MAX_FILE_BYTES without writing it.
+        std::fs::write(&p, "\u{1b}[31mERROR\u{1b}[0m first line\n").unwrap();
+        let f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.set_len(MAX_FILE_BYTES + 4096).unwrap();
+        drop(f);
+
+        let mut e = Editor::new();
+        e.open(&p).expect("a windowed log open has no size ceiling");
+        let log = e.log.as_mut().expect("opens rendered, not refused");
+        assert!(log.file_len > MAX_FILE_BYTES);
+        log.ensure(0, 1).unwrap();
+        assert_eq!(
+            log.visible_text(0),
+            Some("ERROR first line"),
+            "the first window parses without reading the whole file"
+        );
+    }
+
+    /// Colours resolve through the ACTIVE theme's ANSI palette, so a rendered
+    /// log matches the terminal panes rather than a hardcoded table.
+    #[test]
+    fn rendered_log_paints_colors_from_the_theme_palette() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("c.log");
+        std::fs::write(&p, "\u{1b}[31mRED\u{1b}[0m\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+
+        let area = Rect::new(0, 0, 40, 4);
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+
+        let (r, g, b) = e.theme.ansi()[1];
+        // Find the painted "RED" rather than assuming where the frame and
+        // header put it.
+        let mut found = None;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if buf[(x, y)].symbol() == "R"
+                    && buf[(x, y)].style().fg == Some(Color::Rgb(r, g, b))
+                {
+                    found = Some((x, y));
+                }
+            }
+        }
+        let (x, y) = found.expect("the red R paints somewhere in the body");
+        assert_eq!(buf[(x + 1, y)].symbol(), "E", "the stripped text paints");
+        assert_eq!(
+            buf[(x + 1, y)].style().fg,
+            Some(Color::Rgb(r, g, b)),
+            "SGR 31 resolves through the theme's ANSI slot 1 across the span"
+        );
     }
 
     #[test]

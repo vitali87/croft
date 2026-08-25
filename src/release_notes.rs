@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Code intelligence lands on the right symbol in files with emoji: hover, go-to-definition, completion, references, rename and friends now measure columns the way language servers do, so a line containing an emoji no longer shifts every result sideways.",
+    kind: NoteKind::Feature,
+    summary: "Colour logs render in the editor: open a docker, pytest or cargo log and the ANSI colours paint through your theme's palette instead of showing raw escape codes — and because the view is windowed, a log far past the usual size limit opens instantly.",
 }];
