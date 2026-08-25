@@ -20,6 +20,36 @@ fn version_flag_prints_version() {
     assert!(stdout.contains("croft"));
 }
 
+/// #282 end to end, against the real binary: `--version` is a bare `x.y.z`
+/// and the provenance is reachable behind `--build-info`. The unit test pins
+/// the constants and clap's rendering; this pins that the `--build-info`
+/// handler actually runs and prints the verbose form.
+#[test]
+fn build_info_carries_provenance_and_version_does_not() {
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .arg("--build-info")
+        .assert();
+    let out = out.success();
+    let build_info = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        build_info.contains(env!("CARGO_PKG_VERSION")) && build_info.contains("built "),
+        "--build-info carries version and build time: {build_info}"
+    );
+
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .arg("--version")
+        .assert();
+    let out = out.success();
+    let version = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        version.trim(),
+        format!("croft {}", env!("CARGO_PKG_VERSION")),
+        "--version stays bare"
+    );
+}
+
 #[test]
 fn setup_terminal_help_works() {
     Command::cargo_bin("croft")

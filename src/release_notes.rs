@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Your terminals come back with their output after an update: a self-update used to reopen the panes blank, and a multi-pane panel now replays each pane's recent scrollback above a fresh prompt (the shells themselves are new — a relaunch cannot adopt the old processes).",
+    summary: "`croft --version` prints a plain version number again; the build hash moved to the new `--build-info` flag.",
 }];

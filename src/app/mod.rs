@@ -11240,16 +11240,10 @@ impl App {
 
         // Version badge to the right of the wordmark (the wordmark sits
         // in the lower portion of the logo PNG; the badge tracks that row).
-        // The git hash makes two builds of the same crate version tell each
-        // other apart on sight (an updated remote shows a new hash even when
-        // the version number never moved). `unknown` = built outside git;
-        // showing it would only add noise to an unfixable state.
-        let git_hash = env!("CROFT_GIT_HASH");
-        let version_label = if git_hash == "unknown" {
-            format!(" v{} ", env!("CARGO_PKG_VERSION"))
-        } else {
-            format!(" v{}\u{00b7}{} ", env!("CARGO_PKG_VERSION"), git_hash)
-        };
+        // Plain `vX.Y.Z` (#282). The hash told two builds of one version
+        // apart; the drift banner already does that, with an actionable
+        // message, at the moment it matters.
+        let version_label = format!(" v{} ", env!("CARGO_PKG_VERSION"));
         let version_w = version_label.chars().count() as u16;
         let badge_x = logo_x + logo_w_cells + 1;
         let badge_y = logo_y + (logo_h_cells * 5) / 6;
