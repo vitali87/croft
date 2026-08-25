@@ -16621,6 +16621,54 @@ fn zoxide_jump_popup_anchors_over_the_explorer_column_not_centered() {
 }
 
 #[test]
+fn a_zoxide_row_re_roots_under_the_same_key_as_the_add_branch() {
+    // A zoxide row is a bare line from its database, so it can name a
+    // directory in a spelling nothing else in croft uses (a symlinked
+    // `/var/…` for `/private/var/…`). Both branches of the jump must land on
+    // the same spelling: the folder store keys on
+    // `roots.primary().display()`, so two spellings of one directory would
+    // file and restore under different keys.
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().canonicalize().unwrap().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = tmp.path().canonicalize().unwrap().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    // Jump mode: re-root onto the symlinked spelling.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut jump = crate::widgets::zoxide_jump::ZoxideJump::new();
+    jump.set_results(Some(vec![link.clone()]));
+    app.zoxide_jump = Some(jump);
+    app.zoxide_add_folder = false;
+    app.apply_zoxide_jump_selection();
+    let jumped = app.roots.primary().to_path_buf();
+
+    // Add mode: the same row through the other branch.
+    let mut app2 = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut jump2 = crate::widgets::zoxide_jump::ZoxideJump::new();
+    jump2.set_results(Some(vec![link.clone()]));
+    app2.zoxide_jump = Some(jump2);
+    app2.zoxide_add_folder = true;
+    app2.apply_zoxide_jump_selection();
+    let added = app2
+        .roots
+        .iter()
+        .find(|r| r.ends_with("real") || r.ends_with("link"))
+        .expect("the folder was added")
+        .to_path_buf();
+
+    assert_eq!(
+        jumped, added,
+        "both branches of one gesture must store the same spelling"
+    );
+    assert_eq!(
+        jumped,
+        link.canonicalize().unwrap(),
+        "and it is the canonical one, so the folder store keys agree"
+    );
+}
+
+#[test]
 fn cmd_z_in_explorer_opens_the_zoxide_jump_popup() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
