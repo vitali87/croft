@@ -100,6 +100,15 @@ And do not assume the shape is stable: the same bots on the same repo produce an
 empty `reviews[]` on one PR and dozens of entries on another, so "here the
 verdict lives in field X" is never a safe shortcut.
 
+**Work out which bot actually gates the merge, and read that one.** The bot with
+the strongest gate is not necessarily the one that shows up in the field you
+queried, and the two facts are unrelated. On the sibling repo, the bot whose
+score is required for merge contributes zero readable entries to `reviews[]`,
+while a different bot contributes six — so a checker reading that field reports
+six healthy artifacts while being blind to the only one that decides
+mergeability. That failure is confident, not silent, which makes it worse than
+undercounting.
+
 Anchor it to the head SHA. If the artifact names a commit other than the head
 you are about to merge, the review is stale and does not count, however good it
 looks. A stale review and a missing review have the same consequence: do not
