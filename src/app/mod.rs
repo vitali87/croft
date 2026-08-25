@@ -2187,6 +2187,8 @@ pub struct App {
     /// Whitespace rendering mode (#133), frame-synced to every editor;
     /// "selection" by default, the palette command cycles it.
     whitespace_mode: crate::widgets::editor::WhitespaceMode,
+    /// Default ignore-whitespace mode applied to newly opened diffs (#258).
+    diff_ws_default: crate::widgets::diff::DiffWhitespace,
     /// Debugger inline values (#135): on by default; rebuilt on every
     /// `InspectionUpdated`, cleared wherever the stop arrow clears.
     inline_values_enabled: bool,
@@ -3874,6 +3876,9 @@ impl App {
             bracket_colors_enabled: !loaded_prefs.disable_bracket_colors,
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
+            ),
+            diff_ws_default: crate::widgets::diff::DiffWhitespace::from_config(
+                &loaded_prefs.diff_ignore_whitespace,
             ),
             inline_values_enabled: !loaded_prefs.disable_inline_values,
             auto_close_pairs: !loaded_prefs.disable_auto_close_pairs,
@@ -12634,6 +12639,7 @@ impl App {
             ed.show_indent_guides = self.indent_guides_enabled;
             ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.whitespace_mode = self.whitespace_mode;
+            ed.diff_ws_default = self.diff_ws_default;
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
@@ -12644,6 +12650,8 @@ impl App {
                 ed.show_indent_guides = self.indent_guides_enabled;
                 ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.whitespace_mode = self.whitespace_mode;
+                ed.diff_ws_default = self.diff_ws_default;
+                ed.diff_ws_default = self.diff_ws_default;
             }
         }
         self.tree.focus_gradient = gradient;
@@ -21659,6 +21667,20 @@ impl App {
         Some((rel, patch))
     }
 
+    /// Cycle the open diff's ignore-whitespace mode (off → leading → all).
+    /// Per-view only: the `diff_ignore_whitespace` pref supplies the starting
+    /// mode for each new diff and is not rewritten here, so an experiment in
+    /// one view never changes what the next file opens with.
+    pub fn diff_cycle_whitespace_mode(&mut self) {
+        let Some(diff) = self.editor.diff.as_mut() else {
+            self.status = String::from("Ignore whitespace applies to a diff view");
+            return;
+        };
+        let mode = diff.ws_mode.next();
+        diff.set_whitespace_mode(mode);
+        self.status = format!("Diff: ignore whitespace {}", mode.label());
+    }
+
     /// Stage only the hunk under the diff caret (`git apply --cached`).
     pub fn stage_hunk_at_caret(&mut self) {
         // A selection spanning changed rows narrows the action to those
@@ -27684,6 +27706,7 @@ impl App {
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
             Cmd::ToggleMinimap => self.toggle_minimap(),
+            Cmd::DiffToggleIgnoreWhitespace => self.diff_cycle_whitespace_mode(),
             Cmd::NewTerminal => match self.split_terminal() {
                 Ok(()) => {
                     self.terminal_status(format!(
