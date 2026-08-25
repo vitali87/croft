@@ -30200,3 +30200,75 @@ fn editing_drops_stale_document_links() {
         "the edit dropped the stale ranges"
     );
 }
+
+/// #256 step 1: a server that publishes project-wide diagnostics (rust-analyzer
+/// does this from `cargo check`) names files the user never opened. The panel
+/// builds from the diagnostics store rather than from open buffers, so those
+/// rows DO appear — this pins that half, which the issue lists as unverified.
+#[test]
+fn problems_shows_diagnostics_for_a_file_that_was_never_opened() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let opened = tmp.path().join("opened.rs");
+    let never = tmp.path().join("never_opened.rs");
+    std::fs::write(&opened, "fn main() {}\n").unwrap();
+    std::fs::write(&never, "fn helper() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&opened).unwrap();
+
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("rust-analyzer"),
+        vec![diag(0, 4, DiagnosticSeverity::Error)],
+    );
+    app.lsp_diagnostics.insert(never.clone(), by_server);
+    app.rebuild_problems();
+
+    let paths: Vec<_> = app.problems.groups().iter().map(|g| &g.path).collect();
+    assert!(
+        paths.contains(&&never),
+        "a diagnostic for an unopened file must still reach PROBLEMS"
+    );
+}
+
+/// #256: the scope toggle changes which files the panel lists, and the badge
+/// counts the same list — both read one projection, so they cannot disagree.
+#[test]
+fn problems_scope_toggle_filters_unopened_files_and_the_badge_follows() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    use crate::widgets::problems::ProblemScope;
+    let tmp = tempfile::tempdir().unwrap();
+    let opened = tmp.path().join("opened.rs");
+    let never = tmp.path().join("never_opened.rs");
+    std::fs::write(&opened, "fn main() {}\n").unwrap();
+    std::fs::write(&never, "fn helper() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&opened).unwrap();
+
+    for p in [&opened, &never] {
+        let mut by_server = std::collections::HashMap::new();
+        by_server.insert(
+            String::from("rust-analyzer"),
+            vec![diag(0, 4, DiagnosticSeverity::Error)],
+        );
+        app.lsp_diagnostics.insert(p.clone(), by_server);
+    }
+
+    app.problems.scope = ProblemScope::WholeProject;
+    app.rebuild_problems();
+    assert_eq!(
+        app.problems.groups().len(),
+        2,
+        "whole project lists the unopened file too"
+    );
+    let whole_count = app.problems.total_count();
+
+    app.problems.scope = ProblemScope::OpenFiles;
+    app.rebuild_problems();
+    let paths: Vec<_> = app.problems.groups().iter().map(|g| &g.path).collect();
+    assert_eq!(paths, vec![&opened], "open files drops the unopened one");
+    assert!(
+        app.problems.total_count() < whole_count,
+        "the badge counts the same filtered list"
+    );
+}

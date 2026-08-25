@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Diffs can ignore whitespace: toggle indentation-only or all-whitespace changes out of the view so a reindented block stops burying the three lines that actually changed — staging always applies the real patch regardless of the view.",
+    summary: "PROBLEMS can show the whole project: diagnostics for files you never opened now appear, and a scope toggle switches between Open Files and Whole Project — the status-bar count follows whichever you pick.",
 }];

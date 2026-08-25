@@ -4269,6 +4269,10 @@ impl App {
         // focused-but-not-gradient: the Black-theme gradient border only
         // arms on the first focus change because nothing ran the sync at
         // construction time.
+        // #256: the PROBLEMS scope comes from prefs; set it after
+        // construction so the panel keeps one plain `new()`.
+        app.problems.scope =
+            crate::widgets::problems::ProblemScope::from_config(&loaded_prefs.problems_scope);
         app.sync_focus_flags();
         // Seed the highlighter with the persisted theme's code palette so a
         // file opened before the first theme switch already highlights in the
@@ -7479,8 +7483,33 @@ impl App {
             .collect();
         paths.sort();
         paths.dedup();
+        // Scope (#256): Open Files keeps only paths with a live buffer, so the
+        // panel and the status-bar badge (which counts the same list) agree.
+        let open: std::collections::HashSet<PathBuf> =
+            if self.problems.scope == crate::widgets::problems::ProblemScope::OpenFiles {
+                self.editor
+                    .editors
+                    .iter()
+                    .chain(
+                        self.editor_layout
+                            .inactive_leaf_tabs()
+                            .into_iter()
+                            .flat_map(|g| g.editors.iter()),
+                    )
+                    .filter_map(|e| e.path.clone())
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+        let scoped_out = |p: &PathBuf| {
+            self.problems.scope == crate::widgets::problems::ProblemScope::OpenFiles
+                && !open.contains(p)
+        };
         let mut groups = Vec::new();
         for path in paths {
+            if scoped_out(path) {
+                continue;
+            }
             let mut items: Vec<ProblemItem> = Vec::new();
             if let Some(by_server) = self.lsp_diagnostics.get(path) {
                 for (server, diags) in by_server {
@@ -27706,6 +27735,14 @@ impl App {
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
             Cmd::ToggleMinimap => self.toggle_minimap(),
+            Cmd::ProblemsToggleScope => {
+                self.problems.scope = self.problems.scope.next();
+                // Rebuild rather than filter in the panel: the badge counts
+                // the same list, so both follow the scope from one place.
+                self.rebuild_problems();
+                self.refresh_problems_badge();
+                self.status = format!("Problems: {}", self.problems.scope.label());
+            }
             Cmd::DiffToggleIgnoreWhitespace => self.diff_cycle_whitespace_mode(),
             Cmd::NewTerminal => match self.split_terminal() {
                 Ok(()) => {

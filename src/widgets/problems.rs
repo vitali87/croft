@@ -77,6 +77,42 @@ enum RenderRow {
     Diag(usize, usize),
 }
 
+/// Which files the panel lists (#256). `OpenFiles` matches the pre-#256
+/// behaviour in spirit — only what the user has open — while `WholeProject`
+/// shows everything the servers and build tools have reported, including
+/// files that were never opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProblemScope {
+    /// Only files with an open buffer.
+    OpenFiles,
+    /// Every file any source has reported a diagnostic for.
+    #[default]
+    WholeProject,
+}
+
+impl ProblemScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenFiles => "Open Files",
+            Self::WholeProject => "Whole Project",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::OpenFiles => Self::WholeProject,
+            Self::WholeProject => Self::OpenFiles,
+        }
+    }
+
+    pub fn from_config(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "open" | "open_files" | "openfiles" => Self::OpenFiles,
+            _ => Self::WholeProject,
+        }
+    }
+}
+
 /// The severity filter applied to the list, cycled from the toolbar. `Warnings`
 /// keeps errors and warnings (VS Code's "Show Errors & Warnings"); `Errors`
 /// keeps only errors.
@@ -148,6 +184,10 @@ pub struct ProblemsPanel {
     /// Group diagnostics under a file header (VS Code default) or show a flat,
     /// file-annotated list. Toggled from the toolbar.
     group_by_file: bool,
+    /// Which files the list covers (#256). Filtering happens where the groups
+    /// are BUILT, not here, so the panel's counts and rows stay one
+    /// projection of one list; this field only records the choice.
+    pub scope: ProblemScope,
 
     pub focus_gradient: bool,
     pub theme: Theme,
@@ -176,6 +216,7 @@ impl ProblemsPanel {
             filter: ProblemFilter::All,
             text_filter: String::new(),
             group_by_file: true,
+            scope: ProblemScope::default(),
             focus_gradient: false,
             theme: Theme::default(),
             focused: false,
@@ -463,8 +504,17 @@ impl Widget for &mut ProblemsPanel {
         buf.set_style(area, Style::default().bg(self.theme.editor_bg()));
 
         if self.groups.is_empty() {
+            // Under Open Files the list is scoped, so "in the workspace" would
+            // be a lie: unopened files may well have errors. Say what was
+            // actually searched (#256).
+            let empty_msg = match self.scope {
+                ProblemScope::WholeProject => "No problems have been detected in the workspace.",
+                ProblemScope::OpenFiles => {
+                    "No problems in the open files. Switch scope to Whole Project to see the rest."
+                }
+            };
             Paragraph::new(Line::from(Span::styled(
-                "No problems have been detected in the workspace.",
+                empty_msg,
                 Style::default().fg(self.theme.ui(COLOR_DIM)),
             )))
             .render(
@@ -981,6 +1031,28 @@ mod tests {
         // Row 0 is the toolbar; the header sits at row 1 and has no diag below.
         assert_eq!(p.hit_at(2), None, "no diagnostic row when collapsed");
         assert_eq!(p.hit_at(1), Some(ProblemHit::Header(path)));
+    }
+
+    /// #256: with the list scoped to open files, an empty panel must not
+    /// claim the WORKSPACE is clean — unopened files may well have errors,
+    /// and that message would send the reader away believing there is
+    /// nothing to fix.
+    #[test]
+    fn the_empty_state_names_the_scope_it_actually_searched() {
+        let mut p = ProblemsPanel::new();
+        p.scope = ProblemScope::OpenFiles;
+        let text = render(&mut p, 90, 6);
+        assert!(
+            text.contains("open files"),
+            "scoped empty state must say so: {text:?}"
+        );
+        assert!(
+            !text.contains("in the workspace"),
+            "and must not claim the workspace is clean: {text:?}"
+        );
+        p.scope = ProblemScope::WholeProject;
+        let text = render(&mut p, 90, 6);
+        assert!(text.contains("workspace"), "unscoped keeps its wording");
     }
 
     #[test]
