@@ -176,6 +176,11 @@ pub enum VimAction {
     Search(SearchDir, String),
     /// Clear any pending operator/count and drop the visual selection.
     ClearPending,
+    /// `q{a-z}` — start recording into a register, or `q` while recording
+    /// stops it. The app owns the recording; the machine only routes the key.
+    MacroRecord(Option<char>),
+    /// `@{a-z}` with a count; `@@` replays the last macro (`None`).
+    MacroReplay(Option<char>, usize),
 }
 
 /// The outcome of feeding one key to the machine.
@@ -203,6 +208,16 @@ pub struct VimState {
     op_count: Option<usize>,
     /// `f`/`t`/`F`/`T` awaiting their target character.
     pending_find: Option<FindKind>,
+    /// `q` pressed in Normal mode, awaiting the register letter. Set only
+    /// when not already recording — a second `q` stops instead.
+    pending_record: bool,
+    /// The APP's recording state, pushed in by [`VimState::set_recording`]
+    /// after every change. Never written by the machine: `q` needs to know
+    /// whether it starts or stops, and a copy the machine maintained itself
+    /// drifted out of sync with the palette's recorder.
+    app_recording: bool,
+    /// `@` pressed, awaiting the register letter (or a second `@`).
+    pending_replay: bool,
     /// After an operator, `i`/`a` was pressed and we await the object char.
     /// `Some(true)` = inner (`i`), `Some(false)` = around (`a`).
     pending_textobj: Option<bool>,
@@ -227,6 +242,9 @@ impl Default for VimState {
             pending_op: None,
             op_count: None,
             pending_find: None,
+            pending_record: false,
+            app_recording: false,
+            pending_replay: false,
             pending_textobj: None,
             pending_g: false,
             cmdline: String::new(),
@@ -265,6 +283,17 @@ impl VimState {
             VimMode::Visual => Some("VISUAL"),
             VimMode::VisualLine => Some("V-LINE"),
             VimMode::Command | VimMode::Search => None,
+        }
+    }
+
+    /// Tell the machine whether a macro recording is live. The app calls
+    /// this after every start/stop from EITHER entry point (vim `q` or the
+    /// palette), so `q` always branches on the real state instead of a copy
+    /// the machine maintained for itself.
+    pub fn set_recording(&mut self, recording: bool) {
+        self.app_recording = recording;
+        if !recording {
+            self.pending_record = false;
         }
     }
 
@@ -313,6 +342,8 @@ impl VimState {
         self.pending_find = None;
         self.pending_textobj = None;
         self.pending_g = false;
+        self.pending_record = false;
+        self.pending_replay = false;
     }
 
     fn take_count(&mut self) -> usize {
@@ -434,6 +465,19 @@ impl VimState {
                 }]);
             }
             self.clear_pending();
+            return VimKeyResult::Consumed(vec![]);
+        }
+
+        // A pending register letter must consume the NEXT key whatever it is.
+        // The per-character handlers below only see plain `Char`s, so without
+        // this an arrow key after `q` returns at the motion arms and leaves
+        // `pending_record` set — the next letter would then silently start a
+        // recording the user never asked for. Vim aborts the gesture on a
+        // non-register key, so consume it and clear.
+        if (self.pending_record || self.pending_replay) && !matches!(key.code, KeyCode::Char(_)) {
+            self.pending_record = false;
+            self.pending_replay = false;
+            let _ = self.take_count();
             return VimKeyResult::Consumed(vec![]);
         }
 
@@ -582,6 +626,40 @@ impl VimState {
     }
 
     fn on_normal_char(&mut self, c: char) -> VimKeyResult {
+        // A pending register letter consumes the NEXT key whatever it is, so
+        // it must be read before digits and motions — `q1` names register
+        // `1`, it does not start a count.
+        if self.pending_record {
+            self.pending_record = false;
+            // Vim discards a count on `q`. Without this the pending count
+            // survives into the recording and silently retargets its FIRST
+            // key — `3qa` then `j` moves three rows, and the wrong motion is
+            // what gets captured. A user cannot see a pending count, so the
+            // corruption is invisible until replay.
+            let _ = self.take_count();
+            // Alphanumeric, not just a-z: `A-Z` and `0-9` are ordinary
+            // registers here. Vim reserves 0-9 as read-only yank registers
+            // and treats `qA` as append-to-`a`; croft's namespace is flat,
+            // so each names its own register.
+            if c.is_ascii_alphanumeric() {
+                return VimKeyResult::Consumed(vec![VimAction::MacroRecord(Some(c))]);
+            }
+            // Not a register name: swallow, like every other bad gesture.
+            return VimKeyResult::Consumed(vec![]);
+        }
+        if self.pending_replay {
+            self.pending_replay = false;
+            let count = self.take_count();
+            // `@@` repeats the last macro; `@{a-z}` names a register.
+            if c == '@' {
+                return VimKeyResult::Consumed(vec![VimAction::MacroReplay(None, count)]);
+            }
+            if c.is_ascii_alphanumeric() {
+                return VimKeyResult::Consumed(vec![VimAction::MacroReplay(Some(c), count)]);
+            }
+            return VimKeyResult::Consumed(vec![]);
+        }
+
         if c.is_ascii_digit() {
             if c == '0' && self.count.is_none() {
                 return self.resolve_motion(Motion::LineStart);
@@ -608,6 +686,25 @@ impl VimState {
                     None => Motion::FileEnd,
                 };
                 self.resolve_motion(m)
+            }
+            'q' => {
+                let _ = self.take_count();
+                // Vim's stop gesture is a BARE `q`, so whether this key needs
+                // a register letter depends on the app's recording state. The
+                // app pushes that in via `set_recording` rather than the
+                // machine keeping its own copy — mirroring it desynchronised
+                // the two entry points, so a palette Stop left vim believing
+                // it was still recording.
+                if self.app_recording {
+                    VimKeyResult::Consumed(vec![VimAction::MacroRecord(None)])
+                } else {
+                    self.pending_record = true;
+                    VimKeyResult::Consumed(vec![])
+                }
+            }
+            '@' => {
+                self.pending_replay = true;
+                VimKeyResult::Consumed(vec![])
             }
             'g' => {
                 self.pending_g = true;

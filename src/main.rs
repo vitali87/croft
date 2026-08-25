@@ -26,6 +26,7 @@ mod keymap;
 mod launcher;
 mod log_view;
 mod lsp;
+mod macros;
 mod magic;
 mod markdown;
 mod mcp;
