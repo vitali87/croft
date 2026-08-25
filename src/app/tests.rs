@@ -30615,3 +30615,140 @@ fn editing_drops_stale_document_links() {
         "the edit dropped the stale ranges"
     );
 }
+
+/// #256 step 1: a server that publishes project-wide diagnostics (rust-analyzer
+/// does this from `cargo check`) names files the user never opened. The panel
+/// builds from the diagnostics store rather than from open buffers, so those
+/// rows DO appear — this pins that half, which the issue lists as unverified.
+#[test]
+fn problems_shows_diagnostics_for_a_file_that_was_never_opened() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let opened = tmp.path().join("opened.rs");
+    let never = tmp.path().join("never_opened.rs");
+    std::fs::write(&opened, "fn main() {}\n").unwrap();
+    std::fs::write(&never, "fn helper() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&opened).unwrap();
+
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("rust-analyzer"),
+        vec![diag(0, 4, DiagnosticSeverity::Error)],
+    );
+    app.lsp_diagnostics.insert(never.clone(), by_server);
+    app.rebuild_problems();
+
+    let paths: Vec<_> = app.problems.groups().iter().map(|g| &g.path).collect();
+    assert!(
+        paths.contains(&&never),
+        "a diagnostic for an unopened file must still reach PROBLEMS"
+    );
+}
+
+/// #256: the scope toggle changes which files the panel lists, and the badge
+/// counts the same list — both read one projection, so they cannot disagree.
+#[test]
+fn problems_scope_toggle_filters_unopened_files_and_the_badge_follows() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    use crate::widgets::problems::ProblemScope;
+    let tmp = tempfile::tempdir().unwrap();
+    let opened = tmp.path().join("opened.rs");
+    let never = tmp.path().join("never_opened.rs");
+    std::fs::write(&opened, "fn main() {}\n").unwrap();
+    std::fs::write(&never, "fn helper() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&opened).unwrap();
+
+    for p in [&opened, &never] {
+        let mut by_server = std::collections::HashMap::new();
+        by_server.insert(
+            String::from("rust-analyzer"),
+            vec![diag(0, 4, DiagnosticSeverity::Error)],
+        );
+        app.lsp_diagnostics.insert(p.clone(), by_server);
+    }
+
+    app.problems.scope = ProblemScope::WholeProject;
+    app.rebuild_problems();
+    assert_eq!(
+        app.problems.groups().len(),
+        2,
+        "whole project lists the unopened file too"
+    );
+    let whole_count = app.problems.total_count();
+
+    app.problems.scope = ProblemScope::OpenFiles;
+    app.rebuild_problems();
+    let paths: Vec<_> = app.problems.groups().iter().map(|g| &g.path).collect();
+    assert_eq!(paths, vec![&opened], "open files drops the unopened one");
+    assert!(
+        app.problems.total_count() < whole_count,
+        "the badge counts the same filtered list"
+    );
+}
+
+/// #296 review: Open Files scope filters on the open-buffer set, so the panel
+/// must refresh when that set changes — not only when diagnostics do.
+/// Previously `rebuild_problems` ran on diagnostic events alone, so opening a
+/// file that already had stored diagnostics showed NOTHING until some
+/// unrelated churn happened to trigger a rebuild.
+#[test]
+fn opening_a_file_refreshes_a_scoped_problems_panel() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    use crate::widgets::problems::ProblemScope;
+    let tmp = tempfile::tempdir().unwrap();
+    let later = tmp.path().join("later.rs");
+    std::fs::write(&later, "fn helper() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.problems.scope = ProblemScope::OpenFiles;
+
+    // A diagnostic arrives for a file that is not open yet.
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("rust-analyzer"),
+        vec![diag(0, 4, DiagnosticSeverity::Error)],
+    );
+    app.lsp_diagnostics.insert(later.clone(), by_server);
+    app.rebuild_problems();
+    assert!(
+        app.problems.groups().is_empty(),
+        "not open yet, so Open Files scope hides it"
+    );
+
+    // Opening it must bring the row in WITHOUT any new diagnostic push.
+    app.editor.open_pinned(&later).unwrap();
+    app.sync_lsp();
+    let paths: Vec<_> = app.problems.groups().iter().map(|g| &g.path).collect();
+    assert!(
+        paths.contains(&&later),
+        "opening the file refreshes the scoped panel"
+    );
+}
+
+/// The config token round-trips: writing a scope back and reading it must
+/// yield the same scope. `label()` is display text, so using it here would
+/// produce a value `from_config` only accepts by accident.
+#[test]
+fn problem_scope_config_tokens_round_trip() {
+    use crate::widgets::problems::ProblemScope;
+    for scope in [ProblemScope::OpenFiles, ProblemScope::WholeProject] {
+        assert_eq!(
+            ProblemScope::from_config(scope.to_config()),
+            scope,
+            "{} must survive a save/load cycle",
+            scope.to_config()
+        );
+    }
+    // The palette label pasted into a config is understood, not silently
+    // treated as an unrecognised value.
+    assert_eq!(
+        ProblemScope::from_config("Open Files"),
+        ProblemScope::OpenFiles
+    );
+    // Anything genuinely unrecognised shows more rather than hiding rows.
+    assert_eq!(
+        ProblemScope::from_config("nonsense"),
+        ProblemScope::WholeProject
+    );
+}

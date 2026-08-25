@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Keyboard macros: record a burst of editing and replay it, with vim's q/@ registers or from the Command Palette. Counts work (3@a), one iteration never merges into the next, and named registers persist across restarts — the VS Code request open since 2016.",
+    summary: "PROBLEMS can show the whole project: diagnostics for files you never opened now appear, and a scope toggle switches between Open Files and Whole Project — the status-bar count follows whichever you pick.",
 }];

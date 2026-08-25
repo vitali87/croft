@@ -129,6 +129,12 @@ pub struct Prefs {
     /// Visibility of the Explorer's stacked sub-views (⋯ menu toggles).
     #[serde(default)]
     pub explorer_views: ExplorerViewsPrefs,
+    /// Which files the PROBLEMS panel lists (#256): `whole_project` (default,
+    /// every file a server or build tool reported) or `open_files`.
+    /// Unrecognised values read as `whole_project`, so a typo shows more
+    /// rather than silently hiding diagnostics.
+    #[serde(default)]
+    pub problems_scope: String,
     /// Default whitespace handling for new diff views: `off` (every byte
     /// counts), `leading` (ignore indentation changes), or `all` (ignore every
     /// whitespace-only difference). Unrecognised values read as `off`, so a
@@ -397,6 +403,15 @@ pub fn save_auto_save_on_focus_change(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.auto_save_on_focus_change = enabled;
+    prefs.save(&path)
+}
+
+/// Persist the PROBLEMS scope (#256), preserving other settings.
+/// Best-effort, like [`save_auto_save`].
+pub fn save_problems_scope(mode: &str) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.problems_scope = mode.to_string();
     prefs.save(&path)
 }
 
