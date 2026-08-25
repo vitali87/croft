@@ -73,3 +73,23 @@ Two habits that avoid the common collisions:
 * **Never rewrite a branch you do not hold.** No force-pushes to another
   session's PR. If a branch needs main, merge main into it — that is the
   convention here, and it keeps the push a fast-forward.
+
+## Verifying a review actually happened
+
+Before merging on a bot review, confirm the review ARTIFACT exists rather than
+trusting an aggregate signal. CodeRabbit's check on this repo has reported
+`pass` while annotated "Review rate limited" — a green row meaning no review
+happened at all. Zero unresolved threads reads the same whether the bot found
+nothing or never ran, and a bot that edits its summary comment in place makes
+any earlier read stale.
+
+Query both `.comments[]` and `.reviews[]`: they carry different artifacts, not
+duplicates, and an entry can be present with an empty body — a container for
+inline threads rather than a verdict. Require the body to be non-empty *and* to
+carry the verdict you are looking for; presence alone is not evidence.
+
+Anchor it to the head SHA. If the artifact names a commit other than the head
+you are about to merge, the review is stale and does not count, however good it
+looks. A stale review and a missing review have the same consequence: do not
+merge yet. "No review yet" and "reviewed and clean" must never collapse into the
+same verdict.
