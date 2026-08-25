@@ -20,7 +20,23 @@ pub struct PaneRecord {
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The pane's visible output at save time, replayed above the fresh
+    /// prompt so a restored pane is not blank (#249).
+    ///
+    /// Plain text, not the raw byte stream: colours and cursor state are
+    /// lost, but a transcript cannot re-run an escape sequence that moves
+    /// the cursor or clears the screen, and it costs a bounded number of
+    /// lines rather than an unbounded byte log. Empty (and omitted from the
+    /// file) when the pane had no output worth carrying, so an older store
+    /// still parses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript: Vec<String>,
 }
+
+/// How many trailing lines of a pane's output are carried across a restart.
+/// One screenful of context is the point — enough to see what you were doing
+/// — without turning the session store into a log file.
+pub const TRANSCRIPT_LINES: usize = 200;
 
 /// A workspace's terminal panel layout.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -33,6 +49,14 @@ pub struct SessionRecord {
 impl SessionRecord {
     /// The default layout every workspace starts with; storing it would be
     /// noise, so [`save_for_root`] prunes it instead.
+    ///
+    /// Transcripts (#249) deliberately do NOT make a record non-trivial. A
+    /// lone unnamed pane at the root is what every workspace starts with, so
+    /// keeping it for its output would grow the store for every directory
+    /// the user ever ran a shell in — including throwaway ones. The
+    /// restore-my-output case that matters is a real panel: two or more
+    /// panes, or a pane the user bothered to name. Those are kept, with
+    /// their transcripts.
     pub fn is_trivial(&self, root: &str) -> bool {
         match self.panes.as_slice() {
             [] => true,
@@ -112,6 +136,7 @@ mod tests {
             panes: vec![PaneRecord {
                 cwd: String::from("/w/a/sub"),
                 name: Some(String::from("srv")),
+                transcript: Vec::new(),
             }],
             active: 0,
         };
@@ -139,10 +164,12 @@ mod tests {
                 PaneRecord {
                     cwd: String::from("/repo"),
                     name: None,
+                    transcript: Vec::new(),
                 },
                 PaneRecord {
                     cwd: String::from("/repo/sub"),
                     name: Some(String::from("srv")),
+                    transcript: Vec::new(),
                 },
             ],
             active: 1,
@@ -159,6 +186,7 @@ mod tests {
                 panes: vec![PaneRecord {
                     cwd: String::from("/repo"),
                     name: None,
+                    transcript: Vec::new(),
                 }],
                 active: 0,
             },

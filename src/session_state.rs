@@ -19,8 +19,13 @@ pub struct OpenTabState {
 }
 
 /// The slice of running-croft state worth carrying across a self-re-exec.
-/// Embedded terminal panes are intentionally absent: a plain `execve`
-/// cannot re-adopt croft's child shells, so they reset on relaunch.
+///
+/// Terminal panes are deliberately ABSENT, and that is not an oversight: the
+/// per-workspace terminal store (`save_terminal_session` /
+/// `restore_terminal_session`) already records pane cwds AND names, is written
+/// before the re-exec, and is replayed at startup ahead of this handoff.
+/// Duplicating panes here would append a second copy on top of the ones that
+/// store already restored (#249 review).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
     pub workspace_root: PathBuf,
@@ -115,6 +120,28 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .starts_with("session-")
+        );
+    }
+
+    /// #249: the handoff must NOT carry terminal panes. The per-workspace
+    /// store already restores them (with names) and runs first at startup, so
+    /// panes here would be appended on top of those — 2 panes becoming 3.
+    /// Serialising the struct and asserting the key is absent pins that.
+    #[test]
+    fn the_handoff_does_not_carry_terminal_panes() {
+        let state = SessionState {
+            workspace_root: PathBuf::from("/work/repo"),
+            tabs: Vec::new(),
+            active_tab: 0,
+            sidebar_view: String::from("Explorer"),
+            sidebar_width: 32,
+            terminal_height: None,
+            focus_editor: true,
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        assert!(
+            !json.contains("terminals"),
+            "panes belong to the per-workspace store, not the handoff: {json}"
         );
     }
 }
