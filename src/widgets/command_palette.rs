@@ -360,7 +360,7 @@ impl Command {
             Command::IndentationToTabs => "Convert Indentation to Tabs",
             Command::TrimFinalNewlines => "Trim Final Newlines",
             Command::FormatDocument => "Format Document",
-            Command::ToggleFormatOnType => "Editor: Toggle Format on Type",
+            Command::ToggleFormatOnType => "Preferences: Toggle Format on Type",
             Command::ToggleFormatOnSave => "Preferences: Toggle Format on Save",
             Command::QuickFix => "Quick Fix",
             Command::ToggleFold => "Toggle Fold",

@@ -835,6 +835,16 @@ enum UpdateStatus {
     Ready,
 }
 
+/// What to do with one on-type formatting reply (#254). `NotOurs` leaves the
+/// armed request alone — a superseded reply must not disarm the newer one
+/// still in flight — while `Stale` and `Apply` both consume it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OnTypeReply {
+    NotOurs,
+    Stale,
+    Apply,
+}
+
 /// Rotating-arc frames for the in-progress update glyph. Cycled to read as a
 /// spinning circular arrow, the universal "working" indicator.
 const UPDATE_SPINNER_FRAMES: [&str; 6] = [
@@ -8213,16 +8223,13 @@ impl App {
         // A keystroke and a tab switch can arrive in the same input burst,
         // draining before this tick runs — the record is then armed on a tab
         // that is no longer active, and nothing else ever clears it. Sweep
-        // every editor (the active one is already drained by the `take`) so
-        // a trigger can only ever fire from the tab that was active at its
-        // tick.
-        for ed in &mut self.editor.editors {
+        // every editor in every group (the active one is already drained by
+        // the `take` above) so a trigger can only ever fire from the tab
+        // that was active at its tick.
+        let groups =
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        for ed in groups.flat_map(|g| g.editors.iter_mut()) {
             ed.last_typed = None;
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in &mut group.editors {
-                ed.last_typed = None;
-            }
         }
         let Some((ch, seq)) = taken else {
             return;
@@ -8268,6 +8275,39 @@ impl App {
         self.on_type_request = Some((id, seq, path));
     }
 
+    /// What to do with one on-type formatting reply. Extracted from the
+    /// drain loop so the three-way decision is testable without a live
+    /// server: the channel's sender lives inside the LSP worker, so a test
+    /// cannot inject a `FormatResult` through it.
+    fn on_type_reply_disposition(
+        &self,
+        result: &crate::lsp::manager::FormatResult,
+    ) -> OnTypeReply {
+        let Some((id, seq, ref requested)) = self.on_type_request else {
+            return OnTypeReply::NotOurs;
+        };
+        // A superseded reply must NOT clear the armed request: a newer one
+        // is in flight and its own reply still has to apply.
+        if result.request_id != id {
+            return OnTypeReply::NotOurs;
+        }
+        // `edit_seq` is per-tab, so the counter comparison only means
+        // "buffer unchanged" when the active tab is still the one the
+        // request was computed against — require the path to match too.
+        // Content-unchanged is also the whole test on purpose: caret-only
+        // motion (arrow keys, auto-pair type-over) leaves the counter
+        // alone, and that is correct — the server's edits are document
+        // edits computed against text that is still byte-identical, so
+        // they apply cleanly wherever the caret has wandered.
+        if self.editor.edit_seq != seq
+            || requested != &result.path
+            || self.editor.path.as_deref() != Some(result.path.as_path())
+        {
+            return OnTypeReply::Stale;
+        }
+        OnTypeReply::Apply
+    }
+
     /// Apply an on-type formatting reply — quietly, and only while the
     /// buffer has not moved since the request (the edits were computed
     /// against exactly that text; continued typing makes them stale).
@@ -8283,26 +8323,13 @@ impl App {
         }
         let mut changed = false;
         for result in results {
-            let Some((id, seq, ref requested)) = self.on_type_request else {
-                continue;
-            };
-            if result.request_id != id {
-                continue;
-            }
-            // `edit_seq` is per-tab, so the counter comparison only means
-            // "buffer unchanged" when the active tab is still the one the
-            // request was computed against — require the path to match too.
-            // Content-unchanged is also the whole test on purpose: caret-only
-            // motion (arrow keys, auto-pair type-over) leaves the counter
-            // alone, and that is correct — the server's edits are document
-            // edits computed against text that is still byte-identical, so
-            // they apply cleanly wherever the caret has wandered.
-            let stale = self.editor.edit_seq != seq
-                || requested != &result.path
-                || self.editor.path.as_deref() != Some(result.path.as_path());
-            self.on_type_request = None;
-            if stale {
-                continue;
+            match self.on_type_reply_disposition(&result) {
+                OnTypeReply::NotOurs => continue,
+                OnTypeReply::Stale => {
+                    self.on_type_request = None;
+                    continue;
+                }
+                OnTypeReply::Apply => self.on_type_request = None,
             }
             if let Some(edits) = result.edits.filter(|e| !e.is_empty())
                 && self

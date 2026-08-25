@@ -5310,6 +5310,10 @@ impl Editor {
     }
 
     /// Insert a character at every caret. One undo step.
+    ///
+    /// Deliberately does not set `last_typed`: an on-type formatting reply
+    /// (#254) is computed at ONE position and would be wrong at the other
+    /// carets, so multi-cursor typing never arms the trigger.
     pub fn multi_insert_char(&mut self, c: char) {
         self.multi_apply(CaretEdit::Insert(c));
     }
@@ -12077,6 +12081,12 @@ mod tests {
         let before = e.last_typed;
         e.insert_str("let x = 1;");
         assert_eq!(e.last_typed, before, "paste must not count as typing");
+        e.multi_insert_char(';');
+        assert_eq!(
+            e.last_typed, before,
+            "multi-cursor typing must not arm the trigger: one reply cannot \
+             be right at every caret"
+        );
         assert_ne!(
             e.last_typed.unwrap().1,
             e.edit_seq,

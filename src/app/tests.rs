@@ -29043,6 +29043,24 @@ fn a_tab_switch_disarms_the_background_tabs_on_type_trigger() {
         "the sweep disarms background tabs — returning to one must not \
          replay the pre-switch keystroke"
     );
+
+    // Same hazard one level out: the typing tab is in a split group that
+    // loses focus before the tick runs.
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.last_typed.is_some(), "keystroke recorded again");
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    assert_eq!(app.editor_layout.leaf_count(), 2, "really split");
+    app.tick_on_type_formatting();
+    let armed = app
+        .editor_layout
+        .inactive_groups_mut()
+        .iter()
+        .any(|g| g.editors.iter().any(|e| e.last_typed.is_some()));
+    assert!(
+        !armed,
+        "the sweep reaches editors in inactive split groups too"
+    );
 }
 
 #[test]
@@ -29063,6 +29081,77 @@ fn a_settings_reload_applies_format_on_type_live() {
     assert!(app.format_on_type, "a reloaded merge turns it on");
     app.apply_merged_settings(&crate::prefs::Prefs::default());
     assert!(!app.format_on_type, "and back off");
+}
+
+#[test]
+fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
+    // The four dispositions of a reply. The channel's sender lives in the
+    // LSP worker, so the decision is tested through the pure helper the
+    // drain loop delegates to.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn a() {\n}\n").unwrap();
+    std::fs::write(&b, "fn b() {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    let reply = |id: u64, path: &std::path::Path| crate::lsp::manager::FormatResult {
+        request_id: id,
+        path: path.to_path_buf(),
+        edits: Some(Vec::new()),
+        unsupported: false,
+    };
+
+    // Nothing armed: any reply is a leftover.
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(1, &a)),
+        OnTypeReply::NotOurs
+    );
+
+    // Armed and everything matches.
+    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &a)),
+        OnTypeReply::Apply
+    );
+
+    // A superseded id must NOT disarm the newer in-flight request.
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(6, &a)),
+        OnTypeReply::NotOurs,
+        "an older reply is ignored without consuming the armed request"
+    );
+    assert!(
+        app.on_type_request.is_some(),
+        "the helper never clears; the newer request stays armed"
+    );
+
+    // Buffer moved since the request.
+    app.on_type_request = Some((7, app.editor.edit_seq.wrapping_sub(1), a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &a)),
+        OnTypeReply::Stale,
+        "edits computed against text that has since changed are dropped"
+    );
+
+    // Reply is for a different file than the one requested.
+    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &b)),
+        OnTypeReply::Stale,
+        "a reply for another path never applies to this tab"
+    );
+
+    // The requested tab is no longer active: edit_seq is per-tab, so the
+    // counter alone would compare two unrelated buffers.
+    app.editor.open_pinned(&b).unwrap();
+    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    assert_eq!(
+        app.on_type_reply_disposition(&reply(7, &a)),
+        OnTypeReply::Stale,
+        "the tab that typed must still be the active one"
+    );
 }
 
 #[test]
