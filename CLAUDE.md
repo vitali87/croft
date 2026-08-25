@@ -18,35 +18,39 @@ anyway, ask the holder first and the user if you cannot reach them.
 
 **When you start work, add the label. When you stop, remove it.**
 
+Where to put it: **label the issue when you claim it, and label the PR too once
+you open one.** Both, not one or the other — sessions look for work in the
+**issue** list, so an issue whose claim sits only on a PR reads as unclaimed to
+everyone scanning `gh issue list`. That is the collision this label exists to
+prevent: it happened on #249, and came close on #260 with two sessions building
+the same feature in parallel.
+
 ```bash
-gh pr view <n> --json labels --jq '[.labels[].name]'   # check first
-gh pr edit <n> --add-label claimed                     # claiming
-gh pr edit <n> --remove-label claimed                  # done, or handing off
+gh issue view <n> --json labels --jq '[.labels[].name]'   # check first
+gh issue edit <n> --add-label claimed                     # claiming
+gh issue edit <n> --remove-label claimed                  # done, or handing off
+
+gh pr view <n> --json labels --jq '[.labels[].name]'      # and the same for
+gh pr edit <n> --add-label claimed                        # the PR, once it
+gh pr edit <n> --remove-label claimed                     # exists
 ```
 
-Use `gh issue view` / `gh issue edit` for issues. To see everything currently
-claimed: `gh pr list --label claimed` and `gh issue list --label claimed`.
-
-Where to put it: **label the issue when you claim it, and label the PR too once
-you open one.** Both, not one or the other.
-
-An earlier version of this rule said to *move* the claim to the PR, on the
-grounds that the PR is where the contended work happens. That is true and it is
-not the point: sessions look for work in the **issue** list. An issue whose
-claim moved to a PR reads as unclaimed to everyone scanning `gh issue list`,
-which is precisely the collision this label exists to prevent — it happened on
-#249, and came close on #260 with two sessions building the same feature in
-parallel. Labelling the PR as well costs one extra command; leaving the issue
-bare costs somebody their afternoon.
+To see everything currently claimed: `gh issue list --label claimed` and
+`gh pr list --label claimed`.
 
 ### Releasing it
 
 The label is a lock, and a lock nobody releases is worse than no lock. Remove it
-when you merge, when you stop working, and when you hand off. Merging usually
-deletes the branch but **not** the label, so drop it as part of the merge —
-**from the issue as well as the PR**, since you claimed both. A merged PR is
-self-evidently done; a closed issue still wearing `claimed` is just noise in the
-next session's `gh issue list --label claimed`.
+when you merge, when you stop working, and when you hand off — and **from both
+the issue and the PR**, since you claimed both. Merging usually deletes the
+branch but **not** either label, so make it part of the merge; abandoning a
+branch deletes nothing at all, which makes it the case most likely to leave a
+lock behind.
+
+Release the issue when the **issue** is done, not when one of its PRs merges.
+An issue with several PRs against it is still claimed while any of them is in
+flight, and unlabelling it on the first merge hands it to the next scanner
+while somebody is still working it.
 
 The two failure modes are not symmetric, which is why releasing belongs in the
 merge rather than in a follow-up step: forgetting to *claim* costs you one
