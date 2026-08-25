@@ -5,6 +5,10 @@ Thanks for hacking on croft. Build, run, and platform setup live in the
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). This guide covers the day to day
 developer workflow concerns that do not belong in any of those.
 
+If you are an AI agent, read [CLAUDE.md](CLAUDE.md) as well: it covers claiming
+work so concurrent sessions do not collide, and verifying that a review actually
+happened before merging. Everything in this guide applies to you too.
+
 ## Every shipped change is a release
 
 A PR that changes anything compiled into the binary (`src/`, `assets/`,

@@ -39,8 +39,7 @@ deletes the branch but **not** the label, so drop it as part of the merge.
 
 The two failure modes are not symmetric, which is why releasing belongs in the
 merge rather than in a follow-up step: forgetting to *claim* costs you one
-possible collision, while forgetting to *release* blocks the work indefinitely,
-and nothing about an abandoned claim distinguishes it from an active one.
+possible collision, while forgetting to *release* blocks the work indefinitely.
 
 It deliberately records no owner, so it cannot tell you *who* holds a claim or
 *when* they took it. That keeps it cheap, at the cost of being unable to
@@ -91,10 +90,12 @@ carry the verdict you are looking for; presence alone is not evidence.
 **Filter on content, not on author.** It is tempting to just exclude the PR
 author, since their inline replies land there as empty entries and make a PR
 look more reviewed the more diligently its author answers feedback. But that is
-not sufficient: on one measured PR, excluding the author left 23 entries of
-which 17 were still empty bot containers — roughly a fourfold overstatement
-against the 6 entries that actually carried content. Author-exclusion narrows
-the error; only requiring a non-empty body with the verdict token removes it.
+not sufficient: on one measured PR (`code-graph-rag#1425`), excluding the author
+still left about three quarters of the remaining entries as empty bot
+containers — a roughly fourfold overstatement against the entries that actually
+carried content. Author-exclusion narrows the error; only requiring a non-empty
+body with the verdict token removes it. Counts drift as new reviews land, so
+re-run the query rather than trusting these proportions.
 
 And do not assume the shape is stable: the same bots on the same repo produce an
 empty `reviews[]` on one PR and dozens of entries on another, so "here the
