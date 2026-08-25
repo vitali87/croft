@@ -360,6 +360,7 @@ pub fn to_markdown(path: &Path, info: &MediaInfo, scratch: &Path) -> String {
 
 fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
     use std::hash::{Hash as _, Hasher as _};
+    use std::process::{Command, Stdio};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);
     let meta = std::fs::metadata(path).ok()?;
@@ -384,16 +385,16 @@ fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
     // Bounded (#202 review): poll with try_wait and kill+reap on the
     // deadline, so a wedged ffmpeg cannot stall the open. First open of
     // a given video only - the poster is hash-cached thereafter.
-    let mut child = std::process::Command::new("ffmpeg")
+    let mut child = Command::new("ffmpeg")
         .args(["-y", "-loglevel", "quiet", "-ss", "1", "-i"])
         .arg(path)
         .args(["-frames:v", "1"])
         .arg(&tmp)
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
         // Never the inherited tty: this runs mid-session, and anything a
         // child writes there paints raw bytes over the TUI frame.
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .ok()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);

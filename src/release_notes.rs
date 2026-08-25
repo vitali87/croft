@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Close All now means all: the tab context menu's Close All (and Cmd+K W) closes the tabs in every split group and collapses the layout to a single pane. It used to empty only the clicked group, which then collapsed away — looking like a single tab closed.",
+    summary: "Child processes stay off the screen: the ffmpeg that grabs a video poster frame can no longer paint raw bytes over the editor, and a failed remote drag-drop setup now reports ssh's own error instead of a bare exit code.",
 }];
