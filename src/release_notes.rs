@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "PROBLEMS can show the whole project: diagnostics for files you never opened now appear, and a scope toggle switches between Open Files and Whole Project — the status-bar count follows whichever you pick.",
+    summary: "Your config follows you over SSH: keybindings, snippets, triggers and matchers are pushed to a remote when you connect, so a fresh box is not a stock croft. MCP consent deliberately stays behind and must be granted per machine.",
 }];
