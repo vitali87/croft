@@ -30399,10 +30399,19 @@ impl App {
                 // the count stays right. The early return below skips the
                 // built-in branch that would have recorded, so the dispatch
                 // has to keep the tracker itself: clear on a fired double
-                // (or a third click re-fires it), RECORD on a fired single
-                // (or a `click` binding starves the `double_click` binding
-                // beside it — `is_double` could never become true again).
+                // (or a third click re-fires it), record on a fired UNMODIFIED
+                // single (or a `click` binding starves the `double_click`
+                // binding beside it — `is_double` could never become true).
+                //
+                // Unmodified only, because the built-ins that read these
+                // trackers do not consult modifiers. Recording a ctrl+click
+                // would arm the editor's plain double-click, and the user's
+                // next ordinary click would select a word they never asked
+                // for. Bare clicks are reserved in `editor`/`terminal`, so
+                // the record here only ever matters for `file_tree` and
+                // `tab_strip`, which is exactly where it is needed.
                 let now = std::time::Instant::now();
+                let unmodified = gesture.mods.is_empty();
                 let tracker = match ctx {
                     crate::keymap::MouseContext::Terminal => &mut self.terminal_click,
                     crate::keymap::MouseContext::FileTree => &mut self.tree_click,
@@ -30410,7 +30419,9 @@ impl App {
                 };
                 match gesture.kind {
                     crate::keymap::GestureKind::DoubleClick => tracker.clear(),
-                    crate::keymap::GestureKind::Click => tracker.record(now, m.column, m.row),
+                    crate::keymap::GestureKind::Click if unmodified => {
+                        tracker.record(now, m.column, m.row)
+                    }
                     _ => {}
                 }
                 // Position-carrying commands read the click through this,
@@ -33167,20 +33178,7 @@ impl App {
             for w in &warns {
                 crate::output::push("Keybindings", crate::output::OutputLevel::Warn, w);
             }
-            self.status = if warns.is_empty() {
-                String::from(
-                    "Keybindings reloaded (for new Cmd chords, re-run croft setup-iterm2 / setup-ghostty)",
-                )
-            } else {
-                // One assignment: a second unconditional one below used to
-                // clobber this, so the user never saw the warning count and
-                // a refused row looked like croft ignoring them.
-                format!(
-                    "Keybindings reloaded with {} warning{} — see OUTPUT · Keybindings",
-                    warns.len(),
-                    if warns.len() == 1 { "" } else { "s" }
-                )
-            };
+            self.status = keybindings_reload_status(&warns);
         } else if path == crate::snippets::snippets_path() {
             self.snippets = crate::snippets::SnippetSet::load(path);
             self.status = String::from("Snippets reloaded");
@@ -37738,6 +37736,30 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
 /// or a raw `Ctrl+B` control byte arrives on a remote Linux session. SHIFT
 /// and ALT must not be held, so it never collides with a future bracketed
 /// or word-motion chord on `b`.
+/// The status line shown after a keybindings reload.
+///
+/// Split out of `reload_config_for_path` so it can be tested against a keymap
+/// built in memory. The alternative — a test that writes the real
+/// `~/.config/croft/keybindings.json` — would leak into every one of the
+/// thousands of concurrent tests that construct an `App`, since `App::new`
+/// loads that path unconditionally.
+fn keybindings_reload_status(warns: &[String]) -> String {
+    if warns.is_empty() {
+        String::from(
+            "Keybindings reloaded (for new Cmd chords, re-run croft setup-iterm2 / setup-ghostty)",
+        )
+    } else {
+        // One assignment: a second unconditional one below used to clobber
+        // this, so the user never saw the warning count and a refused row
+        // looked like croft ignoring them.
+        format!(
+            "Keybindings reloaded with {} warning{} — see OUTPUT · Keybindings",
+            warns.len(),
+            if warns.len() == 1 { "" } else { "s" }
+        )
+    }
+}
+
 fn is_sidebar_toggle_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;

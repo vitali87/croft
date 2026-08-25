@@ -1523,39 +1523,71 @@ fn mouse(
     }
 }
 
-#[test]
-fn reloading_keybindings_with_a_refused_row_puts_the_count_in_the_status() {
-    // Drives the real reload path. The previous version of this test never
-    // touched `app.status` or `reload_config_for_path` despite its name, so
-    // it passed with the clobber bug reintroduced — a test that could not
-    // fail for the reason it existed.
+/// A tree app, rendered, so `tree.last_area` is populated and a click can be
+/// aimed at a real cell.
+fn tree_app_with_keymap(json: &str) -> (App, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "let name = value;\nfn main() {}\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let kb = crate::keymap::keybindings_path();
-    let Some(dir) = kb.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(dir).is_err() {
-        return; // no writable config dir in this environment
-    }
-    let restore = std::fs::read_to_string(&kb).ok();
-    std::fs::write(&kb, r#"[{"key": "click", "command": "save_file"}]"#).unwrap();
+    // An open buffer, so a click in the editor region resolves to it. Without
+    // one there is no editor to hit and the gesture falls through.
+    app.editor.open_pinned(&f).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(json);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    (app, tmp)
+}
 
-    app.reload_config_for_path(&kb);
-    let status = app.status.clone();
+#[test]
+fn a_bound_gesture_runs_its_command() {
+    // The headline claim of #259, driven end to end: a gesture in
+    // keybindings.json reaches `run_command`. Everything else in this file
+    // tested the parser or the tracker in isolation.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+click", "command": "quick_open", "when": "editor"}]"#,
+    );
+    assert!(app.file_finder.is_none(), "nothing open yet");
 
-    // Put the user's file back before asserting, so a failure cannot leave
-    // their real keybindings replaced.
-    match restore {
-        Some(prev) => std::fs::write(&kb, prev).unwrap(),
-        None => {
-            let _ = std::fs::remove_file(&kb);
-        }
-    }
+    let col = app.editor.last_inner.x + 4;
+    let row = app.editor.last_inner.y + 1;
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
 
     assert!(
-        status.contains("warning"),
-        "a refused row must reach the status bar, got {status:?}"
+        app.file_finder.is_some(),
+        "the bound command must run, taking the gesture over from its built-in"
+    );
+}
+
+#[test]
+fn a_gesture_runs_the_binding_for_the_region_it_was_clicked_in() {
+    // The same spelling bound in two regions must resolve by where the click
+    // landed, which is what `mouse_context_for` exists for.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+click", "command": "quick_open", "when": "file_tree"},
+            {"key": "ctrl+click", "command": "toggle_side_bar", "when": "editor"}]"#,
+    );
+
+    let mut in_tree = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        app.tree.last_area.x + 2,
+        app.tree.last_area.y + 1,
+    );
+    in_tree.modifiers = KeyModifiers::CONTROL;
+    let tree_was = app.show_tree;
+    app.handle_mouse(in_tree);
+    assert!(
+        app.file_finder.is_some(),
+        "a click in the tree runs the file_tree row"
+    );
+    assert_eq!(
+        app.show_tree, tree_was,
+        "and must not run the editor row bound to the same spelling"
     );
 }
 
@@ -1563,24 +1595,91 @@ fn reloading_keybindings_with_a_refused_row_puts_the_count_in_the_status() {
 fn a_click_binding_does_not_disable_the_double_click_binding_beside_it() {
     // The dispatch returns early, skipping the built-in branch that would
     // have recorded the click. Without recording it itself, a firing `click`
-    // binding leaves `is_double` permanently false and the `double_click`
-    // binding beside it never fires again.
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.keymap = crate::keymap::Keymap::from_json(
+    // binding leaves `is_double` false forever and the `double_click` binding
+    // beside it never fires again.
+    //
+    // Driven through `handle_mouse`: the previous version of this test called
+    // `tree_click.record` itself and asserted `is_double`, which is a
+    // tautology about `ClickTracker` that passes with the fix reverted.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
         r#"[{"key": "click", "command": "save_file", "when": "file_tree"},
             {"key": "double_click", "command": "quick_open", "when": "file_tree"}]"#,
     );
-    assert!(app.keymap.has_mouse_bindings(), "both rows bound");
+    let col = app.tree.last_area.x + 2;
+    let row = app.tree.last_area.y + 1;
 
-    let now = std::time::Instant::now();
-    // A fired single-click binding must leave the tracker armed, exactly as
-    // the built-in's own `record` would have.
-    app.tree_click.record(now, 4, 4);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
     assert!(
-        app.tree_click.is_double(now, 4, 4),
-        "a recorded click arms the double; without the dispatch recording, \
-         this is what a click binding would have destroyed"
+        app.file_finder.is_none(),
+        "the first click is a single and must run the `click` row"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.file_finder.is_some(),
+        "the second must still read as a double — the click binding has to \
+         keep the tracker the built-in would have kept"
+    );
+}
+
+#[test]
+fn a_modified_click_binding_does_not_arm_the_plain_double_click() {
+    // `GestureKind::Click` covers `ctrl+click` too, and the built-ins read
+    // their trackers without consulting modifiers. Recording a modified click
+    // armed the editor's plain double-click, so the user's next ordinary
+    // click selected a word they never gestured for.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("t.rs");
+    std::fs::write(&file, "let name = value;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "save_file", "when": "editor"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    let col = app.editor.last_inner.x + 12;
+    let row = app.editor.last_inner.y;
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+
+    // A plain click always anchors a collapsed selection (anchor == head);
+    // that is true with no binding loaded too. The defect is a non-empty one,
+    // i.e. a WORD the user never gestured for.
+    let selected_a_word = app.editor.selection.is_some_and(|s| s.anchor != s.head);
+    assert!(
+        !selected_a_word,
+        "a plain click after a bound ctrl+click must not select a word, got {:?}",
+        app.editor.selection
+    );
+}
+
+#[test]
+fn a_reloaded_keymap_with_a_refused_row_reports_its_warning_count() {
+    // Asserts the summary the reload sets, against a keymap built in memory.
+    // Writing the real `~/.config/croft/keybindings.json` — which is what the
+    // previous version of this test did — leaks into every concurrently
+    // running test that builds an `App`, because `App::new` loads that path
+    // unconditionally.
+    let refused = crate::keymap::Keymap::from_json(
+        r#"[{"key": "cmd+click", "command": "save_file", "when": "editor"}]"#,
+    );
+    let warns = refused.warnings().to_vec();
+    assert_eq!(warns.len(), 1, "the Cmd row is refused with a reason");
+
+    let status = super::keybindings_reload_status(&warns);
+    assert!(
+        status.contains("1 warning") && status.contains("OUTPUT"),
+        "the count must reach the status bar and point at the channel, got {status:?}"
+    );
+    assert!(
+        !super::keybindings_reload_status(&[]).contains("warning"),
+        "a clean reload says nothing about warnings"
     );
 }
 

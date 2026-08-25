@@ -392,10 +392,6 @@ impl Gesture {
                     let k = match other {
                         "click" => GestureKind::Click,
                         "double_click" => GestureKind::DoubleClick,
-                        // Rejected on purpose, but with its own reason: a
-                        // bare `None` falls through to `Chord::parse` and
-                        // reports "not a key chord or mouse gesture", which
-                        // reads like a typo rather than a deliberate refusal.
                         // Refused with its own reason. A bare `None` would
                         // fall through to `Chord::parse` and report "not a
                         // key chord or mouse gesture", which reads like a
@@ -414,7 +410,24 @@ impl Gesture {
                         "right_click" => GestureKind::RightClick,
                         "wheel_up" => GestureKind::WheelUp,
                         "wheel_down" => GestureKind::WheelDown,
-                        _ => return None,
+                        // An unknown token after a Cmd refusal keeps the
+                        // refusal's reason ONLY if a gesture token has
+                        // already been seen — `"cmd+double_click+bogus"` is
+                        // a mouse row and deserves the Cmd explanation.
+                        //
+                        // `"cmd+j"` must NOT: Cmd is a real modifier for
+                        // KEYS and only meaningless for mouse, so the row
+                        // has to fall through to `Chord::parse` and bind as
+                        // a chord. Refusing it here silently unbinds every
+                        // user Cmd chord and breaks the iTerm2/Ghostty
+                        // forwarders that read them back.
+                        _ => {
+                            return if refused && kind.is_some() {
+                                Some((None, warn))
+                            } else {
+                                None
+                            };
+                        }
                     };
                     if kind.replace(k).is_some() {
                         return None;
