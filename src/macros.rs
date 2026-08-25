@@ -35,6 +35,13 @@ pub enum Step {
     Text { text: String },
     /// Any other key: a named code plus its modifier bits.
     Key { code: String, mods: u8 },
+    /// A step kind this build does not know, from a macros.json written by a
+    /// newer croft. Without this catch-all serde fails the WHOLE file on one
+    /// unknown tag, so a single future step would make every register
+    /// unloadable and permanently block saves — the store refuses to
+    /// overwrite what it cannot parse. Replays as nothing.
+    #[serde(other)]
+    Unknown,
 }
 
 impl Step {
@@ -100,6 +107,7 @@ impl Macro {
                         out.push(k);
                     }
                 }
+                Step::Unknown => {}
             }
         }
         out
@@ -112,6 +120,7 @@ impl Macro {
             .map(|s| match s {
                 Step::Text { text } => text.chars().count(),
                 Step::Key { .. } => 1,
+                Step::Unknown => 0,
             })
             .sum()
     }

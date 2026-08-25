@@ -211,9 +211,11 @@ pub struct VimState {
     /// `q` pressed in Normal mode, awaiting the register letter. Set only
     /// when not already recording — a second `q` stops instead.
     pending_record: bool,
-    /// True between `q{a-z}` and the closing `q`. The app owns the recording
-    /// itself; this only lets the machine tell "start" from "stop".
-    recording: bool,
+    /// The APP's recording state, pushed in by [`VimState::set_recording`]
+    /// after every change. Never written by the machine: `q` needs to know
+    /// whether it starts or stops, and a copy the machine maintained itself
+    /// drifted out of sync with the palette's recorder.
+    app_recording: bool,
     /// `@` pressed, awaiting the register letter (or a second `@`).
     pending_replay: bool,
     /// After an operator, `i`/`a` was pressed and we await the object char.
@@ -241,7 +243,7 @@ impl Default for VimState {
             op_count: None,
             pending_find: None,
             pending_record: false,
-            recording: false,
+            app_recording: false,
             pending_replay: false,
             pending_textobj: None,
             pending_g: false,
@@ -274,6 +276,17 @@ impl VimState {
 
     /// Short uppercase label for the status bar, or `None` while typing a
     /// `:`/`/`/`?` line (the caller shows [`Self::command_line`] instead).
+    /// Tell the machine whether a macro recording is live. The app calls
+    /// this after every start/stop from EITHER entry point (vim `q` or the
+    /// palette), so `q` always branches on the real state instead of a copy
+    /// the machine maintained for itself.
+    pub fn set_recording(&mut self, recording: bool) {
+        self.app_recording = recording;
+        if !recording {
+            self.pending_record = false;
+        }
+    }
+
     pub fn mode_label(&self) -> Option<&'static str> {
         match self.mode {
             VimMode::Normal => Some("NORMAL"),
@@ -606,7 +619,6 @@ impl VimState {
         if self.pending_record {
             self.pending_record = false;
             if c.is_ascii_alphanumeric() {
-                self.recording = true;
                 return VimKeyResult::Consumed(vec![VimAction::MacroRecord(Some(c))]);
             }
             // Not a register name: swallow, like every other bad gesture.
@@ -653,11 +665,13 @@ impl VimState {
                 self.resolve_motion(m)
             }
             'q' => {
-                // `q` while recording STOPS it; otherwise it awaits a
-                // register letter. The machine tracks `recording` only to
-                // tell those two apart — the app owns the actual recording.
-                if self.recording {
-                    self.recording = false;
+                // Vim's stop gesture is a BARE `q`, so whether this key needs
+                // a register letter depends on the app's recording state. The
+                // app pushes that in via `set_recording` rather than the
+                // machine keeping its own copy — mirroring it desynchronised
+                // the two entry points, so a palette Stop left vim believing
+                // it was still recording.
+                if self.app_recording {
                     VimKeyResult::Consumed(vec![VimAction::MacroRecord(None)])
                 } else {
                     self.pending_record = true;

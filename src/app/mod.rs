@@ -15823,7 +15823,11 @@ impl App {
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
         let result = self.handle_key_inner(key);
-        if capture && self.macro_recording.is_some() {
+        // Focus is re-checked after dispatch too: a key that hands focus to
+        // the terminal would otherwise be recorded while everything after it
+        // is dropped, producing a macro that replays a focus change and then
+        // silently loses its payload.
+        if capture && self.macro_recording.is_some() && self.focus == Pane::Editor {
             self.record_macro_key(key);
         }
         result
@@ -23580,9 +23584,17 @@ impl App {
             // `q{a-z}` starts, a bare `q` stops. The vim machine reports the
             // gesture; the recording itself lives on App so a macro recorded
             // in vim mode replays from the palette and vice versa (#255).
+            // Recording control is inert during replay. `macro_replaying`
+            // gates capture, not dispatch, so without this a replayed `q`
+            // would reach here and leave the user silently recording after
+            // the replay returned — the class of command the issue's
+            // exclusion list exists for.
+            VimAction::MacroRecord(_) | VimAction::MacroReplay(..) if self.macro_replaying => {}
             VimAction::MacroRecord(register) => match register {
-                Some(r) => self.start_macro_recording(Some(r)),
-                None => self.stop_macro_recording(),
+                // A register letter STARTS; a bare `q` stops. The app owns
+                // the recording state, so vim never has to track it.
+                Some(r) if self.macro_recording.is_none() => self.start_macro_recording(Some(r)),
+                _ => self.stop_macro_recording(),
             },
             VimAction::MacroReplay(register, count) => match register {
                 Some(r) => self.replay_macro_register(r, count),
@@ -27328,6 +27340,9 @@ impl App {
             register,
             recorded: crate::macros::Macro::default(),
         });
+        // One source of truth: vim's `q` branches on this, and a copy the
+        // machine kept for itself drifted whenever the palette was used.
+        self.vim.set_recording(true);
         self.status = match register {
             Some(r) => format!("Recording macro into @{r}"),
             None => String::from("Recording macro"),
@@ -27341,6 +27356,7 @@ impl App {
         let Some(rec) = self.macro_recording.take() else {
             return;
         };
+        self.vim.set_recording(false);
         if rec.recorded.is_empty() {
             self.status = String::from("Macro discarded (nothing recorded)");
             return;
@@ -27378,20 +27394,27 @@ impl App {
             return;
         }
         let count = count.max(1);
-        let total = mac.len().saturating_mul(count);
+        // Budget the keys actually fed, not the recorded step count:
+        // `key_events` drops steps this build cannot replay, so `len()` is an
+        // upper bound rather than the real total.
+        let keys = mac.key_events();
+        let total = keys.len().saturating_mul(count);
         if total > MAX_REPLAY_KEYS {
             self.status =
                 format!("Macro would run {total} keys (limit {MAX_REPLAY_KEYS}) — refused");
             return;
         }
-        let keys = mac.key_events();
         self.macro_replaying = true;
         let mut done = 0usize;
         let mut aborted = None;
         'outer: for iteration in 0..count {
-            // Each iteration is its own undo step, matching vim's `.`:
-            // without this a second iteration's opening keystrokes would
-            // coalesce into the previous iteration's typing run.
+            // Break coalescing so a new iteration's opening keystrokes never
+            // merge into the previous iteration's typing run. This bounds
+            // iterations apart; it does NOT make one iteration one undo step
+            // — `push_undo` coalesces only InsertChar→InsertChar, so a macro
+            // holding a delete plus an insert still undoes in two. A real
+            // one-step-per-iteration guarantee needs an undo-group API the
+            // editor does not have (its undo is whole-buffer snapshots).
             self.editor.break_undo_coalescing();
             for k in &keys {
                 if let Err(e) = self.handle_key(*k) {
@@ -27661,12 +27684,16 @@ impl App {
             Cmd::GoToLastEditLocation => self.goto_last_edit_location(),
             Cmd::ToggleVimMode => self.toggle_vim_mode(),
             Cmd::MacroStartStopRecording => {
-                if self.macro_recording.is_some() {
+                if self.macro_replaying {
+                    // See the vim arms: a replayed key must not be able to
+                    // start or stop a recording.
+                } else if self.macro_recording.is_some() {
                     self.stop_macro_recording();
                 } else {
                     self.start_macro_recording(None);
                 }
             }
+            Cmd::MacroReplayLast if self.macro_replaying => {}
             Cmd::MacroReplayLast => self.replay_last_macro(1),
             Cmd::MacroReplayTimes => {
                 use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
