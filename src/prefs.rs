@@ -405,6 +405,15 @@ pub fn save_auto_save_on_focus_change(enabled: bool) -> Result<()> {
     prefs.save(&path)
 }
 
+/// Persist the auto-hide side bar choice (#260), preserving other settings.
+/// Best-effort, like [`save_auto_save`].
+pub fn save_sidebar_auto_hide(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.sidebar_auto_hide = enabled;
+    prefs.save(&path)
+}
+
 pub fn save_inline_blame(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();

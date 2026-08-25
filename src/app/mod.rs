@@ -2290,9 +2290,15 @@ pub struct App {
     /// on any deliberate sidebar action — Cmd+B, an activity-bar icon, or a
     /// sidebar-targeting command like reveal-in-explorer.
     sidebar_auto_hide: bool,
-    /// Set while a command is deliberately steering the user INTO the
-    /// sidebar (reveal-in-explorer and friends). Auto-hide yields to it, so
-    /// the reveal is not undone by the focus change that follows it.
+    /// Set while a focus move is happening for a reason other than the user
+    /// asking for it (async results, launch, sidebar-internal activation).
+    sidebar_auto_hide_suspended: bool,
+    /// One-shot exemption: the next auto-hide collapse is skipped and the
+    /// flag consumed. Cmd+B reveals the sidebar WITHOUT moving focus, so a
+    /// sticky flag would stay set (focus never lands on the tree to clear
+    /// it) and silently disable auto-hide for the rest of the session.
+    /// Consuming it on the next attempt keeps the reveal usable while
+    /// guaranteeing the feature re-arms itself.
     sidebar_pinned_open: bool,
     /// Pre-Zen visibility snapshot; `None` whenever not in Zen Mode.
     pre_zen: Option<PreZenLayout>,
@@ -3938,6 +3944,7 @@ impl App {
             quick_input_position: layout_prefs.quick_input_position,
             zen_mode: false,
             sidebar_auto_hide: loaded_prefs.sidebar_auto_hide,
+            sidebar_auto_hide_suspended: false,
             sidebar_pinned_open: false,
             pre_zen: None,
             layout_icon_areas: LayoutIconAreas::default(),
@@ -9141,6 +9148,20 @@ impl App {
     /// Open (or re-open) the Customize Layout popup with the cursor on row
     /// `selected`. Each toggle re-opens it so the popup stays put while the
     /// user flips several controls, exactly like VS Code's dropdown.
+    /// Reopen the Customize Layout popup with the cursor on the row carrying
+    /// `action`. Looking the row up beats hardcoding an index: the indices
+    /// were already stale for every row below the first separator (a row
+    /// insert shifts them and nothing catches it), so this makes that whole
+    /// class of bug unrepresentable.
+    fn open_customize_layout_menu_on(&mut self, action: &MenuAction) {
+        let idx = self
+            .customize_layout_items()
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Item { action: a, .. } if a == action))
+            .unwrap_or(0);
+        self.open_customize_layout_menu_at(idx);
+    }
+
     fn open_customize_layout_menu_at(&mut self, selected: usize) {
         let origin = self.customize_layout_origin();
         self.context_menu = Some(ContextMenu {
@@ -11651,12 +11672,11 @@ impl App {
     }
 
     fn set_sidebar_view(&mut self, view: SidebarView) {
-        // Choosing a sidebar view — an activity-bar icon, a focus chord like
-        // Cmd+Shift+E, or a command that targets one — is a deliberate
-        // sidebar action, so it reveals and holds under auto-hide (#260).
-        // Every such path funnels through here, which is why the pin lives
-        // at this one point rather than at 30-odd call sites.
-        self.reveal_sidebar_pinned();
+        // Choosing a sidebar view is a deliberate sidebar action, so it must
+        // reveal under auto-hide (#260). No pin is needed: every arm below
+        // focuses Pane::Tree, and auto-hide only collapses on a move to the
+        // editor or a terminal, so the reveal is not at risk from its own
+        // focus move.
         if self.sidebar_view != view {
             self.overlays.activity.mark_dirty();
             // Leaving Search while a scan is in flight: send an
@@ -12578,6 +12598,35 @@ impl App {
             .position(|t| rect_contains(t.last_area, col, row))
     }
 
+    /// Run `f` with auto-hide suppressed, for focus moves the user did not
+    /// ask for. `focus_pane` cannot tell intent apart on its own: an async
+    /// MCP result, a launch-time file open, and Enter on a sidebar row all
+    /// look identical to it, and collapsing on those is the flapping #260
+    /// set out to prevent.
+    fn without_auto_hide<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = std::mem::replace(&mut self.sidebar_auto_hide_suspended, true);
+        let out = f(self);
+        self.sidebar_auto_hide_suspended = prev;
+        out
+    }
+
+    /// Whether a modal overlay owns the screen right now. The same eleven-way
+    /// check was repeated verbatim at three overlay-flush sites; auto-hide
+    /// (#260) needs it too, so it lives here once.
+    fn modal_overlay_open(&self) -> bool {
+        self.shortcuts_modal.is_some()
+            || self.file_finder.is_some()
+            || self.command_palette.is_some()
+            || self.go_to_symbol.is_some()
+            || self.workspace_symbols.is_some()
+            || self.process_picker.is_some()
+            || self.zoxide_jump.is_some()
+            || self.command_history_popup.is_some()
+            || self.branch_picker.is_some()
+            || self.input_prompt.is_some()
+            || self.list_picker.is_some()
+    }
+
     /// Whether auto-hide may collapse the sidebar RIGHT NOW. Every reason to
     /// hold it open lives here rather than being scattered through the call
     /// sites, so the interaction rules are one readable list and a new
@@ -12586,8 +12635,12 @@ impl App {
         if !self.sidebar_auto_hide || !self.show_tree {
             return false;
         }
-        // A command is deliberately steering the user into the sidebar
-        // (reveal-in-explorer and friends); collapsing would undo it.
+        // A focus move nobody asked for is not a reason to hide chrome.
+        if self.sidebar_auto_hide_suspended {
+            return false;
+        }
+        // A deliberate reveal (Cmd+B) exempts the NEXT collapse; the flag is
+        // consumed in `maybe_auto_hide_sidebar`, never held.
         if self.sidebar_pinned_open {
             return false;
         }
@@ -12597,10 +12650,26 @@ impl App {
         if self.splitter_drag.is_some() {
             return false;
         }
-        // A prompt or menu may be anchored over sidebar space, and some are
-        // sidebar-targeting flows (branch picker, connect dialog); yanking
-        // the panel out from under one is disorienting.
-        if self.prompt.is_some() || self.context_menu.is_some() {
+        // Anything modal may be anchored over sidebar space, and several are
+        // sidebar-targeting flows (branch picker, connect dialog) that are
+        // their own fields rather than `Prompt`s — checking only `prompt`
+        // would have missed exactly those.
+        if self.prompt.is_some()
+            || self.context_menu.is_some()
+            || self.connect_dialog.is_some()
+            || self.modal_overlay_open()
+        {
+            return false;
+        }
+        // An Explorer drag is a drag over the sidebar the user is dragging
+        // FROM; `splitter_drag` does not cover it.
+        if self.tree_drag.is_some() {
+            return false;
+        }
+        // With no activity bar there is no on-screen way back to a collapsed
+        // sidebar (hover-to-reveal is not implemented yet), so a mouse-only
+        // user would be stranded.
+        if !self.activity_bar_visible {
             return false;
         }
         // Zen Mode already owns chrome visibility; it wins, as it does today.
@@ -12610,21 +12679,32 @@ impl App {
         true
     }
 
+    /// Flip auto-hide and persist it. Both routes (palette command and the
+    /// Customize Layout row) funnel here so they cannot drift in what they
+    /// set, what they report, or whether the choice survives a restart.
+    fn toggle_sidebar_auto_hide(&mut self) {
+        self.sidebar_auto_hide = !self.sidebar_auto_hide;
+        // Best-effort, like every other pref write: a read-only config must
+        // not break the in-session toggle.
+        let _ = crate::prefs::save_sidebar_auto_hide(self.sidebar_auto_hide);
+        // Turning it ON with the sidebar open takes effect at the next focus
+        // move rather than retroactively yanking it away here.
+        self.status = format!(
+            "Auto-hide side bar {}",
+            if self.sidebar_auto_hide { "on" } else { "off" }
+        );
+    }
+
     /// Collapse the sidebar if auto-hide is on and nothing is suppressing it.
     /// Called on focus moves INTO the editor or a terminal.
     fn maybe_auto_hide_sidebar(&mut self) {
-        if self.sidebar_auto_hide_allowed() {
+        // Consume the one-shot exemption whether or not it was the reason we
+        // are not collapsing: holding it would let it outlive the reveal it
+        // was granted for.
+        let exempt = std::mem::take(&mut self.sidebar_pinned_open);
+        if !exempt && self.sidebar_auto_hide_allowed() {
             self.show_tree = false;
         }
-    }
-
-    /// Show the sidebar for a deliberate sidebar action and hold it open
-    /// across the focus change that follows. Used by reveal-in-explorer and
-    /// the activity-bar / focus chords, which must not be undone by the very
-    /// auto-hide they trigger.
-    fn reveal_sidebar_pinned(&mut self) {
-        self.show_tree = true;
-        self.sidebar_pinned_open = true;
     }
 
     fn focus_pane(&mut self, p: Pane) {
@@ -18799,7 +18879,9 @@ impl App {
     /// missing / unreadable file just leaves the editor on the welcome screen.
     pub fn open_file_at_launch(&mut self, path: &Path) {
         if self.editor.open_pinned(path).is_ok() {
-            self.focus_pane(Pane::Editor);
+            // Launch is not a user focus gesture: collapsing here would hide
+            // the sidebar before the user has interacted at all (#260).
+            self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
             self.sync_open_file_poll_mtime();
         }
     }
@@ -27349,7 +27431,10 @@ impl App {
             Ok(text) => {
                 let label = self.scratch_buffer_path(&format!("{}.md", outcome.title));
                 if self.editor.open_text_buffer(&label, &text).is_ok() {
-                    self.focus_pane(Pane::Editor);
+                    // An MCP result arrives asynchronously; the user may be
+                    // mid-scroll in the Explorer and did not ask for focus to
+                    // move, let alone for the sidebar to close (#260).
+                    self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
                     self.status = format!(
                         "{}: opened in a new tab — Cmd+S saves it into the project",
                         outcome.title
@@ -27786,15 +27871,7 @@ impl App {
                 // move back to the editor.
                 self.sidebar_pinned_open = self.show_tree;
             }
-            Cmd::ToggleAutoHideSideBar => {
-                self.sidebar_auto_hide = !self.sidebar_auto_hide;
-                // Turning it ON with the sidebar open should take effect at
-                // the next focus move, not retroactively yank it away here.
-                self.status = format!(
-                    "Auto-hide side bar {}",
-                    if self.sidebar_auto_hide { "on" } else { "off" }
-                );
-            }
+            Cmd::ToggleAutoHideSideBar => self.toggle_sidebar_auto_hide(),
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
@@ -33954,62 +34031,48 @@ impl App {
                 self.activity_bar_visible = !self.activity_bar_visible;
                 self.persist_layout();
                 self.after_chrome_visibility_change();
-                self.open_customize_layout_menu_at(0);
+                self.open_customize_layout_menu_on(&MenuAction::ToggleActivityBar);
             }
             MenuAction::ToggleSideBar => {
                 self.show_tree = !self.show_tree;
                 self.after_chrome_visibility_change();
-                self.open_customize_layout_menu_at(1);
+                self.open_customize_layout_menu_on(&MenuAction::ToggleSideBar);
             }
             MenuAction::ToggleAutoHideSideBar => {
-                self.sidebar_auto_hide = !self.sidebar_auto_hide;
+                self.toggle_sidebar_auto_hide();
                 // Index 6: appended after Minimap precisely so the existing
-                // rows keep their hardcoded re-open indices.
-                self.open_customize_layout_menu_at(6);
+                // toggle rows keep their hardcoded re-open indices.
+                self.open_customize_layout_menu_on(&MenuAction::ToggleAutoHideSideBar);
             }
             MenuAction::ToggleSecondarySideBar => {
                 self.toggle_secondary_side_bar();
-                self.open_customize_layout_menu_at(2);
+                self.open_customize_layout_menu_on(&MenuAction::ToggleSecondarySideBar);
             }
             MenuAction::TogglePanel => {
                 self.toggle_terminal();
-                self.open_customize_layout_menu_at(3);
+                self.open_customize_layout_menu_on(&MenuAction::TogglePanel);
             }
             MenuAction::ToggleStatusBar => {
                 self.status_bar_visible = !self.status_bar_visible;
                 self.persist_layout();
                 self.after_chrome_visibility_change();
-                self.open_customize_layout_menu_at(4);
+                self.open_customize_layout_menu_on(&MenuAction::ToggleStatusBar);
             }
             MenuAction::SetSideBarPosition(pos) => {
                 self.side_bar_position = pos;
                 self.persist_layout();
                 self.after_chrome_visibility_change();
-                self.open_customize_layout_menu_at(if pos == SideBarPosition::Left {
-                    7
-                } else {
-                    8
-                });
+                self.open_customize_layout_menu_on(&MenuAction::SetSideBarPosition(pos));
             }
             MenuAction::SetPanelAlignment(al) => {
                 self.panel_alignment = al;
                 self.persist_layout();
-                let row = match al {
-                    PanelAlignment::Left => 11,
-                    PanelAlignment::Center => 12,
-                    PanelAlignment::Right => 13,
-                    PanelAlignment::Justify => 14,
-                };
-                self.open_customize_layout_menu_at(row);
+                self.open_customize_layout_menu_on(&MenuAction::SetPanelAlignment(al));
             }
             MenuAction::SetQuickInputPosition(pos) => {
                 self.quick_input_position = pos;
                 self.persist_layout();
-                self.open_customize_layout_menu_at(if pos == QuickInputPosition::Top {
-                    17
-                } else {
-                    18
-                });
+                self.open_customize_layout_menu_on(&MenuAction::SetQuickInputPosition(pos));
             }
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
             MenuAction::RenameTerminal(idx) => self.begin_rename_terminal(idx),
@@ -34180,8 +34243,8 @@ impl App {
     fn reveal_in_explorer(&mut self, path: PathBuf) {
         self.set_sidebar_view(SidebarView::Explorer);
         // A sidebar-targeting command must work even with the sidebar hidden
-        // (#260): show it, and hold it open past the focus move below.
-        self.reveal_sidebar_pinned();
+        // (#260). `set_sidebar_view` above already forced it open and focuses
+        // the tree, so nothing further is required here.
         let found = self.tree.reveal_path(&path);
         self.focus_pane(Pane::Tree);
         self.status = if found {

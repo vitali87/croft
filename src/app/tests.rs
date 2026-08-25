@@ -30317,3 +30317,86 @@ fn customize_layout_toggle_rows_keep_their_reopen_indices() {
         "the new row is appended, not inserted"
     );
 }
+
+/// #294 review: the palette and menu toggles must not drift. Both funnel
+/// through one method, so they set the same state and report the same status;
+/// previously the menu route set neither the status nor any persistence.
+#[test]
+fn both_auto_hide_toggle_routes_agree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(!app.sidebar_auto_hide, "off by default");
+
+    app.toggle_sidebar_auto_hide();
+    assert!(app.sidebar_auto_hide);
+    assert!(
+        app.status.contains("on"),
+        "the toggle reports its new state: {}",
+        app.status
+    );
+    app.toggle_sidebar_auto_hide();
+    assert!(!app.sidebar_auto_hide);
+    assert!(
+        app.status.contains("off"),
+        "and reports off: {}",
+        app.status
+    );
+}
+
+/// #294 review: the reveal exemption is ONE-SHOT. Cmd+B reveals without
+/// moving focus, so a sticky flag would never be cleared (focus never lands
+/// on the tree) and auto-hide would be silently dead for the session.
+#[test]
+fn the_reveal_exemption_is_consumed_rather_than_sticky() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    // Cmd+B-style reveal: exempt the next collapse.
+    app.sidebar_pinned_open = true;
+    app.focus_pane(Pane::Editor);
+    assert!(app.show_tree, "the exemption protects this focus move");
+    assert!(
+        !app.sidebar_pinned_open,
+        "and is consumed rather than latching auto-hide off"
+    );
+
+    // The very next move collapses, proving the feature re-armed itself.
+    app.focus_pane(Pane::Editor);
+    assert!(!app.show_tree, "auto-hide is live again");
+}
+
+/// #294 review: the suppression list must cover the modal states the codebase
+/// already treats as modal — several are sidebar-targeting flows that are
+/// their own fields rather than `Prompt`s, so checking `prompt` alone missed
+/// exactly the ones the comment claimed were covered.
+#[test]
+fn auto_hide_yields_to_real_modal_overlays_and_explorer_drags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    assert!(app.sidebar_auto_hide_allowed(), "baseline collapses");
+
+    // A command palette is modal and may sit over sidebar space.
+    app.command_palette = Some(crate::widgets::command_palette::CommandPalette::new());
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "a modal overlay suppresses the collapse"
+    );
+    app.command_palette = None;
+
+    // With no activity bar there is no on-screen way back to a collapsed
+    // sidebar, so a mouse-only user would be stranded.
+    app.activity_bar_visible = false;
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "no reveal affordance means no auto-hide"
+    );
+    app.activity_bar_visible = true;
+
+    // A focus move the user did not ask for is not a reason to hide chrome.
+    app.without_auto_hide(|a| a.focus_pane(Pane::Editor));
+    assert!(app.show_tree, "programmatic focus leaves the sidebar alone");
+}
