@@ -176,6 +176,11 @@ pub enum VimAction {
     Search(SearchDir, String),
     /// Clear any pending operator/count and drop the visual selection.
     ClearPending,
+    /// `q{a-z}` — start recording into a register, or `q` while recording
+    /// stops it. The app owns the recording; the machine only routes the key.
+    MacroRecord(Option<char>),
+    /// `@{a-z}` with a count; `@@` replays the last macro (`None`).
+    MacroReplay(Option<char>, usize),
 }
 
 /// The outcome of feeding one key to the machine.
@@ -203,6 +208,14 @@ pub struct VimState {
     op_count: Option<usize>,
     /// `f`/`t`/`F`/`T` awaiting their target character.
     pending_find: Option<FindKind>,
+    /// `q` pressed in Normal mode, awaiting the register letter. Set only
+    /// when not already recording — a second `q` stops instead.
+    pending_record: bool,
+    /// True between `q{a-z}` and the closing `q`. The app owns the recording
+    /// itself; this only lets the machine tell "start" from "stop".
+    recording: bool,
+    /// `@` pressed, awaiting the register letter (or a second `@`).
+    pending_replay: bool,
     /// After an operator, `i`/`a` was pressed and we await the object char.
     /// `Some(true)` = inner (`i`), `Some(false)` = around (`a`).
     pending_textobj: Option<bool>,
@@ -227,6 +240,9 @@ impl Default for VimState {
             pending_op: None,
             op_count: None,
             pending_find: None,
+            pending_record: false,
+            recording: false,
+            pending_replay: false,
             pending_textobj: None,
             pending_g: false,
             cmdline: String::new(),
@@ -313,6 +329,8 @@ impl VimState {
         self.pending_find = None;
         self.pending_textobj = None;
         self.pending_g = false;
+        self.pending_record = false;
+        self.pending_replay = false;
     }
 
     fn take_count(&mut self) -> usize {
@@ -582,6 +600,31 @@ impl VimState {
     }
 
     fn on_normal_char(&mut self, c: char) -> VimKeyResult {
+        // A pending register letter consumes the NEXT key whatever it is, so
+        // it must be read before digits and motions — `q1` names register
+        // `1`, it does not start a count.
+        if self.pending_record {
+            self.pending_record = false;
+            if c.is_ascii_alphanumeric() {
+                self.recording = true;
+                return VimKeyResult::Consumed(vec![VimAction::MacroRecord(Some(c))]);
+            }
+            // Not a register name: swallow, like every other bad gesture.
+            return VimKeyResult::Consumed(vec![]);
+        }
+        if self.pending_replay {
+            self.pending_replay = false;
+            let count = self.take_count();
+            // `@@` repeats the last macro; `@{a-z}` names a register.
+            if c == '@' {
+                return VimKeyResult::Consumed(vec![VimAction::MacroReplay(None, count)]);
+            }
+            if c.is_ascii_alphanumeric() {
+                return VimKeyResult::Consumed(vec![VimAction::MacroReplay(Some(c), count)]);
+            }
+            return VimKeyResult::Consumed(vec![]);
+        }
+
         if c.is_ascii_digit() {
             if c == '0' && self.count.is_none() {
                 return self.resolve_motion(Motion::LineStart);
@@ -608,6 +651,22 @@ impl VimState {
                     None => Motion::FileEnd,
                 };
                 self.resolve_motion(m)
+            }
+            'q' => {
+                // `q` while recording STOPS it; otherwise it awaits a
+                // register letter. The machine tracks `recording` only to
+                // tell those two apart — the app owns the actual recording.
+                if self.recording {
+                    self.recording = false;
+                    VimKeyResult::Consumed(vec![VimAction::MacroRecord(None)])
+                } else {
+                    self.pending_record = true;
+                    VimKeyResult::Consumed(vec![])
+                }
+            }
+            '@' => {
+                self.pending_replay = true;
+                VimKeyResult::Consumed(vec![])
             }
             'g' => {
                 self.pending_g = true;

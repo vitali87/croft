@@ -24,6 +24,7 @@ mod iterm2_inline;
 mod keymap;
 mod launcher;
 mod lsp;
+mod macros;
 mod magic;
 mod markdown;
 mod mcp;

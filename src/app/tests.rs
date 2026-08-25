@@ -16716,6 +16716,154 @@ fn vim_feed_str(app: &mut App, s: &str) {
 }
 
 #[test]
+fn vim_q_records_into_a_register_and_at_replays_it() {
+    // #255: `qa … q` records, `@a` replays, and the register survives as the
+    // "last macro" so `@@` repeats it.
+    let (mut app, tmp) = vim_app("one\ntwo\nthree\n");
+    app.macros_path = tmp.path().join("macros.json");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+
+    vim_feed_str(&mut app, "qa");
+    assert!(
+        app.macro_recording.is_some(),
+        "qa starts recording into a register"
+    );
+    assert_eq!(
+        app.macro_recording.as_ref().unwrap().register,
+        Some('a'),
+        "and remembers which one, for the status badge"
+    );
+
+    // Record "insert X at the line start, then go down a line".
+    vim_feed_str(&mut app, "IX");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'j');
+    vim_feed(&mut app, 'q');
+    assert!(app.macro_recording.is_none(), "the closing q stops");
+    assert_eq!(app.editor.lines[0], "Xone", "the recorded keys still ran");
+
+    // Replay once on line two.
+    vim_feed_str(&mut app, "@a");
+    assert_eq!(app.editor.lines[1], "Xtwo", "@a replays the register");
+
+    // `@@` repeats the same macro.
+    vim_feed_str(&mut app, "@@");
+    assert_eq!(app.editor.lines[2], "Xthree", "@@ repeats the last macro");
+}
+
+#[test]
+fn vim_a_count_replays_the_macro_that_many_times() {
+    // `3@a` runs it three times, and a count before `@` is not swallowed by
+    // the register letter.
+    let (mut app, tmp) = vim_app("a\nb\nc\nd\n");
+    app.macros_path = tmp.path().join("macros.json");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+
+    vim_feed_str(&mut app, "qz");
+    vim_feed_str(&mut app, "IX");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'j');
+    vim_feed(&mut app, 'q');
+
+    vim_feed_str(&mut app, "3@z");
+    assert_eq!(
+        (
+            app.editor.lines[1].as_str(),
+            app.editor.lines[2].as_str(),
+            app.editor.lines[3].as_str()
+        ),
+        ("Xb", "Xc", "Xd"),
+        "3@z ran the macro three times"
+    );
+}
+
+#[test]
+fn a_replayed_key_is_never_recorded_into_the_macro_producing_it() {
+    // Replay feeds keys back through handle_key, so without the re-entrancy
+    // guard a macro would grow while replaying and never terminate.
+    let (mut app, tmp) = vim_app("one\ntwo\n");
+    app.macros_path = tmp.path().join("macros.json");
+    vim_feed_str(&mut app, "qa");
+    vim_feed_str(&mut app, "IX");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'q');
+    let recorded_len = app.macro_registers.get("a").unwrap().len();
+
+    vim_feed_str(&mut app, "@a");
+    assert_eq!(
+        app.macro_registers.get("a").unwrap().len(),
+        recorded_len,
+        "replaying must not append to the register it is replaying"
+    );
+}
+
+#[test]
+fn an_empty_recording_is_discarded_rather_than_clobbering_a_good_macro() {
+    let (mut app, tmp) = vim_app("x\n");
+    app.macros_path = tmp.path().join("macros.json");
+    vim_feed_str(&mut app, "qa");
+    vim_feed_str(&mut app, "IZ");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'q');
+    let good = app.macro_registers.get("a").cloned().unwrap();
+
+    // Start and immediately stop: nothing recorded.
+    vim_feed_str(&mut app, "qa");
+    vim_feed(&mut app, 'q');
+    assert_eq!(
+        app.macro_registers.get("a"),
+        Some(&good),
+        "an empty recording must not replace a useful register"
+    );
+}
+
+#[test]
+fn a_macro_recorded_in_vim_mode_replays_from_the_palette() {
+    // The registers and the palette's "last macro" are one store, so the two
+    // entry points are interchangeable — the issue calls this out explicitly.
+    let (mut app, tmp) = vim_app("one\ntwo\n");
+    app.macros_path = tmp.path().join("macros.json");
+    vim_feed_str(&mut app, "qa");
+    vim_feed_str(&mut app, "IX");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'j');
+    vim_feed(&mut app, 'q');
+
+    app.run_command(crate::widgets::command_palette::Command::MacroReplayLast);
+    assert_eq!(
+        app.editor.lines[1], "Xtwo",
+        "the palette replays what vim recorded"
+    );
+}
+
+#[test]
+fn a_register_survives_a_restart_through_macros_json() {
+    let (mut app, tmp) = vim_app("one\n");
+    let path = tmp.path().join("macros.json");
+    app.macros_path = path.clone();
+    vim_feed_str(&mut app, "qa");
+    vim_feed_str(&mut app, "IX");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'q');
+
+    // A fresh load of the store sees the register, which is what App::new does.
+    let reloaded = crate::macros::load(&path);
+    assert_eq!(
+        reloaded.get("a"),
+        app.macro_registers.get("a"),
+        "the register was persisted, not just held in memory"
+    );
+}
+
+#[test]
 fn vim_dd_deletes_the_current_line() {
     let (mut app, _t) = vim_app("alpha\nbeta\ngamma");
     vim_feed_str(&mut app, "dd");

@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Save Workspace As writes portable files again: a folder reached through a symlink (macOS hands croft /var for /private/var, and any symlinked home does the same) was written as an absolute path instead of a relative one, so the file stopped travelling — it kept working where it was written but not on another machine, another checkout, or a different layout.",
+    kind: NoteKind::Feature,
+    summary: "Keyboard macros: record a burst of editing and replay it, with vim's q/@ registers or from the Command Palette. Counts work (3@a), each replay is one undo step, and named registers persist across restarts — the VS Code request open since 2016.",
 }];
