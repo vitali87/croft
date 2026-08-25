@@ -30758,6 +30758,68 @@ fn both_auto_hide_toggle_routes_agree() {
     );
 }
 
+/// #294 re-review found the blocker this pins: the pin was set only on the
+/// palette route, while a real Cmd+B keypress is handled earlier and returns
+/// before `Cmd` dispatch — so the headline reveal gesture revealed the panel
+/// and the very next click into the editor collapsed it again. Driving the
+/// key event is the whole point; every other test here sets the flag by hand
+/// and so could not see it.
+#[test]
+fn the_real_cmd_b_keypress_reveals_and_holds_the_sidebar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = false;
+
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.show_tree, "Cmd+B reveals the sidebar");
+
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.show_tree,
+        "and the reveal survives the next move to the editor"
+    );
+
+    // Still one-shot: the exemption is spent, so the following move collapses.
+    app.focus_pane(Pane::Tree);
+    app.focus_pane(Pane::Editor);
+    assert!(!app.show_tree, "the exemption was consumed, not sticky");
+
+    // Ctrl+B is the same gesture on the other platform convention.
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.show_tree);
+    app.focus_pane(Pane::Editor);
+    assert!(app.show_tree, "Ctrl+B pins exactly as Cmd+B does");
+}
+
+/// A pin taken while the feature is OFF must not be banked: it would sit
+/// unconsumed and silently eat the first collapse after the user turns
+/// auto-hide on, which reads as "the setting did nothing".
+#[test]
+fn a_reveal_while_auto_hide_is_off_does_not_bank_an_exemption() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = false;
+    app.show_tree = false;
+
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.show_tree);
+    assert!(
+        !app.sidebar_pinned_open,
+        "no pin is banked while the feature is off"
+    );
+
+    app.sidebar_auto_hide = true;
+    app.focus_pane(Pane::Editor);
+    assert!(
+        !app.show_tree,
+        "so the first collapse after enabling it actually happens"
+    );
+}
+
 /// #294 review: the reveal exemption is ONE-SHOT. Cmd+B reveals without
 /// moving focus, so a sticky flag would never be cleared (focus never lands
 /// on the tree) and auto-hide would be silently dead for the session.

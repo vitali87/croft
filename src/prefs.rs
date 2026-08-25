@@ -431,8 +431,17 @@ pub fn save_sidebar_auto_hide(enabled: bool) -> Result<()> {
 fn prefs_for_update(path: &Path) -> Result<Prefs> {
     match Prefs::load(path) {
         Ok(p) => Ok(p),
+        // Branch on the error itself rather than a follow-up `path.exists()`:
+        // a dangling symlink at the config path reports "does not exist" while
+        // the open failed for a different reason, and defaults written through
+        // it would clobber whatever it points at. `load` wraps the io error in
+        // context, so the cause is in the chain rather than the top error.
         Err(e) => {
-            if !path.exists() {
+            let missing = e
+                .chain()
+                .filter_map(|c| c.downcast_ref::<std::io::Error>())
+                .any(|io| io.kind() == std::io::ErrorKind::NotFound);
+            if missing {
                 return Ok(Prefs::default());
             }
             Err(e)

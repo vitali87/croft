@@ -3880,7 +3880,16 @@ impl App {
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             extensions,
             disabled_extensions,
-            keymap: crate::keymap::Keymap::load(&crate::keymap::keybindings_path()),
+            // Under test the built-in keymap, mirroring the matcher set above:
+            // the developer's real keybindings.json must never steer app
+            // tests. Harmless while only key chords were rebindable, but a
+            // keymap that gates behaviour lets one line in an untracked file
+            // change what the suite exercises.
+            keymap: if cfg!(test) {
+                crate::keymap::Keymap::default()
+            } else {
+                crate::keymap::Keymap::load(&crate::keymap::keybindings_path())
+            },
             macro_recording: None,
             macro_last: None,
             macro_registers: crate::macros::load(&crate::macros::macros_path()),
@@ -4696,18 +4705,7 @@ impl App {
 
     pub fn flush_run_debug_icon_overlay(&mut self) {
         use std::io::Write;
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-        {
+        if self.modal_overlay_open() {
             return;
         }
         let panel_visible = self.show_tree
@@ -4777,18 +4775,7 @@ impl App {
     /// the screen; arms a one-shot clear when the anchor moves so no ghost stacks.
     pub fn flush_problems_badge_overlay(&mut self) {
         use std::io::Write;
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-        {
+        if self.modal_overlay_open() {
             return;
         }
         let Some((cx, cy)) = self.problems_badge_cell.filter(|_| self.show_terminal) else {
@@ -4830,18 +4817,7 @@ impl App {
     /// surrounding cells redraw.
     pub fn flush_no_repo_hero_overlay(&mut self) {
         use std::io::Write;
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-        {
+        if self.modal_overlay_open() {
             return;
         }
         let panel_visible = self.show_tree
@@ -8584,7 +8560,10 @@ impl App {
             self.editor.last_full_area.x + 1,
             self.editor.last_full_area.y + 1,
         ));
-        self.focus_pane(Pane::Editor);
+        // A late server reply is not the user asking to leave the sidebar.
+        // The `context_menu` guard cannot cover this: it is set on the NEXT
+        // line, so auto-hide would already have fired.
+        self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
         let root = self.tree.root.clone();
         self.context_menu = Some(ContextMenu::flat(origin, items, root));
     }
@@ -9059,7 +9038,10 @@ impl App {
             self.editor.last_full_area.x + 1,
             self.editor.last_full_area.y + 1,
         ));
-        self.focus_pane(Pane::Editor);
+        // As in `present_call_hierarchy_menu`: the reply arrives whenever the
+        // server is ready, and the `context_menu` guard is armed a line too
+        // late to protect the sidebar from this focus move.
+        self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
         self.context_menu = Some(ContextMenu::flat(origin, items, root));
     }
 
@@ -9214,9 +9196,6 @@ impl App {
         ]
     }
 
-    /// Open (or re-open) the Customize Layout popup with the cursor on row
-    /// `selected`. Each toggle re-opens it so the popup stays put while the
-    /// user flips several controls, exactly like VS Code's dropdown.
     /// Reopen the Customize Layout popup with the cursor on the row carrying
     /// `action`. Looking the row up beats hardcoding an index: the indices
     /// were already stale for every row below the first separator (a row
@@ -9231,6 +9210,9 @@ impl App {
         self.open_customize_layout_menu_at(idx);
     }
 
+    /// Open (or re-open) the Customize Layout popup with the cursor on row
+    /// `selected`. Each toggle re-opens it so the popup stays put while the
+    /// user flips several controls, exactly like VS Code's dropdown.
     fn open_customize_layout_menu_at(&mut self, selected: usize) {
         let origin = self.customize_layout_origin();
         self.context_menu = Some(ContextMenu {
@@ -9278,6 +9260,34 @@ impl App {
 
     /// Toggle the secondary side bar (the Outline of the active file), on the
     /// edge opposite the primary side bar. Mirrors ⌥⌘B.
+    /// Show or hide the primary side bar. Every route that flips it by hand —
+    /// the Cmd+B keybinding, the palette command, the Customize Layout row and
+    /// the layout-icon click — goes through here, because each one is a
+    /// deliberate sidebar action and so must take the auto-hide pin (#260).
+    /// Four hand-rolled copies is exactly how three of them ended up without
+    /// it: the pin lived only on the palette route, so the real Cmd+B revealed
+    /// the panel and the next click into the editor collapsed it again.
+    fn toggle_side_bar(&mut self) {
+        let was_visible = self.show_tree;
+        self.show_tree = !self.show_tree;
+        // A reveal the user asked for outlives the focus move that follows it.
+        // Taken only when auto-hide is live: a pin set while the feature is
+        // off would sit unconsumed and silently eat the first collapse after
+        // they turn it on.
+        self.sidebar_pinned_open = self.show_tree && self.sidebar_auto_hide;
+        // Hiding the sidebar while Run-Debug was on screen: arm the same
+        // OSC-1337 image-cell evict gate that fires on a sidebar-view change.
+        // Without this the bug+play icon ghosts on top of the editor /
+        // terminal that fills the space the panel just vacated.
+        if was_visible
+            && !self.show_tree
+            && self.sidebar_view == SidebarView::RunDebug
+            && self.overlays.run_debug.was_emitted()
+        {
+            self.overlays.run_debug.request_clear();
+        }
+    }
+
     fn toggle_secondary_side_bar(&mut self) {
         self.secondary_side_bar_visible = !self.secondary_side_bar_visible;
         self.persist_layout();
@@ -12754,8 +12764,13 @@ impl App {
     fn toggle_sidebar_auto_hide(&mut self) {
         self.sidebar_auto_hide = !self.sidebar_auto_hide;
         // Best-effort, like every other pref write: a read-only config must
-        // not break the in-session toggle.
-        let _ = crate::prefs::save_sidebar_auto_hide(self.sidebar_auto_hide);
+        // not break the in-session toggle. Skipped under test, mirroring the
+        // write-skip in `apply_theme` — `save_*` resolves the developer's real
+        // ~/.config/croft/config.json, and a test has no business rewriting
+        // it (nor leaving the next test to read what it wrote).
+        if !cfg!(test) {
+            let _ = crate::prefs::save_sidebar_auto_hide(self.sidebar_auto_hide);
+        }
         // Turning it ON with the sidebar open takes effect at the next focus
         // move rather than retroactively yanking it away here.
         self.status = format!(
@@ -16562,20 +16577,7 @@ impl App {
             return Ok(());
         }
         if is_sidebar_toggle_key(key) {
-            let was_visible = self.show_tree;
-            self.show_tree = !self.show_tree;
-            // Hiding the sidebar while Run-Debug was on screen: arm
-            // the same OSC-1337 image-cell evict gate that fires on
-            // a sidebar-view change. Without this the bug+play icon
-            // ghosts on top of the editor / terminal that fills the
-            // space the panel just vacated.
-            if was_visible
-                && !self.show_tree
-                && self.sidebar_view == SidebarView::RunDebug
-                && self.overlays.run_debug.was_emitted()
-            {
-                self.overlays.run_debug.request_clear();
-            }
+            self.toggle_side_bar();
             return Ok(());
         }
         match (key.code, key.modifiers) {
@@ -28186,13 +28188,7 @@ impl App {
             Cmd::ShowTesting => self.open_testing_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
-            Cmd::ToggleSideBar => {
-                self.show_tree = !self.show_tree;
-                // Cmd+B is a deliberate sidebar action: showing it must not
-                // be undone by the auto-hide that fires on the next focus
-                // move back to the editor.
-                self.sidebar_pinned_open = self.show_tree;
-            }
+            Cmd::ToggleSideBar => self.toggle_side_bar(),
             Cmd::ToggleAutoHideSideBar => self.toggle_sidebar_auto_hide(),
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
@@ -30358,7 +30354,7 @@ impl App {
         {
             let icons = self.layout_icon_areas;
             if rect_contains(icons.toggle_side_bar, m.column, m.row) {
-                self.show_tree = !self.show_tree;
+                self.toggle_side_bar();
                 self.after_chrome_visibility_change();
                 return;
             }
@@ -34365,14 +34361,12 @@ impl App {
                 self.open_customize_layout_menu_on(&MenuAction::ToggleActivityBar);
             }
             MenuAction::ToggleSideBar => {
-                self.show_tree = !self.show_tree;
+                self.toggle_side_bar();
                 self.after_chrome_visibility_change();
                 self.open_customize_layout_menu_on(&MenuAction::ToggleSideBar);
             }
             MenuAction::ToggleAutoHideSideBar => {
                 self.toggle_sidebar_auto_hide();
-                // Index 6: appended after Minimap precisely so the existing
-                // toggle rows keep their hardcoded re-open indices.
                 self.open_customize_layout_menu_on(&MenuAction::ToggleAutoHideSideBar);
             }
             MenuAction::ToggleSecondarySideBar => {
