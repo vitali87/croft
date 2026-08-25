@@ -16716,6 +16716,421 @@ fn vim_feed_str(app: &mut App, s: &str) {
 }
 
 #[test]
+fn a_replayed_key_cannot_start_a_recording() {
+    // The re-entrancy flag gates CAPTURE, not dispatch, so a replayed `q`
+    // used to reach the vim handler and leave the user silently recording
+    // after the replay returned — every later keystroke captured with no
+    // gesture having asked for it.
+    let (mut app, tmp) = vim_app("one\ntwo\n");
+    app.macros_path = tmp.path().join("macros.json");
+    // A register whose contents are themselves a recording gesture.
+    let mut hostile = crate::macros::Macro::default();
+    hostile.push_key(key(KeyCode::Char('q'), KeyModifiers::NONE));
+    hostile.push_key(key(KeyCode::Char('c'), KeyModifiers::NONE));
+    app.macro_registers.insert("b".into(), hostile);
+
+    vim_feed_str(&mut app, "@b");
+    assert!(
+        app.macro_recording.is_none(),
+        "replaying a recording gesture must not leave the editor recording"
+    );
+}
+
+#[test]
+fn the_palette_and_vim_recorders_are_one_recording_not_two() {
+    // vim used to mirror the recording flag, so a palette Stop left `q`
+    // believing it was still recording: the next `q` re-saved the stale
+    // register and swallowed the key after it as a register name.
+    let (mut app, tmp) = vim_app("one\ntwo\n");
+    app.macros_path = tmp.path().join("macros.json");
+
+    // vim starts, palette stops.
+    vim_feed_str(&mut app, "qa");
+    assert!(app.macro_recording.is_some());
+    app.run_command(crate::widgets::command_palette::Command::MacroStartStopRecording);
+    assert!(app.macro_recording.is_none(), "the palette stopped it");
+
+    // A following `q` must START a fresh recording, not stop a phantom one.
+    vim_feed_str(&mut app, "qb");
+    assert_eq!(
+        app.macro_recording.as_ref().map(|r| r.register),
+        Some(Some('b')),
+        "vim sees the real state and opens register b"
+    );
+
+    // And the other direction: palette starts, a bare vim `q` stops.
+    app.run_command(crate::widgets::command_palette::Command::MacroStartStopRecording);
+    app.run_command(crate::widgets::command_palette::Command::MacroStartStopRecording);
+    assert!(app.macro_recording.is_some(), "palette started one");
+    vim_feed(&mut app, 'q');
+    assert!(
+        app.macro_recording.is_none(),
+        "a bare q stops what the palette started"
+    );
+}
+
+#[test]
+fn saving_one_register_preserves_every_field_of_a_newer_crofts_steps() {
+    // `update_json_store` re-serialises the ENTIRE map on every save, so a
+    // fieldless catch-all would rewrite a newer croft's steps as
+    // `{"kind":"Unknown"}` the first time any unrelated register was
+    // stored — silently destroying them. Worse than refusing to save,
+    // because it is unrecoverable.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("macros.json");
+    std::fs::write(
+        &path,
+        r#"{"b":{"steps":[{"kind":"Mouse","button":"left","x":3}]}}"#,
+    )
+    .unwrap();
+
+    let mut mine = crate::macros::Macro::default();
+    mine.push_key(key(KeyCode::Char('z'), KeyModifiers::NONE));
+    crate::macros::save_register(&path, "c", mine).unwrap();
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        raw.contains("\"button\"") && raw.contains("\"left\""),
+        "the future step's own fields survive an unrelated save: {raw}"
+    );
+    assert!(
+        raw.contains("\"x\""),
+        "including every field, not just the tag: {raw}"
+    );
+}
+
+#[test]
+fn a_replayed_keybinding_cannot_open_the_count_prompt() {
+    // `macro_replay_times` is a bindable id, so a replayed chord reaches it
+    // through keymap -> run_command. A prompt opening mid-replay swallows
+    // the macro's remaining keys into the count field, and `input_prompt`
+    // is checked ABOVE the macro tap, so a later Enter would submit the
+    // count and re-enter replay.
+    let (mut app, tmp) = vim_app("one\n");
+    app.macros_path = tmp.path().join("macros.json");
+    let mut m = crate::macros::Macro::default();
+    m.push_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+    app.macro_last = Some(m);
+
+    app.macro_replaying = true;
+    app.run_command(crate::widgets::command_palette::Command::MacroReplayTimes);
+    assert!(
+        app.input_prompt.is_none(),
+        "the count prompt must not open while a macro is replaying"
+    );
+
+    app.macro_replaying = false;
+    app.run_command(crate::widgets::command_palette::Command::MacroReplayTimes);
+    assert!(
+        app.input_prompt.is_some(),
+        "but it opens normally when nothing is replaying"
+    );
+}
+
+#[test]
+fn a_macro_of_only_unknown_steps_reports_that_it_ran_nothing() {
+    // `is_empty()` tests the step list; a macro whose steps are all
+    // unreplayable is not empty but yields no keys, and reporting
+    // "Macro replayed" would tell the user a newer croft's macro ran.
+    let (mut app, tmp) = vim_app("one\n");
+    app.macros_path = tmp.path().join("macros.json");
+    let path = app.macros_path.clone();
+    std::fs::write(
+        &path,
+        r#"{"u":{"steps":[{"kind":"Mouse","button":"left"}]}}"#,
+    )
+    .unwrap();
+    app.macro_registers = crate::macros::load(&path);
+
+    vim_feed_str(&mut app, "@u");
+    assert!(
+        app.status.contains("no steps this version can replay"),
+        "an all-unknown macro says so, got {:?}",
+        app.status
+    );
+    assert_eq!(app.editor.lines[0], "one", "and nothing ran");
+}
+
+#[test]
+fn an_unknown_step_kind_does_not_brick_the_whole_store() {
+    // A macros.json written by a newer croft must lose the step it names,
+    // not every register in the file — serde's tagged enums fail the WHOLE
+    // parse on an unknown tag without a catch-all, which would also block
+    // every future save (the store refuses to overwrite what it cannot read).
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("macros.json");
+    std::fs::write(
+        &path,
+        r#"{"a":{"steps":[{"kind":"Text","text":"hi"}]},
+            "b":{"steps":[{"kind":"Mouse","button":"left"}]}}"#,
+    )
+    .unwrap();
+
+    let loaded = crate::macros::load(&path);
+    assert!(
+        loaded.contains_key("a"),
+        "the readable register survives: {loaded:?}"
+    );
+    assert_eq!(
+        loaded.get("a").map(|m| m.len()),
+        Some(2),
+        "and still replays its own keys"
+    );
+    // The unknown step is inert rather than fatal.
+    assert_eq!(
+        loaded.get("b").map(|m| m.key_events().len()),
+        Some(0),
+        "an unknown step kind replays as nothing"
+    );
+    // Saves still work, so the store is not permanently locked.
+    assert!(
+        crate::macros::save_register(&path, "c", loaded.get("a").cloned().unwrap()).is_ok(),
+        "an unknown kind elsewhere in the file must not block writes"
+    );
+}
+
+#[test]
+fn a_replay_aborts_visibly_and_keeps_earlier_iterations() {
+    // The issue requires an abort to leave prior iterations intact. Budget
+    // refusal is the reachable abort in a test: assert it refuses without
+    // running anything rather than spinning.
+    let (mut app, tmp) = vim_app("one\n");
+    app.macros_path = tmp.path().join("macros.json");
+    let mut big = crate::macros::Macro::default();
+    for _ in 0..10 {
+        big.push_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+    }
+    app.macro_registers.insert("z".into(), big);
+    let before = app.editor.lines[0].clone();
+
+    vim_feed_str(&mut app, "99999@z");
+    assert!(
+        app.status.contains("refused"),
+        "a replay past the budget is refused visibly, got {:?}",
+        app.status
+    );
+    assert_eq!(
+        app.editor.lines[0], before,
+        "and nothing ran, rather than half of it"
+    );
+}
+
+#[test]
+fn a_count_before_a_closing_q_is_discarded_too() {
+    // The stop gesture takes the `'q'` arm rather than the register branch,
+    // so it needs its own take_count(): `3q` while recording must stop and
+    // discard the 3, not leave it to retarget the next motion.
+    let (mut app, tmp) = vim_app("aaaa\nbbbb\ncccc\ndddd\neeee\n");
+    app.macros_path = tmp.path().join("macros.json");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    vim_feed_str(&mut app, "qa");
+    vim_feed_str(&mut app, "3q");
+    assert!(
+        app.macro_recording.is_none(),
+        "3q still stops the recording"
+    );
+    vim_feed(&mut app, 'j');
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "the discarded 3 must not make the next j move three rows"
+    );
+}
+
+#[test]
+fn a_non_register_key_after_q_aborts_the_gesture() {
+    // The per-character handlers only see plain chars, so an arrow key after
+    // `q` used to return at the motion arms with `pending_record` still set —
+    // and the next letter typed would silently start a recording nobody
+    // asked for. Vim aborts the gesture on a non-register key.
+    let (mut app, tmp) = vim_app("one\ntwo\nthree\n");
+    app.macros_path = tmp.path().join("macros.json");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+
+    vim_feed(&mut app, 'q');
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.macro_recording.is_none(),
+        "the arrow key aborts the pending register gesture"
+    );
+
+    // The following letter must be an ordinary motion, not a register name.
+    vim_feed(&mut app, 'j');
+    assert!(
+        app.macro_recording.is_none(),
+        "and does not retroactively start a recording"
+    );
+}
+
+#[test]
+fn a_count_before_q_does_not_leak_into_the_recording() {
+    // Vim discards a count on `q`. Keeping it would silently retarget the
+    // recording's FIRST key — `3qa` then `j` moves three rows instead of one,
+    // and the wrong motion is what gets captured. A pending count is
+    // invisible, so the corruption only surfaces at replay.
+    let (mut app, tmp) = vim_app("aaaa\nbbbb\ncccc\ndddd\neeee\n");
+    app.macros_path = tmp.path().join("macros.json");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    vim_feed_str(&mut app, "3qa");
+    vim_feed(&mut app, 'j');
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "the stale 3 must not make the recording's first j move three rows"
+    );
+}
+
+#[test]
+fn vim_q_records_into_a_register_and_at_replays_it() {
+    // #255: `qa … q` records, `@a` replays, and the register survives as the
+    // "last macro" so `@@` repeats it.
+    let (mut app, tmp) = vim_app("one\ntwo\nthree\n");
+    app.macros_path = tmp.path().join("macros.json");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+
+    vim_feed_str(&mut app, "qa");
+    assert!(
+        app.macro_recording.is_some(),
+        "qa starts recording into a register"
+    );
+    assert_eq!(
+        app.macro_recording.as_ref().unwrap().register,
+        Some('a'),
+        "and remembers which one, for the status badge"
+    );
+
+    // Record "insert X at the line start, then go down a line".
+    vim_feed_str(&mut app, "IX");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'j');
+    vim_feed(&mut app, 'q');
+    assert!(app.macro_recording.is_none(), "the closing q stops");
+    assert_eq!(app.editor.lines[0], "Xone", "the recorded keys still ran");
+
+    // Replay once on line two.
+    vim_feed_str(&mut app, "@a");
+    assert_eq!(app.editor.lines[1], "Xtwo", "@a replays the register");
+
+    // `@@` repeats the same macro.
+    vim_feed_str(&mut app, "@@");
+    assert_eq!(app.editor.lines[2], "Xthree", "@@ repeats the last macro");
+}
+
+#[test]
+fn vim_a_count_replays_the_macro_that_many_times() {
+    // `3@a` runs it three times, and a count before `@` is not swallowed by
+    // the register letter.
+    let (mut app, tmp) = vim_app("a\nb\nc\nd\n");
+    app.macros_path = tmp.path().join("macros.json");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+
+    vim_feed_str(&mut app, "qz");
+    vim_feed_str(&mut app, "IX");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'j');
+    vim_feed(&mut app, 'q');
+
+    vim_feed_str(&mut app, "3@z");
+    assert_eq!(
+        (
+            app.editor.lines[1].as_str(),
+            app.editor.lines[2].as_str(),
+            app.editor.lines[3].as_str()
+        ),
+        ("Xb", "Xc", "Xd"),
+        "3@z ran the macro three times"
+    );
+}
+
+#[test]
+fn a_replayed_key_is_never_recorded_into_the_macro_producing_it() {
+    // Replay feeds keys back through handle_key, so without the re-entrancy
+    // guard a macro would grow while replaying and never terminate.
+    let (mut app, tmp) = vim_app("one\ntwo\n");
+    app.macros_path = tmp.path().join("macros.json");
+    vim_feed_str(&mut app, "qa");
+    vim_feed_str(&mut app, "IX");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'q');
+    let recorded_len = app.macro_registers.get("a").unwrap().len();
+
+    vim_feed_str(&mut app, "@a");
+    assert_eq!(
+        app.macro_registers.get("a").unwrap().len(),
+        recorded_len,
+        "replaying must not append to the register it is replaying"
+    );
+}
+
+#[test]
+fn an_empty_recording_is_discarded_rather_than_clobbering_a_good_macro() {
+    let (mut app, tmp) = vim_app("x\n");
+    app.macros_path = tmp.path().join("macros.json");
+    vim_feed_str(&mut app, "qa");
+    vim_feed_str(&mut app, "IZ");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'q');
+    let good = app.macro_registers.get("a").cloned().unwrap();
+
+    // Start and immediately stop: nothing recorded.
+    vim_feed_str(&mut app, "qa");
+    vim_feed(&mut app, 'q');
+    assert_eq!(
+        app.macro_registers.get("a"),
+        Some(&good),
+        "an empty recording must not replace a useful register"
+    );
+}
+
+#[test]
+fn a_macro_recorded_in_vim_mode_replays_from_the_palette() {
+    // The registers and the palette's "last macro" are one store, so the two
+    // entry points are interchangeable — the issue calls this out explicitly.
+    let (mut app, tmp) = vim_app("one\ntwo\n");
+    app.macros_path = tmp.path().join("macros.json");
+    vim_feed_str(&mut app, "qa");
+    vim_feed_str(&mut app, "IX");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'j');
+    vim_feed(&mut app, 'q');
+
+    app.run_command(crate::widgets::command_palette::Command::MacroReplayLast);
+    assert_eq!(
+        app.editor.lines[1], "Xtwo",
+        "the palette replays what vim recorded"
+    );
+}
+
+#[test]
+fn a_register_survives_a_restart_through_macros_json() {
+    let (mut app, tmp) = vim_app("one\n");
+    let path = tmp.path().join("macros.json");
+    app.macros_path = path.clone();
+    vim_feed_str(&mut app, "qa");
+    vim_feed_str(&mut app, "IX");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, 'q');
+
+    // A fresh load of the store sees the register, which is what App::new does.
+    let reloaded = crate::macros::load(&path);
+    assert_eq!(
+        reloaded.get("a"),
+        app.macro_registers.get("a"),
+        "the register was persisted, not just held in memory"
+    );
+}
+
+#[test]
 fn vim_dd_deletes_the_current_line() {
     let (mut app, _t) = vim_app("alpha\nbeta\ngamma");
     vim_feed_str(&mut app, "dd");

@@ -2137,6 +2137,20 @@ pub struct App {
     /// User key bindings from `~/.config/croft/keybindings.json`, consulted
     /// ahead of the built-in chords so a rebind wins over the default.
     keymap: crate::keymap::Keymap,
+    /// Live macro recording (#255), `None` when not recording. Carries the
+    /// vim register it will be stored under, or `None` for the palette
+    /// recorder, whose macro is the unnamed "last recording".
+    macro_recording: Option<crate::macros::Recording>,
+    /// The most recent finished recording: what "Replay Last" and vim's `@@`
+    /// run, and what a `q` with no register stores into.
+    macro_last: Option<crate::macros::Macro>,
+    /// Named registers (`qa` … `q`), loaded from macros.json at startup.
+    macro_registers: std::collections::HashMap<String, crate::macros::Macro>,
+    /// True while a replay is feeding keys back through `handle_key`, so a
+    /// replayed key is never recorded and a macro cannot invoke itself.
+    macro_replaying: bool,
+    /// The store path, held so tests can point saves at a tempdir.
+    macros_path: std::path::PathBuf,
     /// User snippets from `~/.config/croft/snippets.json`. Typing a snippet's
     /// prefix and pressing Tab expands it with tab-stop navigation.
     snippets: crate::snippets::SnippetSet,
@@ -3851,6 +3865,11 @@ impl App {
             extensions,
             disabled_extensions,
             keymap: crate::keymap::Keymap::load(&crate::keymap::keybindings_path()),
+            macro_recording: None,
+            macro_last: None,
+            macro_registers: crate::macros::load(&crate::macros::macros_path()),
+            macro_replaying: false,
+            macros_path: crate::macros::macros_path(),
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
@@ -14061,6 +14080,23 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        if let Some(rec) = &self.macro_recording {
+            // Recording is state a user can forget they left on, so it gets a
+            // filled red badge rather than a dim hint (#255). A named register
+            // shows which one, since vim users keep several.
+            let label = match rec.register {
+                Some(r) => format!(" ● REC @{r} "),
+                None => String::from(" ● REC "),
+            };
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .bg(self.theme.ui(Color::Rgb(0xc0, 0x2b, 0x2b)))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+        }
         if self.vim.enabled {
             let (text, bg) = match self.vim.command_line() {
                 Some(cmd) => (
@@ -15876,7 +15912,43 @@ impl App {
         }
     }
 
+    /// Dispatch one key, capturing it into a live macro recording (#255).
+    ///
+    /// The capture happens AFTER dispatch and only if recording was already
+    /// on both before and after: that is what keeps the gesture that ENDS a
+    /// recording (vim's closing `q`, the palette's stop command) out of the
+    /// macro it ends, and the gesture that STARTS one out of the macro it
+    /// opens. Keys are recorded rather than resolved commands because only
+    /// palette selections and user-rebound chords reach `run_command` — the
+    /// built-in defaults call their app methods directly, so a command-level
+    /// recorder would miss most of what a user does.
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        let capture =
+            self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
+        let result = self.handle_key_inner(key);
+        // Focus is re-checked after dispatch too: a key that hands focus to
+        // the terminal would otherwise be recorded while everything after it
+        // is dropped, producing a macro that replays a focus change and then
+        // silently loses its payload.
+        if capture && self.macro_recording.is_some() {
+            if self.focus == Pane::Editor {
+                self.record_macro_key(key);
+            } else {
+                // The issue asks for skipped keys to be logged rather than
+                // vanishing: a macro that quietly stopped recording halfway
+                // is otherwise indistinguishable from one that recorded
+                // everything.
+                crate::output::push(
+                    "Macros",
+                    crate::output::OutputLevel::Info,
+                    &format!("skipped {key:?}: recording captures the editor pane only"),
+                );
+            }
+        }
+        result
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> Result<()> {
         // Peek Definition popup: Enter converts to the real jump, Esc
         // closes, and any other key closes it and keeps its normal
         // meaning — the popup is a glance, never a mode (#115). Gated on
@@ -16016,6 +16088,17 @@ impl App {
             self.scm_menu.close();
             return Ok(());
         }
+        // Macro recording (#255) taps the key here: every modal above has
+        // already returned, so what reaches this point is editor work — the
+        // thing a macro is for. Capturing keys rather than resolved commands
+        // is deliberate: only palette selections and user-rebound chords
+        // reach `run_command`, while the built-in defaults (Cmd+S, Alt+Up,
+        // the debugger keys) call their app methods straight from here, so a
+        // command-level recorder would miss most of what a user does.
+        //
+        // Replay feeds keys back through `handle_key`, so it is re-entrant by
+        // construction — `replaying` keeps a replayed key from being recorded
+        // into the macro that is producing it.
         // User keybindings (keybindings.json) win over the built-in chords, but
         // only when the terminal is not focused (its raw control keys must pass
         // through) and the chord carries a real modifier or is a function key
@@ -19410,6 +19493,13 @@ impl App {
             InputPurpose::AddWatch => {
                 self.close_input_prompt();
                 self.add_watch_expression(value);
+            }
+            InputPurpose::MacroReplayCount => {
+                self.close_input_prompt();
+                match value.trim().parse::<usize>() {
+                    Ok(n) if n > 0 => self.replay_last_macro(n),
+                    _ => self.status = format!("Not a repeat count: {}", value.trim()),
+                }
             }
             InputPurpose::ArchiveExtract { member } => {
                 self.close_input_prompt();
@@ -23620,6 +23710,25 @@ impl App {
                 self.editor.clear_selection();
                 self.vim_visual_line = false;
             }
+            // `q{a-z}` starts, a bare `q` stops. The vim machine reports the
+            // gesture; the recording itself lives on App so a macro recorded
+            // in vim mode replays from the palette and vice versa (#255).
+            // Recording control is inert during replay. `macro_replaying`
+            // gates capture, not dispatch, so without this a replayed `q`
+            // would reach here and leave the user silently recording after
+            // the replay returned — the class of command the issue's
+            // exclusion list exists for.
+            VimAction::MacroRecord(_) | VimAction::MacroReplay(..) if self.macro_replaying => {}
+            VimAction::MacroRecord(register) => match register {
+                // A register letter STARTS; a bare `q` stops. The app owns
+                // the recording state, so vim never has to track it.
+                Some(r) if self.macro_recording.is_none() => self.start_macro_recording(Some(r)),
+                _ => self.stop_macro_recording(),
+            },
+            VimAction::MacroReplay(register, count) => match register {
+                Some(r) => self.replay_macro_register(r, count),
+                None => self.replay_last_macro(count),
+            },
         }
     }
 
@@ -27335,6 +27444,145 @@ impl App {
         true
     }
 
+    /// Capture one key into the live recording. Recording control keys are
+    /// excluded by the callers that own them (vim's `q`, the palette
+    /// commands), so a macro can never contain the gesture that ends it.
+    fn record_macro_key(&mut self, key: crossterm::event::KeyEvent) {
+        if let Some(rec) = self.macro_recording.as_mut() {
+            rec.recorded.push_key(key);
+        }
+    }
+
+    /// Start recording into `register` (vim `q{a-z}`) or into the unnamed
+    /// last-recording slot (the palette command). Starting while already
+    /// recording stops instead, so one gesture toggles.
+    fn start_macro_recording(&mut self, register: Option<char>) {
+        if self.macro_recording.is_some() {
+            self.stop_macro_recording();
+            return;
+        }
+        self.macro_recording = Some(crate::macros::Recording {
+            register,
+            recorded: crate::macros::Macro::default(),
+        });
+        // One source of truth: vim's `q` branches on this, and a copy the
+        // machine kept for itself drifted whenever the palette was used.
+        self.vim.set_recording(true);
+        self.status = match register {
+            Some(r) => format!("Recording macro into @{r}"),
+            None => String::from("Recording macro"),
+        };
+    }
+
+    /// Finish the live recording: it becomes the last macro either way, and
+    /// a named register is also persisted. An empty recording is discarded
+    /// rather than replacing a useful macro with a no-op.
+    fn stop_macro_recording(&mut self) {
+        let Some(rec) = self.macro_recording.take() else {
+            return;
+        };
+        self.vim.set_recording(false);
+        if rec.recorded.is_empty() {
+            self.status = String::from("Macro discarded (nothing recorded)");
+            return;
+        }
+        let len = rec.recorded.len();
+        if let Some(r) = rec.register {
+            let name = r.to_string();
+            self.macro_registers
+                .insert(name.clone(), rec.recorded.clone());
+            if let Err(e) =
+                crate::macros::save_register(&self.macros_path, &name, rec.recorded.clone())
+            {
+                crate::output::push("Macros", crate::output::OutputLevel::Warn, &e);
+            }
+            self.status = format!("Recorded {len} keys into @{r}");
+        } else {
+            self.status = format!("Recorded {len} keys");
+        }
+        self.macro_last = Some(rec.recorded);
+    }
+
+    /// Replay `mac` `count` times by feeding its keys back through
+    /// `handle_key`. Guarded three ways: a re-entrancy flag (a macro cannot
+    /// invoke itself), a total-key budget (a pathological count cannot spin
+    /// the UI), and an abort on the first key that errors, which leaves the
+    /// buffer at the abort point with earlier iterations intact.
+    fn replay_macro(&mut self, mac: crate::macros::Macro, count: usize) {
+        const MAX_REPLAY_KEYS: usize = 100_000;
+        if self.macro_replaying {
+            self.status = String::from("Macro is already replaying");
+            return;
+        }
+        if mac.is_empty() {
+            self.status = String::from("Macro is empty");
+            return;
+        }
+        let count = count.max(1);
+        // Budget the keys actually fed, not the recorded step count:
+        // `key_events` drops steps this build cannot replay, so `len()` is an
+        // upper bound rather than the real total.
+        let keys = mac.key_events();
+        if keys.is_empty() {
+            // Every step was one this build cannot replay (a macro from a
+            // newer croft). Say so rather than reporting a successful run
+            // of nothing.
+            self.status = String::from("Macro has no steps this version can replay");
+            return;
+        }
+        let total = keys.len().saturating_mul(count);
+        if total > MAX_REPLAY_KEYS {
+            self.status =
+                format!("Macro would run {total} keys (limit {MAX_REPLAY_KEYS}) — refused");
+            return;
+        }
+        self.macro_replaying = true;
+        let mut done = 0usize;
+        let mut aborted = None;
+        'outer: for iteration in 0..count {
+            // Break coalescing so a new iteration's opening keystrokes never
+            // merge into the previous iteration's typing run. This bounds
+            // iterations apart; it does NOT make one iteration one undo step
+            // — `push_undo` coalesces only InsertChar→InsertChar, so a macro
+            // holding a delete plus an insert still undoes in two. A real
+            // one-step-per-iteration guarantee needs an undo-group API the
+            // editor does not have (its undo is whole-buffer snapshots).
+            self.editor.break_undo_coalescing();
+            for k in &keys {
+                if let Err(e) = self.handle_key(*k) {
+                    aborted = Some((iteration + 1, e.to_string()));
+                    break 'outer;
+                }
+            }
+            done = iteration + 1;
+        }
+        self.macro_replaying = false;
+        self.status = match aborted {
+            Some((at, e)) => format!("Macro aborted on iteration {at}: {e}"),
+            None if done == 1 => String::from("Macro replayed"),
+            None => format!("Macro replayed {done}×"),
+        };
+    }
+
+    /// Replay the last recording (palette "Macro: Replay Last", vim `@@`).
+    fn replay_last_macro(&mut self, count: usize) {
+        match self.macro_last.clone() {
+            Some(m) => self.replay_macro(m, count),
+            None => self.status = String::from("No macro recorded yet"),
+        }
+    }
+
+    /// Replay a named register (vim `@{a-z}`).
+    fn replay_macro_register(&mut self, register: char, count: usize) {
+        match self.macro_registers.get(&register.to_string()).cloned() {
+            Some(m) => {
+                self.macro_last = Some(m.clone());
+                self.replay_macro(m, count);
+            }
+            None => self.status = format!("Register @{register} is empty"),
+        }
+    }
+
     /// Execute a Command Palette entry. Editor text commands act on the active
     /// editor buffer; view / navigation commands defer to the same methods
     /// their dedicated chords use, so the palette can never drift from the
@@ -27571,6 +27819,30 @@ impl App {
             Cmd::NavigateForward => self.nav_forward(),
             Cmd::GoToLastEditLocation => self.goto_last_edit_location(),
             Cmd::ToggleVimMode => self.toggle_vim_mode(),
+            Cmd::MacroStartStopRecording if self.macro_replaying => {}
+            Cmd::MacroStartStopRecording => {
+                if self.macro_recording.is_some() {
+                    self.stop_macro_recording();
+                } else {
+                    self.start_macro_recording(None);
+                }
+            }
+            Cmd::MacroReplayLast if self.macro_replaying => {}
+            Cmd::MacroReplayLast => self.replay_last_macro(1),
+            // Guarded like its siblings: `macro_replay_times` is a bindable
+            // id, so a replayed key reaches it. A prompt opening mid-replay
+            // swallows the macro's remaining keys into the count field, and
+            // `input_prompt` is checked ABOVE the macro tap, so a later
+            // Enter would submit the count and re-enter replay.
+            Cmd::MacroReplayTimes if self.macro_replaying => {}
+            Cmd::MacroReplayTimes => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                self.open_input_prompt(InputPrompt::new(
+                    InputPurpose::MacroReplayCount,
+                    "Replay Macro N Times",
+                    "count",
+                ));
+            }
             Cmd::ShowExplorer => self.set_sidebar_view(SidebarView::Explorer),
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
             Cmd::ShowSourceControl => self.set_sidebar_view(SidebarView::SourceControl),
