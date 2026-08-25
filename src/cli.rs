@@ -11,18 +11,14 @@ const ITERM2_NONASCII_PS_NAME: &str = "SymbolsNFM";
 const ITERM2_FONT_SIZE: u32 = 13;
 
 /// What `croft --version` prints: the plain crate version (#282).
-///
-/// Provenance is NOT dropped — it moved to `--build-info`, and the
-/// drift machinery never read this string in the first place. `DriftProbe`
-/// compares the baked `CROFT_GIT_HASH_FULL` against the repo's current
-/// commit, so the fix that introduced the hash (a binary silently older than
-/// its own source tree) keeps working with the hash out of the common path.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Version plus build provenance, for `--build-info`. Two builds can
-/// share a crate version — 0.1.758 was both the broken and the fixed binary
-/// in the 2026-08-22 session-host incident — so provenance stays one flag
-/// away rather than in everybody's face.
+/// Version plus build provenance, for `--build-info`. Two builds can share a
+/// crate version — 0.1.758 was both the broken and the fixed binary in the
+/// 2026-08-22 session-host incident — so provenance stays one flag away
+/// rather than in everybody's face. Drift detection is unaffected either way:
+/// `DriftProbe` compares the baked `CROFT_GIT_HASH_FULL` against the repo's
+/// current commit and never read a version string.
 const VERBOSE_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
@@ -43,6 +39,11 @@ pub struct Cli {
     /// Print the version with build provenance (git hash and build time) and
     /// exit. `--version` prints the plain `x.y.z`; this is the flag to quote
     /// in a bug report, since two builds can share a version (#282).
+    ///
+    /// It answers before anything else runs, so pairing it with a subcommand
+    /// swallows that subcommand. Left as-is deliberately: clap subcommands are
+    /// not argument ids, so `conflicts_with = "command"` is a runtime assert
+    /// failure rather than a guard, and `--version` behaves the same way.
     #[arg(long)]
     pub build_info: bool,
 
@@ -1007,11 +1008,23 @@ mod tests {
     /// exactly how the hash got into the common path the first time.
     #[test]
     fn version_is_a_bare_semver_and_provenance_lives_behind_build_info() {
-        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
-        assert!(
-            !VERSION.contains(['(', ' ']),
-            "--version must stay a bare x.y.z, got {VERSION:?}"
+        // Assert on what clap RENDERS, not on the constant. The binding under
+        // test is the `version = VERSION` token in the `#[command(...)]`
+        // attribute, and regressing that alone leaves every constant correct:
+        // a check against VERSION would pass while `--version` printed the
+        // hash again, which is exactly the regression this guards.
+        let rendered = <Cli as clap::CommandFactory>::command().render_version();
+        assert_eq!(
+            rendered.trim(),
+            format!("croft {}", env!("CARGO_PKG_VERSION")),
+            "--version must render a bare x.y.z"
         );
+        assert!(
+            !rendered.contains('('),
+            "provenance must not ride along on --version: {rendered:?}"
+        );
+
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
 
         // The provenance did not disappear, it moved.
         assert!(VERBOSE_VERSION.starts_with(VERSION));

@@ -11193,10 +11193,9 @@ impl App {
 
         // Version badge to the right of the wordmark (the wordmark sits
         // in the lower portion of the logo PNG; the badge tracks that row).
-        // Plain `vX.Y.Z` (#282): the hash belonged here only to tell two
-        // builds of one version apart, and the drift banner already does
-        // that job — with an actionable message — whenever it matters. A
-        // hash on every welcome screen was noise the other 99% of the time.
+        // Plain `vX.Y.Z` (#282). The hash told two builds of one version
+        // apart; the drift banner already does that, with an actionable
+        // message, at the moment it matters.
         let version_label = format!(" v{} ", env!("CARGO_PKG_VERSION"));
         let version_w = version_label.chars().count() as u16;
         let badge_x = logo_x + logo_w_cells + 1;
