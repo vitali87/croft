@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Croft Light: the selected activity-bar icon no longer disappears. The icons are baked as images with a fixed tint, so on a light bar the selected one was painted white on white; the whole icon family now takes its ink from the theme, matching VS Code Light Modern.",
+    summary: "Close All now means all: the tab context menu's Close All (and Cmd+K W) closes the tabs in every split group and collapses the layout to a single pane. It used to empty only the clicked group, which then collapsed away — looking like a single tab closed.",
 }];

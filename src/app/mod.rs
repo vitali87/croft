@@ -2794,6 +2794,9 @@ pub struct App {
     occ_observed_at: std::time::Instant,
     rename_request_id: Option<u64>,
     format_request_id: Option<u64>,
+    /// True when the in-flight format request is Format Selection (#254)
+    /// — the drain words its statuses accordingly.
+    format_request_selection: bool,
     code_action_request_id: Option<u64>,
     /// True when the in-flight code-action request is a `codeAction/resolve`
     /// (the reply is one resolved action to apply directly) rather than the
@@ -4193,6 +4196,7 @@ impl App {
             signature_help_anchor: None,
             rename_request_id: None,
             format_request_id: None,
+            format_request_selection: false,
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
@@ -9710,7 +9714,37 @@ impl App {
         let (tab_size, insert_spaces) = self.editor.indent_preference();
         let id = lsp.request_formatting(path, tab_size, insert_spaces);
         self.format_request_id = Some(id);
+        self.format_request_selection = false;
         self.status = String::from("Formatting document");
+    }
+
+    /// "Format Selection" (#254): `textDocument/rangeFormatting` over the
+    /// primary selection, applied through the same reply path as
+    /// whole-document formatting.
+    fn format_selection(&mut self) {
+        if self.editor.has_non_text_view() {
+            return;
+        }
+        let Some(sel) = self.editor.selection.filter(|s| s.has_area()) else {
+            self.status = String::from("Select something to format");
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file open");
+            return;
+        };
+        let ((sr, sc), (er, ec)) = sel.normalised();
+        let start = self.editor.pos_to_utf16(sr, sc);
+        let end = self.editor.pos_to_utf16(er, ec);
+        let (tab_size, insert_spaces) = self.editor.indent_preference();
+        let Some(lsp) = self.lsp.as_mut() else {
+            self.status = String::from("No language server for this file");
+            return;
+        };
+        let id = lsp.request_range_formatting(path, start, end, tab_size, insert_spaces);
+        self.format_request_id = Some(id);
+        self.format_request_selection = true;
+        self.status = String::from("Formatting selection");
     }
 
     pub fn drain_lsp_format(&mut self) -> bool {
@@ -9736,8 +9770,13 @@ impl App {
             return false;
         }
         self.format_request_id = None;
+        let selection = std::mem::take(&mut self.format_request_selection);
         if unsupported {
-            self.status = String::from("No formatter available for this file");
+            self.status = if selection {
+                String::from("No range formatter available for this file")
+            } else {
+                String::from("No formatter available for this file")
+            };
             self.complete_pending_save();
             return true;
         }
@@ -9746,12 +9785,22 @@ impl App {
                 match self.editor.apply_rename_to_open_tab(&path, &edits) {
                     Some(_) => {
                         self.editor.clamp_cursor();
-                        self.status = String::from("Formatted document");
+                        self.status = if selection {
+                            String::from("Formatted selection")
+                        } else {
+                            String::from("Formatted document")
+                        };
                     }
                     None => self.status = String::from("Format failed: document not open"),
                 }
             }
-            _ => self.status = String::from("Document already formatted"),
+            _ => {
+                self.status = if selection {
+                    String::from("Selection already formatted")
+                } else {
+                    String::from("Document already formatted")
+                }
+            }
         }
         // A format-on-save write is deferred until now so the disk file gets the
         // formatted text in one go.
@@ -15145,15 +15194,7 @@ impl App {
             }
             // Cmd+K W: close all editor tabs.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'w') => {
-                let removed = self.editor.close_all();
-                self.sync_open_file_poll_mtime();
-                self.status = if removed == 1 {
-                    String::from("Closed 1 tab")
-                } else {
-                    format!("Closed {removed} tabs")
-                };
-                self.poke_cursor();
-                self.collapse_split_if_empty();
+                self.close_all_tabs();
                 true
             }
             // Cmd+K U: close all saved (non-dirty) editor tabs.
@@ -15219,6 +15260,18 @@ impl App {
             // Cmd+K Z: toggle Zen Mode (VS Code's binding).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'z') => {
                 self.toggle_zen_mode();
+                true
+            }
+            // Cmd+K Cmd+F (SUPER/CTRL held on the second key): Format
+            // Selection, VS Code's binding (#254). Must precede the plain
+            // Cmd+K F arm, which keeps croft's format-on-save toggle.
+            KeyCode::Char(c)
+                if plain
+                    && c.eq_ignore_ascii_case(&'f')
+                    && (key.modifiers.contains(KeyModifiers::SUPER)
+                        || key.modifiers.contains(KeyModifiers::CONTROL)) =>
+            {
+                self.format_selection();
                 true
             }
             // Cmd+K F: toggle Format on Save (croft binding; VS Code leaves this
@@ -26818,6 +26871,7 @@ impl App {
                 self.status = String::from("Converted indentation to tabs");
             }
             Cmd::FormatDocument => self.start_format_document(),
+            Cmd::FormatSelection => self.format_selection(),
             Cmd::ChangeColorPresentation => self.change_color_presentation(),
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
@@ -33144,17 +33198,7 @@ impl App {
                     self.poke_cursor();
                 }
             }
-            MenuAction::CloseAllTabs => {
-                let removed = self.editor.close_all();
-                self.sync_open_file_poll_mtime();
-                self.status = if removed == 1 {
-                    String::from("Closed 1 tab")
-                } else {
-                    format!("Closed {removed} tabs")
-                };
-                self.poke_cursor();
-                self.collapse_split_if_empty();
-            }
+            MenuAction::CloseAllTabs => self.close_all_tabs(),
             MenuAction::CloseSavedTabs => self.close_saved_tabs(),
             MenuAction::KeepTabOpen(idx) => {
                 if self.editor.keep_open(idx) {
@@ -33441,6 +33485,34 @@ impl App {
     /// Close every saved (non-dirty) editor tab, keeping any with unsaved
     /// changes. Shared by the tab context menu and the `Cmd+K U` chord so both
     /// surfaces produce the same status line and split-collapse behavior.
+    /// Cmd+K W / tab context "Close All": close every tab in EVERY editor
+    /// group, not just the focused one, collapsing any split back to a single
+    /// blank pane. A side-by-side layout (e.g. `cgr duplicates` diffs) would
+    /// otherwise only empty the clicked group and look like a single close
+    /// once the blank group collapsed away.
+    fn close_all_tabs(&mut self) {
+        let mut removed = self.editor.close_all();
+        if self.editor_layout.is_split() {
+            removed += self
+                .editor_layout
+                .inactive_groups()
+                .iter()
+                .map(|g| g.editors.len())
+                .sum::<usize>();
+            self.editor_layout = editor_layout::EditorLayout::single();
+            self.editor_seams.clear();
+            self.disable_editor_image(1);
+            self.sync_focus_flags();
+        }
+        self.sync_open_file_poll_mtime();
+        self.status = if removed == 1 {
+            String::from("Closed 1 tab")
+        } else {
+            format!("Closed {removed} tabs")
+        };
+        self.poke_cursor();
+    }
+
     fn close_saved_tabs(&mut self) {
         let removed = self.editor.close_saved();
         if removed == 0 {

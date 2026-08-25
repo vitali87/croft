@@ -8301,6 +8301,39 @@ fn close_others_records_the_dropped_tabs_for_reopen() {
     assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
 }
 
+/// Tab context "Close All" must close the tabs in EVERY split group, not
+/// just the clicked one. With files open side by side (e.g. `cgr
+/// duplicates`), it used to empty only the focused group, whose blank pane
+/// then collapsed away and promoted the other group — so it looked like a
+/// single tab closed.
+#[test]
+fn close_all_closes_every_split_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    for f in [&a, &b] {
+        std::fs::write(f, "x\n").unwrap();
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.split_editor(); // right group (focused) duplicates a.rs
+    app.editor.open_pinned(&b).unwrap();
+    assert!(app.editor_layout.is_split(), "two groups before Close All");
+    let total: usize = std::iter::once(&app.editor)
+        .chain(app.editor_layout.inactive_groups())
+        .map(|g| g.editors.len())
+        .sum();
+    assert!(total >= 2, "tabs are spread over both groups");
+    app.dispatch_menu_action(MenuAction::CloseAllTabs, tmp.path().to_path_buf());
+    assert!(
+        !app.editor_layout.is_split(),
+        "Close All collapses the split back to a single group"
+    );
+    assert_eq!(app.editor.tab_count(), 1, "a single blank pane remains");
+    assert_eq!(app.editor.path, None, "no file stays open in any group");
+    assert_eq!(app.status, format!("Closed {total} tabs"));
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
@@ -29162,6 +29195,34 @@ fn refresh_run_debug_syncs_the_config_row() {
     app.refresh_run_debug();
     assert_eq!(app.run_debug.config_count, 1);
     assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
+}
+
+#[test]
+fn format_selection_needs_a_selection_and_reports_unsupported_via_the_reply() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("lib.rs"), "fn main( ) {\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    // No selection: refused up front with guidance.
+    app.run_command(crate::widgets::command_palette::Command::FormatSelection);
+    assert_eq!(app.status, "Select something to format");
+    // With a selection: the request fires; with no server spawned in
+    // tests, the worker's always-answer contract reports unsupported
+    // through the SAME drain as whole-document formatting, with
+    // selection-specific wording.
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (1, 1),
+    });
+    app.run_command(crate::widgets::command_palette::Command::FormatSelection);
+    assert_eq!(app.status, "Formatting selection");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.format_request_id.is_some() && std::time::Instant::now() < deadline {
+        app.drain_lsp_format();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.status, "No range formatter available for this file");
 }
 
 #[test]
