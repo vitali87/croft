@@ -27465,6 +27465,13 @@ impl App {
         // `key_events` drops steps this build cannot replay, so `len()` is an
         // upper bound rather than the real total.
         let keys = mac.key_events();
+        if keys.is_empty() {
+            // Every step was one this build cannot replay (a macro from a
+            // newer croft). Say so rather than reporting a successful run
+            // of nothing.
+            self.status = String::from("Macro has no steps this version can replay");
+            return;
+        }
         let total = keys.len().saturating_mul(count);
         if total > MAX_REPLAY_KEYS {
             self.status =
@@ -27750,11 +27757,9 @@ impl App {
             Cmd::NavigateForward => self.nav_forward(),
             Cmd::GoToLastEditLocation => self.goto_last_edit_location(),
             Cmd::ToggleVimMode => self.toggle_vim_mode(),
+            Cmd::MacroStartStopRecording if self.macro_replaying => {}
             Cmd::MacroStartStopRecording => {
-                if self.macro_replaying {
-                    // See the vim arms: a replayed key must not be able to
-                    // start or stop a recording.
-                } else if self.macro_recording.is_some() {
+                if self.macro_recording.is_some() {
                     self.stop_macro_recording();
                 } else {
                     self.start_macro_recording(None);
@@ -27762,6 +27767,12 @@ impl App {
             }
             Cmd::MacroReplayLast if self.macro_replaying => {}
             Cmd::MacroReplayLast => self.replay_last_macro(1),
+            // Guarded like its siblings: `macro_replay_times` is a bindable
+            // id, so a replayed key reaches it. A prompt opening mid-replay
+            // swallows the macro's remaining keys into the count field, and
+            // `input_prompt` is checked ABOVE the macro tap, so a later
+            // Enter would submit the count and re-enter replay.
+            Cmd::MacroReplayTimes if self.macro_replaying => {}
             Cmd::MacroReplayTimes => {
                 use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
                 self.open_input_prompt(InputPrompt::new(

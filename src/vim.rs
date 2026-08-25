@@ -276,6 +276,16 @@ impl VimState {
 
     /// Short uppercase label for the status bar, or `None` while typing a
     /// `:`/`/`/`?` line (the caller shows [`Self::command_line`] instead).
+    pub fn mode_label(&self) -> Option<&'static str> {
+        match self.mode {
+            VimMode::Normal => Some("NORMAL"),
+            VimMode::Insert => Some("INSERT"),
+            VimMode::Visual => Some("VISUAL"),
+            VimMode::VisualLine => Some("V-LINE"),
+            VimMode::Command | VimMode::Search => None,
+        }
+    }
+
     /// Tell the machine whether a macro recording is live. The app calls
     /// this after every start/stop from EITHER entry point (vim `q` or the
     /// palette), so `q` always branches on the real state instead of a copy
@@ -284,16 +294,6 @@ impl VimState {
         self.app_recording = recording;
         if !recording {
             self.pending_record = false;
-        }
-    }
-
-    pub fn mode_label(&self) -> Option<&'static str> {
-        match self.mode {
-            VimMode::Normal => Some("NORMAL"),
-            VimMode::Insert => Some("INSERT"),
-            VimMode::Visual => Some("VISUAL"),
-            VimMode::VisualLine => Some("V-LINE"),
-            VimMode::Command | VimMode::Search => None,
         }
     }
 
