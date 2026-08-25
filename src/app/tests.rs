@@ -30200,3 +30200,120 @@ fn editing_drops_stale_document_links() {
         "the edit dropped the stale ranges"
     );
 }
+
+/// #260: with auto-hide on, moving focus to the editor collapses the sidebar,
+/// and a deliberate sidebar action brings it back and HOLDS it — the reveal
+/// must not be undone by the focus change it performs itself.
+#[test]
+fn auto_hide_collapses_on_editor_focus_and_deliberate_actions_restore_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    app.focus_pane(Pane::Editor);
+    assert!(!app.show_tree, "focusing the editor collapses the sidebar");
+
+    // An activity-bar view switch is a deliberate sidebar action: it reveals
+    // the sidebar AND lands focus there, so the pin it takes is released by
+    // that same focus move — the sidebar stays open because focus is in it,
+    // not because it is pinned.
+    app.set_sidebar_view(SidebarView::Search);
+    assert!(app.show_tree, "choosing a view reveals the sidebar");
+    assert!(app.focus == Pane::Tree, "and puts focus in it");
+    assert!(
+        !app.sidebar_pinned_open,
+        "focus landed in the sidebar, so the pin has done its job"
+    );
+
+    // Leaving again collapses.
+    app.focus_pane(Pane::Editor);
+    assert!(!app.show_tree, "leaving collapses it again");
+
+    // Terminal focus collapses too, not just the editor.
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Tree);
+    app.focus_pane(Pane::Terminal);
+    assert!(!app.show_tree, "a terminal is also 'not the sidebar'");
+}
+
+/// The flapping cases from #260: a seam drag, an open prompt or menu, and Zen
+/// Mode must all suppress the collapse. Each is a state where the sidebar is
+/// either being manipulated or deliberately borrowed.
+#[test]
+fn auto_hide_is_suppressed_while_dragging_prompting_or_in_zen_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+
+    // Baseline: it would collapse.
+    app.show_tree = true;
+    assert!(app.sidebar_auto_hide_allowed());
+
+    // Mid seam-drag the pointer is over the editor by definition; collapsing
+    // under the cursor is exactly the flapping the issue calls out.
+    app.splitter_drag = Some(SplitterDrag::Sidebar);
+    assert!(!app.sidebar_auto_hide_allowed(), "a drag suppresses it");
+    app.focus_pane(Pane::Editor);
+    assert!(app.show_tree, "and the sidebar survives the drag");
+    app.splitter_drag = None;
+
+    // Zen Mode already owns chrome visibility and wins, as it does today.
+    app.zen_mode = true;
+    assert!(!app.sidebar_auto_hide_allowed(), "zen mode wins");
+    app.zen_mode = false;
+
+    // Off by default: a user who never opted in never loses their sidebar.
+    app.sidebar_auto_hide = false;
+    assert!(!app.sidebar_auto_hide_allowed());
+    app.focus_pane(Pane::Editor);
+    assert!(app.show_tree, "opt-in only");
+}
+
+/// Reveal-in-explorer targets the sidebar, so it must work even when
+/// auto-hide has collapsed it — otherwise the command silently does nothing
+/// visible.
+#[test]
+fn reveal_in_explorer_shows_a_collapsed_sidebar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    app.focus_pane(Pane::Editor);
+    assert!(!app.show_tree, "collapsed first");
+
+    app.reveal_in_explorer(f);
+    assert!(
+        app.show_tree,
+        "a sidebar-targeting command reveals the sidebar"
+    );
+}
+
+/// The Customize Layout rows carry hardcoded re-open indices (each toggle
+/// reopens the menu with itself selected), so inserting a row in the middle
+/// silently mis-selects every row after it. #260's Auto-Hide row is appended
+/// after Minimap for that reason; this pins the positions so a future insert
+/// fails here rather than in someone's hands.
+#[test]
+fn customize_layout_toggle_rows_keep_their_reopen_indices() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    let items = app.customize_layout_items();
+    let label = |i: usize| match &items[i] {
+        MenuEntry::Item { label, .. } => label.clone(),
+        _ => panic!("row {i} is not an item"),
+    };
+    assert!(label(0).contains("Activity Bar"));
+    assert!(label(1).contains("Primary Side Bar"));
+    assert!(label(2).contains("Secondary Side Bar"));
+    assert!(label(3).contains("Panel"));
+    assert!(label(4).contains("Status Bar"));
+    assert!(label(5).contains("Minimap"));
+    assert!(
+        label(6).contains("Auto-Hide Side Bar"),
+        "the new row is appended, not inserted"
+    );
+}

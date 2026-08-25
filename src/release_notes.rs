@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Code intelligence lands on the right symbol in files with emoji: hover, go-to-definition, completion, references, rename and friends now measure columns the way language servers do, so a line containing an emoji no longer shifts every result sideways.",
+    kind: NoteKind::Feature,
+    summary: "The sidebar can get out of your way: turn on Auto-Hide Side Bar and it collapses when you move to the editor or a terminal, returning the moment you reach for it — an activity-bar icon, Cmd+B, or a command like Reveal in Explorer.",
 }];

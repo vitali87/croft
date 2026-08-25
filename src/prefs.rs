@@ -129,6 +129,11 @@ pub struct Prefs {
     /// Visibility of the Explorer's stacked sub-views (⋯ menu toggles).
     #[serde(default)]
     pub explorer_views: ExplorerViewsPrefs,
+    /// Collapse the sidebar when focus moves to the editor or a terminal
+    /// (#260). Off by default: hiding chrome on focus surprises people who
+    /// did not ask for it, so this is opt-in.
+    #[serde(default)]
+    pub sidebar_auto_hide: bool,
     /// Extension ids the user has disabled in the Extensions panel. Absent or
     /// empty means every bundled and installed extension is enabled (the
     /// default), so disabling is opt-in and an older config still parses.
