@@ -2035,6 +2035,48 @@ fn go_back_returns_to_the_location_before_a_definition_jump() {
     );
 }
 
+/// A `diff://` link opens two files but is ONE jump for the user, so Back
+/// must return to where the click happened — not to the left half of the
+/// diff on the way there.
+#[test]
+fn side_by_side_diff_link_records_one_go_back_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.rs");
+    let left = tmp.path().join("left.rs");
+    let right = tmp.path().join("right.rs");
+    std::fs::write(&origin, "fn main() {}\nlet x = 1;\n").unwrap();
+    std::fs::write(&left, "fn left() {}\n").unwrap();
+    std::fs::write(&right, "fn right() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&origin).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 4;
+
+    let lref = crate::file_ref::FileRef {
+        path: left.to_string_lossy().into_owned(),
+        line: 1,
+        column: None,
+    };
+    let rref = crate::file_ref::FileRef {
+        path: right.to_string_lossy().into_owned(),
+        line: 1,
+        column: None,
+    };
+    assert!(app.open_side_by_side(&lref, &rref), "both sides open");
+
+    app.nav_back();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(origin.as_path()),
+        "one Back returns to the clicked location, not the left half"
+    );
+    assert_eq!(app.editor.cursor_row, 1, "caret returns to the click row");
+    assert_eq!(
+        app.editor.cursor_col, 4,
+        "caret returns to the click column"
+    );
+}
+
 /// #31: navigate-back rested entirely on the Ctrl+Shift+click mouse chord.
 /// The VS Code keyboard chord (Ctrl+-) and the palette command are the
 /// fallbacks that work when the host terminal never delivers that chord.

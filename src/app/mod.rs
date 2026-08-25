@@ -25634,11 +25634,75 @@ impl App {
                 self.workspace_root().join(&path)
             }
         };
+        self.open_resolved_file_ref(&abs, fr.line, fr.column)
+    }
+
+    /// Jump the editor to an absolute `path:line[:col]`, recording where the
+    /// user was so Back returns to it, exactly like go-to-definition. False
+    /// when the file doesn't exist or won't open.
+    fn open_resolved_file_ref(
+        &mut self,
+        abs: &std::path::Path,
+        line: u32,
+        column: Option<u32>,
+    ) -> bool {
+        self.open_resolved_file_ref_inner(abs, line, column, true)
+    }
+
+    /// [`Self::open_resolved_file_ref`], but `record_nav` false skips the jump
+    /// history. A side-by-side open is ONE jump for the user even though it
+    /// opens two files, so it records the origin itself and opens both halves
+    /// without recording (otherwise the first Back lands on the left half).
+    fn open_resolved_file_ref_inner(
+        &mut self,
+        abs: &std::path::Path,
+        line: u32,
+        column: Option<u32>,
+        record_nav: bool,
+    ) -> bool {
         if !abs.is_file() {
             return false;
         }
-        // Record where the user was so Back returns to it, exactly like
-        // go-to-definition.
+        if record_nav && let Some(from) = self.editor.path.clone() {
+            self.nav.record(NavLoc {
+                path: from,
+                row: self.editor.cursor_row,
+                col: self.editor.cursor_col,
+            });
+        }
+        let line0 = (line as usize).saturating_sub(1);
+        let col0 = column.map(|c| c as usize).unwrap_or(1).saturating_sub(1);
+        match self.open_at(abs, line0, col0) {
+            Ok(()) => {
+                // `explorer.autoReveal` analogue, as quick-open does: sync
+                // the tree to the landed file without stealing editor focus.
+                self.tree.reveal_path(abs);
+                self.status = format!("{}:{}", self.status_path(abs), line);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Open a `diff://` group link's two files side by side: left lands in
+    /// the leftmost editor group, right in the rightmost — splitting first
+    /// when the editor is a single group, reusing the existing pair when it
+    /// is already split (so repeated clicks swap the comparison in place
+    /// instead of accreting columns).
+    fn open_side_by_side(
+        &mut self,
+        left: &crate::file_ref::FileRef,
+        right: &crate::file_ref::FileRef,
+    ) -> bool {
+        // Both sides absolute by construction (diff_uri refuses relative
+        // paths); gated on is_file like every terminal file click.
+        let lp = std::path::PathBuf::from(&left.path);
+        let rp = std::path::PathBuf::from(&right.path);
+        if !lp.is_file() || !rp.is_file() {
+            return false;
+        }
+        // One click, one Back entry: record the origin once here, then open
+        // both halves with recording off.
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
                 path: from,
@@ -25646,15 +25710,26 @@ impl App {
                 col: self.editor.cursor_col,
             });
         }
-        let line0 = (fr.line as usize).saturating_sub(1);
-        let col0 = fr.column.map(|c| c as usize).unwrap_or(1).saturating_sub(1);
-        match self.open_at(&abs, line0, col0) {
-            Ok(()) => {
-                self.status = format!("{}:{}", self.status_path(&abs), fr.line);
-                true
-            }
-            Err(_) => false,
+        self.focus_editor_group(true);
+        if !self.open_resolved_file_ref_inner(&lp, left.line, left.column, false) {
+            return false;
         }
+        if self.editor_layout.is_split() {
+            self.focus_editor_group(false);
+        } else {
+            // The split duplicates the left file into the new focused group
+            // as a preview tab; opening the right file swaps into it.
+            self.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+        }
+        if !self.open_resolved_file_ref_inner(&rp, right.line, right.column, false) {
+            return false;
+        }
+        self.status = format!(
+            "Side by side: {} | {}",
+            self.status_path(&lp),
+            self.status_path(&rp)
+        );
+        true
     }
 
     /// Open a URL discovered in the terminal. On a remote session a loopback
@@ -25662,12 +25737,32 @@ impl App {
     /// local Mac through the drop relay (with the usual confirm gate). On a
     /// local session everything opens directly.
     ///
-    /// Web links only: an OSC 8 cell carries whatever URI the printing
-    /// program chose while showing unrelated text, so a file:// or
-    /// custom-scheme URI would hand `open`/`xdg-open` an arbitrary target
-    /// (app launch, protocol handler) off one disguised click. The refusal
-    /// surfaces the real destination in the status line.
+    /// Editor deep links (`vscode://file/…:line`, and the same shape from
+    /// Cursor/Windsurf/Zed, plus plain `file://`) name a file and line, and
+    /// Croft is an editor: they open in the editor pane right here, never
+    /// through the OS. Beyond those, web links only: an OSC 8 cell carries
+    /// whatever URI the printing program chose while showing unrelated text,
+    /// so any other custom-scheme URI would hand `open`/`xdg-open` an
+    /// arbitrary target (app launch, protocol handler) off one disguised
+    /// click. The refusal surfaces the real destination in the status line.
     fn open_detected_url(&mut self, url: &str) {
+        // A diff:// group link names two files; open them side by side.
+        // Same trust story as single-file deep links: consumed internally,
+        // gated on is_file, never handed to the OS.
+        if let Some((left, right)) = crate::file_ref::diff_uri(url)
+            && self.open_side_by_side(&left, &right)
+        {
+            return;
+        }
+        if let Some(fr) = crate::file_ref::editor_file_uri(url) {
+            // Absolute by construction; gated on is_file like every terminal
+            // file click. An unresolvable link falls through to the web-only
+            // rule so its refusal still shows the real URI.
+            let path = std::path::PathBuf::from(&fr.path);
+            if self.open_resolved_file_ref(&path, fr.line, fr.column) {
+                return;
+            }
+        }
         let scheme_ok = {
             let l = url.trim_start().to_ascii_lowercase();
             l.starts_with("http://") || l.starts_with("https://")
