@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Child processes stay off the screen: the ffmpeg that grabs a video poster frame can no longer paint raw bytes over the editor, and a failed remote drag-drop setup now reports ssh's own error instead of a bare exit code.",
+    kind: NoteKind::Feature,
+    summary: "Editor deep links open in croft: Ctrl+click a vscode://file/<path>:line:col style hyperlink in the terminal (VS Code, Cursor, Windsurf, or Zed scheme) and the file opens right here instead of launching the other editor.",
 }];
