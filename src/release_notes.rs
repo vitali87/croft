@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "PROBLEMS can show the whole project: diagnostics for files you never opened now appear, and a scope toggle switches between Open Files and Whole Project — the status-bar count follows whichever you pick.",
+    summary: "The primary side bar can auto-hide: turn it on in Customize Layout and the panel collapses shortly after focus leaves it, giving the columns back to the editor. It stays put mid-drag, behind a modal, and while it has focus.",
 }];

@@ -30,6 +30,11 @@ pub struct LayoutPrefs {
     pub side_bar_position: SideBarPosition,
     #[serde(default)]
     pub secondary_side_bar: bool,
+    /// Collapse the primary side bar shortly after focus leaves it, giving
+    /// the columns back to the editor (#260). Off by default: a panel that
+    /// disappears on its own is a surprise unless it was asked for.
+    #[serde(default)]
+    pub auto_hide_side_bar: bool,
     #[serde(default)]
     pub panel_alignment: PanelAlignment,
     #[serde(default)]
@@ -43,6 +48,7 @@ impl Default for LayoutPrefs {
             status_bar: true,
             side_bar_position: SideBarPosition::default(),
             secondary_side_bar: false,
+            auto_hide_side_bar: false,
             panel_alignment: PanelAlignment::default(),
             quick_input_position: QuickInputPosition::default(),
         }
@@ -581,6 +587,7 @@ mod tests {
                 status_bar: false,
                 side_bar_position: SideBarPosition::Right,
                 secondary_side_bar: true,
+                auto_hide_side_bar: true,
                 panel_alignment: PanelAlignment::Justify,
                 quick_input_position: QuickInputPosition::Center,
             },
@@ -598,6 +605,10 @@ mod tests {
         assert!(old.activity_bar && old.status_bar);
         assert_eq!(old.side_bar_position, SideBarPosition::Left);
         assert!(!old.secondary_side_bar);
+        assert!(
+            !old.auto_hide_side_bar,
+            "a config written before auto-hide existed must default to off"
+        );
         assert_eq!(old.panel_alignment, PanelAlignment::Center);
         assert_eq!(old.quick_input_position, QuickInputPosition::Top);
         let _ = std::fs::remove_dir_all(&dir);

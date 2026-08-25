@@ -22,6 +22,7 @@ use std::io::{Stdout, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod autohide;
 mod click;
 mod cursor_blink;
 mod editor_layout;
@@ -1102,6 +1103,7 @@ enum MenuAction {
     ToggleSideBar,
     /// Customize Layout: show/hide the secondary side bar (the Outline).
     ToggleSecondarySideBar,
+    ToggleAutoHideSideBar,
     /// Customize Layout: show/hide the bottom panel (the terminal, same as ⌃J).
     TogglePanel,
     /// Customize Layout: show/hide the bottom status bar.
@@ -2751,6 +2753,14 @@ pub struct App {
     /// the tick can re-query when the caret moves or the buffer changes while
     /// the popup is open and close it once the caret leaves the call.
     signature_help_anchor: Option<(usize, usize, u64)>,
+    /// Collapse the primary side bar when focus leaves it (#260). Mirrors
+    /// `LayoutPrefs::auto_hide_side_bar`, copied in at construction like
+    /// every other Customize Layout member.
+    auto_hide_side_bar: bool,
+    /// Pending auto-hide of the primary side bar (#260). Armed when focus
+    /// leaves the panel, disarmed when it returns; the frame loop collapses
+    /// once the grace window elapses.
+    auto_hide: autohide::AutoHide,
     hover: HoverDwell,
     hover_popup: Option<crate::widgets::hover_popup::HoverPopup>,
     hover_request_id: Option<u64>,
@@ -3948,6 +3958,7 @@ impl App {
             status_bar_visible: layout_prefs.status_bar,
             side_bar_position: layout_prefs.side_bar_position,
             secondary_side_bar_visible: layout_prefs.secondary_side_bar,
+            auto_hide_side_bar: layout_prefs.auto_hide_side_bar,
             panel_alignment: layout_prefs.panel_alignment,
             quick_input_position: layout_prefs.quick_input_position,
             zen_mode: false,
@@ -4257,6 +4268,7 @@ impl App {
             pending_color_presentations: Vec::new(),
             pending_color_context: None,
             color_presentations_request: None,
+            auto_hide: autohide::AutoHide::default(),
             hover: HoverDwell::default(),
             hover_popup: None,
             hover_request_id: None,
@@ -6756,6 +6768,52 @@ impl App {
         })
     }
 
+    /// Collapse the primary side bar once focus has been away from it for
+    /// [`autohide::AUTO_HIDE_DELAY`] (#260). Returns `true` when the panel
+    /// actually closed, so the frame loop redraws.
+    ///
+    /// Held open while a seam drag is in flight (collapsing would yank the
+    /// splitter out from under the pointer) or a modal is borrowing the
+    /// screen (the layout would jump when it closes). The suppression is
+    /// re-evaluated here rather than at each interaction's start and end, so
+    /// a modal dismissed by any of its many exits cannot leave a stale hold.
+    fn poll_auto_hide(&mut self) -> bool {
+        self.poll_auto_hide_at(std::time::Instant::now())
+    }
+
+    /// `poll_auto_hide` with the clock injected, so the grace window can be
+    /// tested without sleeping — the same split [`HoverDwell`] uses.
+    fn poll_auto_hide_at(&mut self, now: std::time::Instant) -> bool {
+        if !self.auto_hide_side_bar {
+            return false;
+        }
+        if self.splitter_drag.is_some() {
+            self.auto_hide.suppress(autohide::Suppressed::Dragging);
+            return false;
+        }
+        if self.command_palette.is_some()
+            || self.file_finder.is_some()
+            || self.prompt.is_some()
+            || self.shortcuts_modal.is_some()
+            || self.context_menu.is_some()
+        {
+            self.auto_hide.suppress(autohide::Suppressed::Modal);
+            return false;
+        }
+        self.auto_hide.release();
+        if !self.show_tree || self.focus == Pane::Tree {
+            return false;
+        }
+        if !self.auto_hide.due(now, autohide::AUTO_HIDE_DELAY) {
+            return false;
+        }
+        // Disarm before collapsing so this fires once, not every frame the
+        // panel stays hidden.
+        self.auto_hide.focus_returned();
+        self.set_side_bar_visible(false);
+        true
+    }
+
     /// Fire the chrome button-hint tooltip once its dwell crosses
     /// `HOVER_DELAY`. Returns `true` when a tooltip was created so the frame
     /// loop redraws. Suppressed while a context menu is open so the two never
@@ -9121,6 +9179,10 @@ impl App {
                 format!("{}Minimap", check(self.minimap_visible)),
                 MenuAction::ToggleMinimap,
             ),
+            MenuEntry::item(
+                format!("{}Auto Hide Side Bar", check(self.auto_hide_side_bar)),
+                MenuAction::ToggleAutoHideSideBar,
+            ),
             MenuEntry::Separator,
             MenuEntry::header("Primary Side Bar Position"),
             MenuEntry::item(
@@ -9223,6 +9285,7 @@ impl App {
             status_bar: self.status_bar_visible,
             side_bar_position: self.side_bar_position,
             secondary_side_bar: self.secondary_side_bar_visible,
+            auto_hide_side_bar: self.auto_hide_side_bar,
             panel_alignment: self.panel_alignment,
             quick_input_position: self.quick_input_position,
         });
@@ -9230,6 +9293,58 @@ impl App {
 
     /// Hide the activity bar's inline images when the bar is collapsed so the
     /// OSC-1337 icons don't ghost over the editor; arm a re-emit when shown.
+    /// Turn auto-hide of the primary side bar on or off (#260).
+    ///
+    /// Turning it ON does not collapse the panel immediately: the grace
+    /// window has to elapse with focus away first, so flipping the setting
+    /// while the side bar has focus leaves it exactly where it is.
+    fn toggle_auto_hide_side_bar(&mut self) {
+        self.auto_hide_side_bar = !self.auto_hide_side_bar;
+        // A stale arm from before the setting was turned off must not fire
+        // the instant it comes back on.
+        self.auto_hide.focus_returned();
+        self.persist_layout();
+        self.status = String::from(if self.auto_hide_side_bar {
+            "Side bar auto-hide on"
+        } else {
+            "Side bar auto-hide off"
+        });
+    }
+
+    /// Show or hide the primary side bar.
+    ///
+    /// The flip was inlined at four call sites with three different sets of
+    /// side effects: the key chord evicted the Run-Debug OSC image but never
+    /// re-baked chrome, the palette arm did neither, and the two click paths
+    /// did the chrome call only. Auto-hide (#260) needs one place to observe,
+    /// and the divergence was a latent bug either way — the palette path
+    /// could ghost activity-bar images the click path cleared.
+    fn set_side_bar_visible(&mut self, visible: bool) {
+        if self.show_tree == visible {
+            return;
+        }
+        let was_visible = self.show_tree;
+        self.show_tree = visible;
+        // Hiding the sidebar while Run-Debug was on screen: arm the same
+        // OSC-1337 image-cell evict gate that fires on a sidebar-view change.
+        // Without this the bug+play icon ghosts on top of the editor or
+        // terminal that fills the space the panel just vacated.
+        if was_visible
+            && !self.show_tree
+            && self.sidebar_view == SidebarView::RunDebug
+            && self.overlays.run_debug.was_emitted()
+        {
+            self.overlays.run_debug.request_clear();
+        }
+        self.after_chrome_visibility_change();
+    }
+
+    /// Flip the primary side bar, for the gestures that toggle rather than
+    /// set (the chord, the palette command, the layout icon, the menu row).
+    fn toggle_side_bar(&mut self) {
+        self.set_side_bar_visible(!self.show_tree);
+    }
+
     fn after_chrome_visibility_change(&mut self) {
         self.overlays.activity.mark_dirty();
         if self.overlays.activity.has_images() {
@@ -12645,6 +12760,17 @@ impl App {
         // unrelated and stays.
         if p == Pane::Editor && self.terminal_maximized {
             self.terminal_maximized = false;
+        }
+        // Auto-hide (#260) observes focus here, the single choke point every
+        // pane switch goes through. Arming rather than collapsing outright:
+        // a click that passes through the panel on its way elsewhere, or a
+        // command that briefly focuses the editor and returns, would make it
+        // flap. `focus_left` keeps the FIRST instant, so this being called
+        // every frame does not push the deadline forever.
+        if p == Pane::Tree {
+            self.auto_hide.focus_returned();
+        } else {
+            self.auto_hide.focus_left(std::time::Instant::now());
         }
         self.focus = p;
         self.sync_focus_flags();
@@ -16404,20 +16530,7 @@ impl App {
             return Ok(());
         }
         if is_sidebar_toggle_key(key) {
-            let was_visible = self.show_tree;
-            self.show_tree = !self.show_tree;
-            // Hiding the sidebar while Run-Debug was on screen: arm
-            // the same OSC-1337 image-cell evict gate that fires on
-            // a sidebar-view change. Without this the bug+play icon
-            // ghosts on top of the editor / terminal that fills the
-            // space the panel just vacated.
-            if was_visible
-                && !self.show_tree
-                && self.sidebar_view == SidebarView::RunDebug
-                && self.overlays.run_debug.was_emitted()
-            {
-                self.overlays.run_debug.request_clear();
-            }
+            self.toggle_side_bar();
             return Ok(());
         }
         match (key.code, key.modifiers) {
@@ -28023,8 +28136,9 @@ impl App {
             Cmd::ShowTesting => self.open_testing_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
-            Cmd::ToggleSideBar => self.show_tree = !self.show_tree,
+            Cmd::ToggleSideBar => self.toggle_side_bar(),
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
+            Cmd::ToggleAutoHideSideBar => self.toggle_auto_hide_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
             Cmd::ToggleMinimap => self.toggle_minimap(),
@@ -30188,8 +30302,7 @@ impl App {
         {
             let icons = self.layout_icon_areas;
             if rect_contains(icons.toggle_side_bar, m.column, m.row) {
-                self.show_tree = !self.show_tree;
-                self.after_chrome_visibility_change();
+                self.toggle_side_bar();
                 return;
             }
             if rect_contains(icons.toggle_panel, m.column, m.row) {
@@ -34195,13 +34308,16 @@ impl App {
                 self.open_customize_layout_menu_at(0);
             }
             MenuAction::ToggleSideBar => {
-                self.show_tree = !self.show_tree;
-                self.after_chrome_visibility_change();
+                self.toggle_side_bar();
                 self.open_customize_layout_menu_at(1);
             }
             MenuAction::ToggleSecondarySideBar => {
                 self.toggle_secondary_side_bar();
                 self.open_customize_layout_menu_at(2);
+            }
+            MenuAction::ToggleAutoHideSideBar => {
+                self.toggle_auto_hide_side_bar();
+                self.open_customize_layout_menu_at(6);
             }
             MenuAction::TogglePanel => {
                 self.toggle_terminal();
@@ -34218,19 +34334,19 @@ impl App {
                 self.persist_layout();
                 self.after_chrome_visibility_change();
                 self.open_customize_layout_menu_at(if pos == SideBarPosition::Left {
-                    7
-                } else {
                     8
+                } else {
+                    9
                 });
             }
             MenuAction::SetPanelAlignment(al) => {
                 self.panel_alignment = al;
                 self.persist_layout();
                 let row = match al {
-                    PanelAlignment::Left => 11,
-                    PanelAlignment::Center => 12,
-                    PanelAlignment::Right => 13,
-                    PanelAlignment::Justify => 14,
+                    PanelAlignment::Left => 12,
+                    PanelAlignment::Center => 13,
+                    PanelAlignment::Right => 14,
+                    PanelAlignment::Justify => 15,
                 };
                 self.open_customize_layout_menu_at(row);
             }
@@ -34238,9 +34354,9 @@ impl App {
                 self.quick_input_position = pos;
                 self.persist_layout();
                 self.open_customize_layout_menu_at(if pos == QuickInputPosition::Top {
-                    17
-                } else {
                     18
+                } else {
+                    19
                 });
             }
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
@@ -40390,6 +40506,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let hover_changed = app.drain_lsp_hover();
         let tab_hover_changed = app.poll_tab_hover();
         let ui_tooltip_changed = app.poll_ui_tooltip();
+        let auto_hid = app.poll_auto_hide();
         let definition_changed = app.drain_lsp_definition();
         let declaration_changed = app.drain_lsp_declaration();
         let type_definition_changed = app.drain_lsp_type_definition();
@@ -40473,6 +40590,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || hover_changed
             || tab_hover_changed
             || ui_tooltip_changed
+            // Without this the collapse would not repaint until some other
+            // event happened to redraw, leaving the panel on screen after it
+            // had already been hidden in state.
+            || auto_hid
             || definition_changed
             || declaration_changed
             || type_definition_changed

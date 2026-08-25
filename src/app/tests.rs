@@ -30752,3 +30752,179 @@ fn problem_scope_config_tokens_round_trip() {
         ProblemScope::WholeProject
     );
 }
+
+// ---------------------------------------------------------------------------
+// Auto-hiding side bar (#260)
+// ---------------------------------------------------------------------------
+
+/// The grace window, driven through `poll_auto_hide_at` so the deadline is a
+/// parameter rather than a sleep.
+#[test]
+fn the_side_bar_collapses_once_focus_has_settled_elsewhere() {
+    let mut app = editor_app_with_lines(&["x"]);
+    app.auto_hide_side_bar = true;
+    assert!(app.show_tree, "sidebar starts visible");
+
+    app.focus_pane(Pane::Editor);
+    let armed = app
+        .auto_hide
+        .armed_at()
+        .expect("leaving the side bar must arm the timer");
+
+    assert!(
+        !app.poll_auto_hide_at(armed + std::time::Duration::from_millis(399)),
+        "a click passing through the panel must not collapse it"
+    );
+    assert!(app.show_tree, "still open inside the grace window");
+
+    assert!(
+        app.poll_auto_hide_at(armed + crate::app::autohide::AUTO_HIDE_DELAY),
+        "settled focus collapses the panel"
+    );
+    assert!(!app.show_tree, "and the columns go back to the editor");
+}
+
+#[test]
+fn focus_returning_to_the_side_bar_cancels_the_pending_collapse() {
+    let mut app = editor_app_with_lines(&["x"]);
+    app.auto_hide_side_bar = true;
+
+    app.focus_pane(Pane::Editor);
+    let armed = app.auto_hide.armed_at().expect("armed on leaving");
+    app.focus_pane(Pane::Tree);
+
+    assert!(
+        !app.poll_auto_hide_at(armed + std::time::Duration::from_secs(10)),
+        "a round trip through the editor and back must never collapse"
+    );
+    assert!(app.show_tree, "the panel is still there");
+}
+
+#[test]
+fn auto_hide_does_nothing_while_the_setting_is_off() {
+    // Off by default: a panel that vanishes on its own is a surprise unless
+    // it was asked for.
+    let mut app = editor_app_with_lines(&["x"]);
+    assert!(
+        !app.auto_hide_side_bar,
+        "auto-hide must be opt-in, not the default"
+    );
+
+    app.focus_pane(Pane::Editor);
+    let now = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert!(!app.poll_auto_hide_at(now), "nothing to do with it off");
+    assert!(app.show_tree, "the side bar stays exactly where it was");
+}
+
+#[test]
+fn a_seam_drag_holds_the_side_bar_open() {
+    // Collapsing mid-drag would yank the splitter out from under the pointer.
+    let mut app = editor_app_with_lines(&["x"]);
+    app.auto_hide_side_bar = true;
+    app.focus_pane(Pane::Editor);
+    let armed = app.auto_hide.armed_at().expect("armed on leaving");
+    app.splitter_drag = Some(SplitterDrag::Sidebar);
+
+    let past_due = armed + std::time::Duration::from_secs(10);
+    assert!(!app.poll_auto_hide_at(past_due), "held while dragging");
+    assert!(app.show_tree, "the panel must survive the drag");
+    assert_eq!(
+        app.auto_hide.suppressed(),
+        Some(crate::app::autohide::Suppressed::Dragging),
+        "and the hold names its reason"
+    );
+
+    // Releasing the drag does not collapse retroactively: the window has to
+    // run again from the next time focus is observed away.
+    app.splitter_drag = None;
+    assert!(
+        !app.poll_auto_hide_at(past_due),
+        "the release cleared the arm, so nothing is pending yet"
+    );
+    app.focus_pane(Pane::Editor);
+    let rearmed = app.auto_hide.armed_at().expect("re-armed after the drag");
+    assert!(
+        app.poll_auto_hide_at(rearmed + crate::app::autohide::AUTO_HIDE_DELAY),
+        "and a fresh window collapses normally"
+    );
+}
+
+#[test]
+fn a_modal_holds_the_side_bar_open_until_it_closes() {
+    // Collapsing behind a modal makes the layout jump when it is dismissed.
+    let mut app = editor_app_with_lines(&["x"]);
+    app.auto_hide_side_bar = true;
+    app.focus_pane(Pane::Editor);
+    let armed = app.auto_hide.armed_at().expect("armed on leaving");
+
+    app.open_command_palette();
+    assert!(app.command_palette.is_some(), "the palette is open");
+    let past_due = armed + std::time::Duration::from_secs(10);
+    assert!(!app.poll_auto_hide_at(past_due), "held behind the modal");
+    assert!(app.show_tree, "the panel is still on screen");
+
+    app.command_palette = None;
+    app.focus_pane(Pane::Editor);
+    let rearmed = app.auto_hide.armed_at().expect("re-armed after the modal");
+    assert!(
+        app.poll_auto_hide_at(rearmed + crate::app::autohide::AUTO_HIDE_DELAY),
+        "and it collapses once the modal is gone"
+    );
+}
+
+#[test]
+fn reopening_the_side_bar_does_not_immediately_re_collapse_it() {
+    // The collapse disarms the timer, so a stale arm from BEFORE the panel
+    // was hidden cannot fire again the moment the user reopens it. Without
+    // the disarm the old deadline is still in the past, and the very next
+    // frame takes the panel straight back down — the user cannot get it open.
+    //
+    // Asserting the second poll is a no-op while the panel is still hidden
+    // proves nothing: `!self.show_tree` short-circuits before the timer is
+    // ever consulted, so that assertion holds with the disarm removed.
+    let mut app = editor_app_with_lines(&["x"]);
+    app.auto_hide_side_bar = true;
+    app.focus_pane(Pane::Editor);
+    let armed = app.auto_hide.armed_at().expect("armed on leaving");
+    let due = armed + crate::app::autohide::AUTO_HIDE_DELAY;
+
+    assert!(app.poll_auto_hide_at(due), "the first poll collapses");
+    assert!(!app.show_tree, "the panel is hidden");
+
+    // The user reopens it (Cmd+B) without moving focus back into it.
+    app.set_side_bar_visible(true);
+    assert!(
+        !app.poll_auto_hide_at(due + std::time::Duration::from_millis(1)),
+        "the reopened panel must survive the next frame"
+    );
+    assert!(app.show_tree, "and stay open rather than snapping shut");
+}
+
+#[test]
+fn toggling_auto_hide_on_does_not_collapse_a_focused_side_bar() {
+    // Flipping the setting while the panel has focus must leave it alone; the
+    // grace window has to elapse with focus away first.
+    let mut app = editor_app_with_lines(&["x"]);
+    app.focus_pane(Pane::Tree);
+    app.toggle_auto_hide_side_bar();
+
+    assert!(app.auto_hide_side_bar, "the setting is on");
+    assert!(
+        !app.poll_auto_hide_at(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+        "the side bar has focus, so there is nothing to collapse"
+    );
+    assert!(app.show_tree, "and it is still open");
+}
+
+#[test]
+fn auto_hide_survives_a_layout_round_trip() {
+    // The setting rides in LayoutPrefs beside the other Customize Layout
+    // members, so it must round-trip like them.
+    let prefs = crate::prefs::LayoutPrefs {
+        auto_hide_side_bar: true,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&prefs).unwrap();
+    let back: crate::prefs::LayoutPrefs = serde_json::from_str(&json).unwrap();
+    assert!(back.auto_hide_side_bar, "the setting must persist");
+}

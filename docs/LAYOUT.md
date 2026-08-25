@@ -13,7 +13,22 @@ croft is a three pane workspace in the VS Code arrangement: an Explorer sidebar,
 
 ## Customize Layout
 
-The `⛶` icon at the top-right of the editor (and the welcome screen), or the settings gear → **Customize Layout**, opens a popup that mirrors VS Code's title-bar layout controls. Two icons beside it toggle the primary side bar (`▢`) and the panel (`▭`) directly. The popup groups: visibility toggles (Activity Bar, Primary Side Bar, Secondary Side Bar, Panel, Status Bar), **Primary Side Bar Position** (Left/Right — the activity bar moves with it), **Panel Alignment** (Left/Center/Right/Justify, where Justify spans the panel across the full content width under the side bar), **Quick Input Position** (Top/Center, for the Command Palette / Go to File), and **Zen Mode** (`Cmd`/`Ctrl`+`K` `Z`, which hides all chrome and restores it on the next toggle). Every choice except the frequently-toggled side-bar / panel visibility persists in `~/.config/croft/config.json`.
+The `⛶` icon at the top-right of the editor (and the welcome screen), or the settings gear → **Customize Layout**, opens a popup that mirrors VS Code's title-bar layout controls. Two icons beside it toggle the primary side bar (`▢`) and the panel (`▭`) directly. The popup groups: visibility toggles (Activity Bar, Primary Side Bar, Secondary Side Bar, Panel, Status Bar, Minimap, Auto Hide Side Bar), **Primary Side Bar Position** (Left/Right — the activity bar moves with it), **Panel Alignment** (Left/Center/Right/Justify, where Justify spans the panel across the full content width under the side bar), **Quick Input Position** (Top/Center, for the Command Palette / Go to File), and **Zen Mode** (`Cmd`/`Ctrl`+`K` `Z`, which hides all chrome and restores it on the next toggle). Every choice except the frequently-toggled side-bar / panel visibility persists in `~/.config/croft/config.json`.
+
+### Auto-hiding the primary side bar
+
+**Auto Hide Side Bar** (off by default) collapses the primary side bar shortly
+after focus leaves it, giving the columns back to the editor; reopen it with
+`Cmd`/`Ctrl`+`B` as usual. The collapse is delayed by a short grace window, so
+a click that passes through the panel on its way to the editor — or a command
+that briefly focuses the editor and returns — does not make it flap.
+
+It deliberately stays open while a seam drag is in progress (collapsing would
+yank the splitter out from under the pointer), while a modal is borrowing the
+screen (the layout would jump when the modal closes), and whenever the panel
+itself has focus. Turning the setting on while the side bar is focused leaves
+it exactly where it is. The choice persists in `~/.config/croft/config.json`.
+
 
 ## Command Palette
 
