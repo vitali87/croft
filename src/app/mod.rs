@@ -7404,6 +7404,9 @@ impl App {
             entry.push(crate::widgets::problems::ProblemItem {
                 line: d.line,
                 col: d.col,
+                // Build tools report characters (rustc counts code points),
+                // not the UTF-16 units an LSP position carries.
+                col_utf16: false,
                 severity: d.severity,
                 message: d.message,
                 source: d.source.to_string(),
@@ -7480,6 +7483,7 @@ impl App {
                         items.push(ProblemItem {
                             line: d.start_line,
                             col: d.start_char,
+                            col_utf16: true,
                             severity: d.severity,
                             message: d.message.clone(),
                             source: server.clone(),
@@ -30626,10 +30630,20 @@ impl App {
                     }
                     match self.problems.hit_at(m.row) {
                         Some(ProblemHit::Header(path)) => self.problems.toggle_collapse(&path),
-                        Some(ProblemHit::Diagnostic { path, line, col }) => {
-                            // The diagnostic's column is the server's UTF-16
-                            // `start_char`, not a character column.
-                            if let Err(e) = self.open_at_utf16(&path, line, col) {
+                        Some(ProblemHit::Diagnostic {
+                            path,
+                            line,
+                            col,
+                            col_utf16,
+                        }) => {
+                            // An LSP diagnostic's column is UTF-16; a build
+                            // tool's is already a character column.
+                            let opened = if col_utf16 {
+                                self.open_at_utf16(&path, line, col)
+                            } else {
+                                self.open_at(&path, line as usize, col as usize)
+                            };
+                            if let Err(e) = opened {
                                 self.status = format!("Open failed: {e}");
                             }
                         }
