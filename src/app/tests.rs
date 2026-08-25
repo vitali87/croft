@@ -28991,6 +28991,11 @@ fn on_type_formatting_stays_inert_when_disabled_or_unadvertised() {
         .unwrap();
     app.tick_on_type_formatting();
     assert!(app.on_type_request.is_none(), "disabled: nothing fires");
+    assert!(
+        app.editor.last_typed.is_none(),
+        "the tick consumes the record even while disabled, so enabling \
+         the setting later cannot replay a stale trigger"
+    );
     // Enable via the settings toggle; still inert because no server has
     // advertised any trigger characters for Rust in this test.
     app.toggle_format_on_type();
@@ -29002,6 +29007,10 @@ fn on_type_formatting_stays_inert_when_disabled_or_unadvertised() {
     assert!(
         app.on_type_request.is_none(),
         "no advertised trigger set: the request is never sent"
+    );
+    assert!(
+        app.editor.last_typed.is_none(),
+        "each keystroke is examined exactly once"
     );
 }
 

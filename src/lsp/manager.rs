@@ -1986,7 +1986,11 @@ impl WorkerState {
                     .iter()
                     .filter_map(|c| c.on_type_triggers.as_deref())
                     .collect();
-                support.on_type_triggers.insert(lang, triggers);
+                // No entry when nothing advertises the provider — a missing
+                // entry is the documented "no server carries it" answer.
+                if !triggers.is_empty() {
+                    support.on_type_triggers.insert(lang, triggers);
+                }
                 support.code_action.insert(lang, supports_code_action);
                 support.call_hierarchy.insert(lang, supports_call_hierarchy);
             }

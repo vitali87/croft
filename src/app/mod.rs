@@ -2770,12 +2770,11 @@ pub struct App {
     /// VS Code's `editor.formatOnType` (#254): typing a server trigger
     /// character runs onTypeFormatting at the spot. Off by default.
     format_on_type: bool,
-    /// In-flight on-type request: (id, edit_seq it was computed against).
-    /// The reply applies only while the buffer has not moved since.
-    on_type_request: Option<(u64, u64)>,
-    /// The `edit_seq` the last on-type request fired for, so one typed
-    /// trigger fires exactly one request.
-    on_type_fired_seq: u64,
+    /// In-flight on-type request: (id, the edit_seq it was computed
+    /// against, the tab's path). The reply applies only while that same
+    /// tab is active and its buffer has not moved since — `edit_seq` is
+    /// per-tab, so the seq alone cannot tell tabs apart.
+    on_type_request: Option<(u64, u64, PathBuf)>,
     code_action_request_id: Option<u64>,
     /// True when the in-flight code-action request is a `codeAction/resolve`
     /// (the reply is one resolved action to apply directly) rather than the
@@ -4168,7 +4167,6 @@ impl App {
             format_request_id: None,
             format_on_type: loaded_prefs.format_on_type,
             on_type_request: None,
-            on_type_fired_seq: 0,
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
@@ -8202,25 +8200,22 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Idle-caret occurrences trigger, run once per frame: when the caret has
-    /// rested on one buffer position for `OCCURRENCES_IDLE`, fire ONE
-    /// `documentHighlight` request for it; the moment it moves (or the buffer
-    /// edits), drop the painted set. Mirrors VS Code's word highlight, which
-    /// follows the cursor with a small debounce rather than every keystroke.
-    /// On-type formatting (#254): when enabled and THE last edit was a
-    /// character in the server's advertised trigger set, fire
-    /// `textDocument/onTypeFormatting` at the caret — once per typed
-    /// trigger. Never fires unadvertised: the trigger set comes from the
-    /// capability the server declared, and `None` (no server probed, or
-    /// no provider) means stay inert.
+    /// On-type formatting (#254), run once per frame: when enabled and the
+    /// last edit was a keystroke in the server's advertised trigger set,
+    /// fire `textDocument/onTypeFormatting` at the caret. The typed record
+    /// is consumed here — examined exactly once, on the frame right after
+    /// the keystroke — so a later tab switch or settings toggle can never
+    /// replay a stale trigger. Never fires unadvertised: the trigger set
+    /// comes from the capability the server declared, and `None` (no server
+    /// probed, or no provider) means stay inert.
     pub fn tick_on_type_formatting(&mut self) {
+        let Some((ch, seq)) = self.editor.last_typed.take() else {
+            return;
+        };
         if !self.format_on_type || !self.editor_is_text() {
             return;
         }
-        let Some((ch, seq)) = self.editor.last_typed else {
-            return;
-        };
-        if seq != self.editor.edit_seq || self.on_type_fired_seq == seq {
+        if seq != self.editor.edit_seq {
             return;
         }
         let Some(path) = self.editor.path.clone() else {
@@ -8247,9 +8242,15 @@ impl App {
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
-        let id = lsp.request_on_type_formatting(path, line, character, ch, tab_size, insert_spaces);
-        self.on_type_request = Some((id, seq));
-        self.on_type_fired_seq = seq;
+        let id = lsp.request_on_type_formatting(
+            path.clone(),
+            line,
+            character,
+            ch,
+            tab_size,
+            insert_spaces,
+        );
+        self.on_type_request = Some((id, seq, path));
     }
 
     /// Apply an on-type formatting reply — quietly, and only while the
@@ -8267,16 +8268,20 @@ impl App {
         }
         let mut changed = false;
         for result in results {
-            let Some((id, seq)) = self.on_type_request else {
+            let Some((id, seq, ref requested)) = self.on_type_request else {
                 continue;
             };
             if result.request_id != id {
                 continue;
             }
+            // `edit_seq` is per-tab, so the counter comparison only means
+            // "buffer unchanged" when the active tab is still the one the
+            // request was computed against — require the path to match too.
+            let stale = self.editor.edit_seq != seq
+                || requested != &result.path
+                || self.editor.path.as_deref() != Some(result.path.as_path());
             self.on_type_request = None;
-            if self.editor.edit_seq != seq
-                || self.editor.path.as_deref() != Some(result.path.as_path())
-            {
+            if stale {
                 continue;
             }
             if let Some(edits) = result.edits.filter(|e| !e.is_empty())
@@ -8292,6 +8297,11 @@ impl App {
         changed
     }
 
+    /// Idle-caret occurrences trigger, run once per frame: when the caret has
+    /// rested on one buffer position for `OCCURRENCES_IDLE`, fire ONE
+    /// `documentHighlight` request for it; the moment it moves (or the buffer
+    /// edits), drop the painted set. Mirrors VS Code's word highlight, which
+    /// follows the cursor with a small debounce rather than every keystroke.
     pub fn tick_occurrences(&mut self) -> bool {
         const OCCURRENCES_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
         let eligible = self.editor.diff.is_none()

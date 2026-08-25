@@ -599,10 +599,9 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_format_on_type_defaulting_off() {
+    fn round_trips_format_on_type_and_old_configs_default_off() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.json");
-        assert!(!Prefs::load_or_default().format_on_type || true);
         let mut prefs = Prefs::default();
         assert!(!prefs.format_on_type, "off by default, matching VS Code");
         prefs.format_on_type = true;

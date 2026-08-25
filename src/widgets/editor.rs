@@ -4620,6 +4620,9 @@ impl Editor {
 
     pub fn insert_char(&mut self, c: char) {
         if self.auto_close_pairs && self.insert_char_with_pairs(c) {
+            // Still a keystroke: on-type formatting (#254) keys off the
+            // typed character, whether or not the pair machinery handled it.
+            self.last_typed = Some((c, self.edit_seq));
             return;
         }
         self.pin_on_edit();
@@ -4644,6 +4647,11 @@ impl Editor {
         self.cursor_col += 1;
         self.mark_buffer_changed();
         self.recompute_highlights();
+        // On-type formatting (#254) reads this to know the last edit was
+        // this keystroke (seq must still match at the tick). Set here, not
+        // in insert_char_raw: paste and snippet expansion go through the
+        // raw path and must never count as typing.
+        self.last_typed = Some((c, self.edit_seq));
     }
 
     /// The auto-closing-pairs behaviors, returning true when the keystroke
@@ -4890,9 +4898,6 @@ impl Editor {
         self.lines[row].insert(byte, c);
         self.cursor_col += 1;
         self.mark_buffer_changed();
-        // On-type formatting (#254) reads this to know THE last edit was
-        // this character (seq must still match at the tick).
-        self.last_typed = Some((c, self.edit_seq));
     }
 
     /// The language id (VS Code identifier) of this buffer, for snippet scoping.
@@ -5398,7 +5403,10 @@ impl Editor {
 
     /// An editor `(row, char col)` as an LSP UTF-16 `(line, character)`.
     pub fn pos_to_utf16(&self, row: usize, col: usize) -> (u32, u32) {
-        let row = row.min(self.lines.len().saturating_sub(1));
+        if self.lines.is_empty() {
+            return (0, 0);
+        }
+        let row = row.min(self.lines.len() - 1);
         let line = &self.lines[row];
         let byte = char_byte(line, col.min(line.chars().count()));
         (row as u32, line[..byte].encode_utf16().count() as u32)
@@ -12031,6 +12039,50 @@ mod tests {
         );
         // The last stop ends the session.
         assert!(!e.snippet_active());
+    }
+
+    /// On-type formatting (#254) keys off real keystrokes only: the typed
+    /// paths (`insert_char`, auto-pairs included, and `insert_newline`)
+    /// record the trigger, while paste/snippet insertion through
+    /// `insert_str` must not — VS Code never fires formatOnType on paste.
+    #[test]
+    fn typing_records_last_typed_but_paste_does_not() {
+        let mut e = editor_with("");
+        e.insert_char(';');
+        assert_eq!(e.last_typed, Some((';', e.edit_seq)));
+        e.insert_newline();
+        assert_eq!(e.last_typed, Some(('\n', e.edit_seq)));
+        e.auto_close_pairs = true;
+        e.insert_char('(');
+        assert_eq!(
+            e.last_typed,
+            Some(('(', e.edit_seq)),
+            "an auto-paired opener is still a keystroke"
+        );
+        let before = e.last_typed;
+        e.insert_str("let x = 1;");
+        assert_eq!(e.last_typed, before, "paste must not count as typing");
+        assert_ne!(
+            e.last_typed.unwrap().1,
+            e.edit_seq,
+            "and the stale record can no longer match the buffer seq"
+        );
+    }
+
+    /// UTF-16 mapping for LSP positions: characters count by UTF-16 code
+    /// units, and an empty buffer (a fresh scratch tab before any edit)
+    /// answers the origin instead of panicking.
+    #[test]
+    fn pos_to_utf16_counts_utf16_units_and_survives_an_empty_buffer() {
+        let e = editor_with("日本🙂x");
+        assert_eq!(e.pos_to_utf16(0, 0), (0, 0));
+        assert_eq!(e.pos_to_utf16(0, 2), (0, 2));
+        assert_eq!(e.pos_to_utf16(0, 3), (0, 4), "🙂 is a surrogate pair");
+        assert_eq!(e.pos_to_utf16(0, 4), (0, 5));
+        assert_eq!(e.pos_to_utf16(9, 99), (0, 5), "past-the-end clamps");
+        let mut empty = Editor::new();
+        empty.lines.clear();
+        assert_eq!(empty.pos_to_utf16(0, 0), (0, 0));
     }
 
     /// A failed revert must not launder the buffer clean: clearing `dirty`
