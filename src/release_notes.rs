@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Save Workspace As writes portable files again: a folder reached through a symlink (macOS hands croft /var for /private/var, and any symlinked home does the same) was written as an absolute path instead of a relative one, so the file stopped travelling — it kept working where it was written but not on another machine, another checkout, or a different layout.",
+    summary: "Code intelligence lands on the right symbol in files with emoji: hover, go-to-definition, completion, references, rename and friends now measure columns the way language servers do, so a line containing an emoji no longer shifts every result sideways.",
 }];

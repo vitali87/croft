@@ -39,11 +39,18 @@ const GLYPH_WARNING: char = '\u{ea6c}';
 const GLYPH_INFO: char = '\u{ea74}';
 
 /// One diagnostic in the Problems list, projected from a language server's
-/// published set. Positions are zero-based (LSP), shown one-based in the row.
+/// published set or a build tool's output. Positions are zero-based (LSP),
+/// shown one-based in the row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProblemItem {
     pub line: u32,
     pub col: u32,
+    /// Whether `col` counts UTF-16 code units (a language server's
+    /// `Position.character`) or characters (a build tool's column — rustc
+    /// counts code points, and the matchers only rebase 1-based to 0-based).
+    /// The two sources share this list, so the unit has to travel with the
+    /// item: jumping to it needs to know which conversion to apply.
+    pub col_utf16: bool,
     pub severity: DiagnosticSeverity,
     pub message: String,
     /// The server that produced it (e.g. `rust-analyzer`, `ruff`), shown dim
@@ -114,7 +121,13 @@ pub enum ProblemHit {
     /// A file header: collapse/expand its group.
     Header(PathBuf),
     /// A diagnostic: jump the editor to `(path, line, col)` (zero-based).
-    Diagnostic { path: PathBuf, line: u32, col: u32 },
+    /// `col_utf16` carries the column's unit through from [`ProblemItem`].
+    Diagnostic {
+        path: PathBuf,
+        line: u32,
+        col: u32,
+        col_utf16: bool,
+    },
 }
 
 /// How many trailing characters of the free-text filter the toolbar
@@ -359,6 +372,7 @@ impl ProblemsPanel {
                     path: group.path.clone(),
                     line: item.line,
                     col: item.col,
+                    col_utf16: item.col_utf16,
                 })
             }
         }
@@ -710,6 +724,9 @@ mod tests {
         ProblemItem {
             line,
             col: 0,
+            // The helper's source is a build tool, so its column is a
+            // character column.
+            col_utf16: false,
             severity,
             message: msg.to_string(),
             source: "rustc".to_string(),
@@ -902,6 +919,7 @@ mod tests {
                 path: PathBuf::from("/repo/src/a.rs"),
                 line: 4,
                 col: 0,
+                col_utf16: false,
             }),
         );
         assert_eq!(
@@ -910,9 +928,41 @@ mod tests {
                 path: PathBuf::from("/repo/src/a.rs"),
                 line: 9,
                 col: 0,
+                col_utf16: false,
             }),
         );
         assert_eq!(p.hit_at(4), None, "below the last row");
+    }
+
+    /// #288: the list mixes language-server diagnostics (UTF-16 columns) with
+    /// build-tool diagnostics (character columns), so the unit has to reach the
+    /// jump. If the hit dropped it, every build diagnostic on a line with an
+    /// astral character would be converted a second time and land left of its
+    /// real column.
+    #[test]
+    fn hit_carries_the_column_unit_of_each_source() {
+        let mut lsp_item = diag(4, DiagnosticSeverity::Error, "from a server");
+        lsp_item.col = 7;
+        lsp_item.col_utf16 = true;
+        let mut build_item = diag(9, DiagnosticSeverity::Error, "from cargo");
+        build_item.col = 7;
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group("a.rs", vec![lsp_item, build_item])]);
+        render(&mut p, 60, 6);
+        let utf16_of = |hit| match hit {
+            Some(ProblemHit::Diagnostic { col_utf16, .. }) => Some(col_utf16),
+            _ => None,
+        };
+        assert_eq!(
+            utf16_of(p.hit_at(2)),
+            Some(true),
+            "the server's diagnostic keeps its UTF-16 column"
+        );
+        assert_eq!(
+            utf16_of(p.hit_at(3)),
+            Some(false),
+            "the build tool's identical column is NOT UTF-16"
+        );
     }
 
     #[test]

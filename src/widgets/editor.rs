@@ -13289,6 +13289,34 @@ mod tests {
         assert_eq!(empty.pos_to_utf16(0, 0), (0, 0));
     }
 
+    /// #288: every position-carrying LSP request sends UTF-16 columns and every
+    /// server answer comes back in them, so the two conversions must be exact
+    /// inverses. A char column used raw as UTF-16 (or the reverse) lands the
+    /// caret to the LEFT of the symbol on any line with a surrogate pair, which
+    /// is what made hover/definition/completion miss on emoji lines.
+    #[test]
+    fn utf16_and_char_columns_round_trip_across_surrogate_pairs() {
+        let e = editor_with("let 🙂 = 🙂🙂;");
+        let chars = e.lines[0].chars().count();
+        for col in 0..=chars {
+            let (_, u16col) = e.pos_to_utf16(0, col);
+            assert_eq!(
+                e.utf16_col_to_char_pub(0, u16col),
+                col,
+                "char col {col} must survive the round trip"
+            );
+        }
+        // The divergence the bug rode on: past three surrogate pairs the UTF-16
+        // column runs three units ahead of the character column.
+        let (_, after_three) = e.pos_to_utf16(0, 10);
+        assert_eq!(after_three, 13, "each pair costs one extra unit");
+        assert_eq!(
+            e.utf16_col_to_char_pub(0, 10),
+            9,
+            "reading a UTF-16 column as a char column would slip two to the left"
+        );
+    }
+
     /// A failed revert must not launder the buffer clean: clearing `dirty`
     /// before the fallible reload meant a file deleted between the conflict
     /// popup and the Enter left unsaved edits flagged clean — the tab lost

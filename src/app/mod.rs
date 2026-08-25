@@ -6467,8 +6467,9 @@ impl App {
         let Some(path) = self.editor.path.clone() else {
             return;
         };
-        let line = self.editor.cursor_row as u32;
-        let character = self.editor.cursor_col as u32;
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
@@ -6484,8 +6485,9 @@ impl App {
         let Some(path) = self.editor.path.clone() else {
             return;
         };
-        let line = self.editor.cursor_row as u32;
-        let character = self.editor.cursor_col as u32;
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
@@ -6896,9 +6898,12 @@ impl App {
         // punctuation there is no symbol to describe, so show the diagnostic
         // alone right away.
         let word = self.editor.word_at(line, c).is_some();
+        // Converted before the match: `self.lsp.as_mut()` borrows self for the
+        // whole scrutinee, so the editor is unreachable inside the arm.
+        let (uline, uchar) = self.editor.pos_to_utf16(line, c);
         match (word, self.editor.path.clone(), self.lsp.as_mut()) {
             (true, Some(path), Some(lsp)) => {
-                let id = lsp.request_hover(path, line as u32, c as u32);
+                let id = lsp.request_hover(path, uline, uchar);
                 self.hover_request_id = Some(id);
             }
             _ => {
@@ -7399,6 +7404,9 @@ impl App {
             entry.push(crate::widgets::problems::ProblemItem {
                 line: d.line,
                 col: d.col,
+                // Build tools report characters (rustc counts code points),
+                // not the UTF-16 units an LSP position carries.
+                col_utf16: false,
                 severity: d.severity,
                 message: d.message,
                 source: d.source.to_string(),
@@ -7475,6 +7483,7 @@ impl App {
                         items.push(ProblemItem {
                             line: d.start_line,
                             col: d.start_char,
+                            col_utf16: true,
                             severity: d.severity,
                             message: d.message.clone(),
                             source: server.clone(),
@@ -7719,7 +7728,8 @@ impl App {
                 col: self.editor.cursor_col,
             });
         }
-        match self.open_at(&path, line as usize, col as usize) {
+        // `col` is the server's UTF-16 column, not a character column.
+        match self.open_at_utf16(&path, line, col) {
             Ok(()) => {
                 self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1)
             }
@@ -8489,8 +8499,9 @@ impl App {
     /// Request the callers (`incoming`) or callees of the symbol at the
     /// cursor. Cmd+K H / Cmd+K Shift+H and the right-click menu rows.
     fn request_call_hierarchy_at_cursor(&mut self, incoming: bool) {
-        let row = self.editor.cursor_row;
-        let col = self.editor.cursor_col;
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let Some(path) = self.editor.path.clone() else {
             return;
         };
@@ -8498,7 +8509,7 @@ impl App {
             self.status = String::from("Call hierarchy: no language server for this file");
             return;
         };
-        let id = lsp.request_call_hierarchy(path, row as u32, col as u32, incoming);
+        let id = lsp.request_call_hierarchy(path, line, character, incoming);
         self.call_hierarchy_request_id = Some(id);
     }
 
@@ -8885,10 +8896,11 @@ impl App {
         if already_requested || self.occ_observed_at.elapsed() < OCCURRENCES_IDLE {
             return false;
         }
+        let (uline, uchar) = self.editor.pos_to_utf16(cur.1, cur.2);
         let Some(lsp) = self.lsp.as_mut() else {
             return false;
         };
-        let id = lsp.request_document_highlights(cur.0.clone(), cur.1 as u32, cur.2 as u32);
+        let id = lsp.request_document_highlights(cur.0.clone(), uline, uchar);
         self.occurrences_request = Some((id, cur.0, cur.1, cur.2, cur.3));
         false
     }
@@ -9472,6 +9484,29 @@ impl App {
         self.status = format!("Color Theme: {}", theme.label());
     }
 
+    /// [`Self::open_at`] for a position that came FROM a language server, whose
+    /// column counts UTF-16 code units rather than characters. The file has to
+    /// be open before the conversion can happen — the mapping needs the target
+    /// line's text — so this opens at column 0 and then re-seats the caret.
+    ///
+    /// Out-of-range answers are clamped rather than rejected, matching
+    /// `open_at`: a server that names a line past the end of a buffer we have
+    /// since edited should still land the user on the right file.
+    fn open_at_utf16(&mut self, path: &Path, line: u32, character: u32) -> Result<()> {
+        self.open_at(path, line as usize, 0)?;
+        let row = self.editor.cursor_row;
+        let col = self.editor.utf16_col_to_char_pub(row, character);
+        let max_col = self
+            .editor
+            .lines
+            .get(row)
+            .map(|l| l.chars().count())
+            .unwrap_or(0);
+        self.editor.cursor_col = col.min(max_col);
+        self.editor.ensure_cursor_col_visible();
+        Ok(())
+    }
+
     fn open_at(&mut self, path: &Path, row: usize, col: usize) -> Result<()> {
         self.hover_popup = None;
         self.hover_diagnostic = None;
@@ -9604,10 +9639,11 @@ impl App {
         let Some(path) = self.editor.path.clone() else {
             return;
         };
+        let (uline, uchar) = self.editor.pos_to_utf16(line, c);
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
-        let id = lsp.request_definition(path, line as u32, c as u32);
+        let id = lsp.request_definition(path, uline, uchar);
         self.definition_request_id = Some(id);
     }
 
@@ -9617,8 +9653,9 @@ impl App {
     /// Alt+F12 / palette "Peek Definition": the definition request whose
     /// response opens an excerpt popup instead of jumping (#115).
     fn peek_definition_at_cursor(&mut self) {
-        let row = self.editor.cursor_row;
-        let col = self.editor.cursor_col;
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("No file open");
             return;
@@ -9627,21 +9664,22 @@ impl App {
             self.status = String::from("No language server for this file");
             return;
         };
-        let id = lsp.request_definition(path, row as u32, col as u32);
+        let id = lsp.request_definition(path, line, character);
         self.peek_definition_request_id = Some(id);
         self.status = String::from("Peeking definition");
     }
 
     fn request_definition_at_cursor(&mut self) {
-        let row = self.editor.cursor_row;
-        let col = self.editor.cursor_col;
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let Some(path) = self.editor.path.clone() else {
             return;
         };
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
-        let id = lsp.request_definition(path, row as u32, col as u32);
+        let id = lsp.request_definition(path, line, character);
         self.definition_request_id = Some(id);
     }
 
@@ -9651,15 +9689,16 @@ impl App {
     /// no separate declaration site (e.g. Python); they diverge for C/C++ (header
     /// prototype) and TypeScript (`.d.ts`).
     fn request_declaration_at_cursor(&mut self) {
-        let row = self.editor.cursor_row;
-        let col = self.editor.cursor_col;
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let Some(path) = self.editor.path.clone() else {
             return;
         };
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
-        let id = lsp.request_declaration(path, row as u32, col as u32);
+        let id = lsp.request_declaration(path, line, character);
         self.declaration_request_id = Some(id);
     }
 
@@ -9668,15 +9707,16 @@ impl App {
     /// item and the `⌃F12` keybinding. Jumps to where the *type* of the
     /// expression is defined, as opposed to the symbol itself (definition).
     fn request_type_definition_at_cursor(&mut self) {
-        let row = self.editor.cursor_row;
-        let col = self.editor.cursor_col;
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let Some(path) = self.editor.path.clone() else {
             return;
         };
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
-        let id = lsp.request_type_definition(path, row as u32, col as u32);
+        let id = lsp.request_type_definition(path, line, character);
         self.type_definition_request_id = Some(id);
     }
 
@@ -9685,15 +9725,16 @@ impl App {
     /// item and the `⌘F12` keybinding. Meaningful on traits / interfaces /
     /// abstract methods; the server may return many, and croft jumps to the first.
     fn request_implementation_at_cursor(&mut self) {
-        let row = self.editor.cursor_row;
-        let col = self.editor.cursor_col;
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let Some(path) = self.editor.path.clone() else {
             return;
         };
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
-        let id = lsp.request_implementation(path, row as u32, col as u32);
+        let id = lsp.request_implementation(path, line, character);
         self.implementation_request_id = Some(id);
     }
 
@@ -9702,15 +9743,16 @@ impl App {
     /// `⇧F12` keybinding. The server almost always returns many uses, which
     /// `drain_lsp_references` then offers as a picker.
     fn request_references_at_cursor(&mut self) {
-        let row = self.editor.cursor_row;
-        let col = self.editor.cursor_col;
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let Some(path) = self.editor.path.clone() else {
             return;
         };
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
-        let id = lsp.request_references(path, row as u32, col as u32);
+        let id = lsp.request_references(path, line, character);
         self.references_request_id = Some(id);
     }
 
@@ -10604,8 +10646,11 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
-        let row = self.editor.cursor_row as u32;
-        let col = self.editor.cursor_col as u32;
+        // `row`/`col` go to the server, so the column must be UTF-16;
+        // `diagnostics_in_line_range` takes a plain row and is unaffected.
+        let (row, col) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let diagnostics = self.editor.diagnostics_in_line_range(row, row);
         let Some(lsp) = self.lsp.as_mut() else {
             self.status = String::from("No language server for this file");
@@ -30585,8 +30630,20 @@ impl App {
                     }
                     match self.problems.hit_at(m.row) {
                         Some(ProblemHit::Header(path)) => self.problems.toggle_collapse(&path),
-                        Some(ProblemHit::Diagnostic { path, line, col }) => {
-                            if let Err(e) = self.open_at(&path, line as usize, col as usize) {
+                        Some(ProblemHit::Diagnostic {
+                            path,
+                            line,
+                            col,
+                            col_utf16,
+                        }) => {
+                            // An LSP diagnostic's column is UTF-16; a build
+                            // tool's is already a character column.
+                            let opened = if col_utf16 {
+                                self.open_at_utf16(&path, line, col)
+                            } else {
+                                self.open_at(&path, line as usize, col as usize)
+                            };
+                            if let Err(e) = opened {
                                 self.status = format!("Open failed: {e}");
                             }
                         }
@@ -36325,13 +36382,16 @@ impl App {
                     }
                     return;
                 }
+                // The prompt captured buffer coordinates; the server wants
+                // UTF-16, so convert here rather than casting the char column.
+                let (line, character) = self.editor.pos_to_utf16(row, col);
                 let Some(lsp) = self.lsp.as_mut() else {
                     if let Some(p) = self.prompt.as_mut() {
                         p.error = Some("No language server for this file".to_string());
                     }
                     return;
                 };
-                let id = lsp.request_rename(path, row as u32, col as u32, new_name);
+                let id = lsp.request_rename(path, line, character, new_name);
                 self.rename_request_id = Some(id);
                 self.prompt = None;
                 self.status = String::from("Renaming symbol");
