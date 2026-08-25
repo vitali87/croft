@@ -16770,7 +16770,7 @@ fn the_palette_and_vim_recorders_are_one_recording_not_two() {
 }
 
 #[test]
-fn saving_one_register_preserves_a_newer_crofts_steps_verbatim() {
+fn saving_one_register_preserves_every_field_of_a_newer_crofts_steps() {
     // `update_json_store` re-serialises the ENTIRE map on every save, so a
     // fieldless catch-all would rewrite a newer croft's steps as
     // `{"kind":"Unknown"}` the first time any unrelated register was
@@ -16912,6 +16912,24 @@ fn a_replay_aborts_visibly_and_keeps_earlier_iterations() {
     assert_eq!(
         app.editor.lines[0], before,
         "and nothing ran, rather than half of it"
+    );
+}
+
+#[test]
+fn a_count_before_q_does_not_leak_into_the_recording() {
+    // Vim discards a count on `q`. Keeping it would silently retarget the
+    // recording's FIRST key — `3qa` then `j` moves three rows instead of one,
+    // and the wrong motion is what gets captured. A pending count is
+    // invisible, so the corruption only surfaces at replay.
+    let (mut app, tmp) = vim_app("aaaa\nbbbb\ncccc\ndddd\neeee\n");
+    app.macros_path = tmp.path().join("macros.json");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    vim_feed_str(&mut app, "3qa");
+    vim_feed(&mut app, 'j');
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "the stale 3 must not make the recording's first j move three rows"
     );
 }
 

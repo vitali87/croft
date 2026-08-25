@@ -28,8 +28,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// One recorded step. Typing collapses into `Text` runs so a replayed burst
 /// is one undo step (consecutive `InsertChar` edits coalesce), while every
 /// other key is kept verbatim as the chord that produced it.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
     /// A run of plain characters typed with no modifiers.
     Text { text: String },
@@ -41,13 +40,93 @@ pub enum Step {
     /// unloadable and permanently block saves — the store refuses to
     /// overwrite what it cannot parse.
     ///
-    /// The payload is kept verbatim rather than discarded, because
-    /// `update_json_store` re-serialises the ENTIRE map on every save: a
-    /// fieldless catch-all would rewrite a newer croft's steps as
-    /// `{"kind":"Unknown"}` the first time any unrelated register was
-    /// stored, silently destroying them. Replays as nothing.
-    #[serde(untagged)]
-    Unknown(serde_json::Value),
+    /// Every field is kept (key order is not preserved, since the payload
+    /// round-trips through a JSON object), because `update_json_store`
+    /// re-serialises the ENTIRE map on every save: a fieldless catch-all
+    /// would rewrite a newer croft's steps as `{"kind":"Unknown"}` the first
+    /// time any unrelated register was stored, silently destroying them.
+    /// Replays as nothing.
+    ///
+    /// Deliberately NOT `#[serde(untagged)]`: an untagged catch-all is
+    /// greedy and would also swallow a MALFORMED known step — a `Text` that
+    /// lost its `text` field, or a bare `42` — turning a hard parse error
+    /// into a silently inert macro and dissolving the refuse-a-corrupt-store
+    /// guarantee this module inherits from `workspace.rs`. The custom
+    /// deserialiser below accepts only an object whose `kind` is a tag this
+    /// build does not know.
+    Unknown(serde_json::Map<String, serde_json::Value>),
+}
+
+impl<'de> serde::Deserialize<'de> for Step {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let v = serde_json::Value::deserialize(d)?;
+        let obj = v
+            .as_object()
+            .ok_or_else(|| D::Error::custom("a macro step must be an object"))?;
+        let kind = obj
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| D::Error::custom("a macro step needs a string \"kind\""))?;
+        match kind {
+            // Known kinds must parse properly: a malformed one is a corrupt
+            // store, which the caller refuses rather than silently repairs.
+            "Text" => {
+                let text = obj
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| D::Error::missing_field("text"))?;
+                Ok(Step::Text {
+                    text: text.to_string(),
+                })
+            }
+            "Key" => {
+                let code = obj
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| D::Error::missing_field("code"))?;
+                let mods = obj
+                    .get("mods")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| D::Error::missing_field("mods"))?;
+                Ok(Step::Key {
+                    code: code.to_string(),
+                    mods: u8::try_from(mods).map_err(|_| D::Error::custom("mods out of range"))?,
+                })
+            }
+            // Anything else is a step from a newer croft: keep it whole.
+            _ => Ok(Step::Unknown(obj.clone())),
+        }
+    }
+}
+
+impl serde::Serialize for Step {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            // An unknown step writes back exactly the fields it arrived with,
+            // so a save from this build does not damage a newer one's macro.
+            Step::Unknown(obj) => obj.serialize(s),
+            Step::Text { text } => {
+                let mut m = serde_json::Map::new();
+                m.insert("kind".into(), "Text".into());
+                m.insert("text".into(), text.clone().into());
+                m.serialize(s)
+            }
+            Step::Key { code, mods } => {
+                let mut m = serde_json::Map::new();
+                m.insert("kind".into(), "Key".into());
+                m.insert("code".into(), code.clone().into());
+                m.insert("mods".into(), (*mods).into());
+                m.serialize(s)
+            }
+        }
+    }
 }
 
 impl Step {
@@ -344,6 +423,62 @@ mod tests {
         // An empty macro prunes its key rather than persisting a no-op.
         save_register(&path, "a", Macro::default()).unwrap();
         assert!(!load(&path).contains_key("a"), "the register was removed");
+    }
+
+    #[test]
+    fn a_malformed_known_step_is_still_a_corrupt_store() {
+        // The unknown-kind catch-all must not be greedy. A `Text` that lost
+        // its `text` field (a truncated write) is corruption, not a step from
+        // the future: swallowing it would turn a hard parse error into a
+        // silently shorter macro and dissolve the refuse-a-corrupt-store
+        // guarantee this module inherits from `workspace.rs`.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("macros.json");
+        std::fs::write(&path, r#"{"a":{"steps":[{"kind":"Text"}]}}"#).unwrap();
+        assert!(
+            load(&path).is_empty(),
+            "a structurally corrupt step reads as empty, not as a usable macro"
+        );
+        assert!(
+            save_register(&path, "b", Macro::default()).is_err(),
+            "and a save is refused rather than rewriting the corruption"
+        );
+
+        // Non-objects are corruption too, not future steps.
+        for junk in [r#"{"a":{"steps":[42]}}"#, r#"{"a":{"steps":["hi"]}}"#] {
+            std::fs::write(&path, junk).unwrap();
+            assert!(
+                load(&path).is_empty(),
+                "a non-object step is refused: {junk}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_keeps_every_field_through_a_save() {
+        // `update_json_store` re-serialises the whole map on every save, so a
+        // newer croft's step must survive an unrelated register being stored.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("macros.json");
+        std::fs::write(
+            &path,
+            r#"{"b":{"steps":[{"kind":"Mouse","button":"left","x":3,"nested":{"a":1}}]}}"#,
+        )
+        .unwrap();
+        let mut mine = Macro::default();
+        mine.push_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        save_register(&path, "c", mine).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        for needle in ["\"button\"", "\"left\"", "\"x\"", "\"nested\""] {
+            assert!(raw.contains(needle), "{needle} survived the save: {raw}");
+        }
+        // And it stays inert rather than replaying as something.
+        assert_eq!(
+            load(&path).get("b").map(|m| m.key_events().len()),
+            Some(0),
+            "an unknown step replays as nothing"
+        );
     }
 
     #[test]

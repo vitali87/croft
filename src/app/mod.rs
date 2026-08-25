@@ -27382,10 +27382,6 @@ impl App {
         true
     }
 
-    /// Execute a Command Palette entry. Editor text commands act on the active
-    /// editor buffer; view / navigation commands defer to the same methods
-    /// their dedicated chords use, so the palette can never drift from the
-    /// keyboard surface.
     /// Capture one key into the live recording. Recording control keys are
     /// excluded by the callers that own them (vim's `q`, the palette
     /// commands), so a macro can never contain the gesture that ends it.
@@ -27525,6 +27521,10 @@ impl App {
         }
     }
 
+    /// Execute a Command Palette entry. Editor text commands act on the active
+    /// editor buffer; view / navigation commands defer to the same methods
+    /// their dedicated chords use, so the palette can never drift from the
+    /// keyboard surface.
     fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
         use crate::widgets::command_palette::Command as Cmd;
         use crate::widgets::editor::CaseTransform;

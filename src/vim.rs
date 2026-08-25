@@ -618,9 +618,18 @@ impl VimState {
         // `1`, it does not start a count.
         if self.pending_record {
             self.pending_record = false;
+            // Vim discards a count on `q`. Without this the pending count
+            // survives into the recording and silently retargets its FIRST
+            // key — `3qa` then `j` moves three rows, and the wrong motion is
+            // what gets captured. A user cannot see a pending count, so the
+            // corruption is invisible until replay.
+            let _ = self.take_count();
             if c.is_ascii_alphanumeric() {
                 return VimKeyResult::Consumed(vec![VimAction::MacroRecord(Some(c))]);
             }
+            // Digits are accepted as register names too (`q1`). Vim reserves
+            // 0-9 as read-only yank registers; croft's namespace is flat, so
+            // they are ordinary registers here.
             // Not a register name: swallow, like every other bad gesture.
             return VimKeyResult::Consumed(vec![]);
         }
@@ -665,6 +674,7 @@ impl VimState {
                 self.resolve_motion(m)
             }
             'q' => {
+                let _ = self.take_count();
                 // Vim's stop gesture is a BARE `q`, so whether this key needs
                 // a register letter depends on the app's recording state. The
                 // app pushes that in via `set_recording` rather than the
