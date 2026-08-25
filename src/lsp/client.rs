@@ -909,6 +909,25 @@ impl LspClient {
             .context("rename")
     }
 
+    /// `textDocument/prepareRename`: validate the position and get the
+    /// exact renameable range / placeholder before prompting (#254). An
+    /// `Err` carries the server's own refusal message — the fail-fast
+    /// half of the feature.
+    pub async fn prepare_rename(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<lsp_types::PrepareRenameResponse>> {
+        self.server
+            .prepare_rename(TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position { line, character },
+            })
+            .await
+            .context("prepare_rename")
+    }
+
     /// `textDocument/codeAction`: ask the server for the quick fixes and
     /// refactors available over `range` (a point selection at the cursor, or a
     /// real selection). `diagnostics` are the diagnostics overlapping the range,

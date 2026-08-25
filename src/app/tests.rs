@@ -29240,6 +29240,203 @@ fn refresh_run_debug_syncs_the_config_row() {
 }
 
 #[test]
+fn rename_symbol_defers_the_prompt_until_a_verdict_arrives() {
+    // #254 item 6: F2 no longer opens the prompt straight away — it fires
+    // prepareRename and parks, so the prompt can pre-fill the server's own
+    // validated name. (The document here was never opened through the LSP
+    // layer, so the worker's answer is the unknown-document `unsupported`
+    // verdict; the verdict shapes themselves are covered by
+    // `a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback`.)
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("lib.rs"),
+        "fn main() {\n    let value = 1;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9; // inside `value`
+    app.start_rename_symbol();
+    assert!(app.prompt.is_none(), "the prompt waits on the verdict");
+    assert_eq!(app.status, "Preparing rename…");
+    assert!(
+        app.prepare_rename_request.is_some(),
+        "the request is armed for the verdict to match against"
+    );
+}
+
+#[test]
+fn a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback() {
+    // Every shape the server can answer with (#254 item 6). The reply
+    // channel's sender lives inside the LSP worker, so these drive the
+    // verdict handler the drain loop delegates to.
+    use crate::lsp::manager::PrepareRenameResult;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("lib.rs");
+    std::fs::write(&path, "fn main() {\n    let value = 1;\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9; // inside `value`
+
+    let verdict = |target, error, unsupported| PrepareRenameResult {
+        request_id: 4,
+        path: path.clone(),
+        unsupported,
+        error,
+        target,
+    };
+    let arm = |app: &mut App| {
+        app.prepare_rename_request = Some((4, path.clone(), 1, 9, app.editor.edit_seq));
+        app.prompt = None;
+        app.status = String::from("Preparing rename…");
+    };
+
+    // A placeholder wins over the range text.
+    arm(&mut app);
+    assert!(app.apply_prepare_rename_verdict(verdict(
+        Some(((1, 8, 1, 13), Some(String::from("renamed")))),
+        None,
+        false
+    )));
+    assert_eq!(
+        app.prompt.as_ref().expect("prompt opened").buffer,
+        "renamed",
+        "the server's placeholder pre-fills the prompt"
+    );
+
+    // No placeholder: the validated range's own text.
+    arm(&mut app);
+    assert!(app.apply_prepare_rename_verdict(verdict(Some(((1, 8, 1, 13), None)), None, false)));
+    assert_eq!(
+        app.prompt.as_ref().expect("prompt opened").buffer,
+        "value",
+        "the range text pre-fills when no placeholder is offered"
+    );
+
+    // The server refused the position.
+    arm(&mut app);
+    assert!(app.apply_prepare_rename_verdict(verdict(
+        None,
+        Some(String::from("cannot rename a keyword")),
+        false
+    )));
+    assert_eq!(app.status, "Rename rejected: cannot rename a keyword");
+    assert!(app.prompt.is_none(), "a refusal opens no prompt");
+
+    // The server answered "nothing here".
+    arm(&mut app);
+    assert!(app.apply_prepare_rename_verdict(verdict(None, None, false)));
+    assert_eq!(app.status, "Nothing renameable at the cursor");
+    assert!(app.prompt.is_none());
+
+    // No prepare support: the word-under-cursor fallback.
+    arm(&mut app);
+    assert!(app.apply_prepare_rename_verdict(verdict(None, None, true)));
+    assert_eq!(
+        app.prompt.as_ref().expect("fallback prompt opened").buffer,
+        "value"
+    );
+
+    // The buffer moved under the in-flight request: say so rather than
+    // leaving "Preparing rename…" wedged on screen forever.
+    arm(&mut app);
+    app.editor.edit_seq += 1;
+    assert!(app.apply_prepare_rename_verdict(verdict(
+        Some(((1, 8, 1, 13), Some(String::from("renamed")))),
+        None,
+        false
+    )));
+    assert_eq!(app.status, "Rename cancelled");
+    assert!(app.prompt.is_none(), "a stale verdict opens no prompt");
+
+    // A superseded reply must not disarm the newer in-flight request.
+    arm(&mut app);
+    let stale = PrepareRenameResult {
+        request_id: 3,
+        path: path.clone(),
+        unsupported: false,
+        error: None,
+        target: None,
+    };
+    assert!(!app.apply_prepare_rename_verdict(stale));
+    assert!(
+        app.prepare_rename_request.is_some(),
+        "the armed request survives an older reply"
+    );
+}
+
+#[test]
+fn a_multi_line_validated_range_falls_back_to_the_word_prompt() {
+    // The server may validate a span crossing lines; there is no single-line
+    // text to pre-fill from, so the word-under-cursor fallback takes over
+    // rather than opening a prompt with an empty buffer.
+    use crate::lsp::manager::PrepareRenameResult;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("lib.rs");
+    std::fs::write(&path, "fn main() {\n    let value = 1;\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9; // inside `value`
+    app.prepare_rename_request = Some((4, path.clone(), 1, 9, app.editor.edit_seq));
+    assert!(app.apply_prepare_rename_verdict(PrepareRenameResult {
+        request_id: 4,
+        path: path.clone(),
+        unsupported: false,
+        error: None,
+        target: Some(((1, 8, 2, 4), None)),
+    }));
+    assert_eq!(
+        app.prompt.as_ref().expect("fallback prompt opened").buffer,
+        "value",
+        "a cross-line range yields no pre-fill text, so the fallback runs"
+    );
+}
+
+#[test]
+fn a_cancelled_rename_disarms_the_in_flight_prepare_request() {
+    // Esc on the prompt abandons the caret. A verdict landing afterwards must
+    // not reopen the prompt — it would carry the stale (row, col) into the
+    // rename request and rename the wrong symbol.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("lib.rs");
+    std::fs::write(&path, "fn main() {\n    let value = 1;\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9;
+    app.start_rename_symbol();
+    assert!(
+        app.prepare_rename_request.is_some(),
+        "the request is armed while it is in flight"
+    );
+    app.prompt = Some(Prompt {
+        label: String::from("Rename Symbol 'value'"),
+        buffer: String::from("value"),
+        kind: PromptKind::RenameSymbol {
+            path: path.clone(),
+            row: 1,
+            col: 9,
+        },
+        target_dir: std::path::PathBuf::new(),
+        error: None,
+    });
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.prompt.is_none(), "Esc closes the prompt");
+    assert!(
+        app.prepare_rename_request.is_none(),
+        "and disarms the in-flight prepare so a late verdict cannot reopen it"
+    );
+}
+
+#[test]
 fn format_selection_needs_a_selection_and_reports_unsupported_via_the_reply() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("lib.rs"), "fn main( ) {\n}\n").unwrap();

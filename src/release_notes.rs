@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Format on type: when a language server advertises trigger characters, typing one quietly reformats at the caret. Off by default like VS Code — toggle it in Settings, the Command Palette, or a workspace's editor.formatOnType.",
+    summary: "Rename (F2) now asks the language server first: the prompt pre-fills the server's own validated name, and renaming somewhere the server refuses fails immediately with its reason instead of opening a prompt that cannot succeed.",
 }];
