@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Diffs can ignore whitespace: toggle indentation-only or all-whitespace changes out of the view so a reindented block stops burying the three lines that actually changed — staging always applies the real patch regardless of the view.",
+    summary: "Colour logs render in the editor: open a docker, pytest or cargo log and the ANSI colours paint through your theme's palette instead of showing raw escape codes — and because the view is windowed, a log far past the usual size limit opens instantly.",
 }];

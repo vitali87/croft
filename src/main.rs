@@ -1,3 +1,4 @@
+mod ansi_text;
 mod app;
 mod archive;
 mod build_matchers;
@@ -23,6 +24,7 @@ mod iterm2;
 mod iterm2_inline;
 mod keymap;
 mod launcher;
+mod log_view;
 mod lsp;
 mod magic;
 mod markdown;
