@@ -1121,6 +1121,28 @@ pub fn cwd_of_pid(_pid: u32) -> Option<std::path::PathBuf> {
     None
 }
 
+/// A saved transcript rendered as bytes safe to feed a fresh parser.
+///
+/// Control characters are stripped rather than escaped: a transcript comes off
+/// disk, and a grid should never have contained an escape in the first place,
+/// so anything control-shaped here is either corruption or someone's idea of a
+/// joke. TAB is the exception — it is legitimate output, and deleting it
+/// silently collapses tab-aligned columns — so it becomes a space, which is
+/// what the grid would have shown anyway.
+fn transcript_bytes(lines: &[String]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for l in lines {
+        let cleaned: String = l
+            .chars()
+            .map(|c| if c == '\t' { ' ' } else { c })
+            .filter(|c| !c.is_control())
+            .collect();
+        bytes.extend(cleaned.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+    }
+    bytes
+}
+
 /// The label to show for a pane: a manual name wins, else the live foreground
 /// process name.
 pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
@@ -1131,6 +1153,26 @@ impl PtyTerminal {
     pub fn new(cwd: &std::path::Path) -> Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         Self::new_shell(&shell, cwd)
+    }
+
+    /// Spawn a shell with `transcript` already painted into the grid, for a
+    /// pane restored from a saved session (#249).
+    ///
+    /// The preamble is painted before the reader thread starts, not after the
+    /// constructor returns. Replaying afterwards races the shell: both write
+    /// the same `Term` behind the same lock, and a shell that reaches its
+    /// first prompt before the replay wins, so the restored output lands
+    /// below or through the prompt instead of above it.
+    pub fn new_with_transcript(cwd: &std::path::Path, transcript: &[String]) -> Result<Self> {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let (program, args) = interactive_shell_invocation(&shell);
+        let mut cmd = CommandBuilder::new(&program);
+        let pre = apply_shell_integration_env(&mut cmd, &shell, &crate::prefs::config_dir());
+        for a in pre.iter().chain(args.iter()) {
+            cmd.arg(a);
+        }
+        cmd.cwd(cwd);
+        Self::spawn_with_preamble(cmd, None, &transcript_bytes(transcript))
     }
 
     /// Spawn an interactive login session for a specific shell (a terminal
@@ -1436,7 +1478,18 @@ impl PtyTerminal {
         self.pty_dirty.store(true, Ordering::Release);
     }
 
-    fn spawn_with(mut cmd: CommandBuilder, run_label: Option<String>) -> Result<Self> {
+    fn spawn_with(cmd: CommandBuilder, run_label: Option<String>) -> Result<Self> {
+        Self::spawn_with_preamble(cmd, run_label, &[])
+    }
+
+    /// As [`Self::spawn_with`], but paints `preamble` into the grid before the
+    /// reader thread starts, so restored output cannot interleave with the new
+    /// shell's first prompt.
+    fn spawn_with_preamble(
+        mut cmd: CommandBuilder,
+        run_label: Option<String>,
+        preamble: &[u8],
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let cols = 80u16;
         let rows = 24u16;
@@ -1479,7 +1532,12 @@ impl PtyTerminal {
             size: Some(size_shared.clone()),
             bell: Some(bell.clone()),
         };
-        let term = Term::new(cfg, &term_size, listener);
+        let mut term = Term::new(cfg, &term_size, listener);
+        // Before the reader thread exists, so nothing the child writes can
+        // land ahead of the restored output (#249).
+        if !preamble.is_empty() {
+            Processor::<StdSyncHandler>::new().advance(&mut term, preamble);
+        }
         let term = Arc::new(FairMutex::new(term));
         let term_for_thread = term.clone();
         let writer_for_responder = writer.clone();
@@ -2655,21 +2713,9 @@ impl PtyTerminal {
     /// output contained. The shell is untouched — this only paints the
     /// grid, so the prompt sits below the restored text.
     pub fn replay_transcript(&self, lines: &[String]) {
-        if lines.is_empty() {
+        let bytes = transcript_bytes(lines);
+        if bytes.is_empty() {
             return;
-        }
-        let mut bytes = Vec::new();
-        for l in lines {
-            // Strip anything that could be read as a control sequence; a
-            // saved grid should never contain one, but a transcript read
-            // from a file on disk is not something to trust blindly.
-            bytes.extend(
-                l.chars()
-                    .filter(|c| !c.is_control())
-                    .collect::<String>()
-                    .as_bytes(),
-            );
-            bytes.extend_from_slice(b"\r\n");
         }
         let mut p = Processor::<StdSyncHandler>::new();
         let mut term = self.term.lock();

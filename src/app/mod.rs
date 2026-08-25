@@ -11926,7 +11926,16 @@ impl App {
                 // were doing instead of a blank grid (#249). Trailing blank
                 // rows are dropped: a mostly-empty screen would otherwise
                 // restore as a wall of nothing.
-                transcript: {
+                transcript: if t.alt_screen() {
+                    // A full-screen program's frame is not scrollback: the
+                    // alternate screen exists precisely so its contents
+                    // vanish on exit. Persisting vim's tildes or htop's
+                    // meters and replaying them as inert text above a fresh
+                    // prompt would be worse than restoring nothing.
+                    // `grid_lines` is the one grid reader here without an
+                    // ALT_SCREEN guard of its own, so the check lives here.
+                    Vec::new()
+                } else {
                     let (lines, _) = t.grid_lines();
                     let end = lines
                         .iter()
@@ -11970,11 +11979,11 @@ impl App {
             } else {
                 self.workspace_root().to_path_buf()
             };
-            if let Ok(mut t) = PtyTerminal::new(&dir) {
+            // The transcript is painted during the spawn, not after it: a
+            // replay that follows the constructor races the new shell's
+            // first prompt for the same grid (#249).
+            if let Ok(mut t) = PtyTerminal::new_with_transcript(&dir, &p.transcript) {
                 t.set_manual_name(p.name.clone());
-                // Paint the pane's previous output above the new shell's
-                // prompt, so a restored pane is not a blank grid (#249).
-                t.replay_transcript(&p.transcript);
                 terms.push(t);
             }
         }
