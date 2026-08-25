@@ -30033,6 +30033,9 @@ fn a_document_link_refuses_a_non_web_scheme_and_records_nav_history() {
     for malformed in [
         "https://example.com\nopen\tevil",
         "https://exa\u{0}mple.com",
+        // The check runs before the branch, so a file:// target carrying one
+        // is refused too rather than reaching Url::parse.
+        "file:///etc/hosts\nopen\tevil",
     ] {
         app.open_document_link(malformed);
         assert!(
