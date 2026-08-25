@@ -25520,6 +25520,8 @@ impl App {
         left: &crate::file_ref::FileRef,
         right: &crate::file_ref::FileRef,
     ) -> bool {
+        // Both sides absolute by construction (diff_uri refuses relative
+        // paths); gated on is_file like every terminal file click.
         let lp = std::path::PathBuf::from(&left.path);
         let rp = std::path::PathBuf::from(&right.path);
         if !lp.is_file() || !rp.is_file() {

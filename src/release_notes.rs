@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Close All now means all: the tab context menu's Close All (and Cmd+K W) closes the tabs in every split group and collapses the layout to a single pane. It used to empty only the clicked group, which then collapsed away — looking like a single tab closed.",
+    kind: NoteKind::Feature,
+    summary: "Editor deep links open in croft: Ctrl+click a vscode://file/<path>:line:col style hyperlink in the terminal (VS Code, Cursor, Windsurf, or Zed scheme) and the file opens right here instead of launching the other editor.",
 }];

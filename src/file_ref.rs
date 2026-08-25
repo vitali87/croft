@@ -76,6 +76,13 @@ pub fn file_ref_at(text: &str, col: usize) -> Option<FileRef> {
     None
 }
 
+/// Editors whose `scheme://file/<path>` deep links open here. A terminal
+/// hyperlink can carry any URI while displaying unrelated text, so the
+/// `file/` shape alone is not the gate: `https://file//etc/hosts` is a web
+/// URL whose host happens to be `file`, not an editor link, and must fall
+/// through to the caller's web-only rule.
+const EDITOR_LINK_SCHEMES: [&str; 5] = ["vscode", "vscode-insiders", "cursor", "windsurf", "zed"];
+
 /// An editor deep-link URI carried by a terminal hyperlink:
 /// `scheme://file/<abs path>[:line[:col]]` (VS Code's shape, printed
 /// identically by Cursor, Windsurf, and Zed — VS Code's canonical form
@@ -86,13 +93,6 @@ pub fn file_ref_at(text: &str, col: usize) -> Option<FileRef> {
 /// 1-based, defaulting to line 1 when the URI carries none.
 pub fn editor_file_uri(url: &str) -> Option<FileRef> {
     let (scheme, rest) = url.trim().split_once("://")?;
-    if scheme.is_empty()
-        || !scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    {
-        return None;
-    }
     if scheme.eq_ignore_ascii_case("file") {
         // file://[host]/abs/path — the scheme has no line-suffix convention.
         let path = decode_path(&rest[rest.find('/')?..])?;
@@ -101,6 +101,12 @@ pub fn editor_file_uri(url: &str) -> Option<FileRef> {
             line: 1,
             column: None,
         });
+    }
+    if !EDITOR_LINK_SCHEMES
+        .iter()
+        .any(|s| scheme.eq_ignore_ascii_case(s))
+    {
+        return None;
     }
     let tail = rest.strip_prefix("file/")?;
     let (raw_path, line, column) = split_line_suffix(tail);
@@ -143,7 +149,8 @@ pub fn diff_uri(url: &str) -> Option<(FileRef, FileRef)> {
 }
 
 /// Split a trailing `:line[:col]` off an editor URI path. Digit runs are
-/// bounded like PATH_LINE_RE's, so an overlong run reads as path text.
+/// bounded like PATH_LINE_RE's, so an overlong run reads as path text —
+/// and positions are 1-based, so a `:0` suffix reads as path text too.
 fn split_line_suffix(s: &str) -> (&str, u32, Option<u32>) {
     let Some((head, last)) = numeric_suffix(s) else {
         return (s, 1, None);
@@ -159,7 +166,7 @@ fn numeric_suffix(s: &str) -> Option<(&str, u32)> {
     if tail.is_empty() || tail.len() > 7 || !tail.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some((head, tail.parse().ok()?))
+    Some((head, tail.parse().ok().filter(|&n| n > 0)?))
 }
 
 fn decode_path(raw: &str) -> Option<String> {
@@ -271,6 +278,31 @@ mod tests {
         assert!(editor_file_uri("vscode://settings/keybindings").is_none());
         assert!(editor_file_uri("mailto:a@b.c").is_none());
         assert!(editor_file_uri("vscode://file/").is_none());
+    }
+
+    #[test]
+    fn foreign_schemes_with_a_file_host_are_refused() {
+        // A web URL whose host is literally `file` matches the `file/`
+        // shape but is not an editor link; only allowlisted schemes pass.
+        assert!(editor_file_uri("https://file//etc/hosts").is_none());
+        assert!(editor_file_uri("ftp://file//etc/hosts").is_none());
+        assert!(editor_file_uri("notepad://file//etc/hosts").is_none());
+    }
+
+    #[test]
+    fn zero_line_or_column_reads_as_path_text() {
+        // Positions are 1-based: `:0` is not a position, so the suffix
+        // stays in the path (which then fails the caller's is_file gate).
+        let r = editor_file_uri("vscode://file//tmp/a.rs:0").unwrap();
+        assert_eq!(
+            (r.path.as_str(), r.line, r.column),
+            ("/tmp/a.rs:0", 1, None)
+        );
+        let r = editor_file_uri("vscode://file//tmp/a.rs:12:0").unwrap();
+        assert_eq!(
+            (r.path.as_str(), r.line, r.column),
+            ("/tmp/a.rs:12:0", 1, None)
+        );
     }
 
     #[test]
