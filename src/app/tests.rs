@@ -23345,10 +23345,12 @@ fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: None,
+                    transcript: Vec::new(),
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b_sub.display().to_string(),
                     name: Some(String::from("srv")),
+                    transcript: Vec::new(),
                 },
             ],
             active: 1,
@@ -23387,10 +23389,12 @@ fn restoring_a_workspaces_layout_drops_pane_bound_state_from_the_outgoing_panel(
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: None,
+                    transcript: Vec::new(),
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: Some(String::from("srv")),
+                    transcript: Vec::new(),
                 },
             ],
             active: 0,
@@ -23439,10 +23443,12 @@ fn change_workspace_root_keeps_live_panes_when_the_terminal_was_touched() {
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: None,
+                    transcript: Vec::new(),
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: Some(String::from("srv")),
+                    transcript: Vec::new(),
                 },
             ],
             active: 0,
@@ -30613,5 +30619,66 @@ fn editing_drops_stale_document_links() {
         app.editor.document_link_at(0, 5),
         None,
         "the edit dropped the stale ranges"
+    );
+}
+
+/// #249: after a restart the panes came back in the right directories with
+/// the right names — and completely BLANK, which is what the report means by
+/// "opens all old terminals empty". The pane's own output is now carried in
+/// the session store and repainted above the fresh prompt.
+///
+/// A real panel (two panes) is used deliberately: a lone unnamed pane at the
+/// workspace root is still pruned as the default layout, so that the store
+/// does not grow for every directory a shell was ever run in.
+#[test]
+fn a_restored_terminal_pane_shows_the_output_it_had_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_path = tmp.path().join("sessions.json");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_session_path = session_path.clone();
+    app.split_terminal().unwrap();
+
+    // A pane that has never been rendered has a zero-column grid, so give it
+    // a real size first — the running app does this on its first frame.
+    app.terminals[0].resize(80, 24);
+    // Put a recognisable line on the pane, as the child would have printed.
+    app.terminals[0].feed_bytes_for_test(b"unique-marker-249\r\n");
+    app.save_terminal_session();
+    let raw = std::fs::read_to_string(&session_path).unwrap();
+    assert!(
+        raw.contains("unique-marker-249"),
+        "the store carries the pane's output: {raw}"
+    );
+
+    // A fresh app restores the panel; the marker must be on screen.
+    let mut app2 = App::new(tmp.path().to_path_buf()).unwrap();
+    app2.terminal_session_path = session_path.clone();
+    app2.restore_terminal_session();
+    app2.terminals[0].resize(80, 24);
+    let (lines, _) = app2.terminals[0].grid_lines();
+    assert!(
+        lines.iter().any(|l| l.contains("unique-marker-249")),
+        "the restored pane repaints its previous output: {lines:?}"
+    );
+}
+
+/// The transcript is plain text by design: a replay must not be able to
+/// re-run a cursor move or a screen clear that the original output carried.
+#[test]
+fn a_replayed_transcript_cannot_execute_control_sequences() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A hostile line: were this fed raw, the erase would wipe the screen and
+    // the cursor move would scramble the layout.
+    app.terminals[0].replay_transcript(&[String::from("before\u{1b}[2J\u{1b}[Hafter")]);
+    let (lines, _) = app.terminals[0].grid_lines();
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("before") && joined.contains("after"),
+        "the text survives: {joined:?}"
+    );
+    assert!(
+        !joined.contains('\u{1b}'),
+        "and no escape byte reaches the grid: {joined:?}"
     );
 }

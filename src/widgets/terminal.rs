@@ -2645,6 +2645,37 @@ impl PtyTerminal {
         }
     }
 
+    /// Replay a saved transcript into this pane's grid so a restored pane
+    /// shows the output it had before a restart (#249), above the fresh
+    /// prompt the new shell prints.
+    ///
+    /// Each line is written literally with CRLF and NO escape sequences:
+    /// the transcript is plain text precisely so a replay cannot re-run a
+    /// cursor move, a screen clear, or a title change that the original
+    /// output contained. The shell is untouched — this only paints the
+    /// grid, so the prompt sits below the restored text.
+    pub fn replay_transcript(&self, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        let mut bytes = Vec::new();
+        for l in lines {
+            // Strip anything that could be read as a control sequence; a
+            // saved grid should never contain one, but a transcript read
+            // from a file on disk is not something to trust blindly.
+            bytes.extend(
+                l.chars()
+                    .filter(|c| !c.is_control())
+                    .collect::<String>()
+                    .as_bytes(),
+            );
+            bytes.extend_from_slice(b"\r\n");
+        }
+        let mut p = Processor::<StdSyncHandler>::new();
+        let mut term = self.term.lock();
+        p.advance(&mut *term, &bytes);
+    }
+
     /// Test-only: parse `bytes` straight into this pane's grid, as if the
     /// child had printed them — app-level tests drive alt-screen repaint
     /// scenarios deterministically through this.

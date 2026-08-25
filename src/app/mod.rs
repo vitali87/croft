@@ -11872,6 +11872,19 @@ impl App {
                     .display()
                     .to_string(),
                 name: t.manual_name().map(str::to_string),
+                // The pane's own output, so a restored pane shows what you
+                // were doing instead of a blank grid (#249). Trailing blank
+                // rows are dropped: a mostly-empty screen would otherwise
+                // restore as a wall of nothing.
+                transcript: {
+                    let (lines, _) = t.grid_lines();
+                    let end = lines
+                        .iter()
+                        .rposition(|l| !l.trim().is_empty())
+                        .map_or(0, |i| i + 1);
+                    let start = end.saturating_sub(crate::terminal_session::TRANSCRIPT_LINES);
+                    lines[start..end].to_vec()
+                },
             })
             .collect();
         let record = crate::terminal_session::SessionRecord {
@@ -11909,6 +11922,9 @@ impl App {
             };
             if let Ok(mut t) = PtyTerminal::new(&dir) {
                 t.set_manual_name(p.name.clone());
+                // Paint the pane's previous output above the new shell's
+                // prompt, so a restored pane is not a blank grid (#249).
+                t.replay_transcript(&p.transcript);
                 terms.push(t);
             }
         }
@@ -22312,17 +22328,6 @@ impl App {
                 unsaved_text,
             });
         }
-        // Terminals (#249): the shell processes cannot survive an execve, so
-        // capture where each pane STOOD. Prefer the shell-integration cwd and
-        // fall back to the kernel's, which needs no integration; a remote
-        // pane answers neither and reopens at the workspace root.
-        let terminals: Vec<crate::session_state::TerminalPaneState> = self
-            .terminals
-            .iter()
-            .map(|t| crate::session_state::TerminalPaneState {
-                cwd: t.shell_cwd().or_else(|| t.kernel_shell_cwd()),
-            })
-            .collect();
         crate::session_state::SessionState {
             workspace_root: self.workspace_root().to_path_buf(),
             tabs,
@@ -22330,8 +22335,6 @@ impl App {
             sidebar_view: sidebar_view_label(self.sidebar_view).to_string(),
             sidebar_width: self.sidebar_width,
             terminal_height: self.terminal_height,
-            terminals,
-            active_terminal: self.active_terminal,
             focus_editor: self.focus == Pane::Editor,
         }
     }
@@ -22376,57 +22379,11 @@ impl App {
         }
         self.sidebar_width = state.sidebar_width;
         self.terminal_height = state.terminal_height;
-        self.restore_terminal_panes(state);
         self.focus = if state.focus_editor {
             Pane::Editor
         } else {
             Pane::Tree
         };
-    }
-
-    /// Reopen the terminal panes a re-exec left behind (#249), each in the
-    /// directory its shell stood in.
-    ///
-    /// The processes themselves cannot come back: `execve` replaces croft's
-    /// image and the child shells are orphaned, so "replicate the old
-    /// environment exactly" is not achievable through this path. What IS
-    /// achievable — and what makes the difference between "my terminals came
-    /// back" and "my terminals are gone" — is the same NUMBER of panes, in
-    /// the same order, each sitting where it was.
-    ///
-    /// A pane whose directory no longer exists (a deleted worktree, an
-    /// unmounted volume) falls back to the workspace root rather than failing
-    /// the restore: losing the directory is not a reason to lose the pane.
-    fn restore_terminal_panes(&mut self, state: &crate::session_state::SessionState) {
-        // The first pane already exists from startup; steer it rather than
-        // adding a duplicate.
-        let Some(first) = state.terminals.first() else {
-            return;
-        };
-        let root = self.workspace_root().to_path_buf();
-        let dir_for = |c: &Option<PathBuf>| -> PathBuf {
-            c.as_ref()
-                .filter(|p| p.is_dir())
-                .cloned()
-                .unwrap_or_else(|| root.clone())
-        };
-        if let Ok(t) = PtyTerminal::new(&dir_for(&first.cwd)) {
-            if self.terminals.is_empty() {
-                self.terminals.push(t);
-            } else {
-                self.terminals[0] = t;
-            }
-        }
-        for pane in state.terminals.iter().skip(1) {
-            match PtyTerminal::new(&dir_for(&pane.cwd)) {
-                Ok(t) => self.terminals.push(t),
-                // One pane failing to spawn must not abandon the rest.
-                Err(_) => continue,
-            }
-        }
-        self.active_terminal = state
-            .active_terminal
-            .min(self.terminals.len().saturating_sub(1));
     }
 
     fn tear_down_connect_auth(&mut self) {

@@ -18,23 +18,14 @@ pub struct OpenTabState {
     pub unsaved_text: Option<String>,
 }
 
-/// One terminal pane, captured so a re-exec can reopen a shell in the same
-/// directory. The RUNNING PROCESS cannot be carried across: `execve` replaces
-/// croft's image and the child shells are orphaned, so a restored pane is a
-/// fresh shell — but starting it where the old one stood is the difference
-/// between "my terminals came back" and "my terminals are gone" (#249).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TerminalPaneState {
-    /// Working directory of the pane's shell, when it could be determined.
-    /// `None` for a remote pane or a shell whose cwd the kernel would not
-    /// report; those reopen at the workspace root like a fresh pane.
-    pub cwd: Option<PathBuf>,
-}
-
 /// The slice of running-croft state worth carrying across a self-re-exec.
-/// Terminal panes carry only their working directory: a plain `execve`
-/// cannot re-adopt croft's child shells, so the processes themselves are
-/// gone regardless.
+///
+/// Terminal panes are deliberately ABSENT, and that is not an oversight: the
+/// per-workspace terminal store (`save_terminal_session` /
+/// `restore_terminal_session`) already records pane cwds AND names, is written
+/// before the re-exec, and is replayed at startup ahead of this handoff.
+/// Duplicating panes here would append a second copy on top of the ones that
+/// store already restored (#249 review).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
     pub workspace_root: PathBuf,
@@ -43,13 +34,6 @@ pub struct SessionState {
     pub sidebar_view: String,
     pub sidebar_width: u16,
     pub terminal_height: Option<u16>,
-    /// One entry per open terminal pane, in pane order. Defaults to empty so
-    /// a handoff file written by an older croft still parses.
-    #[serde(default)]
-    pub terminals: Vec<TerminalPaneState>,
-    /// Which pane was active. Ignored when out of range.
-    #[serde(default)]
-    pub active_terminal: usize,
     pub focus_editor: bool,
 }
 
@@ -119,13 +103,6 @@ mod tests {
             sidebar_view: String::from("Explorer"),
             sidebar_width: 32,
             terminal_height: Some(14),
-            terminals: vec![
-                TerminalPaneState {
-                    cwd: Some(PathBuf::from("/work/repo")),
-                },
-                TerminalPaneState { cwd: None },
-            ],
-            active_terminal: 1,
             focus_editor: true,
         };
         state.save(&path).expect("save");
@@ -146,22 +123,25 @@ mod tests {
         );
     }
 
-    /// #249 added terminal panes to the handoff. A file written by an older
-    /// croft has no `terminals` key, and must still load rather than failing
-    /// the restore and losing the tabs along with it.
+    /// #249: the handoff must NOT carry terminal panes. The per-workspace
+    /// store already restores them (with names) and runs first at startup, so
+    /// panes here would be appended on top of those — 2 panes becoming 3.
+    /// Serialising the struct and asserting the key is absent pins that.
     #[test]
-    fn a_handoff_without_terminals_still_loads() {
-        let json = r#"{
-            "workspace_root": "/work/repo",
-            "tabs": [],
-            "active_tab": 0,
-            "sidebar_view": "Explorer",
-            "sidebar_width": 32,
-            "terminal_height": null,
-            "focus_editor": true
-        }"#;
-        let s: SessionState = serde_json::from_str(json).expect("older handoff parses");
-        assert!(s.terminals.is_empty(), "no panes recorded");
-        assert_eq!(s.active_terminal, 0);
+    fn the_handoff_does_not_carry_terminal_panes() {
+        let state = SessionState {
+            workspace_root: PathBuf::from("/work/repo"),
+            tabs: Vec::new(),
+            active_tab: 0,
+            sidebar_view: String::from("Explorer"),
+            sidebar_width: 32,
+            terminal_height: None,
+            focus_editor: true,
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        assert!(
+            !json.contains("terminals"),
+            "panes belong to the per-workspace store, not the handoff: {json}"
+        );
     }
 }
