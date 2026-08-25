@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Croft Light: the selected activity-bar icon no longer disappears. The icons are baked as images with a fixed tint, so on a light bar the selected one was painted white on white; the whole icon family now takes its ink from the theme, matching VS Code Light Modern.",
+    summary: "Child processes stay off the screen: the ffmpeg that grabs a video poster frame can no longer paint raw bytes over the editor, and a failed remote drag-drop setup now reports ssh's own error instead of a bare exit code.",
 }];

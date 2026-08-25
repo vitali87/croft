@@ -858,6 +858,20 @@ struct DropPump {
     handle: Option<JoinHandle<()>>,
 }
 
+/// Failure message for the relay-setup ssh. The stderr suffix is appended
+/// only when the child actually said something: a signal-killed ssh or a
+/// silent `set -e` exit (full disk under `mkdir -p`/`printf`) has an empty
+/// stderr, and the message must not end in a dangling ": ".
+fn relay_setup_error(status: ExitStatus, stderr: &[u8]) -> String {
+    let err = String::from_utf8_lossy(stderr);
+    let err = err.trim();
+    if err.is_empty() {
+        format!("remote relay setup failed with {status}")
+    } else {
+        format!("remote relay setup failed with {status}: {err}")
+    }
+}
+
 impl DropPump {
     fn start(ssh: &SshControl, relay_id: &str) -> Result<Self> {
         // `relay_id` is the deterministic `hash(launch arg)` shared with the
@@ -876,15 +890,19 @@ impl DropPump {
              : > \"$LOG\"; \
              printf '%s\\n%s\\n' \"$INBOX\" \"$LOG\""
         );
+        // Capture stderr so a setup failure carries ssh's own diagnosis in
+        // the bail! message rather than a bare exit code. (This runs in the
+        // pre-TUI cooked-mode flow, so inheriting would be safe — it just
+        // produced worse errors.)
         let output = ssh
             .command()
             .arg(&ssh.host)
             .arg(&resolve)
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .output()
             .context("preparing remote drop relay")?;
         if !output.status.success() {
-            anyhow::bail!("remote relay setup failed with {}", output.status);
+            anyhow::bail!("{}", relay_setup_error(output.status, &output.stderr));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut lines = stdout.lines();
@@ -2703,6 +2721,24 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The relay-setup failure message carries ssh's own stderr when there is
+    /// one, and never ends in a dangling ": " when there is not.
+    #[test]
+    #[cfg(unix)]
+    fn relay_setup_error_appends_stderr_only_when_present() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = ExitStatus::from_raw(256); // exit code 1
+        assert_eq!(
+            relay_setup_error(status, b"  ssh: connect refused \n"),
+            format!("remote relay setup failed with {status}: ssh: connect refused")
+        );
+        assert_eq!(
+            relay_setup_error(status, b" \n"),
+            format!("remote relay setup failed with {status}")
+        );
+        assert!(!relay_setup_error(status, b"").ends_with(": "));
+    }
 
     /// The source sync must ship the BUILD INPUTS and nothing else.
     ///
