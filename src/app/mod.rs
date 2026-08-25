@@ -9777,6 +9777,9 @@ impl App {
             return;
         };
         let id = lsp.request_prepare_rename(path.clone(), line, character);
+        // Overwriting also disarms any previous in-flight prepare: its caret
+        // is abandoned, and a late verdict for it must not reopen a prompt
+        // carrying the old (row, col) into the rename request.
         self.prepare_rename_request = Some((id, path, row, col, self.editor.edit_seq));
         self.status = String::from("Preparing rename…");
     }
@@ -9832,67 +9835,65 @@ impl App {
         &mut self,
         result: crate::lsp::manager::PrepareRenameResult,
     ) -> bool {
-        {
-            let Some((id, path, row, col, seq)) = self.prepare_rename_request.clone() else {
-                return false;
-            };
-            if result.request_id != id {
-                return false;
-            }
-            self.prepare_rename_request = None;
-            if self.editor.path.as_deref() != Some(path.as_path()) || self.editor.edit_seq != seq {
-                // The caret moved on (an edit, or a tab switch — which also
-                // bumps edit_seq). Say so: bailing silently would strand
-                // "Preparing rename…" on screen with no way to tell the
-                // rename died.
-                self.status = String::from("Rename cancelled");
-                return true;
-            }
-            if result.unsupported {
-                self.open_rename_prompt_fallback(path, row, col);
-                return true;
-            }
-            if let Some(msg) = result.error {
-                self.status = format!("Rename rejected: {msg}");
-                return true;
-            }
-            let Some(((sl, sc, el, ec), placeholder)) = result.target else {
-                self.status = String::from("Nothing renameable at the cursor");
-                return true;
-            };
-            // Placeholder wins; otherwise the validated range's text.
-            let word = placeholder.unwrap_or_else(|| {
-                let (sr, er) = (sl as usize, el as usize);
-                let scol = self.editor.utf16_col_to_char_pub(sr, sc);
-                let ecol = self.editor.utf16_col_to_char_pub(er, ec);
-                if sr == er {
-                    self.editor
-                        .lines
-                        .get(sr)
-                        .map(|l| {
-                            l.chars()
-                                .skip(scol)
-                                .take(ecol.saturating_sub(scol))
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                }
-            });
-            if word.is_empty() {
-                self.open_rename_prompt_fallback(path, row, col);
-                return true;
-            }
-            self.prompt = Some(Prompt {
-                label: format!("Rename Symbol '{word}'"),
-                buffer: word,
-                kind: PromptKind::RenameSymbol { path, row, col },
-                target_dir: PathBuf::new(),
-                error: None,
-            });
-            true
+        let Some((id, path, row, col, seq)) = self.prepare_rename_request.clone() else {
+            return false;
+        };
+        if result.request_id != id {
+            return false;
         }
+        self.prepare_rename_request = None;
+        if self.editor.path.as_deref() != Some(path.as_path()) || self.editor.edit_seq != seq {
+            // The caret moved on (an edit, or a tab switch — which also
+            // bumps edit_seq). Say so: bailing silently would strand
+            // "Preparing rename…" on screen with no way to tell the
+            // rename died.
+            self.status = String::from("Rename cancelled");
+            return true;
+        }
+        if result.unsupported {
+            self.open_rename_prompt_fallback(path, row, col);
+            return true;
+        }
+        if let Some(msg) = result.error {
+            self.status = format!("Rename rejected: {msg}");
+            return true;
+        }
+        let Some(((sl, sc, el, ec), placeholder)) = result.target else {
+            self.status = String::from("Nothing renameable at the cursor");
+            return true;
+        };
+        // Placeholder wins; otherwise the validated range's text.
+        let word = placeholder.unwrap_or_else(|| {
+            let (sr, er) = (sl as usize, el as usize);
+            let scol = self.editor.utf16_col_to_char_pub(sr, sc);
+            let ecol = self.editor.utf16_col_to_char_pub(er, ec);
+            if sr == er {
+                self.editor
+                    .lines
+                    .get(sr)
+                    .map(|l| {
+                        l.chars()
+                            .skip(scol)
+                            .take(ecol.saturating_sub(scol))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        });
+        if word.is_empty() {
+            self.open_rename_prompt_fallback(path, row, col);
+            return true;
+        }
+        self.prompt = Some(Prompt {
+            label: format!("Rename Symbol '{word}'"),
+            buffer: word,
+            kind: PromptKind::RenameSymbol { path, row, col },
+            target_dir: PathBuf::new(),
+            error: None,
+        });
+        true
     }
 
     pub fn drain_lsp_rename(&mut self) -> bool {
@@ -36086,6 +36087,10 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.prompt = None;
+                // Abandon any in-flight prepare-rename too: its verdict would
+                // otherwise reopen this prompt at the caret the user just
+                // walked away from (#254 item 6).
+                self.prepare_rename_request = None;
                 self.status = String::from("Cancelled");
             }
             KeyCode::Enter => self.commit_prompt(),
