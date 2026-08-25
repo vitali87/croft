@@ -129,6 +129,13 @@ pub struct Prefs {
     /// Visibility of the Explorer's stacked sub-views (⋯ menu toggles).
     #[serde(default)]
     pub explorer_views: ExplorerViewsPrefs,
+    /// Default whitespace handling for new diff views: `off` (every byte
+    /// counts), `leading` (ignore indentation changes), or `all` (ignore every
+    /// whitespace-only difference). Unrecognised values read as `off`, so a
+    /// typo degrades to the safe, byte-exact view rather than hiding changes.
+    /// Per-view toggling never writes back here.
+    #[serde(default)]
+    pub diff_ignore_whitespace: String,
     /// Extension ids the user has disabled in the Extensions panel. Absent or
     /// empty means every bundled and installed extension is enabled (the
     /// default), so disabling is opt-in and an older config still parses.

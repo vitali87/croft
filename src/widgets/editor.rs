@@ -931,6 +931,12 @@ fn render_diff(
         // header reads as the diff command instead of trailing "↔ null".
         (None, _) => format!(" {left_name} "),
     };
+    // Ignore-whitespace is a lens over the real diff, so say so in the header:
+    // a reader must never mistake a hidden change for an absent one.
+    let header = match diff.ws_mode {
+        crate::widgets::diff::DiffWhitespace::Off => header,
+        mode => format!("{header}\u{2022} ignoring whitespace: {} ", mode.label()),
+    };
     let head_bg = if diff.bytes_differ_but_lines_equal {
         theme.ui(Color::Rgb(0x8a, 0x4a, 0x10))
     } else {
@@ -1006,7 +1012,9 @@ fn render_diff(
     let end = (diff.scroll + viewport).min(total);
     for (vis_row, row_idx) in (diff.scroll..end).enumerate() {
         let y = body_top + vis_row as u16;
-        let row = diff.rows[row_idx];
+        // Paint what the ignore-whitespace toggle says; staging reads the real
+        // rows independently (see DiffData::display_rows).
+        let row = diff.display_rows()[row_idx];
         let (l_cell_bg, l_sign, l_text) = match row {
             DiffRow::Equal { left, .. } => (
                 bg,
@@ -1481,7 +1489,9 @@ fn render_unified_deletion(
     let end = (diff.scroll + viewport).min(total);
     for (vis_row, row_idx) in (diff.scroll..end).enumerate() {
         let y = body_top + vis_row as u16;
-        let row = diff.rows[row_idx];
+        // Paint what the ignore-whitespace toggle says; staging reads the real
+        // rows independently (see DiffData::display_rows).
+        let row = diff.display_rows()[row_idx];
         let (left_idx, sign, cell_bg) = match row {
             DiffRow::Removed { left } | DiffRow::Replaced { left, .. } => {
                 (Some(left), '-', removed_bg)
@@ -2358,6 +2368,10 @@ pub struct Editor {
     bracket_colors: Vec<Vec<(usize, u8)>>,
     /// Whitespace glyph rendering (#133); app-synced from prefs.
     pub whitespace_mode: WhitespaceMode,
+    /// Starting ignore-whitespace mode for diffs opened in this editor
+    /// (#258, `diff.ignore_whitespace`); app-synced from prefs. Note this is
+    /// unrelated to `whitespace_mode` above, which paints glyphs.
+    pub diff_ws_default: crate::widgets::diff::DiffWhitespace,
     /// Debugger inline values (#135, VS Code `debug.inlineValues`): 0-based
     /// line → composed "name = value" trailer, rebuilt by the app on every
     /// stop from the VARIABLES data and cleared on resume/step/terminate.
@@ -2618,6 +2632,7 @@ impl Editor {
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
             whitespace_mode: WhitespaceMode::default(),
+            diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
             inline_values: std::collections::BTreeMap::new(),
             wrap_override: None,
             highlights: Vec::new(),
@@ -12554,6 +12569,7 @@ impl EditorTabs {
             Some(left_text),
             Some(&right_text),
         );
+        data.set_whitespace_mode(self.diff_ws_default);
         // Park the viewport on the first change hunk so the user lands on
         // the first edit instead of reading through unchanged leading
         // lines. Identical files stay at scroll 0.
@@ -12595,8 +12611,9 @@ impl EditorTabs {
     /// clicks on the same Source-Control row reuse the tab rather than
     /// stacking new ones.
     pub fn open_deleted_diff_with_text(&mut self, path: &Path, head_text: &str) -> Result<()> {
-        let data =
+        let mut data =
             crate::widgets::diff::DiffData::build_unified_deletion(path.to_path_buf(), head_text);
+        data.set_whitespace_mode(self.diff_ws_default);
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
         e.preview = false;
@@ -12630,10 +12647,11 @@ impl EditorTabs {
     /// standard two-column renderer takes over — every `+`/`-` pair in a
     /// hunk lines up horizontally instead of zigzagging vertically.
     pub fn open_git_diff_side_by_side(&mut self, label: &Path, raw_diff: &str) -> Result<()> {
-        let data = crate::widgets::diff::DiffData::build_side_by_side_from_git_text(
+        let mut data = crate::widgets::diff::DiffData::build_side_by_side_from_git_text(
             label.to_path_buf(),
             raw_diff,
         );
+        data.set_whitespace_mode(self.diff_ws_default);
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
         e.preview = false;

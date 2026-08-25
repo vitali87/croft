@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Code intelligence lands on the right symbol in files with emoji: hover, go-to-definition, completion, references, rename and friends now measure columns the way language servers do, so a line containing an emoji no longer shifts every result sideways.",
+    kind: NoteKind::Feature,
+    summary: "Diffs can ignore whitespace: toggle indentation-only or all-whitespace changes out of the view so a reindented block stops burying the three lines that actually changed — staging always applies the real patch regardless of the view.",
 }];
