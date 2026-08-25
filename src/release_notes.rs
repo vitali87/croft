@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Croft Light: the selected activity-bar icon no longer disappears. The icons are baked as images with a fixed tint, so on a light bar the selected one was painted white on white; the whole icon family now takes its ink from the theme, matching VS Code Light Modern.",
+    kind: NoteKind::Feature,
+    summary: "Document links: Ctrl+click a URL, import, or path that the language server marks as a link and croft follows it — files open in the editor, web links in your browser. Non-web schemes are refused rather than handed to the system opener.",
 }];

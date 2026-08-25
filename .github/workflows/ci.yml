@@ -24,6 +24,53 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  release-hygiene:
+    # Every merge that changes what ships must be a release in its own right
+    # (#281): the version increments (two different binaries must never share
+    # a version and differ only in commit hash), and src/release_notes.rs is
+    # replaced so the welcome panel's "IN THIS RELEASE" card describes THIS
+    # version instead of silently carrying the previous release's story.
+    # Docs / CI / test-only changes ship nothing and are exempt.
+    name: version bump + release notes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the merge-base with the PR base resolves.
+          fetch-depth: 0
+      - name: Shipped changes must bump the version and replace the notes
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
+          changed="$(git diff --name-only "$base" HEAD)"
+          # What ships in the binary: sources, baked-in assets, the build
+          # script, and the dependency set. src/app/tests.rs and tests/ are
+          # compiled out of release builds.
+          shipped="$(printf '%s\n' "$changed" \
+            | grep -E '^(src/|assets/|build\.rs$|Cargo\.toml$|Cargo\.lock$)' \
+            | grep -vE '^(src/app/tests\.rs|tests/)' || true)"
+          if [ -z "$shipped" ]; then
+            echo "No shipped files changed; no release required."
+            exit 0
+          fi
+          echo "Shipped files changed:"
+          printf '  %s\n' $shipped
+          ver() { git show "$1:Cargo.toml" | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -n1; }
+          old="$(ver "$base")"
+          new="$(ver HEAD)"
+          fail=0
+          highest="$(printf '%s\n%s\n' "$old" "$new" | sort -t. -k1,1n -k2,2n -k3,3n | tail -n1)"
+          if [ "$new" = "$old" ] || [ "$highest" != "$new" ]; then
+            echo "::error file=Cargo.toml::This PR changes shipped files but the version is still $old. Bump it (base: $old, head: $new) - two binaries must never share a version and differ only in commit hash."
+            fail=1
+          fi
+          if ! printf '%s\n' "$changed" | grep -qx 'src/release_notes.rs'; then
+            echo '::error file=src/release_notes.rs::This PR changes shipped files but src/release_notes.rs is untouched. REPLACE the "IN THIS RELEASE" highlights so the welcome panel describes this version.'
+            fail=1
+          fi
+          exit $fail
+
   test:
     name: clippy + tests
     runs-on: ubuntu-latest

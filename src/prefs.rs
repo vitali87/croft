@@ -153,6 +153,12 @@ pub struct Prefs {
     /// an older config parses straight to disabled.
     #[serde(default)]
     pub format_on_save: bool,
+    /// When true, typing one of the language server's on-type trigger
+    /// characters (`}`, `;`, newline, per its capability) runs
+    /// `textDocument/onTypeFormatting` on the just-typed spot (VS Code's
+    /// `editor.formatOnType`). Off by default, matching VS Code.
+    #[serde(default)]
+    pub format_on_type: bool,
     /// When true, a dirty buffer writes itself to disk about a second after
     /// the last edit (VS Code's `files.autoSave: afterDelay`). Off by
     /// default, matching VS Code.
@@ -334,6 +340,13 @@ pub fn save_auto_close_pairs(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disable_auto_close_pairs = !enabled;
+    prefs.save(&path)
+}
+
+pub fn save_format_on_type(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.format_on_type = enabled;
     prefs.save(&path)
 }
 
@@ -583,6 +596,19 @@ mod tests {
         std::fs::write(&path, r#"{"theme":"dark"}"#).expect("write old config");
         assert!(!Prefs::load(&path).expect("load old").format_on_save);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trips_format_on_type_and_old_configs_default_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        let mut prefs = Prefs::default();
+        assert!(!prefs.format_on_type, "off by default, matching VS Code");
+        prefs.format_on_type = true;
+        prefs.save(&path).expect("save");
+        assert!(Prefs::load(&path).expect("load").format_on_type);
+        std::fs::write(&path, "{}").expect("write old config");
+        assert!(!Prefs::load(&path).expect("load old").format_on_type);
     }
 
     #[test]
