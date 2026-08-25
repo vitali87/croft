@@ -29759,6 +29759,52 @@ fn a_task_problem_matcher_owns_its_pane_and_watch_publishes_win() {
 }
 
 #[test]
+fn ctrl_click_follows_a_document_link_before_go_to_definition() {
+    use crate::lsp::manager::DocumentLinkItem;
+    // #254 item 8: a file:// link opens the target in the editor; the
+    // definition request is never fired for a linked range.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "// link here\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "fn target() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    let target = lsp_types::Url::from_file_path(tmp.path().join("b.rs")).unwrap();
+    app.editor.apply_document_links(
+        tmp.path().join("a.rs"),
+        vec![DocumentLinkItem {
+            line: 0,
+            character: 3,
+            end_line: 0,
+            end_character: 12,
+            target: target.to_string(),
+        }],
+    );
+    app.open_document_link(target.as_ref());
+    assert_eq!(
+        app.editor.path.as_deref().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("b.rs")),
+        "the file link opened in the editor"
+    );
+    // And the editor-side lookup that the click dispatch consults.
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.editor.apply_document_links(
+        tmp.path().join("a.rs"),
+        vec![DocumentLinkItem {
+            line: 0,
+            character: 3,
+            end_line: 0,
+            end_character: 12,
+            target: String::from("https://example.com"),
+        }],
+    );
+    assert_eq!(
+        app.editor.document_link_at(0, 5),
+        Some("https://example.com")
+    );
+}
+
+#[test]
 fn on_type_formatting_stays_inert_when_disabled_or_unadvertised() {
     // #254 item 4: gated behind editor.format_on_type (default OFF,
     // matching VS Code), and even when on, nothing fires unless a
@@ -29938,5 +29984,159 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
         app.on_type_reply_disposition(&reply(7, &a)),
         OnTypeReply::Stale,
         "the tab that typed must still be the active one"
+    );
+}
+
+#[test]
+fn a_document_link_refuses_a_non_web_scheme_and_records_nav_history() {
+    use crate::lsp::manager::DocumentLinkItem;
+    // The target comes from a language server and the text it decorates says
+    // nothing about where it points, so anything but file://, http and https
+    // is refused rather than handed to the system opener — the same rule
+    // `open_detected_url` applies to terminal OSC 8 links.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("a.rs"),
+        "// link here
+",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("b.rs"),
+        "fn target() {}
+",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+
+    for hostile in [
+        "vscode://file/etc/passwd",
+        "VSCode://file/etc/passwd",
+        "cursor://file/etc/passwd",
+        "javascript:alert(1)",
+        "mailto:a@b.c",
+        "ssh://host/x",
+        "  HTTP-ish-but-not://x",
+    ] {
+        app.open_document_link(hostile);
+        assert!(
+            app.status.starts_with("Refused to open non-web link:"),
+            "{hostile} must be refused, got {:?}",
+            app.status
+        );
+    }
+
+    // A control character never belongs in a URI, and the relay's own
+    // validator rejects one; refuse before anything downstream sees it.
+    for malformed in [
+        "https://example.com\nopen\tevil",
+        "https://exa\u{0}mple.com",
+        // The check runs before the branch, so a file:// target carrying one
+        // is refused too rather than reaching Url::parse.
+        "file:///etc/hosts\nopen\tevil",
+    ] {
+        app.open_document_link(malformed);
+        assert!(
+            app.status.starts_with("Refused to open malformed link:"),
+            "{malformed:?} must be refused, got {:?}",
+            app.status
+        );
+    }
+
+    // A file:// link still opens, and records where the user was so Back
+    // returns to it.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 4;
+    let target = lsp_types::Url::from_file_path(tmp.path().join("b.rs")).unwrap();
+    app.editor.apply_document_links(
+        tmp.path().join("a.rs"),
+        vec![DocumentLinkItem {
+            line: 0,
+            character: 3,
+            end_line: 0,
+            end_character: 12,
+            target: target.to_string(),
+        }],
+    );
+    app.open_document_link(target.as_ref());
+    assert_eq!(
+        app.editor.path.as_deref().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("b.rs")),
+        "the file link opened"
+    );
+    let back = app
+        .nav
+        .back(None)
+        .expect("the jump recorded a Back location, like go-to-definition");
+    assert_eq!(
+        back.path.file_name(),
+        Some(std::ffi::OsStr::new("a.rs")),
+        "Back returns to the file the link was clicked in"
+    );
+    assert_eq!((back.row, back.col), (0, 4), "and to the click's caret");
+
+    // URI schemes are case-insensitive (RFC 3986) and `file_ref` already
+    // matches them that way; a server spelling it `FILE://` must open, not
+    // fall through to the web guard and get refused.
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    let upper = target.as_ref().replacen("file://", "FILE://", 1);
+    app.open_document_link(&upper);
+    assert_eq!(
+        app.editor.path.as_deref().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("b.rs")),
+        "an upper-case file scheme still opens in the editor"
+    );
+
+    // Surrounding whitespace is trimmed rather than smuggled downstream.
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.open_document_link(&format!("  {}  ", target.as_ref()));
+    assert_eq!(
+        app.editor.path.as_deref().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("b.rs")),
+        "a padded target is normalised, not refused"
+    );
+}
+
+#[test]
+fn editing_drops_stale_document_links() {
+    use crate::lsp::manager::DocumentLinkItem;
+    // Link ranges are measured against the text the server saw; an edit
+    // shifts them, so a Ctrl+click would otherwise follow the wrong span
+    // until the next batch lands.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("a.rs");
+    std::fs::write(
+        &path,
+        "// link here
+",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.apply_document_links(
+        path.clone(),
+        vec![DocumentLinkItem {
+            line: 0,
+            character: 3,
+            end_line: 0,
+            end_character: 12,
+            target: String::from("https://example.com"),
+        }],
+    );
+    assert_eq!(
+        app.editor.document_link_at(0, 5),
+        Some("https://example.com"),
+        "the link is live before the edit"
+    );
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.editor.insert_char('x');
+    assert_eq!(
+        app.editor.document_link_at(0, 5),
+        None,
+        "the edit dropped the stale ranges"
     );
 }

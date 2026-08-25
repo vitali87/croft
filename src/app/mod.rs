@@ -6092,6 +6092,10 @@ impl App {
             if self.inlay_hints_enabled {
                 lsp.request_inlay_hints(path.clone(), line_count, seq);
             }
+            // Document links ride the same cadence (#254); silent when no
+            // server advertises a documentLinkProvider, so Ctrl+click
+            // keeps meaning Go to Definition there.
+            lsp.request_document_links(path.clone(), seq);
             // Fold spans ride the same cadence (#254); the worker drops
             // the request silently when no server advertises the
             // provider, which is what leaves the editor's indentation /
@@ -7071,6 +7075,106 @@ impl App {
             }
         }
         changed
+    }
+
+    /// Drain document-link batches (#254) into every editor showing the
+    /// file — the inlay fan-out, seq gate included. Links change no
+    /// pixels, so this never asks for a redraw.
+    pub fn drain_lsp_document_links(&mut self) {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return;
+        };
+        let mut updates = Vec::new();
+        while let Some(u) = lsp.drain_document_links() {
+            updates.push(u);
+        }
+        for u in updates {
+            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+                continue;
+            }
+            if self.editor.path.as_deref() == Some(u.path.as_path()) {
+                self.editor
+                    .apply_document_links(u.path.clone(), u.links.clone());
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(u.path.as_path()) {
+                    group.apply_document_links(u.path.clone(), u.links.clone());
+                }
+            }
+        }
+    }
+
+    /// Follow a server-resolved document link (#254): `file://` targets
+    /// open in the editor, web links go to the system opener — or, on a
+    /// relay-capable session, to the user's own browser through the relay.
+    ///
+    /// Web links only past the `file://` branch, matching
+    /// `open_detected_url`: the target comes from a language server and the
+    /// text it decorates says nothing about where it points, so a
+    /// custom-scheme URI would hand `open`/`xdg-open` an arbitrary target
+    /// (app launch, protocol handler) off one disguised Ctrl+click. The
+    /// refusal surfaces the real destination in the status line.
+    fn open_document_link(&mut self, target: &str) {
+        // One normalisation for every branch below, so the string that is
+        // checked is the string that is forwarded: surrounding whitespace is
+        // dropped, a control character (which the relay's own validator
+        // rejects, and which has no business in a URI) refuses outright, and
+        // the scheme match is case-insensitive like `file_ref`'s.
+        let target = target.trim();
+        if target.chars().any(char::is_control) {
+            self.status = format!("Refused to open malformed link: {target:?}");
+            return;
+        }
+        let lower = target.to_ascii_lowercase();
+        if lower.starts_with("file://") {
+            if let Ok(url) = lsp_types::Url::parse(target)
+                && let Ok(p) = url.to_file_path()
+            {
+                // Record where the user was so Back returns to it, exactly
+                // like go-to-definition and terminal file links.
+                let from = self.editor.path.clone().map(|path| NavLoc {
+                    path,
+                    row: self.editor.cursor_row,
+                    col: self.editor.cursor_col,
+                });
+                match self.editor.open_pinned(&p) {
+                    Ok(()) => {
+                        if let Some(loc) = from {
+                            self.nav.record(loc);
+                        }
+                        self.focus_pane(Pane::Editor);
+                        self.status = format!("Opened {}", self.status_path(&p));
+                    }
+                    Err(e) => self.status = format!("Open failed: {e}"),
+                }
+                return;
+            }
+            self.status = String::from("Malformed file link");
+            return;
+        }
+        // Deliberately NOT delegated to `open_detected_url`, despite the
+        // duplicated guard below: that path first probes `diff://` and
+        // `editor_file_uri`, which resolves `vscode://file/<path>` (and the
+        // Cursor/Windsurf/Zed schemes) into a file open. A terminal link is
+        // text the user's own program printed; a document link's target is
+        // chosen by the language server, so letting it name an editor URI
+        // would hand a server the ability to open arbitrary paths from a
+        // click on unrelated-looking text.
+        let scheme_ok = lower.starts_with("http://") || lower.starts_with("https://");
+        if !scheme_ok {
+            self.status = format!("Refused to open non-web link: {target}");
+            return;
+        }
+        // Web link on a remote session: the relay can put it in front of the
+        // user's own browser, exactly like a terminal link.
+        if self.drop_relay_active() || is_remote_session() {
+            self.open_detected_url(target);
+            return;
+        }
+        self.status = match open_url(target) {
+            Ok(()) => format!("Opened {target}"),
+            Err(e) => format!("Open link failed: {e}"),
+        };
     }
 
     /// Drain the LSP fold-span replies (#254) into every editor showing
@@ -9489,6 +9593,14 @@ impl App {
         };
         self.editor.cursor_row = line;
         self.editor.cursor_col = c;
+        // A server-resolved document link outranks Go to Definition at
+        // this spot (#254): URLs in comments have no definition at all,
+        // and an import specifier's link and definition land in the same
+        // file anyway — VS Code follows the link too.
+        if let Some(target) = self.editor.document_link_at(line, c).map(str::to_string) {
+            self.open_document_link(&target);
+            return;
+        }
         let Some(path) = self.editor.path.clone() else {
             return;
         };
@@ -39872,6 +39984,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let code_action_changed = app.drain_lsp_code_actions();
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let inlay_changed = app.drain_lsp_inlay_hints();
+        app.drain_lsp_document_links();
         let folds_changed = app.drain_lsp_folding_ranges();
         let selection_ranges_changed = app.drain_lsp_selection_ranges();
         let colors_changed = app.drain_lsp_document_colors();

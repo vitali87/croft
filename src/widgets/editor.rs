@@ -2418,6 +2418,11 @@ pub struct Editor {
     /// anchor; every overlay painter, the caret, and mouse mapping
     /// translate buffer columns past them.
     inlay_spans: Vec<Vec<(usize, String, Option<Color>)>>,
+    /// The server's resolved document links (#254): raw UTF-16 ranges +
+    /// target URIs, path-stamped like `inlay_path`. Consulted by the
+    /// Ctrl+click dispatch BEFORE firing Go to Definition.
+    doc_links: Vec<crate::lsp::manager::DocumentLinkItem>,
+    doc_links_path: Option<PathBuf>,
     /// The document's color values (#254): raw UTF-16 positions + RGB,
     /// re-decoded like `inlay_hints`; feeds the `■` swatch spans and the
     /// Change Color Presentation picker's range lookup.
@@ -2628,6 +2633,8 @@ impl Editor {
             inlay_path: None,
             occurrences: Vec::new(),
             inlay_spans: Vec::new(),
+            doc_links: Vec::new(),
+            doc_links_path: None,
             color_infos: Vec::new(),
             color_path: None,
             registry: LangRegistry::new(),
@@ -2864,6 +2871,11 @@ impl Editor {
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
         self.occurrences.clear();
+        // Link ranges were measured against the pre-edit text; an edit shifts
+        // the spans they point at, so a Ctrl+click would follow the wrong one
+        // until the next server batch lands.
+        self.doc_links.clear();
+        self.doc_links_path = None;
         // Lossy-save consent named the unmappable characters the buffer held
         // when the prompt fired; an edit changes what a write would destroy,
         // so stale consent must not carry over (unlike `force_save_armed`,
@@ -3804,6 +3816,8 @@ impl Editor {
         // must never splice into this one.
         self.inlay_hints = Vec::new();
         self.inlay_path = None;
+        self.doc_links = Vec::new();
+        self.doc_links_path = None;
         self.color_infos = Vec::new();
         self.color_path = None;
         self.inlay_spans = Vec::new();
@@ -4651,6 +4665,45 @@ impl Editor {
         self.inlay_path = Some(path);
         self.inlay_hints = hints;
         self.recompute_inlay_spans();
+    }
+
+    /// Install the server's link set (#254): wholesale replace.
+    pub fn apply_document_links(
+        &mut self,
+        path: PathBuf,
+        links: Vec<crate::lsp::manager::DocumentLinkItem>,
+    ) {
+        self.doc_links_path = Some(path);
+        self.doc_links = links;
+    }
+
+    /// The link target under `(row, col)` — the Ctrl+click dispatch's
+    /// lookup, valid only for the stamped file. Range ends are exclusive
+    /// like every LSP range.
+    pub fn document_link_at(&self, row: usize, col: usize) -> Option<&str> {
+        if self.doc_links_path.as_deref() != self.path.as_deref() {
+            return None;
+        }
+        self.doc_links
+            .iter()
+            .find(|l| {
+                let (sr, er) = (l.line as usize, l.end_line as usize);
+                if row < sr || row > er {
+                    return false;
+                }
+                let sc = self
+                    .lines
+                    .get(sr)
+                    .map(|t| utf16_to_char_col(t, l.character))
+                    .unwrap_or(0);
+                let ec = self
+                    .lines
+                    .get(er)
+                    .map(|t| utf16_to_char_col(t, l.end_character))
+                    .unwrap_or(0);
+                (row > sr || col >= sc) && (row < er || col < ec)
+            })
+            .map(|l| l.target.as_str())
     }
 
     /// Install the document's color values (#254): wholesale replace,
@@ -21186,6 +21239,30 @@ mod tests {
         e.cursor_col = 1;
         e.add_cursor_below();
         assert!(e.carets.is_empty());
+    }
+
+    #[test]
+    fn document_link_at_answers_inside_the_range_for_the_stamped_file_only() {
+        use crate::lsp::manager::DocumentLinkItem;
+        let mut e = editor_with("// see https://example.com/docs for more");
+        e.path = Some(std::path::PathBuf::from("/tmp/a.rs"));
+        e.apply_document_links(
+            std::path::PathBuf::from("/tmp/a.rs"),
+            vec![DocumentLinkItem {
+                line: 0,
+                character: 7,
+                end_line: 0,
+                end_character: 31,
+                target: String::from("https://example.com/docs"),
+            }],
+        );
+        assert_eq!(e.document_link_at(0, 7), Some("https://example.com/docs"));
+        assert_eq!(e.document_link_at(0, 30), Some("https://example.com/docs"));
+        assert_eq!(e.document_link_at(0, 31), None, "range end is exclusive");
+        assert_eq!(e.document_link_at(0, 6), None);
+        // A set stamped for another file never answers.
+        e.path = Some(std::path::PathBuf::from("/tmp/b.rs"));
+        assert_eq!(e.document_link_at(0, 10), None);
     }
 
     #[test]

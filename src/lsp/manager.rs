@@ -390,6 +390,27 @@ pub struct InlayHintsUpdate {
     pub hints: Vec<InlayHintItem>,
 }
 
+/// One server-resolved document link (#254): a UTF-16 range plus its
+/// target URI string. Links the server left target-less are dropped at
+/// normalisation (resolving them needs another round trip croft skips).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentLinkItem {
+    pub line: u32,
+    pub character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub target: String,
+}
+
+/// A fresh, complete link set for one document; same seq contract as
+/// [`InlayHintsUpdate`].
+#[derive(Debug)]
+pub struct DocumentLinksUpdate {
+    pub path: PathBuf,
+    pub seq: u64,
+    pub links: Vec<DocumentLinkItem>,
+}
+
 /// One server fold span (#254), 0-based inclusive line indexes matching
 /// the editor's (header, end) fold model: collapsing hides
 /// `start_line + 1 ..= end_line`.
@@ -617,6 +638,10 @@ enum Cmd {
         line_count: u32,
         seq: u64,
     },
+    RequestDocumentLinks {
+        path: PathBuf,
+        seq: u64,
+    },
     RequestFoldingRanges {
         path: PathBuf,
         seq: u64,
@@ -832,6 +857,7 @@ pub struct LspManager {
     code_action_rx: std_mpsc::Receiver<CodeActionResult>,
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     inlay_rx: std_mpsc::Receiver<InlayHintsUpdate>,
+    links_rx: std_mpsc::Receiver<DocumentLinksUpdate>,
     folding_rx: std_mpsc::Receiver<FoldingRangesUpdate>,
     colors_rx: std_mpsc::Receiver<DocumentColorsUpdate>,
     color_presentations_rx: std_mpsc::Receiver<ColorPresentationsResult>,
@@ -886,6 +912,7 @@ impl LspManager {
         let (code_action_tx, code_action_rx) = std_mpsc::channel();
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let (inlay_tx, inlay_rx) = std_mpsc::channel();
+        let (links_tx, links_rx) = std_mpsc::channel();
         let (folding_tx, folding_rx) = std_mpsc::channel();
         let (colors_tx, colors_rx) = std_mpsc::channel();
         let (color_presentations_tx, color_presentations_rx) = std_mpsc::channel();
@@ -938,6 +965,7 @@ impl LspManager {
                 code_action: code_action_tx,
                 semantic_tokens: semantic_tx,
                 inlay_hints: inlay_tx,
+                document_links: links_tx,
                 folding_ranges: folding_tx,
                 document_colors: colors_tx,
                 color_presentations: color_presentations_tx,
@@ -972,6 +1000,7 @@ impl LspManager {
             code_action_rx,
             semantic_rx,
             inlay_rx,
+            links_rx,
             folding_rx,
             colors_rx,
             color_presentations_rx,
@@ -1139,6 +1168,17 @@ impl LspManager {
 
     pub fn drain_inlay_hints(&self) -> Option<InlayHintsUpdate> {
         self.inlay_rx.try_recv().ok()
+    }
+
+    /// Ask for the document's link set (#254); fire-and-forget on the
+    /// open/change cadence, silent when no server advertises a
+    /// documentLinkProvider.
+    pub fn request_document_links(&self, path: PathBuf, seq: u64) {
+        let _ = self.cmd_tx.send(Cmd::RequestDocumentLinks { path, seq });
+    }
+
+    pub fn drain_document_links(&self) -> Option<DocumentLinksUpdate> {
+        self.links_rx.try_recv().ok()
     }
 
     /// Ask the server for the document's fold spans (#254). Fire-and-forget
@@ -1726,6 +1766,7 @@ struct ManagedClient {
     /// Whether the server advertises an `inlayHintProvider`
     /// (rust-analyzer, vtsls, gopls do; ruff does not).
     supports_inlay_hints: bool,
+    supports_document_link: bool,
     supports_folding_range: bool,
     supports_document_color: bool,
 }
@@ -1793,6 +1834,7 @@ struct ResultSenders {
     code_action: std_mpsc::Sender<CodeActionResult>,
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
     inlay_hints: std_mpsc::Sender<InlayHintsUpdate>,
+    document_links: std_mpsc::Sender<DocumentLinksUpdate>,
     folding_ranges: std_mpsc::Sender<FoldingRangesUpdate>,
     document_colors: std_mpsc::Sender<DocumentColorsUpdate>,
     color_presentations: std_mpsc::Sender<ColorPresentationsResult>,
@@ -1911,6 +1953,11 @@ async fn worker_loop(
             } => {
                 state
                     .request_inlay_hints(path, line_count, seq, &tx.inlay_hints)
+                    .await
+            }
+            Cmd::RequestDocumentLinks { path, seq } => {
+                state
+                    .request_document_links(path, seq, &tx.document_links)
                     .await
             }
             Cmd::RequestFoldingRanges { path, seq } => {
@@ -2326,6 +2373,7 @@ impl WorkerState {
                         let semantic_legend = semantic_legend_of(caps).map(Arc::new);
                         let semantic_supports_range = semantic_tokens_range_supported(caps);
                         let supports_inlay_hints = one_of_supported(&caps.inlay_hint_provider);
+                        let supports_document_link = caps.document_link_provider.is_some();
                         let supports_folding_range =
                             folding_range_supported(&caps.folding_range_provider);
                         let supports_document_color =
@@ -2361,6 +2409,7 @@ impl WorkerState {
                             semantic_legend,
                             semantic_supports_range,
                             supports_inlay_hints,
+                            supports_document_link,
                             supports_folding_range,
                             supports_document_color,
                         });
@@ -2920,6 +2969,62 @@ impl WorkerState {
                 hints.len()
             ));
             let _ = tx.send(InlayHintsUpdate { path, seq, hints });
+        });
+    }
+
+    /// Document links (#254): fire-and-forget, seq-gated, silent when
+    /// unsupported — Ctrl+click simply keeps meaning Go to Definition.
+    async fn request_document_links(
+        &mut self,
+        path: PathBuf,
+        seq: u64,
+        tx: &std_mpsc::Sender<DocumentLinksUpdate>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_document_link)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let Some((server_name, client_arc)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let resp = client.document_links(uri).await;
+            drop(client);
+            let links = match resp {
+                Ok(Some(ls)) => ls
+                    .iter()
+                    .filter_map(|l| {
+                        let target = l.target.as_ref()?;
+                        Some(DocumentLinkItem {
+                            line: l.range.start.line,
+                            character: l.range.start.character,
+                            end_line: l.range.end.line,
+                            end_character: l.range.end.character,
+                            target: target.to_string(),
+                        })
+                    })
+                    .collect(),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] documentLink error: {e:#}"));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(DocumentLinksUpdate { path, seq, links });
         });
     }
 

@@ -827,6 +827,24 @@ impl LspClient {
             .context("inlay_hint")
     }
 
+    /// `textDocument/documentLink`: the ranges the server considers
+    /// clickable links (URLs, import specifiers), with their targets
+    /// (#254). Target-less links (which would need a resolve round trip)
+    /// are dropped by the caller.
+    pub async fn document_links(
+        &mut self,
+        uri: Url,
+    ) -> Result<Option<Vec<lsp_types::DocumentLink>>> {
+        self.server
+            .document_link(lsp_types::DocumentLinkParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("document_link")
+    }
+
     /// `textDocument/foldingRange`: the server's fold spans for the whole
     /// document, with optional kinds (comment / imports / region). Backs
     /// the editor's LSP-first folding (#254); the indentation scan stays
