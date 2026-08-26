@@ -31169,14 +31169,20 @@ fn a_click_passing_through_the_sidebar_does_not_collapse_it() {
         "a click through the panel leaves it exactly where it was"
     );
 
-    // Tick PAST the delay. Without this the test passes against any
-    // implementation that merely defers — including one that never collapses
-    // at all — because `show_tree` is trivially still set before the window
-    // elapses. The claim is that the return to the sidebar CANCELLED the
-    // collapse, and only a tick past the deadline can show that.
+    // Assert the DISARM directly. Ticking alone does not pin it: with focus
+    // parked on `Pane::Tree` the tick declines via its own `focus == Pane::Tree`
+    // early return, so this test passes even with the disarm deleted. The
+    // dwell's own state is the only thing that distinguishes "cancelled" from
+    // "declined for an unrelated reason".
+    assert!(
+        !app.sidebar_dwell.armed(),
+        "the return to the sidebar cancelled the pending collapse outright"
+    );
+
+    // And nothing fires once the window elapses.
     assert!(
         !app.tick_sidebar_auto_hide_at(std::time::Instant::now() + AUTO_HIDE_DWELL),
-        "the return to the sidebar cancelled the pending collapse outright"
+        "no collapse after the deadline"
     );
     assert!(
         app.show_tree,
@@ -31372,6 +31378,65 @@ fn a_reveal_under_zen_mode_banks_no_pin() {
         "but banks no pin: nothing can spend it until Zen exits, and a pin \
          held that long eats a collapse the user never connected to it"
     );
+}
+
+/// #302: a collapse blocked by a TRANSIENT suppression must be retried once
+/// that suppression lifts, not abandoned. The tick disarming before it asks
+/// `sidebar_auto_hide_allowed()` drops the pending collapse on the floor, and
+/// nothing re-arms it but a fresh focus move — so a user whose palette was open
+/// during the grace window keeps a sidebar that never auto-hides again.
+#[test]
+fn a_transiently_suppressed_collapse_is_retried_once_the_suppression_lifts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    // Precondition: a collapse is genuinely live here.
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: nothing is suppressing auto-hide yet"
+    );
+
+    // NOTE: `maybe_auto_hide_sidebar` stamps the anchor with its OWN
+    // `Instant::now()`, so a deadline computed from a timestamp taken HERE is
+    // fractionally too early and the tick declines as not-yet-due — which
+    // looks exactly like the suppression working. Anchor the deadlines to a
+    // point comfortably past any real arm instead.
+    app.focus_pane(Pane::Editor);
+    let armed_at = std::time::Instant::now();
+
+    // A transient suppression appears DURING the grace window.
+    app.command_palette = Some(crate::widgets::command_palette::CommandPalette::new());
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "precondition: the open palette suppresses the collapse"
+    );
+
+    // The window elapses while it is still open: correctly declines.
+    // Precondition: the deadline really has elapsed, so a decline here is the
+    // palette and not the timer. Proven by the far-future tick at the end,
+    // which fires with the identical deadline once the palette is gone.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 5),
+        "the palette suppresses this collapse"
+    );
+    assert!(app.show_tree, "so the sidebar is still up");
+
+    // The user closes the palette. NO new focus move — focus never left the
+    // editor, so nothing re-arms; the pending collapse must survive on its own.
+    app.command_palette = None;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: with the palette closed the collapse is live again"
+    );
+
+    assert!(
+        app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 5),
+        "the collapse the palette deferred must still fire once it closes — \
+         a transient suppression delays the collapse, it does not cancel it"
+    );
+    assert!(!app.show_tree, "and the sidebar is finally down");
 }
 
 /// #256 step 1: a server that publishes project-wide diagnostics (rust-analyzer

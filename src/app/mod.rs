@@ -12870,10 +12870,19 @@ impl App {
         // was banked for, and burning it there loses an exemption the user
         // never saw honoured. Every earlier decline already leaves the pin
         // alone; this makes the late one behave the same way.
-        self.sidebar_dwell.disarm();
+        //
+        // Stay ARMED on that decline, and disarm only once a collapse is
+        // actually due. These suppressions are transient — a drag ends, a
+        // palette closes — and nothing re-arms the dwell but a fresh focus
+        // move into the editor or terminal. Disarming here would drop the
+        // pending collapse for good, so a user whose palette happened to be
+        // open during the grace window would keep a sidebar that never
+        // auto-hides again. Retrying costs nothing: `main_loop` ticks on an
+        // 8ms cadence, so the collapse lands as soon as the suppression lifts.
         if !self.sidebar_auto_hide_allowed() {
             return false;
         }
+        self.sidebar_dwell.disarm();
         // A real collapse is now due, so this IS the moment the one-shot
         // exemption is spent — whether or not it is what stops us.
         //
