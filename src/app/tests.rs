@@ -31439,6 +31439,117 @@ fn a_transiently_suppressed_collapse_is_retried_once_the_suppression_lifts() {
     assert!(!app.show_tree, "and the sidebar is finally down");
 }
 
+/// #302: toggling the auto-hide SETTING drops any pending collapse. The
+/// function's own comment promises turning it on "takes effect at the next
+/// focus move rather than retroactively yanking it away" — a dwell left armed
+/// across an off/on round trip breaks that promise on the next idle tick, with
+/// no focus move of the user's own.
+#[test]
+fn toggling_the_auto_hide_setting_drops_a_pending_collapse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: collapse is live"
+    );
+
+    let armed_at = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.sidebar_dwell.armed(),
+        "precondition: a collapse is pending"
+    );
+
+    // The user turns the feature off, then changes their mind.
+    app.toggle_sidebar_auto_hide();
+    app.toggle_sidebar_auto_hide();
+    assert!(app.sidebar_auto_hide, "precondition: back on");
+
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 1000),
+        "the collapse armed before the setting was touched must not fire"
+    );
+    assert!(app.show_tree, "so the sidebar is still up");
+}
+
+/// #302: the activity bar is a STRUCTURAL suppression that flips on its own,
+/// independently of Zen Mode. A collapse armed while it is hidden must not sit
+/// armed and then fire — spending a banked reveal pin — on the first idle tick
+/// after the bar comes back.
+#[test]
+fn hiding_the_activity_bar_drops_a_pending_collapse_and_its_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    // A deliberate reveal banks the one-shot pin while the bar is visible.
+    app.sidebar_pinned_open = true;
+    let armed_at = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.sidebar_dwell.armed(),
+        "precondition: a collapse is pending"
+    );
+
+    // The user hides the activity bar, then shows it again.
+    let root = app.active_workspace_root();
+    app.dispatch_menu_action(MenuAction::ToggleActivityBar, root.clone());
+    assert!(!app.activity_bar_visible, "precondition: the bar is hidden");
+    app.dispatch_menu_action(MenuAction::ToggleActivityBar, root);
+    assert!(app.activity_bar_visible, "precondition: the bar is back");
+
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 1000),
+        "an idle tick must not collapse after the bar returns"
+    );
+    assert!(app.show_tree, "so the sidebar is still up");
+}
+
+/// #302's actual payload: the collapse WAITS. Every other app-level test ticks
+/// at the deadline or beyond, so all of them pass against a zero-length window
+/// — i.e. against #294's immediate collapse delivered through a tick. Deleting
+/// the `due()` check leaves them all green. This is the only test that fails
+/// when the grace delay itself is removed, which is what makes it the
+/// acceptance test for the feature rather than for its plumbing.
+#[test]
+fn a_collapse_does_not_fire_inside_the_grace_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is live here"
+    );
+
+    // Stamp BEFORE the arm. `maybe_auto_hide_sidebar` anchors on its own
+    // `Instant::now()`, so a deadline derived from a later stamp could land
+    // outside the real window and decline as not-yet-due for the wrong reason.
+    let before = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+
+    // Half a window in: the collapse is pending and must not have fired.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(before + AUTO_HIDE_DWELL / 2),
+        "a tick INSIDE the grace window must not collapse — this is the delay"
+    );
+    assert!(app.show_tree, "so the sidebar is still up mid-window");
+    assert!(
+        app.sidebar_dwell.armed(),
+        "and the collapse is still pending rather than cancelled"
+    );
+
+    // Past the window, with focus still away: now it fires.
+    assert!(
+        app.tick_sidebar_auto_hide_at(before + AUTO_HIDE_DWELL * 3),
+        "once the window elapses the collapse delivers"
+    );
+    assert!(!app.show_tree, "and the sidebar is down");
+}
+
 /// #302: a deliberate Cmd+B reveal supersedes a pending automatic collapse.
 /// Once a declined tick stays ARMED (so a transient suppression defers rather
 /// than cancels), the dwell can outlive the sidebar state it was armed

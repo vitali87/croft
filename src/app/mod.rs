@@ -12816,7 +12816,12 @@ impl App {
             let _ = crate::prefs::save_sidebar_auto_hide(self.sidebar_auto_hide);
         }
         // Turning it ON with the sidebar open takes effect at the next focus
-        // move rather than retroactively yanking it away here.
+        // move rather than retroactively yanking it away here — which means
+        // dropping any collapse already pending. A dwell armed before the
+        // setting was touched belongs to the old state: leaving it armed lets
+        // an idle tick collapse the sidebar after the user turns the feature
+        // off and on again, with no focus move of their own in between.
+        self.sidebar_dwell.disarm();
         self.status = format!(
             "Auto-hide side bar {}",
             if self.sidebar_auto_hide { "on" } else { "off" }
@@ -12902,12 +12907,12 @@ impl App {
         // suppression (seam drag, palette, modal) spends nothing and the pin
         // survives to do its job a moment later.
         //
-        // The structural suppressions do not reach here at all: `toggle_side_bar`
-        // refuses to bank a pin under Zen Mode or a hidden activity bar, the same
-        // way it already refuses when auto-hide is off. That guard is the
-        // codebase's existing answer to "a pin that sits unconsumed and later
-        // eats a collapse", and honouring it there keeps the rule in one place
-        // rather than splitting it across bank-time and spend-time.
+        // Structural suppressions are handled where they are ENTERED rather than
+        // here: `toggle_side_bar` refuses to bank a pin under Zen Mode or a
+        // hidden activity bar, and Zen entry and the activity-bar toggle each
+        // disarm. That keeps the rule at the sites that know the state changed,
+        // instead of asking this tick to distinguish a suppression that lasts a
+        // moment from one that lasts the session.
         let exempt = std::mem::take(&mut self.sidebar_pinned_open);
         if !exempt {
             self.show_tree = false;
@@ -34487,6 +34492,13 @@ impl App {
             MenuAction::OpenCustomizeLayout => self.open_customize_layout_menu(),
             MenuAction::ToggleActivityBar => {
                 self.activity_bar_visible = !self.activity_bar_visible;
+                // The bar is a structural auto-hide suppression, and unlike Zen
+                // it flips here on its own. A pending collapse armed against the
+                // old chrome would otherwise sit armed while `allowed()` declines
+                // for it, then fire — and spend a banked reveal pin — on the
+                // first idle tick after the bar comes back, with no focus move.
+                self.sidebar_dwell.disarm();
+                self.sidebar_pinned_open = false;
                 self.persist_layout();
                 self.after_chrome_visibility_change();
                 self.open_customize_layout_menu_on(&MenuAction::ToggleActivityBar);
