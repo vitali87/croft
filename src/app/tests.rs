@@ -2221,6 +2221,69 @@ fn a_modified_click_over_a_mouse_tracking_child_does_not_arm_the_tracker() {
 }
 
 #[test]
+fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() {
+    // The swallow branch exists so the FIRST click of a bound `ctrl+double_click`
+    // does not fire the built-in that owns the same modifier. But a terminal
+    // whose child asked for mouse tracking owns the pointer, and the matched
+    // dispatch already declines there via `child_owns_pointer`. The swallow
+    // must decline for the same reason, or binding ONLY `ctrl+double_click`
+    // silently disables the built-in Ctrl+click over every full-screen TUI --
+    // while binding `ctrl+click` leaves it working. That is backwards.
+    //
+    // The observable is deliberately a REFUSED link: `open_detected_url`
+    // rejects a non-web scheme and sets a status without spawning anything.
+    // Asserting on a successful open would shell out to `open`/`xdg-open` for
+    // real, creating exactly the flaky spawning test #307 is about.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "terminal must be laid out"
+    );
+    // `area.y` is the BORDER row: `cell_at` hit-tests `last_inner`, so a click
+    // there resolves to no grid cell and the whole test would be vacuous.
+    let (col, row) = (area.x + 2, area.y + 1);
+
+    // A real OSC 8 hyperlink with a non-web scheme: the built-in finds it via
+    // `hyperlink_at_screen`, and `open_detected_url` then refuses it inertly.
+    app.terminals[0].feed_bytes_for_test(b"\x1b]8;;mailto:x@example.com\x1b\\link\x1b]8;;\x1b\\");
+    assert!(
+        app.terminals[0].hyperlink_at_screen(col, row).is_some(),
+        "the cell must carry an OSC 8 link, or the built-in has nothing to act \
+         on and this test cannot distinguish the two branches"
+    );
+
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    assert!(
+        app.terminals[0].mouse_reporting(),
+        "the child must be tracking, or `child_owns_pointer` is false and this \
+         test proves nothing about the guard"
+    );
+
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    assert!(
+        app.status.contains("Refused to open non-web link"),
+        "a double-click PREFIX over a mouse-tracking child must fall through to \
+         the built-in, exactly as a matched gesture does -- the swallow branch \
+         is missing the `child_owns_pointer` guard its sibling applies. \
+         Expected the refusal from the built-in link handler, got {:?}",
+        app.status
+    );
+}
+
+#[test]
 fn a_modified_click_that_drags_away_does_not_pair_with_the_click_it_returns_to() {
     // The built-in trackers get `clear_if_moved` on every drag, so click,
     // drag away, click back is not a double. `ModifiedClickTracker` has no

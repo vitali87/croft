@@ -30699,8 +30699,17 @@ impl App {
         // lets the second click of the pair see the first. Only the prefix of
         // a bound double is swallowed: a Ctrl+click with no double bound
         // reaches the built-in unchanged.
+        //
+        // `child_owns_pointer` for the same reason the matched dispatch below
+        // consults it — a TUI that asked for mouse tracking owns the pointer,
+        // so croft must not suppress a built-in on its behalf. The recording
+        // above already declines there, so the bound double is unreachable in
+        // that state anyway: swallowing would cost the built-in and buy
+        // nothing. Omitting it here disabled the built-in Ctrl+click over
+        // every full-screen TUI for anyone who bound only `ctrl+double_click`.
         if let Some((ctx, gesture, None)) = bound_mouse
             && !gesture.mods.is_empty()
+            && !child_owns_pointer
             && self.keymap.is_double_click_prefix(gesture, ctx)
         {
             // Focus still moves, as a click in a pane always does — otherwise
