@@ -31640,6 +31640,48 @@ fn a_manual_reveal_cancels_a_pending_collapse() {
     assert!(app.show_tree, "the sidebar is still up");
 }
 
+/// #302: disabling and re-enabling auto-hide drops a pin banked beforehand.
+/// `toggle_side_bar` refuses to bank one while the feature is off — "a pin set
+/// while the feature is off would sit unconsumed and silently eat the first
+/// collapse after they turn it on" — and a pin banked BEFORE the user disables
+/// it reaches that same stranded state by the other route. The existing
+/// `a_reveal_while_auto_hide_is_off_does_not_bank_an_exemption` covers
+/// off -> reveal -> enable; this is reveal -> disable -> enable.
+#[test]
+fn disabling_auto_hide_drops_a_pin_banked_before_it_was_turned_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = false;
+
+    app.toggle_side_bar();
+    assert!(
+        app.show_tree && app.sidebar_pinned_open,
+        "precondition: the reveal banked a pin while the feature was on"
+    );
+
+    app.toggle_sidebar_auto_hide();
+    assert!(!app.sidebar_auto_hide, "precondition: the feature is off");
+    assert!(
+        !app.sidebar_pinned_open,
+        "turning the feature off drops the pin: nothing can consume it while \
+         off, so it would eat the first collapse after re-enabling"
+    );
+
+    app.toggle_sidebar_auto_hide();
+    assert!(app.sidebar_auto_hide, "precondition: back on");
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is live again"
+    );
+    let t0 = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.tick_sidebar_auto_hide_at(t0 + AUTO_HIDE_DWELL * 2),
+        "and the first collapse after re-enabling fires — no stranded pin ate it"
+    );
+}
+
 /// #302: Zen entry must drop the reveal pin as well as the dwell. Zen sets
 /// BOTH structural conditions — `activity_bar_visible = false` and
 /// `zen_mode = true` — so `toggle_side_bar`'s reason for refusing to bank a

@@ -12830,7 +12830,17 @@ impl App {
         // setting was touched belongs to the old state: leaving it armed lets
         // an idle tick collapse the sidebar after the user turns the feature
         // off and on again, with no focus move of their own in between.
+        //
+        // The pin goes for the same reason, and the fourth boundary to say so.
+        // `toggle_side_bar` refuses to bank one while the feature is off,
+        // because "a pin set while the feature is off would sit unconsumed and
+        // silently eat the first collapse after they turn it on" — and a pin
+        // banked BEFORE the user disables auto-hide reaches that same state by
+        // the other route. Main cleared it incidentally by taking the pin on
+        // every focus move; consuming at fire time is correct but leaves each
+        // boundary to say so.
         self.sidebar_dwell.disarm();
+        self.sidebar_pinned_open = false;
         self.status = format!(
             "Auto-hide side bar {}",
             if self.sidebar_auto_hide { "on" } else { "off" }
