@@ -589,8 +589,8 @@ and an optional `when` region:
 [
   { "key": "ctrl+click",       "command": "mouse_go_to_definition_at_click" },
   { "key": "alt+click",        "command": "mouse_add_cursor_at_click" },
-  { "key": "middle_click",     "command": "paste",  "when": "terminal" },
-  { "key": "alt+wheel_up",     "command": "page_up" }
+  { "key": "middle_click",     "command": "search_from_terminal", "when": "terminal" },
+  { "key": "alt+wheel_up",     "command": "toggle_word_wrap" }
 ]
 ```
 

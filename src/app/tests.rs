@@ -1658,6 +1658,130 @@ fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
 }
 
 #[test]
+fn every_mouse_binding_the_docs_show_actually_loads() {
+    // Round 7 found `paste` and `page_up` in this example, neither of which is
+    // a real command id: `Keymap::from_json` skipped both rows with a warning,
+    // so a user copying the documented snippet got a keymap that silently did
+    // less than it said. A doc example that does not load is worse than none,
+    // and the only way that stays true is to load the real file here rather
+    // than a copy that can drift from it.
+    let doc = include_str!("../../docs/KEYBINDINGS.md");
+    let block = doc
+        .split("## Mouse bindings in `keybindings.json`")
+        .nth(1)
+        .expect("the mouse bindings section is still in KEYBINDINGS.md")
+        .split("```jsonc")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("the section still carries a jsonc example block");
+    assert!(
+        block.contains("\"command\""),
+        "the extracted block must be the binding example, not an empty match"
+    );
+
+    let km = crate::keymap::Keymap::from_json(block);
+    assert!(
+        km.warnings().is_empty(),
+        "the documented example must load cleanly, but got: {:?}",
+        km.warnings()
+    );
+}
+
+#[test]
+fn a_modified_double_click_can_fire_at_all() {
+    // The dispatch deliberately refuses to record a MODIFIED click into the
+    // built-in trackers: they are shared with the editor's plain select-word,
+    // so arming them with a ctrl+click would make the user's next ORDINARY
+    // click select a word they never asked for. But `double_click` is only
+    // classified by asking a tracker whether it just saw a click here — so
+    // with nothing recording modified clicks, `ctrl+double_click` could never
+    // become true and the binding was unreachable. A separate tracker keeps
+    // both rules: the built-in one stays unarmed, the modified pair is seen.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Bound in `terminal`, not `editor`: with no file open the editor is never
+    // laid out (`last_area` comes back height 0), so no click coordinate can
+    // land in it and the binding's `when` could never match. The terminal is
+    // always present, and this test is about whether a modified double-click
+    // can fire AT ALL — the region it fires in is incidental.
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let before = app.editor.wrap_enabled();
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "the terminal must be laid out, or the click lands nowhere and this \
+         test passes or fails for reasons unrelated to double-click tracking"
+    );
+    let (col, row) = (area.x + 2, area.y + 1);
+
+    // First ctrl+click: arms the modified tracker, fires nothing (no `click`
+    // row is bound), and must NOT arm the plain tracker.
+    let mut first = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    first.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(first);
+    assert_eq!(
+        app.editor.wrap_enabled(),
+        before,
+        "the first click of the pair is not yet a double"
+    );
+
+    // Second ctrl+click at the same cell: now it is a double, so it fires.
+    let mut second = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    second.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(second);
+    assert_ne!(
+        app.editor.wrap_enabled(),
+        before,
+        "ctrl+double_click must be reachable, not permanently dead"
+    );
+}
+
+#[test]
+fn a_bound_gesture_moves_keyboard_focus_to_the_pane_it_clicked() {
+    // Round 7: the dispatch made the clicked terminal pane ACTIVE (so commands
+    // read the right grid) but never called `focus_pane`, which is a different
+    // thing — it decides where the next KEYSTROKE goes. So a bound gesture
+    // clicked into the terminal ran against the terminal while the user's
+    // typing kept going to the editor they had left.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "mouse_open_link_at_click", "when": "terminal"}]"#,
+    );
+    app.focus_pane(Pane::Editor);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(area.width > 4 && area.height > 2, "the terminal is visible");
+    let mut ev = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        area.y + 1,
+    );
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    // `matches!` rather than `assert_eq!`: `Pane` has no `Debug`, and deriving
+    // one on a production type just to format a test failure is the wrong
+    // trade.
+    assert!(
+        matches!(app.focus, Pane::Terminal),
+        "clicking a pane with a bound gesture must focus it, or the next \
+         keystroke goes to the pane the user just clicked away from"
+    );
+}
+
+#[test]
 fn a_bound_wheel_gesture_fires_and_a_modified_wheel_does_not_match_the_bare_row() {
     // The wheel is the one gesture family whose dispatch no other test drives
     // end to end — the rest of the coverage stops at the parser. It is also
