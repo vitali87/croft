@@ -66,6 +66,6 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Revealing the side bar with Cmd+B keeps its one-shot reprieve when a drag, palette or dialog interrupts the collapse it was meant to survive.",
+        summary: "Revealing the side bar with Cmd+B or Ctrl+B keeps its one-shot reprieve when a drag, palette or dialog interrupts the collapse it was meant to survive.",
     },
 ];
