@@ -53,7 +53,7 @@ pub fn discover_compounds(root: &Path) -> Vec<Compound> {
         let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
             continue;
         };
-        for c in parse_compounds(&text) {
+        for c in parse_compounds(&text, rel) {
             if !out.iter().any(|existing| existing.name == c.name) {
                 out.push(c);
             }
@@ -125,6 +125,11 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
 pub struct Compound {
     pub name: String,
     pub configurations: Vec<String>,
+    /// Which file declared it. A compound's members name configurations in
+    /// ITS OWN file first: both files may declare the same name, and binding
+    /// a `.vscode` compound to a `.croft` config of that name would debug a
+    /// different program than the compound was written against.
+    pub source: &'static str,
 }
 
 /// Parse the `compounds` array of a launch.json body. Sibling key of
@@ -132,7 +137,7 @@ pub struct Compound {
 /// Entries without a `name` or a non-empty `configurations` list are skipped —
 /// VS Code refuses to run those too, and an empty compound would present as a
 /// picker row that does nothing.
-pub fn parse_compounds(text: &str) -> Vec<Compound> {
+pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
     let Ok(v) = serde_json::from_str::<Value>(&crate::tasks::strip_jsonc(text)) else {
         return Vec::new();
     };
@@ -169,6 +174,7 @@ pub fn parse_compounds(text: &str) -> Vec<Compound> {
             Some(Compound {
                 name,
                 configurations,
+                source,
             })
         })
         .collect()
@@ -186,12 +192,22 @@ pub fn resolve_compound<'a>(
         .configurations
         .iter()
         .map(|want| {
-            configs.iter().find(|c| &c.name == want).ok_or_else(|| {
-                format!(
-                    "compound \"{}\" names configuration \"{}\", which no launch.json declares",
-                    compound.name, want
-                )
-            })
+            // The compound's own file first: `discover_configs` merges both
+            // files with `.croft` winning a duplicate name, so a bare name
+            // match would bind a `.vscode` compound to a `.croft` config that
+            // may run a different program under a different adapter. Falling
+            // back to any file keeps a compound working when its members live
+            // in the sibling file, which VS Code also allows via `folder`.
+            configs
+                .iter()
+                .find(|c| &c.name == want && c.source == compound.source)
+                .or_else(|| configs.iter().find(|c| &c.name == want))
+                .ok_or_else(|| {
+                    format!(
+                        "compound \"{}\" names configuration \"{}\", which no launch.json declares",
+                        compound.name, want
+                    )
+                })
         })
         .collect()
 }
@@ -917,12 +933,53 @@ mod tests {
               "Server",
               {"folder":"web","name":"Client"}]}]}"#;
 
-        let compounds = parse_compounds(text);
+        let compounds = parse_compounds(text, ".vscode/launch.json");
         assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
         assert_eq!(
             compounds[0].configurations,
             vec!["Server", "Client"],
             "an object member contributes its name, exactly as a bare string does"
+        );
+    }
+
+    /// A compound must bind to the configurations ITS OWN FILE declares. Both
+    /// files may declare the same name — `.croft` wins the picker row, but a
+    /// `.vscode` compound naming "Server" means .vscode's Server, which may be
+    /// a different program under a different adapter. Matching by bare name
+    /// against the merged list launches something other than what the user
+    /// wrote, which is the same rule the parse and resolve boundaries already
+    /// enforce for missing and malformed members.
+    #[test]
+    fn a_compound_binds_to_its_own_files_configuration_not_a_same_named_one() {
+        let croft = r#"{"configurations":[
+              {"name":"Server","type":"python","request":"launch","program":"croft.py"}]}"#;
+        let vscode = r#"{"configurations":[
+              {"name":"Server","type":"node","request":"launch","program":"vscode.js"}],
+            "compounds":[{"name":"VsCompound","configurations":["Server"]}]}"#;
+
+        let mut configs = parse_launch_json(croft, ".croft/launch.json");
+        configs.extend(parse_launch_json(vscode, ".vscode/launch.json"));
+        let compounds = parse_compounds(vscode, ".vscode/launch.json");
+        assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
+        assert_eq!(
+            compounds[0].source, ".vscode/launch.json",
+            "precondition: the compound remembers which file declared it"
+        );
+        assert_eq!(
+            configs.iter().filter(|c| c.name == "Server").count(),
+            2,
+            "precondition: both files declare a Server, so provenance decides"
+        );
+
+        let members = resolve_compound(&compounds[0], &configs).expect("resolves");
+        assert_eq!(
+            members[0].source, ".vscode/launch.json",
+            "the .vscode compound binds .vscode's Server, not .croft's same-named one"
+        );
+        assert_eq!(
+            members[0].type_name, "node",
+            "which is a different adapter — binding .croft's python config here \
+             would debug a different program than the compound declares"
         );
     }
 
@@ -941,7 +998,10 @@ mod tests {
               {"name":"Partial","configurations":["A", 7, "B"]},
               {"name":"Whole","configurations":["A","B"]}]}"#;
 
-        let names: Vec<String> = parse_compounds(text).into_iter().map(|c| c.name).collect();
+        let names: Vec<String> = parse_compounds(text, ".vscode/launch.json")
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
         assert_eq!(
             names,
             vec!["Whole"],
@@ -960,7 +1020,10 @@ mod tests {
               {"name":"Unusable","configurations":[7, true]},
               {"name":"Real","configurations":["A"]}]}"#;
 
-        let names: Vec<String> = parse_compounds(text).into_iter().map(|c| c.name).collect();
+        let names: Vec<String> = parse_compounds(text, ".vscode/launch.json")
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
         assert_eq!(
             names,
             vec!["Real"],
@@ -1018,7 +1081,7 @@ mod tests {
         let cfgs = parse_launch_json(text, "test");
         assert_eq!(cfgs.len(), 2, "precondition: both configurations parsed");
 
-        let compounds = parse_compounds(text);
+        let compounds = parse_compounds(text, ".vscode/launch.json");
         assert_eq!(compounds.len(), 1, "the compound is found");
         assert_eq!(compounds[0].name, "Full Stack");
         assert_eq!(compounds[0].configurations, vec!["Server", "Client"]);
@@ -1034,7 +1097,7 @@ mod tests {
             "compounds": [ { "name": "Both", "configurations": ["Server", "Ghost"] } ]
         }"#;
         let cfgs = parse_launch_json(text, "test");
-        let compounds = parse_compounds(text);
+        let compounds = parse_compounds(text, ".vscode/launch.json");
         assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
 
         let err = resolve_compound(&compounds[0], &cfgs)
@@ -1057,7 +1120,7 @@ mod tests {
             "compounds": [ { "name": "Both", "configurations": ["Server", "Client"] } ]
         }"#;
         let cfgs = parse_launch_json(text, "test");
-        let compounds = parse_compounds(text);
+        let compounds = parse_compounds(text, ".vscode/launch.json");
         let members = resolve_compound(&compounds[0], &cfgs).unwrap();
         assert_eq!(
             members.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),

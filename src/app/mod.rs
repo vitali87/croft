@@ -21370,30 +21370,30 @@ impl App {
             }
             ListPurpose::DebugConfig => {
                 if let Some(idx) = row.id.strip_prefix("compound:") {
-                    let named = idx
+                    // Index the row straight through rather than round-tripping
+                    // via the name. `discover_compounds` dedupes by name, so a
+                    // lookup would find the same element today — but it asks a
+                    // weaker question than the one the row already answers, and
+                    // it made the not-found arm unreachable-but-present.
+                    let found = idx
                         .parse::<usize>()
                         .ok()
-                        .and_then(|i| self.debug_compounds.get(i))
-                        .map(|c| c.name.clone());
-                    if let Some(name) = named {
+                        .and_then(|i| self.debug_compounds.get(i));
+                    if let Some(compound) = found {
                         // Resolve first: a compound naming a configuration no
                         // launch.json declares is a config error worth
                         // reporting now, separately from the unbuilt feature.
-                        let compound = self.debug_compounds.iter().find(|c| c.name == name);
-                        let msg = match compound
-                            .map(|c| crate::dap::configs::resolve_compound(c, &self.debug_configs))
-                        {
-                            Some(Err(e)) => e,
+                        let msg = match crate::dap::configs::resolve_compound(
+                            compound,
+                            &self.debug_configs,
+                        ) {
+                            Err(e) => e,
                             // Resolvable: the only thing stopping it is the
                             // unbuilt multi-session model.
-                            Some(Ok(_)) => format!(
-                                "compound \"{name}\" needs several debug sessions at once, which croft does not support yet (#310)"
+                            Ok(_) => format!(
+                                "compound \"{}\" needs several debug sessions at once, which croft does not support yet (#310)",
+                                compound.name
                             ),
-                            // The row named a compound the list no longer has —
-                            // reported as its own state rather than folded in
-                            // with #310, which would assert a resolution that
-                            // never happened.
-                            None => format!("compound \"{name}\" is no longer declared"),
                         };
                         self.debug_error(msg);
                     }
