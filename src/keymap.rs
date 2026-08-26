@@ -614,7 +614,11 @@ impl Keymap {
             kind: GestureKind::DoubleClick,
             mods: gesture.mods,
         };
-        self.mouse.contains_key(&(double, ctx))
+        // A click with its OWN binding is not the first half of anything:
+        // it has a command, and swallowing it would eat that command. The
+        // sole caller cannot reach this case, but the doc above promises it
+        // to every future one.
+        self.mouse.contains_key(&(double, ctx)) && !self.mouse.contains_key(&(gesture, ctx))
     }
 
     /// No KEY chords bound. Mouse gestures are asked about separately via
@@ -657,6 +661,56 @@ pub const TEMPLATE: &str = r#"// croft keyboard shortcuts. Rebind any palette co
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_bound_single_click_is_not_a_double_click_prefix() {
+        use super::{Keymap, MouseContext};
+        use crossterm::event::KeyModifiers;
+        // The doc says this answers true only when the user bound the DOUBLE
+        // but NOT the single — "the first HALF of a bound double-click". A
+        // click that is itself bound is not a prefix: it has its own command,
+        // and swallowing it would eat that command.
+        //
+        // The sole caller today matches `Some((ctx, gesture, None))`, where
+        // the None IS "no command for this single click", so it cannot reach
+        // the bad case. But this is `pub`, and a contract enforced only by
+        // caller discipline is one the next caller does not know about.
+        let both = Keymap::from_json(
+            r#"[{"key": "ctrl+click", "command": "quick_open", "when": "editor"},
+                 {"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "editor"}]"#,
+        );
+        let click = super::Gesture {
+            kind: super::GestureKind::Click,
+            mods: KeyModifiers::CONTROL,
+        };
+        // Precondition: BOTH rows must have loaded, or "not a prefix" would be
+        // true for the trivial reason that no double is bound either.
+        assert!(
+            both.command_for_mouse(click, MouseContext::Editor)
+                .is_some(),
+            "precondition: the single click must be bound"
+        );
+        assert!(
+            !both.is_double_click_prefix(click, MouseContext::Editor),
+            "a click with its own binding is not the first half of anything: \
+             swallowing it would eat the command the user bound to it"
+        );
+
+        // And the documented positive case still answers true.
+        let double_only = Keymap::from_json(
+            r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "editor"}]"#,
+        );
+        assert!(
+            double_only
+                .command_for_mouse(click, MouseContext::Editor)
+                .is_none(),
+            "precondition: the single click must NOT be bound here"
+        );
+        assert!(
+            double_only.is_double_click_prefix(click, MouseContext::Editor),
+            "the first half of a bound double, with no single bound, IS a prefix"
+        );
+    }
 
     #[test]
     fn gestures_parse_with_modifiers_and_reject_nonsense() {
