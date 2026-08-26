@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Mouse gestures are yours to bind: keybindings.json now takes ctrl/alt/shift-modified clicks, middle click, right click and the wheel, scoped per region — VS Code's second-most-requested feature, open since 2016. A binding croft cannot honour says so in OUTPUT instead of failing silently.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Mouse gestures are yours to bind: keybindings.json now takes ctrl/alt/shift-modified clicks, middle click, right click and the wheel, scoped per region — VS Code's second-most-requested feature, open since 2016. A binding croft cannot honour says so in OUTPUT instead of failing silently.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Modified clicks no longer leak into the built-ins: the first half of a bound ctrl+double_click stops firing go-to-definition, a modified click that drags away no longer pairs with the click it returns to, and a click over a mouse-reporting terminal is left to the child program.",
+    },
+];

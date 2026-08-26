@@ -594,6 +594,29 @@ impl Keymap {
         !self.mouse.is_empty()
     }
 
+    /// Whether this single click is the FIRST HALF of a bound double-click in
+    /// `ctx` — i.e. the user bound `ctrl+double_click` but not `ctrl+click`.
+    ///
+    /// Such a click matches nothing by construction, so it used to fall
+    /// straight through to the built-in that owns the same modifier: the first
+    /// half of every `ctrl+double_click` in the editor fired go-to-definition,
+    /// and the binding was unusable for the one gesture it was written for.
+    /// The dispatch consults this to swallow the prefix click instead.
+    ///
+    /// Deliberately narrow. It answers only for a `Click` whose double IS
+    /// bound, so an ordinary Ctrl+click with no double bound anywhere still
+    /// reaches the built-in exactly as before.
+    pub fn is_double_click_prefix(&self, gesture: Gesture, ctx: MouseContext) -> bool {
+        if !matches!(gesture.kind, GestureKind::Click) {
+            return false;
+        }
+        let double = Gesture {
+            kind: GestureKind::DoubleClick,
+            mods: gesture.mods,
+        };
+        self.mouse.contains_key(&(double, ctx))
+    }
+
     /// No KEY chords bound. Mouse gestures are asked about separately via
     /// [`Self::has_mouse_bindings`], because the key path's caller uses this
     /// to skip its lookup and must not be affected by mouse rows.

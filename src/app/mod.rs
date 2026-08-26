@@ -30663,8 +30663,21 @@ impl App {
         // Unmodified clicks are deliberately not recorded here: their trackers
         // are shared with the built-ins, which record their own clicks on the
         // paths below. Doing it in both places would double-count.
+        //
+        // A click the pointer-owning child gets is not croft's to remember.
+        // The built-ins record INSIDE their `child_owns_pointer` check; this
+        // recording sat above it, so clicks croft deliberately declined to act
+        // on still armed the tracker, and a later modified click paired with
+        // one the user had aimed at the TUI in the terminal. Same predicate as
+        // the dispatch below, indexed by the pane that was CLICKED.
+        let child_owns_pointer = bound_mouse.is_some_and(|(ctx, _, _)| {
+            matches!(ctx, crate::keymap::MouseContext::Terminal)
+                && terminal_hit.is_some_and(|idx| self.terminals[idx].mouse_reporting())
+                && !m.modifiers.contains(KeyModifiers::SHIFT)
+        });
         if let Some((_, gesture, _)) = bound_mouse
             && !gesture.mods.is_empty()
+            && !child_owns_pointer
         {
             let now = std::time::Instant::now();
             match gesture.kind {
@@ -30680,16 +30693,46 @@ impl App {
             }
         }
 
+        // The first half of a bound double-click matches no binding, so
+        // without this it falls through to whatever built-in owns the same
+        // modifier: binding `ctrl+double_click` in the editor made the pair's
+        // first click fire go-to-definition, and in the terminal it armed the
+        // plain double-click tracker so the user's NEXT ordinary click
+        // selected a word they never gestured for. Both are the same bug —
+        // croft acting on a click the user aimed at their own binding.
+        //
+        // Swallowed AFTER the modified-click recording above, which is what
+        // lets the second click of the pair see the first. Only the prefix of
+        // a bound double is swallowed: a Ctrl+click with no double bound
+        // reaches the built-in unchanged.
+        if let Some((ctx, gesture, None)) = bound_mouse
+            && !gesture.mods.is_empty()
+            && self.keymap.is_double_click_prefix(gesture, ctx)
+        {
+            // Focus still moves, as a click in a pane always does — otherwise
+            // the pair's second click lands in a pane the keyboard has not
+            // followed. This mirrors what the matched path does below.
+            match ctx {
+                crate::keymap::MouseContext::Terminal => {
+                    if let Some(idx) = terminal_hit {
+                        self.activate_terminal_pane(idx);
+                        self.focus_pane(Pane::Terminal);
+                    }
+                }
+                crate::keymap::MouseContext::Editor | crate::keymap::MouseContext::TabStrip => {
+                    self.focus_pane(Pane::Editor)
+                }
+                crate::keymap::MouseContext::FileTree => self.focus_pane(Pane::Tree),
+            }
+            return;
+        }
+
         if let Some((ctx, gesture, Some(cmd))) = bound_mouse {
             // A terminal running a mouse-tracking TUI owns the pointer, same
             // rule the built-ins follow: croft must not steal a click the
-            // child asked for.
-            // Index the pane that was CLICKED, not the active one: splits make
-            // several terminals visible at once, so `self.terminal()` would
-            // consult the wrong child's mouse-reporting state.
-            let child_owns_pointer = matches!(ctx, crate::keymap::MouseContext::Terminal)
-                && terminal_hit.is_some_and(|idx| self.terminals[idx].mouse_reporting())
-                && !m.modifiers.contains(KeyModifiers::SHIFT);
+            // child asked for. Computed once above so the recording and this
+            // dispatch cannot drift apart — they must agree on whether the
+            // click was croft's to act on.
             if !child_owns_pointer {
                 // Every built-in pairs `is_double` with `record`/`clear` so
                 // the count stays right. The early return below skips the
@@ -30750,22 +30793,27 @@ impl App {
                 // Termux: the tap still has to raise the on-screen keyboard.
                 // Skipping it leaves a device with no other keyboard unable
                 // to type into the field the tap just focused. Reachable
-                // despite bare clicks being reserved in editor/terminal: a
-                // bare `click` bound in `file_tree` fires over the Search
-                // input, and any MODIFIED click in the editor gets here too.
-                // `ctx` carries the region, so the built-in's in_editor /
-                // in_terminal / in_tree — computed below this block — are
-                // not needed to make the same decision.
+                // despite bare clicks being reserved in editor/terminal: any
+                // MODIFIED click in the editor or terminal gets here, and a
+                // bound gesture there should raise the keyboard exactly as the
+                // built-in press would. `ctx` carries the region, so the
+                // built-in's in_editor / in_terminal / in_tree — computed
+                // below this block — are not needed to make the same decision.
                 if self.osk_auto
                     && self.osk.is_none()
                     && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
                     && match ctx {
                         crate::keymap::MouseContext::Editor
                         | crate::keymap::MouseContext::Terminal => true,
-                        crate::keymap::MouseContext::FileTree => {
-                            self.sidebar_view == SidebarView::Search
-                        }
-                        crate::keymap::MouseContext::TabStrip => false,
+                        // `mouse_context_for` only yields `FileTree` while the
+                        // sidebar is showing the Explorer, so the Search view
+                        // this once tested for is unreachable from here — the
+                        // narrowing that fixed tree bindings firing over other
+                        // sidebar views left this arm behind. The tree has no
+                        // text input to raise a keyboard for, so `false` is
+                        // what the reachable half always evaluated to anyway.
+                        crate::keymap::MouseContext::FileTree
+                        | crate::keymap::MouseContext::TabStrip => false,
                     }
                 {
                     let mut osk = crate::widgets::osk::Osk::new();
@@ -32549,6 +32597,12 @@ impl App {
                 self.editor_click.clear_if_moved(m.column, m.row);
                 self.tree_click.clear_if_moved(m.column, m.row);
                 self.terminal_click.clear_if_moved(m.column, m.row);
+                // The modified tracker gets the same cancellation. It was left
+                // out when it was added, so a bound `ctrl+double_click` fired
+                // across a drag where the built-in double correctly did not —
+                // the one tracker not on this list behaved differently from
+                // every other one for no reason a user could discover.
+                self.modified_click.clear_if_moved(m.column, m.row);
                 // Terminal drag-selection is handled before the per-pane
                 // branches so it keeps extending even when the pointer
                 // leaves the pane: dragging past the bottom edge is how the

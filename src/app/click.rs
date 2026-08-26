@@ -85,4 +85,19 @@ impl ModifiedClickTracker {
     pub fn clear(&mut self) {
         self.last = None;
     }
+
+    /// Cancel a pending pair when the pointer drags away, exactly as
+    /// [`ClickTracker::clear_if_moved`] does for the built-ins.
+    ///
+    /// Without it, click → drag away → click back counted as a double for
+    /// modified gestures where the identical unmodified sequence correctly
+    /// did not: a drag is a deliberate gesture of its own, and the click that
+    /// began it is spent, not the first half of a pair.
+    pub fn clear_if_moved(&mut self, col: u16, row: u16) {
+        if let Some((_, x, y, _)) = self.last
+            && (col != x || row != y)
+        {
+            self.last = None;
+        }
+    }
 }

@@ -2045,6 +2045,232 @@ fn a_modified_click_binding_does_not_arm_the_plain_double_click() {
 }
 
 #[test]
+fn the_first_click_of_a_bound_modified_pair_does_not_fire_the_builtin() {
+    // The dispatch guard is `Some((ctx, gesture, Some(cmd)))`. When a gesture
+    // classifies but matches no command — exactly the first click of a
+    // `ctrl+double_click` pair, which by construction can only be a
+    // `ctrl+click` — the pattern fails, nothing returns early, and control
+    // reaches the built-in Ctrl+click arm. So binding ONLY the double gave a
+    // spurious Go to Definition on every first click: the gesture was
+    // recognised as half of a bound pair and then leaked into the built-in it
+    // was supposed to be part of.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("t.rs");
+    std::fs::write(&file, "let name = value;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "save_file", "when": "editor"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    let (col, row) = (app.editor.last_inner.x + 12, app.editor.last_inner.y);
+    let (before_row, before_col) = (app.editor.cursor_row, app.editor.cursor_col);
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    // `trigger_definition_at` moves the caret to the clicked position before
+    // asking the server, so an unmoved caret is the observable proof the
+    // built-in did not run. Asserting on the LSP request itself would need a
+    // live server; the caret is the same signal without one.
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (before_row, before_col),
+        "the first click of a bound ctrl+double_click must not reach the \
+         built-in Ctrl+click Go to Definition, but the caret moved as though \
+         it had"
+    );
+}
+
+#[test]
+fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal() {
+    // `terminal_click.record` has no modifier guard, so a ctrl+click that
+    // REACHES it arms the plain double-click tracker and the user's next
+    // ordinary click selects a word they never gestured for.
+    //
+    // Reaching it is the subtle part. A ctrl+click that MATCHES a binding
+    // returns early from the dispatch and never touches the built-in path at
+    // all — a version of this test binding `ctrl+click` to a real command
+    // passes vacuously for that reason. The reachable case is the gesture that
+    // classifies but matches nothing: binding only `ctrl+double_click` leaves
+    // the pair's first click, a bare `ctrl+click`, with no command, so it
+    // falls through to the built-in and records.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "the terminal must be laid out, or the clicks land nowhere and this \
+         test passes for reasons unrelated to tracker arming"
+    );
+
+    // There must be a WORD under the pointer. `select_word_at` is what a
+    // spuriously-armed tracker triggers, and it selects nothing on a blank
+    // cell — so clicking an empty terminal makes this test pass vacuously
+    // whether the tracker armed or not. Print text first, and assert it
+    // arrived, so the click has a real word to wrongly select.
+    app.terminals[0].feed_bytes_for_test(b"hello_world_token\r\n");
+    term.draw(|f| app.render(f)).unwrap();
+    // `area.y` is the pane's BORDER row, not its first text row: `cell_at`
+    // hit-tests against `last_inner` and returns None outside it, so a click
+    // there resolves to no grid cell and selects nothing whatever the tracker
+    // holds. `+ 1` is what the working ctrl+double_click test above uses.
+    let (col, row) = (area.x + 2, area.y + 1);
+    assert!(
+        app.terminals[0]
+            .visible_text()
+            .contains("hello_world_token"),
+        "the terminal must actually show the token, or there is no word for a \
+         wrongly-armed tracker to select and this test cannot fail"
+    );
+    // The click must land on a real grid cell holding the token. Without this
+    // the test passes vacuously off-grid — which it did, three times.
+    let (text, idx) = app.terminals[0]
+        .line_text_at(col, row)
+        .expect("the click must resolve to a terminal grid cell, not the border");
+    assert!(
+        text.contains("hello_world_token") && idx < text.len(),
+        "the click must land ON the token: got {text:?} at {idx}"
+    );
+
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+
+    // A plain click ALWAYS anchors a collapsed one-cell selection
+    // (`start_selection_at`), so the correct outcome here is the single
+    // character under the pointer — not an empty string. The defect is the
+    // tracker firing `select_word_at`, which yields the whole WORD.
+    //
+    // Asserting emptiness would fail on correct behaviour, so the assertion
+    // is against the word: anything longer than the one anchored cell means a
+    // double-click fired off a click the user never paired.
+    let selected = app.terminal().selection_text();
+    assert!(
+        !selected.contains("hello_world_token"),
+        "a plain click after a bound ctrl+click must not select a WORD in the \
+         terminal — the ctrl+click armed the plain double-click tracker. \
+         Expected the one anchored cell, got {selected:?}"
+    );
+    assert!(
+        selected.chars().count() <= 1,
+        "a plain click anchors exactly one cell; a longer selection means the \
+         tracker fired a double-click, got {selected:?}"
+    );
+}
+
+#[test]
+fn a_modified_click_over_a_mouse_tracking_child_does_not_arm_the_tracker() {
+    // The modified-click recording sits ABOVE the `child_owns_pointer` guard,
+    // where the built-ins record inside it. So a modified click over a TUI
+    // that owns the pointer is correctly forwarded to the child and NOT acted
+    // on — while still arming the tracker. Two such clicks, then one more
+    // after the child exits, and the third classifies as a double off state
+    // built from clicks croft deliberately declined to handle.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "terminal must be laid out"
+    );
+    let (col, row) = (area.x + 2, area.y + 1);
+
+    // Same escape the sibling tracking test uses: let the child actually turn
+    // reporting on rather than poking a setter, so this exercises the real
+    // predicate `child_owns_pointer` consults.
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    assert!(
+        app.terminals[0].mouse_reporting(),
+        "the child must be tracking, or `child_owns_pointer` is false and this \
+         test proves nothing about the guard"
+    );
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    // The click above was the child's, not croft's. The tracker must be clean,
+    // or the NEXT modified click pairs with a click croft never handled.
+    assert!(
+        !app.modified_click
+            .is_double(std::time::Instant::now(), col, row, KeyModifiers::CONTROL),
+        "a modified click forwarded to a mouse-tracking child must not arm the \
+         modified-click tracker"
+    );
+}
+
+#[test]
+fn a_modified_click_that_drags_away_does_not_pair_with_the_click_it_returns_to() {
+    // The built-in trackers get `clear_if_moved` on every drag, so click,
+    // drag away, click back is not a double. `ModifiedClickTracker` has no
+    // such call anywhere, so the modified pair fires where the identical
+    // unmodified sequence correctly does not.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "terminal must be laid out"
+    );
+    let (col, row) = (area.x + 2, area.y + 1);
+
+    let before = app.editor.wrap_enabled();
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    // Drag well away, then release, then click the origin again.
+    let mut drag = mouse(MouseEventKind::Drag(MouseButton::Left), col + 20, row + 3);
+    drag.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(drag);
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        col + 20,
+        row + 3,
+    ));
+
+    let mut back = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    back.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(back);
+
+    assert_eq!(
+        app.editor.wrap_enabled(),
+        before,
+        "a modified click that dragged away must not pair with the click it \
+         returns to, but the double fired"
+    );
+}
+
+#[test]
 fn a_reloaded_keymap_with_a_refused_row_reports_its_warning_count() {
     // Asserts the summary the reload sets, against a keymap built in memory.
     // Writing the real `~/.config/croft/keybindings.json` — which is what the
