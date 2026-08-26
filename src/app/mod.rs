@@ -12829,7 +12829,15 @@ impl App {
     fn maybe_auto_hide_sidebar(&mut self) {
         // Cheap pre-check only. The real decision is re-made when the timer
         // fires, because every suppression here can change during the window.
-        if self.sidebar_auto_hide && self.show_tree {
+        //
+        // `sidebar_auto_hide_suspended` is the exception and MUST be read here:
+        // it is scoped to a `without_auto_hide` closure and restored the moment
+        // that closure returns, so by tick time it is always false. Deferring
+        // it would silently un-suppress every programmatic focus move — the
+        // async MCP result, the launch-time file open, Enter on a sidebar row —
+        // which is the #260 flapping this flag exists to prevent. Arming is
+        // what has to be refused; there is nothing left to consult later.
+        if self.sidebar_auto_hide && self.show_tree && !self.sidebar_auto_hide_suspended {
             self.sidebar_dwell.arm(std::time::Instant::now());
         }
     }

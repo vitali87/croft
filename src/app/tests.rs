@@ -30873,6 +30873,13 @@ fn auto_hide_is_suppressed_while_dragging_prompting_or_in_zen_mode() {
     app.splitter_drag = Some(SplitterDrag::Sidebar);
     assert!(!app.sidebar_auto_hide_allowed(), "a drag suppresses it");
     app.focus_pane(Pane::Editor);
+    // Tick past the delay: since #302 defers the collapse, asserting
+    // `show_tree` right after the focus move is true for any deferring
+    // implementation and says nothing about the drag suppression.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(std::time::Instant::now() + AUTO_HIDE_DWELL),
+        "the drag suppresses the collapse even once the window elapses"
+    );
     assert!(app.show_tree, "and the sidebar survives the drag");
     app.splitter_drag = None;
 
@@ -31112,7 +31119,15 @@ fn auto_hide_yields_to_real_modal_overlays_and_explorer_drags() {
     app.activity_bar_visible = true;
 
     // A focus move the user did not ask for is not a reason to hide chrome.
+    // Tick PAST the grace delay: with the collapse deferred (#302), asserting
+    // `show_tree` right after the focus move is trivially true for any
+    // implementation that defers, suppressed or not. The suppression is only
+    // observable once the window has elapsed.
     app.without_auto_hide(|a| a.focus_pane(Pane::Editor));
+    assert!(
+        !app.tick_sidebar_auto_hide_at(std::time::Instant::now() + AUTO_HIDE_DWELL),
+        "a programmatic focus move must not collapse, even after the delay"
+    );
     assert!(app.show_tree, "programmatic focus leaves the sidebar alone");
 }
 
@@ -31153,6 +31168,20 @@ fn a_click_passing_through_the_sidebar_does_not_collapse_it() {
         app.show_tree,
         "a click through the panel leaves it exactly where it was"
     );
+
+    // Tick PAST the delay. Without this the test passes against any
+    // implementation that merely defers — including one that never collapses
+    // at all — because `show_tree` is trivially still set before the window
+    // elapses. The claim is that the return to the sidebar CANCELLED the
+    // collapse, and only a tick past the deadline can show that.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(std::time::Instant::now() + AUTO_HIDE_DWELL),
+        "the return to the sidebar cancelled the pending collapse outright"
+    );
+    assert!(
+        app.show_tree,
+        "so the panel is still up after the window closes"
+    );
 }
 
 /// #302: a focus move that stays away must still collapse — the grace delay is
@@ -31176,9 +31205,20 @@ fn leaving_the_sidebar_arms_a_collapse_rather_than_doing_it_immediately() {
     // Several more focus moves land inside the grace window. None of them may
     // collapse it, and — the trap the issue names — none may push the
     // deadline out either, which the timer's own unit tests pin.
+    let armed_at = std::time::Instant::now();
     app.focus_pane(Pane::Terminal);
     app.focus_pane(Pane::Editor);
     assert!(app.show_tree, "still up while the window is open");
+
+    // The deadline is measured from the FIRST arm, not the last focus move, so
+    // a tick at the original deadline still fires. Without this the pane hops
+    // above prove nothing: `show_tree` is set either way before any tick, and
+    // a re-arming bug that pushed the deadline out would pass unnoticed.
+    assert!(
+        app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL),
+        "the hops did not push the deadline out — it fires on the original one"
+    );
+    assert!(!app.show_tree, "and the collapse actually happened");
 }
 
 // Sidebar auto-hide tests, a trap worth knowing before you write one: routing
