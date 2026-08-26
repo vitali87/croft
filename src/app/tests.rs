@@ -29645,10 +29645,11 @@ fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
     std::fs::write(
         tmp.path().join(".vscode/launch.json"),
         r#"{ "configurations": [
-            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" }
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py" }
         ],
         "compounds": [
-            { "name": "Full Stack", "configurations": ["Server"] },
+            { "name": "Full Stack", "configurations": ["Server", "Client"] },
             { "name": "Broken", "configurations": ["Server", "Missing"] }
         ]}"#,
     )
@@ -29659,8 +29660,8 @@ fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
     let picker = app.list_picker.as_ref().expect("picker open");
     assert_eq!(
         picker.rows.len(),
-        4,
-        "zero-config entry + one configuration + two compounds"
+        5,
+        "zero-config entry + two configurations + two compounds"
     );
     let compound_row = picker
         .rows
@@ -29679,8 +29680,11 @@ fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
         compound_row.id
     );
 
-    // Selecting a resolvable compound says why it cannot run yet, and names
-    // the issue rather than failing silently or launching one member.
+    // Selecting a resolvable MULTI-MEMBER compound says why it cannot run yet,
+    // and names the issue rather than failing silently or launching one member.
+    // The arity matters: a one-member compound needs a single session and now
+    // launches (see `a_single_member_compound_launches_...`), so #310's
+    // deferral is about compounds that genuinely need several at once.
     let idx = picker
         .rows
         .iter()
@@ -31327,5 +31331,79 @@ fn problem_scope_config_tokens_round_trip() {
     assert_eq!(
         ProblemScope::from_config("nonsense"),
         ProblemScope::WholeProject
+    );
+}
+
+/// #310 defers compounds that need SEVERAL debug sessions at once. A compound
+/// naming ONE configuration needs exactly one session, which croft has run
+/// since #250 — so refusing it cites a limitation that does not apply and
+/// tells the user something false about their own launch.json.
+///
+/// `parse_compounds` rejects only an EMPTY member list, so a one-member
+/// compound parses and reaches the launch site, where the `Ok(_)` arm reports
+/// the #310 message without ever consulting `configurations.len()`. This is a
+/// relocated-decision leftover: the member list is resolved, then the arm that
+/// consumes it answers a question about session count without reading it.
+#[test]
+fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" }
+        ],
+        "compounds": [
+            { "name": "Just Server", "configurations": ["Server"] },
+            { "name": "Both", "configurations": ["Server", "Server"] }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.open_debug_config_picker();
+    let idx = app
+        .list_picker
+        .as_ref()
+        .expect("picker open")
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Just Server"))
+        .expect("the one-member compound is listed");
+    app.list_picker.as_mut().unwrap().selected = idx;
+    app.confirm_list_picker();
+
+    assert!(
+        !app.status.contains("#310"),
+        "a one-member compound needs ONE session, so the multi-session \
+         deferral does not apply to it: {}",
+        app.status
+    );
+    assert_eq!(
+        app.selected_debug_config.as_deref(),
+        Some("Server"),
+        "it launches its single member, exactly as selecting that \
+         configuration directly would"
+    );
+
+    // The guard that must stay GREEN: this fix must not be satisfiable by
+    // launching EVERY compound. A genuinely multi-session compound is still
+    // deferred, and still says so.
+    app.open_debug_config_picker();
+    let multi = app
+        .list_picker
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Both"))
+        .expect("the two-member compound is listed");
+    app.list_picker.as_mut().unwrap().selected = multi;
+    app.confirm_list_picker();
+    assert!(
+        app.status.contains("#310"),
+        "a compound that really does need several sessions is still deferred, \
+         and still names the issue: {}",
+        app.status
     );
 }

@@ -17542,7 +17542,8 @@ impl App {
         self.run_debug.feedback = None;
         self.run_debug.feedback_is_error = false;
         // The launch.json config row (#250): count + F5 selection. Discovery
-        // is two small file reads and this only runs on active-file changes.
+        // re-reads the same two small files once per helper — four reads — and
+        // this only runs on active-file changes.
         // Compounds count too — the row is the documented route to the picker,
         // and the picker lists them, so counting only configurations makes the
         // row vanish for a compounds-only workspace and undercount otherwise.
@@ -21390,16 +21391,26 @@ impl App {
                         let all = crate::dap::configs::discover_configs_all(
                             &self.active_workspace_root(),
                         );
-                        let msg = match crate::dap::configs::resolve_compound(compound, &all) {
-                            Err(e) => e,
-                            // Resolvable: the only thing stopping it is the
-                            // unbuilt multi-session model.
-                            Ok(_) => format!(
+                        // #310 defers compounds that need SEVERAL sessions at
+                        // once. A compound naming ONE configuration needs one,
+                        // which croft has run since #250 — so the arity has to
+                        // be READ here rather than assumed. Reporting the
+                        // multi-session limit for a one-member compound cites
+                        // a limitation that does not apply and tells the user
+                        // something false about their own launch.json.
+                        match crate::dap::configs::resolve_compound(compound, &all) {
+                            Err(e) => self.debug_error(e),
+                            Ok(members) if members.len() == 1 => {
+                                let cfg = members[0].clone();
+                                self.selected_debug_config = Some(cfg.name.clone());
+                                self.run_debug.selected_config = Some(cfg.name.clone());
+                                self.launch_debug_config(&cfg);
+                            }
+                            Ok(_) => self.debug_error(format!(
                                 "compound \"{}\" needs several debug sessions at once, which croft does not support yet (#310)",
                                 compound.name
-                            ),
-                        };
-                        self.debug_error(msg);
+                            )),
+                        }
                     }
                 } else if row.id == "active" {
                     self.selected_debug_config = None;

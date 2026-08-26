@@ -62,10 +62,6 @@ pub fn discover_compounds(root: &Path) -> Vec<Compound> {
     out
 }
 
-/// Every configuration the workspace declares: `.croft/launch.json` first
-/// (croft-native, same schema, no `.vscode/` directory required), then
-/// `.vscode/launch.json`. Both are JSONC-tolerant. Order is preserved so the
-/// picker lists them as written; duplicate names keep the first occurrence.
 /// Every configuration from every file, duplicates kept, in file-precedence
 /// order. [`discover_configs`] is the picker's list and drops a lower-precedence
 /// duplicate by name; a compound needs the ones it dropped, because its members
@@ -84,6 +80,10 @@ pub fn discover_configs_all(root: &Path) -> Vec<DebugConfig> {
     out
 }
 
+/// Every configuration the workspace declares: `.croft/launch.json` first
+/// (croft-native, same schema, no `.vscode/` directory required), then
+/// `.vscode/launch.json`. Both are JSONC-tolerant. Order is preserved so the
+/// picker lists them as written; duplicate names keep the first occurrence.
 pub fn discover_configs(root: &Path) -> Vec<DebugConfig> {
     let mut out: Vec<DebugConfig> = Vec::new();
     for (rel, source) in [
@@ -1119,7 +1119,7 @@ mod tests {
         }"#;
         // Precondition: the configurations themselves parse, so a compound
         // finding nothing cannot be blamed on the file being unreadable.
-        let cfgs = parse_launch_json(text, "test");
+        let cfgs = parse_launch_json(text, ".vscode/launch.json");
         assert_eq!(cfgs.len(), 2, "precondition: both configurations parsed");
 
         let compounds = parse_compounds(text, ".vscode/launch.json");
@@ -1137,7 +1137,7 @@ mod tests {
             "configurations": [ { "name": "Server", "type": "node", "program": "s.js" } ],
             "compounds": [ { "name": "Both", "configurations": ["Server", "Ghost"] } ]
         }"#;
-        let cfgs = parse_launch_json(text, "test");
+        let cfgs = parse_launch_json(text, ".vscode/launch.json");
         let compounds = parse_compounds(text, ".vscode/launch.json");
         assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
 
@@ -1160,7 +1160,7 @@ mod tests {
             ],
             "compounds": [ { "name": "Both", "configurations": ["Server", "Client"] } ]
         }"#;
-        let cfgs = parse_launch_json(text, "test");
+        let cfgs = parse_launch_json(text, ".vscode/launch.json");
         let compounds = parse_compounds(text, ".vscode/launch.json");
         let members = resolve_compound(&compounds[0], &cfgs).unwrap();
         assert_eq!(
