@@ -31640,6 +31640,59 @@ fn a_manual_reveal_cancels_a_pending_collapse() {
     assert!(app.show_tree, "the sidebar is still up");
 }
 
+/// #302: Zen entry must drop the reveal pin as well as the dwell. Zen sets
+/// BOTH structural conditions — `activity_bar_visible = false` and
+/// `zen_mode = true` — so `toggle_side_bar`'s reason for refusing to bank a
+/// pin there ("no collapse can fire for as long as it lasts") applies in full
+/// to a pin already held.
+///
+/// This is a REGRESSION guard, not just an edge case: on main
+/// `maybe_auto_hide_sidebar` did an unconditional `mem::take` of the pin on
+/// every focus move into the editor or terminal, so any move during or after
+/// Zen cleared it. Moving consumption to fire time removed that incidental
+/// cleanup, and nothing replaced it at the Zen boundary.
+#[test]
+fn entering_zen_mode_drops_the_reveal_pin_as_well_as_the_dwell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = false;
+
+    // A deliberate Cmd+B reveal banks the one-shot exemption.
+    app.toggle_side_bar();
+    assert!(
+        app.show_tree && app.sidebar_pinned_open,
+        "precondition: the reveal banked a pin"
+    );
+
+    app.toggle_zen_mode();
+    assert!(app.zen_mode, "precondition: Zen is on");
+    assert!(
+        !app.sidebar_pinned_open,
+        "Zen entry drops the pin: no collapse can fire while Zen owns the \
+         chrome, so a pin held across it is unconsumable and eats the first \
+         real collapse afterwards"
+    );
+
+    // The user-visible consequence: after Zen, the next deliberate focus move
+    // collapses as expected rather than being silently exempted.
+    app.toggle_zen_mode();
+    assert!(
+        !app.zen_mode && app.show_tree,
+        "precondition: Zen off, sidebar back"
+    );
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is live again"
+    );
+    let t0 = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.tick_sidebar_auto_hide_at(t0 + AUTO_HIDE_DWELL * 2),
+        "and it fires — no stale pin from before Zen absorbed it"
+    );
+}
+
 /// #302: Zen Mode is a STRUCTURAL suppression, not a transient one. The tick
 /// stays armed when a drag or a palette defers a collapse, because those end in
 /// moments — but Zen can last the session, and a dwell left armed across it

@@ -9345,7 +9345,16 @@ impl App {
             // session, and a dwell left armed would fire on the frame Zen
             // exits — a collapse the user long since stopped associating with
             // the focus move that armed it.
+            //
+            // The pin goes too, for the reason `toggle_side_bar` refuses to
+            // bank one here: Zen sets both structural conditions, so no
+            // collapse can fire while it lasts and a pin held across it is
+            // unconsumable — it would silently eat the first real collapse
+            // after Zen exits. Main cleared this incidentally, by taking the
+            // pin on every focus move; consuming at fire time instead is
+            // correct but leaves this boundary to say so explicitly.
             self.sidebar_dwell.disarm();
+            self.sidebar_pinned_open = false;
             self.secondary_side_bar_visible = false;
             self.show_terminal = false;
             self.zen_mode = true;
