@@ -629,6 +629,11 @@ macOS — for the same reporting reason.
 pointer, so user bindings do not fire there; hold `shift` to bypass, the same
 rule croft's built-in scroll follows.
 
+The pane **border** is the exception: it sits outside the grid the child is
+ever told about, so a binding there fires normally however the TUI is
+tracking. Same carve-out croft's built-in wheel makes — a notch on the border
+scrolls croft rather than vanishing into a program that cannot receive it.
+
 Note that `shift` is *also* part of a gesture's identity, so bypassing selects
 a different row rather than rescuing the one you already have: over a tracking
 TUI, a `ctrl+click` binding stays silent no matter what, and the row that fires

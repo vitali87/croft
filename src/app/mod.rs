@@ -28038,13 +28038,6 @@ impl App {
                 }
             },
             Cmd::MouseOpenLinkAtClick => match self.last_mouse_pos {
-                // Same refusal its siblings make: `buffer_pos_at` maps cells
-                // from the TEXT layout, so on a diff/sheet/hex/log view it
-                // still returns a position and the editor lookup below would
-                // read links belonging to a buffer the user is not looking at.
-                Some(_) if self.editor.has_non_text_view() => {
-                    self.status = String::from("No links in this view");
-                }
                 Some((col, row)) => {
                     // `editor` is the DEFAULT `when` region, so the most
                     // natural binding for this command lands there. Both
@@ -28052,19 +28045,33 @@ impl App {
                     // and return false anywhere else, so consulting only them
                     // made the command a permanent no-op in its own default
                     // region -- reporting "No link there" over a link that is.
-                    let followed = self
-                        .editor
-                        .buffer_pos_at(col, row)
-                        .and_then(|(line, c)| {
-                            self.editor.document_link_at(line, c).map(str::to_string)
-                        })
-                        .inspect(|target| self.open_document_link(target))
-                        .is_some();
+                    // The refusal belongs to the EDITOR lookup only. Its
+                    // reason — `buffer_pos_at` maps cells from the TEXT
+                    // layout, so a diff/sheet/hex/log view still yields a
+                    // position and we would read links from a buffer the user
+                    // is not looking at — says nothing about the terminal
+                    // helpers below, which read `self.terminal()` alone. The
+                    // built-in this command replaces guards neither, so a
+                    // guard spanning both made the bound command diverge from
+                    // it in the opposite direction to the one being fixed.
+                    let followed = !self.editor.has_non_text_view()
+                        && self
+                            .editor
+                            .buffer_pos_at(col, row)
+                            .and_then(|(line, c)| {
+                                self.editor.document_link_at(line, c).map(str::to_string)
+                            })
+                            .inspect(|target| self.open_document_link(target))
+                            .is_some();
                     if !followed
                         && !self.terminal_url_click(col, row)
                         && !self.terminal_file_click(col, row)
                     {
-                        self.status = String::from("No link there");
+                        self.status = String::from(if self.editor.has_non_text_view() {
+                            "No links in this view"
+                        } else {
+                            "No link there"
+                        });
                     }
                 }
                 None => {

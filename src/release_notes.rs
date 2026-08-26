@@ -62,7 +62,7 @@ pub struct ReleaseNote {
 pub const RELEASE_NOTES: &[ReleaseNote] = &[
     ReleaseNote {
         kind: NoteKind::Feature,
-        summary: "Mouse gestures are yours to bind: keybindings.json now takes ctrl/alt/shift-modified clicks, middle click, right click and the wheel, scoped per region — A binding croft cannot honour says so in OUTPUT instead of failing silently.",
+        summary: "Mouse gestures are yours to bind: keybindings.json now takes ctrl/alt/shift-modified clicks, middle click, right click and the wheel, scoped per region. A binding croft cannot honour says so in OUTPUT instead of failing silently.",
     },
     ReleaseNote {
         kind: NoteKind::Fix,

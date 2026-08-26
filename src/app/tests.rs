@@ -1658,6 +1658,70 @@ fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
 }
 
 #[test]
+fn a_terminal_link_binding_is_not_refused_for_an_editor_side_reason() {
+    // `MouseOpenLinkAtClick` spans two panes: it tries the editor's document
+    // link, then falls through to the terminal helpers. The `has_non_text_view`
+    // guard was placed on the whole ARM, but its justification — `buffer_pos_at`
+    // maps cells from the TEXT layout, so a diff/hex view yields a position
+    // into a buffer the user is not looking at — is about the EDITOR lookup
+    // only. `terminal_url_click`/`terminal_file_click` read `self.terminal()`
+    // and are independent of editor view state.
+    //
+    // The built-in this command replaces guards neither, so an arm-wide guard
+    // made the bound command diverge from the built-in in the opposite
+    // direction to the one the guard was added to fix.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    // `App::new` + direct keymap assignment, matching the sibling OSC 8 tests:
+    // `tree_app_with_keymap` focuses the TREE, which lays the panes out
+    // differently and moves the terminal's `last_area`.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "mouse_open_link_at_click", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // The editor shows a hex preview of an UNRELATED file — the state the
+    // guard exists for, and which has nothing to do with the terminal.
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+    assert!(
+        app.editor.has_non_text_view(),
+        "precondition: the editor must be on a non-text view, or the guard \
+         never fires and this test is about the ordinary path"
+    );
+
+    // A non-web OSC 8 link in the terminal: resolves via `hyperlink_at_screen`,
+    // then `open_detected_url` refuses the scheme INERTLY. A web URL would
+    // reach `open_url` and launch a real browser.
+    app.terminals[0].feed_bytes_for_test(b"\x1b]8;;mailto:t@example.com\x1b\\link\x1b]8;;\x1b\\");
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.terminals[0].last_area;
+    let (col, row) = (area.x + 2, area.y + 1);
+    assert_eq!(
+        app.terminals[0].hyperlink_at_screen(col, row).as_deref(),
+        Some("mailto:t@example.com"),
+        "precondition: the click must land on the terminal link, or a refusal \
+         proves nothing about which branch refused it"
+    );
+
+    app.focus_pane(Pane::Terminal);
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    assert_eq!(
+        app.status, "Refused to open non-web link: mailto:t@example.com",
+        "a TERMINAL-region link binding must reach the terminal helpers even \
+         while the EDITOR shows a hex preview of an unrelated file: the guard's \
+         reason does not apply to a pane it does not read"
+    );
+}
+
+#[test]
 fn the_at_click_commands_all_refuse_a_non_text_view() {
     // All three At Click commands guard on `has_non_text_view`, because
     // `buffer_pos_at` maps cells from the TEXT layout and still returns a
@@ -2000,7 +2064,14 @@ fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one()
     assert_eq!(app.terminals.len(), 2, "two panes are visible");
 
     // The URL is printed into pane 0 only, while pane 1 holds focus.
-    app.terminals[0].feed_bytes_for_test(b"https://example.com/zero\r\n");
+    // An OSC 8 hyperlink with a NON-WEB scheme, not a printed http(s) URL.
+    // `terminal_url_click` checks `hyperlink_at_screen` before text sniffing,
+    // so this resolves; and `open_detected_url` then refuses a non-web scheme
+    // inertly. A printed https URL would reach `open_url`, which is
+    // `Command::new("open")` with no test guard — the suite would launch a
+    // real browser on every run (#307's spawning class).
+    app.terminals[0]
+        .feed_bytes_for_test(b"\x1b]8;;mailto:zero@example.com\x1b\\zero-link\x1b]8;;\x1b\\\r\n");
     app.active_terminal = 1;
     term.draw(|f| app.render(f)).unwrap();
 
@@ -2011,11 +2082,10 @@ fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one()
     // for entirely the wrong reason.
     let area = app.terminals[0].last_area;
     let (col, row) = (area.x + 2, area.y + 1);
-    assert!(
-        app.terminals[0]
-            .line_text_at(col, row)
-            .is_some_and(|(t, _)| t.trim_end() == "https://example.com/zero"),
-        "the click must land on the URL, or a refusal proves nothing"
+    assert_eq!(
+        app.terminals[0].hyperlink_at_screen(col, row).as_deref(),
+        Some("mailto:zero@example.com"),
+        "the click must land on the OSC 8 link, or a refusal proves nothing"
     );
     let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
     ev.modifiers = KeyModifiers::CONTROL;
