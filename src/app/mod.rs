@@ -9288,6 +9288,12 @@ impl App {
         // answer: refuse to bank it rather than hold it indefinitely.
         self.sidebar_pinned_open =
             self.show_tree && self.sidebar_auto_hide && self.activity_bar_visible && !self.zen_mode;
+        // A deliberate toggle supersedes any pending automatic collapse: the
+        // dwell was armed against a sidebar state the user has since changed by
+        // hand. Leaving it armed lets a later idle tick fire against the NEW
+        // state — spending the pin this reveal just banked on a collapse the
+        // user never saw, which is #294 reached by a different door.
+        self.sidebar_dwell.disarm();
         // Hiding the sidebar while Run-Debug was on screen: arm the same
         // OSC-1337 image-cell evict gate that fires on a sidebar-view change.
         // Without this the bug+play icon ghosts on top of the editor /
@@ -9335,6 +9341,11 @@ impl App {
             self.activity_bar_visible = false;
             self.status_bar_visible = false;
             self.show_tree = false;
+            // Zen is structural, not a transient suppression: it can last the
+            // session, and a dwell left armed would fire on the frame Zen
+            // exits — a collapse the user long since stopped associating with
+            // the focus move that armed it.
+            self.sidebar_dwell.disarm();
             self.secondary_side_bar_visible = false;
             self.show_terminal = false;
             self.zen_mode = true;

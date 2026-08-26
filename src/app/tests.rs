@@ -31439,6 +31439,104 @@ fn a_transiently_suppressed_collapse_is_retried_once_the_suppression_lifts() {
     assert!(!app.show_tree, "and the sidebar is finally down");
 }
 
+/// #302: a deliberate Cmd+B reveal supersedes a pending automatic collapse.
+/// Once a declined tick stays ARMED (so a transient suppression defers rather
+/// than cancels), the dwell can outlive the sidebar state it was armed
+/// against: the user hides and re-reveals by hand, the reveal banks its
+/// one-shot pin, and the very next idle frame tick finds the stale dwell due
+/// and spends that pin on a collapse nobody ever saw. The next focus move then
+/// takes the sidebar down — the #294 bug, reached by a different door.
+#[test]
+fn a_manual_reveal_cancels_a_pending_collapse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is live here"
+    );
+
+    app.focus_pane(Pane::Editor);
+    let armed_at = std::time::Instant::now();
+
+    // A modal defers the collapse. It stays armed by design (that is the
+    // transient-suppression retry this PR added).
+    app.command_palette = Some(crate::widgets::command_palette::CommandPalette::new());
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 5),
+        "precondition: the palette defers this collapse"
+    );
+    app.command_palette = None;
+
+    // The user hides and re-reveals the sidebar by hand.
+    app.toggle_side_bar();
+    app.toggle_side_bar();
+    assert!(
+        app.show_tree && app.sidebar_pinned_open,
+        "precondition: the manual reveal banked a one-shot pin"
+    );
+
+    // An IDLE frame tick — no focus move, no gesture at all.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 6),
+        "an idle tick must not collapse a sidebar the user just revealed"
+    );
+    assert!(
+        app.sidebar_pinned_open,
+        "and must not spend the pin on a collapse the user never saw"
+    );
+
+    // So the deliberate reveal still holds across the next move out.
+    app.focus_pane(Pane::Editor);
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 20),
+        "the reveal survives the next focus move, as #294 guarantees"
+    );
+    assert!(app.show_tree, "the sidebar is still up");
+}
+
+/// #302: Zen Mode is a STRUCTURAL suppression, not a transient one. The tick
+/// stays armed when a drag or a palette defers a collapse, because those end in
+/// moments — but Zen can last the session, and a dwell left armed across it
+/// fires on the very frame Zen exits, collapsing the sidebar for a focus move
+/// the user made an hour earlier.
+#[test]
+fn entering_zen_mode_cancels_a_pending_collapse_rather_than_deferring_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is live here"
+    );
+
+    app.focus_pane(Pane::Editor);
+    let armed_at = std::time::Instant::now();
+
+    // Zen takes over the chrome while the collapse is still pending.
+    app.toggle_zen_mode();
+    assert!(app.zen_mode, "precondition: Zen is on");
+    assert!(!app.show_tree, "precondition: Zen hid the sidebar");
+
+    // The user works in Zen for a long time, then leaves.
+    app.toggle_zen_mode();
+    assert!(!app.zen_mode, "precondition: Zen is off");
+    assert!(
+        app.show_tree,
+        "precondition: leaving Zen restored the sidebar"
+    );
+
+    // A tick far past the original deadline must not fire: that collapse
+    // belonged to a focus move from before Zen.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 1000),
+        "a collapse armed before Zen must not fire on the frame Zen exits"
+    );
+    assert!(app.show_tree, "so the restored sidebar stays up");
+}
+
 /// #256 step 1: a server that publishes project-wide diagnostics (rust-analyzer
 /// does this from `cargo check`) names files the user never opened. The panel
 /// builds from the diagnostics store rather than from open buffers, so those
