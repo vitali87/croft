@@ -31136,10 +31136,9 @@ fn auto_hide_yields_to_real_modal_overlays_and_explorer_drags() {
 /// itself, so the panel flapped; the collapse now waits out a grace delay, and
 /// a return to the sidebar inside that window cancels it outright.
 ///
-/// Deliberately written against the PUBLIC surface only (`focus_pane` and
-/// `show_tree`), so it fails on the missing BEHAVIOUR rather than on a missing
-/// method — the clock-injected assertions live in the tests below, which can
-/// only exist once the timer does.
+/// Written against `focus_pane` and `show_tree` alone, so it fails on the
+/// missing BEHAVIOUR rather than on a missing method. The clock-injected
+/// assertions live in the tests below.
 #[test]
 fn a_click_passing_through_the_sidebar_does_not_collapse_it() {
     let tmp = tempfile::tempdir().unwrap();
@@ -31211,6 +31210,14 @@ fn leaving_the_sidebar_arms_a_collapse_rather_than_doing_it_immediately() {
     // Several more focus moves land inside the grace window. None of them may
     // collapse it, and — the trap the issue names — none may push the
     // deadline out either, which the timer's own unit tests pin.
+    //
+    // Stamped AFTER the arming move on purpose. `due` is `>=`, so an exact
+    // deadline would be fine, but a stamp taken BEFORE `focus_pane` is strictly
+    // earlier than the anchor `focus_pane` records — `armed_at + DWELL` would
+    // then land before the real deadline and the tick would correctly decline.
+    // Taken here it is a hair LATER than the anchor, so the tick is genuinely
+    // due; the re-arming bug this guards against would push the deadline a full
+    // AUTO_HIDE_DWELL out, far beyond that sub-microsecond slack.
     let armed_at = std::time::Instant::now();
     app.focus_pane(Pane::Terminal);
     app.focus_pane(Pane::Editor);
@@ -31910,5 +31917,84 @@ fn problem_scope_config_tokens_round_trip() {
     assert_eq!(
         ProblemScope::from_config("nonsense"),
         ProblemScope::WholeProject
+    );
+}
+
+/// #302: a dwell must not be ARMED while a structural suppression is already
+/// in force. This is the one instance of the class that no entry-site disarm
+/// can catch, and it is worth being explicit about why.
+///
+/// `entering_zen_mode_cancels_a_pending_collapse_rather_than_deferring_it`
+/// covers arming BEFORE Zen: there is a transition, Zen entry sees it, and the
+/// entry hook disarms. Here the dwell is armed DURING Zen — Cmd+B still works
+/// inside Zen, and a focus move afterwards arms as usual — so the suppression
+/// is never entered while the dwell is live. There is no transition, so there
+/// is no boundary to hook, and every existing disarm site is structurally
+/// blind to it.
+///
+/// The consequence is user-visible and delayed: the arm declines at fire time
+/// via `!sidebar_auto_hide_allowed()` and stays armed BY DESIGN (transient
+/// suppressions must retry). Zen is not transient. An hour later the user
+/// leaves Zen and the next 8ms tick collapses the sidebar for a focus move
+/// they made an hour earlier, silently spending any pin with it.
+///
+/// The fix is therefore not a sixth boundary: `maybe_auto_hide_sidebar` must
+/// refuse to arm under a structural suppression at all, mirroring what
+/// `toggle_side_bar` already does for the pin at the same four conditions.
+#[test]
+fn arming_inside_zen_mode_does_not_collapse_the_sidebar_when_zen_exits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = false;
+
+    // Into Zen FIRST, so there is no pending dwell for Zen entry to cancel.
+    app.toggle_zen_mode();
+    assert!(app.zen_mode, "precondition: Zen is on");
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "precondition: Zen structurally suppresses the collapse"
+    );
+
+    // Cmd+B works inside Zen, and the user opens the sidebar to look at a file.
+    app.toggle_side_bar();
+    assert!(app.show_tree, "precondition: the sidebar is up inside Zen");
+    assert!(
+        !app.sidebar_pinned_open,
+        "precondition: toggle_side_bar already refuses to bank a pin under a \
+         structural suppression — this test is about the DWELL, which does not"
+    );
+
+    // Focus moves away, exactly as it would outside Zen. This is the arm that
+    // no entry site can see: the suppression was already in force.
+    let t0 = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        !app.sidebar_dwell.armed(),
+        "arming under a structural suppression is refused at the source: the \
+         collapse cannot fire while Zen lasts, and a dwell left armed across \
+         it has no boundary left to cancel it"
+    );
+
+    // The user-visible failure, spelled out. Zen exit RESTORES the pre-Zen
+    // snapshot, so the sidebar this test opened inside Zen is closed again on
+    // the way out — that part is by design and not what is under test. Reopen
+    // it, then check that no stale collapse from the in-Zen focus move is still
+    // pending to fire on the next tick.
+    app.toggle_zen_mode();
+    assert!(!app.zen_mode, "precondition: Zen is off again");
+    app.show_tree = true;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is structurally possible again"
+    );
+    assert!(
+        !app.tick_sidebar_auto_hide_at(t0 + AUTO_HIDE_DWELL * 2),
+        "and no stale collapse fires after Zen exits, for a focus move made \
+         while Zen was still on"
+    );
+    assert!(
+        app.show_tree,
+        "the sidebar is still up: the user asked for it and never asked otherwise"
     );
 }

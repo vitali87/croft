@@ -12872,7 +12872,29 @@ impl App {
         // async MCP result, the launch-time file open, Enter on a sidebar row —
         // which is the #260 flapping this flag exists to prevent. Arming is
         // what has to be refused; there is nothing left to consult later.
-        if self.sidebar_auto_hide && self.show_tree && !self.sidebar_auto_hide_suspended {
+        //
+        // The STRUCTURAL suppressions (Zen Mode, hidden activity bar) belong in
+        // that same category, for the same reason. `tick_sidebar_auto_hide_at`
+        // says structural cases "are handled where they are ENTERED rather than
+        // here" — true of every case where a transition exists, and false of
+        // this one. Cmd+B works inside Zen, so the dwell can be armed while the
+        // suppression is ALREADY in force: no boundary is crossed, so no entry
+        // hook can fire, and the tick's `!allowed()` decline deliberately stays
+        // armed (correct for transient suppressions, which end in moments).
+        // Zen can last the session, and the collapse then lands on the frame
+        // Zen exits — for a focus move the user made an hour earlier, spending
+        // any pin with it.
+        //
+        // So refuse to ARM under a suppression that no later event will lift on
+        // its own. This mirrors `toggle_side_bar`, which already declines to
+        // bank a pin on exactly these four conditions; matching them here is
+        // what stops each new exit boundary from needing its own disarm.
+        if self.sidebar_auto_hide
+            && self.show_tree
+            && !self.sidebar_auto_hide_suspended
+            && self.activity_bar_visible
+            && !self.zen_mode
+        {
             self.sidebar_dwell.arm(std::time::Instant::now());
         }
     }
