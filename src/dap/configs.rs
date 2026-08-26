@@ -66,6 +66,24 @@ pub fn discover_compounds(root: &Path) -> Vec<Compound> {
 /// (croft-native, same schema, no `.vscode/` directory required), then
 /// `.vscode/launch.json`. Both are JSONC-tolerant. Order is preserved so the
 /// picker lists them as written; duplicate names keep the first occurrence.
+/// Every configuration from every file, duplicates kept, in file-precedence
+/// order. [`discover_configs`] is the picker's list and drops a lower-precedence
+/// duplicate by name; a compound needs the ones it dropped, because its members
+/// name configurations in ITS OWN file and both files may use the same name.
+pub fn discover_configs_all(root: &Path) -> Vec<DebugConfig> {
+    let mut out: Vec<DebugConfig> = Vec::new();
+    for (rel, source) in [
+        (".croft/launch.json", ".croft/launch.json"),
+        (".vscode/launch.json", ".vscode/launch.json"),
+    ] {
+        let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        out.extend(parse_launch_json(&text, source));
+    }
+    out
+}
+
 pub fn discover_configs(root: &Path) -> Vec<DebugConfig> {
     let mut out: Vec<DebugConfig> = Vec::new();
     for (rel, source) in [
@@ -181,7 +199,10 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
 }
 
 /// Resolve a compound's member names against the configurations declared
-/// beside it, in the compound's own order. Errors naming the first member that
+/// beside it, in the compound's own order. Pass [`discover_configs_all`], not
+/// [`discover_configs`]: the latter drops a lower-precedence duplicate by name,
+/// which is exactly the entry a `.vscode` compound naming that name needs, so
+/// the source preference below would have nothing to prefer. Errors naming the first member that
 /// does not exist — launching the subset that happens to resolve would debug
 /// something other than what the user asked for, and silently.
 pub fn resolve_compound<'a>(
@@ -957,9 +978,19 @@ mod tests {
               {"name":"Server","type":"node","request":"launch","program":"vscode.js"}],
             "compounds":[{"name":"VsCompound","configurations":["Server"]}]}"#;
 
-        let mut configs = parse_launch_json(croft, ".croft/launch.json");
-        configs.extend(parse_launch_json(vscode, ".vscode/launch.json"));
-        let compounds = parse_compounds(vscode, ".vscode/launch.json");
+        // Through the PRODUCTION path, not hand-stitched input. Building the
+        // config list with two `parse_launch_json` calls asserts a property on
+        // an input shape the shipped program never produces: `discover_configs`
+        // keeps only the first occurrence per name, so the duplicate this
+        // preference exists to disambiguate would already be gone.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(tmp.path().join(".croft/launch.json"), croft).unwrap();
+        std::fs::write(tmp.path().join(".vscode/launch.json"), vscode).unwrap();
+
+        let configs = discover_configs_all(tmp.path());
+        let compounds = discover_compounds(tmp.path());
         assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
         assert_eq!(
             compounds[0].source, ".vscode/launch.json",
@@ -968,7 +999,17 @@ mod tests {
         assert_eq!(
             configs.iter().filter(|c| c.name == "Server").count(),
             2,
-            "precondition: both files declare a Server, so provenance decides"
+            "precondition: the list resolve_compound receives still holds BOTH \
+             Servers — `discover_configs` would have dropped one, leaving the \
+             source preference nothing to prefer"
+        );
+        assert_eq!(
+            discover_configs(tmp.path())
+                .iter()
+                .filter(|c| c.name == "Server")
+                .count(),
+            1,
+            "and the picker's list drops it, which is why the two lists differ"
         );
 
         let members = resolve_compound(&compounds[0], &configs).expect("resolves");

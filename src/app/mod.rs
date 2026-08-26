@@ -21383,10 +21383,14 @@ impl App {
                         // Resolve first: a compound naming a configuration no
                         // launch.json declares is a config error worth
                         // reporting now, separately from the unbuilt feature.
-                        let msg = match crate::dap::configs::resolve_compound(
-                            compound,
-                            &self.debug_configs,
-                        ) {
+                        // The un-deduped list: `debug_configs` is the picker's
+                        // display list and drops a lower-precedence duplicate by
+                        // name, which is the very entry a `.vscode` compound
+                        // naming that name has to bind.
+                        let all = crate::dap::configs::discover_configs_all(
+                            &self.active_workspace_root(),
+                        );
+                        let msg = match crate::dap::configs::resolve_compound(compound, &all) {
                             Err(e) => e,
                             // Resolvable: the only thing stopping it is the
                             // unbuilt multi-session model.
