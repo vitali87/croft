@@ -5,9 +5,11 @@ Thanks for hacking on croft. Build, run, and platform setup live in the
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). This guide covers the day to day
 developer workflow concerns that do not belong in any of those.
 
-If you are an AI agent, read [CLAUDE.md](CLAUDE.md) as well: it covers claiming
-work so concurrent sessions do not collide, and verifying that a review actually
-happened before merging. Everything in this guide applies to you too.
+Everything in this guide applies to AI agents too. Agents working this repo
+usually also keep a `CLAUDE.md` at the root — covering how to claim work so
+concurrent sessions do not collide, and how to verify a review actually
+happened before merging — but it is deliberately untracked and clone-local, so
+a fresh checkout will not have one and nothing here depends on it.
 
 ## Every shipped change is a release
 
