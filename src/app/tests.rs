@@ -1658,6 +1658,54 @@ fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
 }
 
 #[test]
+fn the_swallowed_prefix_click_dismisses_the_hover_and_tab_tooltip() {
+    // The sibling test above binds `ctrl+click` to a real command, so it takes
+    // the MATCHED branch. The swallow branch needs a gesture that matches
+    // NOTHING but is the first half of a bound double — a different arm, with
+    // its own early return, which for a while did none of the teardown.
+    //
+    // Deleting `dismiss_click_overlays` from the swallow branch leaves the
+    // whole suite green without this test, so the code was correct today and
+    // unguarded tomorrow.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+double_click", "command": "quick_open", "when": "editor"}]"#,
+    );
+    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+        String::from("stale hover"),
+        (1, 1),
+    ));
+    app.tab_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new(
+        String::from("stale tab tooltip"),
+        (1, 1),
+    ));
+
+    let mut ev = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        app.editor.last_inner.x + 4,
+        app.editor.last_inner.y + 1,
+    );
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    // Proves this took the SWALLOW path, not the matched one: only
+    // `ctrl+double_click` is bound, so a single click matches no command.
+    // Without this the test could pass via the sibling branch's teardown and
+    // say nothing about the swallow.
+    assert!(
+        app.file_finder.is_none(),
+        "the prefix click must NOT fire the bound double's command — if it \
+         did, this exercises the matched branch and not the swallow"
+    );
+    assert!(
+        app.hover_popup.is_none(),
+        "a swallowed prefix click must dismiss the hover it painted over, \
+         exactly as the matched branch does: it re-focuses the pane underneath"
+    );
+    assert!(app.tab_tooltip.is_none(), "and the tab tooltip with it");
+}
+
+#[test]
 fn every_mouse_binding_the_docs_show_actually_loads() {
     // Round 7 found `paste` and `page_up` in this example, neither of which is
     // a real command id: `Keymap::from_json` skipped both rows with a warning,

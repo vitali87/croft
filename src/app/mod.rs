@@ -27991,7 +27991,7 @@ impl App {
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
             // caret instead would make one command mean two things.
-            // Both arms refuse on a non-text view for the reason
+            // All three arms refuse on a non-text view for the reason
             // `trigger_definition_at` does: `buffer_pos_at` maps cells using
             // only the text layout, so on a diff/sheet/hex/image/archive tab
             // it happily returns a position into the stub text side. Acting
@@ -28016,6 +28016,13 @@ impl App {
                 Some(_) if self.editor.has_non_text_view() => {
                     self.status = String::from("No definitions in this view");
                 }
+                // The outer `buffer_pos_at` exists ONLY to produce a status
+                // when the click resolves to no buffer position: the built-in
+                // fails silently there, which is right for a gesture the user
+                // did not aim, but a command they bound deliberately should
+                // say why nothing happened. `trigger_definition_at` repeats
+                // the lookup internally — do not "simplify" this away, or the
+                // bound command goes mute on a miss.
                 Some((col, row)) => match self.editor.buffer_pos_at(col, row) {
                     // Delegate rather than re-implement: `trigger_definition_at`
                     // follows a server-resolved document link BEFORE asking for
@@ -28031,6 +28038,13 @@ impl App {
                 }
             },
             Cmd::MouseOpenLinkAtClick => match self.last_mouse_pos {
+                // Same refusal its siblings make: `buffer_pos_at` maps cells
+                // from the TEXT layout, so on a diff/sheet/hex/log view it
+                // still returns a position and the editor lookup below would
+                // read links belonging to a buffer the user is not looking at.
+                Some(_) if self.editor.has_non_text_view() => {
+                    self.status = String::from("No links in this view");
+                }
                 Some((col, row)) => {
                     // `editor` is the DEFAULT `when` region, so the most
                     // natural binding for this command lands there. Both
