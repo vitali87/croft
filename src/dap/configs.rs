@@ -146,16 +146,23 @@ pub fn parse_compounds(text: &str) -> Vec<Compound> {
             // Members may be bare names or `{ "folder": …, "name": … }`
             // objects in multi-root workspaces; croft resolves against one
             // root, so take the name either way rather than dropping the row.
+            //
+            // Collect FALLIBLY: one unusable member drops the whole compound
+            // rather than shrinking it to the members that happen to parse.
+            // `resolve_compound` already refuses to launch a subset when a
+            // member names no configuration; a malformed member is the same
+            // situation one boundary earlier, and silently running two of the
+            // three a user wrote is the outcome both guards exist to prevent.
             let configurations: Vec<String> = obj
                 .get("configurations")?
                 .as_array()?
                 .iter()
-                .filter_map(|m| match m {
+                .map(|m| match m {
                     Value::String(s) => Some(s.clone()),
                     Value::Object(o) => o.get("name")?.as_str().map(str::to_string),
                     _ => None,
                 })
-                .collect();
+                .collect::<Option<Vec<String>>>()?;
             if configurations.is_empty() {
                 return None;
             }
@@ -916,6 +923,30 @@ mod tests {
             compounds[0].configurations,
             vec!["Server", "Client"],
             "an object member contributes its name, exactly as a bare string does"
+        );
+    }
+
+    /// A compound with SOME unusable members must be dropped whole, not
+    /// silently shrunk to the ones that parse. `resolve_compound` already
+    /// refuses to launch a subset when a member names no configuration —
+    /// "launching the subset that happens to resolve would debug something
+    /// other than what the user asked for, and silently" — and a malformed
+    /// member is the same situation one boundary earlier.
+    #[test]
+    fn a_compound_with_one_unusable_member_is_dropped_rather_than_silently_shrunk() {
+        let text = r#"{"configurations":[
+              {"name":"A","type":"lldb","request":"launch"},
+              {"name":"B","type":"lldb","request":"launch"}],
+            "compounds":[
+              {"name":"Partial","configurations":["A", 7, "B"]},
+              {"name":"Whole","configurations":["A","B"]}]}"#;
+
+        let names: Vec<String> = parse_compounds(text).into_iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec!["Whole"],
+            "the compound with a malformed member is dropped entirely — shrinking \
+             it to [\"A\", \"B\"] would launch two of the three the user wrote"
         );
     }
 

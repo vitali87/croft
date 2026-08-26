@@ -21384,9 +21384,16 @@ impl App {
                             .map(|c| crate::dap::configs::resolve_compound(c, &self.debug_configs))
                         {
                             Some(Err(e)) => e,
-                            _ => format!(
+                            // Resolvable: the only thing stopping it is the
+                            // unbuilt multi-session model.
+                            Some(Ok(_)) => format!(
                                 "compound \"{name}\" needs several debug sessions at once, which croft does not support yet (#310)"
                             ),
+                            // The row named a compound the list no longer has —
+                            // reported as its own state rather than folded in
+                            // with #310, which would assert a resolution that
+                            // never happened.
+                            None => format!("compound \"{name}\" is no longer declared"),
                         };
                         self.debug_error(msg);
                     }
