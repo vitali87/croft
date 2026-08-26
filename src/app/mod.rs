@@ -34498,11 +34498,20 @@ impl App {
                 // for it, then fire on the first idle tick after the bar comes
                 // back, with no focus move of the user's own.
                 //
-                // Cancel the collapse but LEAVE THE PIN: a Cmd+B reveal is a
-                // separate deliberate act, and confiscating its one-shot
-                // exemption because the user also toggled the activity bar
-                // would spend it on a collapse that never happened.
+                // Cancel the collapse. And when the bar goes AWAY, drop the pin
+                // too — for the reason `toggle_side_bar` already refuses to bank
+                // one in that state: no collapse can fire while the bar is
+                // hidden, so a pin held across that period is unconsumable, and
+                // it silently eats the first real collapse after the bar
+                // returns. Those two sites disagreed about the same question
+                // until this line; the bank-time answer is the right one.
+                //
+                // Revealing the bar leaves any pin alone: a pin banked while the
+                // bar is visible belongs to a reveal that can still be honoured.
                 self.sidebar_dwell.disarm();
+                if !self.activity_bar_visible {
+                    self.sidebar_pinned_open = false;
+                }
                 self.persist_layout();
                 self.after_chrome_visibility_change();
                 self.open_customize_layout_menu_on(&MenuAction::ToggleActivityBar);

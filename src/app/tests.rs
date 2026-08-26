@@ -31524,8 +31524,20 @@ fn hiding_the_activity_bar_drops_a_pending_collapse_and_its_pin() {
     );
     assert!(app.show_tree, "so the sidebar is still up");
     assert!(
-        app.sidebar_pinned_open,
-        "and the pin was not spent on a collapse the user never saw"
+        !app.sidebar_pinned_open,
+        "and hiding the bar dropped the pin rather than holding an \
+         unconsumable one across a period where no collapse can fire — the \
+         same reason `toggle_side_bar` refuses to bank one in that state"
+    );
+
+    // The pin was dropped, so the next deliberate focus move collapses as the
+    // user expects rather than being silently exempted by a stale reveal.
+    let t1 = std::time::Instant::now();
+    app.focus_pane(Pane::Tree);
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.tick_sidebar_auto_hide_at(t1 + AUTO_HIDE_DWELL * 2),
+        "a fresh focus move after the bar returns collapses — no stale pin ate it"
     );
 }
 
