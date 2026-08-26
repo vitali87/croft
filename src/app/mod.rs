@@ -12838,6 +12838,28 @@ impl App {
         }
     }
 
+    /// Tear down the popups a click invalidates, for press paths that return
+    /// early and so miss the teardown every other path runs.
+    ///
+    /// A fired binding changes the state underneath these popups, and leaving
+    /// them up paints a hover, a tab tooltip or a button hint describing what
+    /// was there before the command ran. Shared by the matched-gesture
+    /// dispatch and the double-click-prefix swallow: both return early, and
+    /// having two copies is how the swallow branch came to skip it entirely.
+    fn dismiss_click_overlays(&mut self, m: MouseEvent) {
+        if !matches!(m.kind, MouseEventKind::Up(_)) {
+            self.hover_popup = None;
+            self.hover_diagnostic = None;
+        }
+        self.tab_tooltip = None;
+        self.tab_hover.clear();
+        self.tab_hover_idx = None;
+        self.ui_tooltip = None;
+        self.ui_hover.clear();
+        self.ui_tooltip_label = None;
+        self.hover.clear();
+    }
+
     fn focus_pane(&mut self, p: Pane) {
         // Leaving the terminal closes its find bar so a stale match highlight
         // never lingers on the grid once input goes elsewhere. Quick-select
@@ -27995,11 +28017,12 @@ impl App {
                     self.status = String::from("No definitions in this view");
                 }
                 Some((col, row)) => match self.editor.buffer_pos_at(col, row) {
-                    Some((line, col)) => {
-                        self.editor.cursor_row = line;
-                        self.editor.cursor_col = col;
-                        self.request_definition_at_cursor();
-                    }
+                    // Delegate rather than re-implement: `trigger_definition_at`
+                    // follows a server-resolved document link BEFORE asking for
+                    // a definition (#254), and a bound gesture meant to replace
+                    // the built-in must keep that precedence. Duplicating the
+                    // check here would let the two drift on the next change.
+                    Some(_) => self.trigger_definition_at(col, row),
                     None => self.status = String::from("Nothing to define there"),
                 },
                 None => {
@@ -28009,7 +28032,24 @@ impl App {
             },
             Cmd::MouseOpenLinkAtClick => match self.last_mouse_pos {
                 Some((col, row)) => {
-                    if !self.terminal_url_click(col, row) && !self.terminal_file_click(col, row) {
+                    // `editor` is the DEFAULT `when` region, so the most
+                    // natural binding for this command lands there. Both
+                    // terminal helpers hit-test the TERMINAL's `last_inner`
+                    // and return false anywhere else, so consulting only them
+                    // made the command a permanent no-op in its own default
+                    // region -- reporting "No link there" over a link that is.
+                    let followed = self
+                        .editor
+                        .buffer_pos_at(col, row)
+                        .and_then(|(line, c)| {
+                            self.editor.document_link_at(line, c).map(str::to_string)
+                        })
+                        .inspect(|target| self.open_document_link(target))
+                        .is_some();
+                    if !followed
+                        && !self.terminal_url_click(col, row)
+                        && !self.terminal_file_click(col, row)
+                    {
                         self.status = String::from("No link there");
                     }
                 }
@@ -30727,6 +30767,10 @@ impl App {
                 }
                 crate::keymap::MouseContext::FileTree => self.focus_pane(Pane::Tree),
             }
+            // Same teardown the matched branch runs: this is an early return
+            // on the same press path, and it re-focuses a pane underneath
+            // whatever popups were showing.
+            self.dismiss_click_overlays(m);
             return;
         }
 
@@ -30781,17 +30825,7 @@ impl App {
                 // what was there before the command ran. The dwell timer is
                 // cleared for the same reason — it is armed at coordinates
                 // whose meaning the command just changed.
-                if !matches!(m.kind, MouseEventKind::Up(_)) {
-                    self.hover_popup = None;
-                    self.hover_diagnostic = None;
-                }
-                self.tab_tooltip = None;
-                self.tab_hover.clear();
-                self.tab_hover_idx = None;
-                self.ui_tooltip = None;
-                self.ui_hover.clear();
-                self.ui_tooltip_label = None;
-                self.hover.clear();
+                self.dismiss_click_overlays(m);
 
                 // Termux: the tap still has to raise the on-screen keyboard.
                 // Skipping it leaves a device with no other keyboard unable

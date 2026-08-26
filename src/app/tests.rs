@@ -31141,6 +31141,133 @@ fn ctrl_click_follows_a_document_link_before_go_to_definition() {
 }
 
 #[test]
+fn the_bound_go_to_definition_follows_a_document_link_like_the_builtin() {
+    use crate::lsp::manager::DocumentLinkItem;
+    // A bound gesture is meant to be able to REPLACE the built-in it mirrors,
+    // so it must keep the built-in's #254 precedence: a server-resolved
+    // document link outranks Go to Definition at that spot, because a URL in
+    // a comment has no definition at all. `trigger_definition_at` checks the
+    // link first; the bound command jumped straight to the LSP request, so
+    // rebinding ctrl+click silently regressed link-following.
+    //
+    // Observable is a file:// link, which opens the target in the editor --
+    // fully inert. A web link would reach `open_url` and launch a browser.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "// link here\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "fn target() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let target = lsp_types::Url::from_file_path(tmp.path().join("b.rs")).unwrap();
+    app.editor.apply_document_links(
+        tmp.path().join("a.rs"),
+        vec![DocumentLinkItem {
+            line: 0,
+            character: 3,
+            end_line: 0,
+            end_character: 12,
+            target: target.to_string(),
+        }],
+    );
+
+    let area = app.editor.last_inner;
+    assert!(area.width > 6 && area.height > 1, "editor must be laid out");
+    // Text starts past the line-number gutter: `buffer_pos_at` computes
+    // `last_inner.x + last_gutter_width + 1`, so a column measured from
+    // `area.x` alone lands in the gutter and resolves to the wrong char.
+    let text_x = area.x + app.editor.last_gutter_width + 1;
+    let (col, row) = (text_x + 5, area.y);
+    assert!(
+        app.editor.buffer_pos_at(col, row).is_some(),
+        "the click must resolve to a buffer position, or nothing downstream runs"
+    );
+    let (bl, bc) = app.editor.buffer_pos_at(col, row).unwrap();
+    assert_eq!(
+        app.editor.document_link_at(bl, bc),
+        Some(target.as_str()),
+        "the clicked cell must sit INSIDE the link range, or this test cannot \
+         tell link-following from its absence"
+    );
+
+    app.last_mouse_pos = Some((col, row));
+    app.run_command(crate::widgets::command_palette::Command::MouseGoToDefinitionAtClick);
+
+    assert_eq!(
+        app.editor.path.as_deref().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("b.rs")),
+        "the bound Go to Definition must follow the document link first, as \
+         `trigger_definition_at` does -- a bound gesture that drops the \
+         built-in's link precedence is not a replacement for it"
+    );
+}
+
+#[test]
+fn the_bound_open_link_works_in_the_editor_not_only_the_terminal() {
+    use crate::lsp::manager::DocumentLinkItem;
+    // `editor` is the DEFAULT `when` region per docs/KEYBINDINGS.md, so the
+    // most natural binding a user writes for this command lands there. It
+    // consulted only the terminal grid (`terminal_url_click` ->
+    // `terminal_file_click`), both of which hit-test `last_inner` of the
+    // TERMINAL, so an editor click could never resolve: it reported
+    // "No link there" over a link that was there.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "// link here\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "fn target() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let target = lsp_types::Url::from_file_path(tmp.path().join("b.rs")).unwrap();
+    app.editor.apply_document_links(
+        tmp.path().join("a.rs"),
+        vec![DocumentLinkItem {
+            line: 0,
+            character: 3,
+            end_line: 0,
+            end_character: 12,
+            target: target.to_string(),
+        }],
+    );
+
+    let area = app.editor.last_inner;
+    assert!(area.width > 6 && area.height > 1, "editor must be laid out");
+    // Text starts past the line-number gutter: `buffer_pos_at` computes
+    // `last_inner.x + last_gutter_width + 1`, so a column measured from
+    // `area.x` alone lands in the gutter and resolves to the wrong char.
+    let text_x = area.x + app.editor.last_gutter_width + 1;
+    let (col, row) = (text_x + 5, area.y);
+    let (bl, bc) = app
+        .editor
+        .buffer_pos_at(col, row)
+        .expect("the click must resolve to a buffer position");
+    assert_eq!(
+        app.editor.document_link_at(bl, bc),
+        Some(target.as_str()),
+        "the clicked cell must sit inside the link range, or a failure here \
+         would mean 'no link' rather than 'the command ignored the editor'"
+    );
+
+    app.last_mouse_pos = Some((col, row));
+    app.run_command(crate::widgets::command_palette::Command::MouseOpenLinkAtClick);
+
+    assert_eq!(
+        app.editor.path.as_deref().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("b.rs")),
+        "Open Link at Click must follow an editor document link. It consulted \
+         only the terminal, so in the DEFAULT `editor` region it was a \
+         permanent no-op that reported {:?}",
+        app.status
+    );
+}
+
+#[test]
 fn on_type_formatting_stays_inert_when_disabled_or_unadvertised() {
     // #254 item 4: gated behind editor.format_on_type (default OFF,
     // matching VS Code), and even when on, nothing fires unless a

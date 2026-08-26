@@ -66,6 +66,6 @@ pub const RELEASE_NOTES: &[ReleaseNote] = &[
     },
     ReleaseNote {
         kind: NoteKind::Fix,
-        summary: "Modified clicks no longer leak into the built-ins: the first half of a bound ctrl+double_click stops firing go-to-definition, a modified click that drags away no longer pairs with the click it returns to, and a click over a mouse-reporting terminal is left to the child program.",
+        summary: "Modified clicks no longer leak into the built-ins: the first half of a bound ctrl+double_click stops firing go-to-definition, a modified click that drags away no longer pairs with the click it returns to, and a click over a mouse-reporting terminal is left to the child program. The At Click commands now match the built-ins they replace: Open Link at Click follows an editor document link instead of only searching the terminal, and Go to Definition at Click follows a document link first, as Ctrl/Cmd+click always has.",
     },
 ];
