@@ -43,10 +43,6 @@ pub struct DebugConfig {
     raw: Map<String, Value>,
 }
 
-/// Every configuration the workspace declares: `.croft/launch.json` first
-/// (croft-native, same schema, no `.vscode/` directory required), then
-/// `.vscode/launch.json`. Both are JSONC-tolerant. Order is preserved so the
-/// picker lists them as written; duplicate names keep the first occurrence.
 /// Compounds declared beside the configurations, in the same precedence order
 /// as [`discover_configs`]: `.croft/launch.json` wins over `.vscode`, and a
 /// duplicate name from the lower-precedence file is dropped rather than
@@ -66,6 +62,10 @@ pub fn discover_compounds(root: &Path) -> Vec<Compound> {
     out
 }
 
+/// Every configuration the workspace declares: `.croft/launch.json` first
+/// (croft-native, same schema, no `.vscode/` directory required), then
+/// `.vscode/launch.json`. Both are JSONC-tolerant. Order is preserved so the
+/// picker lists them as written; duplicate names keep the first occurrence.
 pub fn discover_configs(root: &Path) -> Vec<DebugConfig> {
     let mut out: Vec<DebugConfig> = Vec::new();
     for (rel, source) in [
@@ -897,6 +897,46 @@ mod tests {
     /// #250 phase 2: `compounds` names several configurations to launch
     /// together. It is a sibling key of `configurations` in the same file, so
     /// it parses alongside them rather than needing its own discovery pass.
+    /// Multi-root workspaces write members as `{ "folder": …, "name": … }`
+    /// rather than bare strings. croft resolves against one root, so the name
+    /// is taken either way — dropping the row would silently shrink a compound
+    /// to the members that happen to be written in the short form.
+    #[test]
+    fn compound_members_may_be_folder_name_objects_as_well_as_bare_strings() {
+        let text = r#"{"configurations":[
+              {"name":"Server","type":"lldb","request":"launch"},
+              {"name":"Client","type":"lldb","request":"launch"}],
+            "compounds":[{"name":"Mixed","configurations":[
+              "Server",
+              {"folder":"web","name":"Client"}]}]}"#;
+
+        let compounds = parse_compounds(text);
+        assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
+        assert_eq!(
+            compounds[0].configurations,
+            vec!["Server", "Client"],
+            "an object member contributes its name, exactly as a bare string does"
+        );
+    }
+
+    /// A compound whose members all fail to parse would present as a picker row
+    /// that does nothing, so it is skipped entirely rather than listed empty.
+    #[test]
+    fn a_compound_with_no_usable_members_is_skipped_rather_than_listed_empty() {
+        let text = r#"{"configurations":[{"name":"A","type":"lldb","request":"launch"}],
+            "compounds":[
+              {"name":"Empty","configurations":[]},
+              {"name":"Unusable","configurations":[7, true]},
+              {"name":"Real","configurations":["A"]}]}"#;
+
+        let names: Vec<String> = parse_compounds(text).into_iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec!["Real"],
+            "an empty compound and one whose members are all unusable are both dropped"
+        );
+    }
+
     #[test]
     fn discover_compounds_prefers_croft_over_vscode_for_a_duplicate_name() {
         let tmp = tempfile::tempdir().unwrap();

@@ -29632,6 +29632,97 @@ fn a_parked_launch_aborts_when_its_pane_dies_or_never_reports_a_mark() {
     );
 }
 
+/// #250: the compound layer reaches the user through
+/// `open_debug_config_picker` -> `discover_compounds` -> rows ->
+/// `confirm_list_picker` -> `resolve_compound`. Nothing but clippy's dead-code
+/// lint currently guards that chain: a refactor dropping the compound rows
+/// would leave `resolve_compound` with test-only callers and NO TEST FAILING,
+/// which is the exact regression this PR exists to correct.
+#[test]
+fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" }
+        ],
+        "compounds": [
+            { "name": "Full Stack", "configurations": ["Server"] },
+            { "name": "Broken", "configurations": ["Server", "Missing"] }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.open_debug_config_picker();
+    let picker = app.list_picker.as_ref().expect("picker open");
+    assert_eq!(
+        picker.rows.len(),
+        4,
+        "zero-config entry + one configuration + two compounds"
+    );
+    let compound_row = picker
+        .rows
+        .iter()
+        .find(|r| r.label.starts_with("Full Stack"))
+        .expect("the compound is listed");
+    assert!(
+        compound_row.label.contains("Server"),
+        "the row names its members: {}",
+        compound_row.label
+    );
+    assert!(
+        compound_row.id.starts_with("compound:"),
+        "compound rows carry their own id space so they cannot collide with \
+         a configuration index: {}",
+        compound_row.id
+    );
+
+    // Selecting a resolvable compound says why it cannot run yet, and names
+    // the issue rather than failing silently or launching one member.
+    let idx = picker
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Full Stack"))
+        .unwrap();
+    app.list_picker.as_mut().unwrap().selected = idx;
+    app.confirm_list_picker();
+    assert!(
+        app.run_debug.feedback_is_error,
+        "{:?}",
+        app.run_debug.feedback
+    );
+    assert!(
+        app.status.contains("#310"),
+        "the message points the user at the tracking issue: {}",
+        app.status
+    );
+    assert!(
+        app.dap_session.is_none(),
+        "and nothing was launched — a subset launch would debug the wrong thing"
+    );
+
+    // A compound naming a configuration no launch.json declares is a config
+    // error, reported as such rather than folded into the not-yet message.
+    app.open_debug_config_picker();
+    let bad = app
+        .list_picker
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Broken"))
+        .expect("the second compound is listed");
+    app.list_picker.as_mut().unwrap().selected = bad;
+    app.confirm_list_picker();
+    assert!(
+        app.status.contains("Missing"),
+        "the error names the member that does not exist: {}",
+        app.status
+    );
+}
+
 #[test]
 fn debug_config_picker_lists_configs_and_selection_drives_f5() {
     let tmp = tempfile::tempdir().unwrap();
