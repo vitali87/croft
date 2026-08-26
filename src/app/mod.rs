@@ -3060,6 +3060,10 @@ pub struct App {
     /// launch.json configurations discovered for the picker (#250); refreshed
     /// on every picker open so edits are picked up without a restart.
     debug_configs: Vec<crate::dap::configs::DebugConfig>,
+    /// Compounds declared beside those configurations. Listed in the picker so
+    /// a workspace's compounds are visible; launching one needs the
+    /// multi-session model tracked in #310.
+    debug_compounds: Vec<crate::dap::configs::Compound>,
     /// Name of the launch.json configuration F5 starts. `None` = the
     /// zero-config "Debug active file" behavior.
     selected_debug_config: Option<String>,
@@ -4210,6 +4214,7 @@ impl App {
             process_picker: None,
             dap_session: None,
             debug_configs: Vec::new(),
+            debug_compounds: Vec::new(),
             selected_debug_config: None,
             pending_debug_launch: None,
             pending_test_debug: None,
@@ -18135,6 +18140,7 @@ impl App {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let root = self.active_workspace_root();
         self.debug_configs = crate::dap::configs::discover_configs(&root);
+        self.debug_compounds = crate::dap::configs::discover_compounds(&root);
         let mut rows = vec![ListRow {
             id: String::from("active"),
             label: String::from("Debug active file — no configuration"),
@@ -18143,6 +18149,19 @@ impl App {
             id: i.to_string(),
             label: format!("{} — {} · {}", c.name, c.type_name, c.source),
         }));
+        // Compounds are listed so a workspace's own launch.json is reflected
+        // honestly; selecting one reports that running several sessions at
+        // once is not built yet (#310) rather than silently launching one
+        // member, which would debug something other than what was asked for.
+        rows.extend(
+            self.debug_compounds
+                .iter()
+                .enumerate()
+                .map(|(i, c)| ListRow {
+                    id: format!("compound:{i}"),
+                    label: format!("{} — compound of {}", c.name, c.configurations.join(", ")),
+                }),
+        );
         self.open_list_picker(
             ListPicker::new(ListPurpose::DebugConfig, "Debug Configuration", rows),
             "No debug configurations (.croft/launch.json or .vscode/launch.json)",
@@ -21346,7 +21365,28 @@ impl App {
                 }
             }
             ListPurpose::DebugConfig => {
-                if row.id == "active" {
+                if let Some(idx) = row.id.strip_prefix("compound:") {
+                    let named = idx
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| self.debug_compounds.get(i))
+                        .map(|c| c.name.clone());
+                    if let Some(name) = named {
+                        // Resolve first: a compound naming a configuration no
+                        // launch.json declares is a config error worth
+                        // reporting now, separately from the unbuilt feature.
+                        let compound = self.debug_compounds.iter().find(|c| c.name == name);
+                        let msg = match compound
+                            .map(|c| crate::dap::configs::resolve_compound(c, &self.debug_configs))
+                        {
+                            Some(Err(e)) => e,
+                            _ => format!(
+                                "compound \"{name}\" needs several debug sessions at once, which croft does not support yet (#310)"
+                            ),
+                        };
+                        self.debug_error(msg);
+                    }
+                } else if row.id == "active" {
                     self.selected_debug_config = None;
                     self.run_debug.selected_config = None;
                     self.start_selected_debug();

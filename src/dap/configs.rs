@@ -47,6 +47,25 @@ pub struct DebugConfig {
 /// (croft-native, same schema, no `.vscode/` directory required), then
 /// `.vscode/launch.json`. Both are JSONC-tolerant. Order is preserved so the
 /// picker lists them as written; duplicate names keep the first occurrence.
+/// Compounds declared beside the configurations, in the same precedence order
+/// as [`discover_configs`]: `.croft/launch.json` wins over `.vscode`, and a
+/// duplicate name from the lower-precedence file is dropped rather than
+/// listed twice.
+pub fn discover_compounds(root: &Path) -> Vec<Compound> {
+    let mut out: Vec<Compound> = Vec::new();
+    for rel in [".croft/launch.json", ".vscode/launch.json"] {
+        let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        for c in parse_compounds(&text) {
+            if !out.iter().any(|existing| existing.name == c.name) {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
 pub fn discover_configs(root: &Path) -> Vec<DebugConfig> {
     let mut out: Vec<DebugConfig> = Vec::new();
     for (rel, source) in [
@@ -93,6 +112,78 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
                 request,
                 source,
                 raw: obj.clone(),
+            })
+        })
+        .collect()
+}
+
+/// A `compounds` entry: several configurations launched together under one
+/// name. Members are stored as written and resolved against the file's
+/// `configurations` at launch time, so a compound naming a configuration that
+/// is later renamed fails loudly rather than launching a subset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compound {
+    pub name: String,
+    pub configurations: Vec<String>,
+}
+
+/// Parse the `compounds` array of a launch.json body. Sibling key of
+/// `configurations`, so this reads the same text [`parse_launch_json`] does.
+/// Entries without a `name` or a non-empty `configurations` list are skipped —
+/// VS Code refuses to run those too, and an empty compound would present as a
+/// picker row that does nothing.
+pub fn parse_compounds(text: &str) -> Vec<Compound> {
+    let Ok(v) = serde_json::from_str::<Value>(&crate::tasks::strip_jsonc(text)) else {
+        return Vec::new();
+    };
+    let Some(Value::Array(list)) = v.get("compounds") else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|c| {
+            let obj = c.as_object()?;
+            let name = obj.get("name")?.as_str()?.to_string();
+            // Members may be bare names or `{ "folder": …, "name": … }`
+            // objects in multi-root workspaces; croft resolves against one
+            // root, so take the name either way rather than dropping the row.
+            let configurations: Vec<String> = obj
+                .get("configurations")?
+                .as_array()?
+                .iter()
+                .filter_map(|m| match m {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Object(o) => o.get("name")?.as_str().map(str::to_string),
+                    _ => None,
+                })
+                .collect();
+            if configurations.is_empty() {
+                return None;
+            }
+            Some(Compound {
+                name,
+                configurations,
+            })
+        })
+        .collect()
+}
+
+/// Resolve a compound's member names against the configurations declared
+/// beside it, in the compound's own order. Errors naming the first member that
+/// does not exist — launching the subset that happens to resolve would debug
+/// something other than what the user asked for, and silently.
+pub fn resolve_compound<'a>(
+    compound: &Compound,
+    configs: &'a [DebugConfig],
+) -> Result<Vec<&'a DebugConfig>, String> {
+    compound
+        .configurations
+        .iter()
+        .map(|want| {
+            configs.iter().find(|c| &c.name == want).ok_or_else(|| {
+                format!(
+                    "compound \"{}\" names configuration \"{}\", which no launch.json declares",
+                    compound.name, want
+                )
             })
         })
         .collect()
@@ -801,5 +892,106 @@ mod tests {
         assert_eq!(env["C"], "sq");
         assert!(!env.contains_key("not a pair"));
         assert!(!env.contains_key("BAD KEY"));
+    }
+
+    /// #250 phase 2: `compounds` names several configurations to launch
+    /// together. It is a sibling key of `configurations` in the same file, so
+    /// it parses alongside them rather than needing its own discovery pass.
+    #[test]
+    fn discover_compounds_prefers_croft_over_vscode_for_a_duplicate_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".croft")).unwrap();
+        std::fs::create_dir_all(root.join(".vscode")).unwrap();
+        std::fs::write(
+            root.join(".croft/launch.json"),
+            r#"{"configurations":[{"name":"A","type":"lldb","request":"launch"}],
+                "compounds":[{"name":"Both","configurations":["A"]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".vscode/launch.json"),
+            r#"{"configurations":[{"name":"B","type":"lldb","request":"launch"}],
+                "compounds":[{"name":"Both","configurations":["B"]},
+                             {"name":"VsOnly","configurations":["B"]}]}"#,
+        )
+        .unwrap();
+
+        let found = discover_compounds(root);
+        let names: Vec<&str> = found.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Both", "VsOnly"],
+            "both files contribute, .croft first"
+        );
+        assert_eq!(
+            found[0].configurations,
+            vec!["A"],
+            "the .croft definition of a duplicate name wins, not .vscode's"
+        );
+    }
+
+    #[test]
+    fn compounds_are_parsed_alongside_the_configurations_they_name() {
+        let text = r#"{
+            "configurations": [
+                { "name": "Server", "type": "node", "program": "s.js" },
+                { "name": "Client", "type": "node", "program": "c.js" }
+            ],
+            "compounds": [
+                { "name": "Full Stack", "configurations": ["Server", "Client"] }
+            ]
+        }"#;
+        // Precondition: the configurations themselves parse, so a compound
+        // finding nothing cannot be blamed on the file being unreadable.
+        let cfgs = parse_launch_json(text, "test");
+        assert_eq!(cfgs.len(), 2, "precondition: both configurations parsed");
+
+        let compounds = parse_compounds(text);
+        assert_eq!(compounds.len(), 1, "the compound is found");
+        assert_eq!(compounds[0].name, "Full Stack");
+        assert_eq!(compounds[0].configurations, vec!["Server", "Client"]);
+    }
+
+    /// A compound naming a configuration that does not exist must fail loudly
+    /// at resolve time rather than silently launching the subset it can find —
+    /// the same posture as an unresolvable `${...}` variable (#250).
+    #[test]
+    fn a_compound_naming_a_missing_configuration_errors_rather_than_launching_a_subset() {
+        let text = r#"{
+            "configurations": [ { "name": "Server", "type": "node", "program": "s.js" } ],
+            "compounds": [ { "name": "Both", "configurations": ["Server", "Ghost"] } ]
+        }"#;
+        let cfgs = parse_launch_json(text, "test");
+        let compounds = parse_compounds(text);
+        assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
+
+        let err = resolve_compound(&compounds[0], &cfgs)
+            .expect_err("a missing member is an error, not a shorter list");
+        assert!(
+            err.contains("Ghost"),
+            "the error names the missing configuration, got: {err}"
+        );
+    }
+
+    /// A compound resolves to its members in the order written, so the picker
+    /// and the launch sequence agree with the file.
+    #[test]
+    fn a_resolved_compound_yields_its_members_in_declaration_order() {
+        let text = r#"{
+            "configurations": [
+                { "name": "Client", "type": "node", "program": "c.js" },
+                { "name": "Server", "type": "node", "program": "s.js" }
+            ],
+            "compounds": [ { "name": "Both", "configurations": ["Server", "Client"] } ]
+        }"#;
+        let cfgs = parse_launch_json(text, "test");
+        let compounds = parse_compounds(text);
+        let members = resolve_compound(&compounds[0], &cfgs).unwrap();
+        assert_eq!(
+            members.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["Server", "Client"],
+            "compound order wins over the order in `configurations`"
+        );
     }
 }
