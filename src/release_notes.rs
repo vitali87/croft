@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "`croft --version` prints a plain version number again; the build hash moved to the new `--build-info` flag.",
+    summary: "Auto-hide waits a moment before collapsing the side bar, so a click passing through the panel no longer takes it away under the pointer.",
 }];

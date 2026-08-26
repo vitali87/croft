@@ -31,6 +31,7 @@ mod hover;
 mod nav;
 mod overlay;
 mod perf_hud;
+pub(crate) mod sidebar_dwell;
 mod welcome;
 use click::ClickTracker;
 use cursor_blink::CursorBlink;
@@ -40,6 +41,7 @@ use hover::{HOVER_DELAY, HoverDwell};
 use nav::{NavHistory, NavLoc};
 use overlay::OverlayManager;
 use perf_hud::PerfHud;
+use sidebar_dwell::{AUTO_HIDE_DWELL, SidebarDwell};
 use welcome::WelcomeState;
 
 use crate::widgets::terminal::cwd_of_pid;
@@ -2314,6 +2316,10 @@ pub struct App {
     /// Consuming it on the next attempt keeps the reveal usable while
     /// guaranteeing the feature re-arms itself.
     sidebar_pinned_open: bool,
+    /// Grace delay between focus leaving the sidebar and auto-hide collapsing
+    /// it (#302), so a click passing through the panel does not take it away
+    /// under the pointer.
+    sidebar_dwell: SidebarDwell,
     /// Pre-Zen visibility snapshot; `None` whenever not in Zen Mode.
     pre_zen: Option<PreZenLayout>,
     /// Hit-test rects for the top-right layout-control icons.
@@ -3979,6 +3985,7 @@ impl App {
             sidebar_auto_hide: loaded_prefs.sidebar_auto_hide,
             sidebar_auto_hide_suspended: false,
             sidebar_pinned_open: false,
+            sidebar_dwell: SidebarDwell::default(),
             pre_zen: None,
             layout_icon_areas: LayoutIconAreas::default(),
             status: String::from("Ready"),
@@ -12798,16 +12805,60 @@ impl App {
         );
     }
 
-    /// Collapse the sidebar if auto-hide is on and nothing is suppressing it.
-    /// Called on focus moves INTO the editor or a terminal.
+    /// Arm the grace delay before collapsing. Called on focus moves INTO the
+    /// editor or a terminal.
+    ///
+    /// #294 collapsed right here, which meant a click *passing through* the
+    /// panel on its way to the editor took the panel out from under the
+    /// pointer. The collapse now waits `AUTO_HIDE_DWELL` (#302) and fires from
+    /// `tick_sidebar_auto_hide`, so a click that lands back on the sidebar
+    /// inside the window cancels it.
+    ///
+    /// Note what is deliberately NOT done here: the one-shot pin is not
+    /// consumed. Arming is no longer the same event as collapsing, and eating
+    /// the exemption on an attempt the dwell then cancels would silently strip
+    /// a deliberate reveal of the protection it was granted. It is consumed
+    /// where the collapse actually happens.
     fn maybe_auto_hide_sidebar(&mut self) {
-        // Consume the one-shot exemption whether or not it was the reason we
-        // are not collapsing: holding it would let it outlive the reveal it
-        // was granted for.
+        // Cheap pre-check only. The real decision is re-made when the timer
+        // fires, because every suppression here can change during the window.
+        if self.sidebar_auto_hide && self.show_tree {
+            self.sidebar_dwell.arm(std::time::Instant::now());
+        }
+    }
+
+    /// Fire a pending auto-hide collapse once its grace delay elapses.
+    ///
+    /// Returns `true` when the sidebar collapsed, so the frame redraws.
+    pub fn tick_sidebar_auto_hide(&mut self) -> bool {
+        self.tick_sidebar_auto_hide_at(std::time::Instant::now())
+    }
+
+    /// `tick_sidebar_auto_hide` with the clock injected, so the grace delay is
+    /// testable without sleeping — the same posture as `HoverDwell::due`.
+    pub(crate) fn tick_sidebar_auto_hide_at(&mut self, now: std::time::Instant) -> bool {
+        if !self.sidebar_dwell.armed() {
+            return false;
+        }
+        // Focus came back to the sidebar, or it is already closed: the pending
+        // collapse is moot. Leave the pin alone — it was never spent.
+        if self.focus == Pane::Tree || !self.show_tree {
+            self.sidebar_dwell.disarm();
+            return false;
+        }
+        if !self.sidebar_dwell.due(now, AUTO_HIDE_DWELL) {
+            return false;
+        }
+        // The window has elapsed and focus stayed away, so this is the moment
+        // the collapse would happen — and therefore the moment the one-shot
+        // exemption is spent, whether or not it is what stops us.
+        self.sidebar_dwell.disarm();
         let exempt = std::mem::take(&mut self.sidebar_pinned_open);
         if !exempt && self.sidebar_auto_hide_allowed() {
             self.show_tree = false;
+            return true;
         }
+        false
     }
 
     fn focus_pane(&mut self, p: Pane) {
@@ -12835,7 +12886,13 @@ impl App {
         // the sidebar; moving INTO the sidebar releases the pin a reveal
         // command took, so the next move out can collapse it again.
         match p {
-            Pane::Tree => self.sidebar_pinned_open = false,
+            Pane::Tree => {
+                self.sidebar_pinned_open = false;
+                // Focus came back inside the grace window: the click was
+                // passing through, or landed here. Cancel the pending
+                // collapse (#302) rather than letting it fire under the user.
+                self.sidebar_dwell.disarm();
+            }
             Pane::Editor | Pane::Terminal => self.maybe_auto_hide_sidebar(),
         }
         self.focus = p;
@@ -40574,6 +40631,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let implementation_changed = app.drain_lsp_implementation();
         let references_changed = app.drain_lsp_references();
         let call_hierarchy_changed = app.drain_lsp_call_hierarchy();
+        let sidebar_hide_changed = app.tick_sidebar_auto_hide();
         let occ_tick_changed = app.tick_occurrences();
         let linked_tick_changed = app.tick_linked_editing();
         let linked_changed = app.drain_lsp_linked_editing();
@@ -40657,6 +40715,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || implementation_changed
             || references_changed
             || call_hierarchy_changed
+            || sidebar_hide_changed
             || occ_tick_changed
             || linked_tick_changed
             || linked_changed
