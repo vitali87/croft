@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "Auto-hide waits a moment before collapsing the side bar, so a click passing through the panel no longer takes it away under the pointer.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Auto-hide waits a moment before collapsing the side bar, so a click passing through the panel no longer takes it away under the pointer.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Revealing the side bar with Cmd+B keeps its one-shot reprieve when a drag, palette or dialog interrupts the collapse it was meant to survive.",
+    },
+];

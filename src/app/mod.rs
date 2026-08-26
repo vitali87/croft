@@ -9281,7 +9281,13 @@ impl App {
         // Taken only when auto-hide is live: a pin set while the feature is
         // off would sit unconsumed and silently eat the first collapse after
         // they turn it on.
-        self.sidebar_pinned_open = self.show_tree && self.sidebar_auto_hide;
+        // Structural suppression (Zen Mode, or a hidden activity bar) means no
+        // collapse can fire for as long as it lasts, so a pin taken now is the
+        // "sits unconsumed and silently eats a later collapse" case this line
+        // already guards against for `!sidebar_auto_hide` — same bug, same
+        // answer: refuse to bank it rather than hold it indefinitely.
+        self.sidebar_pinned_open =
+            self.show_tree && self.sidebar_auto_hide && self.activity_bar_visible && !self.zen_mode;
         // Hiding the sidebar while Run-Debug was on screen: arm the same
         // OSC-1337 image-cell evict gate that fires on a sidebar-view change.
         // Without this the bug+play icon ghosts on top of the editor /
@@ -12744,11 +12750,12 @@ impl App {
         if self.sidebar_auto_hide_suspended {
             return false;
         }
-        // A deliberate reveal (Cmd+B) exempts the NEXT collapse; the flag is
-        // consumed in `maybe_auto_hide_sidebar`, never held.
-        if self.sidebar_pinned_open {
-            return false;
-        }
+        // NOTE: the one-shot reveal pin is deliberately NOT checked here. It is
+        // the caller's concern (`tick_sidebar_auto_hide_at`), because this
+        // predicate must stay answerable while a pin is banked: the tick asks
+        // "would this collapse otherwise fire?" precisely so it can decide
+        // whether spending the pin is warranted. Checking the pin here made
+        // that question unanswerable and the pin unspendable.
         // Mid-drag on the sidebar seam: the pointer is over the editor by
         // definition, and collapsing under the cursor is the flapping the
         // issue calls out.
@@ -12849,12 +12856,32 @@ impl App {
         if !self.sidebar_dwell.due(now, AUTO_HIDE_DWELL) {
             return false;
         }
-        // The window has elapsed and focus stayed away, so this is the moment
-        // the collapse would happen — and therefore the moment the one-shot
-        // exemption is spent, whether or not it is what stops us.
+        // The window has elapsed and focus stayed away. Before spending
+        // anything, ask whether a collapse would fire at all: a tick stopped by
+        // a seam drag, an open palette or a modal is not the collapse the pin
+        // was banked for, and burning it there loses an exemption the user
+        // never saw honoured. Every earlier decline already leaves the pin
+        // alone; this makes the late one behave the same way.
         self.sidebar_dwell.disarm();
+        if !self.sidebar_auto_hide_allowed() {
+            return false;
+        }
+        // A real collapse is now due, so this IS the moment the one-shot
+        // exemption is spent — whether or not it is what stops us.
+        //
+        // Semantics: the pin is spent by the next collapse that would genuinely
+        // have fired, not by the next tick — so a tick stopped by a TRANSIENT
+        // suppression (seam drag, palette, modal) spends nothing and the pin
+        // survives to do its job a moment later.
+        //
+        // The structural suppressions do not reach here at all: `toggle_side_bar`
+        // refuses to bank a pin under Zen Mode or a hidden activity bar, the same
+        // way it already refuses when auto-hide is off. That guard is the
+        // codebase's existing answer to "a pin that sits unconsumed and later
+        // eats a collapse", and honouring it there keeps the rule in one place
+        // rather than splitting it across bank-time and spend-time.
         let exempt = std::mem::take(&mut self.sidebar_pinned_open);
-        if !exempt && self.sidebar_auto_hide_allowed() {
+        if !exempt {
             self.show_tree = false;
             return true;
         }

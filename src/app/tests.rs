@@ -31181,6 +31181,14 @@ fn leaving_the_sidebar_arms_a_collapse_rather_than_doing_it_immediately() {
     assert!(app.show_tree, "still up while the window is open");
 }
 
+// Sidebar auto-hide tests, a trap worth knowing before you write one: routing
+// focus through `Pane::Tree` CLEARS the one-shot reveal pin by design (moving
+// into the sidebar means you are using it, so the exemption is released). A
+// Tree->Editor round trip is the obvious way to re-arm a collapse, and it
+// silently wipes the flag under test. Re-arm via `Pane::Terminal` instead when
+// the pin has to survive. This is invisible from the test side and cost one
+// misdiagnosed green.
+
 /// #302, the part that is new work rather than a port: #294's one-shot pin is
 /// consumed by "the next collapse attempt", but with a timer that stops being
 /// a single well-defined event. A deliberate reveal must not lose its
@@ -31192,9 +31200,9 @@ fn arming_a_collapse_does_not_consume_the_reveal_pin() {
     app.sidebar_auto_hide = true;
     app.show_tree = true;
 
-    // Precondition, checked BEFORE the pin is banked (the pin itself makes
-    // `sidebar_auto_hide_allowed` false by design): a collapse is otherwise
-    // live here, so the exemption is protecting against something real.
+    // Precondition: a collapse is otherwise live here, so the exemption is
+    // protecting against something real rather than a case that would never
+    // have fired.
     assert!(
         app.sidebar_auto_hide_allowed(),
         "precondition: without the pin, this focus move would collapse"
@@ -31212,6 +31220,120 @@ fn arming_a_collapse_does_not_consume_the_reveal_pin() {
     );
     assert!(app.show_tree, "and the sidebar is still up");
 }
+
+/// #302: the pin must survive a tick that declines to collapse for a reason
+/// that has nothing to do with the pin. Every EARLY decline in
+/// `tick_sidebar_auto_hide_at` returns before spending it; the LATE decline —
+/// `sidebar_auto_hide_allowed()` being false — sits after the take, so a
+/// transient suppression (a seam drag, an open palette, a modal) burns a pin
+/// the user never got the benefit of. The suppression clears a moment later
+/// and the next collapse proceeds unpinned.
+#[test]
+fn a_suppressed_tick_does_not_spend_the_reveal_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    // Precondition, checked before either the pin or the suppression is set:
+    // a collapse is otherwise live here, so both are suppressing something
+    // real rather than a case that was never going to fire.
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: without pin or drag, this focus move would collapse"
+    );
+
+    // A deliberate reveal (Cmd+B) banks the one-shot exemption.
+    app.sidebar_pinned_open = true;
+
+    // Focus leaves: arms the collapse.
+    app.focus_pane(Pane::Editor);
+
+    // The user starts dragging the sidebar seam. This suppresses the collapse
+    // on its own — independently of the pin — and is transient: it ends when
+    // they release the mouse.
+    app.splitter_drag = Some(SplitterDrag::Sidebar);
+
+    // Precondition: the drag alone is enough to stop this collapse, so the
+    // tick below declines for a reason that is not the pin.
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "precondition: the seam drag suppresses the collapse by itself"
+    );
+
+    let now = std::time::Instant::now();
+    let collapsed = app.tick_sidebar_auto_hide_at(now + AUTO_HIDE_DWELL);
+
+    assert!(!collapsed, "the drag suppressed this collapse");
+    assert!(app.show_tree, "so the sidebar is still up");
+    assert!(
+        app.sidebar_pinned_open,
+        "a collapse stopped by an unrelated suppression must not spend the \
+         one-shot exemption — the user never saw the collapse it was banked for"
+    );
+
+    // The pin surviving is only half the contract: it must still be SPENDABLE.
+    // A fix that keeps the pin by making the collapse permanently unreachable
+    // satisfies the assertion above and is strictly worse than the bug. So
+    // release the drag and let the collapse the pin was banked for happen.
+    //
+    // Re-arm WITHOUT routing focus through `Pane::Tree`: moving into the
+    // sidebar deliberately releases the pin (mod.rs, the `Pane::Tree` arm), so
+    // a Tree->Editor round trip would clear the very flag under test. Focus is
+    // already on Editor here; the dwell is what needs re-arming.
+    app.splitter_drag = None;
+    app.focus_pane(Pane::Terminal);
+    let pinned_collapse = app.tick_sidebar_auto_hide_at(now + AUTO_HIDE_DWELL * 2);
+    assert!(!pinned_collapse, "the pin exempts this one");
+    assert!(app.show_tree, "so the sidebar survives it");
+    assert!(
+        !app.sidebar_pinned_open,
+        "and NOW the exemption is spent — it was banked for exactly this"
+    );
+
+    app.focus_pane(Pane::Editor);
+    let unpinned_collapse = app.tick_sidebar_auto_hide_at(now + AUTO_HIDE_DWELL * 3);
+    assert!(
+        unpinned_collapse,
+        "with the exemption spent, the next collapse fires — a pin that can \
+         never be spent is a sidebar that can never auto-hide"
+    );
+    assert!(!app.show_tree, "and the sidebar is finally down");
+}
+
+/// #302: a reveal under Zen Mode must not bank a pin. No collapse can fire
+/// while Zen owns the chrome, so the pin would sit unconsumed and then eat the
+/// first legitimate collapse after Zen exits — the exact failure
+/// `toggle_side_bar` already guards against when auto-hide is off.
+#[test]
+fn a_reveal_under_zen_mode_banks_no_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = false;
+
+    // Precondition: with Zen off, this same reveal DOES bank a pin — so the
+    // assertion below is about Zen, not about the reveal failing generally.
+    app.toggle_side_bar();
+    assert!(
+        app.sidebar_pinned_open,
+        "precondition: a normal reveal banks the one-shot pin"
+    );
+
+    // Back to a hidden sidebar, now under Zen Mode.
+    app.toggle_side_bar();
+    app.zen_mode = true;
+    app.activity_bar_visible = false;
+
+    app.toggle_side_bar();
+    assert!(app.show_tree, "the reveal still shows the sidebar");
+    assert!(
+        !app.sidebar_pinned_open,
+        "but banks no pin: nothing can spend it until Zen exits, and a pin \
+         held that long eats a collapse the user never connected to it"
+    );
+}
+
 /// #256 step 1: a server that publishes project-wide diagnostics (rust-analyzer
 /// does this from `cargo check`) names files the user never opened. The panel
 /// builds from the diagnostics store rather than from open buffers, so those
