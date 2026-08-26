@@ -31501,11 +31501,32 @@ fn hiding_the_activity_bar_drops_a_pending_collapse_and_its_pin() {
     app.dispatch_menu_action(MenuAction::ToggleActivityBar, root);
     assert!(app.activity_bar_visible, "precondition: the bar is back");
 
+    // Two things mask this test if left alone, and either alone is enough.
+    // `dispatch_menu_action` ends by opening the Customize Layout popup, and
+    // `sidebar_auto_hide_allowed()` bails on `context_menu.is_some()` — so the
+    // tick declines before reaching anything this test is named for. And the
+    // pin banked above would absorb the collapse anyway, leaving `!fired` and
+    // `show_tree` both true while the pin is silently spent, which IS the
+    // failure the hunk exists to prevent. Assert the dwell and the pin
+    // directly, with the popup cleared.
+    app.context_menu = None;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: nothing else is suppressing the collapse now"
+    );
+    assert!(
+        !app.sidebar_dwell.armed(),
+        "the activity-bar toggle cancelled the pending collapse"
+    );
     assert!(
         !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 1000),
         "an idle tick must not collapse after the bar returns"
     );
     assert!(app.show_tree, "so the sidebar is still up");
+    assert!(
+        app.sidebar_pinned_open,
+        "and the pin was not spent on a collapse the user never saw"
+    );
 }
 
 /// #302's actual payload: the collapse WAITS. Every other app-level test ticks

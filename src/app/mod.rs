@@ -34495,10 +34495,14 @@ impl App {
                 // The bar is a structural auto-hide suppression, and unlike Zen
                 // it flips here on its own. A pending collapse armed against the
                 // old chrome would otherwise sit armed while `allowed()` declines
-                // for it, then fire — and spend a banked reveal pin — on the
-                // first idle tick after the bar comes back, with no focus move.
+                // for it, then fire on the first idle tick after the bar comes
+                // back, with no focus move of the user's own.
+                //
+                // Cancel the collapse but LEAVE THE PIN: a Cmd+B reveal is a
+                // separate deliberate act, and confiscating its one-shot
+                // exemption because the user also toggled the activity bar
+                // would spend it on a collapse that never happened.
                 self.sidebar_dwell.disarm();
-                self.sidebar_pinned_open = false;
                 self.persist_layout();
                 self.after_chrome_visibility_change();
                 self.open_customize_layout_menu_on(&MenuAction::ToggleActivityBar);
