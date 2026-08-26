@@ -28054,7 +28054,11 @@ impl App {
                     // built-in this command replaces guards neither, so a
                     // guard spanning both made the bound command diverge from
                     // it in the opposite direction to the one being fixed.
-                    let followed = !self.editor.has_non_text_view()
+                    // Bound once: the refusal and the status it explains must
+                    // answer the SAME question, or the status describes a
+                    // lookup that never ran.
+                    let editor_blocked = self.editor.has_non_text_view();
+                    let followed = !editor_blocked
                         && self
                             .editor
                             .buffer_pos_at(col, row)
@@ -28067,7 +28071,15 @@ impl App {
                         && !self.terminal_url_click(col, row)
                         && !self.terminal_file_click(col, row)
                     {
-                        self.status = String::from(if self.editor.has_non_text_view() {
+                        // Name the view only when the EDITOR lookup is the
+                        // one that missed. A click in a terminal pane never
+                        // consulted the editor — `editor_blocked` short-
+                        // circuited it above — so reporting the editor's view
+                        // there names something that was never searched.
+                        // "a non-text view is up" and "the editor lookup is
+                        // the one that missed" are different questions.
+                        let in_terminal = self.terminal_at_pos(col, row).is_some();
+                        self.status = String::from(if editor_blocked && !in_terminal {
                             "No links in this view"
                         } else {
                             "No link there"

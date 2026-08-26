@@ -1658,6 +1658,62 @@ fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
 }
 
 #[test]
+fn a_terminal_miss_does_not_blame_a_view_it_never_searched() {
+    // The refusal was scoped to the editor lookup, but the STATUS derived from
+    // the same predicate stayed arm-wide: a click in a TERMINAL pane with no
+    // link reported "No links in this view", naming the editor's view — which
+    // `editor_blocked` had already short-circuited, so it was never searched.
+    //
+    // "a non-text view is up" and "the editor lookup is the one that missed"
+    // are different questions, and the status must answer the second.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "mouse_open_link_at_click", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+    assert!(
+        app.editor.has_non_text_view(),
+        "precondition: a non-text view must be up, or the arm-wide status and \
+         the scoped one agree and this test cannot tell them apart"
+    );
+
+    // Plain text, no link anywhere on the row.
+    app.terminals[0].feed_bytes_for_test(b"just some words\r\n");
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.terminals[0].last_area;
+    let (col, row) = (area.x + 2, area.y + 1);
+    assert!(
+        app.terminals[0].hyperlink_at_screen(col, row).is_none(),
+        "precondition: the cell must hold NO link, or this tests the hit path"
+    );
+    assert_eq!(
+        app.terminal_at_pos(col, row),
+        Some(0),
+        "precondition: and must be inside a terminal pane, or the editor \
+         lookup is legitimately the one that missed"
+    );
+
+    app.focus_pane(Pane::Terminal);
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    assert_eq!(
+        app.status, "No link there",
+        "a miss in a TERMINAL pane must not name the editor's view: that \
+         lookup was short-circuited and never searched"
+    );
+}
+
+#[test]
 fn a_terminal_link_binding_is_not_refused_for_an_editor_side_reason() {
     // `MouseOpenLinkAtClick` spans two panes: it tries the editor's document
     // link, then falls through to the terminal helpers. The `has_non_text_view`
@@ -2091,8 +2147,12 @@ fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one()
     ev.modifiers = KeyModifiers::CONTROL;
     app.handle_mouse(ev);
 
-    assert_ne!(
-        app.status, "No link there",
+    // Positive form, not `assert_ne!("No link there")`: excluding one string
+    // cannot tell "resolved pane 0's link" from "resolved nothing and said so
+    // differently". The `zero@` address also pins WHICH pane resolved — pane 1
+    // holds focus and carries no link.
+    assert_eq!(
+        app.status, "Refused to open non-web link: mailto:zero@example.com",
         "the bound command must resolve against the CLICKED pane; it read the active one"
     );
     assert_eq!(
