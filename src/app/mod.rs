@@ -17543,8 +17543,12 @@ impl App {
         self.run_debug.feedback_is_error = false;
         // The launch.json config row (#250): count + F5 selection. Discovery
         // is two small file reads and this only runs on active-file changes.
-        self.run_debug.config_count =
-            crate::dap::configs::discover_configs(&self.active_workspace_root()).len();
+        // Compounds count too — the row is the documented route to the picker,
+        // and the picker lists them, so counting only configurations makes the
+        // row vanish for a compounds-only workspace and undercount otherwise.
+        let root = self.active_workspace_root();
+        self.run_debug.config_count = crate::dap::configs::discover_configs(&root).len()
+            + crate::dap::configs::discover_compounds(&root).len();
         self.run_debug.selected_config = self.selected_debug_config.clone();
     }
 

@@ -29795,6 +29795,51 @@ fn missing_pre_launch_task_and_stale_selection_error_loudly() {
     assert_eq!(app.selected_debug_config, None, "stale selection cleared");
 }
 
+/// #250: the Run and Debug panel's config row is the documented way to reach
+/// the picker — both KEYBINDINGS.md and LAYOUT.md say so, and LAYOUT.md says
+/// compounds "are listed too". But the row is gated on a count that only
+/// covered `discover_configs`, so a workspace declaring ONLY compounds had no
+/// row at all: `config_row_label`'s `(None, 0)` arm suppresses it, the render
+/// never runs, `last_config_area` stays zero-sized, and the click guard on
+/// `width > 0` refuses. The picker lists the compounds; nothing opens it.
+#[test]
+fn the_config_row_counts_compounds_so_a_compounds_only_workspace_still_has_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"{"configurations":[{"name":"Server","type":"python","program":"s.py"}],
+            "compounds":[{"name":"Full Stack","configurations":["Server"]}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.refresh_run_debug();
+    assert_eq!(
+        app.run_debug.config_count, 2,
+        "one configuration plus one compound — the row counts what the picker lists"
+    );
+
+    // The case that loses the row entirely rather than merely undercounting.
+    let only = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(only.path().join(".croft")).unwrap();
+    std::fs::write(
+        only.path().join(".croft/launch.json"),
+        r#"{"configurations":[],
+            "compounds":[{"name":"Orphan","configurations":["Nothing"]}]}"#,
+    )
+    .unwrap();
+    let mut app2 = App::new(only.path().to_path_buf()).unwrap();
+    app2.refresh_run_debug();
+    assert_eq!(
+        app2.run_debug.config_count, 1,
+        "a compounds-only workspace must still get a row, or the documented \
+         route to the picker does not exist for it"
+    );
+    // `config_row_label` is private to the widget module; the count is the
+    // input its `(None, 0)` suppression arm reads, so a non-zero count here is
+    // what makes the row exist. run_debug.rs's own unit test covers the arm.
+}
+
 #[test]
 fn refresh_run_debug_syncs_the_config_row() {
     let tmp = tempfile::tempdir().unwrap();
