@@ -1658,6 +1658,123 @@ fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
 }
 
 #[test]
+fn the_at_click_commands_all_refuse_a_non_text_view() {
+    // All three At Click commands guard on `has_non_text_view`, because
+    // `buffer_pos_at` maps cells from the TEXT layout and still returns a
+    // position on a diff/sheet/hex/log view — so without the guard they would
+    // act on coordinates belonging to a buffer the user is not looking at.
+    //
+    // Short-circuiting all three guards to false leaves the full suite green,
+    // so the guards shipped unpinned. Each arm asserts its OWN status, since
+    // a shared assertion would pass with two of the three guards deleted.
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+
+    // Positive control: without this the test passes vacuously if the fixture
+    // ever stops producing a non-text view.
+    assert!(
+        app.editor.has_non_text_view(),
+        "precondition: the fixture must actually open a non-text view, or \
+         every assertion below is about the ordinary text path"
+    );
+    // And the commands must have a click to act on, or they take the
+    // keyboard-invocation arm and refuse for an unrelated reason.
+    app.last_mouse_pos = Some((10, 10));
+
+    for (cmd, want) in [
+        (
+            crate::widgets::command_palette::Command::MouseAddCursorAtClick,
+            "No cursors in this view",
+        ),
+        (
+            crate::widgets::command_palette::Command::MouseGoToDefinitionAtClick,
+            "No definitions in this view",
+        ),
+        (
+            crate::widgets::command_palette::Command::MouseOpenLinkAtClick,
+            "No links in this view",
+        ),
+    ] {
+        app.status = String::from("untouched");
+        app.run_command(cmd);
+        assert_eq!(
+            app.status, want,
+            "{cmd:?} must refuse on a non-text view rather than acting on a \
+             buffer position the user cannot see"
+        );
+    }
+}
+
+#[test]
+fn a_binding_on_the_terminal_border_fires_because_the_child_cannot_receive_it() {
+    // `child_owns_pointer` declines a user binding when the child has asked
+    // for mouse tracking. But `terminal_at_pos` hit-tests `last_area`, which
+    // INCLUDES the border, while delivery goes through `cell_at`, which
+    // hit-tests `last_inner` and excludes it. So a click on the border was
+    // suppressed for the child's benefit and then never reached the child:
+    // lost by both parties.
+    //
+    // The built-in wheel path already has this rule and says so
+    // ("the wheel sat on the pane BORDER, outside the inner grid ... falls
+    // through like any non-tracking pane instead of swallowing the notch"),
+    // but it requires `report_mouse` to actually return true. This predicate
+    // checked only `mouse_reporting()`.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.focus_pane(Pane::Terminal);
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "terminal must be laid out"
+    );
+    let (col, row) = (area.x + 2, area.y);
+
+    // The two facts that make this a BORDER click rather than a grid click.
+    // Without both, the test would be about something else entirely.
+    assert!(
+        app.terminals[0].cell_at(col, row).is_none(),
+        "precondition: this cell must be OUTSIDE the inner grid, or the child \
+         could receive it and suppression would be correct"
+    );
+    assert_eq!(
+        app.terminal_at_pos(col, row),
+        Some(0),
+        "precondition: but INSIDE last_area, or `child_owns_pointer` never \
+         considers this terminal and the test proves nothing"
+    );
+
+    // Child asks for tracking: the real predicate `mouse_reporting` consults.
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    assert!(
+        app.terminals[0].mouse_reporting(),
+        "precondition: the child must be tracking, or there is nothing to \
+         decline the binding for"
+    );
+
+    let before = app.editor.wrap_enabled();
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    assert_ne!(
+        app.editor.wrap_enabled(),
+        before,
+        "a binding on the BORDER must fire: the child cannot own a cell it \
+         will never be told about, so declining here loses the gesture for \
+         both parties. The wheel path already falls through on this exact case"
+    );
+}
+
+#[test]
 fn the_swallowed_prefix_click_dismisses_the_hover_and_tab_tooltip() {
     // The sibling test above binds `ctrl+click` to a real command, so it takes
     // the MATCHED branch. The swallow branch needs a gesture that matches

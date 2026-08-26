@@ -30720,7 +30720,18 @@ impl App {
         // the dispatch below, indexed by the pane that was CLICKED.
         let child_owns_pointer = bound_mouse.is_some_and(|(ctx, _, _)| {
             matches!(ctx, crate::keymap::MouseContext::Terminal)
-                && terminal_hit.is_some_and(|idx| self.terminals[idx].mouse_reporting())
+                && terminal_hit.is_some_and(|idx| {
+                    // Tracking is not enough: `terminal_at_pos` hit-tests
+                    // `last_area`, which includes the BORDER, while delivery
+                    // goes through `cell_at` on `last_inner`, which does not.
+                    // Declining a binding for a cell the child will never be
+                    // told about loses the gesture for both parties. The
+                    // built-in wheel path already falls through on exactly
+                    // this case — see the `report_mouse` guard on both wheel
+                    // arms, whose comment names the border explicitly.
+                    self.terminals[idx].mouse_reporting()
+                        && self.terminals[idx].cell_at(m.column, m.row).is_some()
+                })
                 && !m.modifiers.contains(KeyModifiers::SHIFT)
         });
         if let Some((_, gesture, _)) = bound_mouse
