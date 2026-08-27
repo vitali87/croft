@@ -21414,11 +21414,31 @@ impl App {
                                 if members.len() == 1
                                     && !compound.unsupported_keys.is_empty() =>
                             {
+                                // #318, NOT #310: this compound needs ONE
+                                // session, which croft runs. What it cannot do
+                                // is honour the key. Citing the multi-session
+                                // limit here would be the same false claim the
+                                // launching branch below exists to stop making.
+                                //
+                                // The remedy is stated with its cost: running
+                                // the member directly DOES skip a preLaunchTask,
+                                // which is the very outcome this refusal
+                                // prevents. Offering it silently would relocate
+                                // the bug onto the user.
+                                let keys = compound.unsupported_keys.join(" and ");
+                                let plural = if compound.unsupported_keys.len() > 1 {
+                                    "those keys"
+                                } else {
+                                    "that key"
+                                };
                                 self.debug_error(format!(
-                                    "compound \"{}\" sets {}, which croft does not support yet (#310) — run \"{}\" directly, or drop the key",
+                                    "compound \"{}\" sets {}, which croft does not honour yet (#318) — remove {} to launch \"{}\" through the compound, or run \"{}\" directly and do the work {} asks for yourself",
                                     compound.name,
-                                    compound.unsupported_keys.join(" and "),
-                                    members[0].name
+                                    keys,
+                                    plural,
+                                    members[0].name,
+                                    members[0].name,
+                                    plural
                                 ));
                             }
                             Ok(members) if members.len() == 1 => {

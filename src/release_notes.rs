@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Debug compounds declared in launch.json now appear in the Debug Configuration picker, with their member configurations listed.",
+    summary: "Debug compounds declared in launch.json now appear in the Debug Configuration picker, with their member configurations listed. Selecting one that names a single configuration launches it; one that names several still reports that croft cannot run several debug sessions at once yet (#310).",
 }];

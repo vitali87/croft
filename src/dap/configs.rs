@@ -143,13 +143,20 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
 pub struct Compound {
     pub name: String,
     pub configurations: Vec<String>,
-    /// Keys VS Code defines on a compound that croft does not honour yet:
-    /// `preLaunchTask`, `stopAll`, `presentation`. Recorded rather than
-    /// silently dropped, because a ONE-member compound now launches, and
-    /// launching it via its member alone would run neither the compound's own
-    /// pre-launch task nor respect its presentation — debugging something
-    /// other than what the file asks for, without saying so. Naming them lets
-    /// the launch site refuse instead of pretending.
+    /// Keys croft does not honour that this compound ACTUALLY ASKS FOR:
+    /// `preLaunchTask` with a non-empty value, or a non-empty `presentation`.
+    /// A key present but requesting nothing (`null`, `""`, `{}`) is not
+    /// recorded — croft delivers that behaviour by doing nothing.
+    ///
+    /// `stopAll` is deliberately absent at either value: it decides whether
+    /// ending one session ends the others, which is meaningless for the
+    /// single-session launch this list gates.
+    ///
+    /// Recorded rather than silently dropped because a ONE-member compound now
+    /// launches, and launching it via its member alone would run neither the
+    /// compound's own pre-launch task nor respect its presentation. Note the
+    /// MULTI-member path still discards these silently: it refuses for the
+    /// session count first, and #310 is the blocker the user must clear.
     pub unsupported_keys: Vec<&'static str>,
     /// Which file declared it. A compound's members name configurations in
     /// ITS OWN file first: both files may declare the same name, and binding
@@ -200,10 +207,27 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // Only `name` and `configurations` are read above. Every other key
             // VS Code defines is dropped here, which was harmless while no
             // compound could launch and is not any more — so record which ones
-            // were present rather than discarding the fact.
-            let unsupported_keys: Vec<&'static str> = ["preLaunchTask", "stopAll", "presentation"]
+            // ASK FOR SOMETHING rather than which ones are merely present.
+            //
+            // Presence is the wrong test. `stopAll: false` is VS Code's own
+            // default written out, and `preLaunchTask: null` requests nothing;
+            // croft honours both perfectly by doing nothing, so refusing to
+            // launch would name a key whose behaviour it is already delivering.
+            //
+            // `stopAll` is excluded from the ONE-member gate entirely, at either
+            // value: it governs whether ending one session ends the others, and
+            // with a single session there are no others. It cannot change a
+            // one-member outcome, so it cannot be a reason to refuse one.
+            let asks_for_something = |k: &str| match obj.get(k) {
+                None | Some(Value::Null) => false,
+                Some(Value::String(s)) => !s.is_empty(),
+                Some(Value::Bool(b)) => *b,
+                Some(Value::Object(o)) => !o.is_empty(),
+                Some(_) => true,
+            };
+            let unsupported_keys: Vec<&'static str> = ["preLaunchTask", "presentation"]
                 .into_iter()
-                .filter(|k| obj.contains_key(*k))
+                .filter(|k| asks_for_something(k))
                 .collect();
             Some(Compound {
                 name,
@@ -1163,6 +1187,73 @@ mod tests {
         assert!(
             err.contains("Ghost"),
             "the error names the missing configuration, got: {err}"
+        );
+    }
+
+    /// A key PRESENT but requesting nothing must not be recorded as
+    /// unsupported. `contains_key` was the first attempt and it refused these:
+    /// `stopAll: false` is VS Code's own default written out, and a null or
+    /// empty `preLaunchTask` asks for nothing at all. croft honours every one
+    /// of them perfectly by doing nothing, so naming them in a refusal tells
+    /// the user croft cannot do what it is already doing.
+    ///
+    /// `stopAll` is excluded at EITHER value: it decides whether ending one
+    /// session ends the others, and a one-member compound has no others.
+    #[test]
+    fn a_compound_key_that_requests_nothing_is_not_recorded_as_unsupported() {
+        let text = r#"{
+            "configurations": [ { "name": "A", "type": "node", "program": "a.js" } ],
+            "compounds": [
+                { "name": "DefaultStopAll", "configurations": ["A"], "stopAll": false },
+                { "name": "TrueStopAll", "configurations": ["A"], "stopAll": true },
+                { "name": "NulledTask", "configurations": ["A"], "preLaunchTask": null },
+                { "name": "EmptyTask", "configurations": ["A"], "preLaunchTask": "" },
+                { "name": "EmptyPresentation", "configurations": ["A"], "presentation": {} },
+                { "name": "RealTask", "configurations": ["A"], "preLaunchTask": "build" }
+            ]
+        }"#;
+        let cs = parse_compounds(text, ".vscode/launch.json");
+        assert_eq!(cs.len(), 6, "precondition: every compound parsed");
+        let by = |n: &str| {
+            cs.iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n} parsed"))
+        };
+
+        assert!(
+            by("DefaultStopAll").unsupported_keys.is_empty(),
+            "stopAll:false is VS Code's default and cannot change a one-member \
+             outcome: {:?}",
+            by("DefaultStopAll").unsupported_keys
+        );
+        assert!(
+            by("TrueStopAll").unsupported_keys.is_empty(),
+            "nor can stopAll:true — with one session there are no others to \
+             stop: {:?}",
+            by("TrueStopAll").unsupported_keys
+        );
+        assert!(
+            by("NulledTask").unsupported_keys.is_empty(),
+            "a null preLaunchTask asks for nothing: {:?}",
+            by("NulledTask").unsupported_keys
+        );
+        assert!(
+            by("EmptyTask").unsupported_keys.is_empty(),
+            "nor does an empty one: {:?}",
+            by("EmptyTask").unsupported_keys
+        );
+        assert!(
+            by("EmptyPresentation").unsupported_keys.is_empty(),
+            "nor an empty presentation object: {:?}",
+            by("EmptyPresentation").unsupported_keys
+        );
+
+        // The positive control: without it, six empties could equally mean the
+        // detection never records anything at all.
+        assert_eq!(
+            by("RealTask").unsupported_keys,
+            vec!["preLaunchTask"],
+            "and a key that DOES ask for something is still recorded"
         );
     }
 
