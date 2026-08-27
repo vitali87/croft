@@ -18155,9 +18155,10 @@ impl App {
             label: format!("{} — {} · {}", c.name, c.type_name, c.source),
         }));
         // Compounds are listed so a workspace's own launch.json is reflected
-        // honestly; selecting one reports that running several sessions at
-        // once is not built yet (#310) rather than silently launching one
-        // member, which would debug something other than what was asked for.
+        // honestly. Selecting one LAUNCHES it when it names a single
+        // configuration and carries no key croft cannot honour; otherwise it
+        // reports what is missing (#310) rather than launching a subset, which
+        // would debug something other than what was asked for.
         rows.extend(
             self.debug_compounds
                 .iter()
@@ -21400,6 +21401,26 @@ impl App {
                         // something false about their own launch.json.
                         match crate::dap::configs::resolve_compound(compound, &all) {
                             Err(e) => self.debug_error(e),
+                            // A one-member compound carrying keys croft does
+                            // not honour is REFUSED rather than launched.
+                            // `parse_compounds` reads only `name` and
+                            // `configurations`, so launching via the member
+                            // alone would run neither the compound's own
+                            // `preLaunchTask` nor respect `presentation` — the
+                            // "silently debug something other than what was
+                            // asked for" outcome every guard here exists to
+                            // prevent. Saying so beats doing it.
+                            Ok(members)
+                                if members.len() == 1
+                                    && !compound.unsupported_keys.is_empty() =>
+                            {
+                                self.debug_error(format!(
+                                    "compound \"{}\" sets {}, which croft does not support yet (#310) — run \"{}\" directly, or drop the key",
+                                    compound.name,
+                                    compound.unsupported_keys.join(" and "),
+                                    members[0].name
+                                ));
+                            }
                             Ok(members) if members.len() == 1 => {
                                 let cfg = members[0].clone();
                                 self.selected_debug_config = Some(cfg.name.clone());

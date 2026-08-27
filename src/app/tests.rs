@@ -31351,11 +31351,13 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
     std::fs::write(
         tmp.path().join(".vscode/launch.json"),
         r#"{ "configurations": [
-            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" }
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py" }
         ],
         "compounds": [
             { "name": "Just Server", "configurations": ["Server"] },
-            { "name": "Both", "configurations": ["Server", "Server"] }
+            { "name": "Both", "configurations": ["Server", "Client"] },
+            { "name": "Tasked", "configurations": ["Server"], "preLaunchTask": "build" }
         ]}"#,
     )
     .unwrap();
@@ -31382,8 +31384,16 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
     assert_eq!(
         app.selected_debug_config.as_deref(),
         Some("Server"),
-        "it launches its single member, exactly as selecting that \
+        "it selects its single member, exactly as selecting that \
          configuration directly would"
+    );
+    // `selected_debug_config` is assigned BEFORE `launch_debug_config`, which
+    // has several early-return error paths — so the assertion above proves only
+    // that the launch BRANCH was reached. Assert the launch was not refused.
+    assert!(
+        !app.run_debug.feedback_is_error,
+        "and the launch was not refused on the way: {:?}",
+        app.run_debug.feedback
     );
 
     // The guard that must stay GREEN: this fix must not be satisfiable by
@@ -31405,5 +31415,46 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         "a compound that really does need several sessions is still deferred, \
          and still names the issue: {}",
         app.status
+    );
+
+    // A ONE-member compound carrying a key croft cannot honour is refused
+    // rather than launched: `parse_compounds` never reads `preLaunchTask`, so
+    // launching via the member alone would skip the build the file asks for
+    // and debug stale artifacts without saying so.
+    //
+    // On a FRESH app: the launches above leave a live `dap_session`, and
+    // `debug_error` does not clear one, so asserting `is_none()` on this app
+    // would be answered by the earlier launch rather than by this refusal.
+    let mut fresh = App::new(tmp.path().to_path_buf()).unwrap();
+    fresh.open_debug_config_picker();
+    let tasked = fresh
+        .list_picker
+        .as_ref()
+        .expect("picker open")
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Tasked"))
+        .expect("the key-carrying compound is listed");
+    fresh.list_picker.as_mut().unwrap().selected = tasked;
+    fresh.confirm_list_picker();
+    assert!(
+        fresh.status.contains("preLaunchTask"),
+        "the refusal names the key croft cannot honour, so the user can act \
+         on it rather than guessing: {}",
+        fresh.status
+    );
+    assert!(
+        fresh.run_debug.feedback_is_error,
+        "and it is reported AS an error, not as a status note"
+    );
+    assert!(
+        fresh.dap_session.is_none(),
+        "and nothing launched — running it without its preLaunchTask would \
+         debug stale artifacts silently"
+    );
+    assert!(
+        fresh.selected_debug_config.is_none(),
+        "nor was a configuration selected: the refusal happens before any \
+         launch bookkeeping"
     );
 }

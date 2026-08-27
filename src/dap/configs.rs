@@ -143,6 +143,14 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
 pub struct Compound {
     pub name: String,
     pub configurations: Vec<String>,
+    /// Keys VS Code defines on a compound that croft does not honour yet:
+    /// `preLaunchTask`, `stopAll`, `presentation`. Recorded rather than
+    /// silently dropped, because a ONE-member compound now launches, and
+    /// launching it via its member alone would run neither the compound's own
+    /// pre-launch task nor respect its presentation — debugging something
+    /// other than what the file asks for, without saying so. Naming them lets
+    /// the launch site refuse instead of pretending.
+    pub unsupported_keys: Vec<&'static str>,
     /// Which file declared it. A compound's members name configurations in
     /// ITS OWN file first: both files may declare the same name, and binding
     /// a `.vscode` compound to a `.croft` config of that name would debug a
@@ -189,10 +197,19 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             if configurations.is_empty() {
                 return None;
             }
+            // Only `name` and `configurations` are read above. Every other key
+            // VS Code defines is dropped here, which was harmless while no
+            // compound could launch and is not any more — so record which ones
+            // were present rather than discarding the fact.
+            let unsupported_keys: Vec<&'static str> = ["preLaunchTask", "stopAll", "presentation"]
+                .into_iter()
+                .filter(|k| obj.contains_key(*k))
+                .collect();
             Some(Compound {
                 name,
                 configurations,
                 source,
+                unsupported_keys,
             })
         })
         .collect()
