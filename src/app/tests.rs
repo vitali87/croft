@@ -2614,6 +2614,67 @@ fn a_bound_click_still_fires_over_a_mouse_tracking_child() {
 }
 
 #[test]
+fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
+    // `terminal_would_open_something_at` decides whether swallowing a
+    // double-click prefix would cost the user a built-in link-open. The
+    // built-in calls `activate_terminal_pane(idx)` BEFORE it looks for a
+    // link, so it reads the CLICKED pane. A predicate reading
+    // `self.terminal()` reads the ACTIVE pane, and in any split layout where
+    // the click lands outside the focused pane those are different content —
+    // so the swallow decision disagrees with what the built-in then does.
+    //
+    // Observable is a REFUSED link (`open_detected_url` rejects a non-web
+    // scheme inertly). A printed https URL would reach `open_url`, which is
+    // `Command::new("open")` with no test guard, and the suite would launch a
+    // real browser on every run.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    // Only the DOUBLE is bound, so a single ctrl+click is a prefix and the
+    // swallow branch is the one under test.
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.terminals.len(), 2, "two panes are visible");
+
+    // Link in pane 0; pane 1 is ACTIVE. The two panes must differ, or the
+    // bug is unreachable and this test proves nothing.
+    app.terminals[0]
+        .feed_bytes_for_test(b"\x1b]8;;mailto:split@example.com\x1b\\split-link\x1b]8;;\x1b\\\r\n");
+    app.active_terminal = 1;
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    let (col, row) = (area.x + 2, area.y + 1);
+    assert!(
+        app.terminals[0].hyperlink_at_screen(col, row).is_some(),
+        "pane 0 must carry the link, or the built-in has nothing to act on"
+    );
+    assert_eq!(
+        app.active_terminal, 1,
+        "pane 1 must be ACTIVE while the click lands in pane 0, or the \
+         clicked-vs-active distinction this test exists for does not arise"
+    );
+
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    assert!(
+        app.status.contains("Refused to open non-web link"),
+        "the prefix click must defer to the built-in, which opens the link in \
+         the CLICKED pane. Reading the ACTIVE pane finds nothing there, \
+         swallows the click, and the link never opens. status was {:?}",
+        app.status
+    );
+}
+
+#[test]
 fn a_prefix_click_defers_to_the_builtin_for_a_file_reference_too() {
     // The built-in Ctrl+click tries `terminal_url_click` OR
     // `terminal_file_click`. A swallow guard that consults only the URL half

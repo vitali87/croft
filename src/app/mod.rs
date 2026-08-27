@@ -26243,16 +26243,23 @@ impl App {
     /// drifts. A file REFERENCE under the cursor is enough to defer to the
     /// built-in — at worst the prefix click is not swallowed, which costs a
     /// stray built-in action rather than a lost one.
-    fn terminal_would_open_something_at(&self, col: u16, row: u16) -> bool {
-        if self.terminal().hyperlink_at_screen(col, row).is_some() {
+    ///
+    /// Takes the CLICKED pane's index rather than reading `self.terminal()`.
+    /// The built-in activates the clicked pane before it looks for a link, so
+    /// a predicate reading the ACTIVE pane answers about different content
+    /// whenever the two differ — which is any split layout where the click
+    /// lands outside the focused pane.
+    fn terminal_would_open_something_at(&self, idx: usize, col: u16, row: u16) -> bool {
+        let Some(t) = self.terminals.get(idx) else {
+            return false;
+        };
+        if t.hyperlink_at_screen(col, row).is_some() {
             return true;
         }
-        self.terminal()
-            .line_text_at(col, row)
-            .is_some_and(|(text, c)| {
-                crate::port_detect::url_at(&text, c).is_some()
-                    || crate::file_ref::file_ref_at(&text, c).is_some()
-            })
+        t.line_text_at(col, row).is_some_and(|(text, c)| {
+            crate::port_detect::url_at(&text, c).is_some()
+                || crate::file_ref::file_ref_at(&text, c).is_some()
+        })
     }
 
     fn terminal_url_click(&mut self, col: u16, row: u16) -> bool {
@@ -30847,7 +30854,8 @@ impl App {
             matches!(ctx, crate::keymap::MouseContext::Terminal))
             && (m.modifiers.contains(KeyModifiers::CONTROL)
                 || m.modifiers.contains(KeyModifiers::SUPER))
-            && self.terminal_would_open_something_at(m.column, m.row);
+            && terminal_hit
+                .is_some_and(|idx| self.terminal_would_open_something_at(idx, m.column, m.row));
         if let Some((ctx, gesture, None)) = bound_mouse
             && !gesture.mods.is_empty()
             && !builtin_would_act
