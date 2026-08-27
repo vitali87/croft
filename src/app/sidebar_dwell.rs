@@ -42,6 +42,22 @@ impl SidebarDwell {
     pub fn disarm(&mut self) {
         self.anchor = None;
     }
+
+    /// Push an ARMED timer's deadline out to `now`, leaving a disarmed one
+    /// alone. Used while a structural suppression (Zen Mode, hidden activity
+    /// bar) holds the collapse off: the dwell must survive — cancelling it
+    /// strands the feature, since nothing re-arms when the suppression lifts —
+    /// but it must not fire the instant it does, for a focus move made an hour
+    /// earlier. Re-stamping keeps the pending collapse alive while restarting
+    /// its grace period from the moment a collapse first becomes possible.
+    ///
+    /// Deliberately NOT `arm`: `arm` starts a timer that was not running, and a
+    /// suppressed tick must never begin one on its own.
+    pub fn restamp(&mut self, now: Instant) {
+        if self.anchor.is_some() {
+            self.anchor = Some(now);
+        }
+    }
 }
 
 #[cfg(test)]

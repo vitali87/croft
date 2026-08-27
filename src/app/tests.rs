@@ -31969,22 +31969,24 @@ fn arming_inside_zen_mode_does_not_collapse_the_sidebar_when_zen_exits() {
     // no entry site can see: the suppression was already in force.
     let t0 = std::time::Instant::now();
     app.focus_pane(Pane::Editor);
-    // NOT asserted here: whether the dwell armed. Arming is fine — what must
-    // never happen is the collapse LANDING later. Refusing to arm was the
-    // first attempt and it stranded the feature whenever the suppression was a
-    // hidden activity bar rather than Zen, because nothing re-arms once the
-    // bar returns (see `auto_hide_recovers_after_the_activity_bar_comes_back`).
-    // The cancel happens at fire time instead, so a tick DURING Zen is what
-    // discards it.
+    // The main loop, faithfully: ticks throughout Zen, well past the grace
+    // delay. None may collapse, and — the part two previous fixes got wrong —
+    // none may destroy the pending collapse either, because nothing would
+    // re-arm it afterwards.
+    for i in 0..50u32 {
+        assert!(
+            !app.tick_sidebar_auto_hide_at(
+                t0 + AUTO_HIDE_DWELL * 2 + std::time::Duration::from_millis(8 * i as u64)
+            ),
+            "no collapse fires inside Zen: Zen owns the chrome (tick {i})"
+        );
+    }
     assert!(
-        !app.tick_sidebar_auto_hide_at(t0 + AUTO_HIDE_DWELL * 2),
-        "a tick inside Zen does not collapse: Zen owns the chrome"
-    );
-    assert!(
-        !app.sidebar_dwell.armed(),
-        "and it CANCELS rather than deferring — a structural suppression can \
-         last the session, so retrying would land the collapse on the frame \
-         Zen exits, for a focus move made an hour earlier"
+        app.sidebar_dwell.armed(),
+        "and the dwell SURVIVES those ticks. Cancelling on a suppressed tick \
+         is indistinguishable from refusing to arm — production ticks every \
+         8ms, so the cancel lands 8ms after the arm, and nothing re-arms once \
+         a structural suppression lifts"
     );
 
     // The user-visible failure, spelled out. Zen exit RESTORES the pre-Zen
@@ -31999,6 +32001,11 @@ fn arming_inside_zen_mode_does_not_collapse_the_sidebar_when_zen_exits() {
         app.sidebar_auto_hide_allowed(),
         "precondition: a collapse is structurally possible again"
     );
+    // The claim this test exists for: no STALE collapse on the frame Zen exits.
+    // The dwell is still armed, but each suppressed tick re-stamped it, so its
+    // deadline is measured from the last moment a collapse was impossible —
+    // not from the focus move made before Zen. The user gets the full grace
+    // period from a moment they can perceive: the chrome coming back.
     assert!(
         !app.tick_sidebar_auto_hide_at(t0 + AUTO_HIDE_DWELL * 2),
         "and no stale collapse fires after Zen exits, for a focus move made \
@@ -32008,25 +32015,31 @@ fn arming_inside_zen_mode_does_not_collapse_the_sidebar_when_zen_exits() {
         app.show_tree,
         "the sidebar is still up: the user asked for it and never asked otherwise"
     );
+    // But the collapse is not LOST either — that was the round-one and
+    // round-two defect. Once the re-stamped grace period elapses it fires.
+    let after_zen = t0 + AUTO_HIDE_DWELL * 2 + std::time::Duration::from_millis(8 * 49);
+    assert!(
+        app.tick_sidebar_auto_hide_at(after_zen + AUTO_HIDE_DWELL * 2),
+        "and once the grace period from Zen exit elapses, it does fire: \
+         retained, not discarded"
+    );
 }
 
-/// #302 REGRESSION GUARD: refusing to arm under a structural suppression must
-/// not leave auto-hide permanently dead once that suppression lifts.
+/// #302 REGRESSION GUARD, round three. The two previous fixes each destroyed
+/// the state the recovery needs, and the guard that was supposed to catch that
+/// COULD NOT, because it never ticked during the suppression.
 ///
-/// This is the failure mode of fixing a class at the wrong boundary. Refusing
-/// to ARM is safe for Zen only because Zen EXIT restores the pre-Zen snapshot
-/// and closes the sidebar, so the user must re-reveal it and that gesture
-/// re-arms. The hidden activity bar has no such restore: the sidebar stays
-/// exactly as it was, focus is already on the editor, and nothing calls
-/// `focus_pane` again — production explicitly guards `if self.focus !=
-/// Pane::Editor` before doing so. So a refusal with no re-arm strands the
-/// feature for the rest of the session, with nothing on screen to explain it.
+/// `main_loop` calls `tick_sidebar_auto_hide()` unconditionally on an 8ms
+/// cadence (mod.rs, `event::poll(Duration::from_millis(8))`). So in production
+/// a tick lands within 8ms of arming — and again, and again, for as long as the
+/// suppression lasts. Any design that cancels the dwell on a suppressed tick
+/// has cancelled it 8ms after it was armed, which is indistinguishable from
+/// refusing to arm at all.
 ///
-/// The retry loop in `tick_sidebar_auto_hide_at` IS the recovery mechanism:
-/// it stays armed through a decline and fires as soon as the suppression
-/// lifts. Anything that stops the dwell arming also makes that loop
-/// unreachable — which turns "every exit needs a disarm" into "every exit
-/// needs a re-arm" without any test failing to say so.
+/// This test therefore TICKS DURING THE SUPPRESSED PERIOD, many times, exactly
+/// as the main loop would. That single property is what separates it from the
+/// vacuous guard it replaces: the previous version set the flag, cleared it,
+/// and ticked once afterwards — a sequence production never produces.
 #[test]
 fn auto_hide_recovers_after_the_activity_bar_comes_back() {
     let tmp = tempfile::tempdir().unwrap();
@@ -32041,16 +32054,40 @@ fn auto_hide_recovers_after_the_activity_bar_comes_back() {
         "precondition: a hidden activity bar structurally suppresses the collapse"
     );
 
-    // The user works in the editor while the bar is hidden.
     let t0 = std::time::Instant::now();
     app.focus_pane(Pane::Editor);
+
+    // The main loop, faithfully: ticks every 8ms while the bar stays hidden,
+    // and — the part that makes this a real guard — PAST the grace delay.
+    //
+    // Ticking only within AUTO_HIDE_DWELL proves nothing: the tick returns at
+    // its `due` check before it ever reaches the structural branch, so a
+    // cancel-on-suppressed-tick defect is unreachable and the test passes
+    // against the very design it exists to reject. That was the third version
+    // of this guard and it had no teeth; teeth-proving it against the round-two
+    // mutation is what exposed that. Production ticks for as long as the
+    // suppression lasts, which is minutes or hours, so the ticks that matter
+    // are the ones AFTER the deadline has elapsed.
+    for i in 0..50u32 {
+        let t = t0 + AUTO_HIDE_DWELL * 2 + std::time::Duration::from_millis(8 * i as u64);
+        assert!(
+            !app.tick_sidebar_auto_hide_at(t),
+            "no collapse may fire while the bar is hidden (tick {i})"
+        );
+    }
+    assert!(
+        app.sidebar_dwell.armed(),
+        "and the dwell SURVIVES them: cancelling on a suppressed tick is what \
+         strands the feature, because nothing re-arms once the bar returns"
+    );
     assert!(
         app.show_tree,
-        "precondition: nothing collapses while the bar is hidden"
+        "precondition: still open after 50 suppressed ticks"
     );
 
-    // An hour later they bring the activity bar back. Focus never moved: it is
-    // still the editor, so no further gesture will arm anything.
+    // An hour later the user brings the activity bar back. Focus never moved —
+    // it is still the editor — so no gesture will arm anything, and production
+    // guards `if self.focus != Pane::Editor` before calling `focus_pane`.
     app.activity_bar_visible = true;
     assert!(
         app.focus == Pane::Editor,
@@ -32061,8 +32098,9 @@ fn auto_hide_recovers_after_the_activity_bar_comes_back() {
         "precondition: the suppression has lifted"
     );
 
+    let last_tick = t0 + AUTO_HIDE_DWELL * 2 + std::time::Duration::from_millis(8 * 49);
     assert!(
-        app.tick_sidebar_auto_hide_at(t0 + AUTO_HIDE_DWELL * 2),
+        app.tick_sidebar_auto_hide_at(last_tick + AUTO_HIDE_DWELL * 2),
         "auto-hide recovers once the bar returns: the pending collapse fires \
          rather than the feature staying dead for the session"
     );

@@ -12945,13 +12945,23 @@ impl App {
         // open during the grace window would keep a sidebar that never
         // auto-hides again. Retrying costs nothing: `main_loop` ticks on an
         // 8ms cadence, so the collapse lands as soon as the suppression lifts.
-        // A STRUCTURAL suppression cancels rather than defers. It can last the
-        // session, so retrying would land the collapse on the frame it lifts,
-        // for a focus move the user long since stopped associating with it.
-        // Disarm and let a fresh gesture arm again — the sidebar is on screen
-        // and reachable, so there is a gesture to be had.
+        // A STRUCTURAL suppression DEFERS and re-stamps. Cancelling here was
+        // the round-two defect: `main_loop` ticks every 8ms unconditionally, so
+        // a cancel-on-suppressed-tick fires 8ms after arming and is
+        // indistinguishable from refusing to arm at all — which strands the
+        // feature, because nothing re-arms once a hidden activity bar returns
+        // (focus never moved, and production will not re-focus a pane that
+        // already has focus).
+        //
+        // Re-stamping is what makes deferral safe. The complaint against
+        // deferral was that Zen can last an hour and the collapse would land on
+        // the frame it exits, for a focus move the user has long forgotten.
+        // Anchoring to the moment the suppression LIFTS answers that exactly:
+        // the user then gets the same AUTO_HIDE_DWELL grace they would get from
+        // a fresh focus move, measured from a moment they can actually perceive
+        // — the chrome coming back.
         if self.sidebar_structurally_suppressed() {
-            self.sidebar_dwell.disarm();
+            self.sidebar_dwell.restamp(now);
             return false;
         }
         if !self.sidebar_auto_hide_allowed() {
