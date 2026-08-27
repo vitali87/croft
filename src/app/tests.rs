@@ -31969,11 +31969,22 @@ fn arming_inside_zen_mode_does_not_collapse_the_sidebar_when_zen_exits() {
     // no entry site can see: the suppression was already in force.
     let t0 = std::time::Instant::now();
     app.focus_pane(Pane::Editor);
+    // NOT asserted here: whether the dwell armed. Arming is fine — what must
+    // never happen is the collapse LANDING later. Refusing to arm was the
+    // first attempt and it stranded the feature whenever the suppression was a
+    // hidden activity bar rather than Zen, because nothing re-arms once the
+    // bar returns (see `auto_hide_recovers_after_the_activity_bar_comes_back`).
+    // The cancel happens at fire time instead, so a tick DURING Zen is what
+    // discards it.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(t0 + AUTO_HIDE_DWELL * 2),
+        "a tick inside Zen does not collapse: Zen owns the chrome"
+    );
     assert!(
         !app.sidebar_dwell.armed(),
-        "arming under a structural suppression is refused at the source: the \
-         collapse cannot fire while Zen lasts, and a dwell left armed across \
-         it has no boundary left to cancel it"
+        "and it CANCELS rather than deferring — a structural suppression can \
+         last the session, so retrying would land the collapse on the frame \
+         Zen exits, for a focus move made an hour earlier"
     );
 
     // The user-visible failure, spelled out. Zen exit RESTORES the pre-Zen
@@ -31997,4 +32008,63 @@ fn arming_inside_zen_mode_does_not_collapse_the_sidebar_when_zen_exits() {
         app.show_tree,
         "the sidebar is still up: the user asked for it and never asked otherwise"
     );
+}
+
+/// #302 REGRESSION GUARD: refusing to arm under a structural suppression must
+/// not leave auto-hide permanently dead once that suppression lifts.
+///
+/// This is the failure mode of fixing a class at the wrong boundary. Refusing
+/// to ARM is safe for Zen only because Zen EXIT restores the pre-Zen snapshot
+/// and closes the sidebar, so the user must re-reveal it and that gesture
+/// re-arms. The hidden activity bar has no such restore: the sidebar stays
+/// exactly as it was, focus is already on the editor, and nothing calls
+/// `focus_pane` again — production explicitly guards `if self.focus !=
+/// Pane::Editor` before doing so. So a refusal with no re-arm strands the
+/// feature for the rest of the session, with nothing on screen to explain it.
+///
+/// The retry loop in `tick_sidebar_auto_hide_at` IS the recovery mechanism:
+/// it stays armed through a decline and fires as soon as the suppression
+/// lifts. Anything that stops the dwell arming also makes that loop
+/// unreachable — which turns "every exit needs a disarm" into "every exit
+/// needs a re-arm" without any test failing to say so.
+#[test]
+fn auto_hide_recovers_after_the_activity_bar_comes_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    app.activity_bar_visible = false;
+    app.focus_pane(Pane::Tree);
+
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "precondition: a hidden activity bar structurally suppresses the collapse"
+    );
+
+    // The user works in the editor while the bar is hidden.
+    let t0 = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.show_tree,
+        "precondition: nothing collapses while the bar is hidden"
+    );
+
+    // An hour later they bring the activity bar back. Focus never moved: it is
+    // still the editor, so no further gesture will arm anything.
+    app.activity_bar_visible = true;
+    assert!(
+        app.focus == Pane::Editor,
+        "precondition: focus never moved, so nothing re-arms by gesture"
+    );
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: the suppression has lifted"
+    );
+
+    assert!(
+        app.tick_sidebar_auto_hide_at(t0 + AUTO_HIDE_DWELL * 2),
+        "auto-hide recovers once the bar returns: the pending collapse fires \
+         rather than the feature staying dead for the session"
+    );
+    assert!(!app.show_tree, "and the sidebar actually collapsed");
 }

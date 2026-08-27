@@ -12762,6 +12762,21 @@ impl App {
     /// hold it open lives here rather than being scattered through the call
     /// sites, so the interaction rules are one readable list and a new
     /// suppression case has exactly one place to go.
+    /// Whether a STRUCTURAL suppression is in force: one that no passage of
+    /// time lifts, only a deliberate chrome change by the user.
+    ///
+    /// Split out from [`Self::sidebar_auto_hide_allowed`] because the tick has
+    /// to treat the two kinds differently and the combined predicate cannot
+    /// say which it declined for. A transient suppression (seam drag, open
+    /// palette, modal) ends in moments, so the dwell stays armed and retries.
+    /// A structural one can last the session, and a dwell left armed across it
+    /// fires on the frame it lifts — a collapse for a focus move the user made
+    /// an hour ago. Cancelling at the ARM site instead would make the retry
+    /// unreachable, which is the recovery path for the transient case.
+    fn sidebar_structurally_suppressed(&self) -> bool {
+        !self.activity_bar_visible || self.zen_mode
+    }
+
     fn sidebar_auto_hide_allowed(&self) -> bool {
         if !self.sidebar_auto_hide || !self.show_tree {
             return false;
@@ -12873,28 +12888,22 @@ impl App {
         // which is the #260 flapping this flag exists to prevent. Arming is
         // what has to be refused; there is nothing left to consult later.
         //
-        // The STRUCTURAL suppressions (Zen Mode, hidden activity bar) belong in
-        // that same category, for the same reason. `tick_sidebar_auto_hide_at`
-        // says structural cases "are handled where they are ENTERED rather than
-        // here" — true of every case where a transition exists, and false of
-        // this one. Cmd+B works inside Zen, so the dwell can be armed while the
-        // suppression is ALREADY in force: no boundary is crossed, so no entry
-        // hook can fire, and the tick's `!allowed()` decline deliberately stays
-        // armed (correct for transient suppressions, which end in moments).
-        // Zen can last the session, and the collapse then lands on the frame
-        // Zen exits — for a focus move the user made an hour earlier, spending
-        // any pin with it.
+        // The STRUCTURAL suppressions (Zen Mode, hidden activity bar) are NOT
+        // checked here, and that is deliberate. Refusing to arm under them
+        // looks right and strands the feature: the tick stays armed through a
+        // decline and fires once the suppression lifts, so that retry IS the
+        // recovery path, and nothing that fails to arm can ever use it. Zen
+        // survives such a refusal only because Zen exit restores the pre-Zen
+        // snapshot and closes the sidebar, forcing a fresh reveal; a hidden
+        // activity bar restores nothing, focus is already on the editor, and
+        // production will not call `focus_pane` again for a pane that already
+        // has focus — so auto-hide would stay dead for the rest of the session
+        // with nothing on screen to explain it.
         //
-        // So refuse to ARM under a suppression that no later event will lift on
-        // its own. This mirrors `toggle_side_bar`, which already declines to
-        // bank a pin on exactly these four conditions; matching them here is
-        // what stops each new exit boundary from needing its own disarm.
-        if self.sidebar_auto_hide
-            && self.show_tree
-            && !self.sidebar_auto_hide_suspended
-            && self.activity_bar_visible
-            && !self.zen_mode
-        {
+        // The structural/transient distinction is drawn at FIRE time instead,
+        // where the state is actually known and no future suppression needs its
+        // own boundary hook. See `tick_sidebar_auto_hide_at`.
+        if self.sidebar_auto_hide && self.show_tree && !self.sidebar_auto_hide_suspended {
             self.sidebar_dwell.arm(std::time::Instant::now());
         }
     }
@@ -12936,6 +12945,15 @@ impl App {
         // open during the grace window would keep a sidebar that never
         // auto-hides again. Retrying costs nothing: `main_loop` ticks on an
         // 8ms cadence, so the collapse lands as soon as the suppression lifts.
+        // A STRUCTURAL suppression cancels rather than defers. It can last the
+        // session, so retrying would land the collapse on the frame it lifts,
+        // for a focus move the user long since stopped associating with it.
+        // Disarm and let a fresh gesture arm again — the sidebar is on screen
+        // and reachable, so there is a gesture to be had.
+        if self.sidebar_structurally_suppressed() {
+            self.sidebar_dwell.disarm();
+            return false;
+        }
         if !self.sidebar_auto_hide_allowed() {
             return false;
         }
@@ -12948,12 +12966,12 @@ impl App {
         // suppression (seam drag, palette, modal) spends nothing and the pin
         // survives to do its job a moment later.
         //
-        // Structural suppressions are handled where they are ENTERED rather than
-        // here: `toggle_side_bar` refuses to bank a pin under Zen Mode or a
-        // hidden activity bar, and Zen entry and the activity-bar toggle each
-        // disarm. That keeps the rule at the sites that know the state changed,
-        // instead of asking this tick to distinguish a suppression that lasts a
-        // moment from one that lasts the session.
+        // Structural suppressions are decided HERE, above, not at the sites
+        // that enter them. Entry hooks cannot see the case where the dwell is
+        // armed while the suppression is ALREADY in force — Cmd+B works inside
+        // Zen, so no transition occurs and no hook fires. This tick is asked to
+        // distinguish a suppression that lasts a moment from one that lasts the
+        // session precisely because it is the one place that always runs.
         let exempt = std::mem::take(&mut self.sidebar_pinned_open);
         if !exempt {
             self.show_tree = false;
