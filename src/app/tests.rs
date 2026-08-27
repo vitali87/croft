@@ -2162,16 +2162,23 @@ fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one()
 }
 
 #[test]
-fn a_mouse_tracking_child_keeps_the_pointer_from_a_bound_gesture() {
-    // A terminal running a mouse-tracking TUI owns the pointer: croft must
-    // not steal a click the child asked for, and a user binding is no more
-    // entitled to it than a built-in. SHIFT is the documented override.
-    use crossterm::event::{MouseButton, MouseEventKind};
+fn a_mouse_tracking_child_keeps_the_pointer_from_a_bound_wheel() {
+    // A tracking child owns the gestures croft actually FORWARDS, and croft
+    // forwards exactly one kind: `report_mouse`'s three production call sites
+    // all construct WheelUp/WheelDown. So the wheel is the case where "the
+    // child asked for it" is true, and a bound wheel must decline for the
+    // child. Clicks are covered by
+    // `a_bound_click_still_fires_over_a_mouse_tracking_child`, which asserts
+    // the opposite for the opposite reason: there is no click-forwarding path,
+    // so declining a click hands it to nobody.
+    //
+    // SHIFT is the documented override.
+    use crossterm::event::MouseEventKind;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Terminal);
     app.keymap = crate::keymap::Keymap::from_json(
-        r#"[{"key": "ctrl+click", "command": "quick_open", "when": "terminal"}]"#,
+        r#"[{"key": "ctrl+wheel_up", "command": "quick_open", "when": "terminal"}]"#,
     );
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -2186,12 +2193,20 @@ fn a_mouse_tracking_child_keeps_the_pointer_from_a_bound_gesture() {
 
     let area = app.terminals[0].last_area;
     let (col, row) = (area.x + 2, area.y + 1);
-    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    // Precondition: the cell must be inside `last_inner`, or the guard
+    // declines for the BORDER reason and this proves nothing about tracking.
+    assert!(
+        app.terminals[0].cell_at(col, row).is_some(),
+        "the wheel must land on a real grid cell"
+    );
+    let mut ev = mouse(MouseEventKind::ScrollUp, col, row);
     ev.modifiers = KeyModifiers::CONTROL;
     app.handle_mouse(ev);
     assert!(
         app.file_finder.is_none(),
-        "the child owns the pointer, so the binding must not fire"
+        "croft FORWARDS the wheel to a tracking child (all three `report_mouse` \
+         call sites construct WheelUp/WheelDown), so the child really does own \
+         this gesture and the binding must not fire"
     );
 }
 
@@ -2382,18 +2397,92 @@ fn the_first_click_of_a_bound_modified_pair_does_not_fire_the_builtin() {
 }
 
 #[test]
+#[ignore = "reproduces #317: the built-in terminal click path records without a \
+            modifier guard, so an unmatched ctrl+click arms the plain \
+            double-click tracker. Un-ignore this as the red when fixing #317; \
+            guarding `record` changes built-in selection for every user, which \
+            is out of scope for #297."]
+fn an_unmatched_modified_click_does_not_arm_the_tracker() {
+    // The shape that actually reaches the built-in `terminal_click.record`,
+    // which has no modifier guard: a modified click that CLASSIFIES, matches
+    // no binding, and is NOT the first half of a bound double-click. Binding
+    // `alt+double_click` and clicking with CTRL gives exactly that — the
+    // swallow branch declines (the bound double is ALT, the click is CTRL, so
+    // `is_double_click_prefix` is false for this gesture), and the dispatch
+    // falls through to the built-in for real.
+    //
+    // If `record` armed on it, the user's next ordinary click would select a
+    // word they never gestured for.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "alt+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "terminal must be laid out"
+    );
+    let (col, row) = (area.x + 2, area.y + 1);
+    app.terminals[0].feed_bytes_for_test(b"hello_world_token some other text\r\n");
+
+    // Precondition: the CTRL click must match nothing, or it returns early
+    // from the matched dispatch and never reaches the built-in.
+    let ctrl_gesture = crate::keymap::Gesture {
+        kind: crate::keymap::GestureKind::Click,
+        mods: KeyModifiers::CONTROL,
+    };
+    assert!(
+        app.keymap
+            .command_for_mouse(ctrl_gesture, crate::keymap::MouseContext::Terminal)
+            .is_none(),
+        "ctrl+click must match nothing, or this never reaches the built-in"
+    );
+    assert!(
+        !app.keymap
+            .is_double_click_prefix(ctrl_gesture, crate::keymap::MouseContext::Terminal),
+        "ctrl+click must NOT be a double-click prefix here, or the swallow \
+         branch returns first and the built-in is never reached"
+    );
+
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    // A following PLAIN click must be a fresh single click, not the second
+    // half of a double the modified click armed.
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col + 1, row));
+    let selected = app.terminal().selection_text();
+    assert!(
+        !selected.contains("hello_world_token"),
+        "a plain click after an unmatched ctrl+click must not select a WORD: \
+         the ctrl+click must not have armed the double-click tracker, but \
+         selection was {selected:?}"
+    );
+}
+
+#[test]
 fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal() {
     // `terminal_click.record` has no modifier guard, so a ctrl+click that
     // REACHES it arms the plain double-click tracker and the user's next
     // ordinary click selects a word they never gestured for.
     //
-    // Reaching it is the subtle part. A ctrl+click that MATCHES a binding
-    // returns early from the dispatch and never touches the built-in path at
-    // all — a version of this test binding `ctrl+click` to a real command
-    // passes vacuously for that reason. The reachable case is the gesture that
-    // classifies but matches nothing: binding only `ctrl+double_click` leaves
-    // the pair's first click, a bare `ctrl+click`, with no command, so it
-    // falls through to the built-in and records.
+    // What this test ACTUALLY covers is the swallow branch, not the built-in.
+    // With only `ctrl+double_click` bound, the pair's first click matches no
+    // command, `is_double_click_prefix` is therefore true, and the SWALLOW
+    // branch returns before the built-in path runs — so `terminal_click.record`
+    // is never reached here. Deleting the swallow branch does fail this test,
+    // which is what it guards: the prefix click must not arm the tracker.
+    //
+    // The unguarded `record` itself is covered separately by
+    // `an_unmatched_modified_click_does_not_arm_the_tracker`, which uses a
+    // gesture that classifies, matches nothing, and is NOT a double-click
+    // prefix — the only shape that actually reaches the built-in.
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -2468,18 +2557,25 @@ fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal(
 }
 
 #[test]
-fn a_modified_click_over_a_mouse_tracking_child_does_not_arm_the_tracker() {
-    // The modified-click recording sits ABOVE the `child_owns_pointer` guard,
-    // where the built-ins record inside it. So a modified click over a TUI
-    // that owns the pointer is correctly forwarded to the child and NOT acted
-    // on — while still arming the tracker. Two such clicks, then one more
-    // after the child exits, and the third classifies as a double off state
-    // built from clicks croft deliberately declined to handle.
+fn a_bound_click_still_fires_over_a_mouse_tracking_child() {
+    // `child_owns_pointer` suppressed bound CLICKS on the stated ground that a
+    // tracking child owns the pointer. For the WHEEL that is exact -- the
+    // wheel arms genuinely call `report_mouse`. For clicks it is false:
+    // `report_mouse`'s three production call sites all construct
+    // WheelUp/WheelDown, and `MouseButtonKind::Left` is never constructed
+    // outside `encode_mouse_report`'s own tests. There is no click-forwarding
+    // path, so suppressing the binding hands the gesture to nobody -- and the
+    // built-in `Down(Left)` arm does not defer either (it runs
+    // `start_selection_at` and Ctrl+click URL-open with no `mouse_reporting`
+    // check, unlike click-to-move-cursor, which does gate on it).
+    //
+    // So the binding must fire. The observable is the bound command's own
+    // effect, not a status string the built-in could also produce.
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.keymap = crate::keymap::Keymap::from_json(
-        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+        r#"[{"key": "ctrl+click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
     );
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -2492,38 +2588,99 @@ fn a_modified_click_over_a_mouse_tracking_child_does_not_arm_the_tracker() {
     );
     let (col, row) = (area.x + 2, area.y + 1);
 
-    // Same escape the sibling tracking test uses: let the child actually turn
-    // reporting on rather than poking a setter, so this exercises the real
-    // predicate `child_owns_pointer` consults.
     app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
     assert!(
         app.terminals[0].mouse_reporting(),
-        "the child must be tracking, or `child_owns_pointer` is false and this \
-         test proves nothing about the guard"
+        "the child must be tracking, or this test says nothing about the guard"
     );
+    assert!(
+        app.terminals[0].cell_at(col, row).is_some(),
+        "the click must land on a real grid cell, or the guard declines for the \
+         border reason instead of the tracking one and the test is vacuous"
+    );
+
+    let before = app.editor.wrap_enabled();
     let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
     ctrl.modifiers = KeyModifiers::CONTROL;
     app.handle_mouse(ctrl);
 
-    // The click above was the child's, not croft's. The tracker must be clean,
-    // or the NEXT modified click pairs with a click croft never handled.
+    assert_ne!(
+        app.editor.wrap_enabled(),
+        before,
+        "a bound ctrl+click over a tracking child must RUN: croft has no \
+         click-forwarding path, so declining it gives the gesture to nobody \
+         while the built-in fires anyway"
+    );
+}
+
+#[test]
+fn a_prefix_click_defers_to_the_builtin_for_a_file_reference_too() {
+    // The built-in Ctrl+click tries `terminal_url_click` OR
+    // `terminal_file_click`. A swallow guard that consults only the URL half
+    // still eats the file jump -- the same defect one branch over, which is
+    // exactly the shape that produced this PR's major 2. Both arms or neither.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("target_file.rs"), "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
     assert!(
-        !app.modified_click
-            .is_double(std::time::Instant::now(), col, row, KeyModifiers::CONTROL),
-        "a modified click forwarded to a mouse-tracking child must not arm the \
-         modified-click tracker"
+        area.width > 12 && area.height > 2,
+        "terminal must be laid out"
+    );
+    app.terminals[0].feed_bytes_for_test(b"target_file.rs:1:1\r\n");
+    term.draw(|f| app.render(f)).unwrap();
+
+    let (col, row) = (area.x + 2, area.y + 1);
+    // Precondition: a file REFERENCE must be under the cursor, or the guard
+    // declines for "nothing there" and the test says nothing about the file
+    // half specifically.
+    let has_ref = app.terminals[0]
+        .line_text_at(col, row)
+        .is_some_and(|(t, c)| crate::file_ref::file_ref_at(&t, c).is_some());
+    assert!(
+        has_ref,
+        "the cell must carry a file reference, or this test cannot distinguish \
+         the file arm from the URL arm"
+    );
+
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    // The built-in ran: it opened the file rather than the click being
+    // swallowed as a double-click prefix.
+    assert!(
+        app.editor
+            .path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("target_file.rs")),
+        "the prefix click must fall through to the built-in file jump, but the \
+         editor holds {:?}",
+        app.editor.path.as_deref()
     );
 }
 
 #[test]
 fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() {
     // The swallow branch exists so the FIRST click of a bound `ctrl+double_click`
-    // does not fire the built-in that owns the same modifier. But a terminal
-    // whose child asked for mouse tracking owns the pointer, and the matched
-    // dispatch already declines there via `child_owns_pointer`. The swallow
-    // must decline for the same reason, or binding ONLY `ctrl+double_click`
-    // silently disables the built-in Ctrl+click over every full-screen TUI --
-    // while binding `ctrl+click` leaves it working. That is backwards.
+    // does not fire the built-in that owns the same modifier. Over a
+    // mouse-tracking child it must still fall through, because swallowing
+    // would disable the built-in Ctrl+click over every full-screen TUI while
+    // binding `ctrl+click` leaves it working -- backwards.
+    //
+    // Note what this does NOT rest on: croft never forwards clicks to the
+    // child. `report_mouse` has three production call sites and all three
+    // construct WheelUp/WheelDown, so there is no click-forwarding path for a
+    // tracking child to "own". The fall-through is right because the built-in
+    // is the only consumer, not because the child is a better one.
     //
     // The observable is deliberately a REFUSED link: `open_detected_url`
     // rejects a non-web scheme and sets a status without spawning anything.
@@ -2571,7 +2728,8 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     assert!(
         app.status.contains("Refused to open non-web link"),
         "a double-click PREFIX over a mouse-tracking child must fall through to \
-         the built-in, exactly as a matched gesture does -- the swallow branch \
+         the built-in: croft has no click-forwarding path, so swallowing it \
+         hands the gesture to nobody -- the swallow branch \
          is missing the `child_owns_pointer` guard its sibling applies. \
          Expected the refusal from the built-in link handler, got {:?}",
         app.status

@@ -26225,6 +26225,36 @@ impl App {
     /// under the cursor, act on it (forward a remote dev-server port and open,
     /// or open the link) and return true so the click doesn't start a
     /// selection. Returns false when there's no URL there.
+    /// Whether the built-in Ctrl/Cmd+click would open something at this cell.
+    ///
+    /// Pure: the lookups [`Self::terminal_url_click`] and
+    /// [`Self::terminal_file_click`] perform, with the opening left out. The
+    /// swallow branch needs to know whether declining a prefix click COSTS the
+    /// user anything, and it cannot find out by calling the acting versions.
+    ///
+    /// BOTH arms of the built-in's `||` are covered deliberately: checking
+    /// only the URL half would let a Ctrl+click on a file reference be
+    /// swallowed and its jump-to-file lost, which is the same defect one
+    /// branch over.
+    ///
+    /// Deliberately conservative on the file half. `terminal_file_click`
+    /// resolves relative paths against the shell's cwd and touches the
+    /// filesystem; reproducing that here would duplicate logic that then
+    /// drifts. A file REFERENCE under the cursor is enough to defer to the
+    /// built-in — at worst the prefix click is not swallowed, which costs a
+    /// stray built-in action rather than a lost one.
+    fn terminal_would_open_something_at(&self, col: u16, row: u16) -> bool {
+        if self.terminal().hyperlink_at_screen(col, row).is_some() {
+            return true;
+        }
+        self.terminal()
+            .line_text_at(col, row)
+            .is_some_and(|(text, c)| {
+                crate::port_detect::url_at(&text, c).is_some()
+                    || crate::file_ref::file_ref_at(&text, c).is_some()
+            })
+    }
+
     fn terminal_url_click(&mut self, col: u16, row: u16) -> bool {
         // A real OSC 8 hyperlink stored in the cell wins over text sniffing —
         // the visible text of a linked cell often isn't the URI at all.
@@ -28004,7 +28034,12 @@ impl App {
                 Some((col, row)) => {
                     if self.editor.has_non_text_view() {
                         self.status = String::from("No cursors in this view");
-                    } else if !self.editor.add_caret_at_screen(col, row) {
+                    } else if self.editor.add_caret_at_screen(col, row) {
+                        // Same as the built-in Alt+click: reset the blink
+                        // phase, or a new caret can land mid-blink-off and
+                        // read as "nothing happened" for up to a full period.
+                        self.poke_cursor();
+                    } else {
                         self.status = String::from("No place for a cursor there");
                     }
                 }
@@ -30737,8 +30772,19 @@ impl App {
         // on still armed the tracker, and a later modified click paired with
         // one the user had aimed at the TUI in the terminal. Same predicate as
         // the dispatch below, indexed by the pane that was CLICKED.
-        let child_owns_pointer = bound_mouse.is_some_and(|(ctx, _, _)| {
-            matches!(ctx, crate::keymap::MouseContext::Terminal)
+        let child_owns_pointer = bound_mouse.is_some_and(|(ctx, gesture, _)| {
+            // ONLY THE WHEEL. A tracking child can only "own" a gesture croft
+            // actually forwards, and croft forwards exactly one kind:
+            // `report_mouse` has three production call sites and all three
+            // construct WheelUp/WheelDown. No path constructs
+            // MouseButtonKind::Left/Middle/Right outside `encode_mouse_report`'s
+            // own tests, so declining a bound CLICK hands it to nobody -- and
+            // the built-in Down(Left) arm then runs anyway, since unlike
+            // click-to-move-cursor it never consults `mouse_reporting()`.
+            matches!(
+                gesture.kind,
+                crate::keymap::GestureKind::WheelUp | crate::keymap::GestureKind::WheelDown
+            ) && matches!(ctx, crate::keymap::MouseContext::Terminal)
                 && terminal_hit.is_some_and(|idx| {
                     // Tracking is not enough: `terminal_at_pos` hit-tests
                     // `last_area`, which includes the BORDER, while delivery
@@ -30791,9 +30837,20 @@ impl App {
         // that state anyway: swallowing would cost the built-in and buy
         // nothing. Omitting it here disabled the built-in Ctrl+click over
         // every full-screen TUI for anyone who bound only `ctrl+double_click`.
+        // `child_owns_pointer` used to carry this branch's deferral too, but it
+        // is wheel-only now (croft forwards no clicks), so it is always false
+        // here and cannot decide anything. The question the swallow actually
+        // needs answered is narrower: would declining this click COST the user
+        // a built-in that was going to act? For Ctrl/Cmd the built-in opens a
+        // URL or a file reference, so defer when either is under the cursor.
+        let builtin_would_act = matches!(bound_mouse, Some((ctx, _, _)) if
+            matches!(ctx, crate::keymap::MouseContext::Terminal))
+            && (m.modifiers.contains(KeyModifiers::CONTROL)
+                || m.modifiers.contains(KeyModifiers::SUPER))
+            && self.terminal_would_open_something_at(m.column, m.row);
         if let Some((ctx, gesture, None)) = bound_mouse
             && !gesture.mods.is_empty()
-            && !child_owns_pointer
+            && !builtin_would_act
             && self.keymap.is_double_click_prefix(gesture, ctx)
         {
             // Focus still moves, as a click in a pane always does — otherwise

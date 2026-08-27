@@ -620,7 +620,8 @@ summarised in the status bar — it never fails silently.
 |---|---|
 | `cmd+click` / `super+click` | Terminals do not report Cmd/Super with mouse events (SGR mouse reporting carries no Super bit), so the binding could never fire. Use `ctrl` or `alt`. This is also why croft's own Go to Definition rides Ctrl. |
 | `triple_click` | croft's click tracker distinguishes single from double only, so a triple binding would fire on the second click and mean something other than what it says. |
-| bare `click` in `editor` or `terminal` | It is how the caret is placed and text is selected; rebinding it leaves no way to do either. Bare `click` in `file_tree` or `tab_strip` is allowed. |
+| bare `click` in `editor` or `terminal` | It is how the caret is placed; rebinding it leaves no way to do that. Bare `click` in `file_tree` or `tab_strip` is allowed. |
+| bare `double_click` in `editor` or `terminal` | It is the only way to select a word; rebinding it leaves no way to do that. A *modified* double-click (`ctrl+double_click`) is bindable, and bare `double_click` in `file_tree` or `tab_strip` is allowed. |
 
 `mod` means Ctrl for mouse on every platform, unlike keys where it is Cmd on
 macOS — for the same reporting reason.

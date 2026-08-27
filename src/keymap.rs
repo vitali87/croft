@@ -451,7 +451,13 @@ impl Gesture {
     /// terminal leaves no way to place the caret or select text.
     pub fn is_reserved_in(&self, ctx: MouseContext) -> bool {
         self.mods.is_empty()
-            && matches!(self.kind, GestureKind::Click)
+            // Click places the caret; DoubleClick selects a word. The
+            // justification for reserving these names BOTH halves, and
+            // `select_word_at` has exactly two production call sites (the
+            // editor and terminal Down(Left) arms), both below the matched
+            // dispatch's early return -- so a bound bare double-click removes
+            // word-selection outright, with no way to get it back.
+            && matches!(self.kind, GestureKind::Click | GestureKind::DoubleClick)
             && matches!(ctx, MouseContext::Editor | MouseContext::Terminal)
     }
 }
@@ -550,12 +556,25 @@ impl Keymap {
                 };
                 if gesture.is_reserved_in(ctx) {
                     warnings.push(format!(
-                        "{}: a bare click is reserved in the {} - rebinding it would leave no \
-                         way to place the caret or select text",
+                        // Name the gesture that was actually refused and the
+                        // one thing it does: saying "click ... caret or select
+                        // text" for a refused double-click is the same
+                        // prose-wider-than-predicate slip that let bare
+                        // double-click through in the first place.
+                        "{}: a bare {} is reserved in the {} - rebinding it would leave no \
+                         way to {}",
                         row.key,
+                        match gesture.kind {
+                            GestureKind::DoubleClick => "double-click",
+                            _ => "click",
+                        },
                         match ctx {
                             MouseContext::Terminal => "terminal",
                             _ => "editor",
+                        },
+                        match gesture.kind {
+                            GestureKind::DoubleClick => "select a word",
+                            _ => "place the caret",
                         }
                     ));
                     continue;
@@ -661,6 +680,70 @@ pub const TEMPLATE: &str = r#"// croft keyboard shortcuts. Rebind any palette co
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_bare_double_click_is_reserved_wherever_word_selection_lives() {
+        use super::{Gesture, GestureKind, Keymap, MouseContext};
+        use crossterm::event::KeyModifiers;
+        // The reservation's stated reason -- in the doc above `is_reserved_in`
+        // and in the refusal table at docs/KEYBINDINGS.md -- is that the
+        // gesture "is how the caret is placed AND TEXT IS SELECTED". Placing
+        // the caret is Click; selecting a word is DOUBLE-click, and it is the
+        // only route to word-selection in either pane (`select_word_at` has
+        // exactly two production call sites, both below the matched
+        // dispatch's early return). Reserving only Click protects half of the
+        // justification and leaves the other half bindable, so binding
+        // `double_click` removes word-selection with no warning at all.
+        for ctx in [MouseContext::Editor, MouseContext::Terminal] {
+            let bare_double = Gesture {
+                kind: GestureKind::DoubleClick,
+                mods: KeyModifiers::NONE,
+            };
+            assert!(
+                bare_double.is_reserved_in(ctx),
+                "{ctx:?}: a bare double-click is the only way to select a word, \
+                 so it is reserved for the same reason a bare click is"
+            );
+        }
+        // ... and the refusal must actually reach the user, not just be
+        // computable: a silently-dropped row and an accepted one look
+        // identical from the keymap.
+        let km = Keymap::from_json(
+            r#"[{"key": "double_click", "command": "toggle_word_wrap", "when": "editor"}]"#,
+        );
+        let bare_double = Gesture {
+            kind: GestureKind::DoubleClick,
+            mods: KeyModifiers::NONE,
+        };
+        assert!(
+            km.command_for_mouse(bare_double, MouseContext::Editor)
+                .is_none(),
+            "the reserved row must not bind"
+        );
+        assert!(
+            km.warnings().iter().any(|w| w.contains("double_click")),
+            "the user must be told why their binding did nothing; warnings were {:?}",
+            km.warnings()
+        );
+    }
+
+    #[test]
+    fn a_modified_double_click_is_still_bindable() {
+        use super::{Gesture, GestureKind, MouseContext};
+        use crossterm::event::KeyModifiers;
+        // The reservation is about the BARE gesture: `ctrl+double_click` does
+        // not collide with word-selection, and reserving it would break the
+        // feature this PR exists to add. Without this, "reserve double-click"
+        // could be satisfied by refusing every double-click.
+        let modified = Gesture {
+            kind: GestureKind::DoubleClick,
+            mods: KeyModifiers::CONTROL,
+        };
+        assert!(
+            !modified.is_reserved_in(MouseContext::Editor),
+            "only the BARE double-click is reserved"
+        );
+    }
 
     #[test]
     fn a_bound_single_click_is_not_a_double_click_prefix() {
