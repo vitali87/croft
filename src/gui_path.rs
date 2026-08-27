@@ -307,7 +307,13 @@ mod tests {
         } else {
             "/bin/sh"
         };
-        let path = probe(shell).expect("the login shell must report a PATH");
+        // `probe()` hardcodes PROBE_TIMEOUT, which is right for a login shell
+        // in isolation and too small under full-suite contention (#307).
+        // Calling `run_probe` with a scaled budget is the same code path with
+        // a number that responds to load, and matches how the sibling tests
+        // here already pass their own durations.
+        let path = run_probe(probe_cmd(shell), crate::test_wait::scaled(PROBE_TIMEOUT))
+            .expect("the login shell must report a PATH");
         assert!(path.contains("/bin"), "got {path:?}");
     }
 

@@ -5182,13 +5182,14 @@ fn cmd_clicking_a_non_web_hyperlink_refuses_instead_of_opening() {
                 .map(|c| (r, c))
         })
     };
-    // 8s like the suite's other shell-startup waits (#165): a 5s cap
-    // missed under full parallel load while dozens of test shells spawn.
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(8000) && linked_cell(&app).is_none()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // 8s was already the second guess here (5s -> 8s, #165), which is the
+    // symptom #307 names: a per-test constant cannot budget for contention,
+    // because contention is a property of how many OTHER tests are spawning
+    // at the same moment. `await_cond` scales the isolated budget by the
+    // suite's parallelism instead of guessing a third time.
+    crate::test_wait::await_cond(std::time::Duration::from_millis(8000), || {
+        linked_cell(&app).is_some()
+    });
     term.draw(|f| app.render(f)).unwrap();
     let (row_idx, col) = linked_cell(&app).expect("shell must print the linked text within 8s");
 

@@ -6673,11 +6673,13 @@ mod tests {
             tmp.path(),
         )
         .unwrap();
-        let mut waited_ms = 0u32;
-        while waited_ms < 4000 && term.peek_pending_bytes() == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            waited_ms += 20;
-        }
+        // 4s is the right budget for a `/bin/echo` round trip IN ISOLATION.
+        // Under full-suite contention it is not, and the right number is not
+        // knowable from inside this test -- see #307. `await_cond` widens it
+        // by the parallelism the suite is actually running under.
+        crate::test_wait::await_cond(std::time::Duration::from_millis(4000), || {
+            term.peek_pending_bytes() > 0
+        });
         assert!(
             term.peek_pending_bytes() > 0,
             "the reader thread must accumulate the bytes it advanced so the main loop can tell echo from a bulk stream"
