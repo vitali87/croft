@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Twenty-five functions had their documentation handed to a neighbour by an inserted function; each carries its own prose again, and CI now catches the next one.",
+    summary: "A ctrl+click that opens nothing no longer makes your next ordinary click select a word you never double-clicked.",
 }];
