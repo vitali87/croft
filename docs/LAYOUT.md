@@ -25,6 +25,7 @@ Turn it on from the Command Palette (**View: Toggle Auto-Hide Side Bar**) or the
 
 The collapse is also held off whenever something else on screen depends on the sidebar staying put:
 
+* **Focus left less than 400ms ago** - a short grace delay, so a click that passes *through* the panel on its way to the editor does not collapse it under the pointer. The clock starts when focus first leaves and is not restarted while it stays away, so the collapse cannot be pushed back indefinitely; returning focus to the sidebar cancels it.
 * **A drag** - either the sidebar seam or an Explorer drag. The pointer is over the editor by definition mid-drag, and collapsing under the cursor is the flapping the feature exists to avoid.
 * **Anything modal** - the keyboard-shortcuts overlay (`F1`), the Command Palette, Go to File, Go to Symbol, workspace symbols, the process picker, `Cmd`+`Z` directory jump, command history, the branch picker, an input prompt, a list picker, a context menu, or the SSH connect dialog. Several of those are sidebar-targeting flows, and some may be anchored over sidebar space.
 * **A focus move you did not make** - an async result arriving, a file opened at launch, `Enter` on a sidebar row. Only a deliberate move into the editor or terminal collapses the panel.
