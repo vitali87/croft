@@ -4953,14 +4953,11 @@ mod tests {
         // The needle only ever appears as command OUTPUT ($(..) is unexpanded
         // in the input echo), so matching it proves the trap line executed.
         term.write_input(b"trap '' HUP; echo TRAP_$(echo armed)\n");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !term.visible_text().contains("TRAP_armed") {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "staging: the shell never confirmed the HUP trap"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(1200),
+            "the shell to confirm the HUP trap",
+            || term.visible_text().contains("TRAP_armed"),
+        );
         drop(term);
         let mut status = 0i32;
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
@@ -5347,13 +5344,18 @@ mod tests {
             tmp.path(),
         )
         .unwrap();
-        let mut waited_ms = 0u32;
-        while waited_ms < 4000 && !term.peek_dirty() {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            waited_ms += 20;
-        }
+        // Wait on the BYTE COUNTER, not the dirty flag: `pty_dirty` is
+        // constructed `true`, so peeking it succeeds before /bin/echo has
+        // written anything and this test would pass just as happily if direct
+        // spawns stopped reaching the reader thread entirely. `pending_bytes`
+        // only moves when the reader actually advanced output.
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the directly spawned /bin/echo to deliver bytes through the PTY",
+            || term.peek_pending_bytes() > 0,
+        );
         assert!(
-            term.peek_dirty(),
+            term.peek_pending_bytes() > 0,
             "direct-spawned /bin/echo must produce output without any write_input"
         );
     }
@@ -6189,16 +6191,11 @@ mod tests {
         cmd.env("ZDOTDIR", &shim);
         cmd.env("CROFT_USER_ZDOTDIR", user_dir.path());
         let term = PtyTerminal::spawn_with(cmd, None).unwrap();
-        let mut waited_ms = 0u32;
-        while term.prompt_lines().is_empty() {
-            assert!(
-                waited_ms < 8000,
-                "zsh never emitted a prompt mark; grid: {:?}",
-                term.grid_lines().0
-            );
-            std::thread::sleep(std::time::Duration::from_millis(40));
-            waited_ms += 40;
-        }
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(1000),
+            "zsh to emit a prompt mark",
+            || !term.prompt_lines().is_empty(),
+        );
         assert!(
             term.shell_cwd().is_some(),
             "the shim's precmd must also report the cwd via OSC 7"
@@ -6673,11 +6670,14 @@ mod tests {
             tmp.path(),
         )
         .unwrap();
-        let mut waited_ms = 0u32;
-        while waited_ms < 4000 && term.peek_pending_bytes() == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            waited_ms += 20;
-        }
+        // The wait is load-scaled (#307): /bin/echo through a PTY is
+        // milliseconds on a quiet box and seconds when the suite is spawning
+        // dozens of shells at once, and no constant here can know which.
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "/bin/echo to deliver a byte through the PTY",
+            || term.peek_pending_bytes() > 0,
+        );
         assert!(
             term.peek_pending_bytes() > 0,
             "the reader thread must accumulate the bytes it advanced so the main loop can tell echo from a bulk stream"

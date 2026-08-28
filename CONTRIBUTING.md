@@ -25,6 +25,32 @@ A PR that changes anything compiled into the binary (`src/`, `assets/`,
 CI enforces both (the `version bump + release notes` job). Docs, CI, and
 test-only PRs (`src/app/tests.rs`, `tests/`) are exempt.
 
+## After adding a function, check the doc below it
+
+Rust attaches a `///` block to whatever item **follows** it. Insert a function
+between an existing one and its doc comment and that prose silently becomes the
+newcomer's: no compiler error, no failing test, no clippy lint. The build stays
+green and the rendered rustdoc is *confidently wrong* rather than absent, which
+is worse - absent docs send a reader to the code, wrong docs stop them looking.
+
+So after adding a `fn`, confirm the doc block above the **next** `fn` still
+describes that next `fn`.
+
+CI catches what the habit misses (the `doc comments stay with their function`
+job): a function that had a doc comment at the merge base and has none at your
+head is the fingerprint this insertion leaves. If a removal is deliberate, say
+so in a commit message on the branch:
+
+```text
+doc-removal: src/path/to/file.rs::some_function_name
+```
+
+The file qualifier matters: an exemption keyed on the bare name would excuse
+every function of that name in every changed file, so a deliberate removal of
+one `new` would quietly cover an accidental loss of another.
+
+Run it yourself with `python3 scripts/check_doc_ownership.py origin/main HEAD`.
+
 ## Managing the `target/` directory
 
 croft is a large workspace with a deep dependency tree, and active development
@@ -142,6 +168,61 @@ name ends in `.noindex`, which Spotlight ignores. See
 [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory) for the
 one line setup. With it applied your build directory is `target.noindex/` rather
 than `target/`.
+
+## Running the suite: cap your thread count
+
+The suite spawns PTYs and real shells, so a slice of it is timing-sensitive and
+starves under contention. Run it flat out on a many-core machine and you get
+failures that have nothing to do with your change — terminal, clipboard and
+pairing tests that pass fine on an idle box. CI pins `RUST_TEST_THREADS: 4` for
+exactly this reason.
+
+Half your cores is a reasonable default:
+
+```bash
+RUST_TEST_THREADS=$(( ($(getconf _NPROCESSORS_ONLN) + 1) / 2 )) cargo test
+```
+
+To make it permanent, the right number is per-machine, so both files are
+gitignored rather than committed: `/.cargo/config.toml` caps build jobs
+(`[build] jobs = N`), and `/.config/nextest.toml` caps nextest's threads —
+nextest reads them from there, not from `RUST_TEST_THREADS`.
+
+Before you blame your change for a terminal or clipboard failure, re-run it
+against an untouched `origin/main` checkout. These flake under load, and
+baselining is faster than bisecting.
+
+## Waiting on a spawned process in a test
+
+A test that spawns a real process and waits a **fixed** wall-clock budget will
+flake on a loaded machine, and the budget looks generous right up until it
+isn't. The number is not knowable from inside the test: what blows it is not
+the operation, it is contention from every other test spawning at the same
+moment, plus whatever else owns the machine.
+
+So do not pick a fresh constant. Use the shared helper, which scales a quiet
+machine baseline by the load actually present:
+
+```rust
+crate::test_budget::await_spawned(
+    Duration::from_millis(500),          // what it costs on a quiet machine
+    "the shell to paint the linked cell", // what you are waiting for
+    || linked_cell(&app).is_some(),
+);
+```
+
+For a wait that hands its deadline to something else (a `recv_timeout`, a
+probe's own timeout) use `test_budget::spawn_budget(base)` for the `Duration`.
+
+The teeth are unchanged: a genuinely broken behaviour never satisfies the
+condition and still fails, just later. That trade - a slow true failure over a
+fast false one - is the point.
+
+**When one of these does fail, the cheap first move is the merge-base
+comparison:** run the full suite on the unmodified merge base under the same
+load. If it fails there too, your diff is innocent. Isolation runs cannot tell
+you this, because an isolated run cannot reproduce a contention failure however
+many times you repeat it.
 
 ## Bumping the Rust toolchain
 
