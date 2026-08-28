@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "A keybinding row that binds nothing now says so in OUTPUT: an unparseable chord, an unknown command id, or a chord you bound twice.",
+    summary: "Test-suite reliability: waits on spawned processes now scale with machine load instead of guessing a fixed budget, so a busy machine stops producing failures that look like real breakage.",
 }];

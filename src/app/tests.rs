@@ -5182,15 +5182,16 @@ fn cmd_clicking_a_non_web_hyperlink_refuses_instead_of_opening() {
                 .map(|c| (r, c))
         })
     };
-    // 8s like the suite's other shell-startup waits (#165): a 5s cap
-    // missed under full parallel load while dozens of test shells spawn.
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(8000) && linked_cell(&app).is_none()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled rather than a fresh constant (#307): this budget was raised
+    // 5s -> 8s once already, which is the shape of a number that cannot be
+    // guessed from inside one test.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1000),
+        "the shell to paint the linked cell",
+        || linked_cell(&app).is_some(),
+    );
     term.draw(|f| app.render(f)).unwrap();
-    let (row_idx, col) = linked_cell(&app).expect("shell must print the linked text within 8s");
+    let (row_idx, col) = linked_cell(&app).expect("shell must print the linked text");
 
     let inner = app.terminal().last_inner;
     app.handle_mouse(crossterm::event::MouseEvent {
@@ -28727,22 +28728,32 @@ fn conflicted_repo(tmp: &std::path::Path) {
 
 /// Wait for the git worker to deliver entries, then return the index of the
 /// conflicted `shared.txt` entry in the Source Control panel.
+/// Wait for the git worker - which spawns a real `git` per query - to report
+/// the conflicted entry, and return its index.
+///
+/// The budget is load-scaled (#307). This helper is where
+/// `accept_all_incoming_then_complete_merge_stages_the_resolved_file` was
+/// actually failing under load: the untimed `git status --porcelain` at the
+/// end of that test cannot time out at all, so the fixed 5s deadline here was
+/// the only clock in the test, which puts it in the same family as the other
+/// three rather than in a category of its own.
 fn wait_for_conflicted_entry(app: &mut App) -> usize {
     app.set_sidebar_view(SidebarView::SourceControl);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        let _ = app.drain_git_responses();
-        if let Some(idx) = app
-            .source_control
-            .entries
-            .iter()
-            .position(|e| e.kind == crate::git::ChangeKind::Conflicted)
-        {
-            return idx;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    panic!("the git worker never reported the conflicted entry");
+    let mut found = None;
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1000),
+        "the git worker to report the conflicted entry",
+        || {
+            let _ = app.drain_git_responses();
+            found = app
+                .source_control
+                .entries
+                .iter()
+                .position(|e| e.kind == crate::git::ChangeKind::Conflicted);
+            found.is_some()
+        },
+    );
+    found.expect("await_spawned returns only once the entry is present")
 }
 
 #[test]
