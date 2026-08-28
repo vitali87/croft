@@ -19,7 +19,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -337,13 +337,52 @@ fn set_cloexec(fd: std::os::fd::RawFd, on: bool) -> Result<()> {
 /// and clients are told to reconnect first - their accepted connections are
 /// the one thing that cannot survive. Returns only on failure.
 fn swap_to_new_image(host: &Host, exe: &Path, handoff: &HandoffFds) -> anyhow::Error {
-    broadcast(host, &encode_control_frame(&Control::HostSwap));
-    // Outboxes are drained by per-client writer threads; give the tiny
-    // frame a beat to flush before exec tears those threads down.
-    std::thread::sleep(Duration::from_millis(300));
+    // Shut the door BEFORE inviting anyone back (#321). The invitation below
+    // sends every attached client round to reconnect within ~200ms, well
+    // inside the delivery barrier and the exec that follow; a reconnect landing
+    // on THIS host would be seated by a process about to vanish, and the
+    // exec's EOF reads to a client as "the session ended" - which is how a
+    // background update kicked everyone out of the remote session instead of
+    // handing them to the successor. Latched under the clients lock so a
+    // registration already in flight either finishes (and gets the broadcast)
+    // or sees the latch and is refused.
+    {
+        let _clients = host.clients.lock().unwrap();
+        host.swapping.store(true, Ordering::SeqCst);
+    }
+    let invited = broadcast_tracked(host, &encode_control_frame(&Control::HostSwap));
+    // Wait for the invitation to LAND, not for a hopeful pause to elapse
+    // (#321). Queueing is not delivery: each client's writer may be parked
+    // mid-frame on an earlier chunk of PTY output for up to
+    // WRITE_FRAME_DEADLINE, so a fixed beat can exec while HostSwap is still
+    // sitting in a queue - and a client that never sees the invitation reads
+    // the exec's EOF as the session ending, which is the whole bug. Ordering
+    // does the rest: outboxes are FIFO, so PTY frames the pump keeps queueing
+    // behind the invitation cannot overtake it, and the pump needs no muting.
+    // Bounded, because one wedged peer must not strand the update forever.
+    let started = Instant::now();
+    await_delivery(&invited, started + SWAP_INVITATION_DEADLINE);
+    // Then the connections refused DURING the swap. They never joined the
+    // roster, so the fence above knows nothing about them, yet their goodbye
+    // is the only thing standing between them and an EOF they would read as
+    // the session ending. Draining until the set is empty UNDER the clients
+    // lock is what seals it: the refusal path registers its goodbye while
+    // holding that same lock, so an empty set observed here cannot grow
+    // before the exec below replaces this image. The guard is deliberately
+    // held across the exec.
+    let _sealed = seal_against_new_arrivals(host, started + SWAP_FENCE_CAP);
     if let Err(e) =
         set_cloexec(handoff.listener, false).and_then(|()| set_cloexec(handoff.master, false))
     {
+        // `and_then` short-circuits, so a failure on the master leaves the
+        // listener already cleared: re-arm both, exactly as the post-exec
+        // failure path does, or this host keeps serving with an inheritable
+        // session socket that any later spawn would carry off.
+        let _ = set_cloexec(handoff.listener, true);
+        let _ = set_cloexec(handoff.master, true);
+        // Every path that returns instead of exec'ing must reopen the door,
+        // or this host refuses clients for the rest of its life.
+        host.swapping.store(false, Ordering::SeqCst);
         return e;
     }
     let mut cmd = std::process::Command::new(exe);
@@ -358,6 +397,10 @@ fn swap_to_new_image(host: &Host, exe: &Path, handoff: &HandoffFds) -> anyhow::E
     let err = anyhow::Error::from(cmd.exec()).context("exec of updated binary");
     let _ = set_cloexec(handoff.listener, true);
     let _ = set_cloexec(handoff.master, true);
+    // No successor is coming: this host serves on (stale, and marked so by
+    // the caller), which means it must seat clients again - refusing them
+    // forever would leave every reconnect looping against a live session.
+    host.swapping.store(false, Ordering::SeqCst);
     err
 }
 
@@ -528,6 +571,17 @@ struct OutboxState {
     /// Set once the peer is gone (closed, wedged past the queue limit, or
     /// deliberately disconnected). Latches: a dead outbox never revives.
     dead: bool,
+    /// Set once nothing further will be queued: the writer delivers what is
+    /// already pending and then exits, instead of parking forever on a
+    /// connection nobody owns (#321).
+    closing: bool,
+    /// Frames this outbox has accepted, and how many of them its writer has
+    /// actually put on the wire. Queueing is not delivery: a writer can be
+    /// parked mid-frame on a slow peer for up to [`WRITE_FRAME_DEADLINE`],
+    /// so the only way to wait for ONE specific frame to land is to
+    /// remember its number here and watch `delivered` reach it (#321).
+    queued: u64,
+    delivered: u64,
 }
 
 impl Outbox {
@@ -542,9 +596,17 @@ impl Outbox {
     /// either already marked, or newly over the queue limit. Never blocks
     /// on the socket, so this is safe to call from the PTY pump.
     fn push(&self, frame: &[u8]) -> bool {
+        self.push_seq(frame).is_some()
+    }
+
+    /// [`push`](Self::push), reporting the frame's number in this outbox's
+    /// delivery order so a caller can wait for that exact frame to reach the
+    /// peer ([`delivered_through`](Self::delivered_through)). `None` means
+    /// the peer is dead and nothing more will be delivered.
+    fn push_seq(&self, frame: &[u8]) -> Option<u64> {
         let mut state = self.queue.lock().unwrap();
         if state.dead {
-            return false;
+            return None;
         }
         // Overflow is judged against the BACKLOG the new frame joins, not
         // the total including it, so one frame larger than the whole limit
@@ -556,15 +618,44 @@ impl Outbox {
         let backlog = state.bytes;
         state.bytes += frame.len();
         state.pending.push_back(frame.to_vec());
+        state.queued += 1;
+        let seq = state.queued;
         if backlog > CLIENT_QUEUE_LIMIT {
             state.dead = true;
             state.pending.clear();
             state.bytes = 0;
             self.wake.notify_all();
-            return false;
+            return None;
         }
         self.wake.notify_all();
-        true
+        Some(seq)
+    }
+
+    /// Count one frame as actually written to the socket. Called by the
+    /// writer thread, which is the only place delivery is observable.
+    fn mark_delivered(&self) {
+        self.queue.lock().unwrap().delivered += 1;
+    }
+
+    /// Has the frame numbered `seq` reached the peer? A dead outbox answers
+    /// true: it will never deliver anything, so a barrier waiting on it must
+    /// stop waiting rather than hold everyone else up.
+    fn delivered_through(&self, seq: u64) -> bool {
+        let state = self.queue.lock().unwrap();
+        state.dead || state.delivered >= seq
+    }
+
+    /// Deliver what is already queued, then end the connection: the writer
+    /// drains the backlog and exits rather than parking on an empty queue.
+    ///
+    /// [`kill`](Self::kill) is the wrong tool for a goodbye frame - it
+    /// clears `pending`, so the frame that says goodbye would never reach
+    /// the peer. Used by the swap refusal (#321), whose whole point is that
+    /// the client READS the HostSwap frame before the socket closes.
+    fn close_when_drained(&self) {
+        let mut state = self.queue.lock().unwrap();
+        state.closing = true;
+        self.wake.notify_all();
     }
 
     /// Mark the peer gone and wake its writer so the thread can exit.
@@ -592,6 +683,11 @@ impl Outbox {
             if let Some(frame) = state.pending.pop_front() {
                 state.bytes -= frame.len();
                 return Some(frame);
+            }
+            // Drained and closing: the goodbye frame is on the wire, so the
+            // writer's work is done.
+            if state.closing {
+                return None;
             }
             state = self.wake.wait(state).unwrap();
         }
@@ -632,6 +728,7 @@ fn spawn_writer(stream: Arc<Mutex<UnixStream>>, outbox: Arc<Outbox>, fd: std::os
                 outbox.kill();
                 break;
             }
+            outbox.mark_delivered();
         }
         // Unblock the client thread's read so it deregisters promptly
         // instead of lingering until the peer happens to send something.
@@ -679,6 +776,22 @@ struct Host {
     /// Which client's input last reached the PTY, to send [`Control::Typing`]
     /// only on writer changes.
     last_writer: Mutex<Option<u64>>,
+    /// Latched once this host has committed to replacing its own process
+    /// image (#238). Every connection it has accepted dies at that `exec`,
+    /// so from the latch on, a newly accepted client is told to reconnect
+    /// instead of being seated (#321). Written under the `clients` lock so
+    /// a registration in flight either completes (and receives the HostSwap
+    /// broadcast) or sees the latch - never neither.
+    swapping: AtomicBool,
+    /// Goodbye frames queued for connections that arrived after the latch and
+    /// were refused rather than seated. They are not in the roster, so the
+    /// swap's delivery fence would not otherwise wait for them - and a refused
+    /// client whose HostSwap is still queued when the exec closes its socket
+    /// reads the EOF as the session ending, which is the very outcome the
+    /// refusal exists to prevent (#321). Registered under the `clients` lock,
+    /// so once the swap observes this empty while holding that lock, no
+    /// further goodbye can appear before the exec.
+    farewells: Mutex<Vec<(Arc<Outbox>, u64)>>,
 }
 
 /// The collab socket sibling of a mux socket: same directory and hash key,
@@ -853,6 +966,8 @@ fn run_host(
         token: token.to_string(),
         privileged: Mutex::new(Vec::new()),
         last_writer: Mutex::new(None),
+        swapping: AtomicBool::new(false),
+        farewells: Mutex::new(Vec::new()),
     });
     // Everything a successor image needs if THIS image is replaced on disk
     // in turn. Missing pieces (no master fd on some pty backend) fall back
@@ -932,6 +1047,78 @@ fn run_host(
 /// After any prune the shared size and roster are recomputed, so a dead
 /// ghost releases the min winsize it was pinning. Returns whether any
 /// client was pruned.
+/// [`broadcast`], reporting for each client the frame number its outbox gave
+/// this frame, so the caller can wait for the frame to actually LAND (see the
+/// swap barrier in [`swap_to_new_image`]). Clients whose outbox refused it are
+/// pruned exactly as in `broadcast`, and contribute nothing to wait on.
+fn broadcast_tracked(host: &Host, frame: &[u8]) -> Vec<(Arc<Outbox>, u64)> {
+    let mut targets = Vec::new();
+    let pruned = {
+        let mut clients = host.clients.lock().unwrap();
+        let before = clients.len();
+        clients.retain(|c| match c.outbox.push_seq(frame) {
+            Some(seq) => {
+                targets.push((Arc::clone(&c.outbox), seq));
+                true
+            }
+            None => false,
+        });
+        clients.len() != before
+    };
+    if pruned {
+        apply_winsize(host, false);
+        update_presence(host);
+    }
+    targets
+}
+
+/// Block until every frame in `targets` has reached its peer, or `deadline`
+/// passes. Bounded on purpose: a peer parked mid-write holds its own frame
+/// for up to [`WRITE_FRAME_DEADLINE`], and the swap cannot wait on it
+/// forever - past the deadline it is treated like any other client that
+/// misses the handover.
+fn await_delivery(targets: &[(Arc<Outbox>, u64)], deadline: Instant) {
+    while Instant::now() < deadline {
+        if targets.iter().all(|(o, seq)| o.delivered_through(*seq)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Wait out the goodbyes owed to connections refused during the swap, then
+/// hold the clients lock so no further one can be registered, and return that
+/// guard for the caller to hold across its `exec`.
+///
+/// Each batch gets its own [`FAREWELL_GRACE`] rather than a slice of one
+/// shared deadline: a goodbye registered as the invitation fence expires
+/// would otherwise inherit a spent budget and be waved through undelivered.
+/// `hard_cap` bounds the whole thing, since a refused client reconnects
+/// within ~200ms and could keep the fence fed indefinitely.
+fn seal_against_new_arrivals(
+    host: &Host,
+    hard_cap: Instant,
+) -> std::sync::MutexGuard<'_, Vec<Client>> {
+    loop {
+        let pending = std::mem::take(&mut *host.farewells.lock().unwrap());
+        if pending.is_empty() {
+            // Observed empty while holding the lock the refusal path must
+            // take to register one: from here nothing new can appear.
+            let sealed = host.clients.lock().unwrap();
+            if host.farewells.lock().unwrap().is_empty() {
+                return sealed;
+            }
+            drop(sealed);
+        } else {
+            let grace = (Instant::now() + FAREWELL_GRACE).min(hard_cap);
+            await_delivery(&pending, grace);
+        }
+        if Instant::now() >= hard_cap {
+            return host.clients.lock().unwrap();
+        }
+    }
+}
+
 fn broadcast(host: &Host, frame: &[u8]) -> bool {
     let pruned = {
         let mut clients = host.clients.lock().unwrap();
@@ -1074,9 +1261,34 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                     };
                     spawn_writer(Arc::clone(&tx), Arc::clone(&outbox), fd);
                     let id = host.next_id.fetch_add(1, Ordering::Relaxed);
-                    my_id = Some(id);
+                    let mut refused = false;
                     let displaced = {
                         let mut clients = host.clients.lock().unwrap();
+                        // This host is replacing its process image (#238):
+                        // seating this client would hand it a session that
+                        // ends in an EOF at the exec, which reads as "the
+                        // session is over" and drops the user out of a
+                        // perfectly live session (#321). Send it round to
+                        // the successor instead - the listening socket
+                        // never unbinds, so the reconnect lands there.
+                        // Checked under this lock, the same one the latch is
+                        // written under, so the decision cannot straddle it.
+                        if host.swapping.load(Ordering::SeqCst) {
+                            refused = true;
+                            // Queue the goodbye and enrol it in the swap's
+                            // delivery fence WHILE HOLDING this lock: the
+                            // swap seals the fence by taking the same lock,
+                            // so the pair cannot straddle the exec and leave
+                            // this client with a bare EOF.
+                            if let Some(seq) =
+                                outbox.push_seq(&encode_control_frame(&Control::HostSwap))
+                            {
+                                host.farewells
+                                    .lock()
+                                    .unwrap()
+                                    .push((Arc::clone(&outbox), seq));
+                            }
+                        }
                         // Evict this client's own earlier registration
                         // (#229). A reconnect after a dead SSH transport
                         // arrives as a brand-new connection while the stale
@@ -1088,7 +1300,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                         // Partition rather than clone field by field: the
                         // ghosts are MOVED out, so a `Client` field added
                         // later cannot be silently dropped on this path.
-                        let displaced: Vec<Client> = if client_id.is_empty() {
+                        let displaced: Vec<Client> = if refused || client_id.is_empty() {
                             Vec::new()
                         } else {
                             let (taken, kept): (Vec<Client>, Vec<Client>) =
@@ -1107,19 +1319,30 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                         // to read-only.
                         let control = displaced.iter().any(|c| c.control)
                             || !clients.iter().any(|c| c.control);
-                        clients.push(Client {
-                            id,
-                            name,
-                            cols,
-                            rows,
-                            control,
-                            tx: Arc::clone(&tx),
-                            fd,
-                            outbox,
-                            client_id,
-                        });
+                        if !refused {
+                            clients.push(Client {
+                                id,
+                                name,
+                                cols,
+                                rows,
+                                control,
+                                tx: Arc::clone(&tx),
+                                fd,
+                                outbox: Arc::clone(&outbox),
+                                client_id,
+                            });
+                        }
                         displaced
                     };
+                    if refused {
+                        // The goodbye was queued above, under the clients
+                        // lock. It rides this connection's own writer thread
+                        // and the outbox is FIFO, so it lands after the
+                        // ServerHello rather than interleaving mid-frame.
+                        outbox.close_when_drained();
+                        break 'conn;
+                    }
+                    my_id = Some(id);
                     // Tear the ghosts down outside the clients lock: killing
                     // an outbox wakes its writer, and shutdown unblocks the
                     // ghost's client thread so it deregisters (finding
@@ -1927,6 +2150,27 @@ impl InnerChannel {
 /// A peer whose buffers stay full this long is gone for practical purposes;
 /// reporting failure lets the caller treat the connection as dead.
 pub(crate) const WRITE_FRAME_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long a swapping host waits for its HostSwap invitation to reach the
+/// clients it just sent it to (#321). One [`WRITE_FRAME_DEADLINE`] plus a
+/// margin: that is the longest a writer can be parked on the frame ahead of
+/// the invitation, so this covers the worst honest case while still bounding
+/// the swap against a peer that never drains at all.
+const SWAP_INVITATION_DEADLINE: Duration = Duration::from_secs(6);
+
+/// Grace a goodbye gets once it is registered, measured from the moment the
+/// fence notices it rather than from when the swap began. A refused
+/// connection's HostSwap is two small frames onto a socket accepted moments
+/// ago, so this lands in milliseconds - but it has to be its OWN window: a
+/// client refused a microsecond before the invitation deadline would
+/// otherwise be enrolled into a budget already spent, and handed exactly the
+/// bare EOF the refusal exists to prevent.
+const FAREWELL_GRACE: Duration = Duration::from_millis(250);
+
+/// And the whole fence is capped regardless, because clients refused during
+/// the swap come straight back (a reconnect every ~200ms) and could otherwise
+/// keep feeding it goodbyes for as long as they cared to.
+const SWAP_FENCE_CAP: Duration = Duration::from_secs(10);
 
 /// Write a whole frame to a socket that may be in non-blocking mode. `write_all`
 /// aborts on the first `WouldBlock` even after a partial write, which would leave
@@ -3628,6 +3872,369 @@ mod tests {
             image_identity(&bin).unwrap(),
             start,
             "a rename-over is a replacement and must change the identity"
+        );
+    }
+
+    /// A host wired to nothing: enough of one to drive [`client_thread`]
+    /// directly, which is the only way to observe the mid-swap window
+    /// without a real `exec` racing the assertions.
+    fn bare_host(socket: &Path) -> Arc<Host> {
+        Arc::new(Host {
+            clients: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(0),
+            pty_input: Mutex::new(Box::new(Vec::new())),
+            master: Mutex::new(MasterHandle::Adopted(-1)),
+            last_size: Mutex::new((80, 24)),
+            socket: socket.to_path_buf(),
+            token: String::from(TEST_TOKEN),
+            privileged: Mutex::new(Vec::new()),
+            last_writer: Mutex::new(None),
+            swapping: AtomicBool::new(false),
+            farewells: Mutex::new(Vec::new()),
+        })
+    }
+
+    // #321: a client that arrives while the host is swapping into an updated
+    // image must be sent round to the successor, never seated. Seating it
+    // hands it a session that ends at the exec, and the EOF that follows is
+    // indistinguishable from "the session is over", which is how a
+    // background update kicked every attached client out of a live remote
+    // session instead of handing it over.
+    #[test]
+    fn a_client_arriving_mid_swap_is_told_to_reconnect_not_seated() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("swap.mux.sock");
+        let listener = crate::session::bind_socket_0600(&socket).unwrap();
+        let host = bare_host(&socket);
+        host.swapping.store(true, Ordering::SeqCst);
+        let served = Arc::clone(&host);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            client_thread(&served, stream);
+        });
+
+        let mut c = TestClient::connect(&socket, "owner", 80, 24);
+        let frames = c.read_until(|f| matches!(f, Frame::Control(Control::HostSwap)));
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, Frame::Control(Control::ServerHello { .. }))),
+            "the goodbye must not cost the client its version handshake; saw {frames:?}"
+        );
+        assert!(
+            host.clients.lock().unwrap().is_empty(),
+            "a refused client must never join the roster"
+        );
+        // ...and its goodbye is enrolled in the swap's delivery fence. Without
+        // this the exec can close the socket while HostSwap is still queued,
+        // handing the refused client the bare EOF the refusal exists to spare
+        // it - the roster snapshot the fence starts from cannot know about a
+        // connection that arrived after the latch.
+        let enrolled = host.farewells.lock().unwrap();
+        assert_eq!(
+            enrolled.len(),
+            1,
+            "the refusal must enrol its goodbye for the swap to wait on"
+        );
+        let (outbox, seq) = (Arc::clone(&enrolled[0].0), enrolled[0].1);
+        drop(enrolled);
+        // Bounded wait, not an instant assertion: the writer puts the frame on
+        // the wire and marks it delivered as two steps, so a reader that has
+        // already seen the frame can still observe the moment between them.
+        // Asserting on that instant is the same defect as any other test that
+        // assumes a spawned thread has finished - it passes until the machine
+        // is busy (caught here under deliberate load).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !outbox.delivered_through(seq) {
+            assert!(
+                Instant::now() < deadline,
+                "the client read the goodbye, so the fence must record it delivered"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        server.join().unwrap();
+        // And the connection is actually let go: the writer thread delivers
+        // the goodbye and exits rather than parking on a socket nobody owns.
+        c.stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut buf = [0u8; 32];
+        assert_eq!(
+            c.stream.read(&mut buf).unwrap_or(0),
+            0,
+            "a refused connection must be closed, not left hanging"
+        );
+    }
+
+    // Frames are numbered as they are accepted, and only the writer's
+    // successful write counts as delivery: the distinction is the whole basis
+    // of the swap barrier (#321).
+    #[test]
+    fn an_outbox_numbers_frames_and_counts_only_what_the_writer_wrote() {
+        let o = Outbox::new();
+        assert_eq!(o.push_seq(b"a"), Some(1));
+        assert_eq!(o.push_seq(b"b"), Some(2));
+        assert!(!o.delivered_through(1), "queued is not delivered");
+        o.pop_blocking();
+        o.mark_delivered();
+        assert!(o.delivered_through(1));
+        assert!(
+            !o.delivered_through(2),
+            "one write does not deliver two frames"
+        );
+        o.pop_blocking();
+        o.mark_delivered();
+        assert!(o.delivered_through(2));
+    }
+
+    // #321: the host must WAIT for its HostSwap invitation to land rather
+    // than sleep a hopeful beat past it. A writer parked on an earlier frame
+    // against a peer that stopped reading holds the invitation behind it for
+    // up to WRITE_FRAME_DEADLINE, and a client that never sees the invitation
+    // reads the exec's EOF as the session ending. The wait is still bounded:
+    // one wedged peer must not strand the update for everyone.
+    #[test]
+    fn the_swap_barrier_waits_for_delivery_and_still_bounds_a_parked_writer() {
+        // A writer parked mid-frame is modelled by an outbox nothing drains:
+        // the invitation is queued and never delivered.
+        let parked = Outbox::new();
+        let seq = parked.push_seq(b"invitation").expect("queued");
+        let budget = Duration::from_millis(300);
+        let started = Instant::now();
+        await_delivery(&[(Arc::clone(&parked), seq)], Instant::now() + budget);
+        assert!(
+            started.elapsed() >= budget,
+            "the barrier must actually wait for the invitation, not wave it through"
+        );
+        assert!(
+            started.elapsed() < budget * 10,
+            "but it must give up, not strand the update on one wedged peer"
+        );
+
+        // Delivery releases it at once, well inside the deadline.
+        let live = Outbox::new();
+        let seq = live.push_seq(b"invitation").expect("queued");
+        let writer = {
+            let o = Arc::clone(&live);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                o.pop_blocking();
+                o.mark_delivered();
+            })
+        };
+        let started = Instant::now();
+        await_delivery(
+            &[(Arc::clone(&live), seq)],
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a delivered invitation must release the barrier immediately"
+        );
+        writer.join().unwrap();
+
+        // A peer that died mid-swap can never deliver anything, so it must
+        // not hold the barrier for its full deadline either.
+        let dead = Outbox::new();
+        let seq = dead.push_seq(b"invitation").expect("queued");
+        dead.kill();
+        let started = Instant::now();
+        await_delivery(&[(dead, seq)], Instant::now() + Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a dead peer must not hold the swap open"
+        );
+    }
+
+    // The farewell fence must give a goodbye registered at the LAST moment a
+    // real window of its own. Sharing one deadline with the invitation fence
+    // meant a client refused a microsecond before that deadline was enrolled
+    // into a budget already spent, sealed past, and handed the bare EOF the
+    // refusal exists to prevent (#321).
+    #[test]
+    fn the_fence_waits_for_a_goodbye_registered_at_the_last_moment() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = bare_host(&dir.path().join("late.mux.sock"));
+        host.swapping.store(true, Ordering::SeqCst);
+
+        // A goodbye whose writer has not run yet, exactly as a connection
+        // refused on the deadline's edge leaves it.
+        let outbox = Outbox::new();
+        let seq = outbox.push_seq(b"goodbye").expect("queued");
+        host.farewells
+            .lock()
+            .unwrap()
+            .push((Arc::clone(&outbox), seq));
+        let writer = {
+            let o = Arc::clone(&outbox);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                o.pop_blocking();
+                o.mark_delivered();
+            })
+        };
+
+        // A hard cap far in the future: what must stop the seal here is the
+        // undelivered goodbye, not the clock.
+        let started = Instant::now();
+        let sealed = seal_against_new_arrivals(&host, Instant::now() + Duration::from_secs(5));
+        assert!(
+            outbox.delivered_through(seq),
+            "the fence must not seal while a goodbye is still queued"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "it must have actually waited for the writer, not raced past it"
+        );
+        drop(sealed);
+        writer.join().unwrap();
+    }
+
+    // The wait is still bounded: a goodbye nothing ever delivers cannot hold
+    // the update open, or one wedged peer strands every other participant on
+    // the old image.
+    #[test]
+    fn the_fence_gives_up_at_its_hard_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = bare_host(&dir.path().join("capped.mux.sock"));
+        host.swapping.store(true, Ordering::SeqCst);
+        let outbox = Outbox::new();
+        let seq = outbox.push_seq(b"goodbye").expect("queued");
+        host.farewells
+            .lock()
+            .unwrap()
+            .push((Arc::clone(&outbox), seq));
+
+        let started = Instant::now();
+        let _sealed = seal_against_new_arrivals(&host, Instant::now() + Duration::from_millis(200));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the cap must end the wait; took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !outbox.delivered_through(seq),
+            "staging: this goodbye was never delivered, so the cap is what ended the wait"
+        );
+    }
+
+    // A swap that cannot happen must reopen the door it closed. The host
+    // serves on, stale and marked so; a host that kept refusing every
+    // reconnect would be a worse failure than the staleness it reports.
+    #[test]
+    fn a_swap_that_cannot_exec_seats_clients_again() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("failed.mux.sock");
+        let host = bare_host(&socket);
+        let devnull = std::fs::File::open("/dev/null").unwrap();
+        let handoff = HandoffFds {
+            listener: devnull.as_raw_fd(),
+            master: devnull.as_raw_fd(),
+            child_pid: std::process::id(),
+        };
+        let err = swap_to_new_image(&host, Path::new("/nonexistent/croft-successor"), &handoff);
+        assert!(
+            format!("{err:#}").contains("exec of updated binary"),
+            "the error must name the failed exec; got {err:#}"
+        );
+        assert!(
+            !host.swapping.load(Ordering::SeqCst),
+            "a host that could not swap must seat clients again"
+        );
+    }
+
+    // The gate is the swap latch and nothing else: with no swap in flight the
+    // same path seats the client exactly as before.
+    #[test]
+    fn a_client_arriving_outside_a_swap_is_seated() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("noswap.mux.sock");
+        let listener = crate::session::bind_socket_0600(&socket).unwrap();
+        let host = bare_host(&socket);
+        let served = Arc::clone(&host);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            client_thread(&served, stream);
+        });
+
+        let mut c = TestClient::connect(&socket, "owner", 80, 24);
+        c.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        assert_eq!(
+            host.clients.lock().unwrap().len(),
+            1,
+            "an ordinary attach must still be seated"
+        );
+        drop(c);
+        server.join().unwrap();
+    }
+
+    // The client half of the same handover: a reconnect that lands on the
+    // host still finishing its swap is answered with ServerHello + HostSwap,
+    // and must reconnect AGAIN rather than treating the goodbye (or the
+    // close behind it) as the end of the session.
+    #[test]
+    fn attach_retries_a_reconnect_the_dying_host_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("refuse.mux.sock");
+        let listener = crate::session::bind_socket_0600(&socket).unwrap();
+        let version = || String::from(env!("CARGO_PKG_VERSION"));
+        let attaches = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&attaches);
+        let server = std::thread::spawn(move || {
+            let read_hello = |stream: &mut UnixStream| -> bool {
+                let mut reader = FrameReader::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        return false;
+                    }
+                    for f in reader.push(&buf[..n]) {
+                        if matches!(f, Frame::Control(Control::Hello { .. })) {
+                            return true;
+                        }
+                    }
+                }
+            };
+            // 1: the pre-swap host. 2: the same host, now latched, refusing
+            // the reconnect it invited. 3: the successor, serving normally.
+            for round in 1..=3 {
+                let (mut c, _) = listener.accept().unwrap();
+                assert!(read_hello(&mut c), "attach {round} must Hello");
+                counted.fetch_add(1, Ordering::SeqCst);
+                c.write_all(&encode_control_frame(&Control::ServerHello {
+                    version: version(),
+                }))
+                .unwrap();
+                match round {
+                    1 | 2 => {
+                        c.write_all(&encode_control_frame(&Control::HostSwap))
+                            .unwrap();
+                        // The exec: this connection dies, the socket stays
+                        // bound and the client is expected to come back.
+                        drop(c);
+                    }
+                    _ => {
+                        c.write_all(&encode_bytes_frame(b"AFTER")).unwrap();
+                        c.write_all(&encode_control_frame(&Control::Exit { code: 7 }))
+                            .unwrap();
+                    }
+                }
+            }
+        });
+
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        let outcome = attach_client_loop(&socket, &mut stream).expect("attach loop");
+        assert!(
+            matches!(outcome, PumpOutcome::Exit(7)),
+            "a refused reconnect must be retried, not read as session end; got {outcome:?}"
+        );
+        server.join().unwrap();
+        assert_eq!(
+            attaches.load(Ordering::SeqCst),
+            3,
+            "the client must attach three times: original, refused, successor"
         );
     }
 
