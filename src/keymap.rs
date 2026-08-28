@@ -390,11 +390,24 @@ impl Keymap {
     /// gets the second binding with nothing anywhere to say the first was
     /// discarded.
     pub(crate) fn resolve(json: &str) -> (Self, Vec<String>) {
-        let rows: Vec<Binding> =
-            serde_json::from_str(&strip_line_comments(json)).unwrap_or_default();
+        let mut warnings = Vec::new();
+        // A malformed file is the worst of the silent cases and the likeliest:
+        // this is hand-edited JSON with no schema, and one trailing comma cost
+        // the user EVERY binding with nothing anywhere to say so. Reported
+        // rather than swallowed - an empty file legitimately means no
+        // bindings, but a broken one means bindings the user wrote that
+        // vanished, and the two must not look alike.
+        let rows: Vec<Binding> = match serde_json::from_str(&strip_line_comments(json)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                warnings.push(format!(
+                    "the file does not parse ({e}); NO keybindings were loaded from it"
+                ));
+                Vec::new()
+            }
+        };
         let mut bindings: HashMap<Chord, Command> = HashMap::new();
         let mut sources: HashMap<Chord, String> = HashMap::new();
-        let mut warnings = Vec::new();
         for row in rows {
             let Some(chord) = Chord::parse(&row.key) else {
                 warnings.push(format!(
@@ -612,6 +625,43 @@ mod tests {
         assert!(Keymap::from_json("").is_empty());
         assert!(Keymap::from_json("not json").is_empty());
         assert!(Keymap::load(Path::new("/no/such/keybindings.json")).is_empty());
+    }
+
+    // An empty file and a broken one produce the same keymap and mean opposite
+    // things: one is "I bound nothing", the other is "everything I bound is
+    // gone". The test above passing made this look covered when it was not.
+    #[test]
+    fn a_file_that_does_not_parse_says_so_instead_of_dropping_every_binding() {
+        // One trailing comma, the classic hand-edit.
+        let broken = r#"[
+            { "key": "cmd+1", "command": "save_file" },
+        ]"#;
+        let (map, warnings) = Keymap::resolve(broken);
+        assert!(map.is_empty(), "a broken file binds nothing");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "and must say so exactly once: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("does not parse"),
+            "the warning must name the cause: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("NO keybindings"),
+            "and the consequence, since the file looks fine to the user: {}",
+            warnings[0]
+        );
+
+        // An EMPTY file is not an error: it legitimately means no bindings,
+        // and warning about it would train the reader to ignore the channel.
+        let (map, warnings) = Keymap::resolve("[]");
+        assert!(map.is_empty());
+        assert!(
+            warnings.is_empty(),
+            "an empty list is not a failure: {warnings:?}"
+        );
     }
 
     #[test]
