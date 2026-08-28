@@ -29790,6 +29790,101 @@ fn a_parked_launch_aborts_when_its_pane_dies_or_never_reports_a_mark() {
     );
 }
 
+/// #250: the compound layer reaches the user through
+/// `open_debug_config_picker` -> `discover_compounds` -> rows ->
+/// `confirm_list_picker` -> `resolve_compound`. Nothing but clippy's dead-code
+/// lint currently guards that chain: a refactor dropping the compound rows
+/// would leave `resolve_compound` with test-only callers and NO TEST FAILING,
+/// which is the exact regression this PR exists to correct.
+#[test]
+fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py" }
+        ],
+        "compounds": [
+            { "name": "Full Stack", "configurations": ["Server", "Client"] },
+            { "name": "Broken", "configurations": ["Server", "Missing"] }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.open_debug_config_picker();
+    let picker = app.list_picker.as_ref().expect("picker open");
+    assert_eq!(
+        picker.rows.len(),
+        5,
+        "zero-config entry + two configurations + two compounds"
+    );
+    let compound_row = picker
+        .rows
+        .iter()
+        .find(|r| r.label.starts_with("Full Stack"))
+        .expect("the compound is listed");
+    assert!(
+        compound_row.label.contains("Server"),
+        "the row names its members: {}",
+        compound_row.label
+    );
+    assert!(
+        compound_row.id.starts_with("compound:"),
+        "compound rows carry their own id space so they cannot collide with \
+         a configuration index: {}",
+        compound_row.id
+    );
+
+    // Selecting a resolvable MULTI-MEMBER compound says why it cannot run yet,
+    // and names the issue rather than failing silently or launching one member.
+    // The arity matters: a one-member compound needs a single session and now
+    // launches (see `a_single_member_compound_launches_...`), so #310's
+    // deferral is about compounds that genuinely need several at once.
+    let idx = picker
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Full Stack"))
+        .unwrap();
+    app.list_picker.as_mut().unwrap().selected = idx;
+    app.confirm_list_picker();
+    assert!(
+        app.run_debug.feedback_is_error,
+        "{:?}",
+        app.run_debug.feedback
+    );
+    assert!(
+        app.status.contains("#310"),
+        "the message points the user at the tracking issue: {}",
+        app.status
+    );
+    assert!(
+        app.dap_session.is_none(),
+        "and nothing was launched — a subset launch would debug the wrong thing"
+    );
+
+    // A compound naming a configuration no launch.json declares is a config
+    // error, reported as such rather than folded into the not-yet message.
+    app.open_debug_config_picker();
+    let bad = app
+        .list_picker
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Broken"))
+        .expect("the second compound is listed");
+    app.list_picker.as_mut().unwrap().selected = bad;
+    app.confirm_list_picker();
+    assert!(
+        app.status.contains("Missing"),
+        "the error names the member that does not exist: {}",
+        app.status
+    );
+}
+
 #[test]
 fn debug_config_picker_lists_configs_and_selection_drives_f5() {
     let tmp = tempfile::tempdir().unwrap();
@@ -29860,6 +29955,51 @@ fn missing_pre_launch_task_and_stale_selection_error_loudly() {
     app.selected_debug_config = Some(String::from("Deleted"));
     app.start_selected_debug();
     assert_eq!(app.selected_debug_config, None, "stale selection cleared");
+}
+
+/// #250: the Run and Debug panel's config row is the documented way to reach
+/// the picker — both KEYBINDINGS.md and LAYOUT.md say so, and LAYOUT.md says
+/// compounds "are listed too". But the row is gated on a count that only
+/// covered `discover_configs`, so a workspace declaring ONLY compounds had no
+/// row at all: `config_row_label`'s `(None, 0)` arm suppresses it, the render
+/// never runs, `last_config_area` stays zero-sized, and the click guard on
+/// `width > 0` refuses. The picker lists the compounds; nothing opens it.
+#[test]
+fn the_config_row_counts_compounds_so_a_compounds_only_workspace_still_has_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"{"configurations":[{"name":"Server","type":"python","program":"s.py"}],
+            "compounds":[{"name":"Full Stack","configurations":["Server"]}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.refresh_run_debug();
+    assert_eq!(
+        app.run_debug.config_count, 2,
+        "one configuration plus one compound — the row counts what the picker lists"
+    );
+
+    // The case that loses the row entirely rather than merely undercounting.
+    let only = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(only.path().join(".croft")).unwrap();
+    std::fs::write(
+        only.path().join(".croft/launch.json"),
+        r#"{"configurations":[],
+            "compounds":[{"name":"Orphan","configurations":["Nothing"]}]}"#,
+    )
+    .unwrap();
+    let mut app2 = App::new(only.path().to_path_buf()).unwrap();
+    app2.refresh_run_debug();
+    assert_eq!(
+        app2.run_debug.config_count, 1,
+        "a compounds-only workspace must still get a row, or the documented \
+         route to the picker does not exist for it"
+    );
+    // `config_row_label` is private to the widget module; the count is the
+    // input its `(None, 0)` suppression arm reads, so a non-zero count here is
+    // what makes the row exist. run_debug.rs's own unit test covers the arm.
 }
 
 #[test]
@@ -32075,6 +32215,140 @@ fn problem_scope_config_tokens_round_trip() {
     assert_eq!(
         ProblemScope::from_config("nonsense"),
         ProblemScope::WholeProject
+    );
+}
+
+/// #310 defers compounds that need SEVERAL debug sessions at once. A compound
+/// naming ONE configuration needs exactly one session, which croft has run
+/// since #250 — so refusing it cites a limitation that does not apply and
+/// tells the user something false about their own launch.json.
+///
+/// `parse_compounds` rejects only an EMPTY member list, so a one-member
+/// compound parses and reaches the launch site, where the `Ok(_)` arm reports
+/// the #310 message without ever consulting `configurations.len()`. This is a
+/// relocated-decision leftover: the member list is resolved, then the arm that
+/// consumes it answers a question about session count without reading it.
+#[test]
+fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py" }
+        ],
+        "compounds": [
+            { "name": "Just Server", "configurations": ["Server"] },
+            { "name": "Both", "configurations": ["Server", "Client"] },
+            { "name": "Tasked", "configurations": ["Server"], "preLaunchTask": "build" }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.open_debug_config_picker();
+    let idx = app
+        .list_picker
+        .as_ref()
+        .expect("picker open")
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Just Server"))
+        .expect("the one-member compound is listed");
+    app.list_picker.as_mut().unwrap().selected = idx;
+    app.confirm_list_picker();
+
+    assert!(
+        !app.status.contains("#310"),
+        "a one-member compound needs ONE session, so the multi-session \
+         deferral does not apply to it: {}",
+        app.status
+    );
+    assert_eq!(
+        app.selected_debug_config.as_deref(),
+        Some("Server"),
+        "it selects its single member, exactly as selecting that \
+         configuration directly would"
+    );
+    // `selected_debug_config` is assigned BEFORE `launch_debug_config`, which
+    // has several early-return error paths — so the assertion above proves only
+    // that the launch BRANCH was reached. Assert the launch was not refused.
+    // The launch reached a real adapter, so what it does next depends on the
+    // machine: the GitHub runner has no `uv`, and "Debugger setup failed:
+    // running `uv venv`" is a true report about that box, not this fix
+    // regressing. Assert what the fix actually claims - that the refusal is
+    // not the #310 deferral - rather than that nothing went wrong at all,
+    // which made the test a statement about the environment.
+    if let Some(feedback) = app.run_debug.feedback.as_deref() {
+        assert!(
+            !feedback.contains("#310") && !feedback.contains("several debug sessions"),
+            "a one-member compound must not be refused for needing several \
+             sessions; any other environment-dependent failure is not this \
+             test's business: {feedback}"
+        );
+    }
+
+    // The guard that must stay GREEN: this fix must not be satisfiable by
+    // launching EVERY compound. A genuinely multi-session compound is still
+    // deferred, and still says so.
+    app.open_debug_config_picker();
+    let multi = app
+        .list_picker
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Both"))
+        .expect("the two-member compound is listed");
+    app.list_picker.as_mut().unwrap().selected = multi;
+    app.confirm_list_picker();
+    assert!(
+        app.status.contains("#310"),
+        "a compound that really does need several sessions is still deferred, \
+         and still names the issue: {}",
+        app.status
+    );
+
+    // A ONE-member compound carrying a key croft cannot honour is refused
+    // rather than launched: `parse_compounds` never reads `preLaunchTask`, so
+    // launching via the member alone would skip the build the file asks for
+    // and debug stale artifacts without saying so.
+    //
+    // On a FRESH app: the launches above leave a live `dap_session`, and
+    // `debug_error` does not clear one, so asserting `is_none()` on this app
+    // would be answered by the earlier launch rather than by this refusal.
+    let mut fresh = App::new(tmp.path().to_path_buf()).unwrap();
+    fresh.open_debug_config_picker();
+    let tasked = fresh
+        .list_picker
+        .as_ref()
+        .expect("picker open")
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Tasked"))
+        .expect("the key-carrying compound is listed");
+    fresh.list_picker.as_mut().unwrap().selected = tasked;
+    fresh.confirm_list_picker();
+    assert!(
+        fresh.status.contains("preLaunchTask"),
+        "the refusal names the key croft cannot honour, so the user can act \
+         on it rather than guessing: {}",
+        fresh.status
+    );
+    assert!(
+        fresh.run_debug.feedback_is_error,
+        "and it is reported AS an error, not as a status note"
+    );
+    assert!(
+        fresh.dap_session.is_none(),
+        "and nothing launched — running it without its preLaunchTask would \
+         debug stale artifacts silently"
+    );
+    assert!(
+        fresh.selected_debug_config.is_none(),
+        "nor was a configuration selected: the refusal happens before any \
+         launch bookkeeping"
     );
 }
 

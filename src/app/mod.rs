@@ -3066,6 +3066,10 @@ pub struct App {
     /// launch.json configurations discovered for the picker (#250); refreshed
     /// on every picker open so edits are picked up without a restart.
     debug_configs: Vec<crate::dap::configs::DebugConfig>,
+    /// Compounds declared beside those configurations. Listed in the picker so
+    /// a workspace's compounds are visible; launching one needs the
+    /// multi-session model tracked in #310.
+    debug_compounds: Vec<crate::dap::configs::Compound>,
     /// Name of the launch.json configuration F5 starts. `None` = the
     /// zero-config "Debug active file" behavior.
     selected_debug_config: Option<String>,
@@ -4217,6 +4221,7 @@ impl App {
             process_picker: None,
             dap_session: None,
             debug_configs: Vec::new(),
+            debug_compounds: Vec::new(),
             selected_debug_config: None,
             pending_debug_launch: None,
             pending_test_debug: None,
@@ -17727,9 +17732,14 @@ impl App {
         self.run_debug.feedback = None;
         self.run_debug.feedback_is_error = false;
         // The launch.json config row (#250): count + F5 selection. Discovery
-        // is two small file reads and this only runs on active-file changes.
-        self.run_debug.config_count =
-            crate::dap::configs::discover_configs(&self.active_workspace_root()).len();
+        // re-reads the same two small files once per helper — four reads — and
+        // this only runs on active-file changes.
+        // Compounds count too — the row is the documented route to the picker,
+        // and the picker lists them, so counting only configurations makes the
+        // row vanish for a compounds-only workspace and undercount otherwise.
+        let root = self.active_workspace_root();
+        self.run_debug.config_count = crate::dap::configs::discover_configs(&root).len()
+            + crate::dap::configs::discover_compounds(&root).len();
         self.run_debug.selected_config = self.selected_debug_config.clone();
     }
 
@@ -18325,6 +18335,7 @@ impl App {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let root = self.active_workspace_root();
         self.debug_configs = crate::dap::configs::discover_configs(&root);
+        self.debug_compounds = crate::dap::configs::discover_compounds(&root);
         let mut rows = vec![ListRow {
             id: String::from("active"),
             label: String::from("Debug active file — no configuration"),
@@ -18333,6 +18344,20 @@ impl App {
             id: i.to_string(),
             label: format!("{} — {} · {}", c.name, c.type_name, c.source),
         }));
+        // Compounds are listed so a workspace's own launch.json is reflected
+        // honestly. Selecting one LAUNCHES it when it names a single
+        // configuration and carries no key croft cannot honour; otherwise it
+        // reports what is missing (#310) rather than launching a subset, which
+        // would debug something other than what was asked for.
+        rows.extend(
+            self.debug_compounds
+                .iter()
+                .enumerate()
+                .map(|(i, c)| ListRow {
+                    id: format!("compound:{i}"),
+                    label: format!("{} — compound of {}", c.name, c.configurations.join(", ")),
+                }),
+        );
         self.open_list_picker(
             ListPicker::new(ListPurpose::DebugConfig, "Debug Configuration", rows),
             "No debug configurations (.croft/launch.json or .vscode/launch.json)",
@@ -21536,7 +21561,89 @@ impl App {
                 }
             }
             ListPurpose::DebugConfig => {
-                if row.id == "active" {
+                if let Some(idx) = row.id.strip_prefix("compound:") {
+                    // Index the row straight through rather than round-tripping
+                    // via the name. `discover_compounds` dedupes by name, so a
+                    // lookup would find the same element today — but it asks a
+                    // weaker question than the one the row already answers, and
+                    // it made the not-found arm unreachable-but-present.
+                    let found = idx
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| self.debug_compounds.get(i));
+                    if let Some(compound) = found {
+                        // Resolve first: a compound naming a configuration no
+                        // launch.json declares is a config error worth
+                        // reporting now, separately from the unbuilt feature.
+                        // The un-deduped list: `debug_configs` is the picker's
+                        // display list and drops a lower-precedence duplicate by
+                        // name, which is the very entry a `.vscode` compound
+                        // naming that name has to bind.
+                        let all = crate::dap::configs::discover_configs_all(
+                            &self.active_workspace_root(),
+                        );
+                        // #310 defers compounds that need SEVERAL sessions at
+                        // once. A compound naming ONE configuration needs one,
+                        // which croft has run since #250 — so the arity has to
+                        // be READ here rather than assumed. Reporting the
+                        // multi-session limit for a one-member compound cites
+                        // a limitation that does not apply and tells the user
+                        // something false about their own launch.json.
+                        match crate::dap::configs::resolve_compound(compound, &all) {
+                            Err(e) => self.debug_error(e),
+                            // A one-member compound carrying keys croft does
+                            // not honour is REFUSED rather than launched.
+                            // `parse_compounds` reads only `name` and
+                            // `configurations`, so launching via the member
+                            // alone would run neither the compound's own
+                            // `preLaunchTask` nor respect `presentation` — the
+                            // "silently debug something other than what was
+                            // asked for" outcome every guard here exists to
+                            // prevent. Saying so beats doing it.
+                            Ok(members)
+                                if members.len() == 1
+                                    && !compound.unsupported_keys.is_empty() =>
+                            {
+                                // #318, NOT #310: this compound needs ONE
+                                // session, which croft runs. What it cannot do
+                                // is honour the key. Citing the multi-session
+                                // limit here would be the same false claim the
+                                // launching branch below exists to stop making.
+                                //
+                                // The remedy is stated with its cost: running
+                                // the member directly DOES skip a preLaunchTask,
+                                // which is the very outcome this refusal
+                                // prevents. Offering it silently would relocate
+                                // the bug onto the user.
+                                let keys = compound.unsupported_keys.join(" and ");
+                                let plural = if compound.unsupported_keys.len() > 1 {
+                                    "those keys"
+                                } else {
+                                    "that key"
+                                };
+                                self.debug_error(format!(
+                                    "compound \"{}\" sets {}, which croft does not honour yet (#318) — remove {} to launch \"{}\" through the compound, or run \"{}\" directly and do the work {} asks for yourself",
+                                    compound.name,
+                                    keys,
+                                    plural,
+                                    members[0].name,
+                                    members[0].name,
+                                    plural
+                                ));
+                            }
+                            Ok(members) if members.len() == 1 => {
+                                let cfg = members[0].clone();
+                                self.selected_debug_config = Some(cfg.name.clone());
+                                self.run_debug.selected_config = Some(cfg.name.clone());
+                                self.launch_debug_config(&cfg);
+                            }
+                            Ok(_) => self.debug_error(format!(
+                                "compound \"{}\" needs several debug sessions at once, which croft does not support yet (#310)",
+                                compound.name
+                            )),
+                        }
+                    }
+                } else if row.id == "active" {
                     self.selected_debug_config = None;
                     self.run_debug.selected_config = None;
                     self.start_selected_debug();

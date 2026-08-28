@@ -284,7 +284,10 @@ impl RunDebugPanel {
         match (&self.selected_config, self.config_count) {
             (Some(name), _) => Some(format!("⚙ {name} ▾")),
             (None, 0) => None,
-            (None, n) => Some(format!("⚙ {n} debug configs ▾")),
+            // "entries" rather than "configs": the count covers compounds too
+            // since #250, and the singular case read "1 debug configs".
+            (None, 1) => Some(String::from("⚙ 1 debug entry ▾")),
+            (None, n) => Some(format!("⚙ {n} debug entries ▾")),
         }
     }
 
@@ -1143,8 +1146,15 @@ mod tests {
         panel.config_count = 2;
         assert_eq!(
             panel.config_row_label().as_deref(),
-            Some("⚙ 2 debug configs ▾")
+            Some("⚙ 2 debug entries ▾")
         );
+        panel.config_count = 1;
+        assert_eq!(
+            panel.config_row_label().as_deref(),
+            Some("⚙ 1 debug entry ▾"),
+            "singular reads correctly rather than \"1 debug configs\""
+        );
+        panel.config_count = 2;
         panel.selected_config = Some(String::from("Run API"));
         assert_eq!(panel.config_row_label().as_deref(), Some("⚙ Run API ▾"));
     }

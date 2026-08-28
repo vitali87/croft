@@ -59,13 +59,7 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Auto-hide waits a moment before collapsing the side bar, so a click passing through the panel no longer takes it away under the pointer.",
-    },
-    ReleaseNote {
-        kind: NoteKind::Fix,
-        summary: "Revealing the side bar with Cmd+B or Ctrl+B keeps its one-shot reprieve when a drag, palette or dialog interrupts the collapse it was meant to survive.",
-    },
-];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
+    kind: NoteKind::Feature,
+    summary: "Debug compounds declared in launch.json now appear in the Debug Configuration picker, with their member configurations listed. Selecting one that names a single configuration launches it; one that names several still reports that croft cannot run several debug sessions at once yet (#310).",
+}];
