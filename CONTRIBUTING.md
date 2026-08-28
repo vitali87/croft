@@ -39,9 +39,13 @@ job): a function that had a doc comment at the merge base and has none at your
 head is the fingerprint this insertion leaves. If a removal is deliberate, say
 so in a commit message on the branch:
 
+```text
+doc-removal: src/path/to/file.rs::some_function_name
 ```
-doc-removal: some_function_name
-```
+
+The file qualifier matters: an exemption keyed on the bare name would excuse
+every function of that name in every changed file, so a deliberate removal of
+one `new` would quietly cover an accidental loss of another.
 
 Run it yourself with `python3 scripts/check_doc_ownership.py origin/main HEAD`.
 

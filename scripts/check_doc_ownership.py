@@ -11,8 +11,10 @@ above a plausible function - but the DIFF is not. A function that had a doc
 comment and now has none is the exact fingerprint the insertion leaves behind,
 and it is what both known instances did.
 
-Deliberate removals are rare and are declared: put `doc-removal: <fn name>` in
-a commit message on the branch.
+Deliberate removals are rare and are declared: put
+`doc-removal: <path>::<fn name>` in a commit message on the branch. The path
+qualifier keeps one declared removal from excusing a same-named function
+elsewhere.
 
 Usage: check_doc_ownership.py <base-rev> <head-rev>
 """
@@ -24,8 +26,33 @@ import sys
 FN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?fn\s+([A-Za-z_]\w*)")
 
 
-def git(*args):
-    return subprocess.run(["git", *args], capture_output=True, text=True).stdout
+def git(*args, allow_fail=False):
+    """Run git, failing closed.
+
+    A silent failure here is worse than a crash: an errored `git diff` yields
+    an empty file list, the checker reports "no documentation lost" and exits
+    zero, and the gate has passed by not running. `allow_fail` is for the one
+    expected error - `git show` of a path that does not exist on that side of
+    the diff, i.e. a file this branch added or deleted.
+    """
+    proc = subprocess.run(["git", *args], capture_output=True, text=True)
+    if proc.returncode != 0:
+        if allow_fail:
+            return ""
+        raise SystemExit(
+            f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
+        )
+    return proc.stdout
+
+
+def is_doc(line):
+    """A `///` outer doc comment, and not a `////` rule.
+
+    Four or more slashes is an ordinary comment to rustc, so counting it as
+    documentation invents losses that never happened.
+    """
+    s = line.lstrip()
+    return s.startswith("///") and not s.startswith("////")
 
 
 def documented(text):
@@ -35,6 +62,14 @@ def documented(text):
     a file defines the same name more than once (`new` across impl blocks),
     "any documented" is the deliberately conservative reading: the check fires
     only when every definition of that name has lost its prose.
+
+    `///` lowers to an outer `#[doc]` attribute, and an attribute is not
+    detached from its item by blank lines or ordinary comments - verified
+    against rustc, which warns `unused_doc_comments` when a doc really is
+    orphaned and stays silent here, and against rustdoc, which renders the
+    prose on the function in both shapes. So the backward scan steps over
+    attributes, blanks and `//` comments alike; stopping at the first blank
+    reported documentation as missing when rustc could see it perfectly well.
     """
     lines = text.splitlines()
     state = {}
@@ -43,11 +78,13 @@ def documented(text):
         if not m:
             continue
         j = i - 1
-        # Attributes sit between a doc comment and its item without detaching
-        # it; a BLANK line detaches it, which is why this does not skip those.
-        while j >= 0 and lines[j].lstrip().startswith("#["):
-            j -= 1
-        has_doc = j >= 0 and lines[j].lstrip().startswith("///")
+        while j >= 0:
+            s = lines[j].lstrip()
+            if s.startswith("#[") or s == "" or (s.startswith("//") and not is_doc(lines[j])):
+                j -= 1
+                continue
+            break
+        has_doc = j >= 0 and is_doc(lines[j])
         state[m.group(1)] = state.get(m.group(1), False) or has_doc
     return state
 
@@ -55,7 +92,15 @@ def documented(text):
 def main():
     base, head = sys.argv[1], sys.argv[2]
     declared = git("log", f"{base}..{head}", "--format=%B")
-    exempt = set(re.findall(r"doc-removal:\s*([A-Za-z_]\w*)", declared))
+    # File-qualified: `doc-removal: src/foo.rs::bar`. Keyed on the bare name,
+    # one deliberate removal of `new` would excuse every `new` in every
+    # changed file, including an accidental loss elsewhere in the same branch.
+    exempt = {
+        (path, name)
+        for path, name in re.findall(
+            r"doc-removal:\s*([\w./-]+\.rs)::([A-Za-z_]\w*)", declared
+        )
+    }
     changed = [
         f for f in git("diff", "--name-only", base, head).splitlines()
         if f.endswith(".rs")
@@ -65,14 +110,14 @@ def main():
         before = documented(git("show", f"{base}:{f}"))
         after = documented(git("show", f"{head}:{f}"))
         for name, had_doc in before.items():
-            if had_doc and name in after and not after[name] and name not in exempt:
+            if had_doc and name in after and not after[name] and (f, name) not in exempt:
                 losses.append((f, name))
     for f, name in losses:
         print(
             f"::error file={f}::`{name}` had a doc comment at {base[:12]} and has none now. "
             "A doc block above it was most likely captured by a function inserted between the two "
             "(#314), which hands one function's prose to another with nothing failing. Restore it, "
-            "or declare the removal with `doc-removal: " + f"{name}` in a commit message."
+            "or declare the removal with `doc-removal: " + f"{f}::{name}` in a commit message."
         )
     if losses:
         print(f"\n{len(losses)} function(s) lost documentation.", file=sys.stderr)

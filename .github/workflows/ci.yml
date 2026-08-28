@@ -86,11 +86,18 @@ jobs:
     name: doc comments stay with their function
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # This job runs a script FROM the submitted branch, so a PR can change what
+    # executes here. Give it only what it needs to read the diff, and keep the
+    # checkout token out of the local git config where that script could reach
+    # it.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           # Full history so the merge-base with the PR base resolves.
           fetch-depth: 0
+          persist-credentials: false
       - name: No function may lose its doc comment
         run: |
           set -euo pipefail

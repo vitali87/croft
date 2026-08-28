@@ -354,7 +354,8 @@ impl ProblemsPanel {
         true
     }
 
-    /// The visible groups after the severity filter: `(group index, indices of
+    /// The visible groups after the active severity and free-text filters:
+    /// `(group index, indices of
     /// its items that pass the filter)`. Groups with no passing item are
     /// dropped so a filtered-away file shows no header. Indices are into
     /// `self.groups`, so `hit_at` / `*_spans` need no remapping.
