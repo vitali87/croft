@@ -6189,20 +6189,6 @@ impl App {
         }
     }
 
-    /// Keep each text tab's git-gutter baseline current. The first time a tab
-    /// is seen (or after it switches files, or after HEAD moves), shell out
-    /// once for the committed version of the file and hand it to the editor;
-    /// the per-line diff is then recomputed in-buffer on every edit with no
-    /// further subprocess. Cheap no-op once every open tab has a baseline:
-    /// just a path compare per tab.
-    ///
-    /// `read_file_at_head` is a `git show` (~tens of ms) but runs at most once
-    /// per (file, HEAD) pair, never on the keystroke path. Baselines are shared
-    /// across groups within a sweep: a split usually holds the SAME file in two
-    /// panes, and a HEAD move invalidates every tab in every group at once, so
-    /// without the cache one tick would shell out once per tab per group.
-    /// ponytail: synchronous fetch on the tick. Move to the git worker thread
-    /// if opening a file in a huge repo ever visibly hitches.
     /// The repository toplevel owning the workspace, from the git worker's
     /// last status reply — the only correct base for porcelain-derived
     /// paths and `HEAD:<rel>` pathspecs, which git resolves against the
@@ -6297,6 +6283,20 @@ impl App {
         self.git_worker_for_root_mut(&ws).bypass_debounce();
     }
 
+    /// Keep each text tab's git-gutter baseline current. The first time a tab
+    /// is seen (or after it switches files, or after HEAD moves), shell out
+    /// once for the committed version of the file and hand it to the editor;
+    /// the per-line diff is then recomputed in-buffer on every edit with no
+    /// further subprocess. Cheap no-op once every open tab has a baseline:
+    /// just a path compare per tab.
+    ///
+    /// `read_file_at_head` is a `git show` (~tens of ms) but runs at most once
+    /// per (file, HEAD) pair, never on the keystroke path. Baselines are shared
+    /// across groups within a sweep: a split usually holds the SAME file in two
+    /// panes, and a HEAD move invalidates every tab in every group at once, so
+    /// without the cache one tick would shell out once per tab per group.
+    /// ponytail: synchronous fetch on the tick. Move to the git worker thread
+    /// if opening a file in a huge repo ever visibly hitches.
     fn sync_git_gutters(&mut self) {
         // `HEAD:<rel>` pathspecs resolve against the toplevel (#139), and
         // each file resolves against the repo of ITS owning workspace
@@ -7386,10 +7386,6 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Rebuild the PROBLEMS panel's grouped projection from the per-file
-    /// diagnostics store. Returns whether the projection changed (so the caller
-    /// can fold it into its redraw decision). Files are grouped, ordered by
-    /// path; each group's diagnostics are ordered by position.
     /// Scan one finished command's output through the build matchers and
     /// install the results (#119). The pane's PREVIOUS contribution is
     /// replaced wholesale — a rebuild that fixed everything clears its old
@@ -7529,6 +7525,10 @@ impl App {
             .collect()
     }
 
+    /// Rebuild the PROBLEMS panel's grouped projection from the per-file
+    /// diagnostics store. Returns whether the projection changed (so the caller
+    /// can fold it into its redraw decision). Files are grouped, ordered by
+    /// path; each group's diagnostics are ordered by position.
     fn rebuild_problems(&mut self) -> bool {
         use crate::widgets::problems::{ProblemGroup, ProblemItem};
         let mut paths: Vec<&PathBuf> = self
@@ -8742,11 +8742,6 @@ impl App {
         changed
     }
 
-    /// Idle-caret occurrences trigger, run once per frame: when the caret has
-    /// rested on one buffer position for `OCCURRENCES_IDLE`, fire ONE
-    /// `documentHighlight` request for it; the moment it moves (or the buffer
-    /// edits), drop the painted set. Mirrors VS Code's word highlight, which
-    /// follows the cursor with a small debounce rather than every keystroke.
     /// Linked editing (#254): replay the last keystroke across the
     /// sibling tag ranges, keep the set alive only while the caret
     /// stays inside one, and (debounced on caret idle) ask the server
@@ -8942,6 +8937,11 @@ impl App {
         changed
     }
 
+    /// Idle-caret occurrences trigger, run once per frame: when the caret has
+    /// rested on one buffer position for `OCCURRENCES_IDLE`, fire ONE
+    /// `documentHighlight` request for it; the moment it moves (or the buffer
+    /// edits), drop the painted set. Mirrors VS Code's word highlight, which
+    /// follows the cursor with a small debounce rather than every keystroke.
     pub fn tick_occurrences(&mut self) -> bool {
         const OCCURRENCES_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
         let eligible = self.editor.diff.is_none()
@@ -9265,8 +9265,6 @@ impl App {
         self.overlays.welcome.mark_dirty();
     }
 
-    /// Toggle the secondary side bar (the Outline of the active file), on the
-    /// edge opposite the primary side bar. Mirrors ⌥⌘B.
     /// Show or hide the primary side bar. Every route that flips it by hand —
     /// the Cmd+B keybinding, the palette command, the Customize Layout row and
     /// the layout-icon click — goes through here, because each one is a
@@ -9307,6 +9305,8 @@ impl App {
         }
     }
 
+    /// Toggle the secondary side bar (the Outline of the active file), on the
+    /// edge opposite the primary side bar. Mirrors ⌥⌘B.
     fn toggle_secondary_side_bar(&mut self) {
         self.secondary_side_bar_visible = !self.secondary_side_bar_visible;
         self.persist_layout();
@@ -9801,9 +9801,6 @@ impl App {
         self.definition_request_id = Some(id);
     }
 
-    /// Request the LSP definition of the symbol at the current cursor (buffer)
-    /// position. Used by the editor right-click "Go to Definition" item, where
-    /// the cursor has already been moved to the click point.
     /// Alt+F12 / palette "Peek Definition": the definition request whose
     /// response opens an excerpt popup instead of jumping (#115).
     fn peek_definition_at_cursor(&mut self) {
@@ -9823,6 +9820,9 @@ impl App {
         self.status = String::from("Peeking definition");
     }
 
+    /// Request the LSP definition of the symbol at the current cursor (buffer)
+    /// position. Used by the editor right-click "Go to Definition" item, where
+    /// the cursor has already been moved to the click point.
     fn request_definition_at_cursor(&mut self) {
         let (line, character) = self
             .editor
@@ -11974,9 +11974,6 @@ impl App {
         self.save_terminal_session();
     }
 
-    /// Snapshot the terminal panel (pane order, cwds, names, focus) into
-    /// the per-workspace session store. Called on structural changes and at
-    /// quit; the default single-pane layout prunes the record instead.
     /// Set a structural-change status, keeping any latched session-store
     /// failure visible beside it (#158 review: plain assignments right
     /// after a failed save silently hid the persistence error).
@@ -11987,6 +11984,9 @@ impl App {
         };
     }
 
+    /// Snapshot the terminal panel (pane order, cwds, names, focus) into
+    /// the per-workspace session store. Called on structural changes and at
+    /// quit; the default single-pane layout prunes the record instead.
     pub fn save_terminal_session(&mut self) {
         let root = self.workspace_root().display().to_string();
         let panes = self
@@ -15268,8 +15268,6 @@ impl App {
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
     }
 
-    /// Confirmation modal for "Discard All Changes" — reverts every tracked
-    /// edit to HEAD, so it gets the same red Y/N gate as a single discard.
     /// The Replace All confirmation modal (#123): counts up front, commits
     /// on Enter/Y, cancels on Esc/N — the discard-all popup's shape.
     fn render_replace_all_confirm(&self, frame: &mut ratatui::Frame) {
@@ -15331,6 +15329,8 @@ impl App {
         );
     }
 
+    /// Confirmation modal for "Discard All Changes" — reverts every tracked
+    /// edit to HEAD, so it gets the same red Y/N gate as a single discard.
     fn render_discard_all_confirm(&self, frame: &mut ratatui::Frame) {
         if !self.pending_discard_all {
             return;
@@ -19010,7 +19010,6 @@ impl App {
         self.start_selected_debug();
     }
 
-    /// Shift+F5: stop debugging and tear the session down.
     /// A session ended: the expressions survive (they usually make sense for
     /// the next run too), but the values, the changed-value baseline, and the
     /// baseline latch are that session's — left in place they made every
@@ -19021,6 +19020,7 @@ impl App {
         self.watch_baseline_pending = false;
     }
 
+    /// Shift+F5: stop debugging and tear the session down.
     pub fn debug_stop(&mut self) {
         if let Some(session) = self.dap_session.as_mut() {
             session.disconnect();
@@ -31387,11 +31387,14 @@ impl App {
                             // A second click on the same row opens that port,
                             // the same as pressing Enter on it.
                             let now = std::time::Instant::now();
-                            if self.ports_click.is_double(now, m.column, m.row) {
+                            if self
+                                .ports_click
+                                .is_double(now, m.column, m.row, m.modifiers)
+                            {
                                 self.ports_open_selected();
                                 self.ports_click.clear();
                             } else {
-                                self.ports_click.record(now, m.column, m.row);
+                                self.ports_click.record(now, m.column, m.row, m.modifiers);
                             }
                         }
                         None => self.focus_pane(Pane::Terminal),
@@ -31649,7 +31652,8 @@ impl App {
                     if let Some(idx) = self.search.hit_at_y(m.row) {
                         self.search.selected = idx;
                         let now = std::time::Instant::now();
-                        let is_double = self.tree_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.tree_click.is_double(now, m.column, m.row, m.modifiers);
                         if let Some(hit) = self.search.selected_hit().cloned() {
                             self.open_search_hit(&hit);
                             if is_double {
@@ -31659,7 +31663,7 @@ impl App {
                         if is_double {
                             self.tree_click.clear();
                         } else {
-                            self.tree_click.record(now, m.column, m.row);
+                            self.tree_click.record(now, m.column, m.row, m.modifiers);
                         }
                     } else {
                         // Click on the input/header area: just focus search.
@@ -31857,14 +31861,15 @@ impl App {
                     if let Some(idx) = self.remote.target_at_y(m.row) {
                         self.remote.select(idx);
                         let now = std::time::Instant::now();
-                        let is_double = self.tree_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.tree_click.is_double(now, m.column, m.row, m.modifiers);
                         if is_double {
                             if let Some(target) = self.remote.selected_target().cloned() {
                                 self.request_remote_launch(target.alias, None);
                             }
                             self.tree_click.clear();
                         } else {
-                            self.tree_click.record(now, m.column, m.row);
+                            self.tree_click.record(now, m.column, m.row, m.modifiers);
                         }
                     }
                     return;
@@ -31914,7 +31919,8 @@ impl App {
                     }
                     if let Some(idx) = self.tree.node_at_y(m.row) {
                         let now = std::time::Instant::now();
-                        let is_double = self.tree_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.tree_click.is_double(now, m.column, m.row, m.modifiers);
                         let has_shift = m.modifiers.contains(KeyModifiers::SHIFT);
                         // macOS terminals (iTerm2, Terminal.app) never put the
                         // Cmd bit on mouse events — the SGR mouse encoding only
@@ -32012,7 +32018,7 @@ impl App {
                         if is_double {
                             self.tree_click.clear();
                         } else {
-                            self.tree_click.record(now, m.column, m.row);
+                            self.tree_click.record(now, m.column, m.row, m.modifiers);
                         }
                     }
                 } else if in_editor_pane && !in_editor {
@@ -32167,7 +32173,9 @@ impl App {
                             return;
                         }
                         let now = std::time::Instant::now();
-                        let is_double = self.editor_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.editor_click
+                                .is_double(now, m.column, m.row, m.modifiers);
                         let last_inner = self.editor.last_inner;
                         if let Some(diff) = self.editor.diff.as_mut() {
                             if let Some((side, row_idx, char_col)) =
@@ -32187,7 +32195,7 @@ impl App {
                         if is_double {
                             self.editor_click.clear();
                         } else {
-                            self.editor_click.record(now, m.column, m.row);
+                            self.editor_click.record(now, m.column, m.row, m.modifiers);
                         }
                         self.poke_cursor();
                         return;
@@ -32275,7 +32283,9 @@ impl App {
                         return;
                     }
                     let now = std::time::Instant::now();
-                    let is_double = self.editor_click.is_double(now, m.column, m.row);
+                    let is_double = self
+                        .editor_click
+                        .is_double(now, m.column, m.row, m.modifiers);
                     if is_double {
                         self.editor.select_word_at(m.column, m.row);
                         self.editor_click.clear();
@@ -32283,7 +32293,7 @@ impl App {
                         // Anchor a fresh selection at the click; a drag widens it,
                         // a clean click ends up cleared on mouse-up.
                         self.editor.mouse_down(m.column, m.row);
-                        self.editor_click.record(now, m.column, m.row);
+                        self.editor_click.record(now, m.column, m.row, m.modifiers);
                     }
                     self.poke_cursor();
                 } else if let Some(idx) = terminal_hit {
@@ -32346,7 +32356,9 @@ impl App {
                     // two panes never paint a highlight at once (issue #23).
                     self.editor.clear_selection();
                     let now = std::time::Instant::now();
-                    let is_double = self.terminal_click.is_double(now, m.column, m.row);
+                    let is_double =
+                        self.terminal_click
+                            .is_double(now, m.column, m.row, m.modifiers);
                     if is_double {
                         self.terminal_mut().select_word_at(m.column, m.row);
                         self.terminal_click.clear();
@@ -32356,7 +32368,8 @@ impl App {
                         // ends up cleared on mouse-up. With a drag, this is the
                         // selection anchor.
                         self.terminal_mut().start_selection_at(m.column, m.row);
-                        self.terminal_click.record(now, m.column, m.row);
+                        self.terminal_click
+                            .record(now, m.column, m.row, m.modifiers);
                     }
                 }
             }
@@ -34713,9 +34726,6 @@ impl App {
         }
     }
 
-    /// Close every saved (non-dirty) editor tab, keeping any with unsaved
-    /// changes. Shared by the tab context menu and the `Cmd+K U` chord so both
-    /// surfaces produce the same status line and split-collapse behavior.
     /// Cmd+K W / tab context "Close All": close every tab in EVERY editor
     /// group, not just the focused one, collapsing any split back to a single
     /// blank pane. A side-by-side layout (e.g. `cgr duplicates` diffs) would
@@ -34744,6 +34754,9 @@ impl App {
         self.poke_cursor();
     }
 
+    /// Close every saved (non-dirty) editor tab, keeping any with unsaved
+    /// changes. Shared by the tab context menu and the `Cmd+K U` chord so both
+    /// surfaces produce the same status line and split-collapse behavior.
     fn close_saved_tabs(&mut self) {
         let removed = self.editor.close_saved();
         if removed == 0 {
@@ -36239,10 +36252,6 @@ impl App {
         sheet_follow_cursor(sheet, current, visible);
     }
 
-    /// Hex-tab navigation (#172): cursor movement over bytes, Shift
-    /// extending the selection, F3 repeating the last find. The viewport
-    /// row count comes from the last painted frame's layout (frame
-    /// truth), so PageUp/PageDown match what the user sees.
     /// Archive browser keys (#179): selection movement, Enter extracts
     /// the member to scratch and opens it through the normal dispatch,
     /// E prompts for an extraction folder.
@@ -36322,6 +36331,10 @@ impl App {
         );
     }
 
+    /// Hex-tab navigation (#172): cursor movement over bytes, Shift
+    /// extending the selection, F3 repeating the last find. The viewport
+    /// row count comes from the last painted frame's layout (frame
+    /// truth), so PageUp/PageDown match what the user sees.
     fn handle_hex_key(&mut self, key: KeyEvent) {
         // Cmd/Ctrl+F never reaches here — `is_editor_find_key` routes to
         // `open_editor_find` earlier in the dispatch, which forwards hex
@@ -36433,10 +36446,6 @@ impl App {
         }
     }
 
-    /// F3 / "Hex: Find Next": repeat the stored query from just past the
-    /// cursor. The query itself is set by the find prompt
-    /// (`InputPurpose::HexFind`), whose submit searches cursor-INCLUSIVE
-    /// via `hex_find_run` directly.
     /// Sheet row/column structure ops (#177), palette-driven, anchored
     /// on the selected cell. CSV/TSV only; the workbook kinds are still
     /// read-only (#178).
@@ -36538,6 +36547,10 @@ impl App {
         }
     }
 
+    /// F3 / "Hex: Find Next": repeat the stored query from just past the
+    /// cursor. The query itself is set by the find prompt
+    /// (`InputPurpose::HexFind`), whose submit searches cursor-INCLUSIVE
+    /// via `hex_find_run` directly.
     fn hex_find_next(&mut self) {
         let Some(view) = self.editor.hex.as_ref() else {
             return;
@@ -37242,11 +37255,6 @@ fn mode_reassert_seq() -> Vec<u8> {
     seq
 }
 
-/// True when the "command" modifier is effectively held. That is `Super`
-/// (Cmd) everywhere; on Termux (Android, no Cmd key) `Ctrl` stands in for it
-/// too, mirroring VS Code's Linux keymap so the Super-only chords stay
-/// reachable. `termux` is threaded in explicitly to keep the decision pure
-/// and testable.
 /// Shrink `s` to at most `max` chars by cutting the middle, keeping roughly
 /// a third of the head and two thirds of the tail — for path-shaped
 /// messages the tail carries the filename, the part worth keeping. Never
@@ -37287,6 +37295,11 @@ fn peek_excerpt(
     (start, lines[start..end].to_vec())
 }
 
+/// True when the "command" modifier is effectively held. That is `Super`
+/// (Cmd) everywhere; on Termux (Android, no Cmd key) `Ctrl` stands in for it
+/// too, mirroring VS Code's Linux keymap so the Super-only chords stay
+/// reachable. `termux` is threaded in explicitly to keep the decision pure
+/// and testable.
 fn cmd_active(mods: KeyModifiers, termux: bool) -> bool {
     mods.contains(KeyModifiers::SUPER) || (termux && mods.contains(KeyModifiers::CONTROL))
 }
@@ -38188,10 +38201,6 @@ fn is_select_to_bracket_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
-/// `Ctrl+T`: Transpose Characters around the Cursor (VS Code's
-/// `editor.action.transpose`). A raw control byte, so it needs no iTerm2 /
-/// Ghostty forwarder; the editor intercepts it only when focused, leaving the
-/// shell's own `Ctrl+T` intact when the terminal is focused.
 /// VS Code "Go Back" (Ctrl+-). The kitty keyboard protocol delivers the
 /// chord as `-` + CONTROL; the legacy encoding folds Ctrl+- into 0x1F,
 /// which decodes as `_` + CONTROL, so both spellings are accepted.
@@ -38222,6 +38231,10 @@ fn is_navigate_forward_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
+/// `Ctrl+T`: Transpose Characters around the Cursor (VS Code's
+/// `editor.action.transpose`). A raw control byte, so it needs no iTerm2 /
+/// Ghostty forwarder; the editor intercepts it only when focused, leaving the
+/// shell's own `Ctrl+T` intact when the terminal is focused.
 fn is_transpose_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;

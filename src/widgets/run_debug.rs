@@ -229,8 +229,6 @@ impl RunDebugPanel {
         }
     }
 
-    /// Map a click at screen row `y` to the index of the debug row drawn there,
-    /// or `None` if the click missed the rendered rows.
     /// Map a click to the watch row whose remove `✕` sits at `(x, y)` —
     /// returns the index into the ORDER the Watch rows were rendered in,
     /// which the app maps back to its expression list.
@@ -241,6 +239,8 @@ impl RunDebugPanel {
             .map(|&(_, _, idx)| idx)
     }
 
+    /// Map a click at screen row `y` to the index of the debug row drawn there,
+    /// or `None` if the click missed the rendered rows.
     pub fn debug_row_at(&self, y: u16) -> Option<usize> {
         if !self.debug_active || self.last_debug_rows_shown == 0 || y < self.last_debug_row_y0 {
             return None;

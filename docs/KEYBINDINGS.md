@@ -92,6 +92,7 @@ Click the **⛶** icon at the top-right of the editor (or the welcome screen), o
 | Group | Options |
 |-------|---------|
 | Visibility | Activity Bar, Primary Side Bar (`Cmd`/`Ctrl`+`B`), Secondary Side Bar (`Opt`+`Cmd`/`Ctrl`+`B`), Panel (`Ctrl`+`J`), Status Bar, Minimap (`Opt`+`Cmd`/`Ctrl`+`M`) |
+| Auto-Hide Side Bar | Off by default. On, the primary side bar collapses when focus moves to the editor or a terminal (also on the palette as **View: Toggle Auto-Hide Side Bar**). A reveal you asked for - `Cmd`/`Ctrl`+`B`, the activity bar, this row - is exempt from the next collapse. See [LAYOUT.md](LAYOUT.md#auto-hide-side-bar) for everything that holds it open. |
 | Primary Side Bar Position | Left / Right (moves the activity bar with it) |
 | Panel Alignment | Left / Center / Right / Justify (Justify spans the full width under the side bar) |
 | Quick Input Position | Top / Center (where Command Palette / Go to File appears) |
@@ -455,7 +456,9 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 
 | Keys | Action |
 |------|--------|
-| Any key | Forwarded to the shell PTY (arrows, `Ctrl+letter`, `Alt+x`, function keys translated to VT escapes) |
+| Any key croft does not bind | Forwarded to the shell PTY (arrows, most `Ctrl+letter`, `Alt+x`, function keys translated to VT escapes) |
+| A chord croft binds | **Claimed by croft, whatever pane has focus** - the shell never sees it. Measured by driving every letter through the real key path and watching which ones reach the PTY:<br>`Ctrl` + **B F J P Q S V**, and `Ctrl+Shift` + **B C D E F H J L O P R S T V W X Y**<br>`Cmd` + **B C E F K P S T V W**, and `Cmd+Shift` + **B C D E F L O P R S T V W X**<br>Everything else is forwarded, so the chords a shell leans on - `Ctrl+A` `C` `D` `E` `K` `L` `R` `U` `W` `Z` - all reach the app. `Ctrl+B` does not, which matters for Claude Code, where it backgrounds a running command (see #304) |
+| Bare `F5` / `F9` / `F10` / `F11` | Forwarded while the terminal is focused and no debug session is live, so process-compose's `F10` and htop's `F9` work. Modified, they keep their debug meaning everywhere |
 | Mouse drag | Select text, pinned to the scrollback content; drag past an edge to auto-scroll through history. Inside a full-screen app that scrolls by repainting (Claude Code, a pager), the highlight follows its text across the app's own scrolling — rows covered by the app's chrome (an input box, a floating pill) drop out — a row with an overlay in its middle keeps both intact ends — while the surviving rows stay highlighted, it hides entirely only when none remain (copy still yields the whole selection), and it reappears as the text scrolls back — and a drag held past an edge forwards wheel ticks so the app scrolls under the drag |
 | `Shift`+click | Extend the existing selection to the clicked cell instead of starting a new one |
 | Mouse wheel | At a shell prompt, scroll 5000 rows of scrollback (any keystroke snaps to the live bottom). When a full-screen app is tracking the mouse (Claude Code, htop, vim with `mouse=a`), the wheel scrolls that app's own content; `Shift`+wheel scrolls croft's scrollback instead. Full-screen apps that don't track the mouse still get arrow keys |

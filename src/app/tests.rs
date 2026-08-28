@@ -5182,15 +5182,16 @@ fn cmd_clicking_a_non_web_hyperlink_refuses_instead_of_opening() {
                 .map(|c| (r, c))
         })
     };
-    // 8s like the suite's other shell-startup waits (#165): a 5s cap
-    // missed under full parallel load while dozens of test shells spawn.
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(8000) && linked_cell(&app).is_none()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled rather than a fresh constant (#307): this budget was raised
+    // 5s -> 8s once already, which is the shape of a number that cannot be
+    // guessed from inside one test.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1000),
+        "the shell to paint the linked cell",
+        || linked_cell(&app).is_some(),
+    );
     term.draw(|f| app.render(f)).unwrap();
-    let (row_idx, col) = linked_cell(&app).expect("shell must print the linked text within 8s");
+    let (row_idx, col) = linked_cell(&app).expect("shell must print the linked text");
 
     let inner = app.terminal().last_inner;
     app.handle_mouse(crossterm::event::MouseEvent {
@@ -6214,6 +6215,69 @@ fn double_click_in_terminal_word_selects_in_split_and_maximised_layout() {
             if maximise { "maximised" } else { "split" }
         );
     }
+}
+
+/// #317, the reported gesture end to end: a ctrl+click that matches no link
+/// falls past the URL and file arms into the built-in selection path. That
+/// path used to arm the double-click tracker regardless of modifiers, so the
+/// user's NEXT ordinary click at the same cell classified as a double and
+/// word-selected text they never double-clicked.
+///
+/// The probe word is deliberately link-free and path-free, so the ctrl+click
+/// genuinely reaches the fall-through arm rather than being consumed above it
+/// - a click that IS consumed would make this test pass without the fix.
+#[test]
+fn a_ctrl_click_that_opens_nothing_does_not_arm_the_terminal_double_click() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let probe = format!("croftmodclick{}", std::process::id());
+    await_terminal_probe(&mut app, &probe);
+    term.draw(|f| app.render(f)).unwrap();
+    let snap = app.terminal().visible_text();
+    let row_idx = snap
+        .lines()
+        .position(|l| l.contains(&probe))
+        .expect("probe must render");
+    let line = snap.lines().nth(row_idx).unwrap();
+    let mid_col = line.find(&probe).unwrap() + probe.len() / 2;
+    let inner = app.terminal().last_inner;
+    let screen_y = inner.y + row_idx as u16;
+    let screen_x = inner.x + mid_col as u16;
+
+    let click = |app: &mut App, modifiers| {
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: screen_x,
+            row: screen_y,
+            modifiers,
+        });
+    };
+
+    // The ctrl+click must actually fall through: nothing on this word is a
+    // URL or an existing file, so no link opens and no selection is made yet.
+    click(&mut app, KeyModifiers::CONTROL);
+    // The user's next ordinary click, at the same cell.
+    click(&mut app, KeyModifiers::NONE);
+
+    let sel = app.terminal().selection_text();
+    assert!(
+        !sel.contains(&probe),
+        "a plain click after an unmatched ctrl+click must not word-select: the \
+         ctrl+click must not have armed the double-click tracker, but selection was {sel:?}"
+    );
+
+    // The guard must not have cost the real gesture: two plain clicks still
+    // word-select at the same cell.
+    click(&mut app, KeyModifiers::NONE);
+    let sel = app.terminal().selection_text();
+    assert!(
+        sel.contains(&probe) || probe.contains(&sel),
+        "two ordinary clicks must still word-select; got {sel:?}"
+    );
 }
 
 /// End-to-end variant of the matrix that exercises the user's
@@ -17698,7 +17762,6 @@ fn switching_sidebar_view_closes_the_open_commit_dropdown() {
 
 // --- Split editor (side-by-side panes) -----------------------------------
 
-/// Open a file into the focused editor group of a fresh App.
 /// Seeding the Search panel from a terminal command must describe THAT
 /// command: filter globs left over from an earlier manual search would
 /// silently narrow the seeded results (the terminal scanned everything), and
@@ -17742,6 +17805,7 @@ fn seeding_search_cannot_leave_a_stale_field_selection() {
     assert_eq!(app.search.include, "*.md", "the seeded include is intact");
 }
 
+/// Open a file into the focused editor group of a fresh App.
 fn app_with_open_file(tmp: &std::path::Path, name: &str, body: &str) -> App {
     let f = tmp.join(name);
     std::fs::write(&f, body).unwrap();
@@ -19049,6 +19113,64 @@ fn double_clicking_a_port_row_opens_it() {
     assert!(
         app.status.contains("orward"),
         "a double click opens (forwards) the port: {}",
+        app.status
+    );
+}
+
+/// #317 beyond the terminal: the guard lives in `ClickTracker`, so every
+/// surface that pairs clicks inherits it. The ports table is the cheapest one
+/// to drive end to end, and it has a visible consequence - a double click
+/// forwards the port - so a modified click that wrongly counted as half a
+/// double would open something the user never double-clicked.
+#[test]
+fn a_modified_click_does_not_pair_with_a_plain_one_in_the_ports_table() {
+    use crate::widgets::ports::PortOrigin;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.bottom_panel_tab = BottomPanelTab::Ports;
+    app.ports
+        .upsert(3000, None, None, PortOrigin::Remote("box".into()));
+    draw(&mut app, 140, 50);
+    let x = app.ports.last_area.x + 2;
+    let y = app.ports.last_area.y + 1;
+
+    let click_with = |app: &mut App, modifiers| {
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers,
+        });
+    };
+
+    // A modified click must not ARM the pair: the plain click after it is the
+    // user's first ordinary click on that row, not the second half of a
+    // gesture they never made.
+    click_with(&mut app, KeyModifiers::CONTROL);
+    click_with(&mut app, KeyModifiers::empty());
+    assert!(
+        !app.status.contains("orward"),
+        "a plain click after a ctrl+click must not open the port: {}",
+        app.status
+    );
+
+    // And a modified click must not COMPLETE one either.
+    click_with(&mut app, KeyModifiers::empty());
+    app.status.clear();
+    click_with(&mut app, KeyModifiers::CONTROL);
+    assert!(
+        !app.status.contains("orward"),
+        "a ctrl+click must not complete a double-click: {}",
+        app.status
+    );
+
+    // The guard must not have cost the real gesture.
+    app.status.clear();
+    click_with(&mut app, KeyModifiers::empty());
+    click_with(&mut app, KeyModifiers::empty());
+    assert!(
+        app.status.contains("orward"),
+        "two ordinary clicks must still open the port: {}",
         app.status
     );
 }
@@ -27897,6 +28019,32 @@ fn app_with_baked_terminal_image(
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
+    // The pane owns a REAL shell, and its startup output arrives whenever the
+    // machine gets round to it (#326). Every assertion built on this fixture
+    // reads the picture's position, so a prompt landing after the bake scrolls
+    // the grid out from under it and the test fails for a reason that has
+    // nothing to do with what it is testing. Wait for the shell to go quiet
+    // first: two consecutive idle reads, so a gap between two bursts is not
+    // mistaken for the end of them.
+    let mut quiet = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while quiet < 2 && std::time::Instant::now() < deadline {
+        let _ = app.terminals[0].take_dirty();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        if app.terminals[0].peek_pending_bytes() == 0 && !app.terminals[0].peek_dirty() {
+            quiet += 1;
+        } else {
+            quiet = 0;
+        }
+    }
+    // The deadline is a failure, not a fallback. Falling through it would hand
+    // the caller exactly the unsynchronised fixture this wait exists to
+    // prevent, and the resulting flake would look like the picture logic
+    // rather than a shell that never settled.
+    assert!(
+        quiet >= 2,
+        "the pane's shell never went quiet within 10s, so the fixture cannot bake against a stable grid"
+    );
     let h = app.terminals[0].last_inner.height as usize;
     app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
     app.terminals[0].push_image_for_test(wide_short_png());
@@ -27964,10 +28112,6 @@ fn the_terminal_image_yields_to_an_open_context_menu() {
     );
 }
 
-/// In the alternate screen there is no scrollback, so Shift+End must fall
-/// through to the program like its comment promises and like Shift+Home /
-/// Shift+PageUp/PageDown already do; it used to be swallowed because the
-/// bottom-reset arm had no alt-screen guard.
 /// A wheel notch on the pane BORDER while the child tracks the mouse used
 /// to vanish: the report was undeliverable (the border sits outside the
 /// inner grid) and the handler had no fall-through, so nothing scrolled —
@@ -28003,6 +28147,10 @@ fn a_wheel_on_the_pane_border_scrolls_even_when_the_child_tracks_the_mouse() {
     );
 }
 
+/// In the alternate screen there is no scrollback, so Shift+End must fall
+/// through to the program like its comment promises and like Shift+Home /
+/// Shift+PageUp/PageDown already do; it used to be swallowed because the
+/// bottom-reset arm had no alt-screen guard.
 #[test]
 fn shift_end_reaches_an_alt_screen_program() {
     let tmp = tempfile::tempdir().unwrap();
@@ -28580,22 +28728,32 @@ fn conflicted_repo(tmp: &std::path::Path) {
 
 /// Wait for the git worker to deliver entries, then return the index of the
 /// conflicted `shared.txt` entry in the Source Control panel.
+/// Wait for the git worker - which spawns a real `git` per query - to report
+/// the conflicted entry, and return its index.
+///
+/// The budget is load-scaled (#307). This helper is where
+/// `accept_all_incoming_then_complete_merge_stages_the_resolved_file` was
+/// actually failing under load: the untimed `git status --porcelain` at the
+/// end of that test cannot time out at all, so the fixed 5s deadline here was
+/// the only clock in the test, which puts it in the same family as the other
+/// three rather than in a category of its own.
 fn wait_for_conflicted_entry(app: &mut App) -> usize {
     app.set_sidebar_view(SidebarView::SourceControl);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        let _ = app.drain_git_responses();
-        if let Some(idx) = app
-            .source_control
-            .entries
-            .iter()
-            .position(|e| e.kind == crate::git::ChangeKind::Conflicted)
-        {
-            return idx;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    panic!("the git worker never reported the conflicted entry");
+    let mut found = None;
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1000),
+        "the git worker to report the conflicted entry",
+        || {
+            let _ = app.drain_git_responses();
+            found = app
+                .source_control
+                .entries
+                .iter()
+                .position(|e| e.kind == crate::git::ChangeKind::Conflicted);
+            found.is_some()
+        },
+    );
+    found.expect("await_spawned returns only once the entry is present")
 }
 
 #[test]

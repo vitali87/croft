@@ -260,6 +260,40 @@ An empty id — pre-0.1.701 clients, and local attaches, which have no ghost
 problem because a dead unix socket reports EPIPE at once — matches nothing
 and displaces nothing.
 
+## Self-update handover: the host swaps its own image
+
+A remote croft is updated underneath its session: the launching machine
+ships a new binary to `~/.cargo/bin/croft` while the old one runs. The
+inner croft offers `F9` to re-exec into it; the **host** replaces its own
+process image, keeping the session alive (#238). The listening socket, the
+PTY master, and the inner child's pid ride through the `exec` by number, so
+the successor adopts the running session instead of binding and spawning a
+new one.
+
+Accepted client connections are the one thing that cannot ride along: they
+are ordinary fds and die at the `exec`. So the host broadcasts `HostSwap`
+first, and a client that sees it reconnects (`reconnect_after_swap`) rather
+than reading the EOF behind it as the end of the session.
+
+That invitation opened a hole (#321). The reconnect lands ~200ms later,
+while the outgoing host is still flushing and has not `exec`ed yet, so its
+accept loop seated the returning client, served it a ServerHello, a roster
+and a screenful of PTY bytes, and then vanished. The client had no way to
+tell that EOF from a session that ended, exited 0, and took the user's SSH
+session down with it. Every background update on a remote kicked out
+everyone attached; the update the user was being offered was the thing that
+threw them out.
+
+The fix is to shut the door before sending the invitation: the host latches
+`swapping` (under the clients lock, so a registration in flight either
+completes and receives the broadcast, or sees the latch) and from then on
+answers a newly accepted connection with `HostSwap` and closes it, instead
+of seating it. The client reconnects again; the listening socket never
+unbinds, so the retry queues in the backlog and the successor takes it. If
+the `exec` fails, the latch is released: the host serves on, stale, and
+says so through the `.host-stale` marker rather than refusing clients
+forever.
+
 ## Presence and permissions
 
 - Identity: `hello` carries a name (default `$USER@hostname`, overridable
