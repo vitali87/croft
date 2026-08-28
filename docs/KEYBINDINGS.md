@@ -455,7 +455,9 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 
 | Keys | Action |
 |------|--------|
-| Any key | Forwarded to the shell PTY (arrows, `Ctrl+letter`, `Alt+x`, function keys translated to VT escapes) |
+| Any key croft does not bind | Forwarded to the shell PTY (arrows, most `Ctrl+letter`, `Alt+x`, function keys translated to VT escapes) |
+| A chord croft binds | **Claimed by croft, whatever pane has focus** - the shell never sees it. On Linux that is `Ctrl` + `B` `F` `J` `M` `P` `Q` `S` `T` and their `Shift` variants; on macOS the same letters under `Cmd`, plus `Cmd+E` and the `Cmd+K` prefix. So `Ctrl+A` `C` `D` `E` `K` `L` `R` `U` `W` `Z` reach the app as usual, and `Ctrl+B` does not - which matters for Claude Code, where `Ctrl+B` backgrounds a running command (see #304) |
+| Bare `F5` / `F9` / `F10` / `F11` | Forwarded while the terminal is focused and no debug session is live, so process-compose's `F10` and htop's `F9` work. Modified, they keep their debug meaning everywhere |
 | Mouse drag | Select text, pinned to the scrollback content; drag past an edge to auto-scroll through history. Inside a full-screen app that scrolls by repainting (Claude Code, a pager), the highlight follows its text across the app's own scrolling — rows covered by the app's chrome (an input box, a floating pill) drop out — a row with an overlay in its middle keeps both intact ends — while the surviving rows stay highlighted, it hides entirely only when none remain (copy still yields the whole selection), and it reappears as the text scrolls back — and a drag held past an edge forwards wheel ticks so the app scrolls under the drag |
 | `Shift`+click | Extend the existing selection to the clicked cell instead of starting a new one |
 | Mouse wheel | At a shell prompt, scroll 5000 rows of scrollback (any keystroke snaps to the live bottom). When a full-screen app is tracking the mouse (Claude Code, htop, vim with `mouse=a`), the wheel scrolls that app's own content; `Shift`+wheel scrolls croft's scrollback instead. Full-screen apps that don't track the mouse still get arrow keys |
