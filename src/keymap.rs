@@ -520,6 +520,9 @@ impl Keymap {
         Self::resolve(&json)
     }
 
+    /// Load and resolve `keybindings.json`, reporting every row that binds
+    /// nothing to OUTPUT · Keybindings (a typo skips that one row, never
+    /// blocks startup). A missing file yields an empty keymap.
     pub fn load(path: &Path) -> Self {
         let Ok(json) = std::fs::read_to_string(path) else {
             return Self::default();

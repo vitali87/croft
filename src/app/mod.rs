@@ -26558,6 +26558,10 @@ impl App {
         })
     }
 
+    /// Cmd/Ctrl+click in the active terminal: if a printed http(s) URL sits
+    /// under the cursor, act on it (forward a remote dev-server port and open,
+    /// or open the link) and return true so the click doesn't start a
+    /// selection. Returns false when there's no URL there.
     fn terminal_url_click(&mut self, col: u16, row: u16) -> bool {
         // A real OSC 8 hyperlink stored in the cell wins over text sniffing —
         // the visible text of a linked cell often isn't the URI at all.
