@@ -360,7 +360,31 @@ fn swap_to_new_image(host: &Host, exe: &Path, handoff: &HandoffFds) -> anyhow::E
     // does the rest: outboxes are FIFO, so PTY frames the pump keeps queueing
     // behind the invitation cannot overtake it, and the pump needs no muting.
     // Bounded, because one wedged peer must not strand the update forever.
-    await_delivery(&invited, Instant::now() + SWAP_INVITATION_DEADLINE);
+    let deadline = Instant::now() + SWAP_INVITATION_DEADLINE;
+    await_delivery(&invited, deadline);
+    // Then the connections refused DURING the swap. They never joined the
+    // roster, so the fence above knows nothing about them, yet their goodbye
+    // is the only thing standing between them and an EOF they would read as
+    // the session ending. Draining until the set is empty UNDER the clients
+    // lock is what seals it: the refusal path registers its goodbye while
+    // holding that same lock, so an empty set observed here cannot grow
+    // before the exec below replaces this image. The guard is deliberately
+    // held across the exec.
+    let _sealed = loop {
+        let pending = std::mem::take(&mut *host.farewells.lock().unwrap());
+        if pending.is_empty() {
+            let sealed = host.clients.lock().unwrap();
+            if host.farewells.lock().unwrap().is_empty() {
+                break sealed;
+            }
+            drop(sealed);
+        } else {
+            await_delivery(&pending, deadline);
+        }
+        if Instant::now() >= deadline {
+            break host.clients.lock().unwrap();
+        }
+    };
     if let Err(e) =
         set_cloexec(handoff.listener, false).and_then(|()| set_cloexec(handoff.master, false))
     {
@@ -773,6 +797,15 @@ struct Host {
     /// a registration in flight either completes (and receives the HostSwap
     /// broadcast) or sees the latch - never neither.
     swapping: AtomicBool,
+    /// Goodbye frames queued for connections that arrived after the latch and
+    /// were refused rather than seated. They are not in the roster, so the
+    /// swap's delivery fence would not otherwise wait for them - and a refused
+    /// client whose HostSwap is still queued when the exec closes its socket
+    /// reads the EOF as the session ending, which is the very outcome the
+    /// refusal exists to prevent (#321). Registered under the `clients` lock,
+    /// so once the swap observes this empty while holding that lock, no
+    /// further goodbye can appear before the exec.
+    farewells: Mutex<Vec<(Arc<Outbox>, u64)>>,
 }
 
 /// The collab socket sibling of a mux socket: same directory and hash key,
@@ -948,6 +981,7 @@ fn run_host(
         privileged: Mutex::new(Vec::new()),
         last_writer: Mutex::new(None),
         swapping: AtomicBool::new(false),
+        farewells: Mutex::new(Vec::new()),
     });
     // Everything a successor image needs if THIS image is replaced on disk
     // in turn. Missing pieces (no master fd on some pty backend) fall back
@@ -1222,6 +1256,19 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                         // written under, so the decision cannot straddle it.
                         if host.swapping.load(Ordering::SeqCst) {
                             refused = true;
+                            // Queue the goodbye and enrol it in the swap's
+                            // delivery fence WHILE HOLDING this lock: the
+                            // swap seals the fence by taking the same lock,
+                            // so the pair cannot straddle the exec and leave
+                            // this client with a bare EOF.
+                            if let Some(seq) =
+                                outbox.push_seq(&encode_control_frame(&Control::HostSwap))
+                            {
+                                host.farewells
+                                    .lock()
+                                    .unwrap()
+                                    .push((Arc::clone(&outbox), seq));
+                            }
                         }
                         // Evict this client's own earlier registration
                         // (#229). A reconnect after a dead SSH transport
@@ -1269,11 +1316,10 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                         displaced
                     };
                     if refused {
-                        // Queued, not written inline: this connection's
-                        // writer thread already owns the socket, and the
-                        // outbox is FIFO, so the goodbye lands after the
+                        // The goodbye was queued above, under the clients
+                        // lock. It rides this connection's own writer thread
+                        // and the outbox is FIFO, so it lands after the
                         // ServerHello rather than interleaving mid-frame.
-                        outbox.push(&encode_control_frame(&Control::HostSwap));
                         outbox.close_when_drained();
                         break 'conn;
                     }
@@ -3797,6 +3843,7 @@ mod tests {
             privileged: Mutex::new(Vec::new()),
             last_writer: Mutex::new(None),
             swapping: AtomicBool::new(false),
+            farewells: Mutex::new(Vec::new()),
         })
     }
 
@@ -3830,6 +3877,22 @@ mod tests {
         assert!(
             host.clients.lock().unwrap().is_empty(),
             "a refused client must never join the roster"
+        );
+        // ...and its goodbye is enrolled in the swap's delivery fence. Without
+        // this the exec can close the socket while HostSwap is still queued,
+        // handing the refused client the bare EOF the refusal exists to spare
+        // it - the roster snapshot the fence starts from cannot know about a
+        // connection that arrived after the latch.
+        let enrolled = host.farewells.lock().unwrap();
+        assert_eq!(
+            enrolled.len(),
+            1,
+            "the refusal must enrol its goodbye for the swap to wait on"
+        );
+        let (outbox, seq) = &enrolled[0];
+        assert!(
+            outbox.delivered_through(*seq),
+            "the client read the goodbye, so the fence must see it delivered"
         );
         server.join().unwrap();
         // And the connection is actually let go: the writer thread delivers
