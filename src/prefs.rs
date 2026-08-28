@@ -352,6 +352,9 @@ pub fn save_layout(layout: LayoutPrefs) -> Result<()> {
     prefs.save(&path)
 }
 
+/// Persist the auto-close-pairs choice, preserving other settings. Stored
+/// negated (`disable_auto_close_pairs`) so an absent key means enabled.
+/// Best-effort: a write failure is swallowed by the caller.
 pub fn save_auto_close_pairs(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
@@ -359,6 +362,8 @@ pub fn save_auto_close_pairs(enabled: bool) -> Result<()> {
     prefs.save(&path)
 }
 
+/// Persist the format-on-type choice, preserving other settings.
+/// Best-effort: a write failure is swallowed by the caller.
 pub fn save_format_on_type(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
