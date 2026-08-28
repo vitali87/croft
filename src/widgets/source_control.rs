@@ -548,9 +548,6 @@ impl SourceControlPanel {
         out
     }
 
-    /// Paint the "No repository detected" empty-state card. `inner` is the
-    /// panel's inner rect (border already drawn); the SOURCE CONTROL header
-    /// sits on `inner.y` so the card starts two rows below.
     /// Paint the multi-root REPOSITORIES overview (#161) starting at `y`,
     /// returning the y below it (unchanged when hidden). One row per
     /// repository: label, branch (dim), change count (right-aligned),
@@ -639,6 +636,9 @@ impl SourceControlPanel {
             .map(|(_, root)| root.clone())
     }
 
+    /// Paint the "No repository detected" empty-state card. `inner` is the
+    /// panel's inner rect (border already drawn); the SOURCE CONTROL header
+    /// sits on `inner.y` so the card starts two rows below.
     fn render_no_repo_empty_state(&mut self, inner: Rect, buf: &mut Buffer) {
         if inner.height < 4 || inner.width < 8 {
             return;
