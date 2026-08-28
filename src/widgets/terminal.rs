@@ -5344,13 +5344,18 @@ mod tests {
             tmp.path(),
         )
         .unwrap();
+        // Wait on the BYTE COUNTER, not the dirty flag: `pty_dirty` is
+        // constructed `true`, so peeking it succeeds before /bin/echo has
+        // written anything and this test would pass just as happily if direct
+        // spawns stopped reaching the reader thread entirely. `pending_bytes`
+        // only moves when the reader actually advanced output.
         crate::test_budget::await_spawned(
             std::time::Duration::from_millis(500),
-            "the directly spawned /bin/echo to dirty the grid",
-            || term.peek_dirty(),
+            "the directly spawned /bin/echo to deliver bytes through the PTY",
+            || term.peek_pending_bytes() > 0,
         );
         assert!(
-            term.peek_dirty(),
+            term.peek_pending_bytes() > 0,
             "direct-spawned /bin/echo must produce output without any write_input"
         );
     }
