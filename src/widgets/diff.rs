@@ -1085,12 +1085,6 @@ impl DiffData {
         Some((s, e))
     }
 
-    /// A minimal unified diff containing only the hunk at `range` plus up
-    /// to three lines of surrounding context, in the exact shape
-    /// `git apply` accepts on stdin (`--- a/rel`, `+++ b/rel`, one `@@`
-    /// header). Because `git apply` verifies a hunk against its context
-    /// (with offset search), the same patch stages (`--cached`), unstages
-    /// (`--cached -R`) or reverts (`-R`) that one hunk.
     /// A patch that stages ONLY the rows in `sel` (VS Code's "Stage
     /// Selected Ranges"), with every other row of the surrounding hunk
     /// represented as the index already has it: an unselected `+` is
@@ -1254,6 +1248,12 @@ impl DiffData {
         ))
     }
 
+    /// A minimal unified diff containing only the hunk at `range` plus up
+    /// to three lines of surrounding context, in the exact shape
+    /// `git apply` accepts on stdin (`--- a/rel`, `+++ b/rel`, one `@@`
+    /// header). Because `git apply` verifies a hunk against its context
+    /// (with offset search), the same patch stages (`--cached`), unstages
+    /// (`--cached -R`) or reverts (`-R`) that one hunk.
     pub fn hunk_patch(&self, rel_path: &str, range: (usize, usize)) -> String {
         const CTX: usize = 3;
         let (hs, he) = range;
@@ -1961,10 +1961,6 @@ mod tests {
         }
     }
 
-    /// Issue #214: stage only the SELECTED lines. Rows outside the
-    /// selection must be represented as the index already has them: an
-    /// unselected `+` is dropped (it is not being staged), an unselected
-    /// `-` becomes context (that line still exists in HEAD).
     /// The patch must not just LOOK right: git has to accept it and the
     /// index must end up holding exactly the selected line. Runs a real
     /// repo end to end (issue #214).
@@ -2048,6 +2044,10 @@ mod tests {
         );
     }
 
+    /// Issue #214: stage only the SELECTED lines. Rows outside the
+    /// selection must be represented as the index already has them: an
+    /// unselected `+` is dropped (it is not being staged), an unselected
+    /// `-` becomes context (that line still exists in HEAD).
     #[test]
     fn selected_lines_patch_keeps_unselected_changes_out_of_the_index() {
         // HEAD: a b c d ; work: a X Y d  -> two independent changes.
