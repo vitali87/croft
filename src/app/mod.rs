@@ -12777,6 +12777,10 @@ impl App {
         !self.activity_bar_visible || self.zen_mode
     }
 
+    /// Whether auto-hide may collapse the sidebar RIGHT NOW. Every reason to
+    /// hold it open lives here rather than being scattered through the call
+    /// sites, so the interaction rules are one readable list and a new
+    /// suppression case has exactly one place to go.
     fn sidebar_auto_hide_allowed(&self) -> bool {
         if !self.sidebar_auto_hide || !self.show_tree {
             return false;
