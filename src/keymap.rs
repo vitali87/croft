@@ -348,21 +348,90 @@ impl Keymap {
         let Ok(json) = std::fs::read_to_string(path) else {
             return Self::default();
         };
-        Self::from_json(&json)
+        let (map, warnings) = Self::resolve(&json);
+        // Reported where every other refusal is reported, so a keybinding that
+        // silently did nothing is findable in the same place the user already
+        // looks (#315). Only on the real load path: `from_json` is also the
+        // test and reload entry point, and neither should write to a global.
+        for warning in warnings {
+            crate::output::push(
+                "Keybindings",
+                crate::output::OutputLevel::Warn,
+                &format!("{}: {warning}", path.display()),
+            );
+        }
+        map
     }
 
+    /// The keymap alone, discarding what [`resolve`](Self::resolve) had to say
+    /// about the file. Test-only: the real load path reports those warnings
+    /// rather than dropping them.
+    #[cfg(test)]
     pub fn from_json(json: &str) -> Self {
-        let rows: Vec<Binding> =
-            serde_json::from_str(&strip_line_comments(json)).unwrap_or_default();
-        let mut bindings = HashMap::new();
-        for row in rows {
-            if let (Some(chord), Some(cmd)) =
-                (Chord::parse(&row.key), Command::from_id(&row.command))
-            {
-                bindings.insert(chord, cmd);
+        let (map, _) = Self::resolve(json);
+        map
+    }
+
+    /// [`from_json`](Self::from_json), also returning what it had to say about
+    /// the file. Split so the reporting can be tested without reading a global
+    /// output buffer, and so `from_json` stays the one-line caller API.
+    ///
+    /// A row that does not do what it says must say so (#315). Three ways a
+    /// row can fail to bind, all of them previously silent:
+    ///
+    /// * the chord does not parse,
+    /// * the command id is not one croft has,
+    /// * an earlier row already bound that chord.
+    ///
+    /// The last one keeps VS Code's semantics - a later row deliberately
+    /// overrides an earlier one, which is how a user rebinds a default - so
+    /// this reports the override rather than refusing it. What it must not do
+    /// is stay quiet: a user who binds one chord twice by accident otherwise
+    /// gets the second binding with nothing anywhere to say the first was
+    /// discarded.
+    pub(crate) fn resolve(json: &str) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+        // A malformed file is the worst of the silent cases and the likeliest:
+        // this is hand-edited JSON with no schema, and one trailing comma cost
+        // the user EVERY binding with nothing anywhere to say so. Reported
+        // rather than swallowed - an empty file legitimately means no
+        // bindings, but a broken one means bindings the user wrote that
+        // vanished, and the two must not look alike.
+        let rows: Vec<Binding> = match serde_json::from_str(&strip_line_comments(json)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                warnings.push(format!(
+                    "the file does not parse ({e}); NO keybindings were loaded from it"
+                ));
+                Vec::new()
             }
+        };
+        let mut bindings: HashMap<Chord, Command> = HashMap::new();
+        let mut sources: HashMap<Chord, String> = HashMap::new();
+        for row in rows {
+            let Some(chord) = Chord::parse(&row.key) else {
+                warnings.push(format!(
+                    "`{}` is not a chord croft can parse; the row binding `{}` was skipped",
+                    row.key, row.command
+                ));
+                continue;
+            };
+            let Some(cmd) = Command::from_id(&row.command) else {
+                warnings.push(format!(
+                    "`{}` is not a command croft has; the row for `{}` was skipped",
+                    row.command, row.key
+                ));
+                continue;
+            };
+            if let Some(previous) = sources.insert(chord, row.command.clone()) {
+                warnings.push(format!(
+                    "`{}` is bound more than once; the later row (`{}`) wins and the earlier one (`{}`) was discarded",
+                    row.key, row.command, previous
+                ));
+            }
+            bindings.insert(chord, cmd);
         }
-        Self { bindings }
+        (Self { bindings }, warnings)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -558,6 +627,43 @@ mod tests {
         assert!(Keymap::load(Path::new("/no/such/keybindings.json")).is_empty());
     }
 
+    // An empty file and a broken one produce the same keymap and mean opposite
+    // things: one is "I bound nothing", the other is "everything I bound is
+    // gone". The test above passing made this look covered when it was not.
+    #[test]
+    fn a_file_that_does_not_parse_says_so_instead_of_dropping_every_binding() {
+        // One trailing comma, the classic hand-edit.
+        let broken = r#"[
+            { "key": "cmd+1", "command": "save_file" },
+        ]"#;
+        let (map, warnings) = Keymap::resolve(broken);
+        assert!(map.is_empty(), "a broken file binds nothing");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "and must say so exactly once: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("does not parse"),
+            "the warning must name the cause: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("NO keybindings"),
+            "and the consequence, since the file looks fine to the user: {}",
+            warnings[0]
+        );
+
+        // An EMPTY file is not an error: it legitimately means no bindings,
+        // and warning about it would train the reader to ignore the channel.
+        let (map, warnings) = Keymap::resolve("[]");
+        assert!(map.is_empty());
+        assert!(
+            warnings.is_empty(),
+            "an empty list is not a failure: {warnings:?}"
+        );
+    }
+
     #[test]
     fn template_parses_as_a_valid_keymap() {
         // The seeded starter must itself resolve, or first-run users hit a
@@ -574,5 +680,70 @@ mod tests {
             )),
             Some(Command::OpenSettings)
         );
+    }
+
+    // #315: a row that does not do what it says must say so. All three ways a
+    // row can fail to bind were silent, and a duplicate is the worst of them:
+    // the file looks like it bound both, and nothing anywhere says otherwise.
+    #[test]
+    fn a_duplicate_row_reports_which_binding_was_discarded() {
+        let json = r#"[
+            { "key": "cmd+1", "command": "save_file" },
+            { "key": "cmd+1", "command": "close_editor" }
+        ]"#;
+        let (map, warnings) = Keymap::resolve(json);
+        // VS Code semantics are preserved: the later row deliberately
+        // overrides the earlier one, which is how a default gets rebound.
+        assert_eq!(
+            map.bindings.get(&Chord::parse("cmd+1").unwrap()).copied(),
+            Some(Command::CloseEditor),
+            "the later row must still win"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one duplicate, one warning: {warnings:?}"
+        );
+        let w = &warnings[0];
+        assert!(w.contains("cmd+1"), "the warning must name the chord: {w}");
+        assert!(
+            w.contains("close_editor") && w.contains("save_file"),
+            "it must name BOTH the winner and the discarded row, or the reader \
+             cannot tell which of their two lines stopped working: {w}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_chord_and_an_unknown_command_each_report_their_row() {
+        let json = r#"[
+            { "key": "cmd+shift+not-a-key", "command": "save_file" },
+            { "key": "cmd+2", "command": "definitely_not_a_command" }
+        ]"#;
+        let (map, warnings) = Keymap::resolve(json);
+        assert!(map.is_empty(), "neither row can bind");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("cmd+shift+not-a-key") && warnings[0].contains("save_file"),
+            "an unparseable chord must name the chord AND the command it meant to bind: {:?}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].contains("definitely_not_a_command") && warnings[1].contains("cmd+2"),
+            "an unknown command must name the command AND the chord: {:?}",
+            warnings[1]
+        );
+    }
+
+    // A file where every row is fine must stay silent, or the channel fills
+    // with noise and the real warnings stop being findable.
+    #[test]
+    fn a_clean_file_produces_no_warnings() {
+        let json = r#"[
+            { "key": "cmd+1", "command": "save_file" },
+            { "key": "cmd+2", "command": "close_editor" }
+        ]"#;
+        let (map, warnings) = Keymap::resolve(json);
+        assert_eq!(map.chords().len(), 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }
