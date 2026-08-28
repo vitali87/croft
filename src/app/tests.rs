@@ -27897,6 +27897,24 @@ fn app_with_baked_terminal_image(
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
+    // The pane owns a REAL shell, and its startup output arrives whenever the
+    // machine gets round to it (#326). Every assertion built on this fixture
+    // reads the picture's position, so a prompt landing after the bake scrolls
+    // the grid out from under it and the test fails for a reason that has
+    // nothing to do with what it is testing. Wait for the shell to go quiet
+    // first: two consecutive idle reads, so a gap between two bursts is not
+    // mistaken for the end of them.
+    let mut quiet = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while quiet < 2 && std::time::Instant::now() < deadline {
+        let _ = app.terminals[0].take_dirty();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        if app.terminals[0].peek_pending_bytes() == 0 && !app.terminals[0].peek_dirty() {
+            quiet += 1;
+        } else {
+            quiet = 0;
+        }
+    }
     let h = app.terminals[0].last_inner.height as usize;
     app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
     app.terminals[0].push_image_for_test(wide_short_png());
