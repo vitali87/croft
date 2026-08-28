@@ -339,7 +339,7 @@ fn set_cloexec(fd: std::os::fd::RawFd, on: bool) -> Result<()> {
 fn swap_to_new_image(host: &Host, exe: &Path, handoff: &HandoffFds) -> anyhow::Error {
     // Shut the door BEFORE inviting anyone back (#321). The invitation below
     // sends every attached client round to reconnect within ~200ms, well
-    // inside the flush pause and the exec that follows; a reconnect landing
+    // inside the delivery barrier and the exec that follow; a reconnect landing
     // on THIS host would be seated by a process about to vanish, and the
     // exec's EOF reads to a client as "the session ended" - which is how a
     // background update kicked everyone out of the remote session instead of
@@ -350,10 +350,17 @@ fn swap_to_new_image(host: &Host, exe: &Path, handoff: &HandoffFds) -> anyhow::E
         let _clients = host.clients.lock().unwrap();
         host.swapping.store(true, Ordering::SeqCst);
     }
-    broadcast(host, &encode_control_frame(&Control::HostSwap));
-    // Outboxes are drained by per-client writer threads; give the tiny
-    // frame a beat to flush before exec tears those threads down.
-    std::thread::sleep(Duration::from_millis(300));
+    let invited = broadcast_tracked(host, &encode_control_frame(&Control::HostSwap));
+    // Wait for the invitation to LAND, not for a hopeful pause to elapse
+    // (#321). Queueing is not delivery: each client's writer may be parked
+    // mid-frame on an earlier chunk of PTY output for up to
+    // WRITE_FRAME_DEADLINE, so a fixed beat can exec while HostSwap is still
+    // sitting in a queue - and a client that never sees the invitation reads
+    // the exec's EOF as the session ending, which is the whole bug. Ordering
+    // does the rest: outboxes are FIFO, so PTY frames the pump keeps queueing
+    // behind the invitation cannot overtake it, and the pump needs no muting.
+    // Bounded, because one wedged peer must not strand the update forever.
+    await_delivery(&invited, Instant::now() + SWAP_INVITATION_DEADLINE);
     if let Err(e) =
         set_cloexec(handoff.listener, false).and_then(|()| set_cloexec(handoff.master, false))
     {
@@ -558,6 +565,13 @@ struct OutboxState {
     /// already pending and then exits, instead of parking forever on a
     /// connection nobody owns (#321).
     closing: bool,
+    /// Frames this outbox has accepted, and how many of them its writer has
+    /// actually put on the wire. Queueing is not delivery: a writer can be
+    /// parked mid-frame on a slow peer for up to [`WRITE_FRAME_DEADLINE`],
+    /// so the only way to wait for ONE specific frame to land is to
+    /// remember its number here and watch `delivered` reach it (#321).
+    queued: u64,
+    delivered: u64,
 }
 
 impl Outbox {
@@ -572,9 +586,17 @@ impl Outbox {
     /// either already marked, or newly over the queue limit. Never blocks
     /// on the socket, so this is safe to call from the PTY pump.
     fn push(&self, frame: &[u8]) -> bool {
+        self.push_seq(frame).is_some()
+    }
+
+    /// [`push`](Self::push), reporting the frame's number in this outbox's
+    /// delivery order so a caller can wait for that exact frame to reach the
+    /// peer ([`delivered_through`](Self::delivered_through)). `None` means
+    /// the peer is dead and nothing more will be delivered.
+    fn push_seq(&self, frame: &[u8]) -> Option<u64> {
         let mut state = self.queue.lock().unwrap();
         if state.dead {
-            return false;
+            return None;
         }
         // Overflow is judged against the BACKLOG the new frame joins, not
         // the total including it, so one frame larger than the whole limit
@@ -586,15 +608,31 @@ impl Outbox {
         let backlog = state.bytes;
         state.bytes += frame.len();
         state.pending.push_back(frame.to_vec());
+        state.queued += 1;
+        let seq = state.queued;
         if backlog > CLIENT_QUEUE_LIMIT {
             state.dead = true;
             state.pending.clear();
             state.bytes = 0;
             self.wake.notify_all();
-            return false;
+            return None;
         }
         self.wake.notify_all();
-        true
+        Some(seq)
+    }
+
+    /// Count one frame as actually written to the socket. Called by the
+    /// writer thread, which is the only place delivery is observable.
+    fn mark_delivered(&self) {
+        self.queue.lock().unwrap().delivered += 1;
+    }
+
+    /// Has the frame numbered `seq` reached the peer? A dead outbox answers
+    /// true: it will never deliver anything, so a barrier waiting on it must
+    /// stop waiting rather than hold everyone else up.
+    fn delivered_through(&self, seq: u64) -> bool {
+        let state = self.queue.lock().unwrap();
+        state.dead || state.delivered >= seq
     }
 
     /// Deliver what is already queued, then end the connection: the writer
@@ -680,6 +718,7 @@ fn spawn_writer(stream: Arc<Mutex<UnixStream>>, outbox: Arc<Outbox>, fd: std::os
                 outbox.kill();
                 break;
             }
+            outbox.mark_delivered();
         }
         // Unblock the client thread's read so it deregisters promptly
         // instead of lingering until the peer happens to send something.
@@ -988,6 +1027,45 @@ fn run_host(
 /// After any prune the shared size and roster are recomputed, so a dead
 /// ghost releases the min winsize it was pinning. Returns whether any
 /// client was pruned.
+/// [`broadcast`], reporting for each client the frame number its outbox gave
+/// this frame, so the caller can wait for the frame to actually LAND (see the
+/// swap barrier in [`swap_to_new_image`]). Clients whose outbox refused it are
+/// pruned exactly as in `broadcast`, and contribute nothing to wait on.
+fn broadcast_tracked(host: &Host, frame: &[u8]) -> Vec<(Arc<Outbox>, u64)> {
+    let mut targets = Vec::new();
+    let pruned = {
+        let mut clients = host.clients.lock().unwrap();
+        let before = clients.len();
+        clients.retain(|c| match c.outbox.push_seq(frame) {
+            Some(seq) => {
+                targets.push((Arc::clone(&c.outbox), seq));
+                true
+            }
+            None => false,
+        });
+        clients.len() != before
+    };
+    if pruned {
+        apply_winsize(host, false);
+        update_presence(host);
+    }
+    targets
+}
+
+/// Block until every frame in `targets` has reached its peer, or `deadline`
+/// passes. Bounded on purpose: a peer parked mid-write holds its own frame
+/// for up to [`WRITE_FRAME_DEADLINE`], and the swap cannot wait on it
+/// forever - past the deadline it is treated like any other client that
+/// misses the handover.
+fn await_delivery(targets: &[(Arc<Outbox>, u64)], deadline: Instant) {
+    while Instant::now() < deadline {
+        if targets.iter().all(|(o, seq)| o.delivered_through(*seq)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn broadcast(host: &Host, frame: &[u8]) -> bool {
     let pruned = {
         let mut clients = host.clients.lock().unwrap();
@@ -2007,6 +2085,13 @@ impl InnerChannel {
 /// A peer whose buffers stay full this long is gone for practical purposes;
 /// reporting failure lets the caller treat the connection as dead.
 pub(crate) const WRITE_FRAME_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long a swapping host waits for its HostSwap invitation to reach the
+/// clients it just sent it to (#321). One [`WRITE_FRAME_DEADLINE`] plus a
+/// margin: that is the longest a writer can be parked on the frame ahead of
+/// the invitation, so this covers the worst honest case while still bounding
+/// the swap against a peer that never drains at all.
+const SWAP_INVITATION_DEADLINE: Duration = Duration::from_secs(6);
 
 /// Write a whole frame to a socket that may be in non-blocking mode. `write_all`
 /// aborts on the first `WouldBlock` even after a partial write, which would leave
@@ -3757,6 +3842,86 @@ mod tests {
             c.stream.read(&mut buf).unwrap_or(0),
             0,
             "a refused connection must be closed, not left hanging"
+        );
+    }
+
+    // Frames are numbered as they are accepted, and only the writer's
+    // successful write counts as delivery: the distinction is the whole basis
+    // of the swap barrier (#321).
+    #[test]
+    fn an_outbox_numbers_frames_and_counts_only_what_the_writer_wrote() {
+        let o = Outbox::new();
+        assert_eq!(o.push_seq(b"a"), Some(1));
+        assert_eq!(o.push_seq(b"b"), Some(2));
+        assert!(!o.delivered_through(1), "queued is not delivered");
+        o.pop_blocking();
+        o.mark_delivered();
+        assert!(o.delivered_through(1));
+        assert!(
+            !o.delivered_through(2),
+            "one write does not deliver two frames"
+        );
+        o.pop_blocking();
+        o.mark_delivered();
+        assert!(o.delivered_through(2));
+    }
+
+    // #321: the host must WAIT for its HostSwap invitation to land rather
+    // than sleep a hopeful beat past it. A writer parked on an earlier frame
+    // against a peer that stopped reading holds the invitation behind it for
+    // up to WRITE_FRAME_DEADLINE, and a client that never sees the invitation
+    // reads the exec's EOF as the session ending. The wait is still bounded:
+    // one wedged peer must not strand the update for everyone.
+    #[test]
+    fn the_swap_barrier_waits_for_delivery_and_still_bounds_a_parked_writer() {
+        // A writer parked mid-frame is modelled by an outbox nothing drains:
+        // the invitation is queued and never delivered.
+        let parked = Outbox::new();
+        let seq = parked.push_seq(b"invitation").expect("queued");
+        let budget = Duration::from_millis(300);
+        let started = Instant::now();
+        await_delivery(&[(Arc::clone(&parked), seq)], Instant::now() + budget);
+        assert!(
+            started.elapsed() >= budget,
+            "the barrier must actually wait for the invitation, not wave it through"
+        );
+        assert!(
+            started.elapsed() < budget * 10,
+            "but it must give up, not strand the update on one wedged peer"
+        );
+
+        // Delivery releases it at once, well inside the deadline.
+        let live = Outbox::new();
+        let seq = live.push_seq(b"invitation").expect("queued");
+        let writer = {
+            let o = Arc::clone(&live);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                o.pop_blocking();
+                o.mark_delivered();
+            })
+        };
+        let started = Instant::now();
+        await_delivery(
+            &[(Arc::clone(&live), seq)],
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a delivered invitation must release the barrier immediately"
+        );
+        writer.join().unwrap();
+
+        // A peer that died mid-swap can never deliver anything, so it must
+        // not hold the barrier for its full deadline either.
+        let dead = Outbox::new();
+        let seq = dead.push_seq(b"invitation").expect("queued");
+        dead.kill();
+        let started = Instant::now();
+        await_delivery(&[(dead, seq)], Instant::now() + Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a dead peer must not hold the swap open"
         );
     }
 
