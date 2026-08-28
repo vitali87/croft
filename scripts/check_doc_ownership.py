@@ -107,8 +107,13 @@ def main():
     ]
     losses = []
     for f in changed:
-        before = documented(git("show", f"{base}:{f}"))
-        after = documented(git("show", f"{head}:{f}"))
+        # A path can legitimately be absent on one side: the branch added the
+        # file, or deleted it. That is the one git failure this tolerates -
+        # `allow_fail` exists for exactly it, and not passing it here made the
+        # gate abort on every PR that adds a Rust file, which is how it failed
+        # on the first one that did.
+        before = documented(git("show", f"{base}:{f}", allow_fail=True))
+        after = documented(git("show", f"{head}:{f}", allow_fail=True))
         for name, had_doc in before.items():
             if had_doc and name in after and not after[name] and (f, name) not in exempt:
                 losses.append((f, name))
