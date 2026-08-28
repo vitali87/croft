@@ -92,6 +92,7 @@ Click the **⛶** icon at the top-right of the editor (or the welcome screen), o
 | Group | Options |
 |-------|---------|
 | Visibility | Activity Bar, Primary Side Bar (`Cmd`/`Ctrl`+`B`), Secondary Side Bar (`Opt`+`Cmd`/`Ctrl`+`B`), Panel (`Ctrl`+`J`), Status Bar, Minimap (`Opt`+`Cmd`/`Ctrl`+`M`) |
+| Auto-Hide Side Bar | Off by default. On, the primary side bar collapses when focus moves to the editor or a terminal (also on the palette as **View: Toggle Auto-Hide Side Bar**). A reveal you asked for - `Cmd`/`Ctrl`+`B`, the activity bar, this row - is exempt from the next collapse. See [LAYOUT.md](LAYOUT.md#auto-hide-side-bar) for everything that holds it open. |
 | Primary Side Bar Position | Left / Right (moves the activity bar with it) |
 | Panel Alignment | Left / Center / Right / Justify (Justify spans the full width under the side bar) |
 | Quick Input Position | Top / Center (where Command Palette / Go to File appears) |

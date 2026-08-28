@@ -15,6 +15,22 @@ croft is a three pane workspace in the VS Code arrangement: an Explorer sidebar,
 
 The `⛶` icon at the top-right of the editor (and the welcome screen), or the settings gear → **Customize Layout**, opens a popup that mirrors VS Code's title-bar layout controls. Two icons beside it toggle the primary side bar (`▢`) and the panel (`▭`) directly. The popup groups: visibility toggles (Activity Bar, Primary Side Bar, Secondary Side Bar, Panel, Status Bar), **Primary Side Bar Position** (Left/Right — the activity bar moves with it), **Panel Alignment** (Left/Center/Right/Justify, where Justify spans the panel across the full content width under the side bar), **Quick Input Position** (Top/Center, for the Command Palette / Go to File), and **Zen Mode** (`Cmd`/`Ctrl`+`K` `Z`, which hides all chrome and restores it on the next toggle). Every choice except the frequently-toggled side-bar / panel visibility persists in `~/.config/croft/config.json`.
 
+## Auto-hide side bar
+
+Off by default. When on, moving focus into the editor or a terminal collapses the primary side bar, so the panel is there while you are using it and out of the way while you are not. Focusing back into the sidebar brings it back, as does any reveal (`Cmd`/`Ctrl`+`B`, the activity bar, the Customize Layout row).
+
+Turn it on from the Command Palette (**View: Toggle Auto-Hide Side Bar**) or the **Auto-Hide Side Bar** row in Customize Layout. The choice persists in `~/.config/croft/config.json` as `sidebar_auto_hide`. Turning it on while the sidebar is open takes effect at the next focus move rather than yanking the panel away as you enable it.
+
+**A reveal you asked for survives the focus move that follows it.** `Cmd`/`Ctrl`+`B`, the palette command, the Customize Layout row and the layout-icon click all pin the sidebar open for exactly the next collapse, so revealing it and clicking into the editor does not immediately hide it again. Focusing the sidebar releases the pin, so the move out after that collapses normally.
+
+The collapse is also held off whenever something else on screen depends on the sidebar staying put:
+
+* **A drag** - either the sidebar seam or an Explorer drag. The pointer is over the editor by definition mid-drag, and collapsing under the cursor is the flapping the feature exists to avoid.
+* **Anything modal** - the Command Palette, Go to File, Go to Symbol, workspace symbols, the process picker, `Cmd`+`Z` directory jump, command history, the branch picker, an input prompt, a list picker, a context menu, or the SSH connect dialog. Several of those are sidebar-targeting flows, and some may be anchored over sidebar space.
+* **A focus move you did not make** - an async result arriving, a file opened at launch, `Enter` on a sidebar row. Only a deliberate move into the editor or terminal collapses the panel.
+* **A hidden activity bar** - with no activity bar there is no on-screen way back to a collapsed sidebar, so a mouse-only user would be stranded.
+* **Zen Mode** - it already owns chrome visibility and keeps it.
+
 ## Command Palette
 
 `Cmd`/`Ctrl`+`Shift`+`P` fuzzy-searches and runs every named command, the same surface VS Code uses to make actions reachable without memorising a chord. Go to Symbol (`Cmd`/`Ctrl`+`Shift`+`O`) fuzzy-jumps within a file (or to a line with a `:` prefix), and a `#` prefix in Quick Open searches symbols across the whole workspace through the language servers.
