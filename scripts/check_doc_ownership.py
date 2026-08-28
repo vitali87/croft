@@ -26,18 +26,30 @@ import sys
 FN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?fn\s+([A-Za-z_]\w*)")
 
 
-def git(*args, allow_fail=False):
+# The one git failure this checker tolerates, in the two spellings git uses:
+# the path is simply not present in that revision, because the branch added or
+# deleted the file. Anything else - a bad revision, a malformed object, a
+# broken repository - is a failure to report, not an empty file to accept.
+MISSING_PATH = re.compile(
+    r"fatal: path .*(?:does not exist in|exists on disk, but not in)", re.MULTILINE
+)
+
+
+def git(*args, allow_missing_path=False):
     """Run git, failing closed.
 
     A silent failure here is worse than a crash: an errored `git diff` yields
     an empty file list, the checker reports "no documentation lost" and exits
-    zero, and the gate has passed by not running. `allow_fail` is for the one
-    expected error - `git show` of a path that does not exist on that side of
-    the diff, i.e. a file this branch added or deleted.
+    zero, and the gate has passed by not running.
+
+    `allow_missing_path` narrows that tolerance to exactly the expected case.
+    Tolerating every non-zero exit would let an invalid revision or a
+    malformed object read as empty content, which is the same fail-open bug
+    one door further in.
     """
     proc = subprocess.run(["git", *args], capture_output=True, text=True)
     if proc.returncode != 0:
-        if allow_fail:
+        if allow_missing_path and MISSING_PATH.search(proc.stderr):
             return ""
         raise SystemExit(
             f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
@@ -107,8 +119,13 @@ def main():
     ]
     losses = []
     for f in changed:
-        before = documented(git("show", f"{base}:{f}"))
-        after = documented(git("show", f"{head}:{f}"))
+        # A path can legitimately be absent on one side: the branch added the
+        # file, or deleted it. That is the one git failure this tolerates -
+        # `allow_fail` exists for exactly it, and not passing it here made the
+        # gate abort on every PR that adds a Rust file, which is how it failed
+        # on the first one that did.
+        before = documented(git("show", f"{base}:{f}", allow_missing_path=True))
+        after = documented(git("show", f"{head}:{f}", allow_missing_path=True))
         for name, had_doc in before.items():
             if had_doc and name in after and not after[name] and (f, name) not in exempt:
                 losses.append((f, name))
