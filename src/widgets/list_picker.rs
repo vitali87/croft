@@ -39,9 +39,11 @@ pub enum ListPurpose {
     /// commands discovered from the workspace's manifests; `id` is an
     /// index into the App's discovered-task list.
     RunTask,
-    /// Debug: Select and Start Debugging — the launch.json configurations
-    /// plus the synthesized zero-config entry. `id` is `active` for "Debug
-    /// active file" or an index into the App's discovered-config list.
+    /// Debug: Select and Start Debugging — the launch.json configurations and
+    /// compounds, plus the synthesized zero-config entry. `id` is `active` for
+    /// "Debug active file", `compound:<index>` into the App's discovered
+    /// compounds, or a bare index into its discovered-config list. Compounds
+    /// carry their own id prefix so the two index spaces cannot collide.
     DebugConfig,
     /// The searchable Settings hub (Preferences: Open Settings). Rows toggle a
     /// boolean setting (`id` = `toggle:<field>`) or run a follow-up command

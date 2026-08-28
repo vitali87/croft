@@ -755,9 +755,6 @@ fn render_sheet(
     );
 }
 
-/// Returns the hit-test rects of the prev / next change arrows painted
-/// in the diff header (in that order). Both are `Rect::default()` when
-/// the header was too narrow to allocate them.
 /// Render the merge editor's source panes (#253) into the TOP of `inner`
 /// and return the remaining rect for the ordinary text path — the
 /// editable Result pane. One header row carries the resolved counter,
@@ -1008,6 +1005,9 @@ fn render_merge_panes(
     }
 }
 
+/// Returns the hit-test rects of the prev / next change arrows painted
+/// in the diff header (in that order). Both are `Rect::default()` when
+/// the header was too narrow to allocate them.
 fn render_diff(
     diff: &mut crate::widgets::diff::DiffData,
     inner: Rect,
@@ -4411,10 +4411,6 @@ impl Editor {
                 .is_some_and(|md| md.doc_path.is_some())
     }
 
-    /// Open `path` in the read-only hex viewer (#172): the routing
-    /// fallback for files the text heuristic rejects, and the target of
-    /// the explicit "Reopen as Hex" command. `pub` for that command's
-    /// dispatch; extension routing never needs to call it directly.
     /// Open `path` as a rendered ANSI log (#257): colours paint through the
     /// theme's palette and escapes never reach the text. Windowed, so the
     /// file is not read whole. Fails (and the caller falls through to the
@@ -4480,6 +4476,10 @@ impl Editor {
         crate::ansi_text::looks_like_ansi(&String::from_utf8_lossy(&buf[..n]))
     }
 
+    /// Open `path` in the read-only hex viewer (#172): the routing
+    /// fallback for files the text heuristic rejects, and the target of
+    /// the explicit "Reopen as Hex" command. `pub` for that command's
+    /// dispatch; extension routing never needs to call it directly.
     pub fn open_hex(&mut self, path: &Path) -> Result<()> {
         // `open` is also the same-path reload behind the FS-sync sweep:
         // refresh the existing view in place so the reader keeps their
@@ -13760,8 +13760,6 @@ mod tests {
         );
     }
 
-    /// Opening a real file into an editor showing a diff must drop the diff
-    /// view, or a restore-then-reload keeps rendering the stale side-by-side.
     /// #258: every diff opener must apply the configured default, not just
     /// the HEAD-vs-working one. `open_diff` backs the Compare actions, and
     /// missing the setter there meant Compare always started in `Off`
@@ -13800,6 +13798,8 @@ mod tests {
         );
     }
 
+    /// Opening a real file into an editor showing a diff must drop the diff
+    /// view, or a restore-then-reload keeps rendering the stale side-by-side.
     #[test]
     fn opening_a_real_file_clears_a_stale_diff_view() {
         let tmp = tempfile::tempdir().unwrap();

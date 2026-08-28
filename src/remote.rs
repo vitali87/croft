@@ -379,6 +379,13 @@ fn run_croft_session(
     persistent: bool,
     solo: bool,
 ) -> Result<RemoteOutcome> {
+    // Config sync (#262) before the session takes the terminal, so the
+    // remote croft reads the user's keybindings on the launch below rather
+    // than one launch later. Both entry points converge here — the CLI
+    // `launch_croft_with` and the in-app `launch_only` — which the install
+    // hook does not, since an already-installed remote installs on a
+    // detached thread and never waits.
+    push_config_files(&ssh, &mut |msg| println!("{msg}"));
     let mut bootstrapped = false;
     // The relay rendezvous is keyed on the launch identity — the very same
     // `hash(launch arg)` the dtach socket uses — NOT the remote croft's
@@ -598,10 +605,7 @@ fn try_local_cross_install_streaming(
         );
     }
 
-    let mut mkdir = ssh.background_command();
-    mkdir
-        .arg(&ssh.host)
-        .arg("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"");
+    let mkdir = ssh.background_shell("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"");
     let mkdir_status =
         run_command_streaming(mkdir, log_tx).context("creating remote install dirs")?;
     if !mkdir_status.success() {
@@ -613,15 +617,14 @@ fn try_local_cross_install_streaming(
         "Rsyncing binary to {dest} (bulk lane, {} KB/s cap)",
         lane.bwlimit_kbps()
     ));
-    let rsync = ship_binary_rsync_command(lane, &ssh.socket_path, &binary, &dest);
+    let rsync = ship_file_rsync_command(lane, &ssh.socket_path, &binary, &dest);
     let rsync_status =
         run_command_streaming(rsync, log_tx).context("rsyncing croft binary to remote")?;
     if !rsync_status.success() {
         anyhow::bail!("rsync exited with {rsync_status}");
     }
 
-    let mut act = ssh.background_command();
-    act.arg(&ssh.host).arg(activate_command(source_stamp));
+    let act = ssh.background_shell(&activate_command(source_stamp));
     let act_status =
         run_command_streaming(act, log_tx).context("activating remote croft binary")?;
     if !act_status.success() {
@@ -642,8 +645,7 @@ fn sync_local_source_to_remote_streaming(
     log_tx: &std::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut mkdir = ssh.background_command();
-    mkdir.arg(&ssh.host).arg(remote_source_dir_prep(&source));
+    let mkdir = ssh.background_shell(&remote_source_dir_prep(&source));
     let mkdir_status =
         run_command_streaming(mkdir, log_tx).context("creating remote source dir")?;
     if !mkdir_status.success() {
@@ -786,6 +788,20 @@ impl SshControl {
     /// load-bearing here.
     fn background_command(&self) -> Command {
         ssh_socket_command(&self.socket_path, true)
+    }
+
+    /// A background command that runs `script` on the remote, with the
+    /// destination host where ssh expects it: BEFORE the command.
+    ///
+    /// Every caller needs that ordering and one of them omitted it, which does
+    /// not fail loudly - ssh reads the first non-flag argument as the
+    /// destination, so `mkdir -p ~/.config/croft` became the hostname, the
+    /// connection failed, and the feature above it silently did nothing. The
+    /// ordering lives here now so a caller cannot get it wrong.
+    fn background_shell(&self, script: &str) -> Command {
+        let mut command = self.background_command();
+        command.arg(&self.host).arg(script);
+        command
     }
 }
 
@@ -1884,19 +1900,91 @@ fn sync_workspace_lock(source: &Path, log: impl Fn(String)) {
     }
 }
 
-/// Build the rsync that ships the cross-built binary, routed and paced by
+/// Push the user's syncable config to the remote (#262), so keybindings,
+/// snippets, triggers and matchers follow the binary that already follows
+/// them.
+///
+/// Called from `run_croft_session`'s prologue rather than off the back of
+/// the install: when croft is already present the install runs on a
+/// detached thread and the session opens without waiting for it, so an
+/// install-completion hook would skip the common case entirely.
+///
+/// Best-effort by construction. A remote whose config cannot be written is
+/// a remote that still opens with defaults, which is exactly today's
+/// behaviour — failing the connect over it would be a regression. Every
+/// outcome is reported so a silent no-op is distinguishable from a silent
+/// success.
+fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
+    let files = crate::config_sync::local_files();
+    if files.is_empty() {
+        return;
+    }
+    // `mkdir -p` first: rsync will not create the remote parent, and a
+    // fresh box has no ~/.config/croft until croft has run there once.
+    // `background_command` for its `-n`: this runs before the session
+    // takes the terminal, and a command that inherits stdin would race the
+    // shell for the user's keystrokes.
+    let mut mk = ssh.background_shell("mkdir -p ~/.config/croft");
+    if !matches!(mk.status(), Ok(st) if st.success()) {
+        log(String::from(
+            "Config sync: could not create ~/.config/croft on the remote; skipping",
+        ));
+        return;
+    }
+
+    let bulk = crate::remote_bulk::establish(&ssh.host, &ssh.socket_path, |_| {});
+    let mut pushed = Vec::new();
+    let mut failed = Vec::new();
+    for (syncable, local) in &files {
+        let dest = crate::config_sync::remote_dest(&ssh.host, syncable.name);
+        let mut rsync = ship_file_rsync_command(&bulk.lane, &ssh.socket_path, local, &dest);
+        match rsync.status() {
+            Ok(st) if st.success() => pushed.push(syncable),
+            _ => failed.push(syncable.name),
+        }
+    }
+
+    if !pushed.is_empty() {
+        // Name the files rather than counting them: "4 files" tells a user
+        // nothing about whether the one they just edited went.
+        let names: Vec<&str> = pushed.iter().map(|s| s.name).collect();
+        log(format!("Config sync: pushed {}", names.join(", ")));
+        // ALL of it applies on the remote's next launch, not just the files
+        // with no reload arm. The reload path is driven by croft's own save
+        // (`reload_config_for_path`), and nothing watches ~/.config/croft, so
+        // a file that arrives by rsync is not noticed at all until relaunch.
+        // Saying "these four are live" would be the lie this message exists
+        // to prevent.
+        log(format!(
+            "Config sync: {} applies on the remote's next launch",
+            names.join(", ")
+        ));
+    }
+    if !failed.is_empty() {
+        log(format!(
+            "Config sync: could not push {} (the remote keeps its own copy)",
+            failed.join(", ")
+        ));
+    }
+}
+
+/// Build the rsync that ships one local file to `dest`, routed and paced by
 /// the bulk lane so it never queues ahead of the live session's keystrokes.
-fn ship_binary_rsync_command(
+///
+/// Nothing here is binary-specific: `--checksum` makes rsync compare content
+/// rather than mtime, so a caller shipping config files (#262) gets
+/// push-only-if-different for free and needs no stamp of its own.
+fn ship_file_rsync_command(
     lane: &crate::remote_bulk::BulkLane,
     interactive_socket: &Path,
-    binary: &Path,
+    local: &Path,
     dest: &str,
 ) -> Command {
     let mut rsync = Command::new("rsync");
     rsync.args(["-az", "--checksum"]);
     rsync.args(lane.rsync_throttle_args());
     rsync.arg("-e").arg(lane.rsync_ssh_arg(interactive_socket));
-    rsync.arg(binary).arg(dest);
+    rsync.arg(local).arg(dest);
     rsync
 }
 
@@ -2720,6 +2808,44 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    // The destination host must come BEFORE the script. ssh reads the first
+    // non-flag argument as the destination, so a missing host does not fail
+    // loudly - it turns the command itself into the hostname, the connection
+    // fails, and whatever depended on it silently does nothing. That is
+    // exactly what happened to config sync: `mkdir -p ~/.config/croft` became
+    // the host, the mkdir "failed", and the feature returned before pushing a
+    // single file.
+    #[test]
+    fn a_background_shell_puts_the_host_before_the_script() {
+        let ssh = SshControl {
+            host: String::from("somebox"),
+            socket_dir: PathBuf::from("/tmp/x"),
+            socket_path: PathBuf::from("/tmp/x/ctl"),
+        };
+        let cmd = ssh.background_shell("mkdir -p ~/.config/croft");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let host_at = args.iter().position(|a| a == "somebox");
+        let script_at = args.iter().position(|a| a == "mkdir -p ~/.config/croft");
+        assert!(
+            host_at.is_some(),
+            "the destination host must be passed: {args:?}"
+        );
+        assert!(script_at.is_some(), "the script must be passed: {args:?}");
+        assert!(
+            host_at < script_at,
+            "ssh takes the destination BEFORE the command, or it reads the \
+             command as the hostname: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "-n"),
+            "a background command must not inherit stdin: {args:?}"
+        );
+    }
+
     use super::*;
 
     /// The relay-setup failure message carries ssh's own stderr when there is
@@ -3655,7 +3781,7 @@ Host !blocked *.internal
             },
             512,
         );
-        let cmd = ship_binary_rsync_command(
+        let cmd = ship_file_rsync_command(
             &lane,
             Path::new("/tmp/interactive/ctl"),
             Path::new("/tmp/target/croft"),
@@ -3676,9 +3802,65 @@ Host !blocked *.internal
     }
 
     #[test]
+    fn a_config_push_rides_the_bulk_lane_like_the_binary_does() {
+        // Config files are small, but they ship on the same connection as
+        // the live session; an unpaced push still queues ahead of keystrokes.
+        let lane = crate::remote_bulk::BulkLane::new(
+            crate::remote_bulk::LaneMode::Dedicated {
+                socket_path: PathBuf::from("/tmp/bulk/ctl"),
+            },
+            512,
+        );
+        let cmd = ship_file_rsync_command(
+            &lane,
+            Path::new("/tmp/interactive/ctl"),
+            Path::new("/home/u/.config/croft/keybindings.json"),
+            &crate::config_sync::remote_dest("host", "keybindings.json"),
+        );
+        let args = args_of(&cmd);
+        let e = args
+            .iter()
+            .position(|a| a == "-e")
+            .map(|i| args[i + 1].clone())
+            .expect("rsync must use an explicit -e remote shell");
+        assert!(e.contains("/tmp/bulk/ctl"));
+        assert!(!e.contains("/tmp/interactive/ctl"));
+        assert!(args.iter().any(|a| a == "--bwlimit=512"));
+        assert!(
+            args.iter().any(|a| a == "--checksum"),
+            "content comparison is what makes the push a no-op when nothing changed"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "host:.config/croft/keybindings.json"),
+            "the file must land in the remote's config dir, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_push_never_carries_the_trust_bearing_config_json() {
+        // The argv is the last place this can be caught, so assert on it
+        // rather than only on the allow-list the argv is built from.
+        let lane = crate::remote_bulk::BulkLane::new(crate::remote_bulk::LaneMode::SharedMux, 300);
+        for s in crate::config_sync::SYNCABLE {
+            let cmd = ship_file_rsync_command(
+                &lane,
+                Path::new("/tmp/ctl"),
+                Path::new("/home/u/.config/croft").join(s.name).as_path(),
+                &crate::config_sync::remote_dest("host", s.name),
+            );
+            let args = args_of(&cmd);
+            assert!(
+                !args.iter().any(|a| a.ends_with("config.json")),
+                "config.json carries MCP consent and must never be in a push argv, got {args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn binary_ship_throttles_on_the_shared_mux_when_no_lane_is_available() {
         let lane = crate::remote_bulk::BulkLane::new(crate::remote_bulk::LaneMode::SharedMux, 300);
-        let cmd = ship_binary_rsync_command(
+        let cmd = ship_file_rsync_command(
             &lane,
             Path::new("/tmp/interactive/ctl"),
             Path::new("/tmp/target/croft"),

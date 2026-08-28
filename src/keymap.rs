@@ -503,29 +503,87 @@ struct Binding {
 pub struct Keymap {
     bindings: HashMap<Chord, Command>,
     mouse: HashMap<(Gesture, MouseContext), Command>,
-    /// Rows that parsed but were refused, for the OUTPUT channel. Silently
-    /// dropping these is what makes a mistyped binding feel like croft is
-    /// broken; the settings loader surfaces its warnings the same way.
-    warnings: Vec<String>,
 }
 
 impl Keymap {
     /// Load and resolve `keybindings.json`, ignoring unparsable chords and
     /// unknown command ids (a typo skips that one line, never blocks startup).
     /// A missing file yields an empty keymap.
+    /// [`load`](Self::load) without the reporting, for the one caller that
+    /// needs the warnings itself: the reload path summarises them in the
+    /// status line as well as the OUTPUT channel, and reporting here too
+    /// would print each one twice.
+    pub fn load_with_warnings(path: &Path) -> (Self, Vec<String>) {
+        let Ok(json) = std::fs::read_to_string(path) else {
+            return (Self::default(), Vec::new());
+        };
+        Self::resolve(&json)
+    }
+
     pub fn load(path: &Path) -> Self {
         let Ok(json) = std::fs::read_to_string(path) else {
             return Self::default();
         };
-        Self::from_json(&json)
+        let (map, warnings) = Self::resolve(&json);
+        // Reported where every other refusal is reported, so a keybinding that
+        // silently did nothing is findable in the same place the user already
+        // looks (#315). Only on the real load path: `from_json` is also the
+        // test and reload entry point, and neither should write to a global.
+        for warning in warnings {
+            crate::output::push(
+                "Keybindings",
+                crate::output::OutputLevel::Warn,
+                &format!("{}: {warning}", path.display()),
+            );
+        }
+        map
     }
 
+    /// The keymap alone, discarding what [`resolve`](Self::resolve) had to say
+    /// about the file. Test-only: the real load path reports those warnings
+    /// rather than dropping them.
+    #[cfg(test)]
     pub fn from_json(json: &str) -> Self {
-        let rows: Vec<Binding> =
-            serde_json::from_str(&strip_line_comments(json)).unwrap_or_default();
-        let mut bindings = HashMap::new();
-        let mut mouse = HashMap::new();
+        let (map, _) = Self::resolve(json);
+        map
+    }
+
+    /// [`from_json`](Self::from_json), also returning what it had to say about
+    /// the file. Split so the reporting can be tested without reading a global
+    /// output buffer, and so the loaders stay one-liners.
+    ///
+    /// A row that does not do what it says must say so (#315). The ways a row
+    /// can fail to bind, all of them once silent: the file does not parse at
+    /// all, the command id is not one croft has, the key spelling is neither
+    /// chord nor gesture, the gesture is reserved in that context, or an
+    /// earlier row already bound it. That last one keeps VS Code's semantics -
+    /// a later row deliberately overrides an earlier one - so it reports the
+    /// override rather than refusing it, on the mouse surface as well as the
+    /// key one.
+    pub(crate) fn resolve(json: &str) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
+        // A malformed file is the worst of the silent cases and the likeliest:
+        // this is hand-edited JSON with no schema, and one trailing comma cost
+        // the user EVERY binding with nothing anywhere to say so. Reported
+        // rather than swallowed - an empty file legitimately means no
+        // bindings, but a broken one means bindings the user wrote that
+        // vanished, and the two must not look alike.
+        let rows: Vec<Binding> = match serde_json::from_str(&strip_line_comments(json)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                warnings.push(format!(
+                    "the file does not parse ({e}); NO keybindings were loaded from it"
+                ));
+                Vec::new()
+            }
+        };
+        let mut bindings: HashMap<Chord, Command> = HashMap::new();
+        let mut mouse: HashMap<(Gesture, MouseContext), Command> = HashMap::new();
+        // What each binding was last claimed by, so an override can name the
+        // row that lost as well as the one that won (#315). Kept per surface:
+        // a chord and a gesture cannot collide with each other.
+        let mut key_sources: HashMap<Chord, String> = HashMap::new();
+        let mut mouse_sources: HashMap<(Gesture, MouseContext), String> = HashMap::new();
         for row in rows {
             let Some(cmd) = Command::from_id(&row.command) else {
                 warnings.push(format!(
@@ -579,27 +637,34 @@ impl Keymap {
                     ));
                     continue;
                 }
+                // Same convention as the key path: the later row wins, and the
+                // discarded one is named rather than vanishing.
+                if let Some(previous) = mouse_sources.insert((gesture, ctx), row.command.clone()) {
+                    warnings.push(format!(
+                        "`{}` is bound more than once; the later row (`{}`) wins and the earlier one (`{}`) was discarded",
+                        row.key, row.command, previous
+                    ));
+                }
                 mouse.insert((gesture, ctx), cmd);
                 continue;
             }
             match Chord::parse(&row.key) {
                 Some(chord) => {
+                    if let Some(previous) = key_sources.insert(chord, row.command.clone()) {
+                        warnings.push(format!(
+                            "`{}` is bound more than once; the later row (`{}`) wins and the earlier one (`{}`) was discarded",
+                            row.key, row.command, previous
+                        ));
+                    }
                     bindings.insert(chord, cmd);
                 }
-                None => warnings.push(format!("{}: not a key chord or mouse gesture", row.key)),
+                None => warnings.push(format!(
+                    "{}: not a key chord or mouse gesture; the row binding \"{}\" was skipped",
+                    row.key, row.command
+                )),
             }
         }
-        Self {
-            bindings,
-            mouse,
-            warnings,
-        }
-    }
-
-    /// Rows the loader refused, for the caller to surface. Empty is the
-    /// normal case.
-    pub fn warnings(&self) -> &[String] {
-        &self.warnings
+        (Self { bindings, mouse }, warnings)
     }
 
     /// The command a mouse gesture is bound to in `ctx`, if any.
@@ -708,7 +773,7 @@ mod tests {
         // ... and the refusal must actually reach the user, not just be
         // computable: a silently-dropped row and an accepted one look
         // identical from the keymap.
-        let km = Keymap::from_json(
+        let (km, warnings) = Keymap::resolve(
             r#"[{"key": "double_click", "command": "toggle_word_wrap", "when": "editor"}]"#,
         );
         let bare_double = Gesture {
@@ -721,9 +786,9 @@ mod tests {
             "the reserved row must not bind"
         );
         assert!(
-            km.warnings().iter().any(|w| w.contains("double_click")),
+            warnings.iter().any(|w| w.contains("double_click")),
             "the user must be told why their binding did nothing; warnings were {:?}",
-            km.warnings()
+            warnings
         );
     }
 
@@ -849,7 +914,7 @@ mod tests {
 
     #[test]
     fn a_bare_click_is_refused_in_the_editor_and_terminal() {
-        let km = Keymap::from_json(
+        let (km, warnings) = Keymap::resolve(
             r#"[{"key": "click", "command": "save_file"},
                 {"key": "click", "command": "save_file", "when": "terminal"},
                 {"key": "click", "command": "save_file", "when": "file_tree"}]"#,
@@ -857,15 +922,15 @@ mod tests {
         // Editor and terminal refuse; the file tree is fair game, since a
         // click there is not how text gets selected.
         assert_eq!(
-            km.warnings().len(),
+            warnings.len(),
             2,
             "both reserved contexts warn: {:?}",
-            km.warnings()
+            warnings
         );
         assert!(
-            km.warnings().iter().all(|w| w.contains("reserved")),
+            warnings.iter().all(|w| w.contains("reserved")),
             "and say why: {:?}",
-            km.warnings()
+            warnings
         );
         assert!(
             km.command_for_mouse(
@@ -879,7 +944,7 @@ mod tests {
 
     #[test]
     fn one_gesture_binds_differently_per_context() {
-        let km = Keymap::from_json(
+        let (km, _warnings) = Keymap::resolve(
             r#"[{"key": "ctrl+click", "command": "save_file", "when": "editor"},
                 {"key": "ctrl+click", "command": "quick_open", "when": "file_tree"}]"#,
         );
@@ -903,22 +968,22 @@ mod tests {
 
     #[test]
     fn a_bad_row_warns_instead_of_vanishing() {
-        let km = Keymap::from_json(
+        let (_km, warnings) = Keymap::resolve(
             r#"[{"key": "ctrl+click", "command": "no_such_command"},
                 {"key": "ctrl+click", "command": "save_file", "when": "nowhere"},
                 {"key": "not-a-thing", "command": "save_file"}]"#,
         );
-        assert_eq!(km.warnings().len(), 3, "{:?}", km.warnings());
-        assert!(km.warnings()[0].contains("unknown command id"));
-        assert!(km.warnings()[1].contains("when"));
-        assert!(km.warnings()[2].contains("not a key chord or mouse gesture"));
+        assert_eq!(warnings.len(), 3, "{:?}", warnings);
+        assert!(warnings[0].contains("unknown command id"));
+        assert!(warnings[1].contains("when"));
+        assert!(warnings[2].contains("not a key chord or mouse gesture"));
     }
 
     #[test]
     fn mouse_rows_do_not_make_the_key_map_look_non_empty() {
         // `is_empty` gates the KEY lookup in handle_key; a mouse-only file
         // must not make it start asking.
-        let km = Keymap::from_json(r#"[{"key": "ctrl+click", "command": "save_file"}]"#);
+        let (km, _warnings) = Keymap::resolve(r#"[{"key": "ctrl+click", "command": "save_file"}]"#);
         assert!(km.is_empty(), "no key chords bound");
         assert!(km.has_mouse_bindings(), "but a gesture is");
     }
@@ -1040,7 +1105,7 @@ mod tests {
             { "key": "garbage++key", "command": "save_file" },
             { "key": "cmd+j", "command": "no_such_command" }
         ]"#;
-        let km = Keymap::from_json(json);
+        let (km, _warnings) = Keymap::resolve(json);
         assert_eq!(
             km.command_for(ev(KeyCode::Char(','), KeyModifiers::SUPER)),
             Some(Command::OpenSettings)
@@ -1078,11 +1143,48 @@ mod tests {
         assert!(Keymap::load(Path::new("/no/such/keybindings.json")).is_empty());
     }
 
+    // An empty file and a broken one produce the same keymap and mean opposite
+    // things: one is "I bound nothing", the other is "everything I bound is
+    // gone". The test above passing made this look covered when it was not.
+    #[test]
+    fn a_file_that_does_not_parse_says_so_instead_of_dropping_every_binding() {
+        // One trailing comma, the classic hand-edit.
+        let broken = r#"[
+            { "key": "cmd+1", "command": "save_file" },
+        ]"#;
+        let (map, warnings) = Keymap::resolve(broken);
+        assert!(map.is_empty(), "a broken file binds nothing");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "and must say so exactly once: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("does not parse"),
+            "the warning must name the cause: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("NO keybindings"),
+            "and the consequence, since the file looks fine to the user: {}",
+            warnings[0]
+        );
+
+        // An EMPTY file is not an error: it legitimately means no bindings,
+        // and warning about it would train the reader to ignore the channel.
+        let (map, warnings) = Keymap::resolve("[]");
+        assert!(map.is_empty());
+        assert!(
+            warnings.is_empty(),
+            "an empty list is not a failure: {warnings:?}"
+        );
+    }
+
     #[test]
     fn template_parses_as_a_valid_keymap() {
         // The seeded starter must itself resolve, or first-run users hit a
         // dead example. Strip the // comments the way the loader tolerates.
-        let km = Keymap::from_json(TEMPLATE);
+        let (km, _warnings) = Keymap::resolve(TEMPLATE);
         assert_eq!(
             km.command_for(ev(
                 KeyCode::Char(','),
@@ -1094,5 +1196,70 @@ mod tests {
             )),
             Some(Command::OpenSettings)
         );
+    }
+
+    // #315: a row that does not do what it says must say so. All three ways a
+    // row can fail to bind were silent, and a duplicate is the worst of them:
+    // the file looks like it bound both, and nothing anywhere says otherwise.
+    #[test]
+    fn a_duplicate_row_reports_which_binding_was_discarded() {
+        let json = r#"[
+            { "key": "cmd+1", "command": "save_file" },
+            { "key": "cmd+1", "command": "close_editor" }
+        ]"#;
+        let (map, warnings) = Keymap::resolve(json);
+        // VS Code semantics are preserved: the later row deliberately
+        // overrides the earlier one, which is how a default gets rebound.
+        assert_eq!(
+            map.bindings.get(&Chord::parse("cmd+1").unwrap()).copied(),
+            Some(Command::CloseEditor),
+            "the later row must still win"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one duplicate, one warning: {warnings:?}"
+        );
+        let w = &warnings[0];
+        assert!(w.contains("cmd+1"), "the warning must name the chord: {w}");
+        assert!(
+            w.contains("close_editor") && w.contains("save_file"),
+            "it must name BOTH the winner and the discarded row, or the reader \
+             cannot tell which of their two lines stopped working: {w}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_chord_and_an_unknown_command_each_report_their_row() {
+        let json = r#"[
+            { "key": "cmd+shift+not-a-key", "command": "save_file" },
+            { "key": "cmd+2", "command": "definitely_not_a_command" }
+        ]"#;
+        let (map, warnings) = Keymap::resolve(json);
+        assert!(map.is_empty(), "neither row can bind");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("cmd+shift+not-a-key") && warnings[0].contains("save_file"),
+            "an unparseable chord must name the chord AND the command it meant to bind: {:?}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].contains("definitely_not_a_command") && warnings[1].contains("cmd+2"),
+            "an unknown command must name the command AND the chord: {:?}",
+            warnings[1]
+        );
+    }
+
+    // A file where every row is fine must stay silent, or the channel fills
+    // with noise and the real warnings stop being findable.
+    #[test]
+    fn a_clean_file_produces_no_warnings() {
+        let json = r#"[
+            { "key": "cmd+1", "command": "save_file" },
+            { "key": "cmd+2", "command": "close_editor" }
+        ]"#;
+        let (map, warnings) = Keymap::resolve(json);
+        assert_eq!(map.chords().len(), 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }

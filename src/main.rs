@@ -8,6 +8,7 @@ mod collab;
 mod collab_agent;
 mod command_history;
 mod config_layers;
+mod config_sync;
 mod dap;
 mod docx;
 mod file_ref;
@@ -59,6 +60,8 @@ mod svg;
 mod tasks;
 mod terminal_session;
 mod termux;
+#[cfg(test)]
+mod test_budget;
 mod testing;
 mod theme;
 mod triggers;
