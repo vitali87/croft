@@ -360,8 +360,8 @@ fn swap_to_new_image(host: &Host, exe: &Path, handoff: &HandoffFds) -> anyhow::E
     // does the rest: outboxes are FIFO, so PTY frames the pump keeps queueing
     // behind the invitation cannot overtake it, and the pump needs no muting.
     // Bounded, because one wedged peer must not strand the update forever.
-    let deadline = Instant::now() + SWAP_INVITATION_DEADLINE;
-    await_delivery(&invited, deadline);
+    let started = Instant::now();
+    await_delivery(&invited, started + SWAP_INVITATION_DEADLINE);
     // Then the connections refused DURING the swap. They never joined the
     // roster, so the fence above knows nothing about them, yet their goodbye
     // is the only thing standing between them and an EOF they would read as
@@ -370,21 +370,7 @@ fn swap_to_new_image(host: &Host, exe: &Path, handoff: &HandoffFds) -> anyhow::E
     // holding that same lock, so an empty set observed here cannot grow
     // before the exec below replaces this image. The guard is deliberately
     // held across the exec.
-    let _sealed = loop {
-        let pending = std::mem::take(&mut *host.farewells.lock().unwrap());
-        if pending.is_empty() {
-            let sealed = host.clients.lock().unwrap();
-            if host.farewells.lock().unwrap().is_empty() {
-                break sealed;
-            }
-            drop(sealed);
-        } else {
-            await_delivery(&pending, deadline);
-        }
-        if Instant::now() >= deadline {
-            break host.clients.lock().unwrap();
-        }
-    };
+    let _sealed = seal_against_new_arrivals(host, started + SWAP_FENCE_CAP);
     if let Err(e) =
         set_cloexec(handoff.listener, false).and_then(|()| set_cloexec(handoff.master, false))
     {
@@ -1097,6 +1083,39 @@ fn await_delivery(targets: &[(Arc<Outbox>, u64)], deadline: Instant) {
             return;
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Wait out the goodbyes owed to connections refused during the swap, then
+/// hold the clients lock so no further one can be registered, and return that
+/// guard for the caller to hold across its `exec`.
+///
+/// Each batch gets its own [`FAREWELL_GRACE`] rather than a slice of one
+/// shared deadline: a goodbye registered as the invitation fence expires
+/// would otherwise inherit a spent budget and be waved through undelivered.
+/// `hard_cap` bounds the whole thing, since a refused client reconnects
+/// within ~200ms and could keep the fence fed indefinitely.
+fn seal_against_new_arrivals(
+    host: &Host,
+    hard_cap: Instant,
+) -> std::sync::MutexGuard<'_, Vec<Client>> {
+    loop {
+        let pending = std::mem::take(&mut *host.farewells.lock().unwrap());
+        if pending.is_empty() {
+            // Observed empty while holding the lock the refusal path must
+            // take to register one: from here nothing new can appear.
+            let sealed = host.clients.lock().unwrap();
+            if host.farewells.lock().unwrap().is_empty() {
+                return sealed;
+            }
+            drop(sealed);
+        } else {
+            let grace = (Instant::now() + FAREWELL_GRACE).min(hard_cap);
+            await_delivery(&pending, grace);
+        }
+        if Instant::now() >= hard_cap {
+            return host.clients.lock().unwrap();
+        }
     }
 }
 
@@ -2138,6 +2157,20 @@ pub(crate) const WRITE_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 /// the invitation, so this covers the worst honest case while still bounding
 /// the swap against a peer that never drains at all.
 const SWAP_INVITATION_DEADLINE: Duration = Duration::from_secs(6);
+
+/// Grace a goodbye gets once it is registered, measured from the moment the
+/// fence notices it rather than from when the swap began. A refused
+/// connection's HostSwap is two small frames onto a socket accepted moments
+/// ago, so this lands in milliseconds - but it has to be its OWN window: a
+/// client refused a microsecond before the invitation deadline would
+/// otherwise be enrolled into a budget already spent, and handed exactly the
+/// bare EOF the refusal exists to prevent.
+const FAREWELL_GRACE: Duration = Duration::from_millis(250);
+
+/// And the whole fence is capped regardless, because clients refused during
+/// the swap come straight back (a reconnect every ~200ms) and could otherwise
+/// keep feeding it goodbyes for as long as they cared to.
+const SWAP_FENCE_CAP: Duration = Duration::from_secs(10);
 
 /// Write a whole frame to a socket that may be in non-blocking mode. `write_all`
 /// aborts on the first `WouldBlock` even after a partial write, which would leave
@@ -3889,11 +3922,22 @@ mod tests {
             1,
             "the refusal must enrol its goodbye for the swap to wait on"
         );
-        let (outbox, seq) = &enrolled[0];
-        assert!(
-            outbox.delivered_through(*seq),
-            "the client read the goodbye, so the fence must see it delivered"
-        );
+        let (outbox, seq) = (Arc::clone(&enrolled[0].0), enrolled[0].1);
+        drop(enrolled);
+        // Bounded wait, not an instant assertion: the writer puts the frame on
+        // the wire and marks it delivered as two steps, so a reader that has
+        // already seen the frame can still observe the moment between them.
+        // Asserting on that instant is the same defect as any other test that
+        // assumes a spawned thread has finished - it passes until the machine
+        // is busy (caught here under deliberate load).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !outbox.delivered_through(seq) {
+            assert!(
+                Instant::now() < deadline,
+                "the client read the goodbye, so the fence must record it delivered"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         server.join().unwrap();
         // And the connection is actually let go: the writer thread delivers
         // the goodbye and exits rather than parking on a socket nobody owns.
@@ -3985,6 +4029,78 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "a dead peer must not hold the swap open"
+        );
+    }
+
+    // The farewell fence must give a goodbye registered at the LAST moment a
+    // real window of its own. Sharing one deadline with the invitation fence
+    // meant a client refused a microsecond before that deadline was enrolled
+    // into a budget already spent, sealed past, and handed the bare EOF the
+    // refusal exists to prevent (#321).
+    #[test]
+    fn the_fence_waits_for_a_goodbye_registered_at_the_last_moment() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = bare_host(&dir.path().join("late.mux.sock"));
+        host.swapping.store(true, Ordering::SeqCst);
+
+        // A goodbye whose writer has not run yet, exactly as a connection
+        // refused on the deadline's edge leaves it.
+        let outbox = Outbox::new();
+        let seq = outbox.push_seq(b"goodbye").expect("queued");
+        host.farewells
+            .lock()
+            .unwrap()
+            .push((Arc::clone(&outbox), seq));
+        let writer = {
+            let o = Arc::clone(&outbox);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                o.pop_blocking();
+                o.mark_delivered();
+            })
+        };
+
+        // A hard cap far in the future: what must stop the seal here is the
+        // undelivered goodbye, not the clock.
+        let started = Instant::now();
+        let sealed = seal_against_new_arrivals(&host, Instant::now() + Duration::from_secs(5));
+        assert!(
+            outbox.delivered_through(seq),
+            "the fence must not seal while a goodbye is still queued"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "it must have actually waited for the writer, not raced past it"
+        );
+        drop(sealed);
+        writer.join().unwrap();
+    }
+
+    // The wait is still bounded: a goodbye nothing ever delivers cannot hold
+    // the update open, or one wedged peer strands every other participant on
+    // the old image.
+    #[test]
+    fn the_fence_gives_up_at_its_hard_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = bare_host(&dir.path().join("capped.mux.sock"));
+        host.swapping.store(true, Ordering::SeqCst);
+        let outbox = Outbox::new();
+        let seq = outbox.push_seq(b"goodbye").expect("queued");
+        host.farewells
+            .lock()
+            .unwrap()
+            .push((Arc::clone(&outbox), seq));
+
+        let started = Instant::now();
+        let _sealed = seal_against_new_arrivals(&host, Instant::now() + Duration::from_millis(200));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the cap must end the wait; took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !outbox.delivered_through(seq),
+            "staging: this goodbye was never delivered, so the cap is what ended the wait"
         );
     }
 
