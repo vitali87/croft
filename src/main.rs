@@ -59,6 +59,8 @@ mod svg;
 mod tasks;
 mod terminal_session;
 mod termux;
+#[cfg(test)]
+mod test_budget;
 mod testing;
 mod theme;
 mod triggers;

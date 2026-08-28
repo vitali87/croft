@@ -2490,11 +2490,25 @@ mod tests {
     }
 
     fn wait_alive(socket: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !crate::session::is_alive(socket) {
-            assert!(Instant::now() < deadline, "server never bound the socket");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        crate::test_budget::await_spawned(
+            Duration::from_millis(1000),
+            "the session host to bind its socket",
+            || crate::session::is_alive(socket),
+        );
+    }
+
+    /// A fresh host clears its predecessor's stale marker, but only once it
+    /// owns the socket: the removal has to follow the bind, or a host that
+    /// LOSES the bind race would wipe the marker belonging to the live host
+    /// that won it. So "the socket answers" does not imply "the marker is
+    /// gone" - there is a window between the two, and under load a test that
+    /// asserts on the instant after `wait_alive` lands inside it (#307).
+    fn wait_marker_cleared(socket: &Path) {
+        crate::test_budget::await_spawned(
+            Duration::from_millis(1000),
+            "the fresh host to clear its predecessor's stale marker",
+            || !stale_marker_path(socket).exists(),
+        );
     }
 
     #[test]
@@ -3626,6 +3640,7 @@ mod tests {
         std::fs::write(stale_marker_path(&socket), b"").unwrap();
         let server = spawn_test_server(socket.clone());
         wait_alive(&socket);
+        wait_marker_cleared(&socket);
         assert!(
             !stale_marker_path(&socket).exists(),
             "the marker must not outlive the host it described"

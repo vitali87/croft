@@ -164,6 +164,38 @@ Before you blame your change for a terminal or clipboard failure, re-run it
 against an untouched `origin/main` checkout. These flake under load, and
 baselining is faster than bisecting.
 
+## Waiting on a spawned process in a test
+
+A test that spawns a real process and waits a **fixed** wall-clock budget will
+flake on a loaded machine, and the budget looks generous right up until it
+isn't. The number is not knowable from inside the test: what blows it is not
+the operation, it is contention from every other test spawning at the same
+moment, plus whatever else owns the machine.
+
+So do not pick a fresh constant. Use the shared helper, which scales a quiet
+machine baseline by the load actually present:
+
+```rust
+crate::test_budget::await_spawned(
+    Duration::from_millis(500),          // what it costs on a quiet machine
+    "the shell to paint the linked cell", // what you are waiting for
+    || linked_cell(&app).is_some(),
+);
+```
+
+For a wait that hands its deadline to something else (a `recv_timeout`, a
+probe's own timeout) use `test_budget::spawn_budget(base)` for the `Duration`.
+
+The teeth are unchanged: a genuinely broken behaviour never satisfies the
+condition and still fails, just later. That trade - a slow true failure over a
+fast false one - is the point.
+
+**When one of these does fail, the cheap first move is the merge-base
+comparison:** run the full suite on the unmodified merge base under the same
+load. If it fails there too, your diff is innocent. Isolation runs cannot tell
+you this, because an isolated run cannot reproduce a contention failure however
+many times you repeat it.
+
 ## Bumping the Rust toolchain
 
 `rust-toolchain.toml` is the single source of truth for the channel, and
