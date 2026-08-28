@@ -49,5 +49,7 @@ preview*.svg
 /clippy-report.json
 /.scannerwork/
 
-# Agent instruction file: local to each clone, not shared through the repo
-CLAUDE.md
+# Agent instruction file: local to each clone, not shared through the repo.
+# Anchored, so it scopes to the root file the guide describes rather than any
+# CLAUDE.md a subdirectory might later want tracked.
+/CLAUDE.md
