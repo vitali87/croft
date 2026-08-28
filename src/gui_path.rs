@@ -307,7 +307,15 @@ mod tests {
         } else {
             "/bin/sh"
         };
-        let path = probe(shell).expect("the login shell must report a PATH");
+        // The production probe caps a hanging shell at PROBE_TIMEOUT so croft's
+        // startup cannot hang; under suite load a healthy shell legitimately
+        // exceeds it, so the TEST scales that same deadline (#307) instead of
+        // asserting production's startup budget is generous enough for CI.
+        let path = run_probe(
+            probe_cmd(shell),
+            crate::test_budget::spawn_budget(PROBE_TIMEOUT),
+        )
+        .expect("the login shell must report a PATH");
         assert!(path.contains("/bin"), "got {path:?}");
     }
 

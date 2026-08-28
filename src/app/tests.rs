@@ -5182,15 +5182,16 @@ fn cmd_clicking_a_non_web_hyperlink_refuses_instead_of_opening() {
                 .map(|c| (r, c))
         })
     };
-    // 8s like the suite's other shell-startup waits (#165): a 5s cap
-    // missed under full parallel load while dozens of test shells spawn.
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(8000) && linked_cell(&app).is_none()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled rather than a fresh constant (#307): this budget was raised
+    // 5s -> 8s once already, which is the shape of a number that cannot be
+    // guessed from inside one test.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1000),
+        "the shell to paint the linked cell",
+        || linked_cell(&app).is_some(),
+    );
     term.draw(|f| app.render(f)).unwrap();
-    let (row_idx, col) = linked_cell(&app).expect("shell must print the linked text within 8s");
+    let (row_idx, col) = linked_cell(&app).expect("shell must print the linked text");
 
     let inner = app.terminal().last_inner;
     app.handle_mouse(crossterm::event::MouseEvent {
@@ -6214,6 +6215,69 @@ fn double_click_in_terminal_word_selects_in_split_and_maximised_layout() {
             if maximise { "maximised" } else { "split" }
         );
     }
+}
+
+/// #317, the reported gesture end to end: a ctrl+click that matches no link
+/// falls past the URL and file arms into the built-in selection path. That
+/// path used to arm the double-click tracker regardless of modifiers, so the
+/// user's NEXT ordinary click at the same cell classified as a double and
+/// word-selected text they never double-clicked.
+///
+/// The probe word is deliberately link-free and path-free, so the ctrl+click
+/// genuinely reaches the fall-through arm rather than being consumed above it
+/// - a click that IS consumed would make this test pass without the fix.
+#[test]
+fn a_ctrl_click_that_opens_nothing_does_not_arm_the_terminal_double_click() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let probe = format!("croftmodclick{}", std::process::id());
+    await_terminal_probe(&mut app, &probe);
+    term.draw(|f| app.render(f)).unwrap();
+    let snap = app.terminal().visible_text();
+    let row_idx = snap
+        .lines()
+        .position(|l| l.contains(&probe))
+        .expect("probe must render");
+    let line = snap.lines().nth(row_idx).unwrap();
+    let mid_col = line.find(&probe).unwrap() + probe.len() / 2;
+    let inner = app.terminal().last_inner;
+    let screen_y = inner.y + row_idx as u16;
+    let screen_x = inner.x + mid_col as u16;
+
+    let click = |app: &mut App, modifiers| {
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: screen_x,
+            row: screen_y,
+            modifiers,
+        });
+    };
+
+    // The ctrl+click must actually fall through: nothing on this word is a
+    // URL or an existing file, so no link opens and no selection is made yet.
+    click(&mut app, KeyModifiers::CONTROL);
+    // The user's next ordinary click, at the same cell.
+    click(&mut app, KeyModifiers::NONE);
+
+    let sel = app.terminal().selection_text();
+    assert!(
+        !sel.contains(&probe),
+        "a plain click after an unmatched ctrl+click must not word-select: the \
+         ctrl+click must not have armed the double-click tracker, but selection was {sel:?}"
+    );
+
+    // The guard must not have cost the real gesture: two plain clicks still
+    // word-select at the same cell.
+    click(&mut app, KeyModifiers::NONE);
+    let sel = app.terminal().selection_text();
+    assert!(
+        sel.contains(&probe) || probe.contains(&sel),
+        "two ordinary clicks must still word-select; got {sel:?}"
+    );
 }
 
 /// End-to-end variant of the matrix that exercises the user's
@@ -17698,7 +17762,6 @@ fn switching_sidebar_view_closes_the_open_commit_dropdown() {
 
 // --- Split editor (side-by-side panes) -----------------------------------
 
-/// Open a file into the focused editor group of a fresh App.
 /// Seeding the Search panel from a terminal command must describe THAT
 /// command: filter globs left over from an earlier manual search would
 /// silently narrow the seeded results (the terminal scanned everything), and
@@ -17742,6 +17805,7 @@ fn seeding_search_cannot_leave_a_stale_field_selection() {
     assert_eq!(app.search.include, "*.md", "the seeded include is intact");
 }
 
+/// Open a file into the focused editor group of a fresh App.
 fn app_with_open_file(tmp: &std::path::Path, name: &str, body: &str) -> App {
     let f = tmp.join(name);
     std::fs::write(&f, body).unwrap();
@@ -19049,6 +19113,64 @@ fn double_clicking_a_port_row_opens_it() {
     assert!(
         app.status.contains("orward"),
         "a double click opens (forwards) the port: {}",
+        app.status
+    );
+}
+
+/// #317 beyond the terminal: the guard lives in `ClickTracker`, so every
+/// surface that pairs clicks inherits it. The ports table is the cheapest one
+/// to drive end to end, and it has a visible consequence - a double click
+/// forwards the port - so a modified click that wrongly counted as half a
+/// double would open something the user never double-clicked.
+#[test]
+fn a_modified_click_does_not_pair_with_a_plain_one_in_the_ports_table() {
+    use crate::widgets::ports::PortOrigin;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.bottom_panel_tab = BottomPanelTab::Ports;
+    app.ports
+        .upsert(3000, None, None, PortOrigin::Remote("box".into()));
+    draw(&mut app, 140, 50);
+    let x = app.ports.last_area.x + 2;
+    let y = app.ports.last_area.y + 1;
+
+    let click_with = |app: &mut App, modifiers| {
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers,
+        });
+    };
+
+    // A modified click must not ARM the pair: the plain click after it is the
+    // user's first ordinary click on that row, not the second half of a
+    // gesture they never made.
+    click_with(&mut app, KeyModifiers::CONTROL);
+    click_with(&mut app, KeyModifiers::empty());
+    assert!(
+        !app.status.contains("orward"),
+        "a plain click after a ctrl+click must not open the port: {}",
+        app.status
+    );
+
+    // And a modified click must not COMPLETE one either.
+    click_with(&mut app, KeyModifiers::empty());
+    app.status.clear();
+    click_with(&mut app, KeyModifiers::CONTROL);
+    assert!(
+        !app.status.contains("orward"),
+        "a ctrl+click must not complete a double-click: {}",
+        app.status
+    );
+
+    // The guard must not have cost the real gesture.
+    app.status.clear();
+    click_with(&mut app, KeyModifiers::empty());
+    click_with(&mut app, KeyModifiers::empty());
+    assert!(
+        app.status.contains("orward"),
+        "two ordinary clicks must still open the port: {}",
         app.status
     );
 }
@@ -27897,6 +28019,32 @@ fn app_with_baked_terminal_image(
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
+    // The pane owns a REAL shell, and its startup output arrives whenever the
+    // machine gets round to it (#326). Every assertion built on this fixture
+    // reads the picture's position, so a prompt landing after the bake scrolls
+    // the grid out from under it and the test fails for a reason that has
+    // nothing to do with what it is testing. Wait for the shell to go quiet
+    // first: two consecutive idle reads, so a gap between two bursts is not
+    // mistaken for the end of them.
+    let mut quiet = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while quiet < 2 && std::time::Instant::now() < deadline {
+        let _ = app.terminals[0].take_dirty();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        if app.terminals[0].peek_pending_bytes() == 0 && !app.terminals[0].peek_dirty() {
+            quiet += 1;
+        } else {
+            quiet = 0;
+        }
+    }
+    // The deadline is a failure, not a fallback. Falling through it would hand
+    // the caller exactly the unsynchronised fixture this wait exists to
+    // prevent, and the resulting flake would look like the picture logic
+    // rather than a shell that never settled.
+    assert!(
+        quiet >= 2,
+        "the pane's shell never went quiet within 10s, so the fixture cannot bake against a stable grid"
+    );
     let h = app.terminals[0].last_inner.height as usize;
     app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
     app.terminals[0].push_image_for_test(wide_short_png());
@@ -27964,10 +28112,6 @@ fn the_terminal_image_yields_to_an_open_context_menu() {
     );
 }
 
-/// In the alternate screen there is no scrollback, so Shift+End must fall
-/// through to the program like its comment promises and like Shift+Home /
-/// Shift+PageUp/PageDown already do; it used to be swallowed because the
-/// bottom-reset arm had no alt-screen guard.
 /// A wheel notch on the pane BORDER while the child tracks the mouse used
 /// to vanish: the report was undeliverable (the border sits outside the
 /// inner grid) and the handler had no fall-through, so nothing scrolled —
@@ -28003,6 +28147,10 @@ fn a_wheel_on_the_pane_border_scrolls_even_when_the_child_tracks_the_mouse() {
     );
 }
 
+/// In the alternate screen there is no scrollback, so Shift+End must fall
+/// through to the program like its comment promises and like Shift+Home /
+/// Shift+PageUp/PageDown already do; it used to be swallowed because the
+/// bottom-reset arm had no alt-screen guard.
 #[test]
 fn shift_end_reaches_an_alt_screen_program() {
     let tmp = tempfile::tempdir().unwrap();
@@ -28580,22 +28728,32 @@ fn conflicted_repo(tmp: &std::path::Path) {
 
 /// Wait for the git worker to deliver entries, then return the index of the
 /// conflicted `shared.txt` entry in the Source Control panel.
+/// Wait for the git worker - which spawns a real `git` per query - to report
+/// the conflicted entry, and return its index.
+///
+/// The budget is load-scaled (#307). This helper is where
+/// `accept_all_incoming_then_complete_merge_stages_the_resolved_file` was
+/// actually failing under load: the untimed `git status --porcelain` at the
+/// end of that test cannot time out at all, so the fixed 5s deadline here was
+/// the only clock in the test, which puts it in the same family as the other
+/// three rather than in a category of its own.
 fn wait_for_conflicted_entry(app: &mut App) -> usize {
     app.set_sidebar_view(SidebarView::SourceControl);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        let _ = app.drain_git_responses();
-        if let Some(idx) = app
-            .source_control
-            .entries
-            .iter()
-            .position(|e| e.kind == crate::git::ChangeKind::Conflicted)
-        {
-            return idx;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    panic!("the git worker never reported the conflicted entry");
+    let mut found = None;
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1000),
+        "the git worker to report the conflicted entry",
+        || {
+            let _ = app.drain_git_responses();
+            found = app
+                .source_control
+                .entries
+                .iter()
+                .position(|e| e.kind == crate::git::ChangeKind::Conflicted);
+            found.is_some()
+        },
+    );
+    found.expect("await_spawned returns only once the entry is present")
 }
 
 #[test]
@@ -30947,7 +31105,17 @@ fn auto_hide_collapses_on_editor_focus_and_deliberate_actions_restore_it() {
     app.sidebar_auto_hide = true;
     app.show_tree = true;
 
+    // #302: the collapse is now delivered by the dwell tick rather than by the
+    // focus move itself. What this test protects — that focusing the editor
+    // DOES collapse, and that deliberate sidebar actions bring it back and
+    // hold it — is unchanged; only the moment of the collapse moved.
     app.focus_pane(Pane::Editor);
+    assert!(
+        app.tick_sidebar_auto_hide_at(
+            std::time::Instant::now() + crate::app::sidebar_dwell::AUTO_HIDE_DWELL
+        ),
+        "the grace delay elapses and the collapse fires"
+    );
     assert!(!app.show_tree, "focusing the editor collapses the sidebar");
 
     // An activity-bar view switch is a deliberate sidebar action: it reveals
@@ -30964,12 +31132,24 @@ fn auto_hide_collapses_on_editor_focus_and_deliberate_actions_restore_it() {
 
     // Leaving again collapses.
     app.focus_pane(Pane::Editor);
+    assert!(
+        app.tick_sidebar_auto_hide_at(
+            std::time::Instant::now() + crate::app::sidebar_dwell::AUTO_HIDE_DWELL
+        ),
+        "the collapse fires after the delay"
+    );
     assert!(!app.show_tree, "leaving collapses it again");
 
     // Terminal focus collapses too, not just the editor.
     app.set_sidebar_view(SidebarView::Explorer);
     app.focus_pane(Pane::Tree);
     app.focus_pane(Pane::Terminal);
+    assert!(
+        app.tick_sidebar_auto_hide_at(
+            std::time::Instant::now() + crate::app::sidebar_dwell::AUTO_HIDE_DWELL
+        ),
+        "and for a terminal too"
+    );
     assert!(!app.show_tree, "a terminal is also 'not the sidebar'");
 }
 
@@ -30991,6 +31171,13 @@ fn auto_hide_is_suppressed_while_dragging_prompting_or_in_zen_mode() {
     app.splitter_drag = Some(SplitterDrag::Sidebar);
     assert!(!app.sidebar_auto_hide_allowed(), "a drag suppresses it");
     app.focus_pane(Pane::Editor);
+    // Tick past the delay: since #302 defers the collapse, asserting
+    // `show_tree` right after the focus move is true for any deferring
+    // implementation and says nothing about the drag suppression.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(std::time::Instant::now() + AUTO_HIDE_DWELL),
+        "the drag suppresses the collapse even once the window elapses"
+    );
     assert!(app.show_tree, "and the sidebar survives the drag");
     app.splitter_drag = None;
 
@@ -31018,6 +31205,13 @@ fn reveal_in_explorer_shows_a_collapsed_sidebar() {
     app.sidebar_auto_hide = true;
     app.show_tree = true;
     app.focus_pane(Pane::Editor);
+    // #302: the collapse arrives on the dwell tick rather than the focus move.
+    // What this test protects — that a sidebar-targeting command reveals an
+    // ALREADY-COLLAPSED sidebar — is unchanged; it just has to reach that
+    // collapsed state the way the app now does.
+    app.tick_sidebar_auto_hide_at(
+        std::time::Instant::now() + crate::app::sidebar_dwell::AUTO_HIDE_DWELL,
+    );
     assert!(!app.show_tree, "collapsed first");
 
     app.reveal_in_explorer(f);
@@ -31095,7 +31289,12 @@ fn the_real_cmd_b_keypress_reveals_and_holds_the_sidebar() {
         .unwrap();
     assert!(app.show_tree, "Cmd+B reveals the sidebar");
 
+    // #302: each collapse is now delivered by the dwell tick. The guarantee
+    // under test — that the reveal survives the focus move it performs, and is
+    // one-shot rather than sticky — is unchanged.
+    let dwell = crate::app::sidebar_dwell::AUTO_HIDE_DWELL;
     app.focus_pane(Pane::Editor);
+    app.tick_sidebar_auto_hide_at(std::time::Instant::now() + dwell);
     assert!(
         app.show_tree,
         "and the reveal survives the next move to the editor"
@@ -31104,6 +31303,7 @@ fn the_real_cmd_b_keypress_reveals_and_holds_the_sidebar() {
     // Still one-shot: the exemption is spent, so the following move collapses.
     app.focus_pane(Pane::Tree);
     app.focus_pane(Pane::Editor);
+    app.tick_sidebar_auto_hide_at(std::time::Instant::now() + dwell);
     assert!(!app.show_tree, "the exemption was consumed, not sticky");
 
     // Ctrl+B is the same gesture on the other platform convention.
@@ -31111,6 +31311,7 @@ fn the_real_cmd_b_keypress_reveals_and_holds_the_sidebar() {
         .unwrap();
     assert!(app.show_tree);
     app.focus_pane(Pane::Editor);
+    app.tick_sidebar_auto_hide_at(std::time::Instant::now() + dwell);
     assert!(app.show_tree, "Ctrl+B pins exactly as Cmd+B does");
 }
 
@@ -31134,6 +31335,15 @@ fn a_reveal_while_auto_hide_is_off_does_not_bank_an_exemption() {
 
     app.sidebar_auto_hide = true;
     app.focus_pane(Pane::Editor);
+    // #302: delivered by the tick, not the focus move. The guarantee under
+    // test — that no exemption was banked while the feature was off, so the
+    // first collapse after enabling it is not silently eaten — is unchanged.
+    assert!(
+        app.tick_sidebar_auto_hide_at(
+            std::time::Instant::now() + crate::app::sidebar_dwell::AUTO_HIDE_DWELL
+        ),
+        "the collapse fires"
+    );
     assert!(
         !app.show_tree,
         "so the first collapse after enabling it actually happens"
@@ -31143,6 +31353,11 @@ fn a_reveal_while_auto_hide_is_off_does_not_bank_an_exemption() {
 /// #294 review: the reveal exemption is ONE-SHOT. Cmd+B reveals without
 /// moving focus, so a sticky flag would never be cleared (focus never lands
 /// on the tree) and auto-hide would be silently dead for the session.
+///
+/// #302 moved WHEN the exemption is spent — from the focus move itself to the
+/// collapse the dwell later fires — but not WHETHER it is spent. The
+/// one-shot guarantee this test exists to protect is unchanged, so the test
+/// keeps its assertions and gains the tick that now delivers the collapse.
 #[test]
 fn the_reveal_exemption_is_consumed_rather_than_sticky() {
     let tmp = tempfile::tempdir().unwrap();
@@ -31153,7 +31368,10 @@ fn the_reveal_exemption_is_consumed_rather_than_sticky() {
     // Cmd+B-style reveal: exempt the next collapse.
     app.sidebar_pinned_open = true;
     app.focus_pane(Pane::Editor);
-    assert!(app.show_tree, "the exemption protects this focus move");
+    let t0 = std::time::Instant::now();
+    let fired = app.tick_sidebar_auto_hide_at(t0 + crate::app::sidebar_dwell::AUTO_HIDE_DWELL);
+    assert!(!fired, "the exemption protects this collapse");
+    assert!(app.show_tree, "so the sidebar is still up");
     assert!(
         !app.sidebar_pinned_open,
         "and is consumed rather than latching auto-hide off"
@@ -31161,7 +31379,12 @@ fn the_reveal_exemption_is_consumed_rather_than_sticky() {
 
     // The very next move collapses, proving the feature re-armed itself.
     app.focus_pane(Pane::Editor);
-    assert!(!app.show_tree, "auto-hide is live again");
+    let t1 = std::time::Instant::now();
+    assert!(
+        app.tick_sidebar_auto_hide_at(t1 + crate::app::sidebar_dwell::AUTO_HIDE_DWELL),
+        "auto-hide is live again"
+    );
+    assert!(!app.show_tree, "and the sidebar went down");
 }
 
 /// #294 review: the suppression list must cover the modal states the codebase
@@ -31194,9 +31417,670 @@ fn auto_hide_yields_to_real_modal_overlays_and_explorer_drags() {
     app.activity_bar_visible = true;
 
     // A focus move the user did not ask for is not a reason to hide chrome.
+    // Tick PAST the grace delay: with the collapse deferred (#302), asserting
+    // `show_tree` right after the focus move is trivially true for any
+    // implementation that defers, suppressed or not. The suppression is only
+    // observable once the window has elapsed.
     app.without_auto_hide(|a| a.focus_pane(Pane::Editor));
+    assert!(
+        !app.tick_sidebar_auto_hide_at(std::time::Instant::now() + AUTO_HIDE_DWELL),
+        "a programmatic focus move must not collapse, even after the delay"
+    );
     assert!(app.show_tree, "programmatic focus leaves the sidebar alone");
 }
+
+/// #302: a click that PASSES THROUGH the panel on its way to the editor must
+/// not collapse it under the pointer. #294 collapsed on the focus change
+/// itself, so the panel flapped; the collapse now waits out a grace delay, and
+/// a return to the sidebar inside that window cancels it outright.
+///
+/// Written against `focus_pane` and `show_tree` alone, so it fails on the
+/// missing BEHAVIOUR rather than on a missing method. The clock-injected
+/// assertions live in the tests below.
+#[test]
+fn a_click_passing_through_the_sidebar_does_not_collapse_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    // Precondition: the collapse must be POSSIBLE, or "it stayed up" passes
+    // vacuously against a sidebar that could never have gone down.
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: nothing is suppressing auto-hide, so a collapse is live"
+    );
+
+    // Focus crosses into the editor. Under #294 this collapsed immediately;
+    // under #302 the collapse is only ARMED and the panel is still up.
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.show_tree,
+        "the sidebar stays up for the length of the grace delay"
+    );
+
+    // Focus comes back inside the window — the click was passing through.
+    app.focus_pane(Pane::Tree);
+    assert!(
+        app.show_tree,
+        "a click through the panel leaves it exactly where it was"
+    );
+
+    // Assert the DISARM directly. Ticking alone does not pin it: with focus
+    // parked on `Pane::Tree` the tick declines via its own `focus == Pane::Tree`
+    // early return, so this test passes even with the disarm deleted. The
+    // dwell's own state is the only thing that distinguishes "cancelled" from
+    // "declined for an unrelated reason".
+    assert!(
+        !app.sidebar_dwell.armed(),
+        "the return to the sidebar cancelled the pending collapse outright"
+    );
+
+    // And nothing fires once the window elapses.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(std::time::Instant::now() + AUTO_HIDE_DWELL),
+        "no collapse after the deadline"
+    );
+    assert!(
+        app.show_tree,
+        "so the panel is still up after the window closes"
+    );
+}
+
+/// #302: a focus move that stays away must still collapse — the grace delay is
+/// a delay, not a reprieve. Public-surface half: after the move the panel is
+/// still up but a collapse is PENDING, which `tick_sidebar_auto_hide` will
+/// deliver. Timing precision is covered by the unit tests on the timer itself.
+#[test]
+fn leaving_the_sidebar_arms_a_collapse_rather_than_doing_it_immediately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is possible here"
+    );
+
+    app.focus_pane(Pane::Editor);
+    assert!(app.show_tree, "not collapsed on the focus change itself");
+
+    // Several more focus moves land inside the grace window. None of them may
+    // collapse it, and — the trap the issue names — none may push the
+    // deadline out either, which the timer's own unit tests pin.
+    //
+    // Stamped AFTER the arming move on purpose. `due` is `>=`, so an exact
+    // deadline would be fine, but a stamp taken BEFORE `focus_pane` is strictly
+    // earlier than the anchor `focus_pane` records — `armed_at + DWELL` would
+    // then land before the real deadline and the tick would correctly decline.
+    // Taken here it is a hair LATER than the anchor, so the tick is genuinely
+    // due; the re-arming bug this guards against would push the deadline a full
+    // AUTO_HIDE_DWELL out, far beyond that sub-microsecond slack.
+    let armed_at = std::time::Instant::now();
+    app.focus_pane(Pane::Terminal);
+    app.focus_pane(Pane::Editor);
+    assert!(app.show_tree, "still up while the window is open");
+
+    // The deadline is measured from the FIRST arm, not the last focus move, so
+    // a tick at the original deadline still fires. Without this the pane hops
+    // above prove nothing: `show_tree` is set either way before any tick, and
+    // a re-arming bug that pushed the deadline out would pass unnoticed.
+    assert!(
+        app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL),
+        "the hops did not push the deadline out — it fires on the original one"
+    );
+    assert!(!app.show_tree, "and the collapse actually happened");
+}
+
+// Sidebar auto-hide tests, a trap worth knowing before you write one: routing
+// focus through `Pane::Tree` CLEARS the one-shot reveal pin by design (moving
+// into the sidebar means you are using it, so the exemption is released). A
+// Tree->Editor round trip is the obvious way to re-arm a collapse, and it
+// silently wipes the flag under test. Re-arm via `Pane::Terminal` instead when
+// the pin has to survive. This is invisible from the test side and cost one
+// misdiagnosed green.
+
+/// #302, the part that is new work rather than a port: #294's one-shot pin is
+/// consumed by "the next collapse attempt", but with a timer that stops being
+/// a single well-defined event. A deliberate reveal must not lose its
+/// protection to an attempt the dwell then CANCELS.
+#[test]
+fn arming_a_collapse_does_not_consume_the_reveal_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    // Precondition: a collapse is otherwise live here, so the exemption is
+    // protecting against something real rather than a case that would never
+    // have fired.
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: without the pin, this focus move would collapse"
+    );
+
+    // A deliberate reveal (Cmd+B) banks the one-shot exemption.
+    app.sidebar_pinned_open = true;
+
+    // Focus leaves: this ARMS a collapse but must not spend the exemption,
+    // because the collapse has not happened and may yet be cancelled.
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.sidebar_pinned_open,
+        "arming a collapse must not spend the exemption — only firing one does"
+    );
+    assert!(app.show_tree, "and the sidebar is still up");
+}
+
+/// #302: the pin must survive a tick that declines to collapse for a reason
+/// that has nothing to do with the pin. Every EARLY decline in
+/// `tick_sidebar_auto_hide_at` returns before spending it; the LATE decline —
+/// `sidebar_auto_hide_allowed()` being false — sits after the take, so a
+/// transient suppression (a seam drag, an open palette, a modal) burns a pin
+/// the user never got the benefit of. The suppression clears a moment later
+/// and the next collapse proceeds unpinned.
+#[test]
+fn a_suppressed_tick_does_not_spend_the_reveal_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    // Precondition, checked before either the pin or the suppression is set:
+    // a collapse is otherwise live here, so both are suppressing something
+    // real rather than a case that was never going to fire.
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: without pin or drag, this focus move would collapse"
+    );
+
+    // A deliberate reveal (Cmd+B) banks the one-shot exemption.
+    app.sidebar_pinned_open = true;
+
+    // Focus leaves: arms the collapse.
+    app.focus_pane(Pane::Editor);
+
+    // The user starts dragging the sidebar seam. This suppresses the collapse
+    // on its own — independently of the pin — and is transient: it ends when
+    // they release the mouse.
+    app.splitter_drag = Some(SplitterDrag::Sidebar);
+
+    // Precondition: the drag alone is enough to stop this collapse, so the
+    // tick below declines for a reason that is not the pin.
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "precondition: the seam drag suppresses the collapse by itself"
+    );
+
+    let now = std::time::Instant::now();
+    let collapsed = app.tick_sidebar_auto_hide_at(now + AUTO_HIDE_DWELL);
+
+    assert!(!collapsed, "the drag suppressed this collapse");
+    assert!(app.show_tree, "so the sidebar is still up");
+    assert!(
+        app.sidebar_pinned_open,
+        "a collapse stopped by an unrelated suppression must not spend the \
+         one-shot exemption — the user never saw the collapse it was banked for"
+    );
+
+    // The pin surviving is only half the contract: it must still be SPENDABLE.
+    // A fix that keeps the pin by making the collapse permanently unreachable
+    // satisfies the assertion above and is strictly worse than the bug. So
+    // release the drag and let the collapse the pin was banked for happen.
+    //
+    // Re-arm WITHOUT routing focus through `Pane::Tree`: moving into the
+    // sidebar deliberately releases the pin (mod.rs, the `Pane::Tree` arm), so
+    // a Tree->Editor round trip would clear the very flag under test. Focus is
+    // already on Editor here; the dwell is what needs re-arming.
+    app.splitter_drag = None;
+    app.focus_pane(Pane::Terminal);
+    let pinned_collapse = app.tick_sidebar_auto_hide_at(now + AUTO_HIDE_DWELL * 2);
+    assert!(!pinned_collapse, "the pin exempts this one");
+    assert!(app.show_tree, "so the sidebar survives it");
+    assert!(
+        !app.sidebar_pinned_open,
+        "and NOW the exemption is spent — it was banked for exactly this"
+    );
+
+    app.focus_pane(Pane::Editor);
+    let unpinned_collapse = app.tick_sidebar_auto_hide_at(now + AUTO_HIDE_DWELL * 3);
+    assert!(
+        unpinned_collapse,
+        "with the exemption spent, the next collapse fires — a pin that can \
+         never be spent is a sidebar that can never auto-hide"
+    );
+    assert!(!app.show_tree, "and the sidebar is finally down");
+}
+
+/// #302: a reveal under Zen Mode must not bank a pin. No collapse can fire
+/// while Zen owns the chrome, so the pin would sit unconsumed and then eat the
+/// first legitimate collapse after Zen exits — the exact failure
+/// `toggle_side_bar` already guards against when auto-hide is off.
+#[test]
+fn a_reveal_under_zen_mode_banks_no_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = false;
+
+    // Precondition: with Zen off, this same reveal DOES bank a pin — so the
+    // assertion below is about Zen, not about the reveal failing generally.
+    app.toggle_side_bar();
+    assert!(
+        app.sidebar_pinned_open,
+        "precondition: a normal reveal banks the one-shot pin"
+    );
+
+    // Back to a hidden sidebar, now under Zen Mode.
+    app.toggle_side_bar();
+    app.zen_mode = true;
+    app.activity_bar_visible = false;
+
+    app.toggle_side_bar();
+    assert!(app.show_tree, "the reveal still shows the sidebar");
+    assert!(
+        !app.sidebar_pinned_open,
+        "but banks no pin: nothing can spend it until Zen exits, and a pin \
+         held that long eats a collapse the user never connected to it"
+    );
+}
+
+/// #302: a collapse blocked by a TRANSIENT suppression must be retried once
+/// that suppression lifts, not abandoned. The tick disarming before it asks
+/// `sidebar_auto_hide_allowed()` drops the pending collapse on the floor, and
+/// nothing re-arms it but a fresh focus move — so a user whose palette was open
+/// during the grace window keeps a sidebar that never auto-hides again.
+#[test]
+fn a_transiently_suppressed_collapse_is_retried_once_the_suppression_lifts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    // Precondition: a collapse is genuinely live here.
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: nothing is suppressing auto-hide yet"
+    );
+
+    // NOTE: `maybe_auto_hide_sidebar` stamps the anchor with its OWN
+    // `Instant::now()`, so a deadline computed from a timestamp taken HERE is
+    // fractionally too early and the tick declines as not-yet-due — which
+    // looks exactly like the suppression working. Anchor the deadlines to a
+    // point comfortably past any real arm instead.
+    app.focus_pane(Pane::Editor);
+    let armed_at = std::time::Instant::now();
+
+    // A transient suppression appears DURING the grace window.
+    app.command_palette = Some(crate::widgets::command_palette::CommandPalette::new());
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "precondition: the open palette suppresses the collapse"
+    );
+
+    // The window elapses while it is still open: correctly declines.
+    // Precondition: the deadline really has elapsed, so a decline here is the
+    // palette and not the timer. Proven by the far-future tick at the end,
+    // which fires with the identical deadline once the palette is gone.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 5),
+        "the palette suppresses this collapse"
+    );
+    assert!(app.show_tree, "so the sidebar is still up");
+
+    // The user closes the palette. NO new focus move — focus never left the
+    // editor, so nothing re-arms; the pending collapse must survive on its own.
+    app.command_palette = None;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: with the palette closed the collapse is live again"
+    );
+
+    assert!(
+        app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 5),
+        "the collapse the palette deferred must still fire once it closes — \
+         a transient suppression delays the collapse, it does not cancel it"
+    );
+    assert!(!app.show_tree, "and the sidebar is finally down");
+}
+
+/// #302: toggling the auto-hide SETTING drops any pending collapse. The
+/// function's own comment promises turning it on "takes effect at the next
+/// focus move rather than retroactively yanking it away" — a dwell left armed
+/// across an off/on round trip breaks that promise on the next idle tick, with
+/// no focus move of the user's own.
+#[test]
+fn toggling_the_auto_hide_setting_drops_a_pending_collapse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: collapse is live"
+    );
+
+    let armed_at = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.sidebar_dwell.armed(),
+        "precondition: a collapse is pending"
+    );
+
+    // The user turns the feature off, then changes their mind.
+    app.toggle_sidebar_auto_hide();
+    app.toggle_sidebar_auto_hide();
+    assert!(app.sidebar_auto_hide, "precondition: back on");
+
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 1000),
+        "the collapse armed before the setting was touched must not fire"
+    );
+    assert!(app.show_tree, "so the sidebar is still up");
+}
+
+/// #302: the activity bar is a STRUCTURAL suppression that flips on its own,
+/// independently of Zen Mode. A collapse armed while it is hidden must not sit
+/// armed and then fire — spending a banked reveal pin — on the first idle tick
+/// after the bar comes back.
+#[test]
+fn hiding_the_activity_bar_drops_a_pending_collapse_and_its_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+
+    // A deliberate reveal banks the one-shot pin while the bar is visible.
+    app.sidebar_pinned_open = true;
+    let armed_at = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.sidebar_dwell.armed(),
+        "precondition: a collapse is pending"
+    );
+
+    // The user hides the activity bar, then shows it again.
+    let root = app.active_workspace_root();
+    app.dispatch_menu_action(MenuAction::ToggleActivityBar, root.clone());
+    assert!(!app.activity_bar_visible, "precondition: the bar is hidden");
+    app.dispatch_menu_action(MenuAction::ToggleActivityBar, root);
+    assert!(app.activity_bar_visible, "precondition: the bar is back");
+
+    // Two things mask this test if left alone, and either alone is enough.
+    // `dispatch_menu_action` ends by opening the Customize Layout popup, and
+    // `sidebar_auto_hide_allowed()` bails on `context_menu.is_some()` — so the
+    // tick declines before reaching anything this test is named for. And the
+    // pin banked above would absorb the collapse anyway, leaving `!fired` and
+    // `show_tree` both true while the pin is silently spent, which IS the
+    // failure the hunk exists to prevent. Assert the dwell and the pin
+    // directly, with the popup cleared.
+    app.context_menu = None;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: nothing else is suppressing the collapse now"
+    );
+    assert!(
+        !app.sidebar_dwell.armed(),
+        "the activity-bar toggle cancelled the pending collapse"
+    );
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 1000),
+        "an idle tick must not collapse after the bar returns"
+    );
+    assert!(app.show_tree, "so the sidebar is still up");
+    assert!(
+        !app.sidebar_pinned_open,
+        "and hiding the bar dropped the pin rather than holding an \
+         unconsumable one across a period where no collapse can fire — the \
+         same reason `toggle_side_bar` refuses to bank one in that state"
+    );
+
+    // The pin was dropped, so the next deliberate focus move collapses as the
+    // user expects rather than being silently exempted by a stale reveal.
+    let t1 = std::time::Instant::now();
+    app.focus_pane(Pane::Tree);
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.tick_sidebar_auto_hide_at(t1 + AUTO_HIDE_DWELL * 2),
+        "a fresh focus move after the bar returns collapses — no stale pin ate it"
+    );
+}
+
+/// #302's actual payload: the collapse WAITS. Every other app-level test ticks
+/// at the deadline or beyond, so all of them pass against a zero-length window
+/// — i.e. against #294's immediate collapse delivered through a tick. Deleting
+/// the `due()` check leaves them all green. This is the only test that fails
+/// when the grace delay itself is removed, which is what makes it the
+/// acceptance test for the feature rather than for its plumbing.
+#[test]
+fn a_collapse_does_not_fire_inside_the_grace_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is live here"
+    );
+
+    // Stamp BEFORE the arm. `maybe_auto_hide_sidebar` anchors on its own
+    // `Instant::now()`, so a deadline derived from a later stamp could land
+    // outside the real window and decline as not-yet-due for the wrong reason.
+    let before = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+
+    // Half a window in: the collapse is pending and must not have fired.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(before + AUTO_HIDE_DWELL / 2),
+        "a tick INSIDE the grace window must not collapse — this is the delay"
+    );
+    assert!(app.show_tree, "so the sidebar is still up mid-window");
+    assert!(
+        app.sidebar_dwell.armed(),
+        "and the collapse is still pending rather than cancelled"
+    );
+
+    // Past the window, with focus still away: now it fires.
+    assert!(
+        app.tick_sidebar_auto_hide_at(before + AUTO_HIDE_DWELL * 3),
+        "once the window elapses the collapse delivers"
+    );
+    assert!(!app.show_tree, "and the sidebar is down");
+}
+
+/// #302: a deliberate Cmd+B reveal supersedes a pending automatic collapse.
+/// Once a declined tick stays ARMED (so a transient suppression defers rather
+/// than cancels), the dwell can outlive the sidebar state it was armed
+/// against: the user hides and re-reveals by hand, the reveal banks its
+/// one-shot pin, and the very next idle frame tick finds the stale dwell due
+/// and spends that pin on a collapse nobody ever saw. The next focus move then
+/// takes the sidebar down — the #294 bug, reached by a different door.
+#[test]
+fn a_manual_reveal_cancels_a_pending_collapse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is live here"
+    );
+
+    app.focus_pane(Pane::Editor);
+    let armed_at = std::time::Instant::now();
+
+    // A modal defers the collapse. It stays armed by design (that is the
+    // transient-suppression retry this PR added).
+    app.command_palette = Some(crate::widgets::command_palette::CommandPalette::new());
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 5),
+        "precondition: the palette defers this collapse"
+    );
+    app.command_palette = None;
+
+    // The user hides and re-reveals the sidebar by hand.
+    app.toggle_side_bar();
+    app.toggle_side_bar();
+    assert!(
+        app.show_tree && app.sidebar_pinned_open,
+        "precondition: the manual reveal banked a one-shot pin"
+    );
+
+    // An IDLE frame tick — no focus move, no gesture at all.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 6),
+        "an idle tick must not collapse a sidebar the user just revealed"
+    );
+    assert!(
+        app.sidebar_pinned_open,
+        "and must not spend the pin on a collapse the user never saw"
+    );
+
+    // So the deliberate reveal still holds across the next move out.
+    app.focus_pane(Pane::Editor);
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 20),
+        "the reveal survives the next focus move, as #294 guarantees"
+    );
+    assert!(app.show_tree, "the sidebar is still up");
+}
+
+/// #302: disabling and re-enabling auto-hide drops a pin banked beforehand.
+/// `toggle_side_bar` refuses to bank one while the feature is off — "a pin set
+/// while the feature is off would sit unconsumed and silently eat the first
+/// collapse after they turn it on" — and a pin banked BEFORE the user disables
+/// it reaches that same stranded state by the other route. The existing
+/// `a_reveal_while_auto_hide_is_off_does_not_bank_an_exemption` covers
+/// off -> reveal -> enable; this is reveal -> disable -> enable.
+#[test]
+fn disabling_auto_hide_drops_a_pin_banked_before_it_was_turned_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = false;
+
+    app.toggle_side_bar();
+    assert!(
+        app.show_tree && app.sidebar_pinned_open,
+        "precondition: the reveal banked a pin while the feature was on"
+    );
+
+    app.toggle_sidebar_auto_hide();
+    assert!(!app.sidebar_auto_hide, "precondition: the feature is off");
+    assert!(
+        !app.sidebar_pinned_open,
+        "turning the feature off drops the pin: nothing can consume it while \
+         off, so it would eat the first collapse after re-enabling"
+    );
+
+    app.toggle_sidebar_auto_hide();
+    assert!(app.sidebar_auto_hide, "precondition: back on");
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is live again"
+    );
+    let t0 = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.tick_sidebar_auto_hide_at(t0 + AUTO_HIDE_DWELL * 2),
+        "and the first collapse after re-enabling fires — no stranded pin ate it"
+    );
+}
+
+/// #302: Zen entry must drop the reveal pin as well as the dwell. Zen sets
+/// BOTH structural conditions — `activity_bar_visible = false` and
+/// `zen_mode = true` — so `toggle_side_bar`'s reason for refusing to bank a
+/// pin there ("no collapse can fire for as long as it lasts") applies in full
+/// to a pin already held.
+///
+/// This is a REGRESSION guard, not just an edge case: on main
+/// `maybe_auto_hide_sidebar` did an unconditional `mem::take` of the pin on
+/// every focus move into the editor or terminal, so any move during or after
+/// Zen cleared it. Moving consumption to fire time removed that incidental
+/// cleanup, and nothing replaced it at the Zen boundary.
+#[test]
+fn entering_zen_mode_drops_the_reveal_pin_as_well_as_the_dwell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = false;
+
+    // A deliberate Cmd+B reveal banks the one-shot exemption.
+    app.toggle_side_bar();
+    assert!(
+        app.show_tree && app.sidebar_pinned_open,
+        "precondition: the reveal banked a pin"
+    );
+
+    app.toggle_zen_mode();
+    assert!(app.zen_mode, "precondition: Zen is on");
+    assert!(
+        !app.sidebar_pinned_open,
+        "Zen entry drops the pin: no collapse can fire while Zen owns the \
+         chrome, so a pin held across it is unconsumable and eats the first \
+         real collapse afterwards"
+    );
+
+    // The user-visible consequence: after Zen, the next deliberate focus move
+    // collapses as expected rather than being silently exempted.
+    app.toggle_zen_mode();
+    assert!(
+        !app.zen_mode && app.show_tree,
+        "precondition: Zen off, sidebar back"
+    );
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is live again"
+    );
+    let t0 = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.tick_sidebar_auto_hide_at(t0 + AUTO_HIDE_DWELL * 2),
+        "and it fires — no stale pin from before Zen absorbed it"
+    );
+}
+
+/// #302: Zen Mode is a STRUCTURAL suppression, not a transient one. The tick
+/// stays armed when a drag or a palette defers a collapse, because those end in
+/// moments — but Zen can last the session, and a dwell left armed across it
+/// fires on the very frame Zen exits, collapsing the sidebar for a focus move
+/// the user made an hour earlier.
+#[test]
+fn entering_zen_mode_cancels_a_pending_collapse_rather_than_deferring_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is live here"
+    );
+
+    app.focus_pane(Pane::Editor);
+    let armed_at = std::time::Instant::now();
+
+    // Zen takes over the chrome while the collapse is still pending.
+    app.toggle_zen_mode();
+    assert!(app.zen_mode, "precondition: Zen is on");
+    assert!(!app.show_tree, "precondition: Zen hid the sidebar");
+
+    // The user works in Zen for a long time, then leaves.
+    app.toggle_zen_mode();
+    assert!(!app.zen_mode, "precondition: Zen is off");
+    assert!(
+        app.show_tree,
+        "precondition: leaving Zen restored the sidebar"
+    );
+
+    // A tick far past the original deadline must not fire: that collapse
+    // belonged to a focus move from before Zen.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(armed_at + AUTO_HIDE_DWELL * 1000),
+        "a collapse armed before Zen must not fire on the frame Zen exits"
+    );
+    assert!(app.show_tree, "so the restored sidebar stays up");
+}
+
 /// #256 step 1: a server that publishes project-wide diagnostics (rust-analyzer
 /// does this from `cargo check`) names files the user never opened. The panel
 /// builds from the diagnostics store rather than from open buffers, so those
@@ -31457,4 +32341,191 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         "nor was a configuration selected: the refusal happens before any \
          launch bookkeeping"
     );
+}
+
+/// #302: a dwell must not be ARMED while a structural suppression is already
+/// in force. This is the one instance of the class that no entry-site disarm
+/// can catch, and it is worth being explicit about why.
+///
+/// `entering_zen_mode_cancels_a_pending_collapse_rather_than_deferring_it`
+/// covers arming BEFORE Zen: there is a transition, Zen entry sees it, and the
+/// entry hook disarms. Here the dwell is armed DURING Zen — Cmd+B still works
+/// inside Zen, and a focus move afterwards arms as usual — so the suppression
+/// is never entered while the dwell is live. There is no transition, so there
+/// is no boundary to hook, and every existing disarm site is structurally
+/// blind to it.
+///
+/// The consequence is user-visible and delayed: the arm declines at fire time
+/// via `!sidebar_auto_hide_allowed()` and stays armed BY DESIGN (transient
+/// suppressions must retry). Zen is not transient. An hour later the user
+/// leaves Zen and the next 8ms tick collapses the sidebar for a focus move
+/// they made an hour earlier, silently spending any pin with it.
+///
+/// The fix is therefore not a sixth boundary: `maybe_auto_hide_sidebar` must
+/// refuse to arm under a structural suppression at all, mirroring what
+/// `toggle_side_bar` already does for the pin at the same four conditions.
+#[test]
+fn arming_inside_zen_mode_does_not_collapse_the_sidebar_when_zen_exits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = false;
+
+    // Into Zen FIRST, so there is no pending dwell for Zen entry to cancel.
+    app.toggle_zen_mode();
+    assert!(app.zen_mode, "precondition: Zen is on");
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "precondition: Zen structurally suppresses the collapse"
+    );
+
+    // Cmd+B works inside Zen, and the user opens the sidebar to look at a file.
+    app.toggle_side_bar();
+    assert!(app.show_tree, "precondition: the sidebar is up inside Zen");
+    assert!(
+        !app.sidebar_pinned_open,
+        "precondition: toggle_side_bar already refuses to bank a pin under a \
+         structural suppression — this test is about the DWELL, which does not"
+    );
+
+    // Focus moves away, exactly as it would outside Zen. This is the arm that
+    // no entry site can see: the suppression was already in force.
+    let t0 = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+    // The main loop, faithfully: ticks throughout Zen, well past the grace
+    // delay. None may collapse, and — the part two previous fixes got wrong —
+    // none may destroy the pending collapse either, because nothing would
+    // re-arm it afterwards.
+    for i in 0..50u32 {
+        assert!(
+            !app.tick_sidebar_auto_hide_at(
+                t0 + AUTO_HIDE_DWELL * 2 + std::time::Duration::from_millis(8 * i as u64)
+            ),
+            "no collapse fires inside Zen: Zen owns the chrome (tick {i})"
+        );
+    }
+    assert!(
+        app.sidebar_dwell.armed(),
+        "and the dwell SURVIVES those ticks. Cancelling on a suppressed tick \
+         is indistinguishable from refusing to arm — production ticks every \
+         8ms, so the cancel lands 8ms after the arm, and nothing re-arms once \
+         a structural suppression lifts"
+    );
+
+    // The user-visible failure, spelled out. Zen exit RESTORES the pre-Zen
+    // snapshot, so the sidebar this test opened inside Zen is closed again on
+    // the way out — that part is by design and not what is under test. Reopen
+    // it, then check that no stale collapse from the in-Zen focus move is still
+    // pending to fire on the next tick.
+    app.toggle_zen_mode();
+    assert!(!app.zen_mode, "precondition: Zen is off again");
+    app.show_tree = true;
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: a collapse is structurally possible again"
+    );
+    // The claim this test exists for: no STALE collapse on the frame Zen exits.
+    // The dwell is still armed, but each suppressed tick re-stamped it, so its
+    // deadline is measured from the last moment a collapse was impossible —
+    // not from the focus move made before Zen. The user gets the full grace
+    // period from a moment they can perceive: the chrome coming back.
+    assert!(
+        !app.tick_sidebar_auto_hide_at(t0 + AUTO_HIDE_DWELL * 2),
+        "and no stale collapse fires after Zen exits, for a focus move made \
+         while Zen was still on"
+    );
+    assert!(
+        app.show_tree,
+        "the sidebar is still up: the user asked for it and never asked otherwise"
+    );
+    // But the collapse is not LOST either — that was the round-one and
+    // round-two defect. Once the re-stamped grace period elapses it fires.
+    let after_zen = t0 + AUTO_HIDE_DWELL * 2 + std::time::Duration::from_millis(8 * 49);
+    assert!(
+        app.tick_sidebar_auto_hide_at(after_zen + AUTO_HIDE_DWELL * 2),
+        "and once the grace period from Zen exit elapses, it does fire: \
+         retained, not discarded"
+    );
+}
+
+/// #302 REGRESSION GUARD, round three. The two previous fixes each destroyed
+/// the state the recovery needs, and the guard that was supposed to catch that
+/// COULD NOT, because it never ticked during the suppression.
+///
+/// `main_loop` calls `tick_sidebar_auto_hide()` unconditionally on an 8ms
+/// cadence (mod.rs, `event::poll(Duration::from_millis(8))`). So in production
+/// a tick lands within 8ms of arming — and again, and again, for as long as the
+/// suppression lasts. Any design that cancels the dwell on a suppressed tick
+/// has cancelled it 8ms after it was armed, which is indistinguishable from
+/// refusing to arm at all.
+///
+/// This test therefore TICKS DURING THE SUPPRESSED PERIOD, many times, exactly
+/// as the main loop would. That single property is what separates it from the
+/// vacuous guard it replaces: the previous version set the flag, cleared it,
+/// and ticked once afterwards — a sequence production never produces.
+#[test]
+fn auto_hide_recovers_after_the_activity_bar_comes_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_auto_hide = true;
+    app.show_tree = true;
+    app.activity_bar_visible = false;
+    app.focus_pane(Pane::Tree);
+
+    assert!(
+        !app.sidebar_auto_hide_allowed(),
+        "precondition: a hidden activity bar structurally suppresses the collapse"
+    );
+
+    let t0 = std::time::Instant::now();
+    app.focus_pane(Pane::Editor);
+
+    // The main loop, faithfully: ticks every 8ms while the bar stays hidden,
+    // and — the part that makes this a real guard — PAST the grace delay.
+    //
+    // Ticking only within AUTO_HIDE_DWELL proves nothing: the tick returns at
+    // its `due` check before it ever reaches the structural branch, so a
+    // cancel-on-suppressed-tick defect is unreachable and the test passes
+    // against the very design it exists to reject. That was the third version
+    // of this guard and it had no teeth; teeth-proving it against the round-two
+    // mutation is what exposed that. Production ticks for as long as the
+    // suppression lasts, which is minutes or hours, so the ticks that matter
+    // are the ones AFTER the deadline has elapsed.
+    for i in 0..50u32 {
+        let t = t0 + AUTO_HIDE_DWELL * 2 + std::time::Duration::from_millis(8 * i as u64);
+        assert!(
+            !app.tick_sidebar_auto_hide_at(t),
+            "no collapse may fire while the bar is hidden (tick {i})"
+        );
+    }
+    assert!(
+        app.sidebar_dwell.armed(),
+        "and the dwell SURVIVES them: cancelling on a suppressed tick is what \
+         strands the feature, because nothing re-arms once the bar returns"
+    );
+    assert!(
+        app.show_tree,
+        "precondition: still open after 50 suppressed ticks"
+    );
+
+    // An hour later the user brings the activity bar back. Focus never moved —
+    // it is still the editor — so no gesture will arm anything, and production
+    // guards `if self.focus != Pane::Editor` before calling `focus_pane`.
+    app.activity_bar_visible = true;
+    assert!(
+        app.focus == Pane::Editor,
+        "precondition: focus never moved, so nothing re-arms by gesture"
+    );
+    assert!(
+        app.sidebar_auto_hide_allowed(),
+        "precondition: the suppression has lifted"
+    );
+
+    let last_tick = t0 + AUTO_HIDE_DWELL * 2 + std::time::Duration::from_millis(8 * 49);
+    assert!(
+        app.tick_sidebar_auto_hide_at(last_tick + AUTO_HIDE_DWELL * 2),
+        "auto-hide recovers once the bar returns: the pending collapse fires \
+         rather than the feature staying dead for the session"
+    );
+    assert!(!app.show_tree, "and the sidebar actually collapsed");
 }

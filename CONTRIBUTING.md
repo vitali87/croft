@@ -5,9 +5,51 @@ Thanks for hacking on croft. Build, run, and platform setup live in the
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). This guide covers the day to day
 developer workflow concerns that do not belong in any of those.
 
-If you are an AI agent, read [CLAUDE.md](CLAUDE.md) as well: it covers claiming
-work so concurrent sessions do not collide, and verifying that a review actually
-happened before merging. Everything in this guide applies to you too.
+Everything in this guide applies to AI agents too, including the two sections
+below on claiming work and on verifying that a review happened. Agents often
+also keep a `CLAUDE.md` at the root for their own preferences, but it is
+deliberately untracked and clone-local: a fresh checkout will not have one, and
+nothing here depends on it.
+
+## Claiming work, so concurrent sessions do not collide
+
+Several agent sessions work this repo at once. Two signals say a piece of work
+is taken, and **neither covers the other**:
+
+* the issue carries a `claimed` label — that records *intent*;
+* a PR is open against it — that records *work*.
+
+Check both before starting. `gh pr list --search "<issue number>"` is one call,
+and skipping it is how the same issue gets solved twice.
+
+**A claim holds only while someone is behind it.** If nothing has moved, it is
+not a reservation:
+
+1. Age the work by its **last commit**, not `updatedAt` — a comment bumps
+   `updatedAt`, so a stale branch can look active:
+   `gh pr view <n> --json commits -q '.commits | last | .committedDate'`
+2. Ask the sessions that are actually live, naming the specific PRs. One
+   message is cheap; discovering ownership after merging is not.
+3. Silence plus a stale commit date means it is free to take.
+
+When you do take something over, say so on the PR with your reasons, and leave
+the branch untouched and reopenable — no force-push, no rewriting someone
+else's history. Being first is a real claim right up until nobody is behind it.
+
+## Verifying a review actually happened
+
+A green checks column is not evidence that anyone reviewed the change. Before
+merging, confirm an actual review body exists — `gh pr view <n> --json
+reviews,comments` — and that every finding in it is fixed or refuted with a
+reason. Two specific traps:
+
+* A review bot's check can report **pass** while annotated "review rate
+  limited", which means no review ran at all.
+* `mergeStateStatus: CLEAN` answers "is a branch rule blocking this", not "has
+  this been reviewed". A PR with no review at all reports CLEAN.
+
+Re-fetch comments immediately before merging rather than trusting what you read
+earlier: bot replies land asynchronously while checks are still running.
 
 ## Every shipped change is a release
 
@@ -22,6 +64,32 @@ A PR that changes anything compiled into the binary (`src/`, `assets/`,
 
 CI enforces both (the `version bump + release notes` job). Docs, CI, and
 test-only PRs (`src/app/tests.rs`, `tests/`) are exempt.
+
+## After adding a function, check the doc below it
+
+Rust attaches a `///` block to whatever item **follows** it. Insert a function
+between an existing one and its doc comment and that prose silently becomes the
+newcomer's: no compiler error, no failing test, no clippy lint. The build stays
+green and the rendered rustdoc is *confidently wrong* rather than absent, which
+is worse - absent docs send a reader to the code, wrong docs stop them looking.
+
+So after adding a `fn`, confirm the doc block above the **next** `fn` still
+describes that next `fn`.
+
+CI catches what the habit misses (the `doc comments stay with their function`
+job): a function that had a doc comment at the merge base and has none at your
+head is the fingerprint this insertion leaves. If a removal is deliberate, say
+so in a commit message on the branch:
+
+```text
+doc-removal: src/path/to/file.rs::some_function_name
+```
+
+The file qualifier matters: an exemption keyed on the bare name would excuse
+every function of that name in every changed file, so a deliberate removal of
+one `new` would quietly cover an accidental loss of another.
+
+Run it yourself with `python3 scripts/check_doc_ownership.py origin/main HEAD`.
 
 ## Managing the `target/` directory
 
@@ -163,6 +231,38 @@ nextest reads them from there, not from `RUST_TEST_THREADS`.
 Before you blame your change for a terminal or clipboard failure, re-run it
 against an untouched `origin/main` checkout. These flake under load, and
 baselining is faster than bisecting.
+
+## Waiting on a spawned process in a test
+
+A test that spawns a real process and waits a **fixed** wall-clock budget will
+flake on a loaded machine, and the budget looks generous right up until it
+isn't. The number is not knowable from inside the test: what blows it is not
+the operation, it is contention from every other test spawning at the same
+moment, plus whatever else owns the machine.
+
+So do not pick a fresh constant. Use the shared helper, which scales a quiet
+machine baseline by the load actually present:
+
+```rust
+crate::test_budget::await_spawned(
+    Duration::from_millis(500),          // what it costs on a quiet machine
+    "the shell to paint the linked cell", // what you are waiting for
+    || linked_cell(&app).is_some(),
+);
+```
+
+For a wait that hands its deadline to something else (a `recv_timeout`, a
+probe's own timeout) use `test_budget::spawn_budget(base)` for the `Duration`.
+
+The teeth are unchanged: a genuinely broken behaviour never satisfies the
+condition and still fails, just later. That trade - a slow true failure over a
+fast false one - is the point.
+
+**When one of these does fail, the cheap first move is the merge-base
+comparison:** run the full suite on the unmodified merge base under the same
+load. If it fails there too, your diff is innocent. Isolation runs cannot tell
+you this, because an isolated run cannot reproduce a contention failure however
+many times you repeat it.
 
 ## Bumping the Rust toolchain
 
