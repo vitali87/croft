@@ -27915,6 +27915,14 @@ fn app_with_baked_terminal_image(
             quiet = 0;
         }
     }
+    // The deadline is a failure, not a fallback. Falling through it would hand
+    // the caller exactly the unsynchronised fixture this wait exists to
+    // prevent, and the resulting flake would look like the picture logic
+    // rather than a shell that never settled.
+    assert!(
+        quiet >= 2,
+        "the pane's shell never went quiet within 10s, so the fixture cannot bake against a stable grid"
+    );
     let h = app.terminals[0].last_inner.height as usize;
     app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
     app.terminals[0].push_image_for_test(wide_short_png());
