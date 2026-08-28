@@ -19116,6 +19116,64 @@ fn double_clicking_a_port_row_opens_it() {
     );
 }
 
+/// #317 beyond the terminal: the guard lives in `ClickTracker`, so every
+/// surface that pairs clicks inherits it. The ports table is the cheapest one
+/// to drive end to end, and it has a visible consequence - a double click
+/// forwards the port - so a modified click that wrongly counted as half a
+/// double would open something the user never double-clicked.
+#[test]
+fn a_modified_click_does_not_pair_with_a_plain_one_in_the_ports_table() {
+    use crate::widgets::ports::PortOrigin;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.bottom_panel_tab = BottomPanelTab::Ports;
+    app.ports
+        .upsert(3000, None, None, PortOrigin::Remote("box".into()));
+    draw(&mut app, 140, 50);
+    let x = app.ports.last_area.x + 2;
+    let y = app.ports.last_area.y + 1;
+
+    let click_with = |app: &mut App, modifiers| {
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers,
+        });
+    };
+
+    // A modified click must not ARM the pair: the plain click after it is the
+    // user's first ordinary click on that row, not the second half of a
+    // gesture they never made.
+    click_with(&mut app, KeyModifiers::CONTROL);
+    click_with(&mut app, KeyModifiers::empty());
+    assert!(
+        !app.status.contains("orward"),
+        "a plain click after a ctrl+click must not open the port: {}",
+        app.status
+    );
+
+    // And a modified click must not COMPLETE one either.
+    click_with(&mut app, KeyModifiers::empty());
+    app.status.clear();
+    click_with(&mut app, KeyModifiers::CONTROL);
+    assert!(
+        !app.status.contains("orward"),
+        "a ctrl+click must not complete a double-click: {}",
+        app.status
+    );
+
+    // The guard must not have cost the real gesture.
+    app.status.clear();
+    click_with(&mut app, KeyModifiers::empty());
+    click_with(&mut app, KeyModifiers::empty());
+    assert!(
+        app.status.contains("orward"),
+        "two ordinary clicks must still open the port: {}",
+        app.status
+    );
+}
+
 #[test]
 fn clicking_the_port_toast_dismiss_button_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
