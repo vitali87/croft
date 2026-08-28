@@ -26,7 +26,7 @@ Turn it on from the Command Palette (**View: Toggle Auto-Hide Side Bar**) or the
 The collapse is also held off whenever something else on screen depends on the sidebar staying put:
 
 * **A drag** - either the sidebar seam or an Explorer drag. The pointer is over the editor by definition mid-drag, and collapsing under the cursor is the flapping the feature exists to avoid.
-* **Anything modal** - the Command Palette, Go to File, Go to Symbol, workspace symbols, the process picker, `Cmd`+`Z` directory jump, command history, the branch picker, an input prompt, a list picker, a context menu, or the SSH connect dialog. Several of those are sidebar-targeting flows, and some may be anchored over sidebar space.
+* **Anything modal** - the keyboard-shortcuts overlay (`F1`), the Command Palette, Go to File, Go to Symbol, workspace symbols, the process picker, `Cmd`+`Z` directory jump, command history, the branch picker, an input prompt, a list picker, a context menu, or the SSH connect dialog. Several of those are sidebar-targeting flows, and some may be anchored over sidebar space.
 * **A focus move you did not make** - an async result arriving, a file opened at launch, `Enter` on a sidebar row. Only a deliberate move into the editor or terminal collapses the panel.
 * **A hidden activity bar** - with no activity bar there is no on-screen way back to a collapsed sidebar, so a mouse-only user would be stranded.
 * **Zen Mode** - it already owns chrome visibility and keeps it.
