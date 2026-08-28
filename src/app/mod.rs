@@ -31201,11 +31201,14 @@ impl App {
                             // A second click on the same row opens that port,
                             // the same as pressing Enter on it.
                             let now = std::time::Instant::now();
-                            if self.ports_click.is_double(now, m.column, m.row) {
+                            if self
+                                .ports_click
+                                .is_double(now, m.column, m.row, m.modifiers)
+                            {
                                 self.ports_open_selected();
                                 self.ports_click.clear();
                             } else {
-                                self.ports_click.record(now, m.column, m.row);
+                                self.ports_click.record(now, m.column, m.row, m.modifiers);
                             }
                         }
                         None => self.focus_pane(Pane::Terminal),
@@ -31463,7 +31466,8 @@ impl App {
                     if let Some(idx) = self.search.hit_at_y(m.row) {
                         self.search.selected = idx;
                         let now = std::time::Instant::now();
-                        let is_double = self.tree_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.tree_click.is_double(now, m.column, m.row, m.modifiers);
                         if let Some(hit) = self.search.selected_hit().cloned() {
                             self.open_search_hit(&hit);
                             if is_double {
@@ -31473,7 +31477,7 @@ impl App {
                         if is_double {
                             self.tree_click.clear();
                         } else {
-                            self.tree_click.record(now, m.column, m.row);
+                            self.tree_click.record(now, m.column, m.row, m.modifiers);
                         }
                     } else {
                         // Click on the input/header area: just focus search.
@@ -31671,14 +31675,15 @@ impl App {
                     if let Some(idx) = self.remote.target_at_y(m.row) {
                         self.remote.select(idx);
                         let now = std::time::Instant::now();
-                        let is_double = self.tree_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.tree_click.is_double(now, m.column, m.row, m.modifiers);
                         if is_double {
                             if let Some(target) = self.remote.selected_target().cloned() {
                                 self.request_remote_launch(target.alias, None);
                             }
                             self.tree_click.clear();
                         } else {
-                            self.tree_click.record(now, m.column, m.row);
+                            self.tree_click.record(now, m.column, m.row, m.modifiers);
                         }
                     }
                     return;
@@ -31728,7 +31733,8 @@ impl App {
                     }
                     if let Some(idx) = self.tree.node_at_y(m.row) {
                         let now = std::time::Instant::now();
-                        let is_double = self.tree_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.tree_click.is_double(now, m.column, m.row, m.modifiers);
                         let has_shift = m.modifiers.contains(KeyModifiers::SHIFT);
                         // macOS terminals (iTerm2, Terminal.app) never put the
                         // Cmd bit on mouse events — the SGR mouse encoding only
@@ -31826,7 +31832,7 @@ impl App {
                         if is_double {
                             self.tree_click.clear();
                         } else {
-                            self.tree_click.record(now, m.column, m.row);
+                            self.tree_click.record(now, m.column, m.row, m.modifiers);
                         }
                     }
                 } else if in_editor_pane && !in_editor {
@@ -31981,7 +31987,9 @@ impl App {
                             return;
                         }
                         let now = std::time::Instant::now();
-                        let is_double = self.editor_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.editor_click
+                                .is_double(now, m.column, m.row, m.modifiers);
                         let last_inner = self.editor.last_inner;
                         if let Some(diff) = self.editor.diff.as_mut() {
                             if let Some((side, row_idx, char_col)) =
@@ -32001,7 +32009,7 @@ impl App {
                         if is_double {
                             self.editor_click.clear();
                         } else {
-                            self.editor_click.record(now, m.column, m.row);
+                            self.editor_click.record(now, m.column, m.row, m.modifiers);
                         }
                         self.poke_cursor();
                         return;
@@ -32089,7 +32097,9 @@ impl App {
                         return;
                     }
                     let now = std::time::Instant::now();
-                    let is_double = self.editor_click.is_double(now, m.column, m.row);
+                    let is_double = self
+                        .editor_click
+                        .is_double(now, m.column, m.row, m.modifiers);
                     if is_double {
                         self.editor.select_word_at(m.column, m.row);
                         self.editor_click.clear();
@@ -32097,7 +32107,7 @@ impl App {
                         // Anchor a fresh selection at the click; a drag widens it,
                         // a clean click ends up cleared on mouse-up.
                         self.editor.mouse_down(m.column, m.row);
-                        self.editor_click.record(now, m.column, m.row);
+                        self.editor_click.record(now, m.column, m.row, m.modifiers);
                     }
                     self.poke_cursor();
                 } else if let Some(idx) = terminal_hit {
@@ -32160,7 +32170,9 @@ impl App {
                     // two panes never paint a highlight at once (issue #23).
                     self.editor.clear_selection();
                     let now = std::time::Instant::now();
-                    let is_double = self.terminal_click.is_double(now, m.column, m.row);
+                    let is_double =
+                        self.terminal_click
+                            .is_double(now, m.column, m.row, m.modifiers);
                     if is_double {
                         self.terminal_mut().select_word_at(m.column, m.row);
                         self.terminal_click.clear();
@@ -32170,7 +32182,8 @@ impl App {
                         // ends up cleared on mouse-up. With a drag, this is the
                         // selection anchor.
                         self.terminal_mut().start_selection_at(m.column, m.row);
-                        self.terminal_click.record(now, m.column, m.row);
+                        self.terminal_click
+                            .record(now, m.column, m.row, m.modifiers);
                     }
                 }
             }
