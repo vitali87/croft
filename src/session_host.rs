@@ -357,6 +357,12 @@ fn swap_to_new_image(host: &Host, exe: &Path, handoff: &HandoffFds) -> anyhow::E
     if let Err(e) =
         set_cloexec(handoff.listener, false).and_then(|()| set_cloexec(handoff.master, false))
     {
+        // `and_then` short-circuits, so a failure on the master leaves the
+        // listener already cleared: re-arm both, exactly as the post-exec
+        // failure path does, or this host keeps serving with an inheritable
+        // session socket that any later spawn would carry off.
+        let _ = set_cloexec(handoff.listener, true);
+        let _ = set_cloexec(handoff.master, true);
         // Every path that returns instead of exec'ing must reopen the door,
         // or this host refuses clients for the rest of its life.
         host.swapping.store(false, Ordering::SeqCst);
