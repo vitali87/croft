@@ -71,6 +71,32 @@ jobs:
           fi
           exit $fail
 
+  doc-ownership:
+    # Rust attaches a `///` block to whatever item FOLLOWS it, so inserting a
+    # function between an existing one and its doc silently hands that prose to
+    # the newcomer (#314). Nothing else here reports it: the build stays green,
+    # clippy is silent, and the rendered rustdoc is confidently WRONG rather
+    # than absent - which stops a reader looking, where absent docs would have
+    # sent them to the code. It has happened twice on one branch, and a sweep
+    # of recent history found four more that had shipped.
+    #
+    # The snapshot is undetectable (well-formed prose above a plausible
+    # function) but the diff is not: a function that had a doc and now has none
+    # is the exact fingerprint. Validated against both known instances.
+    name: doc comments stay with their function
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the merge-base with the PR base resolves.
+          fetch-depth: 0
+      - name: No function may lose its doc comment
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
+          python3 scripts/check_doc_ownership.py "$base" HEAD
+
   test:
     name: clippy + tests
     runs-on: ubuntu-latest

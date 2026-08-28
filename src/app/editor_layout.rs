@@ -205,7 +205,6 @@ impl EditorLayout {
         }
     }
 
-    /// True when more than one group exists (the editor pane is split).
     /// Every INACTIVE leaf's tabs (the active leaf's live hoisted in
     /// `App::editor` and are not visited). Depth-first, stable order.
     pub fn inactive_leaf_tabs(&self) -> Vec<&EditorTabs> {
@@ -225,6 +224,7 @@ impl EditorLayout {
         out
     }
 
+    /// True when more than one group exists (the editor pane is split).
     pub fn is_split(&self) -> bool {
         self.leaf_count() > 1
     }

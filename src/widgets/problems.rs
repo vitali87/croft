@@ -314,10 +314,6 @@ impl ProblemsPanel {
             .saturating_sub(self.viewport_rows as usize)
     }
 
-    /// The visible groups after the severity filter: `(group index, indices of
-    /// its items that pass the filter)`. Groups with no passing item are
-    /// dropped so a filtered-away file shows no header. Indices are into
-    /// `self.groups`, so `hit_at` / `*_spans` need no remapping.
     /// True when `it` in `group` passes BOTH the severity cycle and the
     /// free-text filter (case-insensitive substring of the message or the
     /// file path).
@@ -358,6 +354,10 @@ impl ProblemsPanel {
         true
     }
 
+    /// The visible groups after the severity filter: `(group index, indices of
+    /// its items that pass the filter)`. Groups with no passing item are
+    /// dropped so a filtered-away file shows no header. Indices are into
+    /// `self.groups`, so `hit_at` / `*_spans` need no remapping.
     fn visible_groups(&self) -> Vec<(usize, Vec<usize>)> {
         self.groups
             .iter()

@@ -17698,7 +17698,6 @@ fn switching_sidebar_view_closes_the_open_commit_dropdown() {
 
 // --- Split editor (side-by-side panes) -----------------------------------
 
-/// Open a file into the focused editor group of a fresh App.
 /// Seeding the Search panel from a terminal command must describe THAT
 /// command: filter globs left over from an earlier manual search would
 /// silently narrow the seeded results (the terminal scanned everything), and
@@ -17742,6 +17741,7 @@ fn seeding_search_cannot_leave_a_stale_field_selection() {
     assert_eq!(app.search.include, "*.md", "the seeded include is intact");
 }
 
+/// Open a file into the focused editor group of a fresh App.
 fn app_with_open_file(tmp: &std::path::Path, name: &str, body: &str) -> App {
     let f = tmp.join(name);
     std::fs::write(&f, body).unwrap();
@@ -27964,10 +27964,6 @@ fn the_terminal_image_yields_to_an_open_context_menu() {
     );
 }
 
-/// In the alternate screen there is no scrollback, so Shift+End must fall
-/// through to the program like its comment promises and like Shift+Home /
-/// Shift+PageUp/PageDown already do; it used to be swallowed because the
-/// bottom-reset arm had no alt-screen guard.
 /// A wheel notch on the pane BORDER while the child tracks the mouse used
 /// to vanish: the report was undeliverable (the border sits outside the
 /// inner grid) and the handler had no fall-through, so nothing scrolled —
@@ -28003,6 +27999,10 @@ fn a_wheel_on_the_pane_border_scrolls_even_when_the_child_tracks_the_mouse() {
     );
 }
 
+/// In the alternate screen there is no scrollback, so Shift+End must fall
+/// through to the program like its comment promises and like Shift+Home /
+/// Shift+PageUp/PageDown already do; it used to be swallowed because the
+/// bottom-reset arm had no alt-screen guard.
 #[test]
 fn shift_end_reaches_an_alt_screen_program() {
     let tmp = tempfile::tempdir().unwrap();
