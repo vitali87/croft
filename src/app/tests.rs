@@ -6216,6 +6216,69 @@ fn double_click_in_terminal_word_selects_in_split_and_maximised_layout() {
     }
 }
 
+/// #317, the reported gesture end to end: a ctrl+click that matches no link
+/// falls past the URL and file arms into the built-in selection path. That
+/// path used to arm the double-click tracker regardless of modifiers, so the
+/// user's NEXT ordinary click at the same cell classified as a double and
+/// word-selected text they never double-clicked.
+///
+/// The probe word is deliberately link-free and path-free, so the ctrl+click
+/// genuinely reaches the fall-through arm rather than being consumed above it
+/// - a click that IS consumed would make this test pass without the fix.
+#[test]
+fn a_ctrl_click_that_opens_nothing_does_not_arm_the_terminal_double_click() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let probe = format!("croftmodclick{}", std::process::id());
+    await_terminal_probe(&mut app, &probe);
+    term.draw(|f| app.render(f)).unwrap();
+    let snap = app.terminal().visible_text();
+    let row_idx = snap
+        .lines()
+        .position(|l| l.contains(&probe))
+        .expect("probe must render");
+    let line = snap.lines().nth(row_idx).unwrap();
+    let mid_col = line.find(&probe).unwrap() + probe.len() / 2;
+    let inner = app.terminal().last_inner;
+    let screen_y = inner.y + row_idx as u16;
+    let screen_x = inner.x + mid_col as u16;
+
+    let click = |app: &mut App, modifiers| {
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: screen_x,
+            row: screen_y,
+            modifiers,
+        });
+    };
+
+    // The ctrl+click must actually fall through: nothing on this word is a
+    // URL or an existing file, so no link opens and no selection is made yet.
+    click(&mut app, KeyModifiers::CONTROL);
+    // The user's next ordinary click, at the same cell.
+    click(&mut app, KeyModifiers::NONE);
+
+    let sel = app.terminal().selection_text();
+    assert!(
+        !sel.contains(&probe),
+        "a plain click after an unmatched ctrl+click must not word-select: the \
+         ctrl+click must not have armed the double-click tracker, but selection was {sel:?}"
+    );
+
+    // The guard must not have cost the real gesture: two plain clicks still
+    // word-select at the same cell.
+    click(&mut app, KeyModifiers::NONE);
+    let sel = app.terminal().selection_text();
+    assert!(
+        sel.contains(&probe) || probe.contains(&sel),
+        "two ordinary clicks must still word-select; got {sel:?}"
+    );
+}
+
 /// End-to-end variant of the matrix that exercises the user's
 /// exact gesture chain: text on screen in the embedded terminal →
 /// real Cmd+C through the terminal pane handler → switch to the
