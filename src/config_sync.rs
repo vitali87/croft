@@ -25,9 +25,15 @@ use std::path::PathBuf;
 pub struct Syncable {
     /// Name under `~/.config/croft/`, and the name it lands under remotely.
     pub name: &'static str,
-    /// Whether the remote applies it without a relaunch. Purely
-    /// informational — it drives what the OUTPUT channel promises the user,
-    /// so a file that needs a relaunch does not silently look applied.
+    /// Whether croft reloads this file when it is saved THROUGH croft on the
+    /// machine that owns it (`reload_config_for_path` has an arm for it).
+    ///
+    /// This says nothing about a file that ARRIVES by sync. Nothing watches
+    /// `~/.config/croft`: the reload path is driven by the editor's own save,
+    /// so a file rsynced in from elsewhere is not noticed until the remote
+    /// next launches, whatever this flag says. Kept because it records a real
+    /// property worth pinning, but the OUTPUT message deliberately does not
+    /// use it to promise a live apply.
     pub hot_reloads: bool,
 }
 
@@ -181,10 +187,11 @@ mod tests {
     }
 
     #[test]
-    fn the_hot_reload_flag_matches_what_the_remote_actually_reloads() {
+    fn the_hot_reload_flag_matches_what_croft_actually_reloads_on_save() {
         // `reload_config_for_path` has arms for keybindings, snippets,
-        // triggers and matchers, but none for macros. Promising a live
-        // apply for a file that needs a relaunch is the lie this pins.
+        // triggers and matchers, but none for macros. The flag records that
+        // and nothing more: a SYNCED file is not reloaded either way, because
+        // nothing watches the config directory.
         let hot: Vec<&str> = SYNCABLE
             .iter()
             .filter(|s| s.hot_reloads)

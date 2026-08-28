@@ -605,10 +605,7 @@ fn try_local_cross_install_streaming(
         );
     }
 
-    let mut mkdir = ssh.background_command();
-    mkdir
-        .arg(&ssh.host)
-        .arg("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"");
+    let mkdir = ssh.background_shell("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"");
     let mkdir_status =
         run_command_streaming(mkdir, log_tx).context("creating remote install dirs")?;
     if !mkdir_status.success() {
@@ -627,8 +624,7 @@ fn try_local_cross_install_streaming(
         anyhow::bail!("rsync exited with {rsync_status}");
     }
 
-    let mut act = ssh.background_command();
-    act.arg(&ssh.host).arg(activate_command(source_stamp));
+    let act = ssh.background_shell(&activate_command(source_stamp));
     let act_status =
         run_command_streaming(act, log_tx).context("activating remote croft binary")?;
     if !act_status.success() {
@@ -649,8 +645,7 @@ fn sync_local_source_to_remote_streaming(
     log_tx: &std::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut mkdir = ssh.background_command();
-    mkdir.arg(&ssh.host).arg(remote_source_dir_prep(&source));
+    let mkdir = ssh.background_shell(&remote_source_dir_prep(&source));
     let mkdir_status =
         run_command_streaming(mkdir, log_tx).context("creating remote source dir")?;
     if !mkdir_status.success() {
@@ -793,6 +788,20 @@ impl SshControl {
     /// load-bearing here.
     fn background_command(&self) -> Command {
         ssh_socket_command(&self.socket_path, true)
+    }
+
+    /// A background command that runs `script` on the remote, with the
+    /// destination host where ssh expects it: BEFORE the command.
+    ///
+    /// Every caller needs that ordering and one of them omitted it, which does
+    /// not fail loudly - ssh reads the first non-flag argument as the
+    /// destination, so `mkdir -p ~/.config/croft` became the hostname, the
+    /// connection failed, and the feature above it silently did nothing. The
+    /// ordering lives here now so a caller cannot get it wrong.
+    fn background_shell(&self, script: &str) -> Command {
+        let mut command = self.background_command();
+        command.arg(&self.host).arg(script);
+        command
     }
 }
 
@@ -1915,8 +1924,7 @@ fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
     // `background_command` for its `-n`: this runs before the session
     // takes the terminal, and a command that inherits stdin would race the
     // shell for the user's keystrokes.
-    let mut mk = ssh.background_command();
-    mk.arg("mkdir -p ~/.config/croft");
+    let mut mk = ssh.background_shell("mkdir -p ~/.config/croft");
     if !matches!(mk.status(), Ok(st) if st.success()) {
         log(String::from(
             "Config sync: could not create ~/.config/croft on the remote; skipping",
@@ -1941,19 +1949,16 @@ fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
         // nothing about whether the one they just edited went.
         let names: Vec<&str> = pushed.iter().map(|s| s.name).collect();
         log(format!("Config sync: pushed {}", names.join(", ")));
-        // A file with no reload arm on the remote applies next launch. Say
-        // so, rather than letting the push above imply it is already live.
-        let cold: Vec<&str> = pushed
-            .iter()
-            .filter(|s| !s.hot_reloads)
-            .map(|s| s.name)
-            .collect();
-        if !cold.is_empty() {
-            log(format!(
-                "Config sync: {} applies on the remote's next launch",
-                cold.join(", ")
-            ));
-        }
+        // ALL of it applies on the remote's next launch, not just the files
+        // with no reload arm. The reload path is driven by croft's own save
+        // (`reload_config_for_path`), and nothing watches ~/.config/croft, so
+        // a file that arrives by rsync is not noticed at all until relaunch.
+        // Saying "these four are live" would be the lie this message exists
+        // to prevent.
+        log(format!(
+            "Config sync: {} applies on the remote's next launch",
+            names.join(", ")
+        ));
     }
     if !failed.is_empty() {
         log(format!(
@@ -2803,6 +2808,44 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    // The destination host must come BEFORE the script. ssh reads the first
+    // non-flag argument as the destination, so a missing host does not fail
+    // loudly - it turns the command itself into the hostname, the connection
+    // fails, and whatever depended on it silently does nothing. That is
+    // exactly what happened to config sync: `mkdir -p ~/.config/croft` became
+    // the host, the mkdir "failed", and the feature returned before pushing a
+    // single file.
+    #[test]
+    fn a_background_shell_puts_the_host_before_the_script() {
+        let ssh = SshControl {
+            host: String::from("somebox"),
+            socket_dir: PathBuf::from("/tmp/x"),
+            socket_path: PathBuf::from("/tmp/x/ctl"),
+        };
+        let cmd = ssh.background_shell("mkdir -p ~/.config/croft");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let host_at = args.iter().position(|a| a == "somebox");
+        let script_at = args.iter().position(|a| a == "mkdir -p ~/.config/croft");
+        assert!(
+            host_at.is_some(),
+            "the destination host must be passed: {args:?}"
+        );
+        assert!(script_at.is_some(), "the script must be passed: {args:?}");
+        assert!(
+            host_at < script_at,
+            "ssh takes the destination BEFORE the command, or it reads the \
+             command as the hostname: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "-n"),
+            "a background command must not inherit stdin: {args:?}"
+        );
+    }
+
     use super::*;
 
     /// The relay-setup failure message carries ssh's own stderr when there is

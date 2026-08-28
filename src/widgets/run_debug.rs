@@ -229,8 +229,6 @@ impl RunDebugPanel {
         }
     }
 
-    /// Map a click at screen row `y` to the index of the debug row drawn there,
-    /// or `None` if the click missed the rendered rows.
     /// Map a click to the watch row whose remove `✕` sits at `(x, y)` —
     /// returns the index into the ORDER the Watch rows were rendered in,
     /// which the app maps back to its expression list.
@@ -241,6 +239,8 @@ impl RunDebugPanel {
             .map(|&(_, _, idx)| idx)
     }
 
+    /// Map a click at screen row `y` to the index of the debug row drawn there,
+    /// or `None` if the click missed the rendered rows.
     pub fn debug_row_at(&self, y: u16) -> Option<usize> {
         if !self.debug_active || self.last_debug_rows_shown == 0 || y < self.last_debug_row_y0 {
             return None;
@@ -284,7 +284,10 @@ impl RunDebugPanel {
         match (&self.selected_config, self.config_count) {
             (Some(name), _) => Some(format!("⚙ {name} ▾")),
             (None, 0) => None,
-            (None, n) => Some(format!("⚙ {n} debug configs ▾")),
+            // "entries" rather than "configs": the count covers compounds too
+            // since #250, and the singular case read "1 debug configs".
+            (None, 1) => Some(String::from("⚙ 1 debug entry ▾")),
+            (None, n) => Some(format!("⚙ {n} debug entries ▾")),
         }
     }
 
@@ -1143,8 +1146,15 @@ mod tests {
         panel.config_count = 2;
         assert_eq!(
             panel.config_row_label().as_deref(),
-            Some("⚙ 2 debug configs ▾")
+            Some("⚙ 2 debug entries ▾")
         );
+        panel.config_count = 1;
+        assert_eq!(
+            panel.config_row_label().as_deref(),
+            Some("⚙ 1 debug entry ▾"),
+            "singular reads correctly rather than \"1 debug configs\""
+        );
+        panel.config_count = 2;
         panel.selected_config = Some(String::from("Run API"));
         assert_eq!(panel.config_row_label().as_deref(), Some("⚙ Run API ▾"));
     }

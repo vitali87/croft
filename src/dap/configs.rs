@@ -43,6 +43,43 @@ pub struct DebugConfig {
     raw: Map<String, Value>,
 }
 
+/// Compounds declared beside the configurations, in the same precedence order
+/// as [`discover_configs`]: `.croft/launch.json` wins over `.vscode`, and a
+/// duplicate name from the lower-precedence file is dropped rather than
+/// listed twice.
+pub fn discover_compounds(root: &Path) -> Vec<Compound> {
+    let mut out: Vec<Compound> = Vec::new();
+    for rel in [".croft/launch.json", ".vscode/launch.json"] {
+        let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        for c in parse_compounds(&text, rel) {
+            if !out.iter().any(|existing| existing.name == c.name) {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Every configuration from every file, duplicates kept, in file-precedence
+/// order. [`discover_configs`] is the picker's list and drops a lower-precedence
+/// duplicate by name; a compound needs the ones it dropped, because its members
+/// name configurations in ITS OWN file and both files may use the same name.
+pub fn discover_configs_all(root: &Path) -> Vec<DebugConfig> {
+    let mut out: Vec<DebugConfig> = Vec::new();
+    for (rel, source) in [
+        (".croft/launch.json", ".croft/launch.json"),
+        (".vscode/launch.json", ".vscode/launch.json"),
+    ] {
+        let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        out.extend(parse_launch_json(&text, source));
+    }
+    out
+}
+
 /// Every configuration the workspace declares: `.croft/launch.json` first
 /// (croft-native, same schema, no `.vscode/` directory required), then
 /// `.vscode/launch.json`. Both are JSONC-tolerant. Order is preserved so the
@@ -94,6 +131,145 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
                 source,
                 raw: obj.clone(),
             })
+        })
+        .collect()
+}
+
+/// A `compounds` entry: several configurations launched together under one
+/// name. Members are stored as written and resolved against the file's
+/// `configurations` at launch time, so a compound naming a configuration that
+/// is later renamed fails loudly rather than launching a subset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compound {
+    pub name: String,
+    pub configurations: Vec<String>,
+    /// Keys croft does not honour that this compound ACTUALLY ASKS FOR:
+    /// `preLaunchTask` with a non-empty value, or a non-empty `presentation`.
+    /// A key present but requesting nothing (`null`, `""`, `{}`) is not
+    /// recorded — croft delivers that behaviour by doing nothing.
+    ///
+    /// `stopAll` is deliberately absent at either value: it decides whether
+    /// ending one session ends the others, which is meaningless for the
+    /// single-session launch this list gates.
+    ///
+    /// Recorded rather than silently dropped because a ONE-member compound now
+    /// launches, and launching it via its member alone would run neither the
+    /// compound's own pre-launch task nor respect its presentation. Note the
+    /// MULTI-member path still discards these silently: it refuses for the
+    /// session count first, and #310 is the blocker the user must clear.
+    pub unsupported_keys: Vec<&'static str>,
+    /// Which file declared it. A compound's members name configurations in
+    /// ITS OWN file first: both files may declare the same name, and binding
+    /// a `.vscode` compound to a `.croft` config of that name would debug a
+    /// different program than the compound was written against.
+    pub source: &'static str,
+}
+
+/// Parse the `compounds` array of a launch.json body. Sibling key of
+/// `configurations`, so this reads the same text [`parse_launch_json`] does.
+/// Entries without a `name` or a non-empty `configurations` list are skipped —
+/// VS Code refuses to run those too, and an empty compound would present as a
+/// picker row that does nothing.
+pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
+    let Ok(v) = serde_json::from_str::<Value>(&crate::tasks::strip_jsonc(text)) else {
+        return Vec::new();
+    };
+    let Some(Value::Array(list)) = v.get("compounds") else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|c| {
+            let obj = c.as_object()?;
+            let name = obj.get("name")?.as_str()?.to_string();
+            // Members may be bare names or `{ "folder": …, "name": … }`
+            // objects in multi-root workspaces; croft resolves against one
+            // root, so take the name either way rather than dropping the row.
+            //
+            // Collect FALLIBLY: one unusable member drops the whole compound
+            // rather than shrinking it to the members that happen to parse.
+            // `resolve_compound` already refuses to launch a subset when a
+            // member names no configuration; a malformed member is the same
+            // situation one boundary earlier, and silently running two of the
+            // three a user wrote is the outcome both guards exist to prevent.
+            let configurations: Vec<String> = obj
+                .get("configurations")?
+                .as_array()?
+                .iter()
+                .map(|m| match m {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Object(o) => o.get("name")?.as_str().map(str::to_string),
+                    _ => None,
+                })
+                .collect::<Option<Vec<String>>>()?;
+            if configurations.is_empty() {
+                return None;
+            }
+            // Only `name` and `configurations` are read above. Every other key
+            // VS Code defines is dropped here, which was harmless while no
+            // compound could launch and is not any more — so record which ones
+            // ASK FOR SOMETHING rather than which ones are merely present.
+            //
+            // Presence is the wrong test. `stopAll: false` is VS Code's own
+            // default written out, and `preLaunchTask: null` requests nothing;
+            // croft honours both perfectly by doing nothing, so refusing to
+            // launch would name a key whose behaviour it is already delivering.
+            //
+            // `stopAll` is excluded from the ONE-member gate entirely, at either
+            // value: it governs whether ending one session ends the others, and
+            // with a single session there are no others. It cannot change a
+            // one-member outcome, so it cannot be a reason to refuse one.
+            let asks_for_something = |k: &str| match obj.get(k) {
+                None | Some(Value::Null) => false,
+                Some(Value::String(s)) => !s.is_empty(),
+                Some(Value::Bool(b)) => *b,
+                Some(Value::Object(o)) => !o.is_empty(),
+                Some(_) => true,
+            };
+            let unsupported_keys: Vec<&'static str> = ["preLaunchTask", "presentation"]
+                .into_iter()
+                .filter(|k| asks_for_something(k))
+                .collect();
+            Some(Compound {
+                name,
+                configurations,
+                source,
+                unsupported_keys,
+            })
+        })
+        .collect()
+}
+
+/// Resolve a compound's member names against the configurations declared
+/// beside it, in the compound's own order. Pass [`discover_configs_all`], not
+/// [`discover_configs`]: the latter drops a lower-precedence duplicate by name,
+/// which is exactly the entry a `.vscode` compound naming that name needs, so
+/// the source preference below would have nothing to prefer. Errors naming the first member that
+/// does not exist — launching the subset that happens to resolve would debug
+/// something other than what the user asked for, and silently.
+pub fn resolve_compound<'a>(
+    compound: &Compound,
+    configs: &'a [DebugConfig],
+) -> Result<Vec<&'a DebugConfig>, String> {
+    compound
+        .configurations
+        .iter()
+        .map(|want| {
+            // The compound's own file first: `discover_configs` merges both
+            // files with `.croft` winning a duplicate name, so a bare name
+            // match would bind a `.vscode` compound to a `.croft` config that
+            // may run a different program under a different adapter. Falling
+            // back to any file keeps a compound working when its members live
+            // in the sibling file, which VS Code also allows via `folder`.
+            configs
+                .iter()
+                .find(|c| &c.name == want && c.source == compound.source)
+                .or_else(|| configs.iter().find(|c| &c.name == want))
+                .ok_or_else(|| {
+                    format!(
+                        "compound \"{}\" names configuration \"{}\", which no launch.json declares",
+                        compound.name, want
+                    )
+                })
         })
         .collect()
 }
@@ -801,5 +977,304 @@ mod tests {
         assert_eq!(env["C"], "sq");
         assert!(!env.contains_key("not a pair"));
         assert!(!env.contains_key("BAD KEY"));
+    }
+
+    /// #250 phase 2: `compounds` names several configurations to launch
+    /// together. It is a sibling key of `configurations` in the same file, so
+    /// it parses alongside them rather than needing its own discovery pass.
+    /// Multi-root workspaces write members as `{ "folder": …, "name": … }`
+    /// rather than bare strings. croft resolves against one root, so the name
+    /// is taken either way — dropping the row would silently shrink a compound
+    /// to the members that happen to be written in the short form.
+    #[test]
+    fn compound_members_may_be_folder_name_objects_as_well_as_bare_strings() {
+        let text = r#"{"configurations":[
+              {"name":"Server","type":"lldb","request":"launch"},
+              {"name":"Client","type":"lldb","request":"launch"}],
+            "compounds":[{"name":"Mixed","configurations":[
+              "Server",
+              {"folder":"web","name":"Client"}]}]}"#;
+
+        let compounds = parse_compounds(text, ".vscode/launch.json");
+        assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
+        assert_eq!(
+            compounds[0].configurations,
+            vec!["Server", "Client"],
+            "an object member contributes its name, exactly as a bare string does"
+        );
+    }
+
+    /// A compound must bind to the configurations ITS OWN FILE declares. Both
+    /// files may declare the same name — `.croft` wins the picker row, but a
+    /// `.vscode` compound naming "Server" means .vscode's Server, which may be
+    /// a different program under a different adapter. Matching by bare name
+    /// against the merged list launches something other than what the user
+    /// wrote, which is the same rule the parse and resolve boundaries already
+    /// enforce for missing and malformed members.
+    #[test]
+    fn a_compound_binds_to_its_own_files_configuration_not_a_same_named_one() {
+        let croft = r#"{"configurations":[
+              {"name":"Server","type":"python","request":"launch","program":"croft.py"}]}"#;
+        let vscode = r#"{"configurations":[
+              {"name":"Server","type":"node","request":"launch","program":"vscode.js"}],
+            "compounds":[{"name":"VsCompound","configurations":["Server"]}]}"#;
+
+        // Through the PRODUCTION path, not hand-stitched input. Building the
+        // config list with two `parse_launch_json` calls asserts a property on
+        // an input shape the shipped program never produces: `discover_configs`
+        // keeps only the first occurrence per name, so the duplicate this
+        // preference exists to disambiguate would already be gone.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(tmp.path().join(".croft/launch.json"), croft).unwrap();
+        std::fs::write(tmp.path().join(".vscode/launch.json"), vscode).unwrap();
+
+        let configs = discover_configs_all(tmp.path());
+        let compounds = discover_compounds(tmp.path());
+        assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
+        assert_eq!(
+            compounds[0].source, ".vscode/launch.json",
+            "precondition: the compound remembers which file declared it"
+        );
+        assert_eq!(
+            configs.iter().filter(|c| c.name == "Server").count(),
+            2,
+            "precondition: the list resolve_compound receives still holds BOTH \
+             Servers — `discover_configs` would have dropped one, leaving the \
+             source preference nothing to prefer"
+        );
+        assert_eq!(
+            discover_configs(tmp.path())
+                .iter()
+                .filter(|c| c.name == "Server")
+                .count(),
+            1,
+            "and the picker's list drops it, which is why the two lists differ"
+        );
+
+        let members = resolve_compound(&compounds[0], &configs).expect("resolves");
+        assert_eq!(
+            members[0].source, ".vscode/launch.json",
+            "the .vscode compound binds .vscode's Server, not .croft's same-named one"
+        );
+        assert_eq!(
+            members[0].type_name, "node",
+            "which is a different adapter — binding .croft's python config here \
+             would debug a different program than the compound declares"
+        );
+    }
+
+    /// A compound with SOME unusable members must be dropped whole, not
+    /// silently shrunk to the ones that parse. `resolve_compound` already
+    /// refuses to launch a subset when a member names no configuration —
+    /// "launching the subset that happens to resolve would debug something
+    /// other than what the user asked for, and silently" — and a malformed
+    /// member is the same situation one boundary earlier.
+    #[test]
+    fn a_compound_with_one_unusable_member_is_dropped_rather_than_silently_shrunk() {
+        let text = r#"{"configurations":[
+              {"name":"A","type":"lldb","request":"launch"},
+              {"name":"B","type":"lldb","request":"launch"}],
+            "compounds":[
+              {"name":"Partial","configurations":["A", 7, "B"]},
+              {"name":"Whole","configurations":["A","B"]}]}"#;
+
+        let names: Vec<String> = parse_compounds(text, ".vscode/launch.json")
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Whole"],
+            "the compound with a malformed member is dropped entirely — shrinking \
+             it to [\"A\", \"B\"] would launch two of the three the user wrote"
+        );
+    }
+
+    /// A compound whose members all fail to parse would present as a picker row
+    /// that does nothing, so it is skipped entirely rather than listed empty.
+    #[test]
+    fn a_compound_with_no_usable_members_is_skipped_rather_than_listed_empty() {
+        let text = r#"{"configurations":[{"name":"A","type":"lldb","request":"launch"}],
+            "compounds":[
+              {"name":"Empty","configurations":[]},
+              {"name":"Unusable","configurations":[7, true]},
+              {"name":"Real","configurations":["A"]}]}"#;
+
+        let names: Vec<String> = parse_compounds(text, ".vscode/launch.json")
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Real"],
+            "an empty compound and one whose members are all unusable are both dropped"
+        );
+    }
+
+    #[test]
+    fn discover_compounds_prefers_croft_over_vscode_for_a_duplicate_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".croft")).unwrap();
+        std::fs::create_dir_all(root.join(".vscode")).unwrap();
+        std::fs::write(
+            root.join(".croft/launch.json"),
+            r#"{"configurations":[{"name":"A","type":"lldb","request":"launch"}],
+                "compounds":[{"name":"Both","configurations":["A"]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".vscode/launch.json"),
+            r#"{"configurations":[{"name":"B","type":"lldb","request":"launch"}],
+                "compounds":[{"name":"Both","configurations":["B"]},
+                             {"name":"VsOnly","configurations":["B"]}]}"#,
+        )
+        .unwrap();
+
+        let found = discover_compounds(root);
+        let names: Vec<&str> = found.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Both", "VsOnly"],
+            "both files contribute, .croft first"
+        );
+        assert_eq!(
+            found[0].configurations,
+            vec!["A"],
+            "the .croft definition of a duplicate name wins, not .vscode's"
+        );
+    }
+
+    #[test]
+    fn compounds_are_parsed_alongside_the_configurations_they_name() {
+        let text = r#"{
+            "configurations": [
+                { "name": "Server", "type": "node", "program": "s.js" },
+                { "name": "Client", "type": "node", "program": "c.js" }
+            ],
+            "compounds": [
+                { "name": "Full Stack", "configurations": ["Server", "Client"] }
+            ]
+        }"#;
+        // Precondition: the configurations themselves parse, so a compound
+        // finding nothing cannot be blamed on the file being unreadable.
+        let cfgs = parse_launch_json(text, ".vscode/launch.json");
+        assert_eq!(cfgs.len(), 2, "precondition: both configurations parsed");
+
+        let compounds = parse_compounds(text, ".vscode/launch.json");
+        assert_eq!(compounds.len(), 1, "the compound is found");
+        assert_eq!(compounds[0].name, "Full Stack");
+        assert_eq!(compounds[0].configurations, vec!["Server", "Client"]);
+    }
+
+    /// A compound naming a configuration that does not exist must fail loudly
+    /// at resolve time rather than silently launching the subset it can find —
+    /// the same posture as an unresolvable `${...}` variable (#250).
+    #[test]
+    fn a_compound_naming_a_missing_configuration_errors_rather_than_launching_a_subset() {
+        let text = r#"{
+            "configurations": [ { "name": "Server", "type": "node", "program": "s.js" } ],
+            "compounds": [ { "name": "Both", "configurations": ["Server", "Ghost"] } ]
+        }"#;
+        let cfgs = parse_launch_json(text, ".vscode/launch.json");
+        let compounds = parse_compounds(text, ".vscode/launch.json");
+        assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
+
+        let err = resolve_compound(&compounds[0], &cfgs)
+            .expect_err("a missing member is an error, not a shorter list");
+        assert!(
+            err.contains("Ghost"),
+            "the error names the missing configuration, got: {err}"
+        );
+    }
+
+    /// A key PRESENT but requesting nothing must not be recorded as
+    /// unsupported. `contains_key` was the first attempt and it refused these:
+    /// `stopAll: false` is VS Code's own default written out, and a null or
+    /// empty `preLaunchTask` asks for nothing at all. croft honours every one
+    /// of them perfectly by doing nothing, so naming them in a refusal tells
+    /// the user croft cannot do what it is already doing.
+    ///
+    /// `stopAll` is excluded at EITHER value: it decides whether ending one
+    /// session ends the others, and a one-member compound has no others.
+    #[test]
+    fn a_compound_key_that_requests_nothing_is_not_recorded_as_unsupported() {
+        let text = r#"{
+            "configurations": [ { "name": "A", "type": "node", "program": "a.js" } ],
+            "compounds": [
+                { "name": "DefaultStopAll", "configurations": ["A"], "stopAll": false },
+                { "name": "TrueStopAll", "configurations": ["A"], "stopAll": true },
+                { "name": "NulledTask", "configurations": ["A"], "preLaunchTask": null },
+                { "name": "EmptyTask", "configurations": ["A"], "preLaunchTask": "" },
+                { "name": "EmptyPresentation", "configurations": ["A"], "presentation": {} },
+                { "name": "RealTask", "configurations": ["A"], "preLaunchTask": "build" }
+            ]
+        }"#;
+        let cs = parse_compounds(text, ".vscode/launch.json");
+        assert_eq!(cs.len(), 6, "precondition: every compound parsed");
+        let by = |n: &str| {
+            cs.iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n} parsed"))
+        };
+
+        assert!(
+            by("DefaultStopAll").unsupported_keys.is_empty(),
+            "stopAll:false is VS Code's default and cannot change a one-member \
+             outcome: {:?}",
+            by("DefaultStopAll").unsupported_keys
+        );
+        assert!(
+            by("TrueStopAll").unsupported_keys.is_empty(),
+            "nor can stopAll:true — with one session there are no others to \
+             stop: {:?}",
+            by("TrueStopAll").unsupported_keys
+        );
+        assert!(
+            by("NulledTask").unsupported_keys.is_empty(),
+            "a null preLaunchTask asks for nothing: {:?}",
+            by("NulledTask").unsupported_keys
+        );
+        assert!(
+            by("EmptyTask").unsupported_keys.is_empty(),
+            "nor does an empty one: {:?}",
+            by("EmptyTask").unsupported_keys
+        );
+        assert!(
+            by("EmptyPresentation").unsupported_keys.is_empty(),
+            "nor an empty presentation object: {:?}",
+            by("EmptyPresentation").unsupported_keys
+        );
+
+        // The positive control: without it, six empties could equally mean the
+        // detection never records anything at all.
+        assert_eq!(
+            by("RealTask").unsupported_keys,
+            vec!["preLaunchTask"],
+            "and a key that DOES ask for something is still recorded"
+        );
+    }
+
+    /// A compound resolves to its members in the order written, so the picker
+    /// and the launch sequence agree with the file.
+    #[test]
+    fn a_resolved_compound_yields_its_members_in_declaration_order() {
+        let text = r#"{
+            "configurations": [
+                { "name": "Client", "type": "node", "program": "c.js" },
+                { "name": "Server", "type": "node", "program": "s.js" }
+            ],
+            "compounds": [ { "name": "Both", "configurations": ["Server", "Client"] } ]
+        }"#;
+        let cfgs = parse_launch_json(text, ".vscode/launch.json");
+        let compounds = parse_compounds(text, ".vscode/launch.json");
+        let members = resolve_compound(&compounds[0], &cfgs).unwrap();
+        assert_eq!(
+            members.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["Server", "Client"],
+            "compound order wins over the order in `configurations`"
+        );
     }
 }

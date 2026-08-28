@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Your config follows you over SSH: keybindings, snippets, triggers and matchers are pushed to a remote when you connect, so a fresh box is not a stock croft. MCP consent deliberately stays behind and must be granted per machine.",
+    summary: "Your config follows you over SSH: keybindings, snippets, triggers, matchers and macros are pushed to a remote when you connect, and apply on that remote's next launch. MCP consent deliberately stays behind.",
 }];

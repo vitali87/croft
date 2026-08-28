@@ -31,6 +31,7 @@ mod hover;
 mod nav;
 mod overlay;
 mod perf_hud;
+pub(crate) mod sidebar_dwell;
 mod welcome;
 use click::ClickTracker;
 use cursor_blink::CursorBlink;
@@ -40,6 +41,7 @@ use hover::{HOVER_DELAY, HoverDwell};
 use nav::{NavHistory, NavLoc};
 use overlay::OverlayManager;
 use perf_hud::PerfHud;
+use sidebar_dwell::{AUTO_HIDE_DWELL, SidebarDwell};
 use welcome::WelcomeState;
 
 use crate::widgets::terminal::cwd_of_pid;
@@ -2314,6 +2316,10 @@ pub struct App {
     /// Consuming it on the next attempt keeps the reveal usable while
     /// guaranteeing the feature re-arms itself.
     sidebar_pinned_open: bool,
+    /// Grace delay between focus leaving the sidebar and auto-hide collapsing
+    /// it (#302), so a click passing through the panel does not take it away
+    /// under the pointer.
+    sidebar_dwell: SidebarDwell,
     /// Pre-Zen visibility snapshot; `None` whenever not in Zen Mode.
     pre_zen: Option<PreZenLayout>,
     /// Hit-test rects for the top-right layout-control icons.
@@ -3060,6 +3066,10 @@ pub struct App {
     /// launch.json configurations discovered for the picker (#250); refreshed
     /// on every picker open so edits are picked up without a restart.
     debug_configs: Vec<crate::dap::configs::DebugConfig>,
+    /// Compounds declared beside those configurations. Listed in the picker so
+    /// a workspace's compounds are visible; launching one needs the
+    /// multi-session model tracked in #310.
+    debug_compounds: Vec<crate::dap::configs::Compound>,
     /// Name of the launch.json configuration F5 starts. `None` = the
     /// zero-config "Debug active file" behavior.
     selected_debug_config: Option<String>,
@@ -3979,6 +3989,7 @@ impl App {
             sidebar_auto_hide: loaded_prefs.sidebar_auto_hide,
             sidebar_auto_hide_suspended: false,
             sidebar_pinned_open: false,
+            sidebar_dwell: SidebarDwell::default(),
             pre_zen: None,
             layout_icon_areas: LayoutIconAreas::default(),
             status: String::from("Ready"),
@@ -4210,6 +4221,7 @@ impl App {
             process_picker: None,
             dap_session: None,
             debug_configs: Vec::new(),
+            debug_compounds: Vec::new(),
             selected_debug_config: None,
             pending_debug_launch: None,
             pending_test_debug: None,
@@ -6182,20 +6194,6 @@ impl App {
         }
     }
 
-    /// Keep each text tab's git-gutter baseline current. The first time a tab
-    /// is seen (or after it switches files, or after HEAD moves), shell out
-    /// once for the committed version of the file and hand it to the editor;
-    /// the per-line diff is then recomputed in-buffer on every edit with no
-    /// further subprocess. Cheap no-op once every open tab has a baseline:
-    /// just a path compare per tab.
-    ///
-    /// `read_file_at_head` is a `git show` (~tens of ms) but runs at most once
-    /// per (file, HEAD) pair, never on the keystroke path. Baselines are shared
-    /// across groups within a sweep: a split usually holds the SAME file in two
-    /// panes, and a HEAD move invalidates every tab in every group at once, so
-    /// without the cache one tick would shell out once per tab per group.
-    /// ponytail: synchronous fetch on the tick. Move to the git worker thread
-    /// if opening a file in a huge repo ever visibly hitches.
     /// The repository toplevel owning the workspace, from the git worker's
     /// last status reply — the only correct base for porcelain-derived
     /// paths and `HEAD:<rel>` pathspecs, which git resolves against the
@@ -6290,6 +6288,20 @@ impl App {
         self.git_worker_for_root_mut(&ws).bypass_debounce();
     }
 
+    /// Keep each text tab's git-gutter baseline current. The first time a tab
+    /// is seen (or after it switches files, or after HEAD moves), shell out
+    /// once for the committed version of the file and hand it to the editor;
+    /// the per-line diff is then recomputed in-buffer on every edit with no
+    /// further subprocess. Cheap no-op once every open tab has a baseline:
+    /// just a path compare per tab.
+    ///
+    /// `read_file_at_head` is a `git show` (~tens of ms) but runs at most once
+    /// per (file, HEAD) pair, never on the keystroke path. Baselines are shared
+    /// across groups within a sweep: a split usually holds the SAME file in two
+    /// panes, and a HEAD move invalidates every tab in every group at once, so
+    /// without the cache one tick would shell out once per tab per group.
+    /// ponytail: synchronous fetch on the tick. Move to the git worker thread
+    /// if opening a file in a huge repo ever visibly hitches.
     fn sync_git_gutters(&mut self) {
         // `HEAD:<rel>` pathspecs resolve against the toplevel (#139), and
         // each file resolves against the repo of ITS owning workspace
@@ -7379,10 +7391,6 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Rebuild the PROBLEMS panel's grouped projection from the per-file
-    /// diagnostics store. Returns whether the projection changed (so the caller
-    /// can fold it into its redraw decision). Files are grouped, ordered by
-    /// path; each group's diagnostics are ordered by position.
     /// Scan one finished command's output through the build matchers and
     /// install the results (#119). The pane's PREVIOUS contribution is
     /// replaced wholesale — a rebuild that fixed everything clears its old
@@ -7522,6 +7530,10 @@ impl App {
             .collect()
     }
 
+    /// Rebuild the PROBLEMS panel's grouped projection from the per-file
+    /// diagnostics store. Returns whether the projection changed (so the caller
+    /// can fold it into its redraw decision). Files are grouped, ordered by
+    /// path; each group's diagnostics are ordered by position.
     fn rebuild_problems(&mut self) -> bool {
         use crate::widgets::problems::{ProblemGroup, ProblemItem};
         let mut paths: Vec<&PathBuf> = self
@@ -8735,11 +8747,6 @@ impl App {
         changed
     }
 
-    /// Idle-caret occurrences trigger, run once per frame: when the caret has
-    /// rested on one buffer position for `OCCURRENCES_IDLE`, fire ONE
-    /// `documentHighlight` request for it; the moment it moves (or the buffer
-    /// edits), drop the painted set. Mirrors VS Code's word highlight, which
-    /// follows the cursor with a small debounce rather than every keystroke.
     /// Linked editing (#254): replay the last keystroke across the
     /// sibling tag ranges, keep the set alive only while the caret
     /// stays inside one, and (debounced on caret idle) ask the server
@@ -8935,6 +8942,11 @@ impl App {
         changed
     }
 
+    /// Idle-caret occurrences trigger, run once per frame: when the caret has
+    /// rested on one buffer position for `OCCURRENCES_IDLE`, fire ONE
+    /// `documentHighlight` request for it; the moment it moves (or the buffer
+    /// edits), drop the painted set. Mirrors VS Code's word highlight, which
+    /// follows the cursor with a small debounce rather than every keystroke.
     pub fn tick_occurrences(&mut self) -> bool {
         const OCCURRENCES_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
         let eligible = self.editor.diff.is_none()
@@ -9258,8 +9270,6 @@ impl App {
         self.overlays.welcome.mark_dirty();
     }
 
-    /// Toggle the secondary side bar (the Outline of the active file), on the
-    /// edge opposite the primary side bar. Mirrors ⌥⌘B.
     /// Show or hide the primary side bar. Every route that flips it by hand —
     /// the Cmd+B keybinding, the palette command, the Customize Layout row and
     /// the layout-icon click — goes through here, because each one is a
@@ -9274,7 +9284,19 @@ impl App {
         // Taken only when auto-hide is live: a pin set while the feature is
         // off would sit unconsumed and silently eat the first collapse after
         // they turn it on.
-        self.sidebar_pinned_open = self.show_tree && self.sidebar_auto_hide;
+        // Structural suppression (Zen Mode, or a hidden activity bar) means no
+        // collapse can fire for as long as it lasts, so a pin taken now is the
+        // "sits unconsumed and silently eats a later collapse" case this line
+        // already guards against for `!sidebar_auto_hide` — same bug, same
+        // answer: refuse to bank it rather than hold it indefinitely.
+        self.sidebar_pinned_open =
+            self.show_tree && self.sidebar_auto_hide && self.activity_bar_visible && !self.zen_mode;
+        // A deliberate toggle supersedes any pending automatic collapse: the
+        // dwell was armed against a sidebar state the user has since changed by
+        // hand. Leaving it armed lets a later idle tick fire against the NEW
+        // state — spending the pin this reveal just banked on a collapse the
+        // user never saw, which is #294 reached by a different door.
+        self.sidebar_dwell.disarm();
         // Hiding the sidebar while Run-Debug was on screen: arm the same
         // OSC-1337 image-cell evict gate that fires on a sidebar-view change.
         // Without this the bug+play icon ghosts on top of the editor /
@@ -9288,6 +9310,8 @@ impl App {
         }
     }
 
+    /// Toggle the secondary side bar (the Outline of the active file), on the
+    /// edge opposite the primary side bar. Mirrors ⌥⌘B.
     fn toggle_secondary_side_bar(&mut self) {
         self.secondary_side_bar_visible = !self.secondary_side_bar_visible;
         self.persist_layout();
@@ -9322,6 +9346,20 @@ impl App {
             self.activity_bar_visible = false;
             self.status_bar_visible = false;
             self.show_tree = false;
+            // Zen is structural, not a transient suppression: it can last the
+            // session, and a dwell left armed would fire on the frame Zen
+            // exits — a collapse the user long since stopped associating with
+            // the focus move that armed it.
+            //
+            // The pin goes too, for the reason `toggle_side_bar` refuses to
+            // bank one here: Zen sets both structural conditions, so no
+            // collapse can fire while it lasts and a pin held across it is
+            // unconsumable — it would silently eat the first real collapse
+            // after Zen exits. Main cleared this incidentally, by taking the
+            // pin on every focus move; consuming at fire time instead is
+            // correct but leaves this boundary to say so explicitly.
+            self.sidebar_dwell.disarm();
+            self.sidebar_pinned_open = false;
             self.secondary_side_bar_visible = false;
             self.show_terminal = false;
             self.zen_mode = true;
@@ -9768,9 +9806,6 @@ impl App {
         self.definition_request_id = Some(id);
     }
 
-    /// Request the LSP definition of the symbol at the current cursor (buffer)
-    /// position. Used by the editor right-click "Go to Definition" item, where
-    /// the cursor has already been moved to the click point.
     /// Alt+F12 / palette "Peek Definition": the definition request whose
     /// response opens an excerpt popup instead of jumping (#115).
     fn peek_definition_at_cursor(&mut self) {
@@ -9790,6 +9825,9 @@ impl App {
         self.status = String::from("Peeking definition");
     }
 
+    /// Request the LSP definition of the symbol at the current cursor (buffer)
+    /// position. Used by the editor right-click "Go to Definition" item, where
+    /// the cursor has already been moved to the click point.
     fn request_definition_at_cursor(&mut self) {
         let (line, character) = self
             .editor
@@ -11941,9 +11979,6 @@ impl App {
         self.save_terminal_session();
     }
 
-    /// Snapshot the terminal panel (pane order, cwds, names, focus) into
-    /// the per-workspace session store. Called on structural changes and at
-    /// quit; the default single-pane layout prunes the record instead.
     /// Set a structural-change status, keeping any latched session-store
     /// failure visible beside it (#158 review: plain assignments right
     /// after a failed save silently hid the persistence error).
@@ -11954,6 +11989,9 @@ impl App {
         };
     }
 
+    /// Snapshot the terminal panel (pane order, cwds, names, focus) into
+    /// the per-workspace session store. Called on structural changes and at
+    /// quit; the default single-pane layout prunes the record instead.
     pub fn save_terminal_session(&mut self) {
         let root = self.workspace_root().display().to_string();
         let panes = self
@@ -12729,6 +12767,25 @@ impl App {
     /// hold it open lives here rather than being scattered through the call
     /// sites, so the interaction rules are one readable list and a new
     /// suppression case has exactly one place to go.
+    /// Whether a STRUCTURAL suppression is in force: one that no passage of
+    /// time lifts, only a deliberate chrome change by the user.
+    ///
+    /// Split out from [`Self::sidebar_auto_hide_allowed`] because the tick has
+    /// to treat the two kinds differently and the combined predicate cannot
+    /// say which it declined for. A transient suppression (seam drag, open
+    /// palette, modal) ends in moments, so the dwell stays armed and retries.
+    /// A structural one can last the session, and a dwell left armed across it
+    /// fires on the frame it lifts — a collapse for a focus move the user made
+    /// an hour ago. Cancelling at the ARM site instead would make the retry
+    /// unreachable, which is the recovery path for the transient case.
+    fn sidebar_structurally_suppressed(&self) -> bool {
+        !self.activity_bar_visible || self.zen_mode
+    }
+
+    /// Whether auto-hide may collapse the sidebar RIGHT NOW. Every reason to
+    /// hold it open lives here rather than being scattered through the call
+    /// sites, so the interaction rules are one readable list and a new
+    /// suppression case has exactly one place to go.
     fn sidebar_auto_hide_allowed(&self) -> bool {
         if !self.sidebar_auto_hide || !self.show_tree {
             return false;
@@ -12737,11 +12794,12 @@ impl App {
         if self.sidebar_auto_hide_suspended {
             return false;
         }
-        // A deliberate reveal (Cmd+B) exempts the NEXT collapse; the flag is
-        // consumed in `maybe_auto_hide_sidebar`, never held.
-        if self.sidebar_pinned_open {
-            return false;
-        }
+        // NOTE: the one-shot reveal pin is deliberately NOT checked here. It is
+        // the caller's concern (`tick_sidebar_auto_hide_at`), because this
+        // predicate must stay answerable while a pin is banked: the tick asks
+        // "would this collapse otherwise fire?" precisely so it can decide
+        // whether spending the pin is warranted. Checking the pin here made
+        // that question unanswerable and the pin unspendable.
         // Mid-drag on the sidebar seam: the pointer is over the editor by
         // definition, and collapsing under the cursor is the flapping the
         // issue calls out.
@@ -12791,23 +12849,154 @@ impl App {
             let _ = crate::prefs::save_sidebar_auto_hide(self.sidebar_auto_hide);
         }
         // Turning it ON with the sidebar open takes effect at the next focus
-        // move rather than retroactively yanking it away here.
+        // move rather than retroactively yanking it away here — which means
+        // dropping any collapse already pending. A dwell armed before the
+        // setting was touched belongs to the old state: leaving it armed lets
+        // an idle tick collapse the sidebar after the user turns the feature
+        // off and on again, with no focus move of their own in between.
+        //
+        // The pin goes for the same reason, and the fourth boundary to say so.
+        // `toggle_side_bar` refuses to bank one while the feature is off,
+        // because "a pin set while the feature is off would sit unconsumed and
+        // silently eat the first collapse after they turn it on" — and a pin
+        // banked BEFORE the user disables auto-hide reaches that same state by
+        // the other route. Main cleared it incidentally by taking the pin on
+        // every focus move; consuming at fire time is correct but leaves each
+        // boundary to say so.
+        self.sidebar_dwell.disarm();
+        self.sidebar_pinned_open = false;
         self.status = format!(
             "Auto-hide side bar {}",
             if self.sidebar_auto_hide { "on" } else { "off" }
         );
     }
 
-    /// Collapse the sidebar if auto-hide is on and nothing is suppressing it.
-    /// Called on focus moves INTO the editor or a terminal.
+    /// Arm the grace delay before collapsing. Called on focus moves INTO the
+    /// editor or a terminal.
+    ///
+    /// #294 collapsed right here, which meant a click *passing through* the
+    /// panel on its way to the editor took the panel out from under the
+    /// pointer. The collapse now waits `AUTO_HIDE_DWELL` (#302) and fires from
+    /// `tick_sidebar_auto_hide`, so a click that lands back on the sidebar
+    /// inside the window cancels it.
+    ///
+    /// Note what is deliberately NOT done here: the one-shot pin is not
+    /// consumed. Arming is no longer the same event as collapsing, and eating
+    /// the exemption on an attempt the dwell then cancels would silently strip
+    /// a deliberate reveal of the protection it was granted. It is consumed
+    /// where the collapse actually happens.
     fn maybe_auto_hide_sidebar(&mut self) {
-        // Consume the one-shot exemption whether or not it was the reason we
-        // are not collapsing: holding it would let it outlive the reveal it
-        // was granted for.
-        let exempt = std::mem::take(&mut self.sidebar_pinned_open);
-        if !exempt && self.sidebar_auto_hide_allowed() {
-            self.show_tree = false;
+        // Cheap pre-check only. The real decision is re-made when the timer
+        // fires, because every suppression here can change during the window.
+        //
+        // `sidebar_auto_hide_suspended` is the exception and MUST be read here:
+        // it is scoped to a `without_auto_hide` closure and restored the moment
+        // that closure returns, so by tick time it is always false. Deferring
+        // it would silently un-suppress every programmatic focus move — the
+        // async MCP result, the launch-time file open, Enter on a sidebar row —
+        // which is the #260 flapping this flag exists to prevent. Arming is
+        // what has to be refused; there is nothing left to consult later.
+        //
+        // The STRUCTURAL suppressions (Zen Mode, hidden activity bar) are NOT
+        // checked here, and that is deliberate. Refusing to arm under them
+        // looks right and strands the feature: the tick stays armed through a
+        // decline and fires once the suppression lifts, so that retry IS the
+        // recovery path, and nothing that fails to arm can ever use it. Zen
+        // survives such a refusal only because Zen exit restores the pre-Zen
+        // snapshot and closes the sidebar, forcing a fresh reveal; a hidden
+        // activity bar restores nothing, focus is already on the editor, and
+        // production will not call `focus_pane` again for a pane that already
+        // has focus — so auto-hide would stay dead for the rest of the session
+        // with nothing on screen to explain it.
+        //
+        // The structural/transient distinction is drawn at FIRE time instead,
+        // where the state is actually known and no future suppression needs its
+        // own boundary hook. See `tick_sidebar_auto_hide_at`.
+        if self.sidebar_auto_hide && self.show_tree && !self.sidebar_auto_hide_suspended {
+            self.sidebar_dwell.arm(std::time::Instant::now());
         }
+    }
+
+    /// Fire a pending auto-hide collapse once its grace delay elapses.
+    ///
+    /// Returns `true` when the sidebar collapsed, so the frame redraws.
+    pub fn tick_sidebar_auto_hide(&mut self) -> bool {
+        self.tick_sidebar_auto_hide_at(std::time::Instant::now())
+    }
+
+    /// `tick_sidebar_auto_hide` with the clock injected, so the grace delay is
+    /// testable without sleeping — the same posture as `HoverDwell::due`.
+    pub(crate) fn tick_sidebar_auto_hide_at(&mut self, now: std::time::Instant) -> bool {
+        if !self.sidebar_dwell.armed() {
+            return false;
+        }
+        // Focus came back to the sidebar, or it is already closed: the pending
+        // collapse is moot. Leave the pin alone — it was never spent.
+        if self.focus == Pane::Tree || !self.show_tree {
+            self.sidebar_dwell.disarm();
+            return false;
+        }
+        if !self.sidebar_dwell.due(now, AUTO_HIDE_DWELL) {
+            return false;
+        }
+        // The window has elapsed and focus stayed away. Before spending
+        // anything, ask whether a collapse would fire at all: a tick stopped by
+        // a seam drag, an open palette or a modal is not the collapse the pin
+        // was banked for, and burning it there loses an exemption the user
+        // never saw honoured. Every earlier decline already leaves the pin
+        // alone; this makes the late one behave the same way.
+        //
+        // Stay ARMED on that decline, and disarm only once a collapse is
+        // actually due. These suppressions are transient — a drag ends, a
+        // palette closes — and nothing re-arms the dwell but a fresh focus
+        // move into the editor or terminal. Disarming here would drop the
+        // pending collapse for good, so a user whose palette happened to be
+        // open during the grace window would keep a sidebar that never
+        // auto-hides again. Retrying costs nothing: `main_loop` ticks on an
+        // 8ms cadence, so the collapse lands as soon as the suppression lifts.
+        // A STRUCTURAL suppression DEFERS and re-stamps. Cancelling here was
+        // the round-two defect: `main_loop` ticks every 8ms unconditionally, so
+        // a cancel-on-suppressed-tick fires 8ms after arming and is
+        // indistinguishable from refusing to arm at all — which strands the
+        // feature, because nothing re-arms once a hidden activity bar returns
+        // (focus never moved, and production will not re-focus a pane that
+        // already has focus).
+        //
+        // Re-stamping is what makes deferral safe. The complaint against
+        // deferral was that Zen can last an hour and the collapse would land on
+        // the frame it exits, for a focus move the user has long forgotten.
+        // Anchoring to the moment the suppression LIFTS answers that exactly:
+        // the user then gets the same AUTO_HIDE_DWELL grace they would get from
+        // a fresh focus move, measured from a moment they can actually perceive
+        // — the chrome coming back.
+        if self.sidebar_structurally_suppressed() {
+            self.sidebar_dwell.restamp(now);
+            return false;
+        }
+        if !self.sidebar_auto_hide_allowed() {
+            return false;
+        }
+        self.sidebar_dwell.disarm();
+        // A real collapse is now due, so this IS the moment the one-shot
+        // exemption is spent — whether or not it is what stops us.
+        //
+        // Semantics: the pin is spent by the next collapse that would genuinely
+        // have fired, not by the next tick — so a tick stopped by a TRANSIENT
+        // suppression (seam drag, palette, modal) spends nothing and the pin
+        // survives to do its job a moment later.
+        //
+        // Structural suppressions are decided HERE, above, not at the sites
+        // that enter them. Entry hooks cannot see the case where the dwell is
+        // armed while the suppression is ALREADY in force — Cmd+B works inside
+        // Zen, so no transition occurs and no hook fires. This tick is asked to
+        // distinguish a suppression that lasts a moment from one that lasts the
+        // session precisely because it is the one place that always runs.
+        let exempt = std::mem::take(&mut self.sidebar_pinned_open);
+        if !exempt {
+            self.show_tree = false;
+            return true;
+        }
+        false
     }
 
     fn focus_pane(&mut self, p: Pane) {
@@ -12835,7 +13024,13 @@ impl App {
         // the sidebar; moving INTO the sidebar releases the pin a reveal
         // command took, so the next move out can collapse it again.
         match p {
-            Pane::Tree => self.sidebar_pinned_open = false,
+            Pane::Tree => {
+                self.sidebar_pinned_open = false;
+                // Focus came back inside the grace window: the click was
+                // passing through, or landed here. Cancel the pending
+                // collapse (#302) rather than letting it fire under the user.
+                self.sidebar_dwell.disarm();
+            }
             Pane::Editor | Pane::Terminal => self.maybe_auto_hide_sidebar(),
         }
         self.focus = p;
@@ -15082,8 +15277,6 @@ impl App {
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
     }
 
-    /// Confirmation modal for "Discard All Changes" — reverts every tracked
-    /// edit to HEAD, so it gets the same red Y/N gate as a single discard.
     /// The Replace All confirmation modal (#123): counts up front, commits
     /// on Enter/Y, cancels on Esc/N — the discard-all popup's shape.
     fn render_replace_all_confirm(&self, frame: &mut ratatui::Frame) {
@@ -15145,6 +15338,8 @@ impl App {
         );
     }
 
+    /// Confirmation modal for "Discard All Changes" — reverts every tracked
+    /// edit to HEAD, so it gets the same red Y/N gate as a single discard.
     fn render_discard_all_confirm(&self, frame: &mut ratatui::Frame) {
         if !self.pending_discard_all {
             return;
@@ -17537,9 +17732,14 @@ impl App {
         self.run_debug.feedback = None;
         self.run_debug.feedback_is_error = false;
         // The launch.json config row (#250): count + F5 selection. Discovery
-        // is two small file reads and this only runs on active-file changes.
-        self.run_debug.config_count =
-            crate::dap::configs::discover_configs(&self.active_workspace_root()).len();
+        // re-reads the same two small files once per helper — four reads — and
+        // this only runs on active-file changes.
+        // Compounds count too — the row is the documented route to the picker,
+        // and the picker lists them, so counting only configurations makes the
+        // row vanish for a compounds-only workspace and undercount otherwise.
+        let root = self.active_workspace_root();
+        self.run_debug.config_count = crate::dap::configs::discover_configs(&root).len()
+            + crate::dap::configs::discover_compounds(&root).len();
         self.run_debug.selected_config = self.selected_debug_config.clone();
     }
 
@@ -18135,6 +18335,7 @@ impl App {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let root = self.active_workspace_root();
         self.debug_configs = crate::dap::configs::discover_configs(&root);
+        self.debug_compounds = crate::dap::configs::discover_compounds(&root);
         let mut rows = vec![ListRow {
             id: String::from("active"),
             label: String::from("Debug active file — no configuration"),
@@ -18143,6 +18344,20 @@ impl App {
             id: i.to_string(),
             label: format!("{} — {} · {}", c.name, c.type_name, c.source),
         }));
+        // Compounds are listed so a workspace's own launch.json is reflected
+        // honestly. Selecting one LAUNCHES it when it names a single
+        // configuration and carries no key croft cannot honour; otherwise it
+        // reports what is missing (#310) rather than launching a subset, which
+        // would debug something other than what was asked for.
+        rows.extend(
+            self.debug_compounds
+                .iter()
+                .enumerate()
+                .map(|(i, c)| ListRow {
+                    id: format!("compound:{i}"),
+                    label: format!("{} — compound of {}", c.name, c.configurations.join(", ")),
+                }),
+        );
         self.open_list_picker(
             ListPicker::new(ListPurpose::DebugConfig, "Debug Configuration", rows),
             "No debug configurations (.croft/launch.json or .vscode/launch.json)",
@@ -18824,7 +19039,6 @@ impl App {
         self.start_selected_debug();
     }
 
-    /// Shift+F5: stop debugging and tear the session down.
     /// A session ended: the expressions survive (they usually make sense for
     /// the next run too), but the values, the changed-value baseline, and the
     /// baseline latch are that session's — left in place they made every
@@ -18835,6 +19049,7 @@ impl App {
         self.watch_baseline_pending = false;
     }
 
+    /// Shift+F5: stop debugging and tear the session down.
     pub fn debug_stop(&mut self) {
         if let Some(session) = self.dap_session.as_mut() {
             session.disconnect();
@@ -21346,7 +21561,89 @@ impl App {
                 }
             }
             ListPurpose::DebugConfig => {
-                if row.id == "active" {
+                if let Some(idx) = row.id.strip_prefix("compound:") {
+                    // Index the row straight through rather than round-tripping
+                    // via the name. `discover_compounds` dedupes by name, so a
+                    // lookup would find the same element today — but it asks a
+                    // weaker question than the one the row already answers, and
+                    // it made the not-found arm unreachable-but-present.
+                    let found = idx
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| self.debug_compounds.get(i));
+                    if let Some(compound) = found {
+                        // Resolve first: a compound naming a configuration no
+                        // launch.json declares is a config error worth
+                        // reporting now, separately from the unbuilt feature.
+                        // The un-deduped list: `debug_configs` is the picker's
+                        // display list and drops a lower-precedence duplicate by
+                        // name, which is the very entry a `.vscode` compound
+                        // naming that name has to bind.
+                        let all = crate::dap::configs::discover_configs_all(
+                            &self.active_workspace_root(),
+                        );
+                        // #310 defers compounds that need SEVERAL sessions at
+                        // once. A compound naming ONE configuration needs one,
+                        // which croft has run since #250 — so the arity has to
+                        // be READ here rather than assumed. Reporting the
+                        // multi-session limit for a one-member compound cites
+                        // a limitation that does not apply and tells the user
+                        // something false about their own launch.json.
+                        match crate::dap::configs::resolve_compound(compound, &all) {
+                            Err(e) => self.debug_error(e),
+                            // A one-member compound carrying keys croft does
+                            // not honour is REFUSED rather than launched.
+                            // `parse_compounds` reads only `name` and
+                            // `configurations`, so launching via the member
+                            // alone would run neither the compound's own
+                            // `preLaunchTask` nor respect `presentation` — the
+                            // "silently debug something other than what was
+                            // asked for" outcome every guard here exists to
+                            // prevent. Saying so beats doing it.
+                            Ok(members)
+                                if members.len() == 1
+                                    && !compound.unsupported_keys.is_empty() =>
+                            {
+                                // #318, NOT #310: this compound needs ONE
+                                // session, which croft runs. What it cannot do
+                                // is honour the key. Citing the multi-session
+                                // limit here would be the same false claim the
+                                // launching branch below exists to stop making.
+                                //
+                                // The remedy is stated with its cost: running
+                                // the member directly DOES skip a preLaunchTask,
+                                // which is the very outcome this refusal
+                                // prevents. Offering it silently would relocate
+                                // the bug onto the user.
+                                let keys = compound.unsupported_keys.join(" and ");
+                                let plural = if compound.unsupported_keys.len() > 1 {
+                                    "those keys"
+                                } else {
+                                    "that key"
+                                };
+                                self.debug_error(format!(
+                                    "compound \"{}\" sets {}, which croft does not honour yet (#318) — remove {} to launch \"{}\" through the compound, or run \"{}\" directly and do the work {} asks for yourself",
+                                    compound.name,
+                                    keys,
+                                    plural,
+                                    members[0].name,
+                                    members[0].name,
+                                    plural
+                                ));
+                            }
+                            Ok(members) if members.len() == 1 => {
+                                let cfg = members[0].clone();
+                                self.selected_debug_config = Some(cfg.name.clone());
+                                self.run_debug.selected_config = Some(cfg.name.clone());
+                                self.launch_debug_config(&cfg);
+                            }
+                            Ok(_) => self.debug_error(format!(
+                                "compound \"{}\" needs several debug sessions at once, which croft does not support yet (#310)",
+                                compound.name
+                            )),
+                        }
+                    }
+                } else if row.id == "active" {
                     self.selected_debug_config = None;
                     self.run_debug.selected_config = None;
                     self.start_selected_debug();
@@ -31201,11 +31498,14 @@ impl App {
                             // A second click on the same row opens that port,
                             // the same as pressing Enter on it.
                             let now = std::time::Instant::now();
-                            if self.ports_click.is_double(now, m.column, m.row) {
+                            if self
+                                .ports_click
+                                .is_double(now, m.column, m.row, m.modifiers)
+                            {
                                 self.ports_open_selected();
                                 self.ports_click.clear();
                             } else {
-                                self.ports_click.record(now, m.column, m.row);
+                                self.ports_click.record(now, m.column, m.row, m.modifiers);
                             }
                         }
                         None => self.focus_pane(Pane::Terminal),
@@ -31463,7 +31763,8 @@ impl App {
                     if let Some(idx) = self.search.hit_at_y(m.row) {
                         self.search.selected = idx;
                         let now = std::time::Instant::now();
-                        let is_double = self.tree_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.tree_click.is_double(now, m.column, m.row, m.modifiers);
                         if let Some(hit) = self.search.selected_hit().cloned() {
                             self.open_search_hit(&hit);
                             if is_double {
@@ -31473,7 +31774,7 @@ impl App {
                         if is_double {
                             self.tree_click.clear();
                         } else {
-                            self.tree_click.record(now, m.column, m.row);
+                            self.tree_click.record(now, m.column, m.row, m.modifiers);
                         }
                     } else {
                         // Click on the input/header area: just focus search.
@@ -31671,14 +31972,15 @@ impl App {
                     if let Some(idx) = self.remote.target_at_y(m.row) {
                         self.remote.select(idx);
                         let now = std::time::Instant::now();
-                        let is_double = self.tree_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.tree_click.is_double(now, m.column, m.row, m.modifiers);
                         if is_double {
                             if let Some(target) = self.remote.selected_target().cloned() {
                                 self.request_remote_launch(target.alias, None);
                             }
                             self.tree_click.clear();
                         } else {
-                            self.tree_click.record(now, m.column, m.row);
+                            self.tree_click.record(now, m.column, m.row, m.modifiers);
                         }
                     }
                     return;
@@ -31728,7 +32030,8 @@ impl App {
                     }
                     if let Some(idx) = self.tree.node_at_y(m.row) {
                         let now = std::time::Instant::now();
-                        let is_double = self.tree_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.tree_click.is_double(now, m.column, m.row, m.modifiers);
                         let has_shift = m.modifiers.contains(KeyModifiers::SHIFT);
                         // macOS terminals (iTerm2, Terminal.app) never put the
                         // Cmd bit on mouse events — the SGR mouse encoding only
@@ -31826,7 +32129,7 @@ impl App {
                         if is_double {
                             self.tree_click.clear();
                         } else {
-                            self.tree_click.record(now, m.column, m.row);
+                            self.tree_click.record(now, m.column, m.row, m.modifiers);
                         }
                     }
                 } else if in_editor_pane && !in_editor {
@@ -31981,7 +32284,9 @@ impl App {
                             return;
                         }
                         let now = std::time::Instant::now();
-                        let is_double = self.editor_click.is_double(now, m.column, m.row);
+                        let is_double =
+                            self.editor_click
+                                .is_double(now, m.column, m.row, m.modifiers);
                         let last_inner = self.editor.last_inner;
                         if let Some(diff) = self.editor.diff.as_mut() {
                             if let Some((side, row_idx, char_col)) =
@@ -32001,7 +32306,7 @@ impl App {
                         if is_double {
                             self.editor_click.clear();
                         } else {
-                            self.editor_click.record(now, m.column, m.row);
+                            self.editor_click.record(now, m.column, m.row, m.modifiers);
                         }
                         self.poke_cursor();
                         return;
@@ -32089,7 +32394,9 @@ impl App {
                         return;
                     }
                     let now = std::time::Instant::now();
-                    let is_double = self.editor_click.is_double(now, m.column, m.row);
+                    let is_double = self
+                        .editor_click
+                        .is_double(now, m.column, m.row, m.modifiers);
                     if is_double {
                         self.editor.select_word_at(m.column, m.row);
                         self.editor_click.clear();
@@ -32097,7 +32404,7 @@ impl App {
                         // Anchor a fresh selection at the click; a drag widens it,
                         // a clean click ends up cleared on mouse-up.
                         self.editor.mouse_down(m.column, m.row);
-                        self.editor_click.record(now, m.column, m.row);
+                        self.editor_click.record(now, m.column, m.row, m.modifiers);
                     }
                     self.poke_cursor();
                 } else if let Some(idx) = terminal_hit {
@@ -32160,7 +32467,9 @@ impl App {
                     // two panes never paint a highlight at once (issue #23).
                     self.editor.clear_selection();
                     let now = std::time::Instant::now();
-                    let is_double = self.terminal_click.is_double(now, m.column, m.row);
+                    let is_double =
+                        self.terminal_click
+                            .is_double(now, m.column, m.row, m.modifiers);
                     if is_double {
                         self.terminal_mut().select_word_at(m.column, m.row);
                         self.terminal_click.clear();
@@ -32170,7 +32479,8 @@ impl App {
                         // ends up cleared on mouse-up. With a drag, this is the
                         // selection anchor.
                         self.terminal_mut().start_selection_at(m.column, m.row);
-                        self.terminal_click.record(now, m.column, m.row);
+                        self.terminal_click
+                            .record(now, m.column, m.row, m.modifiers);
                     }
                 }
             }
@@ -34375,6 +34685,26 @@ impl App {
             MenuAction::OpenCustomizeLayout => self.open_customize_layout_menu(),
             MenuAction::ToggleActivityBar => {
                 self.activity_bar_visible = !self.activity_bar_visible;
+                // The bar is a structural auto-hide suppression, and unlike Zen
+                // it flips here on its own. A pending collapse armed against the
+                // old chrome would otherwise sit armed while `allowed()` declines
+                // for it, then fire on the first idle tick after the bar comes
+                // back, with no focus move of the user's own.
+                //
+                // Cancel the collapse. And when the bar goes AWAY, drop the pin
+                // too — for the reason `toggle_side_bar` already refuses to bank
+                // one in that state: no collapse can fire while the bar is
+                // hidden, so a pin held across that period is unconsumable, and
+                // it silently eats the first real collapse after the bar
+                // returns. Those two sites disagreed about the same question
+                // until this line; the bank-time answer is the right one.
+                //
+                // Revealing the bar leaves any pin alone: a pin banked while the
+                // bar is visible belongs to a reveal that can still be honoured.
+                self.sidebar_dwell.disarm();
+                if !self.activity_bar_visible {
+                    self.sidebar_pinned_open = false;
+                }
                 self.persist_layout();
                 self.after_chrome_visibility_change();
                 self.open_customize_layout_menu_on(&MenuAction::ToggleActivityBar);
@@ -34507,9 +34837,6 @@ impl App {
         }
     }
 
-    /// Close every saved (non-dirty) editor tab, keeping any with unsaved
-    /// changes. Shared by the tab context menu and the `Cmd+K U` chord so both
-    /// surfaces produce the same status line and split-collapse behavior.
     /// Cmd+K W / tab context "Close All": close every tab in EVERY editor
     /// group, not just the focused one, collapsing any split back to a single
     /// blank pane. A side-by-side layout (e.g. `cgr duplicates` diffs) would
@@ -34538,6 +34865,9 @@ impl App {
         self.poke_cursor();
     }
 
+    /// Close every saved (non-dirty) editor tab, keeping any with unsaved
+    /// changes. Shared by the tab context menu and the `Cmd+K U` chord so both
+    /// surfaces produce the same status line and split-collapse behavior.
     fn close_saved_tabs(&mut self) {
         let removed = self.editor.close_saved();
         if removed == 0 {
@@ -36033,10 +36363,6 @@ impl App {
         sheet_follow_cursor(sheet, current, visible);
     }
 
-    /// Hex-tab navigation (#172): cursor movement over bytes, Shift
-    /// extending the selection, F3 repeating the last find. The viewport
-    /// row count comes from the last painted frame's layout (frame
-    /// truth), so PageUp/PageDown match what the user sees.
     /// Archive browser keys (#179): selection movement, Enter extracts
     /// the member to scratch and opens it through the normal dispatch,
     /// E prompts for an extraction folder.
@@ -36116,6 +36442,10 @@ impl App {
         );
     }
 
+    /// Hex-tab navigation (#172): cursor movement over bytes, Shift
+    /// extending the selection, F3 repeating the last find. The viewport
+    /// row count comes from the last painted frame's layout (frame
+    /// truth), so PageUp/PageDown match what the user sees.
     fn handle_hex_key(&mut self, key: KeyEvent) {
         // Cmd/Ctrl+F never reaches here — `is_editor_find_key` routes to
         // `open_editor_find` earlier in the dispatch, which forwards hex
@@ -36227,10 +36557,6 @@ impl App {
         }
     }
 
-    /// F3 / "Hex: Find Next": repeat the stored query from just past the
-    /// cursor. The query itself is set by the find prompt
-    /// (`InputPurpose::HexFind`), whose submit searches cursor-INCLUSIVE
-    /// via `hex_find_run` directly.
     /// Sheet row/column structure ops (#177), palette-driven, anchored
     /// on the selected cell. CSV/TSV only; the workbook kinds are still
     /// read-only (#178).
@@ -36332,6 +36658,10 @@ impl App {
         }
     }
 
+    /// F3 / "Hex: Find Next": repeat the stored query from just past the
+    /// cursor. The query itself is set by the find prompt
+    /// (`InputPurpose::HexFind`), whose submit searches cursor-INCLUSIVE
+    /// via `hex_find_run` directly.
     fn hex_find_next(&mut self) {
         let Some(view) = self.editor.hex.as_ref() else {
             return;
@@ -37036,11 +37366,6 @@ fn mode_reassert_seq() -> Vec<u8> {
     seq
 }
 
-/// True when the "command" modifier is effectively held. That is `Super`
-/// (Cmd) everywhere; on Termux (Android, no Cmd key) `Ctrl` stands in for it
-/// too, mirroring VS Code's Linux keymap so the Super-only chords stay
-/// reachable. `termux` is threaded in explicitly to keep the decision pure
-/// and testable.
 /// Shrink `s` to at most `max` chars by cutting the middle, keeping roughly
 /// a third of the head and two thirds of the tail — for path-shaped
 /// messages the tail carries the filename, the part worth keeping. Never
@@ -37081,6 +37406,11 @@ fn peek_excerpt(
     (start, lines[start..end].to_vec())
 }
 
+/// True when the "command" modifier is effectively held. That is `Super`
+/// (Cmd) everywhere; on Termux (Android, no Cmd key) `Ctrl` stands in for it
+/// too, mirroring VS Code's Linux keymap so the Super-only chords stay
+/// reachable. `termux` is threaded in explicitly to keep the decision pure
+/// and testable.
 fn cmd_active(mods: KeyModifiers, termux: bool) -> bool {
     mods.contains(KeyModifiers::SUPER) || (termux && mods.contains(KeyModifiers::CONTROL))
 }
@@ -37982,10 +38312,6 @@ fn is_select_to_bracket_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
-/// `Ctrl+T`: Transpose Characters around the Cursor (VS Code's
-/// `editor.action.transpose`). A raw control byte, so it needs no iTerm2 /
-/// Ghostty forwarder; the editor intercepts it only when focused, leaving the
-/// shell's own `Ctrl+T` intact when the terminal is focused.
 /// VS Code "Go Back" (Ctrl+-). The kitty keyboard protocol delivers the
 /// chord as `-` + CONTROL; the legacy encoding folds Ctrl+- into 0x1F,
 /// which decodes as `_` + CONTROL, so both spellings are accepted.
@@ -38016,6 +38342,10 @@ fn is_navigate_forward_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
+/// `Ctrl+T`: Transpose Characters around the Cursor (VS Code's
+/// `editor.action.transpose`). A raw control byte, so it needs no iTerm2 /
+/// Ghostty forwarder; the editor intercepts it only when focused, leaving the
+/// shell's own `Ctrl+T` intact when the terminal is focused.
 fn is_transpose_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -40574,6 +40904,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let implementation_changed = app.drain_lsp_implementation();
         let references_changed = app.drain_lsp_references();
         let call_hierarchy_changed = app.drain_lsp_call_hierarchy();
+        let sidebar_hide_changed = app.tick_sidebar_auto_hide();
         let occ_tick_changed = app.tick_occurrences();
         let linked_tick_changed = app.tick_linked_editing();
         let linked_changed = app.drain_lsp_linked_editing();
@@ -40657,6 +40988,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || implementation_changed
             || references_changed
             || call_hierarchy_changed
+            || sidebar_hide_changed
             || occ_tick_changed
             || linked_tick_changed
             || linked_changed
