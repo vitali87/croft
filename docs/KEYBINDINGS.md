@@ -128,7 +128,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | Preferences: Open Keyboard Shortcuts (JSON) | `keybindings.json` | Rebind any palette command; **applies on save** |
 | Preferences: Configure User Snippets | `snippets.json` | Define snippets; **applies on save** |
 
-**Custom keybindings.** `keybindings.json` is a JSON (with `//` comments) array of `{ "key": …, "command": … }`. The `key` is a chord like `ctrl+shift+p`, `cmd+,`, `alt+up`, or `f2`; modifiers are `ctrl`, `alt`/`opt`, `shift`, `cmd`/`super`, and `mod` (Cmd on macOS, Ctrl elsewhere). The `command` is a palette command id (see the ids in `Preferences: Open Settings`, e.g. `save_file`, `quick_open`, `toggle_terminal`). A bound chord wins over the built-in default for the same chord. Bindings apply while any pane except the terminal is focused, and only to chords that carry a modifier or are function keys, so plain typing and the terminal's control keys are never shadowed. In iTerm2, reserved `Cmd` chords must be forwarded first (`croft setup-iterm2`); `Ctrl`/`Alt`/function-key bindings always reach croft, and Ghostty forwards everything after `croft setup-ghostty`.
+**Custom keybindings.** `keybindings.json` is a JSON (with `//` comments) array of `{ "key": …, "command": … }`. The `key` is a chord like `ctrl+shift+p`, `cmd+,`, `alt+up`, or `f2`; modifiers are `ctrl`, `alt`/`opt`, `shift`, `cmd`/`super`, and `mod` (Cmd on macOS, Ctrl elsewhere). The `command` is a palette command id (see the ids in `Preferences: Open Settings`, e.g. `save_file`, `quick_open`, `toggle_terminal`). A bound chord wins over the built-in default for the same chord. These restrictions are about KEYBOARD chords: they apply while any pane except the terminal is focused, and only to chords that carry a modifier or are function keys, so plain typing and the terminal's control keys are never shadowed. Mouse gestures are bound in the same file under different rules — they reach the terminal, and a bare gesture is allowed where it collides with nothing (see [Mouse bindings in `keybindings.json`](#mouse-bindings-in-keybindingsjson) below). In iTerm2, reserved `Cmd` chords must be forwarded first (`croft setup-iterm2`); `Ctrl`/`Alt`/function-key bindings always reach croft, and Ghostty forwards everything after `croft setup-ghostty`.
 
 **User snippets.** `snippets.json` mirrors VS Code's global snippets file: an object keyed by a name, each with a `prefix`, a `body` (a string or an array of lines), and an optional `scope` (comma-separated language ids; omit for every language). Type a snippet's prefix and press `Tab` to expand it, or pick it from the completion popup (it appears there alongside language-server suggestions, accepted with `Enter`/`Tab`). The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in order with `Tab`, `$0` is the final caret, and `${1:name}` seeds a stop with selected placeholder text. Continuation lines are re-indented to the caret. Language-server completions that arrive as snippets (rust-analyzer's `println!` and the like) expand the same way.
 
@@ -582,3 +582,65 @@ The CAPTURES tab collects output lines matched by `capture` triggers in `trigger
 Ghostty resolves its own keybinds (`new_tab`, `goto_tab`, ...) before it hands a key to croft, so by default `⌘T` opens a Ghostty tab and `⌘1`..`⌘9` switch Ghostty tabs instead of reaching croft. `croft setup-ghostty` adds a managed `keybind` block to your Ghostty config (`~/.config/ghostty/config`, or `~/Library/Application Support/com.mitchellh.ghostty/config`) that re-emits every croft chord as the same CSI-u sequence iTerm2 forwards, via Ghostty's `csi:` action. After running it, reload the config (`⌘⇧,`) or restart Ghostty.
 
 The chord set is identical to the [iTerm2 key mappings](#iterm2-key-mappings) above (`⌘T` / `⌘W` / `⌘[` / `⌘]`, `⌘1`..`⌘9` / `⌘0`, the editor / Explorer / Source Control chords, the `⌘F12` family, and so on), so croft behaves the same under both terminals. `⌘V` is left on Ghostty's native paste for the same reason it is under iTerm2. Only the block between croft's marker comments is rewritten on each run; the rest of your Ghostty config is preserved.
+
+## Mouse bindings in `keybindings.json`
+
+Mouse gestures bind in the same array as keys, using a gesture name in `key`
+and an optional `when` region:
+
+```jsonc
+[
+  { "key": "ctrl+click",       "command": "mouse_go_to_definition_at_click" },
+  { "key": "alt+click",        "command": "mouse_add_cursor_at_click" },
+  { "key": "middle_click",     "command": "search_from_terminal", "when": "terminal" },
+  { "key": "alt+wheel_up",     "command": "toggle_word_wrap" }
+]
+```
+
+**Gestures (six bindable):** `click`, `double_click`, `middle_click`,
+`right_click`, `wheel_up`, `wheel_down`, each combinable with `ctrl`, `alt`,
+`shift`. A seventh name, `triple_click`, is recognised and refused with a
+warning rather than ignored — see the refusal table below.
+
+**`when` regions:** `editor` (the default when omitted), `terminal`,
+`file_tree`, `tab_strip`. The same gesture can mean different things in
+different regions.
+
+User bindings resolve *before* the built-in behaviour, so rebinding one takes
+it over; a gesture with no binding falls through untouched.
+
+Three commands read the click position and are meaningless from the keyboard:
+`mouse_add_cursor_at_click`, `mouse_go_to_definition_at_click`, and
+`mouse_open_link_at_click`. Invoked from the palette they report that they
+need a mouse binding rather than guessing at the caret.
+
+### What croft refuses, and why
+
+A refused row is reported in **OUTPUT · Keybindings** and, on a live reload,
+summarised in the status bar — it never fails silently.
+
+| Refused | Why |
+|---|---|
+| `cmd+click` / `super+click` | Terminals do not report Cmd/Super with mouse events (SGR mouse reporting carries no Super bit), so the binding could never fire. Use `ctrl` or `alt`. This is also why croft's own Go to Definition rides Ctrl. |
+| `triple_click` | croft's click tracker distinguishes single from double only, so a triple binding would fire on the second click and mean something other than what it says. |
+| bare `click` in `editor` or `terminal` | It is how the caret is placed; rebinding it leaves no way to do that. Bare `click` in `file_tree` or `tab_strip` is allowed. |
+| bare `double_click` in `editor` or `terminal` | It is the only way to select a word; rebinding it leaves no way to do that. A *modified* double-click (`ctrl+double_click`) is bindable, and bare `double_click` in `file_tree` or `tab_strip` is allowed. |
+
+`mod` means Ctrl for mouse on every platform, unlike keys where it is Cmd on
+macOS — for the same reporting reason.
+
+**In terminal panes**, a TUI that has asked for mouse tracking owns the
+pointer, so user bindings do not fire there; hold `shift` to bypass, the same
+rule croft's built-in scroll follows.
+
+The pane **border** is the exception: it sits outside the grid the child is
+ever told about, so a binding there fires normally however the TUI is
+tracking. Same carve-out croft's built-in wheel makes — a notch on the border
+scrolls croft rather than vanishing into a program that cannot receive it.
+
+Note that `shift` is *also* part of a gesture's identity, so bypassing selects
+a different row rather than rescuing the one you already have: over a tracking
+TUI, a `ctrl+click` binding stays silent no matter what, and the row that fires
+when you hold shift is `ctrl+shift+click`. Bind that spelling if you want a
+gesture that works over a full-screen TUI.
+

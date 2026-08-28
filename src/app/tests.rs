@@ -1523,6 +1523,1367 @@ fn mouse(
     }
 }
 
+/// A tree app, rendered, so `tree.last_area` is populated and a click can be
+/// aimed at a real cell.
+fn tree_app_with_keymap(json: &str) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "let name = value;\nfn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // An open buffer, so a click in the editor region resolves to it. Without
+    // one there is no editor to hit and the gesture falls through.
+    app.editor.open_pinned(&f).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(json);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    (app, tmp)
+}
+
+#[test]
+fn a_bound_gesture_runs_its_command() {
+    // The headline claim of #259, driven end to end: a gesture in
+    // keybindings.json reaches `run_command`. Everything else in this file
+    // tested the parser or the tracker in isolation.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+click", "command": "quick_open", "when": "editor"}]"#,
+    );
+    assert!(app.file_finder.is_none(), "nothing open yet");
+
+    let col = app.editor.last_inner.x + 4;
+    let row = app.editor.last_inner.y + 1;
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    assert!(
+        app.file_finder.is_some(),
+        "the bound command must run, taking the gesture over from its built-in"
+    );
+}
+
+#[test]
+fn a_gesture_runs_the_binding_for_the_region_it_was_clicked_in() {
+    // The same spelling bound in two regions must resolve by where the click
+    // landed, which is what `mouse_context_for` exists for.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+click", "command": "quick_open", "when": "file_tree"},
+            {"key": "ctrl+click", "command": "toggle_side_bar", "when": "editor"}]"#,
+    );
+
+    let mut in_tree = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        app.tree.last_area.x + 2,
+        app.tree.last_area.y + 1,
+    );
+    in_tree.modifiers = KeyModifiers::CONTROL;
+    let tree_was = app.show_tree;
+    app.handle_mouse(in_tree);
+    assert!(
+        app.file_finder.is_some(),
+        "a click in the tree runs the file_tree row"
+    );
+    assert_eq!(
+        app.show_tree, tree_was,
+        "and must not run the editor row bound to the same spelling"
+    );
+}
+
+#[test]
+fn a_click_binding_does_not_disable_the_double_click_binding_beside_it() {
+    // The dispatch returns early, skipping the built-in branch that would
+    // have recorded the click. Without recording it itself, a firing `click`
+    // binding leaves `is_double` false forever and the `double_click` binding
+    // beside it never fires again.
+    //
+    // Driven through `handle_mouse`: the previous version of this test called
+    // `tree_click.record` itself and asserted `is_double`, which is a
+    // tautology about `ClickTracker` that passes with the fix reverted.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "click", "command": "save_file", "when": "file_tree"},
+            {"key": "double_click", "command": "quick_open", "when": "file_tree"}]"#,
+    );
+    let col = app.tree.last_area.x + 2;
+    let row = app.tree.last_area.y + 1;
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.file_finder.is_none(),
+        "the first click is a single and must run the `click` row"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.file_finder.is_some(),
+        "the second must still read as a double — the click binding has to \
+         keep the tracker the built-in would have kept"
+    );
+}
+
+#[test]
+fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
+    // The dispatch returns early, above the teardown every other left-press
+    // path runs. Without doing it itself, a fired binding leaves a hover or
+    // tab tooltip painted over state the command just changed — describing
+    // what was there before it ran.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+click", "command": "quick_open", "when": "editor"}]"#,
+    );
+    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+        String::from("stale hover"),
+        (1, 1),
+    ));
+    app.tab_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new(
+        String::from("stale tab tooltip"),
+        (1, 1),
+    ));
+
+    let mut ev = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        app.editor.last_inner.x + 4,
+        app.editor.last_inner.y + 1,
+    );
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    assert!(app.file_finder.is_some(), "the binding fired");
+    assert!(
+        app.hover_popup.is_none(),
+        "a fired binding must dismiss the hover it painted over"
+    );
+    assert!(app.tab_tooltip.is_none(), "and the tab tooltip with it");
+}
+
+#[test]
+fn a_terminal_miss_does_not_blame_a_view_it_never_searched() {
+    // The refusal was scoped to the editor lookup, but the STATUS derived from
+    // the same predicate stayed arm-wide: a click in a TERMINAL pane with no
+    // link reported "No links in this view", naming the editor's view — which
+    // `editor_blocked` had already short-circuited, so it was never searched.
+    //
+    // "a non-text view is up" and "the editor lookup is the one that missed"
+    // are different questions, and the status must answer the second.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "mouse_open_link_at_click", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+    assert!(
+        app.editor.has_non_text_view(),
+        "precondition: a non-text view must be up, or the arm-wide status and \
+         the scoped one agree and this test cannot tell them apart"
+    );
+
+    // Plain text, no link anywhere on the row.
+    app.terminals[0].feed_bytes_for_test(b"just some words\r\n");
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.terminals[0].last_area;
+    let (col, row) = (area.x + 2, area.y + 1);
+    assert!(
+        app.terminals[0].hyperlink_at_screen(col, row).is_none(),
+        "precondition: the cell must hold NO link, or this tests the hit path"
+    );
+    assert_eq!(
+        app.terminal_at_pos(col, row),
+        Some(0),
+        "precondition: and must be inside a terminal pane, or the editor \
+         lookup is legitimately the one that missed"
+    );
+
+    app.focus_pane(Pane::Terminal);
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    assert_eq!(
+        app.status, "No link there",
+        "a miss in a TERMINAL pane must not name the editor's view: that \
+         lookup was short-circuited and never searched"
+    );
+}
+
+#[test]
+fn a_terminal_link_binding_is_not_refused_for_an_editor_side_reason() {
+    // `MouseOpenLinkAtClick` spans two panes: it tries the editor's document
+    // link, then falls through to the terminal helpers. The `has_non_text_view`
+    // guard was placed on the whole ARM, but its justification — `buffer_pos_at`
+    // maps cells from the TEXT layout, so a diff/hex view yields a position
+    // into a buffer the user is not looking at — is about the EDITOR lookup
+    // only. `terminal_url_click`/`terminal_file_click` read `self.terminal()`
+    // and are independent of editor view state.
+    //
+    // The built-in this command replaces guards neither, so an arm-wide guard
+    // made the bound command diverge from the built-in in the opposite
+    // direction to the one the guard was added to fix.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    // `App::new` + direct keymap assignment, matching the sibling OSC 8 tests:
+    // `tree_app_with_keymap` focuses the TREE, which lays the panes out
+    // differently and moves the terminal's `last_area`.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "mouse_open_link_at_click", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // The editor shows a hex preview of an UNRELATED file — the state the
+    // guard exists for, and which has nothing to do with the terminal.
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+    assert!(
+        app.editor.has_non_text_view(),
+        "precondition: the editor must be on a non-text view, or the guard \
+         never fires and this test is about the ordinary path"
+    );
+
+    // A non-web OSC 8 link in the terminal: resolves via `hyperlink_at_screen`,
+    // then `open_detected_url` refuses the scheme INERTLY. A web URL would
+    // reach `open_url` and launch a real browser.
+    app.terminals[0].feed_bytes_for_test(b"\x1b]8;;mailto:t@example.com\x1b\\link\x1b]8;;\x1b\\");
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.terminals[0].last_area;
+    let (col, row) = (area.x + 2, area.y + 1);
+    assert_eq!(
+        app.terminals[0].hyperlink_at_screen(col, row).as_deref(),
+        Some("mailto:t@example.com"),
+        "precondition: the click must land on the terminal link, or a refusal \
+         proves nothing about which branch refused it"
+    );
+
+    app.focus_pane(Pane::Terminal);
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    assert_eq!(
+        app.status, "Refused to open non-web link: mailto:t@example.com",
+        "a TERMINAL-region link binding must reach the terminal helpers even \
+         while the EDITOR shows a hex preview of an unrelated file: the guard's \
+         reason does not apply to a pane it does not read"
+    );
+}
+
+#[test]
+fn the_at_click_commands_all_refuse_a_non_text_view() {
+    // All three At Click commands guard on `has_non_text_view`, because
+    // `buffer_pos_at` maps cells from the TEXT layout and still returns a
+    // position on a diff/sheet/hex/log view — so without the guard they would
+    // act on coordinates belonging to a buffer the user is not looking at.
+    //
+    // Short-circuiting all three guards to false leaves the full suite green,
+    // so the guards shipped unpinned. Each arm asserts its OWN status, since
+    // a shared assertion would pass with two of the three guards deleted.
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+
+    // Positive control: without this the test passes vacuously if the fixture
+    // ever stops producing a non-text view.
+    assert!(
+        app.editor.has_non_text_view(),
+        "precondition: the fixture must actually open a non-text view, or \
+         every assertion below is about the ordinary text path"
+    );
+    // And the commands must have a click to act on, or they take the
+    // keyboard-invocation arm and refuse for an unrelated reason.
+    app.last_mouse_pos = Some((10, 10));
+
+    for (cmd, want) in [
+        (
+            crate::widgets::command_palette::Command::MouseAddCursorAtClick,
+            "No cursors in this view",
+        ),
+        (
+            crate::widgets::command_palette::Command::MouseGoToDefinitionAtClick,
+            "No definitions in this view",
+        ),
+        (
+            crate::widgets::command_palette::Command::MouseOpenLinkAtClick,
+            "No links in this view",
+        ),
+    ] {
+        app.status = String::from("untouched");
+        app.run_command(cmd);
+        assert_eq!(
+            app.status, want,
+            "{cmd:?} must refuse on a non-text view rather than acting on a \
+             buffer position the user cannot see"
+        );
+    }
+}
+
+#[test]
+fn a_binding_on_the_terminal_border_fires_because_the_child_cannot_receive_it() {
+    // `child_owns_pointer` declines a user binding when the child has asked
+    // for mouse tracking. But `terminal_at_pos` hit-tests `last_area`, which
+    // INCLUDES the border, while delivery goes through `cell_at`, which
+    // hit-tests `last_inner` and excludes it. So a click on the border was
+    // suppressed for the child's benefit and then never reached the child:
+    // lost by both parties.
+    //
+    // The built-in wheel path already has this rule and says so
+    // ("the wheel sat on the pane BORDER, outside the inner grid ... falls
+    // through like any non-tracking pane instead of swallowing the notch"),
+    // but it requires `report_mouse` to actually return true. This predicate
+    // checked only `mouse_reporting()`.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.focus_pane(Pane::Terminal);
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "terminal must be laid out"
+    );
+    let (col, row) = (area.x + 2, area.y);
+
+    // The two facts that make this a BORDER click rather than a grid click.
+    // Without both, the test would be about something else entirely.
+    assert!(
+        app.terminals[0].cell_at(col, row).is_none(),
+        "precondition: this cell must be OUTSIDE the inner grid, or the child \
+         could receive it and suppression would be correct"
+    );
+    assert_eq!(
+        app.terminal_at_pos(col, row),
+        Some(0),
+        "precondition: but INSIDE last_area, or `child_owns_pointer` never \
+         considers this terminal and the test proves nothing"
+    );
+
+    // Child asks for tracking: the real predicate `mouse_reporting` consults.
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    assert!(
+        app.terminals[0].mouse_reporting(),
+        "precondition: the child must be tracking, or there is nothing to \
+         decline the binding for"
+    );
+
+    let before = app.editor.wrap_enabled();
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    assert_ne!(
+        app.editor.wrap_enabled(),
+        before,
+        "a binding on the BORDER must fire: the child cannot own a cell it \
+         will never be told about, so declining here loses the gesture for \
+         both parties. The wheel path already falls through on this exact case"
+    );
+}
+
+#[test]
+fn the_swallowed_prefix_click_dismisses_the_hover_and_tab_tooltip() {
+    // The sibling test above binds `ctrl+click` to a real command, so it takes
+    // the MATCHED branch. The swallow branch needs a gesture that matches
+    // NOTHING but is the first half of a bound double — a different arm, with
+    // its own early return, which for a while did none of the teardown.
+    //
+    // Deleting `dismiss_click_overlays` from the swallow branch leaves the
+    // whole suite green without this test, so the code was correct today and
+    // unguarded tomorrow.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+double_click", "command": "quick_open", "when": "editor"}]"#,
+    );
+    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+        String::from("stale hover"),
+        (1, 1),
+    ));
+    app.tab_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new(
+        String::from("stale tab tooltip"),
+        (1, 1),
+    ));
+
+    let mut ev = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        app.editor.last_inner.x + 4,
+        app.editor.last_inner.y + 1,
+    );
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    // Proves this took the SWALLOW path, not the matched one: only
+    // `ctrl+double_click` is bound, so a single click matches no command.
+    // Without this the test could pass via the sibling branch's teardown and
+    // say nothing about the swallow.
+    assert!(
+        app.file_finder.is_none(),
+        "the prefix click must NOT fire the bound double's command — if it \
+         did, this exercises the matched branch and not the swallow"
+    );
+    assert!(
+        app.hover_popup.is_none(),
+        "a swallowed prefix click must dismiss the hover it painted over, \
+         exactly as the matched branch does: it re-focuses the pane underneath"
+    );
+    assert!(app.tab_tooltip.is_none(), "and the tab tooltip with it");
+}
+
+#[test]
+fn every_mouse_binding_the_docs_show_actually_loads() {
+    // Round 7 found `paste` and `page_up` in this example, neither of which is
+    // a real command id: `Keymap::from_json` skipped both rows with a warning,
+    // so a user copying the documented snippet got a keymap that silently did
+    // less than it said. A doc example that does not load is worse than none,
+    // and the only way that stays true is to load the real file here rather
+    // than a copy that can drift from it.
+    let doc = include_str!("../../docs/KEYBINDINGS.md");
+    let block = doc
+        .split("## Mouse bindings in `keybindings.json`")
+        .nth(1)
+        .expect("the mouse bindings section is still in KEYBINDINGS.md")
+        .split("```jsonc")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("the section still carries a jsonc example block");
+    assert!(
+        block.contains("\"command\""),
+        "the extracted block must be the binding example, not an empty match"
+    );
+
+    let (_km, warnings) = crate::keymap::Keymap::resolve(block);
+    assert!(
+        warnings.is_empty(),
+        "the documented example must load cleanly, but got: {warnings:?}"
+    );
+}
+
+#[test]
+fn a_modified_double_click_can_fire_at_all() {
+    // The dispatch deliberately refuses to record a MODIFIED click into the
+    // built-in trackers: they are shared with the editor's plain select-word,
+    // so arming them with a ctrl+click would make the user's next ORDINARY
+    // click select a word they never asked for. But `double_click` is only
+    // classified by asking a tracker whether it just saw a click here — so
+    // with nothing recording modified clicks, `ctrl+double_click` could never
+    // become true and the binding was unreachable. A separate tracker keeps
+    // both rules: the built-in one stays unarmed, the modified pair is seen.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Bound in `terminal`, not `editor`: with no file open the editor is never
+    // laid out (`last_area` comes back height 0), so no click coordinate can
+    // land in it and the binding's `when` could never match. The terminal is
+    // always present, and this test is about whether a modified double-click
+    // can fire AT ALL — the region it fires in is incidental.
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let before = app.editor.wrap_enabled();
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "the terminal must be laid out, or the click lands nowhere and this \
+         test passes or fails for reasons unrelated to double-click tracking"
+    );
+    let (col, row) = (area.x + 2, area.y + 1);
+
+    // First ctrl+click: arms the modified tracker, fires nothing (no `click`
+    // row is bound), and must NOT arm the plain tracker.
+    let mut first = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    first.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(first);
+    assert_eq!(
+        app.editor.wrap_enabled(),
+        before,
+        "the first click of the pair is not yet a double"
+    );
+
+    // Second ctrl+click at the same cell: now it is a double, so it fires.
+    let mut second = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    second.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(second);
+    assert_ne!(
+        app.editor.wrap_enabled(),
+        before,
+        "ctrl+double_click must be reachable, not permanently dead"
+    );
+}
+
+#[test]
+fn a_bound_gesture_moves_keyboard_focus_to_the_pane_it_clicked() {
+    // Round 7: the dispatch made the clicked terminal pane ACTIVE (so commands
+    // read the right grid) but never called `focus_pane`, which is a different
+    // thing — it decides where the next KEYSTROKE goes. So a bound gesture
+    // clicked into the terminal ran against the terminal while the user's
+    // typing kept going to the editor they had left.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "mouse_open_link_at_click", "when": "terminal"}]"#,
+    );
+    app.focus_pane(Pane::Editor);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(area.width > 4 && area.height > 2, "the terminal is visible");
+    let mut ev = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        area.y + 1,
+    );
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    // `matches!` rather than `assert_eq!`: `Pane` has no `Debug`, and deriving
+    // one on a production type just to format a test failure is the wrong
+    // trade.
+    assert!(
+        matches!(app.focus, Pane::Terminal),
+        "clicking a pane with a bound gesture must focus it, or the next \
+         keystroke goes to the pane the user just clicked away from"
+    );
+}
+
+#[test]
+fn a_bound_wheel_gesture_fires_and_a_modified_wheel_does_not_match_the_bare_row() {
+    // The wheel is the one gesture family whose dispatch no other test drives
+    // end to end — the rest of the coverage stops at the parser. It is also
+    // the family where a regression is invisible: a wheel that silently falls
+    // through to the built-in scroll looks like ordinary scrolling.
+    //
+    // Modifiers are part of a gesture's identity, so a bare `wheel_up` row
+    // must not answer a ctrl+wheel_up. That is the same rule the shift test
+    // above pins for clicks, checked here for the wheel.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) =
+        tree_app_with_keymap(r#"[{"key": "wheel_up", "command": "quick_open", "when": "editor"}]"#);
+    let _ = MouseButton::Left;
+
+    let (col, row) = (app.editor.last_inner.x + 4, app.editor.last_inner.y + 1);
+    let mut modified = mouse(MouseEventKind::ScrollUp, col, row);
+    modified.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(modified);
+    assert!(
+        app.file_finder.is_none(),
+        "ctrl+wheel_up must not match a bare `wheel_up` row"
+    );
+
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, col, row));
+    assert!(
+        app.file_finder.is_some(),
+        "a bare wheel_up binding must fire through the dispatch"
+    );
+}
+
+#[test]
+fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one() {
+    // Splits make several terminals visible at once, and every terminal
+    // command reads the grid through `self.terminal()`, i.e. the ACTIVE
+    // pane. The built-in ctrl+click makes the clicked pane active before
+    // resolving the link; the binding dispatch returns above that point, so
+    // without its own activation a bound `mouse_open_link_at_click` inspects
+    // whichever pane happened to be focused and reports "No link there" over
+    // a URL the user can plainly see.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "mouse_open_link_at_click", "when": "terminal"}]"#,
+    );
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.terminals.len(), 2, "two panes are visible");
+
+    // The URL is printed into pane 0 only, while pane 1 holds focus.
+    // An OSC 8 hyperlink with a NON-WEB scheme, not a printed http(s) URL.
+    // `terminal_url_click` checks `hyperlink_at_screen` before text sniffing,
+    // so this resolves; and `open_detected_url` then refuses a non-web scheme
+    // inertly. A printed https URL would reach `open_url`, which is
+    // `Command::new("open")` with no test guard — the suite would launch a
+    // real browser on every run (#307's spawning class).
+    app.terminals[0]
+        .feed_bytes_for_test(b"\x1b]8;;mailto:zero@example.com\x1b\\zero-link\x1b]8;;\x1b\\\r\n");
+    app.active_terminal = 1;
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Click directly on the URL — in pane 0, the pane that is NOT active.
+    // The pane's first row is its border, so the printed line lands on the
+    // next one. Assert the cell really holds the URL first: clicking an
+    // empty cell also yields "No link there", which would pass this test
+    // for entirely the wrong reason.
+    let area = app.terminals[0].last_area;
+    let (col, row) = (area.x + 2, area.y + 1);
+    assert_eq!(
+        app.terminals[0].hyperlink_at_screen(col, row).as_deref(),
+        Some("mailto:zero@example.com"),
+        "the click must land on the OSC 8 link, or a refusal proves nothing"
+    );
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+
+    // Positive form, not `assert_ne!("No link there")`: excluding one string
+    // cannot tell "resolved pane 0's link" from "resolved nothing and said so
+    // differently". The `zero@` address also pins WHICH pane resolved — pane 1
+    // holds focus and carries no link.
+    assert_eq!(
+        app.status, "Refused to open non-web link: mailto:zero@example.com",
+        "the bound command must resolve against the CLICKED pane; it read the active one"
+    );
+    assert_eq!(
+        app.active_terminal, 0,
+        "clicking a pane through a binding makes it active, as the built-in does"
+    );
+}
+
+#[test]
+fn a_mouse_tracking_child_keeps_the_pointer_from_a_bound_wheel() {
+    // A tracking child owns the gestures croft actually FORWARDS, and croft
+    // forwards exactly one kind: `report_mouse`'s three production call sites
+    // all construct WheelUp/WheelDown. So the wheel is the case where "the
+    // child asked for it" is true, and a bound wheel must decline for the
+    // child. Clicks are covered by
+    // `a_bound_click_still_fires_over_a_mouse_tracking_child`, which asserts
+    // the opposite for the opposite reason: there is no click-forwarding path,
+    // so declining a click hands it to nobody.
+    //
+    // SHIFT is the documented override.
+    use crossterm::event::MouseEventKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+wheel_up", "command": "quick_open", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // The child enables mouse tracking.
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.terminals[0].mouse_reporting(),
+        "the child is tracking the mouse"
+    );
+
+    let area = app.terminals[0].last_area;
+    let (col, row) = (area.x + 2, area.y + 1);
+    // Precondition: the cell must be inside `last_inner`, or the guard
+    // declines for the BORDER reason and this proves nothing about tracking.
+    assert!(
+        app.terminals[0].cell_at(col, row).is_some(),
+        "the wheel must land on a real grid cell"
+    );
+    let mut ev = mouse(MouseEventKind::ScrollUp, col, row);
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+    assert!(
+        app.file_finder.is_none(),
+        "croft FORWARDS the wheel to a tracking child (all three `report_mouse` \
+         call sites construct WheelUp/WheelDown), so the child really does own \
+         this gesture and the binding must not fire"
+    );
+}
+
+/// The Shift half of the same rule, on its own app: the first click of the
+/// pair above is forwarded to the child, which starts a selection drag, and
+/// a drag in flight legitimately swallows the next press. Sequencing the two
+/// halves would test that interaction rather than the bypass.
+#[test]
+fn holding_shift_takes_the_pointer_back_from_a_tracking_child() {
+    // Shift is ALSO part of a gesture's identity, so the bypass selects a
+    // different row rather than rescuing the `ctrl+click` one: over a
+    // tracking TUI you must bind `ctrl+shift+click` for a gesture that fires.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+shift+click", "command": "quick_open", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(app.terminals[0].mouse_reporting(), "the child is tracking");
+
+    let area = app.terminals[0].last_area;
+    let mut shifted = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        area.y + 1,
+    );
+    shifted.modifiers = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    app.handle_mouse(shifted);
+    assert!(
+        app.file_finder.is_some(),
+        "Shift takes the pointer back and the ctrl+shift+click row fires"
+    );
+}
+
+#[test]
+fn a_tab_strip_binding_fires_only_on_the_strip() {
+    // `gesture_for` deliberately shares `editor_click` between the strip and
+    // the editor body. That is only safe because a double needs both clicks
+    // at the SAME cell and the two regions never overlap, so pin it.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+click", "command": "quick_open", "when": "tab_strip"}]"#,
+    );
+    let strip_y = app.editor.tab_strip_y_for_test();
+    let tab = app
+        .editor
+        .tab_at(app.editor.last_inner.x + 1, strip_y)
+        .map(|_| (app.editor.last_inner.x + 1, strip_y))
+        .expect("a rendered tab cell to aim at");
+
+    let mut on_strip = mouse(MouseEventKind::Down(MouseButton::Left), tab.0, tab.1);
+    on_strip.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(on_strip);
+    assert!(
+        app.file_finder.is_some(),
+        "the strip row fires on the strip"
+    );
+
+    // The body is a different region, so the same spelling must fall through
+    // to the built-in rather than firing the tab_strip row.
+    app.file_finder = None;
+    let body_row = app.editor.last_inner.y + 1;
+    assert_ne!(body_row, strip_y, "the strip and the body do not overlap");
+    let mut in_body = mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        app.editor.last_inner.x + 4,
+        body_row,
+    );
+    in_body.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(in_body);
+    assert!(
+        app.file_finder.is_none(),
+        "a tab_strip binding must not fire in the editor body"
+    );
+}
+
+#[test]
+fn the_at_click_commands_refuse_a_keyboard_invocation() {
+    // Each reads the click through `last_mouse_pos`, which a palette or
+    // chord invocation leaves None. They must say so rather than guess at
+    // the caret and act somewhere the user never pointed.
+    use crate::widgets::command_palette::Command;
+    let (mut app, _tmp) = tree_app_with_keymap("[]");
+    for (cmd, want) in [
+        (
+            Command::MouseAddCursorAtClick,
+            "Mouse: Add Cursor at Click needs a mouse binding",
+        ),
+        (
+            Command::MouseGoToDefinitionAtClick,
+            "Mouse: Go to Definition at Click needs a mouse binding",
+        ),
+        (
+            Command::MouseOpenLinkAtClick,
+            "Mouse: Open Link at Click needs a mouse binding",
+        ),
+    ] {
+        app.last_mouse_pos = None;
+        app.status.clear();
+        app.run_command(cmd);
+        assert_eq!(app.status, want, "{cmd:?} must refuse a keyboard call");
+    }
+}
+
+#[test]
+fn a_modified_click_binding_does_not_arm_the_plain_double_click() {
+    // `GestureKind::Click` covers `ctrl+click` too, and the built-ins read
+    // their trackers without consulting modifiers. Recording a modified click
+    // armed the editor's plain double-click, so the user's next ordinary
+    // click selected a word they never gestured for.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("t.rs");
+    std::fs::write(&file, "let name = value;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "save_file", "when": "editor"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    let col = app.editor.last_inner.x + 12;
+    let row = app.editor.last_inner.y;
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+
+    // A plain click always anchors a collapsed selection (anchor == head);
+    // that is true with no binding loaded too. The defect is a non-empty one,
+    // i.e. a WORD the user never gestured for.
+    let selected_a_word = app.editor.selection.is_some_and(|s| s.anchor != s.head);
+    assert!(
+        !selected_a_word,
+        "a plain click after a bound ctrl+click must not select a word, got {:?}",
+        app.editor.selection
+    );
+}
+
+#[test]
+fn the_first_click_of_a_bound_modified_pair_does_not_fire_the_builtin() {
+    // The dispatch guard is `Some((ctx, gesture, Some(cmd)))`. When a gesture
+    // classifies but matches no command — exactly the first click of a
+    // `ctrl+double_click` pair, which by construction can only be a
+    // `ctrl+click` — the pattern fails, nothing returns early, and control
+    // reaches the built-in Ctrl+click arm. So binding ONLY the double gave a
+    // spurious Go to Definition on every first click: the gesture was
+    // recognised as half of a bound pair and then leaked into the built-in it
+    // was supposed to be part of.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("t.rs");
+    std::fs::write(&file, "let name = value;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "save_file", "when": "editor"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    let (col, row) = (app.editor.last_inner.x + 12, app.editor.last_inner.y);
+    let (before_row, before_col) = (app.editor.cursor_row, app.editor.cursor_col);
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    // `trigger_definition_at` moves the caret to the clicked position before
+    // asking the server, so an unmoved caret is the observable proof the
+    // built-in did not run. Asserting on the LSP request itself would need a
+    // live server; the caret is the same signal without one.
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (before_row, before_col),
+        "the first click of a bound ctrl+double_click must not reach the \
+         built-in Ctrl+click Go to Definition, but the caret moved as though \
+         it had"
+    );
+}
+
+#[test]
+fn an_unmatched_modified_click_does_not_arm_the_tracker() {
+    // The shape that actually reaches the built-in `terminal_click.record`,
+    // which has no modifier guard: a modified click that CLASSIFIES, matches
+    // no binding, and is NOT the first half of a bound double-click. Binding
+    // `alt+double_click` and clicking with CTRL gives exactly that — the
+    // swallow branch declines (the bound double is ALT, the click is CTRL, so
+    // `is_double_click_prefix` is false for this gesture), and the dispatch
+    // falls through to the built-in for real.
+    //
+    // If `record` armed on it, the user's next ordinary click would select a
+    // word they never gestured for.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "alt+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "terminal must be laid out"
+    );
+    let (col, row) = (area.x + 2, area.y + 1);
+    app.terminals[0].feed_bytes_for_test(b"hello_world_token some other text\r\n");
+
+    // Precondition: the CTRL click must match nothing, or it returns early
+    // from the matched dispatch and never reaches the built-in.
+    let ctrl_gesture = crate::keymap::Gesture {
+        kind: crate::keymap::GestureKind::Click,
+        mods: KeyModifiers::CONTROL,
+    };
+    assert!(
+        app.keymap
+            .command_for_mouse(ctrl_gesture, crate::keymap::MouseContext::Terminal)
+            .is_none(),
+        "ctrl+click must match nothing, or this never reaches the built-in"
+    );
+    assert!(
+        !app.keymap
+            .is_double_click_prefix(ctrl_gesture, crate::keymap::MouseContext::Terminal),
+        "ctrl+click must NOT be a double-click prefix here, or the swallow \
+         branch returns first and the built-in is never reached"
+    );
+
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    // A following PLAIN click must be a fresh single click, not the second
+    // half of a double the modified click armed.
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col + 1, row));
+    let selected = app.terminal().selection_text();
+    assert!(
+        !selected.contains("hello_world_token"),
+        "a plain click after an unmatched ctrl+click must not select a WORD: \
+         the ctrl+click must not have armed the double-click tracker, but \
+         selection was {selected:?}"
+    );
+}
+
+#[test]
+fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal() {
+    // `terminal_click.record` has no modifier guard, so a ctrl+click that
+    // REACHES it arms the plain double-click tracker and the user's next
+    // ordinary click selects a word they never gestured for.
+    //
+    // What this test ACTUALLY covers is the swallow branch, not the built-in.
+    // With only `ctrl+double_click` bound, the pair's first click matches no
+    // command, `is_double_click_prefix` is therefore true, and the SWALLOW
+    // branch returns before the built-in path runs — so `terminal_click.record`
+    // is never reached here. Deleting the swallow branch does fail this test,
+    // which is what it guards: the prefix click must not arm the tracker.
+    //
+    // The unguarded `record` itself is covered separately by
+    // `an_unmatched_modified_click_does_not_arm_the_tracker`, which uses a
+    // gesture that classifies, matches nothing, and is NOT a double-click
+    // prefix — the only shape that actually reaches the built-in.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "the terminal must be laid out, or the clicks land nowhere and this \
+         test passes for reasons unrelated to tracker arming"
+    );
+
+    // There must be a WORD under the pointer. `select_word_at` is what a
+    // spuriously-armed tracker triggers, and it selects nothing on a blank
+    // cell — so clicking an empty terminal makes this test pass vacuously
+    // whether the tracker armed or not. Print text first, and assert it
+    // arrived, so the click has a real word to wrongly select.
+    app.terminals[0].feed_bytes_for_test(b"hello_world_token\r\n");
+    term.draw(|f| app.render(f)).unwrap();
+    // `area.y` is the pane's BORDER row, not its first text row: `cell_at`
+    // hit-tests against `last_inner` and returns None outside it, so a click
+    // there resolves to no grid cell and selects nothing whatever the tracker
+    // holds. `+ 1` is what the working ctrl+double_click test above uses.
+    let (col, row) = (area.x + 2, area.y + 1);
+    assert!(
+        app.terminals[0]
+            .visible_text()
+            .contains("hello_world_token"),
+        "the terminal must actually show the token, or there is no word for a \
+         wrongly-armed tracker to select and this test cannot fail"
+    );
+    // The click must land on a real grid cell holding the token. Without this
+    // the test passes vacuously off-grid — which it did, three times.
+    let (text, idx) = app.terminals[0]
+        .line_text_at(col, row)
+        .expect("the click must resolve to a terminal grid cell, not the border");
+    assert!(
+        text.contains("hello_world_token") && idx < text.len(),
+        "the click must land ON the token: got {text:?} at {idx}"
+    );
+
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+
+    // A plain click ALWAYS anchors a collapsed one-cell selection
+    // (`start_selection_at`), so the correct outcome here is the single
+    // character under the pointer — not an empty string. The defect is the
+    // tracker firing `select_word_at`, which yields the whole WORD.
+    //
+    // Asserting emptiness would fail on correct behaviour, so the assertion
+    // is against the word: anything longer than the one anchored cell means a
+    // double-click fired off a click the user never paired.
+    let selected = app.terminal().selection_text();
+    assert!(
+        !selected.contains("hello_world_token"),
+        "a plain click after a bound ctrl+click must not select a WORD in the \
+         terminal — the ctrl+click armed the plain double-click tracker. \
+         Expected the one anchored cell, got {selected:?}"
+    );
+    assert!(
+        selected.chars().count() <= 1,
+        "a plain click anchors exactly one cell; a longer selection means the \
+         tracker fired a double-click, got {selected:?}"
+    );
+}
+
+#[test]
+fn a_bound_click_still_fires_over_a_mouse_tracking_child() {
+    // `child_owns_pointer` suppressed bound CLICKS on the stated ground that a
+    // tracking child owns the pointer. For the WHEEL that is exact -- the
+    // wheel arms genuinely call `report_mouse`. For clicks it is false:
+    // `report_mouse`'s three production call sites all construct
+    // WheelUp/WheelDown, and `MouseButtonKind::Left` is never constructed
+    // outside `encode_mouse_report`'s own tests. There is no click-forwarding
+    // path, so suppressing the binding hands the gesture to nobody -- and the
+    // built-in `Down(Left)` arm does not defer either (it runs
+    // `start_selection_at` and Ctrl+click URL-open with no `mouse_reporting`
+    // check, unlike click-to-move-cursor, which does gate on it).
+    //
+    // So the binding must fire. The observable is the bound command's own
+    // effect, not a status string the built-in could also produce.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "terminal must be laid out"
+    );
+    let (col, row) = (area.x + 2, area.y + 1);
+
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    assert!(
+        app.terminals[0].mouse_reporting(),
+        "the child must be tracking, or this test says nothing about the guard"
+    );
+    assert!(
+        app.terminals[0].cell_at(col, row).is_some(),
+        "the click must land on a real grid cell, or the guard declines for the \
+         border reason instead of the tracking one and the test is vacuous"
+    );
+
+    let before = app.editor.wrap_enabled();
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    assert_ne!(
+        app.editor.wrap_enabled(),
+        before,
+        "a bound ctrl+click over a tracking child must RUN: croft has no \
+         click-forwarding path, so declining it gives the gesture to nobody \
+         while the built-in fires anyway"
+    );
+}
+
+#[test]
+fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
+    // `terminal_would_open_something_at` decides whether swallowing a
+    // double-click prefix would cost the user a built-in link-open. The
+    // built-in calls `activate_terminal_pane(idx)` BEFORE it looks for a
+    // link, so it reads the CLICKED pane. A predicate reading
+    // `self.terminal()` reads the ACTIVE pane, and in any split layout where
+    // the click lands outside the focused pane those are different content —
+    // so the swallow decision disagrees with what the built-in then does.
+    //
+    // Observable is a REFUSED link (`open_detected_url` rejects a non-web
+    // scheme inertly). A printed https URL would reach `open_url`, which is
+    // `Command::new("open")` with no test guard, and the suite would launch a
+    // real browser on every run.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    // Only the DOUBLE is bound, so a single ctrl+click is a prefix and the
+    // swallow branch is the one under test.
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.terminals.len(), 2, "two panes are visible");
+
+    // Link in pane 0; pane 1 is ACTIVE. The two panes must differ, or the
+    // bug is unreachable and this test proves nothing.
+    app.terminals[0]
+        .feed_bytes_for_test(b"\x1b]8;;mailto:split@example.com\x1b\\split-link\x1b]8;;\x1b\\\r\n");
+    app.active_terminal = 1;
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    let (col, row) = (area.x + 2, area.y + 1);
+    assert!(
+        app.terminals[0].hyperlink_at_screen(col, row).is_some(),
+        "pane 0 must carry the link, or the built-in has nothing to act on"
+    );
+    assert_eq!(
+        app.active_terminal, 1,
+        "pane 1 must be ACTIVE while the click lands in pane 0, or the \
+         clicked-vs-active distinction this test exists for does not arise"
+    );
+
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    assert!(
+        app.status.contains("Refused to open non-web link"),
+        "the prefix click must defer to the built-in, which opens the link in \
+         the CLICKED pane. Reading the ACTIVE pane finds nothing there, \
+         swallows the click, and the link never opens. status was {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn a_prefix_click_defers_to_the_builtin_for_a_file_reference_too() {
+    // The built-in Ctrl+click tries `terminal_url_click` OR
+    // `terminal_file_click`. A swallow guard that consults only the URL half
+    // still eats the file jump -- the same defect one branch over, which is
+    // exactly the shape that produced this PR's major 2. Both arms or neither.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("target_file.rs"), "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 12 && area.height > 2,
+        "terminal must be laid out"
+    );
+    app.terminals[0].feed_bytes_for_test(b"target_file.rs:1:1\r\n");
+    term.draw(|f| app.render(f)).unwrap();
+
+    let (col, row) = (area.x + 2, area.y + 1);
+    // Precondition: a file REFERENCE must be under the cursor, or the guard
+    // declines for "nothing there" and the test says nothing about the file
+    // half specifically.
+    let has_ref = app.terminals[0]
+        .line_text_at(col, row)
+        .is_some_and(|(t, c)| crate::file_ref::file_ref_at(&t, c).is_some());
+    assert!(
+        has_ref,
+        "the cell must carry a file reference, or this test cannot distinguish \
+         the file arm from the URL arm"
+    );
+
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    // The built-in ran: it opened the file rather than the click being
+    // swallowed as a double-click prefix.
+    assert!(
+        app.editor
+            .path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("target_file.rs")),
+        "the prefix click must fall through to the built-in file jump, but the \
+         editor holds {:?}",
+        app.editor.path.as_deref()
+    );
+}
+
+#[test]
+fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() {
+    // The swallow branch exists so the FIRST click of a bound `ctrl+double_click`
+    // does not fire the built-in that owns the same modifier. Over a
+    // mouse-tracking child it must still fall through, because swallowing
+    // would disable the built-in Ctrl+click over every full-screen TUI while
+    // binding `ctrl+click` leaves it working -- backwards.
+    //
+    // Note what this does NOT rest on: croft never forwards clicks to the
+    // child. `report_mouse` has three production call sites and all three
+    // construct WheelUp/WheelDown, so there is no click-forwarding path for a
+    // tracking child to "own". The fall-through is right because the built-in
+    // is the only consumer, not because the child is a better one.
+    //
+    // The observable is deliberately a REFUSED link: `open_detected_url`
+    // rejects a non-web scheme and sets a status without spawning anything.
+    // Asserting on a successful open would shell out to `open`/`xdg-open` for
+    // real, creating exactly the flaky spawning test #307 is about.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "terminal must be laid out"
+    );
+    // `area.y` is the BORDER row: `cell_at` hit-tests `last_inner`, so a click
+    // there resolves to no grid cell and the whole test would be vacuous.
+    let (col, row) = (area.x + 2, area.y + 1);
+
+    // A real OSC 8 hyperlink with a non-web scheme: the built-in finds it via
+    // `hyperlink_at_screen`, and `open_detected_url` then refuses it inertly.
+    app.terminals[0].feed_bytes_for_test(b"\x1b]8;;mailto:x@example.com\x1b\\link\x1b]8;;\x1b\\");
+    assert!(
+        app.terminals[0].hyperlink_at_screen(col, row).is_some(),
+        "the cell must carry an OSC 8 link, or the built-in has nothing to act \
+         on and this test cannot distinguish the two branches"
+    );
+
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    assert!(
+        app.terminals[0].mouse_reporting(),
+        "the child must be tracking, or `child_owns_pointer` is false and this \
+         test proves nothing about the guard"
+    );
+
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    assert!(
+        app.status.contains("Refused to open non-web link"),
+        "a double-click PREFIX over a mouse-tracking child must fall through to \
+         the built-in: croft has no click-forwarding path, so swallowing it \
+         hands the gesture to nobody -- the swallow branch \
+         is missing the `child_owns_pointer` guard its sibling applies. \
+         Expected the refusal from the built-in link handler, got {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn a_modified_click_that_drags_away_does_not_pair_with_the_click_it_returns_to() {
+    // The built-in trackers get `clear_if_moved` on every drag, so click,
+    // drag away, click back is not a double. `ModifiedClickTracker` has no
+    // such call anywhere, so the modified pair fires where the identical
+    // unmodified sequence correctly does not.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "terminal"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "terminal must be laid out"
+    );
+    let (col, row) = (area.x + 2, area.y + 1);
+
+    let before = app.editor.wrap_enabled();
+    let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ctrl.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ctrl);
+
+    // Drag well away, then release, then click the origin again.
+    let mut drag = mouse(MouseEventKind::Drag(MouseButton::Left), col + 20, row + 3);
+    drag.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(drag);
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        col + 20,
+        row + 3,
+    ));
+
+    let mut back = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    back.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(back);
+
+    assert_eq!(
+        app.editor.wrap_enabled(),
+        before,
+        "a modified click that dragged away must not pair with the click it \
+         returns to, but the double fired"
+    );
+}
+
+#[test]
+fn a_reloaded_keymap_with_a_refused_row_reports_its_warning_count() {
+    // Asserts the summary the reload sets, against a keymap built in memory.
+    // Writing the real `~/.config/croft/keybindings.json` — which is what the
+    // previous version of this test did — leaks into every concurrently
+    // running test that builds an `App`, because `App::new` loads that path
+    // unconditionally.
+    let (_refused, warns) = crate::keymap::Keymap::resolve(
+        r#"[{"key": "cmd+click", "command": "save_file", "when": "editor"}]"#,
+    );
+    assert_eq!(warns.len(), 1, "the Cmd row is refused with a reason");
+
+    let status = super::keybindings_reload_status(&warns);
+    assert!(
+        status.contains("1 warning") && status.contains("OUTPUT"),
+        "the count must reach the status bar and point at the channel, got {status:?}"
+    );
+    assert!(
+        !super::keybindings_reload_status(&[]).contains("warning"),
+        "a clean reload says nothing about warnings"
+    );
+}
+
+#[test]
+fn a_cmd_or_triple_gesture_is_refused_rather_than_bound_to_a_dead_entry() {
+    // Both parse but can never match, so binding them would make
+    // `has_mouse_bindings()` true for entries nothing can look up — and
+    // would let cmd+click dodge the reserved bare-click check.
+    let (km, warnings) = crate::keymap::Keymap::resolve(
+        r#"[{"key": "cmd+click", "command": "save_file"},
+            {"key": "triple_click", "command": "save_file"}]"#,
+    );
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        !km.has_mouse_bindings(),
+        "neither is bound, so the per-event dispatch stays off"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("second click")),
+        "triple_click says the real reason, not 'not a gesture': {warnings:?}"
+    );
+}
+
 #[test]
 fn outline_scrollbar_drag_is_not_hijacked_by_the_sidebar_splitter() {
     use crate::lsp::manager::{OutlineKind, OutlineSymbol};
@@ -30580,6 +31941,133 @@ fn ctrl_click_follows_a_document_link_before_go_to_definition() {
     assert_eq!(
         app.editor.document_link_at(0, 5),
         Some("https://example.com")
+    );
+}
+
+#[test]
+fn the_bound_go_to_definition_follows_a_document_link_like_the_builtin() {
+    use crate::lsp::manager::DocumentLinkItem;
+    // A bound gesture is meant to be able to REPLACE the built-in it mirrors,
+    // so it must keep the built-in's #254 precedence: a server-resolved
+    // document link outranks Go to Definition at that spot, because a URL in
+    // a comment has no definition at all. `trigger_definition_at` checks the
+    // link first; the bound command jumped straight to the LSP request, so
+    // rebinding ctrl+click silently regressed link-following.
+    //
+    // Observable is a file:// link, which opens the target in the editor --
+    // fully inert. A web link would reach `open_url` and launch a browser.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "// link here\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "fn target() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let target = lsp_types::Url::from_file_path(tmp.path().join("b.rs")).unwrap();
+    app.editor.apply_document_links(
+        tmp.path().join("a.rs"),
+        vec![DocumentLinkItem {
+            line: 0,
+            character: 3,
+            end_line: 0,
+            end_character: 12,
+            target: target.to_string(),
+        }],
+    );
+
+    let area = app.editor.last_inner;
+    assert!(area.width > 6 && area.height > 1, "editor must be laid out");
+    // Text starts past the line-number gutter: `buffer_pos_at` computes
+    // `last_inner.x + last_gutter_width + 1`, so a column measured from
+    // `area.x` alone lands in the gutter and resolves to the wrong char.
+    let text_x = area.x + app.editor.last_gutter_width + 1;
+    let (col, row) = (text_x + 5, area.y);
+    assert!(
+        app.editor.buffer_pos_at(col, row).is_some(),
+        "the click must resolve to a buffer position, or nothing downstream runs"
+    );
+    let (bl, bc) = app.editor.buffer_pos_at(col, row).unwrap();
+    assert_eq!(
+        app.editor.document_link_at(bl, bc),
+        Some(target.as_str()),
+        "the clicked cell must sit INSIDE the link range, or this test cannot \
+         tell link-following from its absence"
+    );
+
+    app.last_mouse_pos = Some((col, row));
+    app.run_command(crate::widgets::command_palette::Command::MouseGoToDefinitionAtClick);
+
+    assert_eq!(
+        app.editor.path.as_deref().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("b.rs")),
+        "the bound Go to Definition must follow the document link first, as \
+         `trigger_definition_at` does -- a bound gesture that drops the \
+         built-in's link precedence is not a replacement for it"
+    );
+}
+
+#[test]
+fn the_bound_open_link_works_in_the_editor_not_only_the_terminal() {
+    use crate::lsp::manager::DocumentLinkItem;
+    // `editor` is the DEFAULT `when` region per docs/KEYBINDINGS.md, so the
+    // most natural binding a user writes for this command lands there. It
+    // consulted only the terminal grid (`terminal_url_click` ->
+    // `terminal_file_click`), both of which hit-test `last_inner` of the
+    // TERMINAL, so an editor click could never resolve: it reported
+    // "No link there" over a link that was there.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "// link here\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "fn target() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let target = lsp_types::Url::from_file_path(tmp.path().join("b.rs")).unwrap();
+    app.editor.apply_document_links(
+        tmp.path().join("a.rs"),
+        vec![DocumentLinkItem {
+            line: 0,
+            character: 3,
+            end_line: 0,
+            end_character: 12,
+            target: target.to_string(),
+        }],
+    );
+
+    let area = app.editor.last_inner;
+    assert!(area.width > 6 && area.height > 1, "editor must be laid out");
+    // Text starts past the line-number gutter: `buffer_pos_at` computes
+    // `last_inner.x + last_gutter_width + 1`, so a column measured from
+    // `area.x` alone lands in the gutter and resolves to the wrong char.
+    let text_x = area.x + app.editor.last_gutter_width + 1;
+    let (col, row) = (text_x + 5, area.y);
+    let (bl, bc) = app
+        .editor
+        .buffer_pos_at(col, row)
+        .expect("the click must resolve to a buffer position");
+    assert_eq!(
+        app.editor.document_link_at(bl, bc),
+        Some(target.as_str()),
+        "the clicked cell must sit inside the link range, or a failure here \
+         would mean 'no link' rather than 'the command ignored the editor'"
+    );
+
+    app.last_mouse_pos = Some((col, row));
+    app.run_command(crate::widgets::command_palette::Command::MouseOpenLinkAtClick);
+
+    assert_eq!(
+        app.editor.path.as_deref().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("b.rs")),
+        "Open Link at Click must follow an editor document link. It consulted \
+         only the terminal, so in the DEFAULT `editor` region it was a \
+         permanent no-op that reported {:?}",
+        app.status
     );
 }
 

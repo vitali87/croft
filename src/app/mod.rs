@@ -33,7 +33,7 @@ mod overlay;
 mod perf_hud;
 pub(crate) mod sidebar_dwell;
 mod welcome;
-use click::ClickTracker;
+use click::{ClickTracker, ModifiedClickTracker};
 use cursor_blink::CursorBlink;
 use fs_watch::FsWatch;
 use git_worker::GitWorker;
@@ -2154,6 +2154,11 @@ pub struct App {
     macro_replaying: bool,
     /// The store path, held so tests can point saves at a tempdir.
     macros_path: std::path::PathBuf,
+    /// The click a user mouse binding is running for (#259), set only for
+    /// the duration of that dispatch. Position-carrying commands read it;
+    /// `None` everywhere else, so a keyboard invocation of the same command
+    /// can never act on a stale click.
+    last_mouse_pos: Option<(u16, u16)>,
     /// User snippets from `~/.config/croft/snippets.json`. Typing a snippet's
     /// prefix and pressing Tab expands it with tab-stop navigation.
     snippets: crate::snippets::SnippetSet,
@@ -2373,6 +2378,12 @@ pub struct App {
     editor_click: ClickTracker,
     tree_click: ClickTracker,
     terminal_click: ClickTracker,
+    /// Modified clicks, so `ctrl+double_click` and friends can be recognised
+    /// without arming the unmodified trackers above (see the type's docs).
+    /// One tracker, not one per region: it is only ever read by the binding
+    /// dispatch, and a double needs both clicks at the same cell, so two
+    /// regions cannot be confused for one another.
+    modified_click: ModifiedClickTracker,
     /// Double-click tracking for PORTS rows: a second click on the same row
     /// opens that port, the same as pressing Enter on it.
     ports_click: ClickTracker,
@@ -3803,6 +3814,24 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         let loaded_prefs = merged_settings.prefs.clone();
+        // Same treatment for keybindings: a row croft refused (an unknown
+        // command id, a gesture that can never fire, a reserved bare click)
+        // used to vanish silently, which reads as croft being broken rather
+        // than the binding being wrong (#259).
+        // Under test an empty keymap, exactly like the matcher set below: the
+        // developer's real keybindings.json must never steer app tests. That
+        // mattered less when a user keymap only rebound key chords, which no
+        // test dispatches; a mouse row now gates an early return at the top
+        // of `handle_mouse` that every mouse test flows through, so one line
+        // in a file the suite does not control could redirect thousands of
+        // tests. Tests that want a keymap assign `app.keymap` themselves.
+        let loaded_keymap = if cfg!(test) {
+            crate::keymap::Keymap::default()
+        } else {
+            crate::keymap::Keymap::load(&crate::keymap::keybindings_path())
+        };
+        // `Keymap::load` already reports its own warnings to OUTPUT ·
+        // Keybindings, so nothing to do here.
         // Problem matchers (#252). Under test an empty set: the developer's
         // real matchers.json must never steer app tests; tests inject their
         // own. Compile warnings surface once, in OUTPUT · Matchers.
@@ -3890,16 +3919,13 @@ impl App {
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             extensions,
             disabled_extensions,
-            // Under test the built-in keymap, mirroring the matcher set above:
-            // the developer's real keybindings.json must never steer app
-            // tests. Harmless while only key chords were rebindable, but a
-            // keymap that gates behaviour lets one line in an untracked file
-            // change what the suite exercises.
-            keymap: if cfg!(test) {
-                crate::keymap::Keymap::default()
-            } else {
-                crate::keymap::Keymap::load(&crate::keymap::keybindings_path())
-            },
+            // Built from `loaded_keymap` above, which applies the same
+            // cfg!(test) guard main landed here independently: the
+            // developer's real keybindings.json must never steer app tests.
+            // Hoisted rather than inlined so the parse warnings can be
+            // reported once, in OUTPUT · Keybindings.
+            keymap: loaded_keymap,
+            last_mouse_pos: None,
             macro_recording: None,
             macro_last: None,
             macro_registers: crate::macros::load(&crate::macros::macros_path()),
@@ -4016,6 +4042,7 @@ impl App {
             editor_click: ClickTracker::default(),
             tree_click: ClickTracker::default(),
             terminal_click: ClickTracker::default(),
+            modified_click: ModifiedClickTracker::default(),
             ports_click: ClickTracker::default(),
             terminal_select_autoscroll: None,
             scrollbar_drag: None,
@@ -12915,6 +12942,28 @@ impl App {
         if self.sidebar_auto_hide && self.show_tree && !self.sidebar_auto_hide_suspended {
             self.sidebar_dwell.arm(std::time::Instant::now());
         }
+    }
+
+    /// Tear down the popups a click invalidates, for press paths that return
+    /// early and so miss the teardown every other path runs.
+    ///
+    /// A fired binding changes the state underneath these popups, and leaving
+    /// them up paints a hover, a tab tooltip or a button hint describing what
+    /// was there before the command ran. Shared by the matched-gesture
+    /// dispatch and the double-click-prefix swallow: both return early, and
+    /// having two copies is how the swallow branch came to skip it entirely.
+    fn dismiss_click_overlays(&mut self, m: MouseEvent) {
+        if !matches!(m.kind, MouseEventKind::Up(_)) {
+            self.hover_popup = None;
+            self.hover_diagnostic = None;
+        }
+        self.tab_tooltip = None;
+        self.tab_hover.clear();
+        self.tab_hover_idx = None;
+        self.ui_tooltip = None;
+        self.ui_hover.clear();
+        self.ui_tooltip_label = None;
+        self.hover.clear();
     }
 
     /// Fire a pending auto-hide collapse once its grace delay elapses.
@@ -26472,6 +26521,47 @@ impl App {
     /// under the cursor, act on it (forward a remote dev-server port and open,
     /// or open the link) and return true so the click doesn't start a
     /// selection. Returns false when there's no URL there.
+    /// Whether the built-in Ctrl/Cmd+click would open something at this cell.
+    ///
+    /// Pure: the lookups [`Self::terminal_url_click`] and
+    /// [`Self::terminal_file_click`] perform, with the opening left out. The
+    /// swallow branch needs to know whether declining a prefix click COSTS the
+    /// user anything, and it cannot find out by calling the acting versions.
+    ///
+    /// BOTH arms of the built-in's `||` are covered deliberately: checking
+    /// only the URL half would let a Ctrl+click on a file reference be
+    /// swallowed and its jump-to-file lost, which is the same defect one
+    /// branch over.
+    ///
+    /// Deliberately conservative on the file half. `terminal_file_click`
+    /// resolves relative paths against the shell's cwd and touches the
+    /// filesystem; reproducing that here would duplicate logic that then
+    /// drifts. A file REFERENCE under the cursor is enough to defer to the
+    /// built-in — at worst the prefix click is not swallowed, which costs a
+    /// stray built-in action rather than a lost one.
+    ///
+    /// Takes the CLICKED pane's index rather than reading `self.terminal()`.
+    /// The built-in activates the clicked pane before it looks for a link, so
+    /// a predicate reading the ACTIVE pane answers about different content
+    /// whenever the two differ — which is any split layout where the click
+    /// lands outside the focused pane.
+    fn terminal_would_open_something_at(&self, idx: usize, col: u16, row: u16) -> bool {
+        let Some(t) = self.terminals.get(idx) else {
+            return false;
+        };
+        if t.hyperlink_at_screen(col, row).is_some() {
+            return true;
+        }
+        t.line_text_at(col, row).is_some_and(|(text, c)| {
+            crate::port_detect::url_at(&text, c).is_some()
+                || crate::file_ref::file_ref_at(&text, c).is_some()
+        })
+    }
+
+    /// Cmd/Ctrl+click in the active terminal: if a printed http(s) URL sits
+    /// under the cursor, act on it (forward a remote dev-server port and open,
+    /// or open the link) and return true so the click doesn't start a
+    /// selection. Returns false when there's no URL there.
     fn terminal_url_click(&mut self, col: u16, row: u16) -> bool {
         // A real OSC 8 hyperlink stored in the cell wins over text sniffing —
         // the visible text of a linked cell often isn't the URI at all.
@@ -28234,6 +28324,114 @@ impl App {
             },
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
+            // Position-carrying commands (#259). They read the click the
+            // dispatcher set, and do nothing from the keyboard: invoked from
+            // the palette there is no click to act on, and guessing the
+            // caret instead would make one command mean two things.
+            // All three arms refuse on a non-text view for the reason
+            // `trigger_definition_at` does: `buffer_pos_at` maps cells using
+            // only the text layout, so on a diff/sheet/hex/image/archive tab
+            // it happily returns a position into the stub text side. Acting
+            // on it moves the cursor somewhere meaningless and — for the
+            // definition arm — fires an LSP request against it. The built-in
+            // returns silently; a BOUND command says so instead, because the
+            // user asked for it explicitly and silence reads as a broken
+            // binding rather than a deliberate refusal.
+            Cmd::MouseAddCursorAtClick => match self.last_mouse_pos {
+                Some((col, row)) => {
+                    if self.editor.has_non_text_view() {
+                        self.status = String::from("No cursors in this view");
+                    } else if self.editor.add_caret_at_screen(col, row) {
+                        // Same as the built-in Alt+click: reset the blink
+                        // phase, or a new caret can land mid-blink-off and
+                        // read as "nothing happened" for up to a full period.
+                        self.poke_cursor();
+                    } else {
+                        self.status = String::from("No place for a cursor there");
+                    }
+                }
+                None => {
+                    self.status = String::from("Mouse: Add Cursor at Click needs a mouse binding")
+                }
+            },
+            Cmd::MouseGoToDefinitionAtClick => match self.last_mouse_pos {
+                Some(_) if self.editor.has_non_text_view() => {
+                    self.status = String::from("No definitions in this view");
+                }
+                // The outer `buffer_pos_at` exists ONLY to produce a status
+                // when the click resolves to no buffer position: the built-in
+                // fails silently there, which is right for a gesture the user
+                // did not aim, but a command they bound deliberately should
+                // say why nothing happened. `trigger_definition_at` repeats
+                // the lookup internally — do not "simplify" this away, or the
+                // bound command goes mute on a miss.
+                Some((col, row)) => match self.editor.buffer_pos_at(col, row) {
+                    // Delegate rather than re-implement: `trigger_definition_at`
+                    // follows a server-resolved document link BEFORE asking for
+                    // a definition (#254), and a bound gesture meant to replace
+                    // the built-in must keep that precedence. Duplicating the
+                    // check here would let the two drift on the next change.
+                    Some(_) => self.trigger_definition_at(col, row),
+                    None => self.status = String::from("Nothing to define there"),
+                },
+                None => {
+                    self.status =
+                        String::from("Mouse: Go to Definition at Click needs a mouse binding")
+                }
+            },
+            Cmd::MouseOpenLinkAtClick => match self.last_mouse_pos {
+                Some((col, row)) => {
+                    // `editor` is the DEFAULT `when` region, so the most
+                    // natural binding for this command lands there. Both
+                    // terminal helpers hit-test the TERMINAL's `last_inner`
+                    // and return false anywhere else, so consulting only them
+                    // made the command a permanent no-op in its own default
+                    // region -- reporting "No link there" over a link that is.
+                    // The refusal belongs to the EDITOR lookup only. Its
+                    // reason — `buffer_pos_at` maps cells from the TEXT
+                    // layout, so a diff/sheet/hex/log view still yields a
+                    // position and we would read links from a buffer the user
+                    // is not looking at — says nothing about the terminal
+                    // helpers below, which read `self.terminal()` alone. The
+                    // built-in this command replaces guards neither, so a
+                    // guard spanning both made the bound command diverge from
+                    // it in the opposite direction to the one being fixed.
+                    // Bound once: the refusal and the status it explains must
+                    // answer the SAME question, or the status describes a
+                    // lookup that never ran.
+                    let editor_blocked = self.editor.has_non_text_view();
+                    let followed = !editor_blocked
+                        && self
+                            .editor
+                            .buffer_pos_at(col, row)
+                            .and_then(|(line, c)| {
+                                self.editor.document_link_at(line, c).map(str::to_string)
+                            })
+                            .inspect(|target| self.open_document_link(target))
+                            .is_some();
+                    if !followed
+                        && !self.terminal_url_click(col, row)
+                        && !self.terminal_file_click(col, row)
+                    {
+                        // Name the view only when the EDITOR lookup is the
+                        // one that missed. A click in a terminal pane never
+                        // consulted the editor — `editor_blocked` short-
+                        // circuited it above — so reporting the editor's view
+                        // there names something that was never searched.
+                        // "a non-text view is up" and "the editor lookup is
+                        // the one that missed" are different questions.
+                        let in_terminal = self.terminal_at_pos(col, row).is_some();
+                        self.status = String::from(if editor_blocked && !in_terminal {
+                            "No links in this view"
+                        } else {
+                            "No link there"
+                        });
+                    }
+                }
+                None => {
+                    self.status = String::from("Mouse: Open Link at Click needs a mouse binding")
+                }
+            },
             Cmd::ClearBuildDiagnostics => self.clear_build_diagnostics(),
             Cmd::DebugClearWatch => {
                 let n = self.watch_exprs.len();
@@ -29268,6 +29466,45 @@ impl App {
             // Land on the bottom-most (most recent) match, like iTerm2.
             self.terminal_find_jump(false);
         }
+    }
+
+    /// Make pane `idx` the active terminal, tearing down the overlays that
+    /// were bound to the pane being left.
+    ///
+    /// Shared by the built-in click path and the bound-gesture dispatch so
+    /// the two cannot drift: every terminal helper reaches the grid through
+    /// `self.terminal()`, which indexes `active_terminal`, so a caller that
+    /// skips this reads a pane the user did not click. That is not
+    /// hypothetical — a bound `mouse_open_link_at_click` reported "No link
+    /// there" over a plainly visible URL in a split, because the dispatch
+    /// returned above the assignment the built-in makes.
+    fn activate_terminal_pane(&mut self, idx: usize) {
+        if self.active_terminal == idx {
+            return;
+        }
+        // Copy mode is bound to the pane it opened on; a click on a sibling
+        // pane leaves it, tmux-style, rather than hijacking the new pane's
+        // grid.
+        if self
+            .terminal_copy_mode
+            .as_ref()
+            .is_some_and(|st| st.pane != idx)
+        {
+            self.close_terminal_copy_mode();
+        }
+        // Quick-select labels are pane-bound the same way.
+        if self
+            .terminal_quick_select
+            .as_ref()
+            .is_some_and(|st| st.pane != idx)
+        {
+            self.close_terminal_quick_select();
+        }
+        // As is the find bar and its highlight.
+        if self.terminal_find.is_some() && self.terminal_find_pane != idx {
+            self.close_terminal_find();
+        }
+        self.active_terminal = idx;
     }
 
     fn close_terminal_find(&mut self) {
@@ -30805,6 +31042,280 @@ impl App {
         let in_editor = rect_contains(self.editor.last_area, m.column, m.row);
         let terminal_hit = self.terminal_at_pos(m.column, m.row);
         let in_terminal = terminal_hit.is_some();
+        // User mouse bindings (#259) resolve before the built-in widget
+        // behaviour, mirroring how keybindings.json wins over default chords.
+        // Placed after the region predicates so a binding's `when` context is
+        // known, and above every built-in so rebinding one actually takes it
+        // over. A gesture croft has no binding for falls straight through.
+        // Classify ONCE and reuse. `gesture_for` reads the modified-click
+        // tracker to decide `Click` vs `DoubleClick`, so calling it a second
+        // time after recording would let a single click arm itself and come
+        // back a double — which is exactly what an earlier attempt at this did.
+        // The recording therefore happens after the lookup, using the gesture
+        // decided here, never a freshly re-derived one.
+        let bound_mouse = if self.keymap.has_mouse_bindings()
+            && let Some(ctx) = mouse_context_for(&m, in_editor, in_terminal, in_tree, self)
+            && let Some(gesture) = gesture_for(&m, self, ctx, std::time::Instant::now())
+        {
+            Some((ctx, gesture, self.keymap.command_for_mouse(gesture, ctx)))
+        } else {
+            None
+        };
+
+        // A modified click is recorded whether or not it matched a binding. The
+        // first click of a `ctrl+double_click` pair matches nothing by
+        // construction — it classifies as `ctrl+click`, and a user who bound
+        // only the double has nothing for it to hit — so recording only on a
+        // match left the pair's second click seeing an empty tracker, and the
+        // double could not fire at all.
+        //
+        // Unmodified clicks are deliberately not recorded here: their trackers
+        // are shared with the built-ins, which record their own clicks on the
+        // paths below. Doing it in both places would double-count.
+        //
+        // A click the pointer-owning child gets is not croft's to remember.
+        // The built-ins record INSIDE their `child_owns_pointer` check; this
+        // recording sat above it, so clicks croft deliberately declined to act
+        // on still armed the tracker, and a later modified click paired with
+        // one the user had aimed at the TUI in the terminal. Same predicate as
+        // the dispatch below, indexed by the pane that was CLICKED.
+        let child_owns_pointer = bound_mouse.is_some_and(|(ctx, gesture, _)| {
+            // ONLY THE WHEEL. A tracking child can only "own" a gesture croft
+            // actually forwards, and croft forwards exactly one kind:
+            // `report_mouse` has three production call sites and all three
+            // construct WheelUp/WheelDown. No path constructs
+            // MouseButtonKind::Left/Middle/Right outside `encode_mouse_report`'s
+            // own tests, so declining a bound CLICK hands it to nobody -- and
+            // the built-in Down(Left) arm then runs anyway, since unlike
+            // click-to-move-cursor it never consults `mouse_reporting()`.
+            matches!(
+                gesture.kind,
+                crate::keymap::GestureKind::WheelUp | crate::keymap::GestureKind::WheelDown
+            ) && matches!(ctx, crate::keymap::MouseContext::Terminal)
+                && terminal_hit.is_some_and(|idx| {
+                    // Tracking is not enough: `terminal_at_pos` hit-tests
+                    // `last_area`, which includes the BORDER, while delivery
+                    // goes through `cell_at` on `last_inner`, which does not.
+                    // Declining a binding for a cell the child will never be
+                    // told about loses the gesture for both parties. The
+                    // built-in wheel path already falls through on exactly
+                    // this case — see the `report_mouse` guard on both wheel
+                    // arms, whose comment names the border explicitly.
+                    self.terminals[idx].mouse_reporting()
+                        && self.terminals[idx].cell_at(m.column, m.row).is_some()
+                })
+                && !m.modifiers.contains(KeyModifiers::SHIFT)
+        });
+        if let Some((_, gesture, _)) = bound_mouse
+            && !gesture.mods.is_empty()
+            && !child_owns_pointer
+        {
+            let now = std::time::Instant::now();
+            match gesture.kind {
+                // Clear on a fired double so a third click re-arms rather than
+                // re-firing; record otherwise so the NEXT modified click can be
+                // seen as the second of a pair.
+                crate::keymap::GestureKind::DoubleClick => self.modified_click.clear(),
+                crate::keymap::GestureKind::Click => {
+                    self.modified_click
+                        .record(now, m.column, m.row, gesture.mods)
+                }
+                _ => {}
+            }
+        }
+
+        // The first half of a bound double-click matches no binding, so
+        // without this it falls through to whatever built-in owns the same
+        // modifier: binding `ctrl+double_click` in the editor made the pair's
+        // first click fire go-to-definition, and in the terminal it armed the
+        // plain double-click tracker so the user's NEXT ordinary click
+        // selected a word they never gestured for. Both are the same bug —
+        // croft acting on a click the user aimed at their own binding.
+        //
+        // Swallowed AFTER the modified-click recording above, which is what
+        // lets the second click of the pair see the first. Only the prefix of
+        // a bound double is swallowed: a Ctrl+click with no double bound
+        // reaches the built-in unchanged.
+        //
+        // `child_owns_pointer` for the same reason the matched dispatch below
+        // consults it — a TUI that asked for mouse tracking owns the pointer,
+        // so croft must not suppress a built-in on its behalf. The recording
+        // above already declines there, so the bound double is unreachable in
+        // that state anyway: swallowing would cost the built-in and buy
+        // nothing. Omitting it here disabled the built-in Ctrl+click over
+        // every full-screen TUI for anyone who bound only `ctrl+double_click`.
+        // `child_owns_pointer` used to carry this branch's deferral too, but it
+        // is wheel-only now (croft forwards no clicks), so it is always false
+        // here and cannot decide anything. The question the swallow actually
+        // needs answered is narrower: would declining this click COST the user
+        // a built-in that was going to act? For Ctrl/Cmd the built-in opens a
+        // URL or a file reference, so defer when either is under the cursor.
+        let builtin_would_act = matches!(bound_mouse, Some((ctx, _, _)) if
+            matches!(ctx, crate::keymap::MouseContext::Terminal))
+            && (m.modifiers.contains(KeyModifiers::CONTROL)
+                || m.modifiers.contains(KeyModifiers::SUPER))
+            && terminal_hit
+                .is_some_and(|idx| self.terminal_would_open_something_at(idx, m.column, m.row));
+        if let Some((ctx, gesture, None)) = bound_mouse
+            && !gesture.mods.is_empty()
+            && !builtin_would_act
+            && self.keymap.is_double_click_prefix(gesture, ctx)
+        {
+            // Focus still moves, as a click in a pane always does — otherwise
+            // the pair's second click lands in a pane the keyboard has not
+            // followed. This mirrors what the matched path does below.
+            match ctx {
+                crate::keymap::MouseContext::Terminal => {
+                    if let Some(idx) = terminal_hit {
+                        self.activate_terminal_pane(idx);
+                        self.focus_pane(Pane::Terminal);
+                    }
+                }
+                crate::keymap::MouseContext::Editor | crate::keymap::MouseContext::TabStrip => {
+                    self.focus_pane(Pane::Editor)
+                }
+                crate::keymap::MouseContext::FileTree => self.focus_pane(Pane::Tree),
+            }
+            // Same teardown the matched branch runs: this is an early return
+            // on the same press path, and it re-focuses a pane underneath
+            // whatever popups were showing.
+            self.dismiss_click_overlays(m);
+            return;
+        }
+
+        if let Some((ctx, gesture, Some(cmd))) = bound_mouse {
+            // A terminal running a mouse-tracking TUI owns the pointer, same
+            // rule the built-ins follow: croft must not steal a click the
+            // child asked for. Computed once above so the recording and this
+            // dispatch cannot drift apart — they must agree on whether the
+            // click was croft's to act on.
+            if !child_owns_pointer {
+                // Every built-in pairs `is_double` with `record`/`clear` so
+                // the count stays right. The early return below skips the
+                // built-in branch that would have recorded, so the dispatch
+                // has to keep the tracker itself: clear on a fired double
+                // (or a third click re-fires it), record on a fired UNMODIFIED
+                // single (or a `click` binding starves the `double_click`
+                // binding beside it — `is_double` could never become true).
+                //
+                // Unmodified only, because the built-ins that read these
+                // trackers do not consult modifiers. Recording a ctrl+click
+                // would arm the editor's plain double-click, and the user's
+                // next ordinary click would select a word they never asked
+                // for. Bare clicks are reserved in `editor`/`terminal`, so
+                // the record here only ever matters for `file_tree` and
+                // `tab_strip`, which is exactly where it is needed.
+                // Modified clicks are recorded above, before the command
+                // lookup, so the first click of a pair is remembered even
+                // though it matches nothing.
+                let now = std::time::Instant::now();
+                if gesture.mods.is_empty() {
+                    let tracker = match ctx {
+                        crate::keymap::MouseContext::Terminal => &mut self.terminal_click,
+                        crate::keymap::MouseContext::FileTree => &mut self.tree_click,
+                        // The strip shares the editor's tracker, as
+                        // `gesture_for` does: a double-click is the same
+                        // gesture whether it lands on a tab or the text below
+                        // it. Spelled out rather than caught by `_` so a new
+                        // variant has to choose.
+                        crate::keymap::MouseContext::Editor
+                        | crate::keymap::MouseContext::TabStrip => &mut self.editor_click,
+                    };
+                    match gesture.kind {
+                        crate::keymap::GestureKind::DoubleClick => tracker.clear(),
+                        // Pass the modifiers through: #317's guard then keeps
+                        // a MODIFIED gesture from arming the built-in tracker,
+                        // which is what the separate ModifiedClickTracker
+                        // exists for. Hard-coding NONE here would re-open the
+                        // exact hole - a ctrl+click binding arming the plain
+                        // double-click the user never made.
+                        crate::keymap::GestureKind::Click => {
+                            tracker.record(now, m.column, m.row, m.modifiers)
+                        }
+                        _ => {}
+                    }
+                }
+                // The early return below skips the teardown every other
+                // press path runs, so do it here: a fired binding changes
+                // the state underneath these popups, and leaving them up
+                // paints a hover, a tab tooltip or a button hint describing
+                // what was there before the command ran. The dwell timer is
+                // cleared for the same reason — it is armed at coordinates
+                // whose meaning the command just changed.
+                self.dismiss_click_overlays(m);
+
+                // Termux: the tap still has to raise the on-screen keyboard.
+                // Skipping it leaves a device with no other keyboard unable
+                // to type into the field the tap just focused. Reachable
+                // despite bare clicks being reserved in editor/terminal: any
+                // MODIFIED click in the editor or terminal gets here, and a
+                // bound gesture there should raise the keyboard exactly as the
+                // built-in press would. `ctx` carries the region, so the
+                // built-in's in_editor / in_terminal / in_tree — computed
+                // below this block — are not needed to make the same decision.
+                if self.osk_auto
+                    && self.osk.is_none()
+                    && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                    && match ctx {
+                        crate::keymap::MouseContext::Editor
+                        | crate::keymap::MouseContext::Terminal => true,
+                        // `mouse_context_for` only yields `FileTree` while the
+                        // sidebar is showing the Explorer, so the Search view
+                        // this once tested for is unreachable from here — the
+                        // narrowing that fixed tree bindings firing over other
+                        // sidebar views left this arm behind. The tree has no
+                        // text input to raise a keyboard for, so `false` is
+                        // what the reachable half always evaluated to anyway.
+                        crate::keymap::MouseContext::FileTree
+                        | crate::keymap::MouseContext::TabStrip => false,
+                    }
+                {
+                    let mut osk = crate::widgets::osk::Osk::new();
+                    osk.split = crate::prefs::Prefs::load_or_default().osk_split;
+                    self.osk = Some(osk);
+                }
+
+                // Every terminal command reads the grid through
+                // `self.terminal()`, i.e. `active_terminal`. The built-in
+                // click path makes the clicked pane active before it runs
+                // any of them; this early-returns above that, so it has to
+                // do the same or a bound command inspects whichever pane
+                // happened to be focused. Same helper, so the overlay
+                // teardown cannot drift between the two paths.
+                if matches!(ctx, crate::keymap::MouseContext::Terminal)
+                    && let Some(idx) = terminal_hit
+                {
+                    self.activate_terminal_pane(idx);
+                }
+
+                // Clicking a pane focuses it — every built-in click handler
+                // does this, and returning above them skips it. Distinct from
+                // the pane activation above: that decides which terminal a
+                // command READS, this decides where the next KEYSTROKE goes.
+                // Without it a bound gesture that clicks into another pane
+                // acts on the clicked pane while the keyboard silently stays
+                // behind, so the user's next character lands in the pane they
+                // just clicked away from.
+                //
+                // The tab strip focuses the editor: it has no focus of its
+                // own, and that is what clicking a tab does anyway.
+                match ctx {
+                    crate::keymap::MouseContext::Terminal => self.focus_pane(Pane::Terminal),
+                    crate::keymap::MouseContext::FileTree => self.focus_pane(Pane::Tree),
+                    crate::keymap::MouseContext::Editor | crate::keymap::MouseContext::TabStrip => {
+                        self.focus_pane(Pane::Editor)
+                    }
+                }
+
+                // Position-carrying commands read the click through this,
+                // set before dispatch and cleared after so a keyboard
+                // invocation of the same command never sees a stale click.
+                self.last_mouse_pos = Some((m.column, m.row));
+                self.run_command(cmd);
+                self.last_mouse_pos = None;
+                return;
+            }
+        }
         let in_problems = self.bottom_panel_tab == BottomPanelTab::Problems
             && rect_contains(self.problems.last_area, m.column, m.row);
         let in_output = self.bottom_panel_tab == BottomPanelTab::Output
@@ -32408,31 +32919,7 @@ impl App {
                     }
                     self.poke_cursor();
                 } else if let Some(idx) = terminal_hit {
-                    if self.active_terminal != idx {
-                        // Copy mode is bound to the pane it opened on; a
-                        // click on a sibling pane leaves it, tmux-style,
-                        // rather than hijacking the new pane's grid.
-                        if self
-                            .terminal_copy_mode
-                            .as_ref()
-                            .is_some_and(|st| st.pane != idx)
-                        {
-                            self.close_terminal_copy_mode();
-                        }
-                        // Quick-select labels are pane-bound the same way.
-                        if self
-                            .terminal_quick_select
-                            .as_ref()
-                            .is_some_and(|st| st.pane != idx)
-                        {
-                            self.close_terminal_quick_select();
-                        }
-                        // As is the find bar and its highlight.
-                        if self.terminal_find.is_some() && self.terminal_find_pane != idx {
-                            self.close_terminal_find();
-                        }
-                        self.active_terminal = idx;
-                    }
+                    self.activate_terminal_pane(idx);
                     self.focus_pane(Pane::Terminal);
                     // Click on a gutter decoration dot (the pane's left
                     // border): open the command's action menu (VS Code's
@@ -32577,6 +33064,12 @@ impl App {
                 self.editor_click.clear_if_moved(m.column, m.row);
                 self.tree_click.clear_if_moved(m.column, m.row);
                 self.terminal_click.clear_if_moved(m.column, m.row);
+                // The modified tracker gets the same cancellation. It was left
+                // out when it was added, so a bound `ctrl+double_click` fired
+                // across a drag where the built-in double correctly did not —
+                // the one tracker not on this list behaved differently from
+                // every other one for no reason a user could discover.
+                self.modified_click.clear_if_moved(m.column, m.row);
                 // Terminal drag-selection is handled before the per-pane
                 // branches so it keeps extending even when the pointer
                 // leaves the pane: dragging past the bottom edge is how the
@@ -33554,10 +34047,19 @@ impl App {
     /// sweep (every written tab, background and inactive splits included).
     fn reload_config_for_path(&mut self, path: &std::path::Path) {
         if path == crate::keymap::keybindings_path() {
-            self.keymap = crate::keymap::Keymap::load(path);
-            self.status = String::from(
-                "Keybindings reloaded (for new Cmd chords, re-run croft setup-iterm2 / setup-ghostty)",
-            );
+            // The non-reporting loader: this path needs the warnings itself
+            // for the status summary below, and `load` would print each one to
+            // OUTPUT a second time.
+            let (map, warns) = crate::keymap::Keymap::load_with_warnings(path);
+            self.keymap = map;
+            // Refused rows used to vanish, which makes a mistyped binding
+            // feel like croft is broken. Same treatment the settings loader
+            // gives its warnings: OUTPUT for the detail, a status summary so
+            // the user knows to look (#259).
+            for w in &warns {
+                crate::output::push("Keybindings", crate::output::OutputLevel::Warn, w);
+            }
+            self.status = keybindings_reload_status(&warns);
         } else if path == crate::snippets::snippets_path() {
             self.snippets = crate::snippets::SnippetSet::load(path);
             self.status = String::from("Snippets reloaded");
@@ -38121,6 +38623,30 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
     has_shift && has_ctrl_or_super
 }
 
+/// The status line shown after a keybindings reload.
+///
+/// Split out of `reload_config_for_path` so it can be tested against a keymap
+/// built in memory. The alternative — a test that writes the real
+/// `~/.config/croft/keybindings.json` — would leak into every one of the
+/// thousands of concurrent tests that construct an `App`, since `App::new`
+/// loads that path unconditionally.
+fn keybindings_reload_status(warns: &[String]) -> String {
+    if warns.is_empty() {
+        String::from(
+            "Keybindings reloaded (for new Cmd chords, re-run croft setup-iterm2 / setup-ghostty)",
+        )
+    } else {
+        // One assignment: a second unconditional one below used to clobber
+        // this, so the user never saw the warning count and a refused row
+        // looked like croft ignoring them.
+        format!(
+            "Keybindings reloaded with {} warning{} — see OUTPUT · Keybindings",
+            warns.len(),
+            if warns.len() == 1 { "" } else { "s" }
+        )
+    }
+}
+
 /// `Cmd+B` (macOS) / `Ctrl+B` (Linux): toggle the primary side bar (left
 /// pane) visibility, mirroring VS Code's "View: Toggle Primary Side Bar".
 /// Accepts SUPER *or* CONTROL so the chord behaves identically whether
@@ -38623,6 +39149,110 @@ fn snippet_completion_item(snip: &crate::snippets::Snippet) -> crate::lsp::Compl
         kind: Some(lsp_types::CompletionItemKind::SNIPPET),
         is_snippet: true,
     }
+}
+
+/// Which mouse region a binding's `when` context refers to, or `None` when
+/// the pointer is somewhere no context covers (a panel, a seam, the status
+/// bar) — a user binding must not fire there.
+fn mouse_context_for(
+    m: &MouseEvent,
+    in_editor: bool,
+    in_terminal: bool,
+    in_tree: bool,
+    app: &App,
+) -> Option<crate::keymap::MouseContext> {
+    use crate::keymap::MouseContext;
+    // The tab strip has no focus notion, so it is recognised positionally and
+    // checked first: it overlaps the editor pane's full area.
+    if app.editor.tab_at(m.column, m.row).is_some() {
+        return Some(MouseContext::TabStrip);
+    }
+    if in_terminal {
+        return Some(MouseContext::Terminal);
+    }
+    // `in_tree` is true anywhere in the ACTIVE SIDEBAR, whichever view it is
+    // showing, so it alone would make a `file_tree` binding fire over Search
+    // results, the Remote list, the Testing panel and the commit graph. The
+    // context is named for the file tree and documented as the file tree, so
+    // it is narrowed to the view that actually is one; the other sidebar
+    // views have their own row semantics and no binding context yet, and
+    // firing a tree binding over them would act on a row it never meant.
+    if in_tree && app.sidebar_view == SidebarView::Explorer {
+        return Some(MouseContext::FileTree);
+    }
+    if in_editor {
+        return Some(MouseContext::Editor);
+    }
+    None
+}
+
+/// The gesture a mouse event spells, or `None` for events that are not
+/// bindable (motion, drags, button releases).
+///
+/// A left press reports `DoubleClick` when croft's own click tracker already
+/// considers it one, so a binding agrees with the built-in select-word
+/// behaviour rather than disagreeing about the same physical click. Triple
+/// click is NOT reported: the tracker distinguishes single from double only,
+/// and inventing a third level here would make `triple_click` bindings fire
+/// on the second click. `Gesture::parse` therefore rejects it with a load
+/// warning rather than accepting a binding that could never behave.
+fn gesture_for(
+    m: &MouseEvent,
+    app: &App,
+    ctx: crate::keymap::MouseContext,
+    now: std::time::Instant,
+) -> Option<crate::keymap::Gesture> {
+    use crate::keymap::{Gesture, GestureKind, MouseContext};
+    // Only the three modifiers a terminal actually reports for mouse; Super
+    // is never present (see `Gesture::parse`).
+    let mods = m.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+    let kind = match m.kind {
+        MouseEventKind::Down(MouseButton::Left) if !mods.is_empty() => {
+            // A modified click reads its OWN tracker. The unmodified ones are
+            // shared with built-ins that ignore modifiers, so the dispatch
+            // deliberately never records a modified click into them — which
+            // left `ctrl+double_click` unable to fire at all, since nothing
+            // remembered the first click of the pair.
+            if app.modified_click.is_double(now, m.column, m.row, mods) {
+                GestureKind::DoubleClick
+            } else {
+                GestureKind::Click
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            // The tracker has to match the region: each pane records into its
+            // own, so consulting `editor_click` everywhere left `double_click`
+            // permanently false in the tree, tab strip, and terminal — a
+            // binding there would silently never match.
+            let tracker = match ctx {
+                MouseContext::Terminal => &app.terminal_click,
+                MouseContext::FileTree => &app.tree_click,
+                MouseContext::Editor => &app.editor_click,
+                // The tab strip writes to no tracker of its own, so a double
+                // there can only be seen because the dispatch itself records
+                // into `editor_click` above. Sharing it with the editor body
+                // is acceptable: a double needs both clicks within 500ms at
+                // the SAME cell, and the strip and the body do not overlap.
+                MouseContext::TabStrip => &app.editor_click,
+            };
+            // `mods` is empty in this arm by construction (the modified case
+            // is matched above and reads its own tracker), and passing it
+            // rather than a literal keeps that true if the guard ever moves:
+            // #317 makes the built-in tracker refuse a modified pair, which is
+            // exactly what should happen if a modified click ever reached here.
+            if tracker.is_double(now, m.column, m.row, mods) {
+                GestureKind::DoubleClick
+            } else {
+                GestureKind::Click
+            }
+        }
+        MouseEventKind::Down(MouseButton::Middle) => GestureKind::MiddleClick,
+        MouseEventKind::Down(MouseButton::Right) => GestureKind::RightClick,
+        MouseEventKind::ScrollUp => GestureKind::WheelUp,
+        MouseEventKind::ScrollDown => GestureKind::WheelDown,
+        _ => return None,
+    };
+    Some(Gesture { kind, mods })
 }
 
 /// A chord eligible for a user rebind: it carries a real modifier

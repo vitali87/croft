@@ -59,7 +59,13 @@ pub struct ReleaseNote {
 }
 
 /// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Your config follows you over SSH: keybindings, snippets, triggers, matchers and macros are pushed to a remote when you connect, and apply on that remote's next launch. MCP consent deliberately stays behind.",
-}];
+pub const RELEASE_NOTES: &[ReleaseNote] = &[
+    ReleaseNote {
+        kind: NoteKind::Feature,
+        summary: "Mouse gestures are yours to bind: keybindings.json now takes ctrl/alt/shift-modified clicks, middle click, right click and the wheel, scoped per region. A binding croft cannot honour says so in OUTPUT instead of failing silently.",
+    },
+    ReleaseNote {
+        kind: NoteKind::Fix,
+        summary: "Modified clicks no longer leak into the built-ins: the first half of a bound ctrl+double_click stops firing go-to-definition, a modified click that drags away no longer pairs with the click it returns to, and a click over a mouse-reporting terminal is left to the child program. The At Click commands now match the built-ins they replace: Open Link at Click follows an editor document link instead of only searching the terminal, and Go to Definition at Click follows a document link first, as Ctrl/Cmd+click always has.",
+    },
+];

@@ -327,23 +327,202 @@ pub(crate) fn strip_line_comments(src: &str) -> String {
     out
 }
 
-/// One `{ "key": ..., "command": ... }` row as written on disk.
+/// A mouse gesture bindable in `keybindings.json` (#259).
+///
+/// Deliberately NOT expressed as a [`Chord`]: a chord is a `KeyCode` plus
+/// modifiers, and a gesture has no key code. Keeping the two apart also keeps
+/// gestures out of [`Keymap::chords`], which drives the iTerm2/Ghostty
+/// forwarder pass — a terminal forwarder for a mouse gesture is meaningless.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GestureKind {
+    Click,
+    DoubleClick,
+    MiddleClick,
+    RightClick,
+    WheelUp,
+    WheelDown,
+}
+
+/// A gesture plus the modifiers held with it.
+///
+/// `cmd`/`super` parses but can never match: SGR mouse reporting carries no
+/// Super bit, which is why croft's own go-to-definition rides Ctrl rather than
+/// Cmd. Binding it produces a load warning instead of a binding that silently
+/// never fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Gesture {
+    pub kind: GestureKind,
+    pub mods: KeyModifiers,
+}
+
+impl Gesture {
+    /// Parse `"ctrl+click"`, `"middle_click"`, `"alt+wheel_up"`. Returns the
+    /// gesture and, when the spelling parses but cannot ever match, a warning
+    /// for the OUTPUT channel.
+    /// `None` — not a gesture spelling; the caller should try it as a key
+    /// chord. `Some((None, Some(reason)))` — a gesture croft understands but
+    /// refuses to bind, with the reason. `Some((Some(g), warn))` — bind it.
+    pub fn parse(s: &str) -> Option<(Option<Gesture>, Option<String>)> {
+        let mut mods = KeyModifiers::NONE;
+        let mut kind: Option<GestureKind> = None;
+        let mut warn = None;
+        let mut refused = false;
+        for part in s.split('+') {
+            let p = part.trim().to_ascii_lowercase();
+            match p.as_str() {
+                "ctrl" | "control" => mods |= KeyModifiers::CONTROL,
+                "alt" | "opt" | "option" => mods |= KeyModifiers::ALT,
+                "shift" => mods |= KeyModifiers::SHIFT,
+                "cmd" | "command" | "super" | "meta" | "win" => {
+                    // Warned AND refused: `gesture_for` masks Super off, so a
+                    // bound entry could never be looked up, yet it would make
+                    // `has_mouse_bindings()` true and let `cmd+click` dodge
+                    // the reserved bare-click check by being a different key.
+                    refused = true;
+                    warn = Some(format!(
+                        "{s}: terminals do not report Cmd/Super for mouse events, so this \
+                         binding can never fire - use ctrl or alt instead"
+                    ));
+                }
+                // `mod` is Cmd for KEYS on macOS, but no terminal reports Cmd
+                // for mouse, so it resolves to Ctrl on every platform here
+                // rather than becoming an unfirable binding.
+                "mod" => mods |= KeyModifiers::CONTROL,
+                other => {
+                    let k = match other {
+                        "click" => GestureKind::Click,
+                        "double_click" => GestureKind::DoubleClick,
+                        // Refused with its own reason. A bare `None` would
+                        // fall through to `Chord::parse` and report "not a
+                        // key chord or mouse gesture", which reads like a
+                        // typo rather than a deliberate refusal.
+                        "triple_click" => {
+                            return Some((
+                                None,
+                                Some(String::from(
+                                    "triple_click: croft's click tracker counts single and \
+                                     double only, so a triple binding would fire on the second \
+                                     click — refused",
+                                )),
+                            ));
+                        }
+                        "middle_click" => GestureKind::MiddleClick,
+                        "right_click" => GestureKind::RightClick,
+                        "wheel_up" => GestureKind::WheelUp,
+                        "wheel_down" => GestureKind::WheelDown,
+                        // An unknown token after a Cmd refusal keeps the
+                        // refusal's reason ONLY if a gesture token has
+                        // already been seen — `"cmd+double_click+bogus"` is
+                        // a mouse row and deserves the Cmd explanation.
+                        //
+                        // `"cmd+j"` must NOT: Cmd is a real modifier for
+                        // KEYS and only meaningless for mouse, so the row
+                        // has to fall through to `Chord::parse` and bind as
+                        // a chord. Refusing it here silently unbinds every
+                        // user Cmd chord and breaks the iTerm2/Ghostty
+                        // forwarders that read them back.
+                        _ => {
+                            return if refused && kind.is_some() {
+                                Some((None, warn))
+                            } else {
+                                None
+                            };
+                        }
+                    };
+                    if kind.replace(k).is_some() {
+                        return None;
+                    }
+                }
+            }
+        }
+        // Checked BEFORE `kind?`: `"cmd"` or `"cmd+bogus"` has no gesture
+        // token, so returning early here would drop the Cmd-is-unreportable
+        // reason and fall through to a generic "not a key chord or mouse
+        // gesture" — losing exactly the explanation this path exists for.
+        if refused {
+            return Some((None, warn));
+        }
+        let kind = kind?;
+        Some((Some(Gesture { kind, mods }), warn))
+    }
+
+    /// True when this gesture would shadow primary selection. Binding these
+    /// is refused at load: rebinding a bare click or drag in the editor or
+    /// terminal leaves no way to place the caret or select text.
+    pub fn is_reserved_in(&self, ctx: MouseContext) -> bool {
+        self.mods.is_empty()
+            // Click places the caret; DoubleClick selects a word. The
+            // justification for reserving these names BOTH halves, and
+            // `select_word_at` has exactly two production call sites (the
+            // editor and terminal Down(Left) arms), both below the matched
+            // dispatch's early return -- so a bound bare double-click removes
+            // word-selection outright, with no way to get it back.
+            && matches!(self.kind, GestureKind::Click | GestureKind::DoubleClick)
+            && matches!(ctx, MouseContext::Editor | MouseContext::Terminal)
+    }
+}
+
+/// Where a mouse binding applies. Omitted means the editor, which is where
+/// nearly every gesture is wanted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MouseContext {
+    #[default]
+    Editor,
+    Terminal,
+    FileTree,
+    TabStrip,
+}
+
+impl MouseContext {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "editor" => Self::Editor,
+            "terminal" => Self::Terminal,
+            "file_tree" | "filetree" => Self::FileTree,
+            "tab_strip" | "tabstrip" => Self::TabStrip,
+            _ => return None,
+        })
+    }
+}
+
+/// One `{ "key": ..., "command": ... }` row as written on disk. `when` scopes
+/// a MOUSE binding to a region and is ignored for key chords, which keep the
+/// existing focus-based rule (see the module note).
 #[derive(Debug, Deserialize)]
 struct Binding {
     key: String,
     command: String,
+    #[serde(default)]
+    when: Option<String>,
 }
 
-/// The resolved user keymap: a chord lookup table into [`Command`].
+/// The resolved user keymap: a chord table into [`Command`], plus a separate
+/// mouse-gesture table keyed by gesture AND context, since one gesture can be
+/// bound differently per region.
 #[derive(Debug, Clone, Default)]
 pub struct Keymap {
     bindings: HashMap<Chord, Command>,
+    mouse: HashMap<(Gesture, MouseContext), Command>,
 }
 
 impl Keymap {
     /// Load and resolve `keybindings.json`, ignoring unparsable chords and
     /// unknown command ids (a typo skips that one line, never blocks startup).
     /// A missing file yields an empty keymap.
+    /// [`load`](Self::load) without the reporting, for the one caller that
+    /// needs the warnings itself: the reload path summarises them in the
+    /// status line as well as the OUTPUT channel, and reporting here too
+    /// would print each one twice.
+    pub fn load_with_warnings(path: &Path) -> (Self, Vec<String>) {
+        let Ok(json) = std::fs::read_to_string(path) else {
+            return (Self::default(), Vec::new());
+        };
+        Self::resolve(&json)
+    }
+
+    /// Load and resolve `keybindings.json`, reporting every row that binds
+    /// nothing to OUTPUT · Keybindings (a typo skips that one row, never
+    /// blocks startup). A missing file yields an empty keymap.
     pub fn load(path: &Path) -> Self {
         let Ok(json) = std::fs::read_to_string(path) else {
             return Self::default();
@@ -374,21 +553,16 @@ impl Keymap {
 
     /// [`from_json`](Self::from_json), also returning what it had to say about
     /// the file. Split so the reporting can be tested without reading a global
-    /// output buffer, and so `from_json` stays the one-line caller API.
+    /// output buffer, and so the loaders stay one-liners.
     ///
-    /// A row that does not do what it says must say so (#315). Three ways a
-    /// row can fail to bind, all of them previously silent:
-    ///
-    /// * the chord does not parse,
-    /// * the command id is not one croft has,
-    /// * an earlier row already bound that chord.
-    ///
-    /// The last one keeps VS Code's semantics - a later row deliberately
-    /// overrides an earlier one, which is how a user rebinds a default - so
-    /// this reports the override rather than refusing it. What it must not do
-    /// is stay quiet: a user who binds one chord twice by accident otherwise
-    /// gets the second binding with nothing anywhere to say the first was
-    /// discarded.
+    /// A row that does not do what it says must say so (#315). The ways a row
+    /// can fail to bind, all of them once silent: the file does not parse at
+    /// all, the command id is not one croft has, the key spelling is neither
+    /// chord nor gesture, the gesture is reserved in that context, or an
+    /// earlier row already bound it. That last one keeps VS Code's semantics -
+    /// a later row deliberately overrides an earlier one - so it reports the
+    /// override rather than refusing it, on the mouse surface as well as the
+    /// key one.
     pub(crate) fn resolve(json: &str) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         // A malformed file is the worst of the silent cases and the likeliest:
@@ -407,33 +581,136 @@ impl Keymap {
             }
         };
         let mut bindings: HashMap<Chord, Command> = HashMap::new();
-        let mut sources: HashMap<Chord, String> = HashMap::new();
+        let mut mouse: HashMap<(Gesture, MouseContext), Command> = HashMap::new();
+        // What each binding was last claimed by, so an override can name the
+        // row that lost as well as the one that won (#315). Kept per surface:
+        // a chord and a gesture cannot collide with each other.
+        let mut key_sources: HashMap<Chord, String> = HashMap::new();
+        let mut mouse_sources: HashMap<(Gesture, MouseContext), String> = HashMap::new();
         for row in rows {
-            let Some(chord) = Chord::parse(&row.key) else {
+            let Some(cmd) = Command::from_id(&row.command) else {
                 warnings.push(format!(
-                    "`{}` is not a chord croft can parse; the row binding `{}` was skipped",
+                    "{}: unknown command id \"{}\"",
                     row.key, row.command
                 ));
                 continue;
             };
-            let Some(cmd) = Command::from_id(&row.command) else {
-                warnings.push(format!(
-                    "`{}` is not a command croft has; the row for `{}` was skipped",
-                    row.command, row.key
-                ));
+            // A gesture spelling wins over a chord spelling: `Gesture::parse`
+            // only accepts the seven gesture names, so nothing a chord could
+            // legitimately spell is captured here.
+            if let Some((gesture, warn)) = Gesture::parse(&row.key) {
+                if let Some(w) = warn {
+                    warnings.push(w);
+                }
+                let Some(gesture) = gesture else {
+                    continue;
+                };
+                let ctx = match row.when.as_deref() {
+                    None => MouseContext::default(),
+                    Some(w) => match MouseContext::parse(w) {
+                        Some(c) => c,
+                        None => {
+                            warnings.push(format!("{}: unknown \"when\" context \"{w}\"", row.key));
+                            continue;
+                        }
+                    },
+                };
+                if gesture.is_reserved_in(ctx) {
+                    warnings.push(format!(
+                        // Name the gesture that was actually refused and the
+                        // one thing it does: saying "click ... caret or select
+                        // text" for a refused double-click is the same
+                        // prose-wider-than-predicate slip that let bare
+                        // double-click through in the first place.
+                        "{}: a bare {} is reserved in the {} - rebinding it would leave no \
+                         way to {}",
+                        row.key,
+                        match gesture.kind {
+                            GestureKind::DoubleClick => "double-click",
+                            _ => "click",
+                        },
+                        match ctx {
+                            MouseContext::Terminal => "terminal",
+                            _ => "editor",
+                        },
+                        match gesture.kind {
+                            GestureKind::DoubleClick => "select a word",
+                            _ => "place the caret",
+                        }
+                    ));
+                    continue;
+                }
+                // Same convention as the key path: the later row wins, and the
+                // discarded one is named rather than vanishing.
+                if let Some(previous) = mouse_sources.insert((gesture, ctx), row.command.clone()) {
+                    warnings.push(format!(
+                        "`{}` is bound more than once; the later row (`{}`) wins and the earlier one (`{}`) was discarded",
+                        row.key, row.command, previous
+                    ));
+                }
+                mouse.insert((gesture, ctx), cmd);
                 continue;
-            };
-            if let Some(previous) = sources.insert(chord, row.command.clone()) {
-                warnings.push(format!(
-                    "`{}` is bound more than once; the later row (`{}`) wins and the earlier one (`{}`) was discarded",
-                    row.key, row.command, previous
-                ));
             }
-            bindings.insert(chord, cmd);
+            match Chord::parse(&row.key) {
+                Some(chord) => {
+                    if let Some(previous) = key_sources.insert(chord, row.command.clone()) {
+                        warnings.push(format!(
+                            "`{}` is bound more than once; the later row (`{}`) wins and the earlier one (`{}`) was discarded",
+                            row.key, row.command, previous
+                        ));
+                    }
+                    bindings.insert(chord, cmd);
+                }
+                None => warnings.push(format!(
+                    "{}: not a key chord or mouse gesture; the row binding \"{}\" was skipped",
+                    row.key, row.command
+                )),
+            }
         }
-        (Self { bindings }, warnings)
+        (Self { bindings, mouse }, warnings)
     }
 
+    /// The command a mouse gesture is bound to in `ctx`, if any.
+    pub fn command_for_mouse(&self, gesture: Gesture, ctx: MouseContext) -> Option<Command> {
+        self.mouse.get(&(gesture, ctx)).copied()
+    }
+
+    /// True when no mouse gesture is bound, so `handle_mouse` can skip the
+    /// lookup entirely on the common path.
+    pub fn has_mouse_bindings(&self) -> bool {
+        !self.mouse.is_empty()
+    }
+
+    /// Whether this single click is the FIRST HALF of a bound double-click in
+    /// `ctx` — i.e. the user bound `ctrl+double_click` but not `ctrl+click`.
+    ///
+    /// Such a click matches nothing by construction, so it used to fall
+    /// straight through to the built-in that owns the same modifier: the first
+    /// half of every `ctrl+double_click` in the editor fired go-to-definition,
+    /// and the binding was unusable for the one gesture it was written for.
+    /// The dispatch consults this to swallow the prefix click instead.
+    ///
+    /// Deliberately narrow. It answers only for a `Click` whose double IS
+    /// bound, so an ordinary Ctrl+click with no double bound anywhere still
+    /// reaches the built-in exactly as before.
+    pub fn is_double_click_prefix(&self, gesture: Gesture, ctx: MouseContext) -> bool {
+        if !matches!(gesture.kind, GestureKind::Click) {
+            return false;
+        }
+        let double = Gesture {
+            kind: GestureKind::DoubleClick,
+            mods: gesture.mods,
+        };
+        // A click with its OWN binding is not the first half of anything:
+        // it has a command, and swallowing it would eat that command. The
+        // sole caller cannot reach this case, but the doc above promises it
+        // to every future one.
+        self.mouse.contains_key(&(double, ctx)) && !self.mouse.contains_key(&(gesture, ctx))
+    }
+
+    /// No KEY chords bound. Mouse gestures are asked about separately via
+    /// [`Self::has_mouse_bindings`], because the key path's caller uses this
+    /// to skip its lookup and must not be affected by mouse rows.
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
@@ -471,6 +748,248 @@ pub const TEMPLATE: &str = r#"// croft keyboard shortcuts. Rebind any palette co
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_bare_double_click_is_reserved_wherever_word_selection_lives() {
+        use super::{Gesture, GestureKind, Keymap, MouseContext};
+        use crossterm::event::KeyModifiers;
+        // The reservation's stated reason -- in the doc above `is_reserved_in`
+        // and in the refusal table at docs/KEYBINDINGS.md -- is that the
+        // gesture "is how the caret is placed AND TEXT IS SELECTED". Placing
+        // the caret is Click; selecting a word is DOUBLE-click, and it is the
+        // only route to word-selection in either pane (`select_word_at` has
+        // exactly two production call sites, both below the matched
+        // dispatch's early return). Reserving only Click protects half of the
+        // justification and leaves the other half bindable, so binding
+        // `double_click` removes word-selection with no warning at all.
+        for ctx in [MouseContext::Editor, MouseContext::Terminal] {
+            let bare_double = Gesture {
+                kind: GestureKind::DoubleClick,
+                mods: KeyModifiers::NONE,
+            };
+            assert!(
+                bare_double.is_reserved_in(ctx),
+                "{ctx:?}: a bare double-click is the only way to select a word, \
+                 so it is reserved for the same reason a bare click is"
+            );
+        }
+        // ... and the refusal must actually reach the user, not just be
+        // computable: a silently-dropped row and an accepted one look
+        // identical from the keymap.
+        let (km, warnings) = Keymap::resolve(
+            r#"[{"key": "double_click", "command": "toggle_word_wrap", "when": "editor"}]"#,
+        );
+        let bare_double = Gesture {
+            kind: GestureKind::DoubleClick,
+            mods: KeyModifiers::NONE,
+        };
+        assert!(
+            km.command_for_mouse(bare_double, MouseContext::Editor)
+                .is_none(),
+            "the reserved row must not bind"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("double_click")),
+            "the user must be told why their binding did nothing; warnings were {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn a_modified_double_click_is_still_bindable() {
+        use super::{Gesture, GestureKind, MouseContext};
+        use crossterm::event::KeyModifiers;
+        // The reservation is about the BARE gesture: `ctrl+double_click` does
+        // not collide with word-selection, and reserving it would break the
+        // feature this PR exists to add. Without this, "reserve double-click"
+        // could be satisfied by refusing every double-click.
+        let modified = Gesture {
+            kind: GestureKind::DoubleClick,
+            mods: KeyModifiers::CONTROL,
+        };
+        assert!(
+            !modified.is_reserved_in(MouseContext::Editor),
+            "only the BARE double-click is reserved"
+        );
+    }
+
+    #[test]
+    fn a_bound_single_click_is_not_a_double_click_prefix() {
+        use super::{Keymap, MouseContext};
+        use crossterm::event::KeyModifiers;
+        // The doc says this answers true only when the user bound the DOUBLE
+        // but NOT the single — "the first HALF of a bound double-click". A
+        // click that is itself bound is not a prefix: it has its own command,
+        // and swallowing it would eat that command.
+        //
+        // The sole caller today matches `Some((ctx, gesture, None))`, where
+        // the None IS "no command for this single click", so it cannot reach
+        // the bad case. But this is `pub`, and a contract enforced only by
+        // caller discipline is one the next caller does not know about.
+        let both = Keymap::from_json(
+            r#"[{"key": "ctrl+click", "command": "quick_open", "when": "editor"},
+                 {"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "editor"}]"#,
+        );
+        let click = super::Gesture {
+            kind: super::GestureKind::Click,
+            mods: KeyModifiers::CONTROL,
+        };
+        // Precondition: BOTH rows must have loaded, or "not a prefix" would be
+        // true for the trivial reason that no double is bound either.
+        assert!(
+            both.command_for_mouse(click, MouseContext::Editor)
+                .is_some(),
+            "precondition: the single click must be bound"
+        );
+        assert!(
+            !both.is_double_click_prefix(click, MouseContext::Editor),
+            "a click with its own binding is not the first half of anything: \
+             swallowing it would eat the command the user bound to it"
+        );
+
+        // And the documented positive case still answers true.
+        let double_only = Keymap::from_json(
+            r#"[{"key": "ctrl+double_click", "command": "toggle_word_wrap", "when": "editor"}]"#,
+        );
+        assert!(
+            double_only
+                .command_for_mouse(click, MouseContext::Editor)
+                .is_none(),
+            "precondition: the single click must NOT be bound here"
+        );
+        assert!(
+            double_only.is_double_click_prefix(click, MouseContext::Editor),
+            "the first half of a bound double, with no single bound, IS a prefix"
+        );
+    }
+
+    #[test]
+    fn gestures_parse_with_modifiers_and_reject_nonsense() {
+        use super::{Gesture, GestureKind};
+        let (g, warn) = Gesture::parse("ctrl+click").expect("ctrl+click parses");
+        let g = g.expect("and binds");
+        assert_eq!(g.kind, GestureKind::Click);
+        assert_eq!(g.mods, KeyModifiers::CONTROL);
+        assert!(warn.is_none());
+
+        let (g, _) = Gesture::parse("middle_click").expect("bare gesture parses");
+        let g = g.expect("and binds");
+        assert_eq!(g.kind, GestureKind::MiddleClick);
+        assert_eq!(g.mods, KeyModifiers::NONE);
+
+        let (g, _) = Gesture::parse("alt+shift+wheel_up").expect("two modifiers parse");
+        let g = g.expect("and binds");
+        assert_eq!(g.kind, GestureKind::WheelUp);
+        assert_eq!(g.mods, KeyModifiers::ALT | KeyModifiers::SHIFT);
+
+        assert!(
+            Gesture::parse("ctrl+f").is_none(),
+            "a key chord is not a gesture"
+        );
+        assert!(
+            Gesture::parse("click+wheel_up").is_none(),
+            "two gestures in one binding is nonsense"
+        );
+        let (g, warn) = Gesture::parse("triple_click").expect("it is recognised");
+        assert!(g.is_none(), "but refused rather than bound");
+        assert!(
+            warn.expect("with a reason").contains("second click"),
+            "the reason names the real problem, not a typo"
+        );
+    }
+
+    #[test]
+    fn a_cmd_gesture_warns_because_terminals_never_report_super() {
+        use super::Gesture;
+        let (g, warn) = Gesture::parse("cmd+click").expect("it still parses");
+        assert!(g.is_none(), "and is refused, not bound to a dead entry");
+        let warn = warn.expect("but it warns");
+        assert!(
+            warn.contains("can never fire"),
+            "the warning says why, not just that: {warn}"
+        );
+        // `mod` resolves to Ctrl for mouse on every platform rather than
+        // becoming an unfirable Cmd binding.
+        let (g, warn) = Gesture::parse("mod+click").expect("mod parses");
+        assert_eq!(g.expect("and binds").mods, KeyModifiers::CONTROL);
+        assert!(warn.is_none(), "and needs no warning");
+    }
+
+    #[test]
+    fn a_bare_click_is_refused_in_the_editor_and_terminal() {
+        let (km, warnings) = Keymap::resolve(
+            r#"[{"key": "click", "command": "save_file"},
+                {"key": "click", "command": "save_file", "when": "terminal"},
+                {"key": "click", "command": "save_file", "when": "file_tree"}]"#,
+        );
+        // Editor and terminal refuse; the file tree is fair game, since a
+        // click there is not how text gets selected.
+        assert_eq!(
+            warnings.len(),
+            2,
+            "both reserved contexts warn: {:?}",
+            warnings
+        );
+        assert!(
+            warnings.iter().all(|w| w.contains("reserved")),
+            "and say why: {:?}",
+            warnings
+        );
+        assert!(
+            km.command_for_mouse(
+                Gesture::parse("click").unwrap().0.unwrap(),
+                MouseContext::FileTree
+            )
+            .is_some(),
+            "the file-tree binding survived"
+        );
+    }
+
+    #[test]
+    fn one_gesture_binds_differently_per_context() {
+        let (km, _warnings) = Keymap::resolve(
+            r#"[{"key": "ctrl+click", "command": "save_file", "when": "editor"},
+                {"key": "ctrl+click", "command": "quick_open", "when": "file_tree"}]"#,
+        );
+        let g = Gesture::parse("ctrl+click").unwrap().0.unwrap();
+        assert_eq!(
+            km.command_for_mouse(g, MouseContext::Editor)
+                .map(|c| c.id()),
+            Some("save_file")
+        );
+        assert_eq!(
+            km.command_for_mouse(g, MouseContext::FileTree)
+                .map(|c| c.id()),
+            Some("quick_open"),
+            "the same gesture means something else in another region"
+        );
+        assert!(
+            km.command_for_mouse(g, MouseContext::Terminal).is_none(),
+            "and nothing at all where it was not bound"
+        );
+    }
+
+    #[test]
+    fn a_bad_row_warns_instead_of_vanishing() {
+        let (_km, warnings) = Keymap::resolve(
+            r#"[{"key": "ctrl+click", "command": "no_such_command"},
+                {"key": "ctrl+click", "command": "save_file", "when": "nowhere"},
+                {"key": "not-a-thing", "command": "save_file"}]"#,
+        );
+        assert_eq!(warnings.len(), 3, "{:?}", warnings);
+        assert!(warnings[0].contains("unknown command id"));
+        assert!(warnings[1].contains("when"));
+        assert!(warnings[2].contains("not a key chord or mouse gesture"));
+    }
+
+    #[test]
+    fn mouse_rows_do_not_make_the_key_map_look_non_empty() {
+        // `is_empty` gates the KEY lookup in handle_key; a mouse-only file
+        // must not make it start asking.
+        let (km, _warnings) = Keymap::resolve(r#"[{"key": "ctrl+click", "command": "save_file"}]"#);
+        assert!(km.is_empty(), "no key chords bound");
+        assert!(km.has_mouse_bindings(), "but a gesture is");
+    }
     use super::*;
 
     fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -589,7 +1108,7 @@ mod tests {
             { "key": "garbage++key", "command": "save_file" },
             { "key": "cmd+j", "command": "no_such_command" }
         ]"#;
-        let km = Keymap::from_json(json);
+        let (km, _warnings) = Keymap::resolve(json);
         assert_eq!(
             km.command_for(ev(KeyCode::Char(','), KeyModifiers::SUPER)),
             Some(Command::OpenSettings)
@@ -668,7 +1187,7 @@ mod tests {
     fn template_parses_as_a_valid_keymap() {
         // The seeded starter must itself resolve, or first-run users hit a
         // dead example. Strip the // comments the way the loader tolerates.
-        let km = Keymap::from_json(TEMPLATE);
+        let (km, _warnings) = Keymap::resolve(TEMPLATE);
         assert_eq!(
             km.command_for(ev(
                 KeyCode::Char(','),
