@@ -233,8 +233,32 @@ pub fn looks_destructive(code: &str) -> bool {
 /// (`->`, `=>`), not in a trailing comment. Quotes are honoured, so a `#`
 /// or `>` inside `"…"` / `'…'` is text - otherwise
 /// `echo "step #1" > ~/.bashrc` would hide its redirect behind a fake
-/// comment. `<>` counts: it opens its target for writing too.
+/// comment. A backslash escapes the next byte outside quotes and inside
+/// double quotes (`echo \" > ~/.bashrc` really writes the file). A quote
+/// that never closes (`echo don't > ~/.bashrc`) fails OPEN: the line is
+/// rescanned with quotes as plain text, since a missed write costs more
+/// than a spurious red banner. `<>` counts: it opens its target for
+/// writing too.
 fn has_write_redirect(line: &str) -> bool {
+    match redirect_scan(line, true) {
+        RedirectScan::Found => true,
+        RedirectScan::Clean => false,
+        RedirectScan::Unterminated => redirect_scan(line, false) == RedirectScan::Found,
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum RedirectScan {
+    Found,
+    Clean,
+    /// The line ended inside a quote, so nothing after the opening quote
+    /// was looked at.
+    Unterminated,
+}
+
+/// One pass of [`has_write_redirect`]; `quotes` says whether `'` and `"`
+/// open a string or are ordinary bytes.
+fn redirect_scan(line: &str, quotes: bool) -> RedirectScan {
     let b = line.as_bytes();
     let mut quote: Option<u8> = None;
     let mut i = 0;
@@ -242,12 +266,12 @@ fn has_write_redirect(line: &str) -> bool {
         let c = b[i];
         match quote {
             Some(q) if c == q => quote = None,
-            // A backslash inside double quotes escapes the next byte.
             Some(b'"') if c == b'\\' => i += 1,
             Some(_) => {}
             None => match c {
-                b'\'' | b'"' => quote = Some(c),
-                b'#' if i == 0 || b[i - 1].is_ascii_whitespace() => return false,
+                b'\\' => i += 1,
+                b'\'' | b'"' if quotes => quote = Some(c),
+                b'#' if i == 0 || b[i - 1].is_ascii_whitespace() => return RedirectScan::Clean,
                 b'>' => {
                     let prev = if i > 0 { b[i - 1] } else { b' ' };
                     if prev != b'-' && prev != b'=' {
@@ -266,7 +290,7 @@ fn has_write_redirect(line: &str) -> bool {
                                 })
                         });
                         if !(target.starts_with('&') || dev_null) {
-                            return true;
+                            return RedirectScan::Found;
                         }
                     }
                 }
@@ -275,7 +299,11 @@ fn has_write_redirect(line: &str) -> bool {
         }
         i += 1;
     }
-    false
+    if quote.is_some() {
+        RedirectScan::Unterminated
+    } else {
+        RedirectScan::Clean
+    }
 }
 
 /// One local image block in a rendered preview (#176).
@@ -1167,6 +1195,11 @@ mod tests {
             "printf 'step #2\\n' > ~/.zshrc",
             "exec 3<> /tmp/x",
             "make > /dev/nullish",
+            "echo don't > ~/.bashrc",
+            "echo \\\" > ~/.bashrc",
+            "echo \"unterminated > ~/.bashrc",
+            "printf '%s\\\\' > ~/.bashrc",
+            "cat payload >| ~/.profile",
             "git push --force",
             "git reset --hard HEAD~3",
         ] {
