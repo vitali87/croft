@@ -131,6 +131,8 @@ jobs:
         run: cargo fmt --check
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets -- -D warnings
+      - name: Issue-vetting script tests (stdlib, no venv)
+        run: python3 -m unittest discover -s scripts/tests -v
       - name: Tests
         # The suite spawns PTYs and real shells; keep the thread count modest
         # so the timing-sensitive terminal tests are not starved.
