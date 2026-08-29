@@ -441,19 +441,21 @@ fn prepared(ds: &Dataset, kind: ChartKind) -> Dataset {
     }
 }
 
-/// Bucket a long series down to at most `slots` points (mean per bucket),
-/// so a 10k-row line is a few hundred segments rather than ten thousand.
 /// The half-open row range bucket `i` of `slots` covers when `n` rows are
 /// squeezed into `slots` bars. One place for the arithmetic, so the bar a
 /// bucket averages and the label it wears can never name different rows.
 /// Every row lands in exactly one bucket and no bucket is empty while
-/// `slots <= n`.
+/// `slots <= n`; with more slots than rows, buckets past the last row
+/// repeat it rather than come back empty.
 fn bucket_range(i: usize, n: usize, slots: usize) -> (usize, usize) {
+    debug_assert!(slots > 0, "a bucket range needs at least one slot");
     let a = i * n / slots;
     let b = ((i + 1) * n / slots).max(a + 1);
     (a, b)
 }
 
+/// Bucket a long series down to at most `slots` points (mean per bucket),
+/// so a 10k-row line is a few hundred segments rather than ten thousand.
 fn downsample(values: &[f64], slots: usize) -> Vec<f64> {
     if values.len() <= slots || slots == 0 {
         return values.to_vec();
@@ -600,8 +602,9 @@ pub fn svg(
                     .map(|i| {
                         let (start, end) = bucket_range(i, n, shown);
                         let first = labels.get(start).cloned().unwrap_or_default();
-                        let last = labels.get(end - 1).cloned().unwrap_or_default();
-                        if end - 1 > start && last != first {
+                        let last_row = end - 1;
+                        let last = labels.get(last_row).cloned().unwrap_or_default();
+                        if last_row > start && last != first {
                             format!("{first}\u{2026}{last}")
                         } else {
                             first
@@ -1034,6 +1037,17 @@ mod tests {
                 next = b;
             }
             assert_eq!(next, n, "{n}/{slots}: the last bucket ends at the last row");
+        }
+    }
+
+    /// More slots than rows: the `.max(a + 1)` is what keeps every bucket
+    /// non-empty, so this is the case that pins it.
+    #[test]
+    fn a_bucket_is_never_empty_even_with_more_slots_than_rows() {
+        for i in 0..7 {
+            let (a, b) = bucket_range(i, 3, 7);
+            assert!(b > a, "bucket {i} of 3/7 is empty");
+            assert!(a < 3, "bucket {i} of 3/7 starts past the last row");
         }
     }
 
