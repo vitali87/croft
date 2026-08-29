@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Secrets in terminal output are masked live: AWS keys, sk-/ghp_/xox tokens, JWTs and bearer tokens paint as •••• while the real text stays in the pane - click a mask to read it, copies keep the real value unless a trigger says otherwise, and the scrollback-to-editor dump is always masked. A new `redact` trigger action adds your own patterns; Settings switches the built-in set off; the status bar counts masks on screen and a palette command reveals them for ten seconds.",
+    summary: "Runnable docs: shell fences in the Markdown preview wear a play glyph; click it (or press Cmd+Enter with the caret in the fence in the source) and the block is typed into a pane named after the document and block, in the document's directory, reusing that pane on a rerun. `{run=false}` opts a block out, `{confirm}` and destructive-looking blocks (rm -rf, sudo, curl | sh) ask first.",
 }];

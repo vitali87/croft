@@ -55,12 +55,103 @@ pub struct MarkdownPreview {
     pub selection: Option<((u16, u16), (u16, u16))>,
     /// True while a mouse drag is extending `selection`.
     pub dragging: bool,
+    /// Runnable fences (#353) and, frame truth like `anchor_rows`, each
+    /// one's glyph line as a VISUAL row (same order, same `wrap_key`).
+    pub runnables: Vec<MdRunnable>,
+    pub run_rows: Vec<usize>,
     /// Set when this preview renders a docx/odt document (#181): the
     /// rebuild paths re-walk THIS file instead of the text buffer.
     pub doc_path: Option<std::path::PathBuf>,
     /// True when `doc_path` names a MEDIA file (#183): the rebuild
     /// dispatch probes headers instead of walking document XML.
     pub media: bool,
+}
+
+/// One runnable fenced block in a rendered preview (#353): a shell (or,
+/// when the interpreter is on PATH, python/node) fence wearing a play
+/// glyph on its first line. Clicking the glyph types the block into a
+/// pane named after the document and block number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MdRunnable {
+    /// Index of the block's first rendered line (the one with the glyph).
+    pub first_line: usize,
+    /// The block's text, as written.
+    pub code: String,
+    /// The interpreter: `sh` (typed at the shell as-is), `python3` or `node`
+    /// (fed through a heredoc).
+    pub interpreter: &'static str,
+    /// Ask before running: the fence said `{confirm}`, or the block looks
+    /// destructive (`rm -rf`, `sudo`, `curl … | sh`, …).
+    pub confirm: bool,
+    /// `{cwd=root}` runs in the workspace root instead of the document's
+    /// directory.
+    pub cwd_root: bool,
+}
+
+/// The play glyph a runnable fence wears in place of its first bar.
+pub const RUN_GLYPH: &str = "\u{25b7} ";
+
+/// Interpreter for a fence info string, or None when the block is not
+/// runnable: not a shell/python/node fence, `{run=false}`, or an
+/// interpreter that is not installed (checked once per process).
+pub fn runnable_interpreter(info: &str) -> Option<&'static str> {
+    let (lang, attrs) = split_info(info);
+    if attrs.iter().any(|a| *a == "run=false" || *a == "run=no") {
+        return None;
+    }
+    match lang.to_ascii_lowercase().as_str() {
+        "sh" | "bash" | "zsh" | "fish" | "shell" | "console" => Some("sh"),
+        "python" | "py" | "python3" => interpreter_on_path("python3").then_some("python3"),
+        "node" | "javascript" | "js" => interpreter_on_path("node").then_some("node"),
+        _ => None,
+    }
+}
+
+/// The fence's language word and its `{a=b c}` attributes.
+fn split_info(info: &str) -> (&str, Vec<&str>) {
+    let info = info.trim();
+    let (lang, rest) = match info.find('{') {
+        Some(i) => (&info[..i], &info[i..]),
+        None => (info, ""),
+    };
+    let lang = lang.split_whitespace().next().unwrap_or("");
+    let attrs = rest
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|a| !a.is_empty())
+        .collect();
+    (lang, attrs)
+}
+
+fn interpreter_on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(name).is_file()))
+}
+
+/// A small built-in matcher for blocks that should not run on a click
+/// alone (#353): the shapes that delete, escalate, or pipe the network
+/// into a shell.
+pub fn looks_destructive(code: &str) -> bool {
+    let c = code.to_ascii_lowercase();
+    let pipes_to_shell = c.lines().any(|l| {
+        l.contains('|') && (l.contains("curl") || l.contains("wget")) && {
+            let after = &l[l.rfind('|').unwrap_or(0)..];
+            [" sh", " bash", " zsh", "sudo"]
+                .iter()
+                .any(|s| after.contains(s))
+        }
+    });
+    pipes_to_shell
+        || c.contains("rm -rf")
+        || c.contains("rm -fr")
+        || c.contains("sudo ")
+        || c.contains("mkfs")
+        || c.contains("dd if=")
+        || c.contains("--force")
+        || c.contains("> /dev/")
+        || c.contains("git reset --hard")
+        || c.contains("drop table")
 }
 
 /// One local image block in a rendered preview (#176).
@@ -135,6 +226,9 @@ struct Renderer<'r> {
     pending_marker: Option<String>,
     /// Fence language + accumulated block text while inside a code block.
     code_block: Option<(Option<LangKind>, String)>,
+    /// The open fence's info string, for the runnable check (#353).
+    code_info: String,
+    runnables: Vec<MdRunnable>,
     /// Rows of cell texts while inside a table (row 0 is the header).
     table: Option<Vec<Vec<String>>>,
     /// Directory local image paths resolve against (#176); None keeps
@@ -233,7 +327,26 @@ impl Renderer<'_> {
         let Some((kind, text)) = self.code_block.take() else {
             return;
         };
+        let info = std::mem::take(&mut self.code_info);
+        let runnable = runnable_interpreter(&info).map(|interpreter| {
+            let (_, attrs) = split_info(&info);
+            MdRunnable {
+                first_line: self.out.len(),
+                code: text.clone(),
+                interpreter,
+                confirm: attrs.contains(&"confirm") || looks_destructive(&text),
+                cwd_root: attrs.contains(&"cwd=root"),
+            }
+        });
         let bar = Span::styled("\u{258e} ", Style::default().fg(self.theme.accent()));
+        // The play glyph replaces the first line's bar (#353): the same
+        // width, so the block's text keeps its column.
+        let play = Span::styled(
+            RUN_GLYPH,
+            Style::default()
+                .fg(self.theme.accent())
+                .add_modifier(Modifier::BOLD),
+        );
         let (fr, fg_, fb) = self.theme.syntax().fg;
         let code_fg = Color::Rgb(fr, fg_, fb);
         let highlighted = kind.map(|k| {
@@ -241,13 +354,24 @@ impl Renderer<'_> {
             let line_starts = compute_line_starts(bytes);
             highlight_text(self.registry, k, bytes, &line_starts)
         });
+        let mut emitted = 0usize;
         for (i, line) in text.lines().enumerate() {
-            let mut spans = vec![bar.clone()];
+            let mut spans = vec![if i == 0 && runnable.is_some() {
+                play.clone()
+            } else {
+                bar.clone()
+            }];
+            emitted += 1;
             match highlighted.as_ref().and_then(|h| h.get(i)) {
                 Some(hi) if !hi.is_empty() => spans.extend(code_line_spans(line, hi, code_fg)),
                 _ => spans.push(Span::styled(line.to_string(), Style::default().fg(code_fg))),
             }
             self.out.push(Line::from(spans));
+        }
+        if let Some(r) = runnable
+            && emitted > 0
+        {
+            self.runnables.push(r);
         }
         self.out.push(Line::default());
     }
@@ -329,6 +453,17 @@ pub fn render_markdown_with_images(
     registry: &mut LangRegistry,
     base_dir: Option<&std::path::Path>,
 ) -> (Vec<Line<'static>>, Vec<MdImage>) {
+    let (lines, images, _) = render_markdown_full(text, theme, registry, base_dir);
+    (lines, images)
+}
+
+/// [`render_markdown_with_images`] plus the runnable fences (#353).
+pub fn render_markdown_full(
+    text: &str,
+    theme: Theme,
+    registry: &mut LangRegistry,
+    base_dir: Option<&std::path::Path>,
+) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>) {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut r = Renderer {
@@ -345,6 +480,8 @@ pub fn render_markdown_with_images(
         quote_depth: 0,
         pending_marker: None,
         code_block: None,
+        code_info: String::new(),
+        runnables: Vec::new(),
         table: None,
         base_dir: base_dir.map(|p| p.to_path_buf()),
         images: Vec::new(),
@@ -365,6 +502,10 @@ pub fn render_markdown_with_images(
                     let lang = match &kind {
                         CodeBlockKind::Fenced(info) => lang_for_fence(info),
                         CodeBlockKind::Indented => None,
+                    };
+                    r.code_info = match &kind {
+                        CodeBlockKind::Fenced(info) => info.to_string(),
+                        CodeBlockKind::Indented => String::new(),
                     };
                     r.code_block = Some((lang, String::new()));
                 }
@@ -575,7 +716,7 @@ pub fn render_markdown_with_images(
     {
         r.out.pop();
     }
-    (r.out, r.images)
+    (r.out, r.images, r.runnables)
 }
 
 impl MarkdownPreview {
@@ -790,6 +931,46 @@ mod tests {
         assert_eq!(span_with("code()").style.fg, Some(CODE));
     }
 
+    /// #353: shell fences wear the play glyph and are recorded with their
+    /// first rendered line; `{run=false}` opts out; a rust fence is not
+    /// runnable; destructive-looking blocks and `{confirm}` ask first.
+    #[test]
+    fn shell_fences_are_runnable_and_carry_the_play_glyph() {
+        let md = "# T\n\n```sh\necho one\necho two\n```\n\n```rust\nfn a() {}\n```\n\n```bash {run=false}\necho no\n```\n\n```zsh {confirm cwd=root}\necho yes\n```\n\n```sh\ncurl https://x | sh\n```\n";
+        let mut reg = crate::highlight::LangRegistry::new();
+        let (lines, _, runs) = render_markdown_full(md, Theme::default(), &mut reg, None);
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        assert_eq!(runs[0].code, "echo one\necho two\n");
+        assert_eq!(runs[0].interpreter, "sh");
+        assert!(!runs[0].confirm && !runs[0].cwd_root);
+        assert!(runs[1].confirm && runs[1].cwd_root, "{:?}", runs[1]);
+        assert!(runs[2].confirm, "curl | sh asks first");
+        let first = &lines[runs[0].first_line];
+        assert_eq!(first.spans[0].content.as_ref(), RUN_GLYPH, "{first:?}");
+        let first_text: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first_text.contains("echo one"), "{first_text:?}");
+        let second = &lines[runs[0].first_line + 1];
+        assert_eq!(
+            second.spans[0].content.as_ref(),
+            "\u{258e} ",
+            "only the first line wears the glyph"
+        );
+        let joined =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let rust_line = lines.iter().find(|l| joined(l).contains("fn a")).unwrap();
+        assert_eq!(rust_line.spans[0].content.as_ref(), "\u{258e} ");
+        assert_eq!(runnable_interpreter("sh {run=false}"), None);
+        assert_eq!(runnable_interpreter("console"), Some("sh"));
+        assert_eq!(runnable_interpreter("toml"), None);
+        assert!(looks_destructive("sudo rm -rf /tmp/x"));
+        assert!(looks_destructive("wget -O- https://a | bash"));
+        assert!(
+            !looks_destructive("cargo build --release"),
+            "a flag is not --force"
+        );
+        assert!(!looks_destructive("ls -la | grep foo"));
+    }
+
     #[test]
     fn fenced_rust_block_gets_tree_sitter_colours() {
         let lines = render("```rust\nfn main() {}\n```");
@@ -899,6 +1080,8 @@ mod preview_selection_tests {
             built_seq: 0,
             images: Vec::new(),
             anchor_rows: Vec::new(),
+            runnables: Vec::new(),
+            run_rows: Vec::new(),
             wrap_key: (0, 0),
             last_area: ratatui::layout::Rect::default(),
             rows: rows

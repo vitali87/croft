@@ -877,6 +877,14 @@ enum UpdateSource {
     Watch,
     SelfInstall,
     Staged,
+/// A fenced block about to run (#353), parked behind the confirm popup.
+#[derive(Clone, Debug)]
+struct PendingRunBlock {
+    pane_name: String,
+    cwd: PathBuf,
+    command: String,
+    /// The first line of the block, for the popup.
+    preview: String,
 }
 
 /// State of a background self-update observed by a remote-launched croft.
@@ -3104,6 +3112,9 @@ pub struct App {
     /// gated: the classic footgun is typing into panes you forgot were
     /// listening).
     pub pending_broadcast_enable: bool,
+    /// A runnable fence waiting on the confirm popup (#353): destructive-
+    /// looking blocks and `{confirm}` fences ask before they type.
+    pending_run_block: Option<PendingRunBlock>,
     /// Paint the terminal panes' right-edge arrival-time gutter ("Terminal:
     /// Toggle Timestamps"). Session-scoped, off by default.
     pub show_terminal_timestamps: bool,
@@ -4321,6 +4332,7 @@ impl App {
             watch_published_panes: std::collections::HashSet::new(),
             broadcast_input: false,
             pending_broadcast_enable: false,
+            pending_run_block: None,
             show_terminal_timestamps: false,
             host_accents: compile_host_accents(&loaded_prefs.host_accents),
             closed_terminals: Vec::new(),
@@ -15031,6 +15043,7 @@ impl App {
         self.render_discard_all_confirm(frame);
         self.render_replace_all_confirm(frame);
         self.render_broadcast_confirm(frame);
+        self.render_run_block_confirm(frame);
         // Terminal-pane inline image: sync after the panes have painted so
         // last_inner and the scroll offset are this frame's (all gating —
         // hidden panel, alt screen, off-screen anchor — is inside).
@@ -15637,6 +15650,73 @@ impl App {
     /// Confirmation modal for enabling broadcast input: the classic footgun
     /// is typing a destructive command into panes you forgot were listening,
     /// so switching it on gets the same red Y/N gate iTerm2 shows.
+    /// The confirm popup for a destructive-looking or `{confirm}` fence
+    /// (#353): the block's first line, the pane it would run in, Y/N.
+    fn render_run_block_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(block) = self.pending_run_block.as_ref() else {
+            return;
+        };
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let height: u16 = 7;
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        };
+        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
+        let popup = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
+            .title(ratatui::text::Span::styled(
+                " RUN THIS BLOCK? ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(popup, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let body = ratatui::text::Text::from(vec![
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!(
+                    "{} - in pane {} at {}. It looks destructive or the fence asked to confirm.",
+                    block.preview,
+                    block.pane_name,
+                    block.cwd.display()
+                ),
+                Style::default().fg(self.theme.ui(Color::White)),
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(
+                    "[Y]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("es, run   "),
+                ratatui::text::Span::styled(
+                    "[N]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("o / Esc"),
+            ]),
+        ]);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
+    }
+
     fn render_broadcast_confirm(&self, frame: &mut ratatui::Frame) {
         if !self.pending_broadcast_enable {
             return;
@@ -16818,6 +16898,18 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.cancel_pending_broadcast();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.pending_run_block.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_pending_run_block();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_run_block();
                 }
                 _ => {}
             }
@@ -23978,6 +24070,9 @@ impl App {
             return;
         }
         // Markdown: Toggle Preview (Cmd/Ctrl+Shift+V, the VS Code default).
+        if is_run_fence_key(key) && self.focus == Pane::Editor && self.run_fence_at_cursor() {
+            return;
+        }
         if is_markdown_preview_key(key) {
             self.toggle_markdown_preview();
             return;
@@ -25819,6 +25914,10 @@ impl App {
     /// consumed, so the normal editor click path is skipped: the source
     /// buffer is not visible, and a caret there would serve nobody.
     fn begin_preview_selection(&mut self, col: u16, row: u16) -> bool {
+        if let Some(idx) = self.preview_runnable_at(col, row) {
+            self.run_markdown_block(idx);
+            return true;
+        }
         let Some(md) = self.editor.markdown_preview.as_mut() else {
             return false;
         };
@@ -25835,6 +25934,161 @@ impl App {
         md.dragging = true;
         self.focus_pane(Pane::Editor);
         true
+    }
+
+    /// The runnable fence whose play glyph sits under screen `(col, row)`
+    /// (#353): the glyph is the first two cells of the block's first
+    /// visual row.
+    fn preview_runnable_at(&self, col: u16, row: u16) -> Option<usize> {
+        let md = self.editor.markdown_preview.as_ref()?;
+        if !rect_contains(md.last_area, col, row) || col - md.last_area.x > 1 {
+            return None;
+        }
+        let visual = (row - md.last_area.y) as usize + md.scroll as usize;
+        md.run_rows.iter().position(|r| *r == visual)
+    }
+
+    /// Run runnable fence `idx` of the open preview: straight into its
+    /// pane, or parked behind the confirm popup when the block asked for
+    /// one or looks destructive.
+    fn run_markdown_block(&mut self, idx: usize) {
+        let Some(md) = self.editor.markdown_preview.as_ref() else {
+            return;
+        };
+        let Some(block) = md.runnables.get(idx).cloned() else {
+            return;
+        };
+        let doc = self.editor.path.clone();
+        let file = doc
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from("doc"));
+        let cwd = if block.cwd_root {
+            self.active_workspace_root()
+        } else {
+            doc.as_ref()
+                .and_then(|p| p.parent())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.active_workspace_root())
+        };
+        let pending = PendingRunBlock {
+            pane_name: format!("{file}:{}", idx + 1),
+            cwd,
+            command: fence_command(block.interpreter, &block.code),
+            preview: block.code.lines().next().unwrap_or("").to_string(),
+        };
+        if block.confirm {
+            self.pending_run_block = Some(pending);
+        } else {
+            self.run_block_in_pane(pending);
+        }
+    }
+
+    /// Cmd+Enter in a Markdown SOURCE buffer (#353): run the shell fence the
+    /// caret sits in, without opening the preview.
+    fn run_fence_at_cursor(&mut self) -> bool {
+        let is_markdown = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| p.extension().and_then(|e| e.to_str()))
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown"));
+        if self.editor.markdown_preview.is_some() || !is_markdown {
+            return false;
+        }
+        let Some((info, code)) = fence_around(&self.editor.lines, self.editor.cursor_row) else {
+            self.status = String::from("Cmd+Enter: put the caret inside a shell fence to run it");
+            return true;
+        };
+        let Some(interpreter) = crate::markdown::runnable_interpreter(&info) else {
+            self.status = format!("Cmd+Enter: a `{}` fence is not runnable", info.trim());
+            return true;
+        };
+        let text = self.editor.lines.join("\n");
+        let (_, _, runnables) = crate::markdown::render_markdown_full(
+            &text,
+            self.theme,
+            &mut crate::highlight::LangRegistry::new(),
+            None,
+        );
+        // The block's number, so the pane matches the one a preview click
+        // would use.
+        let idx = runnables
+            .iter()
+            .position(|r| r.code.trim_end() == code.trim_end())
+            .unwrap_or(0);
+        let doc = self.editor.path.clone();
+        let file = doc
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from("doc"));
+        let attrs_root = info.contains("cwd=root");
+        let cwd = if attrs_root {
+            self.active_workspace_root()
+        } else {
+            doc.as_ref()
+                .and_then(|p| p.parent())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.active_workspace_root())
+        };
+        let pending = PendingRunBlock {
+            pane_name: format!("{file}:{}", idx + 1),
+            cwd,
+            command: fence_command(interpreter, &code),
+            preview: code.lines().next().unwrap_or("").to_string(),
+        };
+        if info.contains("confirm") || crate::markdown::looks_destructive(&code) {
+            self.pending_run_block = Some(pending);
+        } else {
+            self.run_block_in_pane(pending);
+        }
+        true
+    }
+
+    /// Type a fence into its pane (#353): the pane named after the document
+    /// and block, reused when it sits idle at a prompt, else a fresh one in
+    /// the document's directory. The block is typed, not spawned, so the
+    /// user sees it and shell history records it.
+    fn run_block_in_pane(&mut self, block: PendingRunBlock) {
+        // Ctrl-E + Ctrl-U first, as tasks do: an idle shell's line editor
+        // may hold a half-typed command.
+        let bytes = format!("\x05\x15{}", block.command);
+        if let Some(idx) = self
+            .terminals
+            .iter()
+            .position(|t| t.label() == block.pane_name && t.foreground_is_shell())
+        {
+            self.active_terminal = idx;
+            self.terminals[idx].write_input(bytes.as_bytes());
+            self.show_terminal = true;
+            self.focus_pane(Pane::Terminal);
+            self.status = format!("Running {}", block.pane_name);
+            return;
+        }
+        match crate::widgets::terminal::PtyTerminal::new(&block.cwd) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(block.pane_name.clone()));
+                term.write_input(bytes.as_bytes());
+                self.insert_terminal(term);
+                self.status = format!("Running {}", block.pane_name);
+            }
+            Err(e) => {
+                self.status = format!("Could not start a pane for {}: {e}", block.pane_name);
+            }
+        }
+    }
+
+    fn confirm_pending_run_block(&mut self) {
+        if let Some(block) = self.pending_run_block.take() {
+            self.run_block_in_pane(block);
+        }
+    }
+
+    fn cancel_pending_run_block(&mut self) {
+        self.pending_run_block = None;
+        self.status = String::from("Block not run");
     }
 
     /// Extend a live preview drag and finish it on release. Returns true
@@ -39240,6 +39494,61 @@ fn is_run_build_task_key(key: KeyEvent) -> bool {
 /// `setup-iterm2` relocates that menu item so this chord reaches croft.
 fn is_markdown_preview_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'v')
+}
+
+/// Cmd+Enter (#353): run the shell fence under the caret in a Markdown
+/// source buffer.
+fn is_run_fence_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Enter) && key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// The command typed into a pane for a fenced block (#353): a shell block
+/// as written (a trailing newline runs its last line); python and node
+/// through a quoted heredoc so the block runs whole.
+fn fence_command(interpreter: &str, code: &str) -> String {
+    let code = code.trim_end_matches('\n');
+    match interpreter {
+        "sh" => format!("{code}\r"),
+        other => format!("{other} - <<'CROFT_BLOCK'\n{code}\nCROFT_BLOCK\r"),
+    }
+}
+
+/// The fence enclosing `row` of a Markdown source: its info string and
+/// body. None when the caret is not between a pair of ``` lines.
+fn fence_around(lines: &[String], row: usize) -> Option<(String, String)> {
+    let is_fence = |l: &str| l.trim_start().starts_with("```");
+    // Fences pair up from the top of the file: the caret is inside a block
+    // when an odd number of fence lines precede it, and the last of those
+    // is the opener.
+    let mut open: Option<usize> = None;
+    for (i, l) in lines
+        .iter()
+        .enumerate()
+        .take(row.min(lines.len().saturating_sub(1)) + 1)
+    {
+        if is_fence(l) {
+            open = match open {
+                Some(_) => None,
+                None => Some(i),
+            };
+        }
+    }
+    let open = open?;
+    if open == row {
+        // The caret sits ON the opener: still the block's own line.
+    }
+    let close = ((open + 1)..lines.len()).find(|&i| is_fence(&lines[i]))?;
+    if row > close {
+        return None;
+    }
+    let info = lines[open]
+        .trim_start()
+        .trim_start_matches('`')
+        .trim()
+        .to_string();
+    let mut body = lines[open + 1..close].join("\n");
+    body.push('\n');
+    Some((info, body))
 }
 
 /// Milliseconds since the Unix epoch, for stamping local-history snapshots

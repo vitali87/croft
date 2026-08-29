@@ -20845,6 +20845,126 @@ fn a_staged_update_offers_relaunch_and_only_relaunch_re_execs() {
         .expect("a Relaunch button");
     left_click(&mut app, relaunch.x, relaunch.y);
     assert!(app.pending_reexec && app.quit, "Relaunch arms the re-exec");
+/// #353: a click on a shell fence's play glyph in the preview types the
+/// block into a pane named `<file>:<n>` in the document's directory; a
+/// `curl | sh` block parks behind the confirm popup instead, and N drops
+/// it. Cmd+Enter in the source runs the fence under the caret.
+#[test]
+fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sub = tmp.path().join("docs");
+    std::fs::create_dir_all(&sub).unwrap();
+    let readme = sub.join("README.md");
+    std::fs::write(
+        &readme,
+        "# Run me\n\n```sh\necho first\n```\n\nText between.\n\n```bash\necho second\n```\n\n```sh\ncurl https://example.invalid/x | sh\n```\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&readme).unwrap();
+    app.toggle_markdown_preview();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let md = app.editor.markdown_preview.as_ref().expect("preview open");
+    assert_eq!(md.runnables.len(), 3, "{:?}", md.runnables);
+    assert_eq!(md.run_rows.len(), 3);
+    let area = md.last_area;
+    let glyph_row = |app: &App, i: usize| {
+        let md = app.editor.markdown_preview.as_ref().unwrap();
+        (area.x, area.y + md.run_rows[i] as u16)
+    };
+    // The glyph paints where run_rows says.
+    let (gx, gy) = glyph_row(&app, 1);
+    assert_eq!(
+        term.backend().buffer()[(gx, gy)].symbol(),
+        "\u{25b7}",
+        "the second block's first row starts with the play glyph"
+    );
+    let panes_before = app.terminals.len();
+    left_click(&mut app, gx, gy);
+    assert_eq!(app.terminals.len(), panes_before + 1, "a pane was opened");
+    let pane = &app.terminals[app.active_terminal];
+    assert_eq!(pane.label(), "README.md:2");
+    assert!(app.pending_run_block.is_none());
+    assert!(app.status.contains("README.md:2"), "{}", app.status);
+
+    // The third block pipes the network into a shell: it asks first.
+    let (gx, gy) = glyph_row(&app, 2);
+    let panes_before = app.terminals.len();
+    left_click(&mut app, gx, gy);
+    assert_eq!(app.terminals.len(), panes_before, "nothing ran yet");
+    let pending = app
+        .pending_run_block
+        .as_ref()
+        .expect("the confirm popup is up");
+    assert_eq!(pending.pane_name, "README.md:3");
+    assert_eq!(pending.cwd, sub, "the document's directory is the cwd");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_run_block.is_none(), "N drops it");
+    assert_eq!(app.terminals.len(), panes_before);
+
+    // Cmd+Enter in the source runs the fence under the caret. The last run
+    // focused its pane; the chord is an editor one.
+    app.toggle_markdown_preview();
+    assert!(app.editor.markdown_preview.is_none());
+    app.focus_pane(super::Pane::Editor);
+    app.editor.cursor_row = 3; // "echo first"
+    let panes_before = app.terminals.len();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.terminals.len(), panes_before + 1, "{}", app.status);
+    assert_eq!(app.terminals[app.active_terminal].label(), "README.md:1");
+    // Outside any fence it explains itself instead of running.
+    app.focus_pane(super::Pane::Editor);
+    app.editor.cursor_row = 6; // "Text between."
+    let panes_before = app.terminals.len();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.terminals.len(), panes_before);
+    assert!(
+        app.status.contains("inside a shell fence"),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn fence_command_and_fence_around_shape_the_typed_block() {
+    assert_eq!(
+        super::fence_command("sh", "echo a\necho b\n"),
+        "echo a\necho b\r"
+    );
+    assert_eq!(
+        super::fence_command("python3", "print(1)\n"),
+        "python3 - <<'CROFT_BLOCK'\nprint(1)\nCROFT_BLOCK\r"
+    );
+    let lines: Vec<String> = [
+        "# T",
+        "```sh {confirm}",
+        "a",
+        "b",
+        "```",
+        "after",
+        "```",
+        "x",
+        "```",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        super::fence_around(&lines, 2),
+        Some((String::from("sh {confirm}"), String::from("a\nb\n")))
+    );
+    assert_eq!(super::fence_around(&lines, 5), None, "between fences");
+    assert_eq!(super::fence_around(&lines, 0), None, "before any fence");
+    assert_eq!(
+        super::fence_around(&lines, 7),
+        Some((String::new(), String::from("x\n"))),
+        "a bare fence has an empty info string"
+    );
 }
 
 /// #360: the built-in secret rules sit in the trigger set by default,
