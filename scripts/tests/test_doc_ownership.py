@@ -121,6 +121,41 @@ class ItemKinds(unittest.TestCase):
                 f"to the gate rather than merely undocumented",
             )
 
+    def test_multi_line_attributes_and_block_docs_are_read_correctly(self):
+        """Both shapes made a DOCUMENTED item read as undocumented.
+
+        That is a false accusation, not a miss: the gate would report a loss
+        that never happened, on a branch that had merely reformatted an
+        attribute or used `/** */`. For a gate that is the worse direction,
+        because one that cries wolf stops being read.
+
+        The inner form `/*!` and the ordinary `/*` and `/***` comments must
+        NOT count, or the gate invents documentation instead.
+        """
+        documented_shapes = [
+            ("multi-line attribute", "/// doc\n#[cfg(all(\n    feature = \"x\",\n    unix\n))]\nconst A: u8 = 1;\n"),
+            ("one-line block doc", "/** doc */\nconst A: u8 = 1;\n"),
+            ("multi-line block doc", "/**\n * doc\n */\nconst A: u8 = 1;\n"),
+            ("block doc then attribute", "/** doc */\n#[cfg(test)]\nconst A: u8 = 1;\n"),
+        ]
+        for label, text in documented_shapes:
+            self.assertEqual(
+                gate.documented(text).get("A"), True, f"{label} documents A"
+            )
+
+        undocumented_shapes = [
+            ("inner block doc documents the MODULE", "/*! module */\nconst A: u8 = 1;\n"),
+            ("ordinary block comment", "/* a note */\nconst A: u8 = 1;\n"),
+            ("triple-star rule", "/*** rule ***/\nconst A: u8 = 1;\n"),
+            ("four slashes is a rule", "//// rule\nconst A: u8 = 1;\n"),
+        ]
+        for label, text in undocumented_shapes:
+            self.assertEqual(
+                gate.documented(text).get("A"),
+                False,
+                f"{label} must not count as documentation",
+            )
+
     def test_a_declaration_inside_a_string_is_not_an_item(self):
         """The regex is line-anchored, so a declaration quoted mid-line is
         not mistaken for one."""
