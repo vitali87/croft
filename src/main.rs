@@ -65,6 +65,7 @@ mod test_budget;
 mod testing;
 mod theme;
 mod triggers;
+mod update_check;
 mod update_watch;
 mod vim;
 mod voice;

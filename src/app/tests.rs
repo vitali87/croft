@@ -20561,6 +20561,95 @@ fn clicking_the_port_toast_dismiss_button_clears_it() {
     );
 }
 
+/// #333: a newer release raises a bottom-LEFT popup that never captures
+/// keys; Later dismisses it and remembers the version, so the same release
+/// is not offered on the next launch.
+#[test]
+fn an_update_offer_raises_the_bottom_left_toast_and_later_dismisses_it() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.update_check = Some(crate::update_check::UpdateCheck::preloaded(Some(
+            "9.9.9".into(),
+        )));
+        assert!(app.poll_update_watch(), "the offer landing is a redraw");
+        let toast = app
+            .update_toast
+            .as_ref()
+            .expect("the offer raises the toast");
+        assert_eq!(toast.version, "9.9.9");
+        let backend = ratatui::backend::TestBackend::new(140, 50);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buttons = app.update_toast.as_ref().unwrap().buttons.clone();
+        let update = buttons
+            .iter()
+            .find(|(_, a)| matches!(a, super::UpdateToastAction::Update))
+            .map(|(r, _)| *r)
+            .expect("an Update button");
+        assert!(update.x < 70, "the popup sits bottom-left: {update:?}");
+        assert!(update.y > 40, "the popup sits bottom-left: {update:?}");
+        let later = buttons
+            .iter()
+            .find(|(_, a)| matches!(a, super::UpdateToastAction::Later))
+            .map(|(r, _)| *r)
+            .expect("a Later button");
+        left_click(&mut app, later.x, later.y);
+        assert!(app.update_toast.is_none(), "Later clears the toast");
+        assert!(
+            app.staged_install.is_none(),
+            "Later stages nothing: the installed binary is untouched"
+        );
+        let cache =
+            crate::update_check::CheckCache::load(&home.path().join(".cache").join("croft"));
+        assert_eq!(
+            cache.dismissed.as_deref(),
+            Some("9.9.9"),
+            "Later is remembered"
+        );
+    });
+}
+
+/// #333: a staged build that lands turns the popup into a Relaunch offer,
+/// and Relaunch is the same re-exec F9 arms - never automatic.
+#[test]
+fn a_staged_update_offers_relaunch_and_only_relaunch_re_execs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let staged = tmp.path().join("staged-croft");
+    app.staged_install = Some(crate::update_check::StagedInstall::preloaded(
+        &[
+            crate::update_watch::UpdateEvent::InProgress,
+            crate::update_watch::UpdateEvent::Ready,
+        ],
+        staged.clone(),
+        "9.9.9",
+    ));
+    assert!(app.poll_update_watch());
+    assert_eq!(app.update_status, UpdateStatus::Ready);
+    assert!(!app.pending_reexec, "landing never relaunches by itself");
+    assert_eq!(
+        app.staged_update_binary().as_deref(),
+        Some(staged.as_path())
+    );
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let relaunch = app
+        .update_toast
+        .as_ref()
+        .expect("the ready toast")
+        .buttons
+        .iter()
+        .find(|(_, a)| matches!(a, super::UpdateToastAction::Relaunch))
+        .map(|(r, _)| *r)
+        .expect("a Relaunch button");
+    left_click(&mut app, relaunch.x, relaunch.y);
+    assert!(app.pending_reexec && app.quit, "Relaunch arms the re-exec");
+}
+
 #[test]
 fn clicking_the_problems_tab_switches_the_panel_view() {
     let tmp = tempfile::tempdir().unwrap();
