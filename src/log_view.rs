@@ -591,6 +591,12 @@ impl LogView {
             .is_some_and(|(a, b)| a != b)
     }
 
+    /// [`Self::ordered_selection`] for the renderer, which needs the same
+    /// normalisation to paint a backwards drag.
+    pub fn ordered_selection_public(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.ordered_selection()
+    }
+
     /// The selection with its endpoints in reading order.
     fn ordered_selection(&self) -> Option<((usize, usize), (usize, usize))> {
         let (a, b) = self.selection?;
