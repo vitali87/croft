@@ -135,8 +135,7 @@ pub enum CliCommand {
     Ls,
     /// Chart numbers, CSV/TSV, or JSON lines from stdin inline in the pane:
     /// `seq 1 100 | awk '{print sin($1/10)}' | croft plot`. Draws an image on
-    /// iTerm2 / Kitty / sixel terminals and a braille or block chart anywhere
-    /// else. Headers are detected; `--x` names the label column, `--y` the
+    /// iTerm2 / Kitty terminals and a braille or block chart anywhere else. Headers are detected; `--x` names the label column, `--y` the
     /// series (repeatable).
     Plot {
         /// Chart shape: line, bar, spark (one row), or hist (histogram of
@@ -553,9 +552,11 @@ impl Cli {
 }
 
 /// `croft plot` (#361): parse stdin, draw, and print either an inline image
-/// or the text chart. The image path is taken only when the terminal has
-/// an inline protocol (iTerm2/Kitty from the environment, sixel by a DA1
-/// probe of the tty); everything else, and `--text`, gets braille/blocks.
+/// or the text chart. The image path is taken only when the terminal
+/// advertises an inline protocol in the environment (iTerm2/Kitty); the
+/// sixel DA1 probe needs a raw-mode tty on stdin, and stdin is the data
+/// pipe here, so sixel hosts get the text chart. Everything else, and
+/// `--text`, gets braille/blocks.
 /// Exit 1 with the parse error on bad input rather than drawing a blank.
 fn plot(
     kind: &str,
@@ -583,13 +584,7 @@ fn plot(
     };
     let mut out = std::io::stdout();
     if !text_only && out.is_terminal() {
-        let mut protocol = crate::iterm2_inline::detect_inline_image_protocol();
-        if protocol == crate::iterm2_inline::InlineImageProtocol::None
-            && std::io::stdin().is_terminal()
-            && crate::iterm2_inline::probe_sixel_support()
-        {
-            protocol = crate::iterm2_inline::InlineImageProtocol::Sixel;
-        }
+        let protocol = crate::iterm2_inline::detect_inline_image_protocol();
         if protocol != crate::iterm2_inline::InlineImageProtocol::None {
             let palette = plot_palette();
             // Cells are roughly 1:2, so the raster keeps the on-screen aspect.
@@ -612,12 +607,14 @@ fn plot(
                 crate::iterm2_inline::KITTY_ID_PLOT,
             ) {
                 out.write_all(seq.as_bytes())?;
-                // Kitty leaves the cursor where it was (C=1): step past the
-                // image so the next prompt lands under it.
+                // Kitty leaves the cursor on the image's first row (C=1):
+                // newlines, not a cursor-down, so an image emitted near the
+                // bottom scrolls up instead of the prompt landing on it.
                 if protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
-                    write!(out, "\x1b[{rows}B")?;
+                    out.write_all("\n".repeat(rows as usize).as_bytes())?;
+                } else {
+                    out.write_all(b"\n")?;
                 }
-                out.write_all(b"\n")?;
                 return out.flush().context("writing the chart");
             }
         }

@@ -117,11 +117,49 @@ fn parse_number(field: &str) -> Option<f64> {
     if t.is_empty() {
         return None;
     }
-    // Thousands separators and a trailing percent are common in exported
-    // tables; both are unambiguous once the field is otherwise numeric.
-    let cleaned: String = t.chars().filter(|c| *c != ',' && *c != '_').collect();
-    let cleaned = cleaned.strip_suffix('%').unwrap_or(&cleaned);
+    let t = t.strip_suffix('%').unwrap_or(t);
+    // A thousands separator is only ever in thousands position: groups of
+    // three after a leading group of one to three digits. Anything else
+    // with a comma ("1,2,3") is several fields, never one number.
+    let cleaned = strip_thousands(t)?;
     cleaned.parse::<f64>().ok()
+}
+
+fn strip_thousands(t: &str) -> Option<String> {
+    let sep = if t.contains(',') {
+        ','
+    } else if t.contains('_') {
+        '_'
+    } else {
+        return Some(t.to_string());
+    };
+    let (sign, body) = match t.strip_prefix('-') {
+        Some(b) => ("-", b),
+        None => ("", t),
+    };
+    let (int, frac) = match body.find('.') {
+        Some(i) => (&body[..i], Some(&body[i..])),
+        None => (body, None),
+    };
+    let mut groups = int.split(sep);
+    let first = groups.next()?;
+    if first.is_empty() || first.len() > 3 || !first.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut out = format!("{sign}{first}");
+    for g in groups {
+        if g.len() != 3 || !g.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        out.push_str(g);
+    }
+    if let Some(f) = frac {
+        if f.contains(sep) {
+            return None;
+        }
+        out.push_str(f);
+    }
+    Some(out)
 }
 
 /// Which separator the first data line uses: tabs beat commas beat runs of
@@ -156,10 +194,14 @@ enum Delim {
     Space,
 }
 
-fn detect_delim(line: &str) -> Delim {
-    if line.contains('\t') {
+/// The delimiter, from the first few lines rather than the first alone: a
+/// CSV whose first row happens to be one column must not be read as
+/// whitespace-separated, which would fold `1,2` into one field.
+fn detect_delim(lines: &[&str]) -> Delim {
+    let sample: Vec<&&str> = lines.iter().take(8).collect();
+    if sample.iter().any(|l| l.contains('\t')) {
         Delim::Tab
-    } else if line.contains(',') {
+    } else if sample.iter().filter(|l| l.contains(',')).count() * 2 >= sample.len() {
         Delim::Comma
     } else {
         Delim::Space
@@ -213,7 +255,7 @@ pub fn parse(input: &str, x: Option<&str>, y: &[String]) -> Result<Dataset, Stri
         }
         (headers, rows)
     } else {
-        let delim = detect_delim(first);
+        let delim = detect_delim(&lines);
         let mut rows: Vec<Vec<String>> = lines.iter().map(|l| split_line(l, delim)).collect();
         let width = rows.iter().map(Vec::len).max().unwrap_or(0);
         for r in &mut rows {
@@ -223,7 +265,9 @@ pub fn parse(input: &str, x: Option<&str>, y: &[String]) -> Result<Dataset, Stri
         // while the row after it is all numbers where the header is not.
         let first_row = rows[0].clone();
         let has_header = rows.len() > 1
-            && first_row.iter().any(|f| parse_number(f).is_none())
+            && first_row
+                .iter()
+                .any(|f| !f.is_empty() && parse_number(f).is_none())
             && rows[1]
                 .iter()
                 .zip(&first_row)
@@ -277,7 +321,15 @@ pub fn parse(input: &str, x: Option<&str>, y: &[String]) -> Result<Dataset, Stri
             .filter(|&i| Some(i) != x_col && numeric(i))
             .collect()
     } else {
-        y.iter().map(|n| column(n)).collect::<Result<_, _>>()?
+        let cols = y.iter().map(|n| column(n)).collect::<Result<Vec<_>, _>>()?;
+        if let Some(&bad) = cols.iter().find(|&&i| !numeric(i)) {
+            return Err(format!(
+                "column {:?} is not numeric; the input has: {}",
+                headers[bad],
+                headers.join(", ")
+            ));
+        }
+        cols
     };
     if y_cols.is_empty() {
         return Err(format!(
@@ -305,15 +357,17 @@ pub fn histogram(ds: &Dataset, bins: usize) -> Dataset {
         return Dataset::default();
     };
     let finite: Vec<f64> = s.values.iter().copied().filter(|v| v.is_finite()).collect();
-    let bins = bins.max(1);
+    if finite.is_empty() {
+        return Dataset::default();
+    }
     let (lo, hi) = finite
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), v| {
             (l.min(*v), h.max(*v))
         });
-    if finite.is_empty() {
-        return Dataset::default();
-    }
+    // Constant data is one bin; inventing neighbours would label values
+    // that were never there.
+    let bins = if hi > lo { bins.max(1) } else { 1 };
     let width = if hi > lo {
         (hi - lo) / bins as f64
     } else {
@@ -343,7 +397,13 @@ pub fn format_num(v: f64) -> String {
         return String::from("-");
     }
     let a = v.abs();
-    if a >= 1_000_000.0 {
+    // Band edges sit where the rounded lower band would print the next
+    // unit ("1000.0k"), so no label ever exceeds seven characters.
+    if a >= 999_950_000_000.0 {
+        format!("{:.1e}", v)
+    } else if a >= 999_950_000.0 {
+        format!("{:.1}G", v / 1_000_000_000.0)
+    } else if a >= 999_950.0 {
         format!("{:.1}M", v / 1_000_000.0)
     } else if a >= 10_000.0 {
         format!("{:.1}k", v / 1_000.0)
@@ -400,7 +460,7 @@ pub fn svg(
     palette: &Palette,
 ) -> String {
     let ds = prepared(ds, kind);
-    let (w, h) = (w.max(80) as f64, h.max(40) as f64);
+    let (w, h) = (w.max(80) as f64, h.max(20) as f64);
     let mut out = String::new();
     let _ = write!(
         out,
@@ -412,6 +472,8 @@ pub fn svg(
         hex(palette.background)
     );
     let fg = hex(palette.foreground);
+    // A one-row spark has no room for a title.
+    let title = title.filter(|_| h >= 40.0);
     let top = if title.is_some() { 24.0 } else { 8.0 };
     if let Some(t) = title {
         let _ = write!(
@@ -499,13 +561,28 @@ pub fn svg(
             }
         }
         ChartKind::Bar | ChartKind::Hist => {
-            let groups = n.max(1) as f64;
+            // One bar per pixel column at most: 10k rows bucket to the
+            // width like the line path, and the labels follow the buckets.
+            let slots = ((right - left) as usize).max(2);
+            let shown = n.min(slots);
+            let labels = ds.labels.as_ref().map(|labels| {
+                (0..shown)
+                    .map(|i| {
+                        labels
+                            .get(i * n / shown.max(1))
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let groups = shown.max(1) as f64;
             let group_w = (right - left) / groups;
             let bar_w = (group_w * 0.8 / ds.series.len().max(1) as f64).max(1.0);
             let zero = y_of(0.0);
             for (si, s) in ds.series.iter().enumerate() {
                 let colour = hex(palette.series[si % palette.series.len()]);
-                for (i, v) in s.values.iter().enumerate() {
+                let vals = downsample(&s.values, shown);
+                for (i, v) in vals.iter().enumerate() {
                     if !v.is_finite() {
                         continue;
                     }
@@ -522,7 +599,7 @@ pub fn svg(
                     );
                 }
             }
-            if let Some(labels) = &ds.labels {
+            if let Some(labels) = &labels {
                 // At most one label per ~40px so they never overlap.
                 let every = ((40.0 / group_w).ceil() as usize).max(1);
                 for (i, l) in labels.iter().enumerate().step_by(every) {
@@ -541,6 +618,28 @@ pub fn svg(
     out
 }
 
+/// Columns a glyph occupies: 2 for the East Asian wide and emoji ranges,
+/// else 1 (zero-width combining marks are rare in labels and rounded up).
+fn display_width(c: char) -> usize {
+    let u = c as u32;
+    if (0x1100..=0x115F).contains(&u)
+        || (0x2E80..=0xA4CF).contains(&u)
+        || (0xAC00..=0xD7A3).contains(&u)
+        || (0xF900..=0xFAFF).contains(&u)
+        || (0xFE30..=0xFE4F).contains(&u)
+        || (0xFF00..=0xFF60).contains(&u)
+        || (0xFFE0..=0xFFE6).contains(&u)
+        || (0x1F300..=0x1FAFF).contains(&u)
+        || (0x20000..=0x3FFFD).contains(&u)
+    {
+        2
+    } else {
+        1
+    }
+}
+
+/// Text-node escaping only: every escaped value lands between tags, never
+/// in an attribute, so quotes need no treatment here.
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -642,14 +741,22 @@ pub fn text(ds: &Dataset, kind: ChartKind, title: Option<&str>, cols: u16, rows:
             let gap = usize::from(bar_w > 1);
             let shown = n.min(plot_cols / (bar_w + gap).max(1)).max(1);
             let vals = downsample(&s.values, shown);
-            let levels: Vec<usize> = vals
+            // Bars grow from ZERO, as the SVG's do: a negative value hangs
+            // down from the zero row, and an exact zero still shows one
+            // unit so it reads as a point rather than a gap.
+            let units = (rows * 8) as isize;
+            let zero_units = (((0.0 - lo) / span) * units as f64).round() as isize;
+            let spans: Vec<Option<(isize, isize)>> = vals
                 .iter()
                 .map(|v| {
-                    if v.is_finite() {
-                        (((v - lo) / span) * (rows * 8) as f64).round() as usize
-                    } else {
-                        0
+                    if !v.is_finite() {
+                        return None;
                     }
+                    let mut level = (((v - lo) / span) * units as f64).round() as isize;
+                    if level == zero_units {
+                        level += if zero_units >= units { -1 } else { 1 };
+                    }
+                    Some((level.min(zero_units), level.max(zero_units)))
                 })
                 .collect();
             for r in 0..rows {
@@ -661,9 +768,14 @@ pub fn text(ds: &Dataset, kind: ChartKind, title: Option<&str>, cols: u16, rows:
                     String::new()
                 };
                 let _ = write!(out, "{label:>w$} ", w = label_w - 1);
-                let floor = (rows - 1 - r) * 8;
-                for lv in &levels {
-                    let fill = lv.saturating_sub(floor).min(8);
+                let floor = ((rows - 1 - r) * 8) as isize;
+                for sp in &spans {
+                    let fill = match sp {
+                        Some((from, to)) => {
+                            ((to - floor).clamp(0, 8) - (from - floor).clamp(0, 8)) as usize
+                        }
+                        None => 0,
+                    };
                     for _ in 0..bar_w {
                         out.push(BLOCKS[fill]);
                     }
@@ -679,8 +791,23 @@ pub fn text(ds: &Dataset, kind: ChartKind, title: Option<&str>, cols: u16, rows:
                 let _ = write!(out, "{:>w$} ", "", w = label_w - 1);
                 for l in labels.iter().take(shown) {
                     let cell = bar_w + gap;
-                    let short: String = l.chars().take(cell.saturating_sub(gap).max(1)).collect();
-                    let _ = write!(out, "{short:<cell$}");
+                    let budget = cell.saturating_sub(gap).max(1);
+                    // Wide glyphs (CJK, emoji) take two columns: truncate and
+                    // pad by display width so labels stay under their bars.
+                    let mut short = String::new();
+                    let mut width = 0;
+                    for c in l.chars() {
+                        let cw = display_width(c);
+                        if width + cw > budget {
+                            break;
+                        }
+                        short.push(c);
+                        width += cw;
+                    }
+                    out.push_str(&short);
+                    for _ in width..cell {
+                        out.push(' ');
+                    }
                 }
                 out.push('\n');
             }
@@ -695,6 +822,85 @@ mod tests {
 
     fn ds(input: &str) -> Dataset {
         parse(input, None, &[]).unwrap()
+    }
+
+    #[test]
+    fn separators_count_only_in_thousands_position() {
+        assert_eq!(parse_number("1,200"), Some(1200.0));
+        assert_eq!(parse_number("1,234,567.5"), Some(1234567.5));
+        assert_eq!(parse_number("-1_000"), Some(-1000.0));
+        assert_eq!(parse_number("12%"), Some(12.0));
+        assert_eq!(
+            parse_number("1,2,3"),
+            None,
+            "several fields, never one number"
+        );
+        assert_eq!(parse_number("1,,,2"), None);
+        assert_eq!(parse_number("1_0_0"), None);
+        // A CSV whose first row is one column still splits on commas.
+        let d = ds("10\n1,2\n3,4\n");
+        assert_eq!(d.series.len(), 2, "{d:?}");
+        assert_eq!(d.series[0].values, [10.0, 1.0, 3.0]);
+        assert!(d.series[1].values[0].is_nan());
+        assert_eq!(d.series[1].values[1..], [2.0, 4.0]);
+        let err = parse("k,a\nx,1\ny,2\n", None, &["k".into()]).unwrap_err();
+        assert!(err.contains("\"k\" is not numeric"), "{err}");
+    }
+
+    #[test]
+    fn text_bars_grow_from_zero_like_the_svg_does() {
+        let d = Dataset {
+            labels: None,
+            series: vec![Series {
+                name: "v".into(),
+                values: vec![-1.0, -5.0, -3.0],
+            }],
+        };
+        let rows: Vec<String> = text(&d, ChartKind::Bar, None, 30, 5)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let ink = |col: usize| {
+            rows.iter()
+                .filter(|r| r.chars().nth(col).is_some_and(|c| c != ' '))
+                .count()
+        };
+        // Sample each bar's first column: the bars start where the zero
+        // row (row 0, every bar touches zero) shows its first block.
+        let mut starts: Vec<usize> = Vec::new();
+        let mut prev = ' ';
+        for (i, c) in rows[0].chars().enumerate() {
+            if c != ' ' && prev == ' ' {
+                starts.push(i);
+            }
+            prev = c;
+        }
+        let starts: Vec<usize> = starts.into_iter().skip(1).collect(); // the "0" label
+        assert_eq!(starts.len(), 3, "three bars on the zero row: {rows:?}");
+        let (a, b, c) = (ink(starts[0]), ink(starts[1]), ink(starts[2]));
+        assert!(
+            b > c && c > a,
+            "-5 out-draws -3 out-draws -1: a={a} b={b} c={c}\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows[0].trim_start().starts_with('0'),
+            "zero is the top label: {rows:?}"
+        );
+        let mixed = Dataset {
+            labels: None,
+            series: vec![Series {
+                name: "v".into(),
+                values: vec![-5.0, 0.0, 5.0],
+            }],
+        };
+        let t = text(&mixed, ChartKind::Bar, None, 30, 4);
+        // Bars start at columns 3, 10, 17 (a 3-wide label gutter, 6-wide
+        // bars, one-column gaps); the zero bar is the middle one.
+        let zero_col_has_ink = t
+            .lines()
+            .any(|r| r.chars().nth(10).is_some_and(|c| "▁▂▃▄▅▆▇█".contains(c)));
+        assert!(zero_col_has_ink, "an exact zero still shows a mark:\n{t}");
     }
 
     #[test]
@@ -774,9 +980,15 @@ mod tests {
         let h = histogram(&ds("1\n1\n2\n9\n10\n"), 3);
         assert_eq!(h.series[0].values, [3.0, 0.0, 2.0]);
         assert_eq!(h.labels.as_deref().map(|l| l.len()), Some(3));
+        let flat = histogram(&ds("5\n5\n5\n5\n"), 4);
+        assert_eq!(flat.series[0].values, [4.0], "constant data is one bin");
+        assert_eq!(flat.labels.as_deref(), Some(&[String::from("5")][..]));
         assert_eq!(format_num(1500.0), "1500");
         assert_eq!(format_num(12345.0), "12.3k");
         assert_eq!(format_num(2.5), "2.50");
+        assert_eq!(format_num(999_999.0), "1.0M");
+        assert_eq!(format_num(2.5e9), "2.5G");
+        assert!(format_num(1e20).len() <= 7, "{}", format_num(1e20));
     }
 
     #[test]
@@ -869,6 +1081,11 @@ mod tests {
         assert!(
             s.matches(',').count() < 2_000,
             "the line is downsampled to the pixel width"
+        );
+        let bars = svg(&d, ChartKind::Bar, None, 800, 300, &Palette::default());
+        assert!(
+            bars.matches("<rect").count() < 2_000,
+            "bars bucket to the width too"
         );
         assert!(!t.is_empty());
         assert!(
