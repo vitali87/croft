@@ -1079,7 +1079,7 @@ fn theme_import(file: &Path, id: Option<&str>, dry_run: bool) -> Result<()> {
     );
     if !converted.notes.is_empty() {
         println!(
-            "\n{} colour{} croft needs were not in the theme and were derived:",
+            "\n{} note{} about this import:",
             converted.notes.len(),
             if converted.notes.len() == 1 { "" } else { "s" }
         );

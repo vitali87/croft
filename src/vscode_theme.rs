@@ -120,10 +120,11 @@ pub struct Converted {
     pub label: String,
     /// The complete `extension.toml` to write.
     pub manifest: String,
-    /// Colours croft needed that the source theme did not name, and where
-    /// each came from instead. Shown to the user by the CLI: a derived
-    /// colour is a choice croft made, and silently making it is how an
-    /// import "works" while looking wrong.
+    /// Everything the user should know about this conversion: colours croft
+    /// had to derive, an id that had to change, rules that could not be read.
+    /// Shown by the CLI, because each is a choice croft made on the user's
+    /// behalf, and silently making them is how an import "works" while
+    /// looking wrong.
     pub notes: Vec<String>,
 }
 
@@ -477,12 +478,20 @@ pub fn convert_file(path: &Path, id_override: Option<&str>) -> Result<Converted>
     convert(merged, id_override, &stem)
 }
 
+/// A theme name reduced to an id: alphanumerics kept, everything else a
+/// separator.
+///
+/// Alphanumeric in the UNICODE sense, not the ASCII one. Keeping only ASCII
+/// made a theme named in any non-Latin script slug to nothing and fail the
+/// import outright, and reduced a mixed name like "\u{4e2d}\u{6587} Dark" to
+/// "dark", dropping the half that distinguishes it and inviting a collision
+/// with every other theme with Dark in its name.
 fn slug(s: &str) -> String {
     let mut out = String::new();
     let mut dash = false;
     for c in s.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
+        if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
             dash = false;
         } else if !out.is_empty() && !dash {
             out.push('-');
@@ -511,6 +520,19 @@ fn existing_ids() -> Vec<String> {
 }
 
 /// Whether `id`'s manifest is one this importer wrote.
+///
+/// COUPLING, stated because every other judgment call in this file is: this
+/// reconstructs the directory name (`theme-{id}`) that [`install`] chose,
+/// while the loader enumerates every subdirectory and takes each id from the
+/// manifest BODY, never comparing directory to id. The two agree for
+/// anything this importer wrote and nothing keeps them agreeing. A user who
+/// renames the directory therefore gets a fresh suffix on the next import.
+///
+/// Left as-is deliberately: the trigger needs a hand-rename nothing invites,
+/// the failure is a duplicate picker entry rather than lost data, and the
+/// user is told through the collision note. Closing it properly means asking
+/// the loader which file an id came from, rather than adding a second
+/// convention beside it.
 fn was_generated_by_import(id: &str) -> bool {
     let path = crate::lsp::manifest::user_extensions_dir()
         .join(format!("theme-{id}"))
@@ -521,17 +543,18 @@ fn was_generated_by_import(id: &str) -> bool {
 }
 
 /// `wanted`, or `wanted-2`, `wanted-3`, ... until it is free.
-fn unique_id(wanted: String, taken: &[String]) -> String {
+///
+/// `None` when every candidate is taken. Returning `wanted` on exhaustion
+/// would hand back the one value just proved to collide, resurrecting the
+/// silent no-op this function exists to prevent: the import would look like
+/// it succeeded and the picker would keep showing the other theme.
+fn unique_id(wanted: String, taken: &[String]) -> Option<String> {
     if !taken.contains(&wanted) {
-        return wanted;
+        return Some(wanted);
     }
-    for n in 2..1000 {
-        let candidate = format!("{wanted}-{n}");
-        if !taken.contains(&candidate) {
-            return candidate;
-        }
-    }
-    wanted
+    (2..1000)
+        .map(|n| format!("{wanted}-{n}"))
+        .find(|candidate| !taken.contains(candidate))
 }
 
 fn convert(theme: RawTheme, id_override: Option<&str>, stem: &str) -> Result<Converted> {
@@ -718,7 +741,9 @@ fn convert_with_ids(
     // error: the picker resolves the id to the BUILT-IN, so the import
     // appears to succeed and then does nothing. Importing upstream One Dark
     // Pro produced "one-dark-pro", which croft already has.
-    let id = unique_id(wanted, taken);
+    let id = unique_id(wanted.clone(), taken).ok_or_else(|| {
+        anyhow!("every id from {wanted:?} to {wanted}-999 is already taken; pass --id")
+    })?;
     if id != slug(id_override.unwrap_or(&label)) {
         notes.push(format!(
             "a theme with id {:?} already exists, so this one was installed as {id:?}",
@@ -853,22 +878,22 @@ mod tests {
                 "editorGroupHeader.tabsBackground": "#181926",
                 "tab.inactiveBackground": "#1e2030",
                 "tab.activeBackground": "#24273a",
-                "terminal.ansiBlack": "#494d64",
-                "terminal.ansiRed": "#ed8796",
-                "terminal.ansiGreen": "#a6da95",
-                "terminal.ansiYellow": "#eed49f",
-                "terminal.ansiBlue": "#8aadf4",
-                "terminal.ansiMagenta": "#f5bde6",
-                "terminal.ansiCyan": "#8bd5ca",
-                "terminal.ansiWhite": "#b8c0e0",
-                "terminal.ansiBrightBlack": "#5b6078",
-                "terminal.ansiBrightRed": "#ed8796",
-                "terminal.ansiBrightGreen": "#a6da95",
-                "terminal.ansiBrightYellow": "#eed49f",
-                "terminal.ansiBrightBlue": "#8aadf4",
-                "terminal.ansiBrightMagenta": "#f5bde6",
-                "terminal.ansiBrightCyan": "#8bd5ca",
-                "terminal.ansiBrightWhite": "#a5adcb"
+                "terminal.ansiBlack": "#000100",
+                "terminal.ansiRed": "#000101",
+                "terminal.ansiGreen": "#000102",
+                "terminal.ansiYellow": "#000103",
+                "terminal.ansiBlue": "#000104",
+                "terminal.ansiMagenta": "#000105",
+                "terminal.ansiCyan": "#000106",
+                "terminal.ansiWhite": "#000107",
+                "terminal.ansiBrightBlack": "#000108",
+                "terminal.ansiBrightRed": "#000109",
+                "terminal.ansiBrightGreen": "#00010a",
+                "terminal.ansiBrightYellow": "#00010b",
+                "terminal.ansiBrightBlue": "#00010c",
+                "terminal.ansiBrightMagenta": "#00010d",
+                "terminal.ansiBrightCyan": "#00010e",
+                "terminal.ansiBrightWhite": "#00010f"
             },
             "tokenColors": [
                 { "settings": { "foreground": "#cad3f5" } },
@@ -905,8 +930,16 @@ mod tests {
         assert_eq!(t.selection, "#3a3f58");
         assert_eq!(t.search, "#181926");
         assert_eq!(t.button, "#7dc4e4");
+        // Every slot differs, so the ORDER is observable: with the palette's
+        // real colours six of the eight bright slots duplicated their normal
+        // counterpart, and a conversion that swapped the halves passed this
+        // assertion unchanged.
         assert_eq!(t.ansi.len(), 16, "a full terminal palette carries over");
-        assert_eq!(t.ansi[1], "#ed8796");
+        let expected: Vec<String> = (0..16).map(|i| format!("#0001{i:02x}")).collect();
+        assert_eq!(
+            t.ansi, expected,
+            "the sixteen slots must land in croft's order, black..bright white"
+        );
         assert_eq!(t.syn_keyword, "#c6a0f6");
         assert_eq!(t.syn_string, "#a6da95");
         assert_eq!(t.syn_comment, "#6e738d");
@@ -1417,6 +1450,60 @@ mod tests {
             "and the skipped rule is reported: {:?}",
             converted.notes
         );
+    }
+
+    /// Review finding: `slug` kept only ASCII alphanumerics, so a theme
+    /// named in any non-Latin script slugged to nothing and could not be
+    /// imported at all, and a MIXED name silently lost its distinguishing
+    /// half.
+    ///
+    /// The round-1 test asserting the non-ASCII LABEL survives passed
+    /// throughout: it named a property next to the one that mattered.
+    #[test]
+    fn a_theme_named_in_a_non_latin_script_can_be_imported() {
+        for (name, want) in [
+            (
+                "\u{4e2d}\u{6587}\u{4e3b}\u{9898}",
+                "\u{4e2d}\u{6587}\u{4e3b}\u{9898}",
+            ),
+            ("\u{30c6}\u{30fc}\u{30de}", "\u{30c6}\u{30fc}\u{30de}"),
+            (
+                "\u{422}\u{435}\u{43c}\u{430}",
+                "\u{442}\u{435}\u{43c}\u{430}",
+            ),
+            // A mixed name keeps BOTH halves: dropping the script half made
+            // every "... Dark" theme collide with every other.
+            ("\u{4e2d}\u{6587} Dark", "\u{4e2d}\u{6587}-dark"),
+        ] {
+            let src = format!(
+                r##"{{ "name": "{name}", "type": "dark", "colors": {{ "editor.background": "#101010" }} }}"##
+            );
+            let raw = parse_theme(&src).expect("parses");
+            let converted =
+                convert_with_ids(raw, None, "fixture", &[]).expect("a non-Latin name must import");
+            assert_eq!(converted.id, want, "id derived from {name:?}");
+            let manifest = crate::lsp::manifest::parse(&converted.manifest)
+                .expect("and the manifest must parse");
+            assert_eq!(manifest.themes[0].label, name);
+        }
+    }
+
+    /// `unique_id` must never hand back the value it just proved is taken:
+    /// that resurrects the silent no-op the suffixing exists to prevent.
+    #[test]
+    fn an_exhausted_id_space_is_an_error_not_a_collision() {
+        let mut taken = vec![String::from("busy")];
+        taken.extend((2..1000).map(|n| format!("busy-{n}")));
+        assert_eq!(unique_id(String::from("busy"), &taken), None);
+        assert_eq!(
+            unique_id(String::from("free"), &taken),
+            Some(String::from("free"))
+        );
+
+        let raw = parse_theme(r##"{ "name": "Busy", "type": "dark", "colors": {} }"##).unwrap();
+        let err = convert_with_ids(raw, None, "busy", &taken)
+            .expect_err("an exhausted space must fail loudly");
+        assert!(format!("{err:#}").contains("--id"), "{err:#}");
     }
 
     /// Theme names carry characters TOML would otherwise take as syntax.
