@@ -27347,6 +27347,19 @@ fn an_unopenable_host_lock_is_reported_as_such_and_re_announced_when_the_reason_
         b.status
     );
 
+    // The reverse transition: the holder is still there but the lock's
+    // directory vanishes, so the refusal is an open failure again - and
+    // that change of reason is announced too.
+    std::fs::remove_dir_all(&lock_dir).unwrap();
+    b.last_pair_check = None;
+    assert!(b.maybe_seat_navigator(), "Busy -> Io is a changed reason");
+    assert!(
+        b.status.contains("cannot open host lock"),
+        "the open failure is named again, got: {}",
+        b.status
+    );
+    std::fs::create_dir_all(&lock_dir).unwrap();
+
     // The holder exits: this window takes over.
     drop(holder);
     b.last_pair_check = None;

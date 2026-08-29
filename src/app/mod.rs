@@ -3272,7 +3272,8 @@ pub struct App {
     /// repaint). The KIND is latched, not just the fact, so a refusal that
     /// changes reason (an fd limit clears and another window now holds the
     /// lock, or the reverse) is announced again rather than leaving a
-    /// message that is no longer true (#337).
+    /// message that is no longer true (#337). Per kind, not per message: an
+    /// open failure whose errno changes keeps the first announcement.
     pair_lock_denied: Option<PairLockDenial>,
     /// Proactive navigator looks (docs/MULTIPLAYER.md): a completed new
     /// construct plus a typing pause hands the seated navigator a

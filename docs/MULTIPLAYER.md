@@ -612,8 +612,10 @@ interaction into turn-based driver/navigator pairing:
   `flock` on `<hash>.pair-host.lock` (`session::try_acquire_pair_host_lock`)
   guards it, so a second window is refused ("hosted by another croft
   window") instead of both claiming owner site 1 and corrupting the buffer.
-  The OS drops the lock when the holder exits, so a crashed host hands off
-  automatically. (The non-hosting window does not yet observe the owner's
+  A lock file that cannot be opened at all (a missing or read-only config
+  directory, an fd limit) is reported as exactly that, with the path and
+  the OS error, never as contention (#337). The OS drops the lock when the
+  holder exits, so a crashed host hands off automatically. (The non-hosting window does not yet observe the owner's
   edits as a guest — a documented follow-up; `croft attach` is the shared
   path for that today.)
 - **Ask turns (may edit).** Right-click the gutter ("Ask Navigator"), a
@@ -701,7 +703,8 @@ interaction into turn-based driver/navigator pairing:
   fixing the backend all re-activate. A window whose spawn failed also
   releases the single-host lock (and its same-tick owner self-appointment),
   so another croft window in the workspace can host instead; the losing
-  window announces the refusal once and keeps polling silently for
+  window announces the refusal once per reason (a busy lock that becomes
+  an unopenable one, or the reverse, is announced again) and keeps polling silently for
   takeover. Teardown on unseat runs on a
   detached thread so the 2s grace-kill never freezes the UI, and the exit
   paths (drop-to-local, self-update exec) reap the child synchronously
