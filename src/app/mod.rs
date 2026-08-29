@@ -18431,9 +18431,6 @@ impl App {
         );
     }
 
-    /// Resolve and launch one launch.json configuration: substitution against
-    /// the active editor state, then either straight to the adapter or parked
-    /// behind its `preLaunchTask`.
     /// Continue a parked launch whose `preLaunchTask` has finished.
     ///
     /// Split from the terminal sweep so it can be driven directly: reaching it
@@ -18507,6 +18504,9 @@ impl App {
         );
     }
 
+    /// Resolve and launch one launch.json configuration: substitution against
+    /// the active editor state, then either straight to the adapter or parked
+    /// behind its `preLaunchTask`.
     fn launch_debug_config(&mut self, cfg: &crate::dap::configs::DebugConfig) {
         use crate::dap::configs;
         if self.dap_session.is_some() {
