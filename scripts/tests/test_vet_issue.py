@@ -128,6 +128,25 @@ class Decide(unittest.TestCase):
     def test_injection_suspected_needs_human_even_if_accepted(self):
         self.assertEqual(self.decide(verdict(injection_suspected=True)).status, "needs-human")
 
+    def test_omitted_injection_status_fails_closed(self):
+        v = verdict()
+        del v["injection_suspected"]
+        self.assertEqual(self.decide(v).status, "needs-human")
+
+    def test_non_boolean_injection_status_fails_closed(self):
+        self.assertEqual(self.decide(verdict(injection_suspected="no")).status, "needs-human")
+
+    def test_non_finite_confidence_needs_human(self):
+        for token in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(token=token):
+                raw = json.dumps(verdict()).replace("0.95", token)
+                self.assertEqual(self.decide(raw).status, "needs-human")
+
+    def test_confidence_outside_unit_range_needs_human(self):
+        for value in (1.5, -0.2):
+            with self.subTest(value=value):
+                self.assertEqual(self.decide(verdict(confidence=value)).status, "needs-human")
+
     def test_out_of_scope_accept_needs_human(self):
         self.assertEqual(self.decide(verdict(in_scope=False)).status, "needs-human")
 

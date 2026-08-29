@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass, field
@@ -232,9 +233,13 @@ def decide(response: dict | None) -> Decision:
         flags = ["unparseable-verdict"]
         return Decision(STATUS_NEEDS_HUMAN, flags, _needs_human_comment(flags, "The screening model's answer was not a verdict."))
 
+    # Fail closed on anything that is not a finite probability: NaN compares
+    # false against every threshold, and infinity clears all of them.
     try:
         confidence = float(verdict.get("confidence", 0))
     except (TypeError, ValueError):
+        confidence = 0.0
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
         confidence = 0.0
     spec = str(verdict.get("restated_spec") or "").strip()
     reasons = _reasons(verdict)
@@ -242,7 +247,9 @@ def decide(response: dict | None) -> Decision:
     flags: list[str] = []
     if confidence < CONFIDENCE_MIN:
         flags.append("low-confidence")
-    if verdict.get("injection_suspected") is True:
+    # Only an explicit `false` clears the injection check; an omitted or
+    # malformed field is not a clean bill of health.
+    if verdict.get("injection_suspected") is not False:
         flags.append("injection-suspected")
 
     if verdict["verdict"] == "accept" and not flags:

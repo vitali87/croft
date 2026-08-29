@@ -105,6 +105,11 @@ jobs:
           if [ -z "$INFERENCE_API_URL" ]; then
             echo "::warning::INFERENCE_API_URL is not set; the issue goes to needs-human"; exit 0
           fi
+          # The bearer token travels in a header, so only a TLS endpoint may see it.
+          case "$INFERENCE_API_URL" in
+            https://*) ;;
+            *) echo "::warning::INFERENCE_API_URL is not https; the issue goes to needs-human"; exit 0 ;;
+          esac
           RESOLVE_ARGS=()
           [ -n "$INFERENCE_RESOLVE" ] && RESOLVE_ARGS=(--resolve "$INFERENCE_RESOLVE")
           curl -sf --max-time 1500 "${RESOLVE_ARGS[@]}" \
@@ -162,8 +167,9 @@ jobs:
       - name: Find open external issues with no verdict and dispatch each
         run: |
           set -euo pipefail
+          # gh's built-in --jq takes no --arg, so the owner is bound in standalone jq.
           gh issue list --state open --limit 500 --json number,author,labels \
-            --jq --arg owner "$GITHUB_REPOSITORY_OWNER" '
+          | jq -r --arg owner "$GITHUB_REPOSITORY_OWNER" '
               .[] | select(.author.login != $owner)
                   | select(any(.labels[].name; . == "ready" or . == "needs-human" or . == "rejected") | not)
                   | .number' \
