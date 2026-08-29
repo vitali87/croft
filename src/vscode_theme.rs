@@ -140,6 +140,13 @@ type Rgb = (u8, u8, u8);
 /// actually sits on, which is what a reader sees in VS Code.
 fn parse_color(raw: &str, over: Rgb) -> Option<Rgb> {
     let s = raw.trim().strip_prefix('#')?;
+    // Byte lengths and byte-range slicing below, so a non-ASCII value would
+    // index mid-character and panic: "#\u{20ac}" is one character and THREE
+    // bytes, so it reaches the three-digit arm and slices `&s[0..1]`. A
+    // colour is hex digits by definition, so anything else is simply not one.
+    if !s.is_ascii() {
+        return None;
+    }
     let hex = |b: &str| u8::from_str_radix(b, 16).ok();
     let (r, g, b, a) = match s.len() {
         3 => {
@@ -1514,6 +1521,32 @@ mod tests {
                 .expect("and the manifest must parse");
             assert_eq!(manifest.themes[0].label, name);
         }
+    }
+
+    /// A colour value that is not ASCII must be refused, not sliced.
+    ///
+    /// `parse_color` indexes by BYTE range, so a multi-byte character makes
+    /// the length arms lie: "#\u{20ac}" is one character and three bytes, hits
+    /// the three-digit arm, and slices mid-character. The bug was a panic, so
+    /// reaching the assertions is the test.
+    #[test]
+    fn a_non_ascii_colour_value_is_refused_rather_than_sliced() {
+        for value in [
+            "#\u{20ac}",           // three bytes, three-digit arm
+            "#\u{e9}\u{e9}\u{e9}", // six bytes, six-digit arm
+            "#\u{4e2d}\u{6587}",   // six bytes, two characters
+            "#\u{1f600}",          // four bytes, four-digit arm
+        ] {
+            assert_eq!(
+                parse_color(value, (0, 0, 0)),
+                None,
+                "{value:?} is not a colour and must not be indexed as one"
+            );
+        }
+
+        // The ASCII forms still parse, so the guard is narrow.
+        assert_eq!(parse_color("#fff", (0, 0, 0)), Some((255, 255, 255)));
+        assert_eq!(parse_color("#102030", (0, 0, 0)), Some((16, 32, 48)));
     }
 
     /// A name with no letter or digit cannot become an id.
