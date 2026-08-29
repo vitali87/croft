@@ -22,6 +22,11 @@ pub struct EditorFind {
     pub last_rect: Rect,
     pub match_count: usize,
     pub match_index: Option<usize>,
+    /// Set when `match_count` covers only part of the searched content, so
+    /// the bar says `N+` rather than presenting a partial count as a total.
+    /// Only the windowed log view (#257) can set it: every other surface
+    /// counts an in-memory buffer exhaustively.
+    pub count_truncated: bool,
     /// Second input row (VS Code's expanded find widget, `Cmd+Opt+F`).
     pub replace_visible: bool,
     pub replace: String,
@@ -365,11 +370,22 @@ pub fn render_editor_find(
     state.last_rect = rect;
 
     Widget::render(Clear, rect, buf);
+    // A budgeted count (the windowed log view) reports what it could see
+    // plus a `+`, so a partial total is never shown as a whole one.
+    let total_txt = if state.count_truncated {
+        format!("{}+", state.match_count)
+    } else {
+        state.match_count.to_string()
+    };
     let title = match (state.match_count, state.match_index) {
         (0, _) if state.query.is_empty() => String::from(" Find "),
+        (0, _) if state.count_truncated => format!(
+            " Find: no match in the first {} scanned ",
+            crate::log_view::scanned_label()
+        ),
         (0, _) => " Find — No results ".to_string(),
-        (total, Some(idx)) => format!(" Find — {idx} of {total} "),
-        (total, None) => format!(" Find — {total} matches "),
+        (_, Some(idx)) => format!(" Find — {idx} of {total_txt} "),
+        (_, None) => format!(" Find — {total_txt} matches "),
     };
     let title = Span::styled(
         title,

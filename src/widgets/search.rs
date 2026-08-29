@@ -346,6 +346,35 @@ pub fn search_workspace(root: &Path, query: &str, opts: SearchOpts) -> Vec<Searc
 /// Concatenating the segments reproduces the original line byte-for-byte.
 /// Empty needle, no match, or invalid regex all return the whole line as
 /// a single non-match segment.
+/// Cheap "could this line match at all?" pre-filter for bulk scans.
+///
+/// [`split_for_highlight`] copies the whole line (twice, when the search is
+/// case-insensitive) before it can answer, which is nothing on a screenful
+/// and everything when sweeping megabytes of log. This answers the same
+/// question without allocating, and is deliberately CONSERVATIVE: it may say
+/// `true` for a line that turns out not to match, and must never say `false`
+/// for one that does, so a caller can only use it to skip work.
+///
+/// `whole_word` is ignored on purpose: it only ever narrows the match set, so
+/// plain containment stays a superset. Regex and non-ASCII fall straight
+/// through to the exact path rather than reimplementing their semantics here.
+pub fn line_may_match(line: &str, needle: &str, opts: SearchOpts) -> bool {
+    if needle.is_empty() || opts.use_regex {
+        return true;
+    }
+    if !line.is_ascii() || !needle.is_ascii() {
+        return true;
+    }
+    if opts.case_sensitive {
+        return line.contains(needle);
+    }
+    let (hay, pat) = (line.as_bytes(), needle.as_bytes());
+    if pat.len() > hay.len() {
+        return false;
+    }
+    hay.windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat))
+}
+
 pub fn split_for_highlight(line: &str, needle: &str, opts: SearchOpts) -> Vec<(String, bool)> {
     if needle.is_empty() {
         return vec![(line.to_string(), false)];
@@ -3795,5 +3824,71 @@ mod tests {
                 (String::new(), true),
             ]
         );
+    }
+
+    /// The pre-filter exists only to SKIP work, so the one thing it must
+    /// never do is say `false` for a line that really matches. Checked
+    /// against the exact matcher over the cases that tempt a shortcut:
+    /// case folding, whole-word narrowing, regex, and non-ASCII.
+    #[test]
+    fn the_scan_prefilter_never_hides_a_real_match() {
+        let lines = [
+            "ERROR disk full",
+            "error disk full",
+            "ErRoR",
+            "no match here",
+            "",
+            "prefix_error_suffix",
+            "\u{440}\u{443}\u{441}\u{441}\u{43a}\u{438}\u{439} error",
+            "\u{130}stanbul error",
+            "tab\terror",
+        ];
+        let needles = ["error", "ERROR", "err", "\u{440}\u{443}", "zzz", ""];
+        let mut opt_sets = Vec::new();
+        for case_sensitive in [true, false] {
+            for whole_word in [true, false] {
+                for use_regex in [true, false] {
+                    let mut o = SearchOpts::default();
+                    o.case_sensitive = case_sensitive;
+                    o.whole_word = whole_word;
+                    o.use_regex = use_regex;
+                    opt_sets.push(o);
+                }
+            }
+        }
+        for line in lines {
+            for needle in needles {
+                for opts in &opt_sets {
+                    let real =
+                        !crate::widgets::editor_find::line_matches(line, *opts, needle).is_empty();
+                    if real {
+                        assert!(
+                            line_may_match(line, needle, *opts),
+                            "pre-filter hid a real match: line={line:?} needle={needle:?} \
+                             case_sensitive={} whole_word={} regex={}",
+                            opts.case_sensitive,
+                            opts.whole_word,
+                            opts.use_regex
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// And it must actually skip something, or it is only overhead.
+    #[test]
+    fn the_scan_prefilter_rejects_lines_that_cannot_match() {
+        let opts = SearchOpts::default();
+        assert!(!line_may_match("nothing to see", "error", opts));
+        assert!(!line_may_match(
+            "short",
+            "a longer needle than the line",
+            opts
+        ));
+        let mut ci = SearchOpts::default();
+        ci.case_sensitive = false;
+        assert!(line_may_match("ERROR here", "error", ci), "case folds");
+        assert!(!line_may_match("ERROR here", "warning", ci));
     }
 }

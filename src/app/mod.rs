@@ -30847,6 +30847,10 @@ impl App {
             self.diff_find_set_query(new_query);
             return;
         }
+        if self.editor.log.is_some() {
+            self.log_find_set_query(new_query);
+            return;
+        }
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
@@ -30888,6 +30892,10 @@ impl App {
             self.diff_find_apply(self.diff_find_current_pos() + 1);
             return;
         }
+        if self.editor.log.is_some() {
+            self.log_find_step(true);
+            return;
+        }
         let opts = state.opts;
         let needle = state.query.clone();
         if let Some(m) = crate::widgets::editor_find::find_next_match(
@@ -30918,6 +30926,10 @@ impl App {
             self.diff_find_apply(self.diff_find_current_pos() + count - 1);
             return;
         }
+        if self.editor.log.is_some() {
+            self.log_find_step(false);
+            return;
+        }
         let opts = state.opts;
         let needle = state.query.clone();
         if let Some(m) = crate::widgets::editor_find::find_prev_match(
@@ -30930,6 +30942,91 @@ impl App {
         ) {
             self.jump_editor_to_match(m);
             self.refresh_editor_find_index();
+        }
+    }
+
+    /// Find over a rendered ANSI log (#257).
+    ///
+    /// A log tab's `lines` is a one-line stub, because the file stays on disk
+    /// and only a window of it is ever parsed. Running the ordinary find path
+    /// over that stub answers "No results" for a file full of matches, so the
+    /// search goes through the view's own stripped text instead, the same fork
+    /// the diff view already takes.
+    fn log_find_set_query(&mut self, new_query: String) {
+        let Some(state) = self.editor_find.as_mut() else {
+            return;
+        };
+        state.query = new_query;
+        let opts = state.opts;
+        let needle = state.query.clone();
+        if needle.is_empty() {
+            state.match_count = 0;
+            state.count_truncated = false;
+            state.match_index = None;
+            self.editor.active_search_match = None;
+            self.editor.set_search_highlight(None, opts);
+            return;
+        }
+        let Some(log) = self.editor.log.as_ref() else {
+            return;
+        };
+        let (count, truncated) = log.count_matches(&needle, opts);
+        // Search from the top of the viewport, so typing finds what is on
+        // screen first rather than jumping to the head of the file.
+        let hit = log.find_next(&needle, opts, self.editor.scroll, 0, false);
+        if let Some(state) = self.editor_find.as_mut() {
+            state.match_count = count;
+            state.count_truncated = truncated;
+            // "N of M" would have to count the matches BEFORE this one, which
+            // for a budgeted scan is a number we may not have; the bar falls
+            // back to "M matches" rather than guessing an index.
+            state.match_index = None;
+        }
+        self.editor.set_search_highlight(Some(needle), opts);
+        self.scroll_log_to_match(hit);
+    }
+
+    /// Enter / Shift+Enter over a rendered log.
+    fn log_find_step(&mut self, forward: bool) {
+        let Some(state) = self.editor_find.as_ref() else {
+            return;
+        };
+        let opts = state.opts;
+        let needle = state.query.clone();
+        let Some(log) = self.editor.log.as_ref() else {
+            return;
+        };
+        // With no active match, walk from the viewport rather than the file
+        // head, so the first step lands near what the user is looking at.
+        let (row, col) = match self.editor.active_search_match {
+            Some((r, c, _)) => (r, c),
+            None => (self.editor.scroll, 0),
+        };
+        let hit = if forward {
+            log.find_next(&needle, opts, row, col, true)
+        } else {
+            log.find_prev(&needle, opts, row, col)
+        };
+        self.scroll_log_to_match(hit);
+    }
+
+    /// Park the viewport on `hit` and mark it the active match. A log has no
+    /// caret, so the match position is carried by `active_search_match`
+    /// alone and the row is centred rather than merely revealed.
+    fn scroll_log_to_match(&mut self, hit: Option<crate::widgets::editor_find::MatchPos>) {
+        let Some(m) = hit else {
+            self.editor.active_search_match = None;
+            return;
+        };
+        self.editor.active_search_match = Some((m.row, m.col_chars, m.len_chars));
+        // The log body starts one row below the header.
+        let rows = (self.editor.last_inner.height as usize).saturating_sub(1);
+        if rows == 0 {
+            self.editor.scroll = m.row;
+            return;
+        }
+        if m.row < self.editor.scroll || m.row >= self.editor.scroll + rows {
+            self.editor.scroll = m.row.saturating_sub(rows / 2);
         }
     }
 
