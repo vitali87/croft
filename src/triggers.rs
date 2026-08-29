@@ -73,9 +73,6 @@ pub struct Trigger {
     /// Redact only: a copy of a masked span yields the mask, not the value
     /// (`"copy": "masked"`). Default: copies carry the real text.
     pub copy_masked: bool,
-    /// Redact only: a match must carry at least one digit to count, so a
-    /// prefix rule (`sk-…`) cannot swallow a hyphenated word.
-    pub require_digit: bool,
 }
 
 /// The user's trigger list. Shared read-only between the app, the render
@@ -196,7 +193,6 @@ impl TriggerSet {
                     bg: r.bg.as_deref().and_then(parse_hex),
                     message: r.message,
                     copy_masked: r.copy.as_deref() == Some("masked"),
-                    require_digit: false,
                 })
             })
             .collect();
@@ -241,45 +237,39 @@ impl TriggerSet {
 }
 
 /// The key and token shapes masked out of the box (#360). Each pattern is
-/// anchored on a distinctive prefix so ordinary words never match; a
-/// bearer token masks only the token (group 1), leaving the header word
-/// readable. PEM bodies are not covered: their base64 lines carry no
+/// anchored on a distinctive prefix (or, for bearer tokens, the
+/// `Authorization:` header) so ordinary words never match; a bearer token
+/// masks only the token (group 1), leaving the header readable. PEM bodies are not covered: their base64 lines carry no
 /// prefix to anchor on, and masking every long base64 line would eat
 /// checksums and blobs.
 pub fn builtin_redactions() -> Vec<Trigger> {
-    // (pattern, must the match carry a digit)
-    const RULES: &[(&str, bool)] = &[
+    const RULES: &[&str] = &[
         // AWS access key ids.
-        (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", false),
-        // OpenAI / Anthropic-style secret keys. Digit-gated: `sk-` also
-        // opens hyphenated prose ("sk-something-like-this").
-        (r"\bsk-[A-Za-z0-9_-]{20,}\b", true),
+        r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+        // OpenAI / Anthropic-style secret keys: `sk-` plus at most one
+        // labelled segment (`sk-proj-…`, `sk-ant-…`) and a long body. A
+        // hyphenated phrase ("sk-something-like-this") has more hyphens.
+        r"\bsk-(?:[A-Za-z0-9_]+-)?[A-Za-z0-9_]{16,}\b",
         // GitHub tokens: classic (ghp_), OAuth (gho_), app (ghu_/ghs_/ghr_), fine-grained.
-        (
-            r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b",
-            true,
-        ),
+        r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b",
         // Slack tokens.
-        (r"\bxox[abpors]-[A-Za-z0-9-]{10,}\b", true),
+        r"\bxox[abpors]-[A-Za-z0-9-]{10,}\b",
         // JWTs: three base64url segments, the first a JSON header.
-        (
-            r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
-            false,
-        ),
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
         // `Authorization: Bearer <token>` - only the token is masked. Anchored
-        // on the header so "Bearer" as an English word never matches.
-        (r"(?i)\bauthorization: *bearer +(\S{16,})", false),
+        // on the header so "Bearer" as an English word never matches; a
+        // closing quote around the token stays outside the mask.
+        r#"(?i)\bauthorization: *bearer +([^\s'"]{16,})"#,
     ];
     RULES
         .iter()
-        .map(|(r, require_digit)| Trigger {
+        .map(|r| Trigger {
             regex: Regex::new(r).expect("built-in redaction regex compiles"),
             action: TriggerAction::Redact,
             fg: None,
             bg: None,
             message: None,
             copy_masked: false,
-            require_digit: *require_digit,
         })
         .collect()
 }
@@ -310,9 +300,7 @@ pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
                     None => continue,
                 },
             };
-            if m.as_str().is_empty()
-                || (t.require_digit && !m.as_str().chars().any(|c| c.is_ascii_digit()))
-            {
+            if m.as_str().is_empty() {
                 continue;
             }
             out.push(RedactSpan {
@@ -727,8 +715,19 @@ mod tests {
         );
         assert_eq!(
             masked("ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"),
-            "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ",
-            "a token shape with no digit is a word, not a secret"
+            "•".repeat(40),
+            "a real token can be digit-free; the prefix is the anchor"
+        );
+        assert_eq!(masked("xoxb-abcdefghijklmnopqrstuvwx"), "•".repeat(29));
+        assert_eq!(
+            masked("sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGH"),
+            "•".repeat(42),
+            "one labelled segment is a key shape"
+        );
+        assert_eq!(
+            masked("curl -H 'Authorization: Bearer abcdef0123456789ABCDEF' https://x"),
+            "curl -H 'Authorization: Bearer ••••••••••••••••••••••' https://x",
+            "the closing quote stays outside the mask"
         );
         assert_eq!(
             masked("Authorization: Bearer abcdef0123456789ABCDEF"),

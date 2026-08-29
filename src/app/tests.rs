@@ -20915,6 +20915,44 @@ fn secret_redaction_toggles_the_builtin_rules_and_reveal_expires() {
     );
 }
 
+/// #360, byte level: the terminal session store is written to disk and
+/// replayed next launch, so a key that was on screen must not be in it.
+#[test]
+fn the_session_store_holds_the_mask_not_the_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_session_path = tmp.path().join("terminal-sessions.json");
+    let term = crate::widgets::terminal::PtyTerminal::new_with_transcript(
+        tmp.path(),
+        &[String::from("key AKIAIOSFODNN7EXAMPLE end")],
+    )
+    .unwrap();
+    app.insert_terminal(term);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.terminals.iter().any(|t| {
+        t.grid_lines()
+            .0
+            .iter()
+            .any(|l| l.contains("AKIAIOSFODNN7EXAMPLE"))
+    }) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the transcript never painted"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    app.save_terminal_session();
+    let store = std::fs::read_to_string(&app.terminal_session_path).unwrap();
+    assert!(
+        !store.contains("AKIAIOSFODNN7EXAMPLE"),
+        "the key leaked to disk: {store}"
+    );
+    assert!(
+        store.contains("key \u{2022}"),
+        "the mask was stored in its place: {store}"
+    );
+}
+
 #[test]
 fn clicking_the_problems_tab_switches_the_panel_view() {
     let tmp = tempfile::tempdir().unwrap();

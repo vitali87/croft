@@ -26760,7 +26760,9 @@ impl App {
         let Some(t) = self.terminals.get(idx) else {
             return;
         };
-        let text = t.command_output_text(&d);
+        // Same clipboard rule as a selection copy (#360): rules marked
+        // copy=masked keep their mask.
+        let text = self.terminal_text_for_copy(t.command_output_text(&d));
         if text.is_empty() {
             self.status = String::from("Command produced no output");
             return;
@@ -30669,7 +30671,9 @@ impl App {
                 let candidate = format!("{}{}", state.typed, c.to_ascii_lowercase());
                 let shifted = state.shifted || c.is_ascii_uppercase();
                 if let Some(hit) = state.hints.iter().find(|h| h.label == candidate) {
-                    let text = hit.text.clone();
+                    // A hint can land inside a masked span (a hex run, a
+                    // number); the clipboard rule applies here too (#360).
+                    let text = self.terminal_text_for_copy(hit.text.clone());
                     self.close_terminal_quick_select();
                     copy_to_clipboard(&text);
                     if shifted {

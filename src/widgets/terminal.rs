@@ -2386,6 +2386,12 @@ impl PtyTerminal {
         // The clicked column as a char index: a wide char's spacer column
         // resolves to the wide char itself (the `line_text_at` rule).
         let vc = vc as usize;
+        // Blank cells past the row's last character belong to no char: a
+        // click there must not pop the last token's value.
+        let last = *colmap.last()?;
+        if vc > last + 1 {
+            return None;
+        }
         let ci = colmap.iter().rposition(|&gc| gc <= vc)?;
         crate::triggers::redact_spans(&text, &set)
             .into_iter()
