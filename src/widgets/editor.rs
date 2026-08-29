@@ -216,6 +216,11 @@ fn render_log(
         }
     }
     if inner.height == 0 || inner.width == 0 {
+        // Frame truth cuts both ways: a frame that paints nothing must
+        // publish nothing. Returning with the previous rect still stored let
+        // the mouse path accept a click in an area this frame did not paint,
+        // after a resize or a layout change.
+        view.last_body = Rect::default();
         return;
     }
     let name = path
@@ -10353,6 +10358,14 @@ impl Widget for &mut Editor {
         self.last_scrollbar = Rect::default();
         self.last_hscrollbar = Rect::default();
         self.merge_action_spans.clear();
+        // Every rect this frame publishes is cleared up front, so a frame
+        // that paints nothing leaves nothing behind for the mouse path to
+        // hit-test against. `render_log` sets its own when it paints; the
+        // early return below means it may never run at all, which is the
+        // case a reset inside `render_log` cannot cover.
+        if let Some(log) = self.log.as_mut() {
+            log.last_body = Rect::default();
+        }
 
         if inner.height == 0 {
             return;

@@ -648,7 +648,16 @@ impl LogView {
         // advance in lockstep.
         clamped |= cut_short;
         if out.len() > MAX_COPY_BYTES {
-            out.truncate(MAX_COPY_BYTES);
+            // Truncate at a CHARACTER boundary. `String::truncate` panics
+            // when the byte offset lands inside a multi-byte character, and a
+            // selection of accented or non-Latin text reaches that offset as
+            // readily as ASCII does: a copy that crashes croft is a worse
+            // outcome than any clipboard content.
+            let mut end = MAX_COPY_BYTES;
+            while end > 0 && !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
             clamped = true;
         }
         (out, clamped)
@@ -831,6 +840,36 @@ mod tests {
             plain_text.len() > MAX_COPY_BYTES / 2,
             "an escape-free copy should reach most of the cap, got {} bytes",
             plain_text.len()
+        );
+    }
+
+    /// The cap must fall on a CHARACTER boundary.
+    ///
+    /// `String::truncate` panics when the byte offset lands inside a
+    /// multi-byte character, so a selection of accented or non-Latin text
+    /// large enough to hit the cap crashed croft outright. Every earlier test
+    /// here used ASCII, where every byte offset is a boundary, so none of
+    /// them could reach it.
+    #[test]
+    fn the_copy_cap_never_splits_a_character() {
+        // Two bytes per character, so a cap at an even byte offset lands
+        // mid-character for half the possible alignments.
+        let line = "\u{e9}".repeat(64) + "\n";
+        let lines = (MAX_COPY_BYTES / line.len()) + 200;
+        let (_d, p) = write_tmp(line.repeat(lines).as_bytes());
+        let mut v = LogView::open(&p).unwrap();
+        v.selection = Some(((0, 0), (v.len() - 1, 64)));
+
+        // The bug was a panic, so reaching the assertions at all is the test.
+        let (text, clamped) = v.selection_text();
+        assert!(clamped, "a selection this size must report itself clamped");
+        assert!(
+            text.chars().all(|c| c == '\u{e9}' || c == '\n'),
+            "the truncation must not leave a partial character behind"
+        );
+        assert!(
+            text.len() <= MAX_COPY_BYTES,
+            "and must still respect the cap"
         );
     }
 

@@ -25893,11 +25893,13 @@ impl App {
         }
         let bytes = text.len();
         copy_to_clipboard(&text);
+        // Say what was actually copied. `clamped` is true for the byte CAP
+        // and for a sweep that ran out of budget on escape-heavy text, and in
+        // the second case the copy can be far short of the cap: naming the
+        // cap then tells the user they got four megabytes when they got a
+        // fraction of one.
         self.status = if clamped {
-            format!(
-                "Copied the first {} MiB of the selection (a log selection is capped)",
-                crate::log_view::MAX_COPY_BYTES / (1024 * 1024)
-            )
+            format!("Copied {bytes} bytes; the selection was larger than one copy allows")
         } else {
             format!("Copied {bytes} bytes")
         };
@@ -25983,8 +25985,13 @@ impl App {
             }
             return;
         }
-        // A rendered log likewise hides its own text behind a stub buffer.
-        if self.editor.log.is_some() && self.copy_log_selection() {
+        // A rendered log likewise hides its own text behind a stub buffer,
+        // and the return is unconditional: falling through when there is no
+        // selection would run the editor's copy over that stub and put its
+        // placeholder content on the clipboard, which is worse than copying
+        // nothing.
+        if self.editor.log.is_some() {
+            self.copy_log_selection();
             return;
         }
         if let Some(diff) = self.editor.diff.as_ref() {

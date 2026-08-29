@@ -35166,3 +35166,65 @@ fn dragging_past_a_short_lines_end_paints_what_it_copies() {
         "the paint must stop where the copy does, not follow the pointer"
     );
 }
+
+/// #257: a frame that paints no log body must publish no body rect.
+///
+/// `render_log` returned early for a zero-sized area WITHOUT clearing
+/// `last_body`, so after a resize the mouse path could accept a click inside
+/// a rectangle this frame had not painted. Frame truth cuts both ways: the
+/// rect is a claim about what was drawn, and drawing nothing is a claim too.
+#[test]
+fn a_log_that_paints_nothing_publishes_no_body_rect() {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("run.log");
+    std::fs::write(&p, "\u{1b}[31mERROR\u{1b}[0m boom\nsecond\n").unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&p).unwrap();
+
+    // A real frame publishes a real rect.
+    let mut buf = ratatui::buffer::Buffer::empty(Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 8,
+    });
+    (&mut e).render(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        },
+        &mut buf,
+    );
+    assert!(
+        e.log.as_ref().unwrap().last_body.height > 0,
+        "a painted frame publishes its body"
+    );
+
+    // A frame with no room paints nothing, so it must claim nothing.
+    let mut narrow = ratatui::buffer::Buffer::empty(Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 8,
+    });
+    (&mut e).render(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        },
+        &mut narrow,
+    );
+    assert_eq!(
+        e.log.as_ref().unwrap().last_body,
+        Rect::default(),
+        "a frame that painted nothing must not leave a stale rect for the \
+         mouse path to hit-test against"
+    );
+}
