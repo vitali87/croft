@@ -1053,6 +1053,10 @@ pub const KITTY_ID_TERMINAL: u32 = KITTY_ID_BASE + 25;
 /// The active editor's markdown-preview inline image (#176): the topmost
 /// visible reserved block's picture.
 pub const KITTY_ID_MARKDOWN: u32 = KITTY_ID_BASE + 26;
+/// `croft plot`'s image/placement id (#361). A CLI run has no per-overlay
+/// slot table; one fixed id in croft's namespace keeps its placement
+/// distinct from the editor's own images should both share a terminal.
+pub const KITTY_ID_PLOT: u32 = KITTY_ID_BASE + 27;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it
@@ -1143,6 +1147,7 @@ mod tests {
             ("EDITOR_LEFT", KITTY_ID_EDITOR_BASE),
             ("EDITOR_RIGHT", KITTY_ID_EDITOR_BASE + 1),
             ("EXTENSIONS", KITTY_ID_EXTENSIONS),
+            ("PLOT", KITTY_ID_PLOT),
             ("LAYOUT_SIDEBAR", KITTY_ID_LAYOUT_SIDEBAR),
             ("LAYOUT_PANEL", KITTY_ID_LAYOUT_PANEL),
             ("LAYOUT_CUSTOMIZE", KITTY_ID_LAYOUT_CUSTOMIZE),

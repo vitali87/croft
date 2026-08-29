@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Drag to select in a rendered colour log and copy it: the clipboard gets the text you can see rather than the escape codes behind it, and a selection too large to copy whole says so instead of quietly handing over less.",
+    summary: "croft plot: pipe numbers, CSV/TSV or JSON lines into an inline chart. `seq 1 100 | awk '{print sin($1/10)}' | croft plot` draws a line chart in the pane on iTerm2 and Kitty terminals and a braille chart everywhere else; --type bar labels bars from the first column, spark fits one row, hist bins the values. Headers are detected, --x/--y pick columns, and 10k rows render in a blink.",
 }];
