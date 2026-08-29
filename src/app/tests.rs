@@ -33798,14 +33798,14 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         app.status
     );
 
-    // A ONE-member compound carrying a key croft cannot honour is refused
-    // rather than launched: `parse_compounds` never reads `preLaunchTask`, so
-    // launching via the member alone would skip the build the file asks for
-    // and debug stale artifacts without saying so.
+    // #318: a compound's own `preLaunchTask` is now RUN rather than refused.
+    // This workspace declares no tasks at all, so the compound naming one is
+    // an error that says which task is missing — the same contract a config's
+    // own task gets, because the user cannot tell the two apart from outside.
     //
     // On a FRESH app: the launches above leave a live `dap_session`, and
     // `debug_error` does not clear one, so asserting `is_none()` on this app
-    // would be answered by the earlier launch rather than by this refusal.
+    // would be answered by the earlier launch rather than by this path.
     let mut fresh = App::new(tmp.path().to_path_buf()).unwrap();
     fresh.open_debug_config_picker();
     let tasked = fresh
@@ -33815,29 +33815,216 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         .rows
         .iter()
         .position(|r| r.label.starts_with("Tasked"))
-        .expect("the key-carrying compound is listed");
+        .expect("the task-carrying compound is listed");
     fresh.list_picker.as_mut().unwrap().selected = tasked;
     fresh.confirm_list_picker();
     assert!(
-        fresh.status.contains("preLaunchTask"),
-        "the refusal names the key croft cannot honour, so the user can act \
-         on it rather than guessing: {}",
+        fresh.status.contains("\"build\" not found"),
+        "the error names the task the file asked for, so the user can declare \
+         it rather than guessing: {}",
         fresh.status
     );
     assert!(
-        fresh.run_debug.feedback_is_error,
-        "and it is reported AS an error, not as a status note"
+        !fresh.status.contains("#318"),
+        "and it no longer cites the unbuilt-feature issue: croft honours this \
+         key now, so naming #318 would report a limitation it does not have: {}",
+        fresh.status
+    );
+    assert!(
+        fresh.pending_debug_launch.is_none(),
+        "nothing parked behind a task that does not exist"
     );
     assert!(
         fresh.dap_session.is_none(),
-        "and nothing launched — running it without its preLaunchTask would \
-         debug stale artifacts silently"
+        "and nothing launched — starting the member anyway would debug stale \
+         artifacts, which is what running the task exists to prevent"
+    );
+}
+
+/// #318: a compound's own `preLaunchTask` runs before its member starts, and
+/// the launch waits for it — the same contract a configuration's own task has.
+///
+/// The distinguishing assertion is the PARK. A compound that simply launched
+/// its member would leave `pending_debug_launch` empty and a session starting;
+/// one that refused would report an error and do nothing. Parked-with-no-error
+/// is the state that only "the task is running, the debugger is waiting for
+/// it" produces.
+#[test]
+fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "build", "type": "shell", "command": "true" }
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" }
+        ],
+        "compounds": [
+            { "name": "Tasked", "configurations": ["Server"], "preLaunchTask": "build" },
+            { "name": "Presented", "configurations": ["Server"], "presentation": { "order": 2 } }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    let select = |app: &mut App, label: &str| {
+        app.open_debug_config_picker();
+        let idx = app
+            .list_picker
+            .as_ref()
+            .expect("picker open")
+            .rows
+            .iter()
+            .position(|r| r.label.starts_with(label))
+            .unwrap_or_else(|| panic!("{label} is listed"));
+        app.list_picker.as_mut().unwrap().selected = idx;
+        app.confirm_list_picker();
+    };
+
+    select(&mut app, "Tasked");
+    assert!(
+        app.pending_debug_launch.is_some(),
+        "the launch waits behind the compound's task rather than starting \
+         alongside it: status was {:?}",
+        app.status
     );
     assert!(
-        fresh.selected_debug_config.is_none(),
-        "nor was a configuration selected: the refusal happens before any \
-         launch bookkeeping"
+        !app.run_debug.feedback_is_error,
+        "and this is progress, not a refusal: {:?}",
+        app.run_debug.feedback
     );
+    assert!(
+        app.status.contains("build") && app.status.contains("exits 0"),
+        "the status names the task and the condition the launch waits on: {}",
+        app.status
+    );
+    assert!(
+        app.dap_session.is_none(),
+        "nothing has been debugged yet — that is the whole point of the wait"
+    );
+
+    // The guard that must stay GREEN: honouring one key must not be
+    // satisfiable by launching everything. `presentation` is still unhonoured,
+    // so a compound asking for it is still refused, and the refusal must name
+    // THAT key rather than the one croft now runs.
+    let mut fresh = App::new(tmp.path().to_path_buf()).unwrap();
+    select(&mut fresh, "Presented");
+    assert!(
+        fresh.run_debug.feedback_is_error,
+        "presentation is still not honoured, so it still refuses: {:?}",
+        fresh.run_debug.feedback
+    );
+    assert!(
+        fresh.status.contains("presentation"),
+        "and names the key it cannot honour: {}",
+        fresh.status
+    );
+    assert!(
+        !fresh.status.contains("preLaunchTask"),
+        "without naming the one it now can — reporting a limitation croft no \
+         longer has is the false claim this whole path exists to avoid: {}",
+        fresh.status
+    );
+    assert!(
+        fresh.pending_debug_launch.is_none() && fresh.dap_session.is_none(),
+        "and nothing ran"
+    );
+}
+
+/// #318, the half a parked-launch assertion cannot see: what happens when the
+/// compound's task FINISHES.
+///
+/// A compound's member is resumed through the ordinary launch path, so a
+/// member carrying its own `preLaunchTask` parks again rather than starting.
+/// That chaining is what makes croft run both tasks, as VS Code does, and
+/// nothing about the initial park proves it happens.
+#[test]
+fn a_finished_compound_task_starts_its_member_and_chains_the_members_own_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "compound-build", "type": "shell", "command": "true 1" },
+            { "label": "member-build", "type": "shell", "command": "true 2" }
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch",
+              "program": "s.py", "preLaunchTask": "member-build" }
+        ],
+        "compounds": [
+            { "name": "Tasked", "configurations": ["Server"], "preLaunchTask": "compound-build" }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.open_debug_config_picker();
+    let idx = app
+        .list_picker
+        .as_ref()
+        .expect("picker open")
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Tasked"))
+        .expect("the compound is listed");
+    app.list_picker.as_mut().unwrap().selected = idx;
+    app.confirm_list_picker();
+    let parked = app
+        .pending_debug_launch
+        .take()
+        .expect("the compound's task parked the launch");
+    assert!(
+        app.status.contains("compound-build"),
+        "staging: it is the COMPOUND's task that ran first: {}",
+        app.status
+    );
+
+    // The compound's task exits 0.
+    app.resume_pending_launch(Some(0), parked.step);
+
+    // The member does not go straight to the adapter: it declares a task of
+    // its own, so it parks in turn. Both tasks run, which is the behaviour
+    // being chained rather than merged buys.
+    let second = app
+        .pending_debug_launch
+        .as_ref()
+        .expect("the member's own preLaunchTask parks in turn rather than being skipped");
+    assert!(
+        app.status.contains("member-build"),
+        "and it is the MEMBER's task waiting now: {}",
+        app.status
+    );
+    assert!(
+        !app.run_debug.feedback_is_error,
+        "still progress, not a refusal: {:?}",
+        app.run_debug.feedback
+    );
+    assert!(
+        matches!(second.step, crate::app::PendingLaunchStep::Resolved(_)),
+        "the second park is the member's own launch, so the chain ends here \
+         rather than looping"
+    );
+
+    // A task that fails aborts instead of debugging what the build left.
+    let second = app.pending_debug_launch.take().expect("still parked");
+    app.resume_pending_launch(Some(1), second.step);
+    assert!(
+        app.run_debug.feedback_is_error && app.status.contains("exited 1"),
+        "a non-zero task aborts the launch and says so: {}",
+        app.status
+    );
+    assert!(app.dap_session.is_none(), "and nothing was debugged");
 }
 
 /// #302: a dwell must not be ARMED while a structural suppression is already

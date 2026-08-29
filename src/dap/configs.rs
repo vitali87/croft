@@ -143,8 +143,16 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
 pub struct Compound {
     pub name: String,
     pub configurations: Vec<String>,
+    /// The compound's own `preLaunchTask`, if it asks for one (#318). Run
+    /// before the member starts, and separate from the member's own task:
+    /// VS Code runs both, so croft chains them rather than choosing.
+    ///
+    /// `None` for a key that is absent, `null`, or `""` - each of those
+    /// requests nothing, and parking a launch behind a task named `""` would
+    /// invent work the file never asked for.
+    pub pre_launch_task: Option<String>,
     /// Keys croft does not honour that this compound ACTUALLY ASKS FOR:
-    /// `preLaunchTask` with a non-empty value, or a non-empty `presentation`.
+    /// a non-empty `presentation`.
     /// A key present but requesting nothing (`null`, `""`, `{}`) is not
     /// recorded — croft delivers that behaviour by doing nothing.
     ///
@@ -225,14 +233,23 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
                 Some(Value::Object(o)) => !o.is_empty(),
                 Some(_) => true,
             };
-            let unsupported_keys: Vec<&'static str> = ["preLaunchTask", "presentation"]
+            // `preLaunchTask` left this list in #318: it is honoured now, so
+            // naming it as a reason to refuse would report a limitation croft
+            // no longer has. Its VALUE is captured instead - the key alone was
+            // enough to refuse and is not enough to run anything.
+            let unsupported_keys: Vec<&'static str> = ["presentation"]
                 .into_iter()
                 .filter(|k| asks_for_something(k))
                 .collect();
+            let pre_launch_task = asks_for_something("preLaunchTask")
+                .then(|| obj.get("preLaunchTask").and_then(|v| v.as_str()))
+                .flatten()
+                .map(str::to_string);
             Some(Compound {
                 name,
                 configurations,
                 source,
+                pre_launch_task,
                 unsupported_keys,
             })
         })
@@ -1209,7 +1226,7 @@ mod tests {
                 { "name": "NulledTask", "configurations": ["A"], "preLaunchTask": null },
                 { "name": "EmptyTask", "configurations": ["A"], "preLaunchTask": "" },
                 { "name": "EmptyPresentation", "configurations": ["A"], "presentation": {} },
-                { "name": "RealTask", "configurations": ["A"], "preLaunchTask": "build" }
+                { "name": "RealPresentation", "configurations": ["A"], "presentation": { "order": 1 } }
             ]
         }"#;
         let cs = parse_compounds(text, ".vscode/launch.json");
@@ -1249,12 +1266,62 @@ mod tests {
         );
 
         // The positive control: without it, six empties could equally mean the
-        // detection never records anything at all.
+        // detection never records anything at all. `presentation` carries it
+        // now that #318 honours `preLaunchTask` - a key croft DOES honour is
+        // no longer a reason to refuse, so it cannot serve as the control.
         assert_eq!(
-            by("RealTask").unsupported_keys,
-            vec!["preLaunchTask"],
+            by("RealPresentation").unsupported_keys,
+            vec!["presentation"],
             "and a key that DOES ask for something is still recorded"
         );
+    }
+
+    /// #318: a compound's own `preLaunchTask` is now read and run, so it is no
+    /// longer a reason to refuse the launch. The VALUE has to survive parsing
+    /// — recording only that the key was present was enough to refuse, and is
+    /// not enough to honour it.
+    #[test]
+    fn a_compounds_pre_launch_task_is_captured_and_no_longer_unsupported() {
+        let text = r#"{
+            "configurations": [ { "name": "A", "type": "node", "program": "a.js" } ],
+            "compounds": [
+                { "name": "Builds", "configurations": ["A"], "preLaunchTask": "build" },
+                { "name": "Nulled", "configurations": ["A"], "preLaunchTask": null },
+                { "name": "Empty", "configurations": ["A"], "preLaunchTask": "" },
+                { "name": "Presents", "configurations": ["A"], "presentation": { "order": 1 } }
+            ]
+        }"#;
+        let cs = parse_compounds(text, ".vscode/launch.json");
+        let by = |n: &str| {
+            cs.iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n} parsed"))
+        };
+
+        assert_eq!(
+            by("Builds").pre_launch_task.as_deref(),
+            Some("build"),
+            "the task's NAME is what running it needs; the key alone cannot"
+        );
+        assert!(
+            by("Builds").unsupported_keys.is_empty(),
+            "preLaunchTask is honoured now, so it must stop being a refusal              reason: {:?}",
+            by("Builds").unsupported_keys
+        );
+
+        // Requesting nothing stays nothing: null and "" must not park a launch
+        // behind a task that does not exist.
+        assert_eq!(by("Nulled").pre_launch_task, None);
+        assert_eq!(by("Empty").pre_launch_task, None);
+
+        // The positive control: `presentation` is still unhonoured, so the
+        // refusal path must still have something to fire on.
+        assert_eq!(
+            by("Presents").unsupported_keys,
+            vec!["presentation"],
+            "presentation is still not honoured and must still refuse"
+        );
+        assert_eq!(by("Presents").pre_launch_task, None);
     }
 
     /// A compound resolves to its members in the order written, so the picker

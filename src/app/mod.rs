@@ -1268,6 +1268,24 @@ fn menu_entry_width(entry: &MenuEntry) -> usize {
 /// exited without ever stopping, say so explicitly — that is the common "I set a
 /// breakpoint and nothing happened" confusion (e.g. running a library module
 /// whose breakpointed code is never called). Otherwise a plain end message.
+/// What a parked launch does once its task exits 0.
+///
+/// Two shapes, because a compound's task and a config's task are different
+/// steps (#318). A config's own task is the LAST thing before the adapter
+/// starts, so the config is already resolved. A compound's task runs BEFORE
+/// its member is considered at all, and the member may carry a task of its
+/// own - VS Code runs both - so that continuation re-enters the normal launch
+/// path rather than skipping to the adapter.
+enum PendingLaunchStep {
+    /// The config's own task just finished: start it. Boxed like the other
+    /// variant so neither dominates the enum's size - a resolved config is
+    /// several hundred bytes, and this type is held in an `Option` on `App`.
+    Resolved(Box<crate::dap::configs::ResolvedConfig>),
+    /// A compound's task just finished: launch its member from the top, which
+    /// parks again if the member has a `preLaunchTask` too.
+    Member(Box<crate::dap::configs::DebugConfig>),
+}
+
 /// A launch.json config launch parked behind its `preLaunchTask` (#250): the
 /// task runs in a terminal pane, and the FinishedCommand sweep decides.
 struct PendingDebugLaunch {
@@ -1276,8 +1294,8 @@ struct PendingDebugLaunch {
     /// The task's command line, matched against the pane's next finished
     /// command (OSC 133 reports what actually ran).
     command: String,
-    /// The fully resolved config, launched once the task exits 0.
-    config: crate::dap::configs::ResolvedConfig,
+    /// What to do once the task exits 0.
+    step: PendingLaunchStep,
     /// When the task was written, for the no-command-mark fallback below.
     started: std::time::Instant,
 }
@@ -18416,6 +18434,79 @@ impl App {
     /// Resolve and launch one launch.json configuration: substitution against
     /// the active editor state, then either straight to the adapter or parked
     /// behind its `preLaunchTask`.
+    /// Continue a parked launch whose `preLaunchTask` has finished.
+    ///
+    /// Split from the terminal sweep so it can be driven directly: reaching it
+    /// through the sweep needs a pane emitting OSC 133 marks, and the branch
+    /// that matters most - a compound's task completing, then its MEMBER
+    /// starting (#318) - is invisible to every test that only checks the
+    /// launch parked.
+    fn resume_pending_launch(&mut self, exit: Option<i32>, step: PendingLaunchStep) {
+        if exit != Some(0) {
+            let code = exit.map_or_else(|| String::from("?"), |c| c.to_string());
+            self.debug_error(format!(
+                "preLaunchTask exited {code} — debug launch aborted (its pane has the output)"
+            ));
+            return;
+        }
+        match step {
+            PendingLaunchStep::Resolved(rc) => self.launch_resolved_config(*rc),
+            // Back through the front door: the member may have a
+            // `preLaunchTask` of its own, and VS Code runs the compound's AND
+            // the member's. Calling the resolved-launch path here would
+            // silently skip the member's.
+            PendingLaunchStep::Member(cfg) => self.launch_debug_config(&cfg),
+        }
+    }
+
+    /// Run a COMPOUND's own `preLaunchTask`, then launch its single member
+    /// (#318).
+    ///
+    /// Deliberately not folded into [`Self::launch_debug_config`]: that runs
+    /// the *config's* task as the last step before the adapter, while this one
+    /// runs before the member is even resolved. Keeping them separate is what
+    /// lets both fire for a compound whose member also declares a task, which
+    /// is what VS Code does.
+    ///
+    /// Same failure contract as a config's task, because a user cannot tell
+    /// the two apart from the outside: a task the workspace does not declare
+    /// is an error rather than a silent skip, and a non-zero exit aborts the
+    /// launch instead of debugging whatever the build left behind.
+    fn launch_after_compound_task(
+        &mut self,
+        task_label: &str,
+        member: crate::dap::configs::DebugConfig,
+    ) {
+        if self.dap_session.is_some() {
+            self.debug_stop();
+        }
+        self.pending_debug_launch = None;
+        let root = self.active_workspace_root();
+        let tasks = crate::tasks::discover_tasks(&root);
+        let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
+            self.debug_error(format!(
+                "compound preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
+            ));
+            return;
+        };
+        let command = task.command.clone();
+        let Some(pane) = self.run_project_task(task) else {
+            // run_project_task already reported why the pane failed.
+            return;
+        };
+        self.pending_debug_launch = Some(PendingDebugLaunch {
+            pane,
+            command,
+            step: PendingLaunchStep::Member(Box::new(member)),
+            started: std::time::Instant::now(),
+        });
+        self.run_debug.feedback = Some(format!("compound preLaunchTask \"{task_label}\" running…"));
+        self.run_debug.feedback_is_error = false;
+        self.status = format!(
+            "compound preLaunchTask \"{task_label}\" running — debug starts when it exits 0"
+        );
+    }
+
     fn launch_debug_config(&mut self, cfg: &crate::dap::configs::DebugConfig) {
         use crate::dap::configs;
         if self.dap_session.is_some() {
@@ -18450,7 +18541,7 @@ impl App {
             self.pending_debug_launch = Some(PendingDebugLaunch {
                 pane,
                 command,
-                config: rc,
+                step: PendingLaunchStep::Resolved(Box::new(rc)),
                 started: std::time::Instant::now(),
             });
             self.run_debug.feedback = Some(format!("preLaunchTask \"{task_label}\" running…"));
@@ -21642,13 +21733,12 @@ impl App {
                             Err(e) => self.debug_error(e),
                             // A one-member compound carrying keys croft does
                             // not honour is REFUSED rather than launched.
-                            // `parse_compounds` reads only `name` and
-                            // `configurations`, so launching via the member
-                            // alone would run neither the compound's own
-                            // `preLaunchTask` nor respect `presentation` — the
-                            // "silently debug something other than what was
-                            // asked for" outcome every guard here exists to
-                            // prevent. Saying so beats doing it.
+                            // Since #318 that is `presentation` alone: the
+                            // compound's own `preLaunchTask` is run by the
+                            // branch below. Launching while ignoring what the
+                            // compound asked for is the "silently debug
+                            // something other than what was asked for" outcome
+                            // every guard here exists to prevent.
                             Ok(members)
                                 if members.len() == 1
                                     && !compound.unsupported_keys.is_empty() =>
@@ -21684,7 +21774,16 @@ impl App {
                                 let cfg = members[0].clone();
                                 self.selected_debug_config = Some(cfg.name.clone());
                                 self.run_debug.selected_config = Some(cfg.name.clone());
-                                self.launch_debug_config(&cfg);
+                                match compound.pre_launch_task.clone() {
+                                    // #318: the compound's own task runs
+                                    // first, and the member starts only if it
+                                    // exits 0 - the same contract a config's
+                                    // own task already gets. Chained rather
+                                    // than merged: the member may declare a
+                                    // task too, and VS Code runs both.
+                                    Some(task) => self.launch_after_compound_task(&task, cfg),
+                                    None => self.launch_debug_config(&cfg),
+                                }
                             }
                             Ok(_) => self.debug_error(format!(
                                 "compound \"{}\" needs several debug sessions at once, which croft does not support yet (#310)",
@@ -26083,14 +26182,7 @@ impl App {
         if let Some(exit) = settled_launch
             && let Some(pending) = self.pending_debug_launch.take()
         {
-            if exit == Some(0) {
-                self.launch_resolved_config(pending.config);
-            } else {
-                let code = exit.map_or_else(|| String::from("?"), |c| c.to_string());
-                self.debug_error(format!(
-                    "preLaunchTask exited {code} — debug launch aborted (its pane has the output)"
-                ));
-            }
+            self.resume_pending_launch(exit, pending.step);
         }
         // Liveness fallback for a still-parked launch: the FinishedCommand
         // match depends on OSC 133 marks, and a pane without integration (or
