@@ -443,14 +443,24 @@ fn prepared(ds: &Dataset, kind: ChartKind) -> Dataset {
 
 /// Bucket a long series down to at most `slots` points (mean per bucket),
 /// so a 10k-row line is a few hundred segments rather than ten thousand.
+/// The half-open row range bucket `i` of `slots` covers when `n` rows are
+/// squeezed into `slots` bars. One place for the arithmetic, so the bar a
+/// bucket averages and the label it wears can never name different rows.
+/// Every row lands in exactly one bucket and no bucket is empty while
+/// `slots <= n`.
+fn bucket_range(i: usize, n: usize, slots: usize) -> (usize, usize) {
+    let a = i * n / slots;
+    let b = ((i + 1) * n / slots).max(a + 1);
+    (a, b)
+}
+
 fn downsample(values: &[f64], slots: usize) -> Vec<f64> {
     if values.len() <= slots || slots == 0 {
         return values.to_vec();
     }
     (0..slots)
         .map(|i| {
-            let a = i * values.len() / slots;
-            let b = ((i + 1) * values.len() / slots).max(a + 1);
+            let (a, b) = bucket_range(i, values.len(), slots);
             let bucket: Vec<f64> = values[a..b]
                 .iter()
                 .copied()
@@ -583,15 +593,15 @@ pub fn svg(
             debug_assert!(shown <= n, "buckets never outnumber rows");
             // A bucket's bar is the mean of its rows, so its label names the
             // rows it covers: one label for a single row, `first…last` for
-            // several.
+            // several - unless the rows share a label, when repeating it
+            // says nothing.
             let labels = ds.labels.as_ref().map(|labels| {
                 (0..shown)
                     .map(|i| {
-                        let start = i * n / shown.max(1);
-                        let end = ((i + 1) * n / shown.max(1)).saturating_sub(1).max(start);
+                        let (start, end) = bucket_range(i, n, shown);
                         let first = labels.get(start).cloned().unwrap_or_default();
-                        if end > start {
-                            let last = labels.get(end).cloned().unwrap_or_default();
+                        let last = labels.get(end - 1).cloned().unwrap_or_default();
+                        if end - 1 > start && last != first {
                             format!("{first}\u{2026}{last}")
                         } else {
                             first
@@ -954,7 +964,7 @@ mod tests {
         let titled = svg(&ds("1\n2\n3\n"), ChartKind::Line, Some("t"), 600, 40, &p);
         assert!(titled.contains(">t<"));
         // 1000 labelled bars into a 600px chart: fewer rects than rows, and
-        // the labels shown are the ones at the bucket starts.
+        // each label names the rows its bucket averages.
         let input: String = (0..1000).map(|i| format!("l{i},{i}\n")).collect();
         let d = ds(&format!("label,v\n{input}"));
         let out = svg(&d, ChartKind::Bar, None, 600, 300, &p);
@@ -988,6 +998,43 @@ mod tests {
             widths.iter().all(|w| *w == widths[0]),
             "every row the same display width: {rows:?}"
         );
+    }
+
+    #[test]
+    fn a_bucket_of_identical_labels_wears_one_label() {
+        let p = Palette::default();
+        let input: String = (0..1000).map(|i| format!("x,{i}\n")).collect();
+        let out = svg(
+            &ds(&format!("label,v\n{input}")),
+            ChartKind::Bar,
+            None,
+            600,
+            300,
+            &p,
+        );
+        assert!(out.contains(">x<"), "the shared label survives: {out}");
+        assert!(!out.contains("x\u{2026}x"), "no `x…x`: {out}");
+    }
+
+    /// The label range and the averaged bucket are one computation, so
+    /// every row lands in exactly one bucket - checked on a row count that
+    /// is not a multiple of the slot count, where the last bucket is the one
+    /// that goes wrong.
+    #[test]
+    fn bucket_ranges_tile_the_rows_exactly() {
+        for (n, slots) in [(1081usize, 540usize), (1000, 540), (7, 3), (5, 5)] {
+            let mut next = 0;
+            for i in 0..slots {
+                let (a, b) = bucket_range(i, n, slots);
+                assert_eq!(
+                    a, next,
+                    "bucket {i} of {n}/{slots} starts where the last ended"
+                );
+                assert!(b > a, "bucket {i} of {n}/{slots} is not empty");
+                next = b;
+            }
+            assert_eq!(next, n, "{n}/{slots}: the last bucket ends at the last row");
+        }
     }
 
     #[test]
