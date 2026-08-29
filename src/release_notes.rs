@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Runnable docs: shell fences in the Markdown preview wear a play glyph; click it (or press Cmd+Enter with the caret in the fence in the source) and the block is typed into a pane named after the document and block, in the document's directory, reusing that pane on a rerun. `{run=false}` opts a block out, `{confirm}` and destructive-looking blocks (rm -rf, sudo, curl | sh) ask first.",
+    summary: "Runnable docs: shell fences in the Markdown preview wear a play glyph; click it (or press Cmd+Enter with the caret in the fence in the source) and a popup shows the block, the pane it will run in and its directory - Y types it there, reusing that pane on a rerun. Every block confirms, since a README is untrusted; blocks that look destructive turn the popup red, `{run=false}` opts a fence out.",
 }];
