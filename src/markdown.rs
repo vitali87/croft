@@ -174,76 +174,82 @@ pub fn has_control_chars(code: &str) -> bool {
 pub fn looks_destructive(code: &str) -> bool {
     let c = code.to_ascii_lowercase();
     let fetches = |l: &str| l.contains("curl") || l.contains("wget");
-    c.lines().any(|l| {
-        let l = l.trim();
-        // `curl … | sh`, `wget … |bash`, `… | sudo …`
-        let piped_to_shell = fetches(l)
-            && l.split('|').skip(1).any(|part| {
-                let p = part.trim_start();
-                [
-                    "sh", "bash", "zsh", "fish", "sudo", "python", "perl", "ruby", "node",
-                ]
-                .iter()
-                .any(|w| {
-                    p == *w || p.starts_with(&format!("{w} ")) || p.starts_with(&format!("{w}\t"))
-                })
-            });
-        // `sh -c "$(curl …)"`, `eval "$(wget …)"`, backticks
-        let substituted_fetch = fetches(l)
-            && (l.contains("$(") || l.contains('`'))
-            && (l.contains("eval")
-                || l.contains(" -c ")
-                || l.starts_with("sh ")
-                || l.starts_with("bash "));
-        // `rm -rf`, `rm -r -f`, `\rm -fr …`: an rm with both r and f flags
-        let rm_rf = l
-            .split_whitespace()
-            .next()
-            .is_some_and(|w| w.trim_start_matches('\\') == "rm")
-            && l.split_whitespace()
-                .skip(1)
-                .any(|f| f.starts_with('-') && f.contains('r'))
-            && l.split_whitespace()
-                .skip(1)
-                .any(|f| f.starts_with('-') && f.contains('f'));
-        piped_to_shell
-            || substituted_fetch
-            || rm_rf
-            || l.starts_with("sudo ")
-            || l.contains(" sudo ")
-            || l.contains("mkfs")
-            || l.contains("dd if=")
-            || l.contains("--force")
-            || l.contains("git reset --hard")
-            || l.contains("drop table")
-            || l.starts_with("nc ")
-            || l.contains(" nc ")
-            || l.contains("ncat ")
-            || l.contains("/dev/tcp")
-            || l.starts_with("chmod ")
-            || l.starts_with("chown ")
-            || l.contains(" chmod ")
-            || l.contains(" chown ")
-            || has_write_redirect(l)
-    })
+    // The redirect scan reads the whole block: a string can span lines,
+    // and its closing line on its own looks like a comment.
+    has_write_redirect(&c)
+        || c.lines().any(|l| {
+            let l = l.trim();
+            // `curl … | sh`, `wget … |bash`, `… | sudo …`
+            let piped_to_shell = fetches(l)
+                && l.split('|').skip(1).any(|part| {
+                    let p = part.trim_start();
+                    [
+                        "sh", "bash", "zsh", "fish", "sudo", "python", "perl", "ruby", "node",
+                    ]
+                    .iter()
+                    .any(|w| {
+                        p == *w
+                            || p.starts_with(&format!("{w} "))
+                            || p.starts_with(&format!("{w}\t"))
+                    })
+                });
+            // `sh -c "$(curl …)"`, `eval "$(wget …)"`, backticks
+            let substituted_fetch = fetches(l)
+                && (l.contains("$(") || l.contains('`'))
+                && (l.contains("eval")
+                    || l.contains(" -c ")
+                    || l.starts_with("sh ")
+                    || l.starts_with("bash "));
+            // `rm -rf`, `rm -r -f`, `\rm -fr …`: an rm with both r and f flags
+            let rm_rf = l
+                .split_whitespace()
+                .next()
+                .is_some_and(|w| w.trim_start_matches('\\') == "rm")
+                && l.split_whitespace()
+                    .skip(1)
+                    .any(|f| f.starts_with('-') && f.contains('r'))
+                && l.split_whitespace()
+                    .skip(1)
+                    .any(|f| f.starts_with('-') && f.contains('f'));
+            piped_to_shell
+                || substituted_fetch
+                || rm_rf
+                || l.starts_with("sudo ")
+                || l.contains(" sudo ")
+                || l.contains("mkfs")
+                || l.contains("dd if=")
+                || l.contains("--force")
+                || l.contains("git reset --hard")
+                || l.contains("drop table")
+                || l.starts_with("nc ")
+                || l.contains(" nc ")
+                || l.contains("ncat ")
+                || l.contains("/dev/tcp")
+                || l.starts_with("chmod ")
+                || l.starts_with("chown ")
+                || l.contains(" chmod ")
+                || l.contains(" chown ")
+        })
 }
 
-/// A `>` that writes somewhere: not `2>&1` / `>&2` (a descriptor dup),
+/// A `>` anywhere in the block that writes somewhere: not `2>&1` / `>&2`
+/// (a descriptor dup),
 /// not `>/dev/null` (the device itself, not `/dev/nullish`), not an arrow
 /// (`->`, `=>`), not in a trailing comment. Quotes are honoured, so a `#`
 /// or `>` inside `"…"` / `'…'` is text - otherwise
 /// `echo "step #1" > ~/.bashrc` would hide its redirect behind a fake
 /// comment. A backslash escapes the next byte outside quotes and inside
 /// double quotes (`echo \" > ~/.bashrc` really writes the file). A quote
-/// that never closes (`echo don't > ~/.bashrc`) fails OPEN: the line is
+/// that never closes (`echo don't > ~/.bashrc`) fails OPEN: the block is
 /// rescanned with quotes as plain text, since a missed write costs more
-/// than a spurious red banner. `<>` counts: it opens its target for
-/// writing too.
-fn has_write_redirect(line: &str) -> bool {
-    match redirect_scan(line, true) {
+/// than a spurious red banner. Quotes span lines, so the closing line of
+/// `echo "hello\nworld # note" > /tmp/x` is a redirect, not a comment.
+/// `<>` counts: it opens its target for writing too.
+fn has_write_redirect(code: &str) -> bool {
+    match redirect_scan(code, true) {
         RedirectScan::Found => true,
         RedirectScan::Clean => false,
-        RedirectScan::Unterminated => redirect_scan(line, false) == RedirectScan::Found,
+        RedirectScan::Unterminated => redirect_scan(code, false) == RedirectScan::Found,
     }
 }
 
@@ -251,14 +257,15 @@ fn has_write_redirect(line: &str) -> bool {
 enum RedirectScan {
     Found,
     Clean,
-    /// The line ended inside a quote, so nothing after the opening quote
+    /// The block ended inside a quote, so nothing after the opening quote
     /// was looked at.
     Unterminated,
 }
 
-/// One pass of [`has_write_redirect`]; `quotes` says whether `'` and `"`
-/// open a string or are ordinary bytes.
-fn redirect_scan(line: &str, quotes: bool) -> RedirectScan {
+/// One pass of [`has_write_redirect`] over a whole block; `quotes` says
+/// whether `'` and `"` open a string or are ordinary bytes.
+fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
+    let line = code;
     let b = line.as_bytes();
     let mut quote: Option<u8> = None;
     let mut i = 0;
@@ -271,7 +278,16 @@ fn redirect_scan(line: &str, quotes: bool) -> RedirectScan {
             None => match c {
                 b'\\' => i += 1,
                 b'\'' | b'"' if quotes => quote = Some(c),
-                b'#' if i == 0 || b[i - 1].is_ascii_whitespace() => return RedirectScan::Clean,
+                // A `#` starts a comment only when quotes are being
+                // honoured: the quote-blind rescan runs because a string
+                // was left open, and a `#` inside that string is text.
+                b'#' if quotes && (i == 0 || b[i - 1].is_ascii_whitespace()) => {
+                    // A comment runs to the end of its line; the block goes on.
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
                 b'>' => {
                     let prev = if i > 0 { b[i - 1] } else { b' ' };
                     if prev != b'-' && prev != b'=' {
@@ -1200,6 +1216,9 @@ mod tests {
             "echo \"unterminated > ~/.bashrc",
             "printf '%s\\\\' > ~/.bashrc",
             "cat payload >| ~/.profile",
+            "echo \"hello\nworld # note\" > /tmp/x",
+            // Fail-open: a quote left open makes the rescan read `#` as text.
+            "echo don't # > ~/.bashrc",
             "git push --force",
             "git reset --hard HEAD~3",
         ] {
@@ -1219,6 +1238,7 @@ mod tests {
             "echo '> quoted' # not a redirect",
             "echo \"a > b\"",
             "make >/dev/null 2>&1",
+            "echo hi # writes > nothing\necho done",
             "if [ 3 -gt 2 ]; then echo yes; fi",
         ] {
             assert!(!looks_destructive(ok), "{ok:?} is ordinary");
