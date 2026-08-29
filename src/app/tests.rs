@@ -27269,6 +27269,96 @@ fn only_one_croft_self_appoints_the_navigator_owner() {
     );
 }
 
+/// A lock file croft cannot open is not another window (#337): the status
+/// names the path and the error, never "another croft". And the refusal is
+/// latched by KIND: when the reason changes (the directory appears but a
+/// second window now holds the flock) the new reason is announced, and
+/// when the lock frees this window hosts.
+#[test]
+fn an_unopenable_host_lock_is_reported_as_such_and_re_announced_when_the_reason_changes() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let lock_dir = tmp.path().join("no-such-dir");
+    let lock_path = lock_dir.join("host.lock");
+    let mut b = App::new(tmp.path().to_path_buf()).unwrap();
+    b.pair_record_path = tmp.path().join("b.pair.json");
+    b.pair_socket = socket.clone();
+    b.pair_host_lock_path = lock_path.clone();
+    b.pair_spawn_override = Some(Box::new(local_test_spawn));
+    crate::session::write_pair_record(
+        &b.pair_record_path,
+        &crate::session::PairRecord {
+            model: None,
+            name: "nav".into(),
+            enabled: true,
+            task: None,
+            provider: None,
+            base_url: None,
+        },
+    )
+    .unwrap();
+    b.last_pair_check = None;
+    b.maybe_seat_navigator();
+    assert!(b.pair_host.is_none(), "cannot host without the lock");
+    assert!(
+        b.status.contains("cannot open host lock") && b.status.contains("no-such-dir"),
+        "an unopenable lock names the path and the error, got: {}",
+        b.status
+    );
+    assert!(
+        !b.status.to_lowercase().contains("another croft"),
+        "an open failure must never be blamed on another window: {}",
+        b.status
+    );
+
+    // Same reason next tick: quiet.
+    b.status = String::from("Saved src/foo.rs");
+    b.last_pair_check = None;
+    assert!(
+        !b.maybe_seat_navigator(),
+        "an unchanged refusal stays quiet"
+    );
+    assert_eq!(b.status, "Saved src/foo.rs");
+
+    // The directory appears, but another window holds the flock: the
+    // reason changed, so it is announced.
+    std::fs::create_dir_all(&lock_dir).unwrap();
+    let holder = crate::session::try_acquire_pair_host_lock(&lock_path).expect("holder acquires");
+    b.last_pair_check = None;
+    assert!(
+        b.maybe_seat_navigator(),
+        "a changed reason dirties the frame"
+    );
+    assert!(
+        b.status.to_lowercase().contains("another croft"),
+        "now it IS another window, got: {}",
+        b.status
+    );
+
+    // The holder exits: this window takes over.
+    drop(holder);
+    b.last_pair_check = None;
+    b.maybe_seat_navigator();
+    assert!(
+        b.pair_host.is_some(),
+        "B hosts once the lock frees: {}",
+        b.status
+    );
+    assert!(b.pair_host_lock.is_some());
+}
+
 /// A local-provider seat for tests: connects to the workspace relay but
 /// spawns no child process (the endpoint is never contacted until a turn).
 fn local_test_spawn(cfg: &crate::pair::PairConfig) -> anyhow::Result<crate::pair_host::PairHost> {
