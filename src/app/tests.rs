@@ -20887,6 +20887,19 @@ fn secret_redaction_toggles_the_builtin_rules_and_reveal_expires() {
     assert!(!app.redactions_revealed());
     assert!(app.status.contains("masked again"));
 
+    // The chip reads what was PAINTED: a hidden panel paints nothing, so a
+    // stale count from the last visible frame must not survive it.
+    if let Some(t) = app.terminals.first_mut() {
+        t.redacted_on_screen = 3;
+    }
+    assert_eq!(app.redacted_on_screen(), 3);
+    app.show_terminal = false;
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.redacted_on_screen(), 0, "a hidden pane counts nothing");
+    app.show_terminal = true;
+
     // The clipboard keeps the real value unless a rule says otherwise; the
     // scrollback dump always masks.
     assert_eq!(

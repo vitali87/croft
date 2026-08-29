@@ -73,6 +73,9 @@ pub struct Trigger {
     /// Redact only: a copy of a masked span yields the mask, not the value
     /// (`"copy": "masked"`). Default: copies carry the real text.
     pub copy_masked: bool,
+    /// Redact only: a match must carry at least one digit to count, so a
+    /// prefix rule (`sk-…`) cannot swallow a hyphenated word.
+    pub require_digit: bool,
 }
 
 /// The user's trigger list. Shared read-only between the app, the render
@@ -193,6 +196,7 @@ impl TriggerSet {
                     bg: r.bg.as_deref().and_then(parse_hex),
                     message: r.message,
                     copy_masked: r.copy.as_deref() == Some("masked"),
+                    require_digit: false,
                 })
             })
             .collect();
@@ -243,29 +247,39 @@ impl TriggerSet {
 /// prefix to anchor on, and masking every long base64 line would eat
 /// checksums and blobs.
 pub fn builtin_redactions() -> Vec<Trigger> {
-    const RULES: &[&str] = &[
+    // (pattern, must the match carry a digit)
+    const RULES: &[(&str, bool)] = &[
         // AWS access key ids.
-        r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
-        // OpenAI / Anthropic-style secret keys.
-        r"\bsk-[A-Za-z0-9_-]{20,}\b",
+        (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", false),
+        // OpenAI / Anthropic-style secret keys. Digit-gated: `sk-` also
+        // opens hyphenated prose ("sk-something-like-this").
+        (r"\bsk-[A-Za-z0-9_-]{20,}\b", true),
         // GitHub tokens: classic (ghp_), OAuth (gho_), app (ghu_/ghs_/ghr_), fine-grained.
-        r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b",
+        (
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b",
+            true,
+        ),
         // Slack tokens.
-        r"\bxox[abpors]-[A-Za-z0-9-]{10,}\b",
+        (r"\bxox[abpors]-[A-Za-z0-9-]{10,}\b", true),
         // JWTs: three base64url segments, the first a JSON header.
-        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
-        // Authorization: Bearer <token> - only the token is masked.
-        r"(?i)\bBearer +([A-Za-z0-9._~+/=-]{16,})",
+        (
+            r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+            false,
+        ),
+        // `Authorization: Bearer <token>` - only the token is masked. Anchored
+        // on the header so "Bearer" as an English word never matches.
+        (r"(?i)\bauthorization: *bearer +(\S{16,})", false),
     ];
     RULES
         .iter()
-        .map(|r| Trigger {
+        .map(|(r, require_digit)| Trigger {
             regex: Regex::new(r).expect("built-in redaction regex compiles"),
             action: TriggerAction::Redact,
             fg: None,
             bg: None,
             message: None,
             copy_masked: false,
+            require_digit: *require_digit,
         })
         .collect()
 }
@@ -296,7 +310,9 @@ pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
                     None => continue,
                 },
             };
-            if m.as_str().is_empty() {
+            if m.as_str().is_empty()
+                || (t.require_digit && !m.as_str().chars().any(|c| c.is_ascii_digit()))
+            {
                 continue;
             }
             out.push(RedactSpan {
@@ -566,7 +582,9 @@ impl TriggerScanner {
         if !self.line.is_empty() {
             let line = String::from_utf8_lossy(&self.line);
             for t in &set.triggers {
-                if t.action == TriggerAction::Highlight {
+                // Paint-only actions never become hits: a redact hit would
+                // carry the secret itself into the status bar.
+                if matches!(t.action, TriggerAction::Highlight | TriggerAction::Redact) {
                     continue;
                 }
                 if let Some(caps) = t.regex.captures(&line) {
@@ -671,6 +689,21 @@ mod tests {
         );
     }
 
+    /// A redact rule paints; it must never become a status-bar hit, or the
+    /// bar would print the secret the pane just masked.
+    #[test]
+    fn redact_rules_never_fire_as_hits() {
+        let s = TriggerSet::default().with_builtin_redactions();
+        let mut sc = TriggerScanner::new();
+        let mut out = Vec::new();
+        sc.scan(b"key AKIAIOSFODNN7EXAMPLE end\n", &s, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        let user = set(r##"[{ "regex": "hunter2", "action": "redact" }]"##);
+        sc.scan(b"pw hunter2\n", &user, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(!s.has_events(), "nothing here wakes the scanner");
+    }
+
     #[test]
     fn builtin_rules_mask_the_usual_key_shapes_and_leave_prose_alone() {
         let s = TriggerSet::default().with_builtin_redactions();
@@ -685,12 +718,17 @@ mod tests {
             format!("OPENAI_API_KEY={}", "•".repeat(key.len()))
         );
         assert_eq!(
-            masked("token: ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"),
+            masked("token: ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
             "token: ••••••••••••••••••••••••••••••••••••••••"
         );
         assert_eq!(
             masked("xoxb-123456789012-abcdefGHIJ"),
             "••••••••••••••••••••••••••••"
+        );
+        assert_eq!(
+            masked("ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"),
+            "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ",
+            "a token shape with no digit is a word, not a secret"
         );
         assert_eq!(
             masked("Authorization: Bearer abcdef0123456789ABCDEF"),
@@ -702,6 +740,8 @@ mod tests {
         for prose in [
             "cargo build --release",
             "Bearer of bad news",
+            "Bearer responsibilities matter",
+            "run task sk-something-like-this-long",
             "the skeleton key",
             "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
         ] {

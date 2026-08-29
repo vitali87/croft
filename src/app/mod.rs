@@ -12110,6 +12110,7 @@ impl App {
     /// quit; the default single-pane layout prunes the record instead.
     pub fn save_terminal_session(&mut self) {
         let root = self.workspace_root().display().to_string();
+        let triggers = self.triggers.clone();
         let panes = self
             .terminals
             .iter()
@@ -12142,7 +12143,12 @@ impl App {
                         .rposition(|l| !l.trim().is_empty())
                         .map_or(0, |i| i + 1);
                     let start = end.saturating_sub(crate::terminal_session::TRANSCRIPT_LINES);
-                    lines[start..end].to_vec()
+                    // Persisted to disk and replayed next launch: every
+                    // redact rule applies (#360), as for the dump.
+                    lines[start..end]
+                        .iter()
+                        .map(|l| crate::triggers::mask_text(l, &triggers, false))
+                        .collect()
                 },
             })
             .collect();
@@ -14387,6 +14393,7 @@ impl App {
                     for (i, t) in self.terminals.iter_mut().enumerate() {
                         if cols[i].width == 0 {
                             t.last_area = Rect::default();
+                            t.redacted_on_screen = 0;
                         } else {
                             frame.render_widget(
                                 ratatui::widgets::Block::default()
@@ -14528,6 +14535,7 @@ impl App {
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
+                        t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.problems, content);
                 }
@@ -14542,6 +14550,7 @@ impl App {
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
+                        t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.output, content);
                 }
@@ -14556,6 +14565,7 @@ impl App {
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
+                        t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.ports, content);
                 }
@@ -14569,6 +14579,7 @@ impl App {
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
+                        t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.captures, content);
                 }
@@ -14591,6 +14602,7 @@ impl App {
             // panel's hidden-state reset).
             for t in self.terminals.iter_mut() {
                 t.last_area = Rect::default();
+                t.redacted_on_screen = 0;
             }
         }
 
@@ -26606,7 +26618,10 @@ impl App {
                         .unwrap_or(0);
                     self.command_history
                         .append(crate::command_history::HistoryEntry {
-                            cmd: f.cmd.trim().to_string(),
+                            // The durable history is on disk and cross-
+                            // session: a typed `export KEY=…` is masked
+                            // like any other persisted text (#360).
+                            cmd: crate::triggers::mask_text(f.cmd.trim(), &self.triggers, false),
                             cwd: f
                                 .cwd
                                 .as_deref()
@@ -33779,7 +33794,10 @@ impl App {
                 }
                 // A plain click on a redacted span shows the real value in
                 // a popup (#360): the mask is paint-only, so this is the
-                // one way to read it without a reveal window.
+                // one way to read it without a reveal window. Checked
+                // before click-to-move, like the annotation popup: on the
+                // prompt row a masked token yields its value rather than a
+                // caret move, which is the useful answer for a secret.
                 if self.focus == Pane::Terminal
                     && !self.terminal().selection().is_some_and(|s| s.has_area())
                     && let Some(secret) = self.terminal().redacted_at(m.column, m.row)

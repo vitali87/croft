@@ -2383,10 +2383,13 @@ impl PtyTerminal {
         let line = vr as i32 - term.grid().display_offset() as i32;
         let (text, colmap) = row_text_and_cols(&term, line);
         drop(term);
+        // The clicked column as a char index: a wide char's spacer column
+        // resolves to the wide char itself (the `line_text_at` rule).
         let vc = vc as usize;
+        let ci = colmap.iter().rposition(|&gc| gc <= vc)?;
         crate::triggers::redact_spans(&text, &set)
             .into_iter()
-            .find(|s| (s.start..s.start + s.len).any(|k| colmap.get(k).is_some_and(|&c| c == vc)))
+            .find(|s| ci >= s.start && ci < s.start + s.len)
             .map(|s| text.chars().skip(s.start).take(s.len).collect())
     }
 
