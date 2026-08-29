@@ -580,13 +580,22 @@ pub fn svg(
             // width like the line path, and the labels follow the buckets.
             let slots = ((right - left) as usize).max(2);
             let shown = n.min(slots);
+            debug_assert!(shown <= n, "buckets never outnumber rows");
+            // A bucket's bar is the mean of its rows, so its label names the
+            // rows it covers: one label for a single row, `first…last` for
+            // several.
             let labels = ds.labels.as_ref().map(|labels| {
                 (0..shown)
                     .map(|i| {
-                        labels
-                            .get(i * n / shown.max(1))
-                            .cloned()
-                            .unwrap_or_default()
+                        let start = i * n / shown.max(1);
+                        let end = ((i + 1) * n / shown.max(1)).saturating_sub(1).max(start);
+                        let first = labels.get(start).cloned().unwrap_or_default();
+                        if end > start {
+                            let last = labels.get(end).cloned().unwrap_or_default();
+                            format!("{first}\u{2026}{last}")
+                        } else {
+                            first
+                        }
                     })
                     .collect::<Vec<_>>()
             });
@@ -608,7 +617,7 @@ pub fn svg(
                     let (y0, hh) = if y < zero {
                         (y, (zero - y).max(1.0))
                     } else {
-                        ((zero - 1.0).max(y0_floor(zero, y)), (y - zero).max(1.0))
+                        (y0_floor(zero, y), (y - zero).max(1.0))
                     };
                     let _ = write!(
                         out,
@@ -658,14 +667,14 @@ fn display_width(c: char) -> usize {
     }
 }
 
-/// Text-node escaping only: every escaped value lands between tags, never
-/// in an attribute, so quotes need no treatment here.
 /// Where a bar that grows from `zero` starts: at `zero` when it has
 /// height, one pixel above it when the value is exactly zero.
 fn y0_floor(zero: f64, y: f64) -> f64 {
     if y > zero { zero } else { zero - 1.0 }
 }
 
+/// Text-node escaping only: every escaped value lands between tags, never
+/// in an attribute, so quotes need no treatment here.
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -882,6 +891,13 @@ mod tests {
         assert_eq!(d.series[1].values[1..], [2.0, 4.0]);
         let err = parse("k,a\nx,1\ny,2\n", None, &["k".into()]).unwrap_err();
         assert!(err.contains("\"k\" is not numeric"), "{err}");
+        // Delimiter votes: a line with both a tab and a comma is a TSV (tabs
+        // win the tie), an empty sample is whitespace, and a TSV whose first
+        // line has no tab still reads as a TSV.
+        assert_eq!(detect_delim(&["a\tb,c", "1\t2,3"]), Delim::Tab);
+        assert_eq!(detect_delim(&[]), Delim::Space);
+        assert_eq!(detect_delim(&["header", "1\t2", "3\t4"]), Delim::Tab);
+        assert_eq!(detect_delim(&["1,2", "3 4", "5 6"]), Delim::Space);
         // A whitespace file with one stray comma stays whitespace-separated:
         // the stray line is one field, which makes the first column a label
         // column rather than folding "3,4" into a number.
@@ -946,13 +962,21 @@ mod tests {
             out.matches("<rect").count() < 1000,
             "bars bucket to the width"
         );
+        // 1000 rows into 540 slots: buckets alternate one and two rows, so
+        // single-row labels and range labels both appear.
         assert!(
             out.contains(">l0<"),
-            "the first bucket's label survives: {out}"
+            "a one-row bucket keeps its label: {out}"
         );
         assert!(
-            !out.contains(">l1<"),
-            "a label inside the first bucket does not"
+            out.contains("\u{2026}l"),
+            "a two-row bucket is labelled by its range: {out}"
+        );
+        let few = ds("k,v\na,1\nb,2\n");
+        let out = svg(&few, ChartKind::Bar, None, 600, 300, &p);
+        assert!(
+            out.contains(">a<") && out.contains(">b<"),
+            "single-row buckets keep their label"
         );
         let wide = text(&ds("k,v\n日本語,2\nααα,1\n"), ChartKind::Bar, None, 20, 2);
         let rows: Vec<&str> = wide.lines().collect();
