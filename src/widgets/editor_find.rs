@@ -420,7 +420,9 @@ pub fn render_editor_find(
         // would be wrong in the second case, so the arm says what is true of
         // both.
         (0, _) if state.count_truncated() => {
-            String::from(" Find: no match in the part that could be searched ")
+            // Kept under the bar's 48-cell width: a longer string is
+            // truncated mid-word by the block title.
+            String::from(" Find: no match in the part searched ")
         }
         (0, _) => " Find — No results ".to_string(),
         (_, Some(idx)) => format!(" Find — {idx} of {total_txt} "),

@@ -34950,3 +34950,47 @@ fn a_step_that_runs_out_of_reach_keeps_the_match_it_already_had() {
         "and the bar must say the search did not cover the whole file"
     );
 }
+
+/// #257 round-4 review finding: a CHANGED query must not leave the previous
+/// query's highlight painted. The early return that keeps a match across an
+/// out-of-reach STEP was also firing on the retype path, where the old
+/// position belongs to a query the user has already replaced.
+#[test]
+fn retyping_into_an_out_of_reach_query_clears_the_old_highlight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("far.log");
+    let mut body = String::from("\u{1b}[31mERROR\u{1b}[0m first and only\n");
+    let filler = "quiet line with nothing of interest ".repeat(4);
+    for _ in 0..(crate::log_view::FIND_SCAN_BYTES / filler.len() + 3000) {
+        body.push_str(&filler);
+        body.push('\n');
+    }
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "the match is found while the query still matches"
+    );
+
+    // Extend the query into something that matches nothing reachable.
+    for ch in "ZZQX".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match, None,
+        "the previous query's highlight must not survive under a new query \
+         that found nothing: the bar would say no match while a match stayed \
+         painted"
+    );
+}

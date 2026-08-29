@@ -30982,6 +30982,13 @@ impl App {
             state.match_index = None;
         }
         self.editor.set_search_highlight(Some(needle), opts);
+        // A CHANGED query invalidates the old position outright, so the
+        // active match is cleared before the new step is applied. The early
+        // return for an out-of-reach STEP deliberately keeps the match the
+        // user was on; doing the same here left the previous query's
+        // highlight painted under a new query that could not reach a match
+        // of its own.
+        self.editor.active_search_match = None;
         self.scroll_log_to_match(hit);
     }
 
