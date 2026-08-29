@@ -79,33 +79,65 @@ pub(crate) fn pair_host_lock_path(workspace: &Path) -> PathBuf {
 
 /// Holds the workspace's pair-host lock; the flock releases when this (and its
 /// file) drop.
+#[derive(Debug)]
 pub(crate) struct PairHostLock {
     _file: std::fs::File,
 }
 
-/// Try to claim the single-host lock at `path` without blocking. `Some` means
-/// this croft may self-appoint owner; `None` means another croft already holds
+/// Why the single-host lock could not be taken. The two are kept apart
+/// because they call for opposite remedies: `Busy` means close the other
+/// window, `Io` means there is no other window and the lock file itself
+/// (its directory, its permissions, the fd table) needs fixing. Folding them
+/// together reported a missing config directory as contention (#337).
+#[derive(Debug)]
+pub(crate) enum PairHostLockError {
+    /// Another croft holds the lock.
+    Busy,
+    /// The lock file could not be created or opened.
+    Io(std::io::Error),
+}
+
+/// Try to claim the single-host lock at `path` without blocking. `Ok` means
+/// this croft may self-appoint owner; `Busy` means another croft already holds
 /// it and this one must not host (else two owners would both claim site 1 and
-/// corrupt the shared buffer).
-pub(crate) fn try_acquire_pair_host_lock(path: &Path) -> Option<PairHostLock> {
+/// corrupt the shared buffer); `Io` means the lock could not be opened at all.
+pub(crate) fn try_acquire_pair_host_lock(path: &Path) -> Result<PairHostLock, PairHostLockError> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(path)
-        .ok()?;
+        .map_err(PairHostLockError::Io)?;
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
         // flock is per open-file-description, so two independent opens contend
         // even within one process — the mutual exclusion we want across croft
         // instances. LOCK_NB: fail fast instead of blocking the tick.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            return None;
-        }
+        // errno is read in the same breath as the call: anything run in
+        // between could overwrite it and turn a Busy into a spurious Io.
+        // EINTR carries no information for the user (nothing at the path
+        // to fix), so it is retried like every other syscall site here.
+        let e = loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            let e = std::io::Error::last_os_error();
+            if rc == 0 {
+                return Ok(PairHostLock { _file: file });
+            }
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                break e;
+            }
+        };
+        // EWOULDBLOCK is contention; anything else (ENOLCK, EROFS) is the
+        // environment, not another window.
+        Err(if e.kind() == std::io::ErrorKind::WouldBlock {
+            PairHostLockError::Busy
+        } else {
+            PairHostLockError::Io(e)
+        })
     }
-    Some(PairHostLock { _file: file })
+    #[cfg(not(unix))]
+    Ok(PairHostLock { _file: file })
 }
 
 /// What `croft pair` records for the workspace's resident navigator.
@@ -688,14 +720,32 @@ mod tests {
         let path = dir.path().join("x.pair-host.lock");
         let first = try_acquire_pair_host_lock(&path).expect("first acquires");
         assert!(
-            try_acquire_pair_host_lock(&path).is_none(),
-            "a second croft must be refused while the first holds the lock"
+            matches!(
+                try_acquire_pair_host_lock(&path),
+                Err(PairHostLockError::Busy)
+            ),
+            "a second croft must be refused as BUSY while the first holds the lock"
         );
         drop(first);
         assert!(
-            try_acquire_pair_host_lock(&path).is_some(),
+            try_acquire_pair_host_lock(&path).is_ok(),
             "the lock frees when the holder drops"
         );
+    }
+
+    /// A lock file croft cannot open is not another window holding it: the
+    /// two failures were folded into one `None` and the caller reported a
+    /// missing config directory as contention (#337).
+    #[test]
+    fn an_unopenable_lock_file_is_an_io_error_not_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-such-dir").join("x.pair-host.lock");
+        match try_acquire_pair_host_lock(&path) {
+            Err(PairHostLockError::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+            }
+            other => panic!("expected an io error, got {other:?}"),
+        }
     }
 
     #[test]

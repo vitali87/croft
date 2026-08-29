@@ -840,6 +840,14 @@ enum CreateKind {
     Folder,
 }
 
+/// Why the single-host lock was last refused, for announcing each reason
+/// once (see `App::pair_lock_denied`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PairLockDenial {
+    Busy,
+    Io,
+}
+
 /// State of a background self-update observed by a remote-launched croft.
 /// `Idle` is the steady state; `InProgress` paints an "Updating" hint in
 /// the status bar; `Ready` arms the re-exec into the freshly-shipped binary.
@@ -3258,11 +3266,15 @@ pub struct App {
     /// [`navigator_down`]. Content, not mtime: a same-grain rewrite on a
     /// coarse-timestamp filesystem keeps its mtime.
     last_pair_record_raw: Option<Vec<u8>>,
-    /// Whether the "hosted by another croft window" refusal has already
-    /// been announced: the losing window keeps polling for takeover every
-    /// second, and re-announcing each poll clobbered its status line
-    /// forever (and forced a 1 Hz repaint).
-    pair_lock_denied: bool,
+    /// Which host-lock refusal has already been announced: the losing
+    /// window keeps polling for takeover every second, and re-announcing
+    /// each poll clobbered its status line forever (and forced a 1 Hz
+    /// repaint). The KIND is latched, not just the fact, so a refusal that
+    /// changes reason (an fd limit clears and another window now holds the
+    /// lock, or the reverse) is announced again rather than leaving a
+    /// message that is no longer true (#337). Per kind, not per message: an
+    /// open failure whose errno changes keeps the first announcement.
+    pair_lock_denied: Option<PairLockDenial>,
     /// Proactive navigator looks (docs/MULTIPLAYER.md): a completed new
     /// construct plus a typing pause hands the seated navigator a
     /// comment-only turn on its own. Opt-out via
@@ -4311,7 +4323,7 @@ impl App {
             pair_host_lock: None,
             navigator_down: false,
             last_pair_record_raw: None,
-            pair_lock_denied: false,
+            pair_lock_denied: None,
             pair_noted_files: std::collections::BTreeSet::new(),
             proactive_navigator_enabled: !loaded_prefs.disable_proactive_navigator,
             proactive_scanned: std::collections::HashMap::new(),
@@ -20449,7 +20461,7 @@ impl App {
             // Deactivation clears the death latch, so `croft pair --off`
             // then `croft pair` (or a palette off/on) re-activates.
             self.navigator_down = false;
-            self.pair_lock_denied = false;
+            self.pair_lock_denied = None;
             if let Some(host) = self.pair_host.take() {
                 // Drop tears the seat down; its parked caret goes with it.
                 let sites = host.caret_sites();
@@ -20492,22 +20504,37 @@ impl App {
             // host (keep checking — take over when that croft exits).
             if self.pair_host_lock.is_none() {
                 match crate::session::try_acquire_pair_host_lock(&self.pair_host_lock_path) {
-                    Some(lock) => {
+                    Ok(lock) => {
                         self.pair_host_lock = Some(lock);
-                        self.pair_lock_denied = false;
+                        self.pair_lock_denied = None;
                     }
-                    None => {
-                        // Announced ONCE: the takeover poll keeps running
-                        // every second, and re-announcing clobbered the
-                        // window's status line forever at a 1 Hz repaint.
-                        if self.pair_lock_denied {
+                    Err(e) => {
+                        // Announced ONCE per reason: the takeover poll keeps
+                        // running every second, and re-announcing clobbered
+                        // the window's status line forever at a 1 Hz repaint.
+                        let denial = match &e {
+                            crate::session::PairHostLockError::Busy => PairLockDenial::Busy,
+                            crate::session::PairHostLockError::Io(_) => PairLockDenial::Io,
+                        };
+                        if self.pair_lock_denied == Some(denial) {
                             return false;
                         }
-                        self.pair_lock_denied = true;
-                        self.status = format!(
-                            "Navigator '{}' is hosted by another croft window in this workspace",
-                            record.name
-                        );
+                        self.pair_lock_denied = Some(denial);
+                        // Busy and unopenable read the same from here (no
+                        // host this tick, poll again) but not to the user:
+                        // one has a window to close, the other has a path
+                        // to fix and no window anywhere (#337).
+                        self.status = match e {
+                            crate::session::PairHostLockError::Busy => format!(
+                                "Navigator '{}' is hosted by another croft window in this workspace",
+                                record.name
+                            ),
+                            crate::session::PairHostLockError::Io(e) => format!(
+                                "Navigator '{}': cannot open host lock {}: {e}",
+                                record.name,
+                                self.pair_host_lock_path.display()
+                            ),
+                        };
                         return true;
                     }
                 }
