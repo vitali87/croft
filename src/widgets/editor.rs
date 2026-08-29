@@ -216,6 +216,11 @@ fn render_log(
         }
     }
     if inner.height == 0 || inner.width == 0 {
+        // Frame truth cuts both ways: a frame that paints nothing must
+        // publish nothing. Returning with the previous rect still stored let
+        // the mouse path accept a click in an area this frame did not paint,
+        // after a resize or a layout change.
+        view.last_body = Rect::default();
         return;
     }
     let name = path
@@ -242,8 +247,18 @@ fn render_log(
     let body_top = inner.y + 1;
     let rows = inner.height.saturating_sub(1) as usize;
     if rows == 0 {
+        view.last_body = Rect::default();
         return;
     }
+    // Frame truth: the mouse path reads the body rect this frame painted,
+    // rather than recomputing the header offset in a second place.
+    view.last_body = Rect {
+        x: inner.x,
+        y: body_top,
+        width: inner.width,
+        height: rows as u16,
+    };
+    let selection = view.ordered_selection_public();
     // Refill the window around the viewport: one bounded read per scroll.
     let _ = view.ensure(scroll, rows);
     for r in 0..rows {
@@ -287,6 +302,29 @@ fn render_log(
             let room = (inner.x + inner.width).saturating_sub(x) as usize;
             buf.set_stringn(x, y, text, room, style);
             x = x.saturating_add(text.chars().count().min(room) as u16);
+        }
+        // Selection goes under the find highlight and over the log's own
+        // colours: it is the coarser mark, and a match inside a selection
+        // should still read as the match.
+        if let Some(((sr, sc), (er, ec))) =
+            selection.filter(|((sr, _), (er, _))| idx >= *sr && idx <= *er)
+        {
+            {
+                let from = if idx == sr { sc } else { 0 };
+                let to = if idx == er {
+                    ec
+                } else {
+                    line.text.chars().count()
+                };
+                for c in from..to {
+                    let x = inner.x.saturating_add(c as u16);
+                    if x >= inner.x + inner.width {
+                        break;
+                    }
+                    let cell = &mut buf[(x, y)];
+                    cell.set_style(cell.style().bg(theme.selection()));
+                }
+            }
         }
         // Find highlight goes over the painted colours, keyed off the same
         // stripped text the search ran on, so the columns line up with what
@@ -10320,6 +10358,14 @@ impl Widget for &mut Editor {
         self.last_scrollbar = Rect::default();
         self.last_hscrollbar = Rect::default();
         self.merge_action_spans.clear();
+        // Every rect this frame publishes is cleared up front, so a frame
+        // that paints nothing leaves nothing behind for the mouse path to
+        // hit-test against. `render_log` sets its own when it paints; the
+        // early return below means it may never run at all, which is the
+        // case a reset inside `render_log` cannot cover.
+        if let Some(log) = self.log.as_mut() {
+            log.last_body = Rect::default();
+        }
 
         if inner.height == 0 {
             return;

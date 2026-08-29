@@ -34994,3 +34994,237 @@ fn retyping_into_an_out_of_reach_query_clears_the_old_highlight() {
          painted"
     );
 }
+
+/// #257: dragging over a rendered ANSI log selects it, and Cmd+C copies what
+/// the reader SEES rather than the escape bytes behind it.
+///
+/// Driven through the real gestures and a real render, so the body rect the
+/// mouse path reads is the one a frame actually painted: a test that set
+/// `last_body` by hand would pass with the renderer never having agreed.
+#[test]
+fn dragging_over_a_rendered_log_selects_and_copies_the_visible_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("run.log");
+    std::fs::write(
+        &p,
+        "\u{1b}[32mINFO\u{1b}[0m starting up\n\u{1b}[31mERROR\u{1b}[0m disk full\nbye\n",
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some(), "the fixture opens rendered");
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    assert!(
+        body.width > 0 && body.height > 0,
+        "the render must have published a body rect for the mouse to hit"
+    );
+
+    // Press on the first body row, drag to the second, release.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        body.x,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        body.x + 10,
+        body.y + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        body.x + 10,
+        body.y + 1,
+    ));
+
+    let log = app.editor.log.as_ref().unwrap();
+    assert!(log.has_selection(), "the drag must leave a selection");
+    assert!(!log.dragging, "and the release must end the drag");
+    let (text, clamped) = log.selection_text();
+    assert!(!clamped);
+    assert_eq!(
+        text, "INFO starting up\nERROR disk",
+        "the copy is the stripped text, not the escapes behind it"
+    );
+
+    // What is PAINTED must match what is copied, row for row. Nothing
+    // asserted this before: deleting the entire selection-painting block from
+    // the renderer left the suite green, so the visible half of the feature
+    // had no coverage at all.
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    {
+        use ratatui::widgets::Widget;
+        let area = app.editor.last_area;
+        (&mut app.editor).render(area, &mut buf);
+    }
+    // Frame truth: the rect the render that filled THIS buffer published.
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    let copied_per_row: Vec<usize> = text.split('\n').map(|l| l.chars().count()).collect();
+    for (r, expected) in copied_per_row.iter().enumerate() {
+        let y = body.y + r as u16;
+        let painted = (body.x..body.x + body.width)
+            .filter(|x| buf[(*x, y)].style().bg == Some(selected_bg))
+            .count();
+        assert_eq!(
+            painted, *expected,
+            "row {r}: {painted} cells painted as selected, {expected} characters copied"
+        );
+    }
+
+    // Cmd+C puts exactly that on the clipboard.
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        app.status.starts_with("Copied"),
+        "the copy must report itself, got {:?}",
+        app.status
+    );
+}
+
+/// #257: dragging past the end of a SHORT line must paint what it copies.
+///
+/// The renderer painted to the endpoint it was handed while the copy read
+/// `min(len)`, and `log_cell_at` clamped the line but not the column, so a
+/// drag off the right of a short line painted to the pointer and copied to
+/// the line's end. Clamping at the source means both readers see one value
+/// instead of each clamping its own way.
+#[test]
+fn dragging_past_a_short_lines_end_paints_what_it_copies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("short.log");
+    // A coloured line so the view renders, and a very short one to drag off.
+    std::fs::write(&p, "\u{1b}[31mabc\u{1b}[0m\nlonger second line here\n").unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some());
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let body = app.editor.log.as_ref().unwrap().last_body;
+
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        body.x,
+        body.y,
+    ));
+    // Drag far past the end of a three-character line.
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        body.x + 60,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        body.x + 60,
+        body.y,
+    ));
+
+    let (text, _) = app.editor.log.as_ref().unwrap().selection_text();
+    assert_eq!(text, "abc", "the copy stops at the end of the line");
+
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    {
+        use ratatui::widgets::Widget;
+        let area = app.editor.last_area;
+        (&mut app.editor).render(area, &mut buf);
+    }
+    // Frame truth: the rect to read is the one the render that filled THIS
+    // buffer published, not one captured from an earlier frame. Reading the
+    // stale rect pointed at the header row and reported nothing painted.
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    let painted = (body.x..body.x + body.width)
+        .filter(|x| buf[(*x, body.y)].style().bg == Some(selected_bg))
+        .count();
+    assert_eq!(
+        painted,
+        text.chars().count(),
+        "the paint must stop where the copy does, not follow the pointer"
+    );
+}
+
+/// #257: a frame that paints no log body must publish no body rect.
+///
+/// `render_log` returned early for a zero-sized area WITHOUT clearing
+/// `last_body`, so after a resize the mouse path could accept a click inside
+/// a rectangle this frame had not painted. Frame truth cuts both ways: the
+/// rect is a claim about what was drawn, and drawing nothing is a claim too.
+#[test]
+fn a_log_that_paints_nothing_publishes_no_body_rect() {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("run.log");
+    std::fs::write(&p, "\u{1b}[31mERROR\u{1b}[0m boom\nsecond\n").unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&p).unwrap();
+
+    // A real frame publishes a real rect.
+    let mut buf = ratatui::buffer::Buffer::empty(Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 8,
+    });
+    (&mut e).render(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        },
+        &mut buf,
+    );
+    assert!(
+        e.log.as_ref().unwrap().last_body.height > 0,
+        "a painted frame publishes its body"
+    );
+
+    // A frame with no room paints nothing, so it must claim nothing.
+    let mut narrow = ratatui::buffer::Buffer::empty(Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 8,
+    });
+    (&mut e).render(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        },
+        &mut narrow,
+    );
+    assert_eq!(
+        e.log.as_ref().unwrap().last_body,
+        Rect::default(),
+        "a frame that painted nothing must not leave a stale rect for the \
+         mouse path to hit-test against"
+    );
+}

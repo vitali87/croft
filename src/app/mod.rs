@@ -25817,6 +25817,95 @@ impl App {
         self.status = format!("Copied {} chars to clipboard", text.chars().count());
     }
 
+    /// Start a mouse selection over a rendered ANSI log (#257).
+    ///
+    /// Mirrors `begin_preview_selection`: a log tab's `lines` is a one-line
+    /// stub, so the editor's own selection coordinates cannot describe it and
+    /// the view carries its own, in absolute (line, char column).
+    fn begin_log_selection(&mut self, col: u16, row: u16) -> bool {
+        let scroll = self.editor.scroll;
+        let Some(log) = self.editor.log.as_mut() else {
+            return false;
+        };
+        if !rect_contains(log.last_body, col, row) {
+            if log.has_selection() {
+                log.selection = None;
+                log.dragging = false;
+            }
+            return false;
+        }
+        let cell = log_cell_at(log, scroll, col, row);
+        log.selection = Some((cell, cell));
+        log.dragging = true;
+        self.focus_pane(Pane::Editor);
+        true
+    }
+
+    /// Extend a live log drag and finish it on release.
+    fn update_log_selection(&mut self, m: MouseEvent) -> bool {
+        let scroll = self.editor.scroll;
+        let copy_on_select = self.copy_on_select;
+        let Some(log) = self.editor.log.as_mut() else {
+            return false;
+        };
+        if !log.dragging {
+            return false;
+        }
+        match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let body = log.last_body;
+                // Clamp to the body: dragging past an edge extends to it
+                // rather than dropping the gesture.
+                let col = m
+                    .column
+                    .clamp(body.x, body.x + body.width.saturating_sub(1));
+                let row = m.row.clamp(body.y, body.y + body.height.saturating_sub(1));
+                let head = log_cell_at(log, scroll, col, row);
+                if let Some((anchor, _)) = log.selection {
+                    log.selection = Some((anchor, head));
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                log.dragging = false;
+                if copy_on_select {
+                    self.copy_log_selection();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Put the log selection on the clipboard, saying so when the copy was
+    /// clamped rather than leaving the user with silently less than they
+    /// selected.
+    fn copy_log_selection(&mut self) -> bool {
+        let Some(log) = self.editor.log.as_ref() else {
+            return false;
+        };
+        if !log.has_selection() {
+            return false;
+        }
+        let (text, clamped) = log.selection_text();
+        if text.is_empty() {
+            return false;
+        }
+        let bytes = text.len();
+        copy_to_clipboard(&text);
+        // Say what was actually copied. `clamped` is true for the byte CAP
+        // and for a sweep that ran out of budget on escape-heavy text, and in
+        // the second case the copy can be far short of the cap: naming the
+        // cap then tells the user they got four megabytes when they got a
+        // fraction of one.
+        self.status = if clamped {
+            format!("Copied {bytes} bytes; the selection was larger than one copy allows")
+        } else {
+            format!("Copied {bytes} bytes")
+        };
+        true
+    }
+
     /// Start a drag-selection in the rendered Markdown/document preview
     /// when `(col, row)` lands inside it. Returns true when the press was
     /// consumed, so the normal editor click path is skipped: the source
@@ -25894,6 +25983,15 @@ impl App {
                 copy_to_clipboard(&text);
                 self.status = format!("Copied {} chars to clipboard", text.chars().count());
             }
+            return;
+        }
+        // A rendered log likewise hides its own text behind a stub buffer,
+        // and the return is unconditional: falling through when there is no
+        // selection would run the editor's copy over that stub and put its
+        // placeholder content on the clipboard, which is worse than copying
+        // nothing.
+        if self.editor.log.is_some() {
+            self.copy_log_selection();
             return;
         }
         if let Some(diff) = self.editor.diff.as_ref() {
@@ -32087,6 +32185,11 @@ impl App {
         if self.update_preview_selection(m) {
             return;
         }
+        // A rendered log carries its own selection for the same reason the
+        // preview does: the tab's `lines` is a stub (#257).
+        if self.update_log_selection(m) {
+            return;
+        }
         // The release of a press is not a new gesture, so it keeps the popup:
         // that is what lets a press-and-hold (touch) read the hover after
         // lifting the finger. Every other event dismisses it.
@@ -32493,6 +32596,9 @@ impl App {
                 // the rendered view starts a drag-selection over what the
                 // user can SEE, not the source buffer beneath it.
                 if self.begin_preview_selection(m.column, m.row) {
+                    return;
+                }
+                if self.begin_log_selection(m.column, m.row) {
                     return;
                 }
                 // (H) Go to Definition rides CTRL, matching the terminal pane's
@@ -40996,6 +41102,42 @@ fn sheet_visible_rows(inner: Rect) -> usize {
 /// the content-keyed cache and replayed on every future open.
 fn semantic_reply_is_current(seen: Option<u64>, incoming: u64) -> bool {
     seen.is_none_or(|s| incoming >= s)
+}
+
+/// The absolute (line, char column) a screen cell lands on in a rendered log
+/// body. The body starts one row below the header and the view scrolls by
+/// whole lines, so the mapping is a straight offset.
+///
+/// One cell is treated as one CHARACTER, which is what `render_log` already
+/// assumes: it advances by `chars().count()` rather than by display width,
+/// so a double-width character occupies two cells on screen and one column
+/// in this arithmetic. Selection therefore drifts on a line containing CJK
+/// or emoji, by exactly as much as the painting does. Matching the renderer
+/// is deliberate: a mapping that measured width correctly would disagree
+/// with what is actually on screen, which is worse than agreeing with it
+/// wrongly. Fixing it means teaching the renderer first.
+fn log_cell_at(
+    log: &crate::log_view::LogView,
+    scroll: usize,
+    col: u16,
+    row: u16,
+) -> (usize, usize) {
+    let body = log.last_body;
+    let line = (scroll + row.saturating_sub(body.y) as usize).min(log.len().saturating_sub(1));
+    let column = col.saturating_sub(body.x) as usize;
+    // Clamp the COLUMN to the line's own length, not just the line to the
+    // file's. The renderer paints to the endpoint it is given while the copy
+    // reads `min(len)`, so an unclamped column let a drag past the end of a
+    // short line paint sixty cells and copy three characters. Clamping here
+    // means both readers see one value rather than each clamping its own way.
+    //
+    // A line outside the parsed window has no length to clamp against; the
+    // raw column stands, which is what the old behaviour was everywhere.
+    let width = log
+        .visible_text(line)
+        .map(|t| t.chars().count())
+        .unwrap_or(column);
+    (line, column.min(width))
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {

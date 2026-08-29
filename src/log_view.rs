@@ -91,6 +91,12 @@ impl ScanBudget {
         Self(FIND_SCAN_BYTES)
     }
 
+    /// A budget of a different size, for a sweep with its own bound (a copy
+    /// may gather more than a per-keystroke find may scan).
+    fn new_with(bytes: usize) -> Self {
+        Self(bytes)
+    }
+
     fn charge(&mut self, bytes: usize) {
         self.0 = self.0.saturating_sub(bytes);
     }
@@ -99,6 +105,12 @@ impl ScanBudget {
         self.0 == 0
     }
 }
+
+/// How much text one copy may gather. A log is unbounded and a selection
+/// can span it, so the copy is capped and the caller is told when it hit the
+/// cap: a clipboard that silently holds less than the user selected is worse
+/// than one that says it was clamped.
+pub const MAX_COPY_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct LogView {
     pub path: PathBuf,
@@ -112,6 +124,18 @@ pub struct LogView {
     cache: std::collections::BTreeMap<usize, AnsiLine>,
     /// Line number the cache starts at, for cheap eviction.
     cache_start: usize,
+    /// Anchor and head of a mouse selection, as absolute (line, char column).
+    ///
+    /// Kept here rather than in the editor's own `selection` because those
+    /// coordinates index `lines`, which for a log tab is a one-line stub.
+    /// Same shape the Markdown preview uses for the same reason.
+    pub selection: Option<((usize, usize), (usize, usize))>,
+    /// Whether a drag is in progress, so a move outside the body still
+    /// extends the selection rather than starting a new one.
+    pub dragging: bool,
+    /// The body rect the last frame painted, for mouse hit-testing. Frame
+    /// truth: the renderer writes it, the mouse path reads it.
+    pub last_body: ratatui::layout::Rect,
 }
 
 impl LogView {
@@ -155,6 +179,9 @@ impl LogView {
             truncated,
             cache: std::collections::BTreeMap::new(),
             cache_start: 0,
+            selection: None,
+            dragging: false,
+            last_body: ratatui::layout::Rect::default(),
         })
     }
 
@@ -558,6 +585,84 @@ impl LogView {
         (count, stopped_early)
     }
 
+    /// Whether a selection covers anything at all.
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some_and(|(a, b)| a != b)
+    }
+
+    /// [`Self::ordered_selection`] for the renderer, which needs the same
+    /// normalisation to paint a backwards drag.
+    pub fn ordered_selection_public(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.ordered_selection()
+    }
+
+    /// The selection with its endpoints in reading order.
+    fn ordered_selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (a, b) = self.selection?;
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
+    /// The selected text, as the user sees it: escapes stripped, no colour.
+    ///
+    /// Returns the text and whether it was clamped at [`MAX_COPY_BYTES`]. A
+    /// selection can span a file this view exists precisely to avoid loading,
+    /// so the copy is bounded, and the bound is reported rather than leaving
+    /// the clipboard quietly holding less than was selected.
+    pub fn selection_text(&self) -> (String, bool) {
+        let Some(((sr, sc), (er, ec))) = self.ordered_selection() else {
+            return (String::new(), false);
+        };
+        let mut out = String::new();
+        let mut clamped = false;
+        let mut budget = ScanBudget::new_with(MAX_COPY_BYTES);
+        // Read through the sweep path rather than the viewport cache: a
+        // selection routinely runs past the window the reader is looking at,
+        // and evicting that window to serve a copy would blank the screen.
+        let cut_short = self.scan_range(sr, er + 1, &mut budget, |row, text| {
+            let chars: Vec<char> = text.chars().collect();
+            let from = if row == sr { sc.min(chars.len()) } else { 0 };
+            let to = if row == er {
+                ec.min(chars.len())
+            } else {
+                chars.len()
+            };
+            if from < to {
+                out.extend(&chars[from..to]);
+            }
+            if row < er {
+                out.push('\n');
+            }
+            if out.len() >= MAX_COPY_BYTES {
+                clamped = true;
+                return false;
+            }
+            true
+        });
+        // The sweep's own verdict counts too, and it is the one that fires on
+        // a coloured log. The budget charges RAW bytes (see `scan_range`);
+        // `out.len()` counts what survives stripping. On escape-heavy text the
+        // budget runs out long before the cap, so dropping this returned flag
+        // meant the copy stopped early and reported itself complete: exactly
+        // the silent short clipboard this function's doc promises not to
+        // produce. The escape-free case hid it, because there the two counters
+        // advance in lockstep.
+        clamped |= cut_short;
+        if out.len() > MAX_COPY_BYTES {
+            // Truncate at a CHARACTER boundary. `String::truncate` panics
+            // when the byte offset lands inside a multi-byte character, and a
+            // selection of accented or non-Latin text reaches that offset as
+            // readily as ASCII does: a copy that crashes croft is a worse
+            // outcome than any clipboard content.
+            let mut end = MAX_COPY_BYTES;
+            while end > 0 && !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
+            clamped = true;
+        }
+        (out, clamped)
+    }
+
     /// The escape-free text of `idx`, for find, selection, copy, and
     /// `path:line` scanning — every consumer that must see what the user
     /// sees rather than the raw bytes.
@@ -644,6 +749,148 @@ mod tests {
             .unwrap();
         assert_eq!((a.col_chars, b.col_chars), (0, 8));
         assert_eq!(v.count_matches("err", opts), (2, false));
+    }
+
+    /// Copy takes the text the reader SEES: escapes stripped, whole lines in
+    /// the middle, partial at each end.
+    #[test]
+    fn a_selection_copies_the_stripped_text_between_its_endpoints() {
+        let body = b"alpha one\n\x1b[31mbeta two\x1b[0m\ngamma three\n";
+        let (_d, p) = write_tmp(body);
+        let mut v = LogView::open(&p).unwrap();
+
+        // Mid-word on the first line through mid-word on the last.
+        v.selection = Some(((0, 6), (2, 5)));
+        let (text, clamped) = v.selection_text();
+        assert_eq!(text, "one\nbeta two\ngamma");
+        assert!(!clamped, "a small file is copied whole");
+
+        // A backwards drag selects the same text.
+        v.selection = Some(((2, 5), (0, 6)));
+        assert_eq!(v.selection_text().0, "one\nbeta two\ngamma");
+
+        // A single line, and a caret (no area) copies nothing.
+        v.selection = Some(((1, 0), (1, 4)));
+        assert_eq!(v.selection_text().0, "beta");
+        v.selection = Some(((1, 2), (1, 2)));
+        assert_eq!(v.selection_text().0, "");
+        assert!(!v.has_selection());
+    }
+
+    /// A selection can span a file this view exists to avoid loading whole,
+    /// so the copy is bounded AND says when it hit the bound. A clipboard
+    /// holding silently less than was selected is the failure to avoid.
+    ///
+    /// COLOURED, deliberately. The first version of this test used
+    /// `"x".repeat(120)`, escape-free, where the byte budget and the stripped
+    /// length advance in lockstep, so the two counters could not diverge and
+    /// the real defect was STRUCTURALLY invisible to it. On a view whose
+    /// entire subject is colour-bearing text, that was the one fixture shape
+    /// that could not see the bug.
+    #[test]
+    fn a_selection_larger_than_the_copy_cap_is_clamped_and_reported() {
+        // Mostly escape bytes: 190 raw per line against 10 visible, so the
+        // sweep's raw-byte budget runs out at roughly a fifth of the cap.
+        // That gap is the whole defect, and it only exists when the two
+        // counters diverge. My first attempt at this fixture used one escape
+        // pair per 40 characters and never exhausted the budget at all, which
+        // is the same fixture-cannot-reach-the-dimension failure one level
+        // down: the test failed for want of density, not for want of a bug.
+        let line = "\u{1b}[31mx\u{1b}[0m".repeat(20) + "\n";
+        let lines = 30_000;
+        let body = line.repeat(lines);
+        let (_d, p) = write_tmp(body.as_bytes());
+        let mut v = LogView::open(&p).unwrap();
+
+        v.selection = Some(((0, 0), (v.len() - 1, 20)));
+        let (text, clamped) = v.selection_text();
+        assert!(
+            clamped,
+            "a coloured selection past the budget must report itself clamped: \
+             gathered {} bytes",
+            text.len()
+        );
+        // And it stopped for the BUDGET, not the cap: the visible text is a
+        // fraction of the cap, which is precisely the state that used to be
+        // reported as a complete copy.
+        assert!(
+            text.len() < MAX_COPY_BYTES / 2,
+            "the budget should stop this long before the cap, got {} bytes",
+            text.len()
+        );
+
+        // An escape-free selection of the same visible size, as the control:
+        // there the cap is what stops it, and it must ALSO report clamped.
+        let plain = "y".repeat(40) + "\n";
+        let plain_lines = (MAX_COPY_BYTES / plain.len()) + 500;
+        let (_d2, p2) = write_tmp(plain.repeat(plain_lines).as_bytes());
+        let mut v2 = LogView::open(&p2).unwrap();
+        v2.selection = Some(((0, 0), (v2.len() - 1, 40)));
+        let (plain_text, plain_clamped) = v2.selection_text();
+        assert!(plain_clamped, "and the escape-free case too");
+        assert!(
+            plain_text.len() <= MAX_COPY_BYTES + 200,
+            "the cap is an upper bound: {} bytes",
+            plain_text.len()
+        );
+        // A LOWER bound as well. `<= cap` alone is satisfied by every value
+        // from zero up, including a truncation at a fifth of the cap, so it
+        // cannot tell "stopped at the cap" from "stopped far short of it".
+        assert!(
+            plain_text.len() > MAX_COPY_BYTES / 2,
+            "an escape-free copy should reach most of the cap, got {} bytes",
+            plain_text.len()
+        );
+    }
+
+    /// The cap must fall on a CHARACTER boundary.
+    ///
+    /// `String::truncate` panics when the byte offset lands inside a
+    /// multi-byte character, so a selection of accented or non-Latin text
+    /// large enough to hit the cap crashed croft outright. Every earlier test
+    /// here used ASCII, where every byte offset is a boundary, so none of
+    /// them could reach it.
+    #[test]
+    fn the_copy_cap_never_splits_a_character() {
+        // Two bytes per character, so a cap at an even byte offset lands
+        // mid-character for half the possible alignments.
+        let line = "\u{e9}".repeat(64) + "\n";
+        let lines = (MAX_COPY_BYTES / line.len()) + 200;
+        let (_d, p) = write_tmp(line.repeat(lines).as_bytes());
+        let mut v = LogView::open(&p).unwrap();
+        v.selection = Some(((0, 0), (v.len() - 1, 64)));
+
+        // The bug was a panic, so reaching the assertions at all is the test.
+        let (text, clamped) = v.selection_text();
+        assert!(clamped, "a selection this size must report itself clamped");
+        assert!(
+            text.chars().all(|c| c == '\u{e9}' || c == '\n'),
+            "the truncation must not leave a partial character behind"
+        );
+        assert!(
+            text.len() <= MAX_COPY_BYTES,
+            "and must still respect the cap"
+        );
+    }
+
+    /// Copying must not evict the window the reader is looking at: the cache
+    /// is what the renderer paints from, and a copy that cleared it would
+    /// blank the screen behind the selection.
+    #[test]
+    fn copying_leaves_the_viewport_window_intact() {
+        let body: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let (_d, p) = write_tmp(body.as_bytes());
+        let mut v = LogView::open(&p).unwrap();
+        v.ensure(400, 10).unwrap();
+        assert_eq!(v.visible_text(400), Some("line 400"));
+
+        v.selection = Some(((0, 0), (20, 3)));
+        let _ = v.selection_text();
+        assert_eq!(
+            v.visible_text(400),
+            Some("line 400"),
+            "the copy must not evict the cached viewport"
+        );
     }
 
     /// The strongest check available: a log's find must agree with the
