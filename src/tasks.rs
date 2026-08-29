@@ -42,7 +42,7 @@ pub struct Task {
 
 /// Every task the workspace's manifests declare, in source priority
 /// order (tasks.json first so an explicit VS Code default-build wins).
-/// Duplicate command lines are dropped, first source wins.
+/// Duplicate labels are dropped, first source wins.
 pub fn discover_tasks(root: &Path) -> Vec<Task> {
     let mut out = Vec::new();
     out.extend(vscode_tasks(root));
@@ -371,11 +371,17 @@ pub(crate) fn strip_jsonc(text: &str) -> String {
     out
 }
 
+/// One task per label, first source winning. The label is the identifier
+/// everything else keys on (`preLaunchTask`, the Run Task picker), so it is
+/// the only thing safe to collapse: de-duplicating by command line dropped
+/// a convention source's label whenever tasks.json reused its command under
+/// another name, and the lookup then reported "not found" for a task the
+/// workspace plainly declared (#336).
 fn dedup(tasks: Vec<Task>) -> Vec<Task> {
     let mut seen = BTreeSet::new();
     tasks
         .into_iter()
-        .filter(|t| seen.insert(t.command.clone()))
+        .filter(|t| seen.insert(t.label.clone()))
         .collect()
 }
 
@@ -505,6 +511,46 @@ mod tests {
                 .iter()
                 .any(|t| t.command == "cargo build" && t.is_build),
             "cargo build is the build task"
+        );
+    }
+
+    /// Everything that looks a task up does so by label, so de-duplication
+    /// must key on labels too: a tasks.json entry that reuses a convention
+    /// source's command line under its own name must not make the
+    /// convention label unfindable (#336).
+    #[test]
+    fn a_relabelled_command_keeps_the_convention_label_findable() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [ { "label": "Build Project", "type": "shell", "command": "cargo build" } ] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let labels: Vec<&str> = tasks.iter().map(|t| t.label.as_str()).collect();
+        assert!(labels.contains(&"Build Project"), "{labels:?}");
+        assert!(
+            labels.contains(&"cargo build"),
+            "the Cargo label must survive a tasks.json entry with the same command: {labels:?}"
+        );
+        // Identical labels still collapse, first source winning.
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [ { "label": "cargo build", "type": "shell", "command": "cargo build --release" } ] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let builds: Vec<&Task> = tasks.iter().filter(|t| t.label == "cargo build").collect();
+        assert_eq!(builds.len(), 1, "one task per label: {labels:?}");
+        assert_eq!(
+            builds[0].command, "cargo build --release",
+            "tasks.json comes first"
         );
     }
 

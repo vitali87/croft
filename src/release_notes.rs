@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "A debug compound's own preLaunchTask now runs before its configuration starts, waiting for it to exit 0 — so a compound that builds first launches instead of being refused.",
+    kind: NoteKind::Fix,
+    summary: "Task discovery no longer loses a label: a tasks.json entry that reuses a Makefile, Cargo or package.json command under its own name used to drop the convention task entirely, so a preLaunchTask or Tasks: Run Task pick by that name reported \"not found\". Tasks are now de-duplicated by label, the identifier everything looks up.",
 }];
