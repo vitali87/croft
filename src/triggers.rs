@@ -73,6 +73,11 @@ pub struct Trigger {
     /// Redact only: a copy of a masked span yields the mask, not the value
     /// (`"copy": "masked"`). Default: copies carry the real text.
     pub copy_masked: bool,
+    /// Redact only: the span must carry a digit or an uppercase letter to
+    /// count. A key body is random alphanumerics (all-lowercase-letters is
+    /// a one-in-a-million shape at 16 chars); a hyphenated prose word never
+    /// has either. Built-in `sk-` uses it; user rules do not.
+    pub needs_entropy: bool,
 }
 
 /// The user's trigger list. Shared read-only between the app, the render
@@ -193,6 +198,7 @@ impl TriggerSet {
                     bg: r.bg.as_deref().and_then(parse_hex),
                     message: r.message,
                     copy_masked: r.copy.as_deref() == Some("masked"),
+                    needs_entropy: false,
                 })
             })
             .collect();
@@ -238,40 +244,58 @@ impl TriggerSet {
 
 /// The key and token shapes masked out of the box (#360). Each pattern is
 /// anchored on a distinctive prefix (or, for bearer tokens, the
-/// `Authorization:` header) so ordinary words never match; a bearer token
-/// masks only the token (group 1), leaving the header readable. PEM bodies are not covered: their base64 lines carry no
-/// prefix to anchor on, and masking every long base64 line would eat
-/// checksums and blobs.
+/// `Authorization` header) so ordinary words never match; a bearer token
+/// masks only the token (group 1), leaving the header readable. PEM bodies
+/// are not covered: their base64 lines carry no prefix to anchor on, and
+/// masking every long base64 line would eat checksums and blobs. Compiled
+/// once; the set is cloned per trigger reload.
 pub fn builtin_redactions() -> Vec<Trigger> {
-    const RULES: &[&str] = &[
-        // AWS access key ids.
-        r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
-        // OpenAI / Anthropic-style secret keys: `sk-` plus at most one
-        // labelled segment (`sk-proj-…`, `sk-ant-…`) and a long body. A
-        // hyphenated phrase ("sk-something-like-this") has more hyphens.
-        r"\bsk-(?:[A-Za-z0-9_]+-)?[A-Za-z0-9_]{16,}\b",
-        // GitHub tokens: classic (ghp_), OAuth (gho_), app (ghu_/ghs_/ghr_), fine-grained.
-        r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b",
-        // Slack tokens.
-        r"\bxox[abpors]-[A-Za-z0-9-]{10,}\b",
-        // JWTs: three base64url segments, the first a JSON header.
-        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
-        // `Authorization: Bearer <token>` - only the token is masked. Anchored
-        // on the header so "Bearer" as an English word never matches; a
-        // closing quote around the token stays outside the mask.
-        r#"(?i)\bauthorization: *bearer +([^\s'"]{16,})"#,
-    ];
-    RULES
-        .iter()
-        .map(|r| Trigger {
-            regex: Regex::new(r).expect("built-in redaction regex compiles"),
-            action: TriggerAction::Redact,
-            fg: None,
-            bg: None,
-            message: None,
-            copy_masked: false,
-        })
-        .collect()
+    static RULES: std::sync::LazyLock<Vec<Trigger>> = std::sync::LazyLock::new(|| {
+        // (pattern, the span must carry a digit or an uppercase letter)
+        const PATTERNS: &[(&str, bool)] = &[
+            // AWS access key ids.
+            (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", false),
+            // OpenAI / Anthropic / OpenRouter-style secret keys: `sk-`, up
+            // to three short labels (`sk-proj-`, `sk-ant-api03-`, `sk-or-v1-`)
+            // and a long body. Entropy-gated: `sk-` also opens hyphenated
+            // prose ("sk-learn-preprocessingpipeline"), whose body is all
+            // lowercase letters.
+            (r"\bsk-(?:[A-Za-z0-9]{1,10}-){0,3}[A-Za-z0-9_]{16,}\b", true),
+            // GitHub tokens: classic (ghp_), OAuth (gho_), app (ghu_/ghs_/ghr_), fine-grained.
+            (
+                r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b",
+                false,
+            ),
+            // Slack tokens.
+            (r"\bxox[abpors]-[A-Za-z0-9-]{10,}\b", false),
+            // JWTs: three base64url segments, the first a JSON header.
+            (
+                r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+                false,
+            ),
+            // `Authorization: Bearer <token>` in header or JSON form
+            // (`"Authorization": "Bearer …"`) - only the token is masked.
+            // Anchored on the header so "Bearer" as an English word never
+            // matches; a closing quote, comma or semicolon stays outside.
+            (
+                r#"(?i)\bauthorization"? *: *"?bearer +([^\s'",;]{16,})"#,
+                false,
+            ),
+        ];
+        PATTERNS
+            .iter()
+            .map(|(r, needs_entropy)| Trigger {
+                regex: Regex::new(r).expect("built-in redaction regex compiles"),
+                action: TriggerAction::Redact,
+                fg: None,
+                bg: None,
+                message: None,
+                copy_masked: false,
+                needs_entropy: *needs_entropy,
+            })
+            .collect()
+    });
+    RULES.clone()
 }
 
 /// One masked span on a row, in char indices.
@@ -300,7 +324,13 @@ pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
                     None => continue,
                 },
             };
-            if m.as_str().is_empty() {
+            if m.as_str().is_empty()
+                || (t.needs_entropy
+                    && !m
+                        .as_str()
+                        .chars()
+                        .any(|c| c.is_ascii_digit() || c.is_ascii_uppercase()))
+            {
                 continue;
             }
             out.push(RedactSpan {
@@ -724,6 +754,20 @@ mod tests {
             "•".repeat(42),
             "one labelled segment is a key shape"
         );
+        let ant = "sk-ant-api03-AbCdEf1234567890AbCdEf1234567890";
+        assert_eq!(masked(ant), "•".repeat(ant.len()), "two labels: Anthropic");
+        let or = "sk-or-v1-abcdef1234567890abcdef1234567890";
+        assert_eq!(masked(or), "•".repeat(or.len()), "two labels: OpenRouter");
+        assert_eq!(
+            masked(r#"{"Authorization": "Bearer tok_abcdef1234567890"}"#),
+            r#"{"Authorization": "Bearer ••••••••••••••••••••"}"#,
+            "the JSON header form"
+        );
+        assert_eq!(
+            masked("Authorization: Bearer abcdef0123456789ABCDEF, X-Other: 1"),
+            "Authorization: Bearer ••••••••••••••••••••••, X-Other: 1",
+            "a trailing comma stays outside"
+        );
         assert_eq!(
             masked("curl -H 'Authorization: Bearer abcdef0123456789ABCDEF' https://x"),
             "curl -H 'Authorization: Bearer ••••••••••••••••••••••' https://x",
@@ -741,6 +785,8 @@ mod tests {
             "Bearer of bad news",
             "Bearer responsibilities matter",
             "run task sk-something-like-this-long",
+            "sk-preprocessingtransformerspipeline",
+            "sk-learn-preprocessingtransformerspipeline",
             "the skeleton key",
             "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
         ] {

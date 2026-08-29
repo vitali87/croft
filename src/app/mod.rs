@@ -30265,7 +30265,18 @@ impl App {
     /// them for the render loop.
     fn open_terminal_quick_select(&mut self) {
         let (lines, wraps, top, clock) = self.terminal_mut().visible_lines_and_clock();
-        let matches = crate::quick_select::find_matches_wrapped(&lines, &wraps);
+        let mut matches = crate::quick_select::find_matches_wrapped(&lines, &wraps);
+        // A hex run or a number inside a masked span would be a fragment of
+        // the secret one keystroke from the clipboard (#360): no hint there.
+        if self.triggers.has_redactions() && !self.redactions_revealed() {
+            matches.retain(|m| {
+                lines.get(m.row).is_none_or(|line| {
+                    crate::triggers::redact_spans(line, &self.triggers)
+                        .iter()
+                        .all(|s| m.start + m.len <= s.start || m.start >= s.start + s.len)
+                })
+            });
+        }
         if matches.is_empty() {
             self.status = String::from("Quick select: nothing to match on screen");
             return;

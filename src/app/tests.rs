@@ -20927,20 +20927,9 @@ fn the_session_store_holds_the_mask_not_the_key() {
         &[String::from("key AKIAIOSFODNN7EXAMPLE end")],
     )
     .unwrap();
+    // The transcript is painted into the grid during the spawn, before
+    // the child can write, so the save sees it at once.
     app.insert_terminal(term);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !app.terminals.iter().any(|t| {
-        t.grid_lines()
-            .0
-            .iter()
-            .any(|l| l.contains("AKIAIOSFODNN7EXAMPLE"))
-    }) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the transcript never painted"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
     app.save_terminal_session();
     let store = std::fs::read_to_string(&app.terminal_session_path).unwrap();
     assert!(

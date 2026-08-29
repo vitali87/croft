@@ -2386,13 +2386,13 @@ impl PtyTerminal {
         // The clicked column as a char index: a wide char's spacer column
         // resolves to the wide char itself (the `line_text_at` rule).
         let vc = vc as usize;
-        // Blank cells past the row's last character belong to no char: a
-        // click there must not pop the last token's value.
-        let last = *colmap.last()?;
-        if vc > last + 1 {
+        // Blank cells past the row's text belong to no char (the colmap
+        // covers every grid column, blanks included): a click there must
+        // not pop the last token's value.
+        let ci = colmap.iter().rposition(|&gc| gc <= vc)?;
+        if ci >= text.trim_end().chars().count() {
             return None;
         }
-        let ci = colmap.iter().rposition(|&gc| gc <= vc)?;
         crate::triggers::redact_spans(&text, &set)
             .into_iter()
             .find(|s| ci >= s.start && ci < s.start + s.len)
@@ -5609,6 +5609,12 @@ mod tests {
             term.redacted_at(x.saturating_sub(2), y),
             None,
             "off the mask: nothing"
+        );
+        let past_text = line.trim_end().chars().count() as u16 + 3;
+        assert_eq!(
+            term.redacted_at(past_text, y),
+            None,
+            "blank cells right of the row's text reveal nothing"
         );
 
         // A reveal window paints the text as typed and counts nothing.
