@@ -580,12 +580,16 @@ pub fn svg(
                     r#"<polyline points="{}" fill="none" stroke="{colour}" stroke-width="2" stroke-linejoin="round"/>"#,
                     points.trim_end()
                 );
-                if ds.series.len() > 1 {
+                // One legend line per series, stacked from the top; a
+                // chart too short for a line leaves it out rather than
+                // drawing it below the viewBox.
+                let legend_y = top + 12.0 + 12.0 * si as f64;
+                if ds.series.len() > 1 && legend_y <= bottom {
                     let _ = write!(
                         out,
                         r#"<text x="{}" y="{}" fill="{colour}" font-size="10">{}</text>"#,
                         left + 6.0,
-                        top + 12.0 + 12.0 * si as f64,
+                        legend_y,
                         escape(&s.name)
                     );
                 }
@@ -1008,29 +1012,58 @@ mod tests {
     }
 
     /// A height smaller than the axis padding (`--height 1` with labels, a
-    /// titled chart at 40px) must still draw inside the viewBox: every y
-    /// the chart emits lies within `0..=h`.
+    /// titled chart at 40px) must still draw inside the viewBox, for every
+    /// chart kind: each `y=`/`y1=`/`y2=` attribute and each polyline point
+    /// the SVG emits lies within `0..=h`, and a two-series line's legend
+    /// either fits or is left out.
     #[test]
     fn a_tiny_height_keeps_the_chart_inside_the_viewbox() {
         let p = Palette::default();
-        let d = ds("label,v\na,1\nb,3\nc,2\n");
-        for (title, h) in [(None, 20u32), (Some("t"), 40)] {
-            let out = svg(&d, ChartKind::Bar, title, 600, h, &p);
-            let ys: Vec<f64> = out
-                .split([' ', '/'])
-                .filter_map(|a| {
-                    a.strip_prefix("y=\"")
-                        .or_else(|| a.strip_prefix("y1=\""))
-                        .or_else(|| a.strip_prefix("y2=\""))
-                        .and_then(|v| v.trim_end_matches('"').parse().ok())
-                })
-                .collect();
-            assert!(!ys.is_empty(), "no y coordinates parsed: {out}");
-            assert!(
-                ys.iter().all(|y| *y >= 0.0 && *y <= f64::from(h)),
-                "h={h}: a y escaped the viewBox: {ys:?}"
-            );
+        let two = ds("label,a,b\nx,1,2\ny,3,4\nz,2,1\n");
+        let kinds = [
+            ChartKind::Bar,
+            ChartKind::Line,
+            ChartKind::Spark,
+            ChartKind::Hist,
+        ];
+        for kind in kinds {
+            for (title, h) in [(None, 20u32), (Some("t"), 40)] {
+                let out = svg(&two, kind, title, 600, h, &p);
+                let mut ys: Vec<f64> = out
+                    .split([' ', '/'])
+                    .filter_map(|a| {
+                        a.strip_prefix("y=\"")
+                            .or_else(|| a.strip_prefix("y1=\""))
+                            .or_else(|| a.strip_prefix("y2=\""))
+                            .and_then(|v| v.trim_end_matches('"').parse().ok())
+                    })
+                    .collect();
+                // Polyline points are `x,y` pairs inside one attribute.
+                for pts in out.split("points=\"").skip(1) {
+                    let pts = pts.split('"').next().unwrap_or("");
+                    ys.extend(
+                        pts.split_whitespace()
+                            .filter_map(|pair| pair.split(',').nth(1)?.parse::<f64>().ok()),
+                    );
+                }
+                assert!(
+                    !ys.is_empty(),
+                    "{kind:?} h={h}: no y coordinates parsed: {out}"
+                );
+                for (i, y) in ys.iter().enumerate() {
+                    assert!(
+                        *y >= 0.0 && *y <= f64::from(h),
+                        "{kind:?} h={h}: y[{i}]={y} escaped the viewBox: {ys:?}"
+                    );
+                }
+            }
         }
+        // With room for it the legend is there.
+        let tall = svg(&two, ChartKind::Line, None, 600, 200, &p);
+        assert!(
+            tall.contains(">a<") && tall.contains(">b<"),
+            "legend at 200px: {tall}"
+        );
     }
 
     #[test]
