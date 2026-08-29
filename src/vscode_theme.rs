@@ -494,10 +494,20 @@ fn slug(s: &str) -> String {
     let separators = SEPARATORS.get_or_init(|| {
         regex::Regex::new(r"[^\p{L}\p{N}\p{M}]+").expect("a literal class compiles")
     });
-    separators
+    let slug = separators
         .replace_all(&s.to_lowercase(), "-")
         .trim_matches('-')
-        .to_string()
+        .to_string();
+    // A name of nothing BUT combining marks has no letter or digit to stand
+    // on: the id renders as nothing and would install a directory with an
+    // invisible name. The old loop rejected such a name as a side effect of
+    // its `!out.is_empty()` position guard, which the regex dropped; this
+    // says it directly. `is_alphanumeric` is categories L and N, so a mark
+    // alone does not satisfy it while any real script does.
+    if !slug.chars().any(char::is_alphanumeric) {
+        return String::new();
+    }
+    slug
 }
 
 /// The header every generated manifest carries, used to recognise our own
@@ -1504,6 +1514,39 @@ mod tests {
                 .expect("and the manifest must parse");
             assert_eq!(manifest.themes[0].label, name);
         }
+    }
+
+    /// A name with no letter or digit cannot become an id.
+    ///
+    /// The regex rewrite dropped the old loop's `!out.is_empty()` position
+    /// guard, which had rejected a mark-only name as a side effect. Without
+    /// it, `"\u{301}\u{308}"` slugged to a string of combining marks and
+    /// installed a directory whose name renders as nothing.
+    #[test]
+    fn a_name_with_no_letter_or_digit_is_refused() {
+        for name in [
+            "\u{301}\u{308}",     // combining marks alone
+            "\u{1f600}\u{1f680}", // emoji
+            "!!!",
+            "..",
+            "   ",
+        ] {
+            assert_eq!(slug(name), "", "{name:?} has nothing to name a theme with");
+            let src = format!(r##"{{ "name": "{name}", "type": "dark", "colors": {{}} }}"##);
+            let raw = parse_theme(&src).expect("parses");
+            assert!(
+                convert_with_ids(raw, None, "", &[]).is_err(),
+                "{name:?} must fail the import rather than install an unnameable theme"
+            );
+        }
+
+        // And a real script still passes: the guard is "no letter or digit",
+        // not "no marks".
+        assert_eq!(
+            slug("\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940}"),
+            "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940}"
+        );
+        assert_eq!(slug("Cafe\u{301}"), "cafe\u{301}");
     }
 
     /// `unique_id` must never hand back the value it just proved is taken:
