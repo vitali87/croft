@@ -34734,3 +34734,263 @@ fn auto_hide_recovers_after_the_activity_bar_comes_back() {
     );
     assert!(!app.show_tree, "and the sidebar actually collapsed");
 }
+
+/// #257: Cmd+F in a rendered colour log must search what the user SEES.
+///
+/// The log view keeps the file windowed, so a log tab's `lines` is a stub
+/// and the ordinary find path reads an empty buffer: the bar answers "No
+/// results" over a file full of matches. `LogView::visible_text` was
+/// written for exactly these consumers and had none.
+#[test]
+fn find_in_a_rendered_color_log_matches_the_visible_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("build.log");
+    let mut body = String::new();
+    for i in 0..200 {
+        body.push_str(&format!("\u{1b}[32mINFO\u{1b}[0m step {i} ok\n"));
+    }
+    body.push_str("\u{1b}[31mERROR\u{1b}[0m disk full\n");
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(
+        app.editor.log.is_some(),
+        "the fixture must open as a rendered log"
+    );
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "disk".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+
+    let state = app
+        .editor_find
+        .as_ref()
+        .expect("Cmd+F opens the find bar over a log");
+    assert_eq!(
+        state.match_count, 1,
+        "the one ERROR line must be found through the stripped text"
+    );
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(200),
+        "the match is the last line of the file"
+    );
+    assert!(
+        app.editor.scroll > 0,
+        "the view must scroll to reveal the match, not sit at the top"
+    );
+}
+
+/// #257: Enter and Shift+Enter step through a log's matches. The log has no
+/// caret to carry the position, so the walk is anchored on the active match
+/// alone; without that anchor every Enter would re-find the same line.
+#[test]
+fn enter_steps_through_matches_in_a_rendered_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("run.log");
+    std::fs::write(
+        &p,
+        "\u{1b}[31mFAIL\u{1b}[0m one\nok\n\u{1b}[31mFAIL\u{1b}[0m two\nok\n",
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some());
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "FAIL".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor_find.as_ref().map(|s| s.match_count),
+        Some(2),
+        "both FAIL lines are counted through the stripped text"
+    );
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "typing lands on the first match"
+    );
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(2),
+        "Enter steps to the second match rather than re-finding the first"
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "past the last match, Enter wraps to the top"
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(2),
+        "Shift+Enter walks back, wrapping to the last match"
+    );
+}
+
+/// #257 review finding: the find bar's `N+` belonged to the log tab that
+/// earned it and leaked onto the next search. A text buffer is counted
+/// exhaustively, so showing `N+` there claims a limit that does not exist.
+#[test]
+fn a_logs_budgeted_count_does_not_leak_onto_the_next_text_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("huge.log");
+    // Past FIND_SCAN_BYTES, so the count genuinely runs out of budget.
+    let line = "\u{1b}[31mERROR\u{1b}[0m ".to_string() + &"pad ".repeat(40) + "\n";
+    let body = line.repeat((crate::log_view::FIND_SCAN_BYTES / line.len()) + 2000);
+    std::fs::write(&log, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&log).unwrap();
+    assert!(app.editor.log.is_some(), "the fixture must open rendered");
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert!(
+        app.editor_find
+            .as_ref()
+            .is_some_and(|s| s.count_truncated()),
+        "a log too large to search whole must report its count as partial"
+    );
+
+    // Now search an ordinary file, which IS counted exhaustively. The find
+    // bar deliberately stays OPEN across the tab switch: closing it builds a
+    // fresh EditorFind on the next Cmd+F, and this test then passes against
+    // the very bug it exists to catch (round-2 review finding).
+    let text = tmp.path().join("small.txt");
+    std::fs::write(&text, "ERROR one\nplain\nERROR two\n").unwrap();
+    app.editor.open(&text).unwrap();
+    assert!(app.editor.log.is_none(), "a plain file is a text tab");
+    assert!(
+        app.editor_find.is_some(),
+        "the find bar must still be the one the log search left behind"
+    );
+    // Retype the query into the SAME bar rather than opening a new one.
+    app.editor_find.as_mut().unwrap().query.clear();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let state = app.editor_find.as_ref().expect("the find bar is open");
+    assert_eq!(state.match_count, 2);
+    assert!(
+        !state.count_truncated(),
+        "an exhaustive count must not inherit the log's N+"
+    );
+}
+
+/// #257 round-3 review finding: a step that runs out of budget must leave
+/// the user where they are. Marking the count partial and then clearing the
+/// active match left the bar reading "1+ matches" with nothing highlighted
+/// and no way back to the match they were on.
+#[test]
+fn a_step_that_runs_out_of_reach_keeps_the_match_it_already_had() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("far.log");
+    // One match at the very top, then far more filler than a sweep may read,
+    // so stepping forward from it exhausts the budget without finding another.
+    let mut body = String::from("\u{1b}[31mERROR\u{1b}[0m first and only\n");
+    let filler = "quiet line with nothing of interest ".repeat(4);
+    for _ in 0..(crate::log_view::FIND_SCAN_BYTES / filler.len() + 3000) {
+        body.push_str(&filler);
+        body.push('\n');
+    }
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some());
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "typing lands on the only match"
+    );
+
+    // Enter steps forward, runs out of budget, and finds nothing more.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "an out-of-reach step must leave the highlight where it was, not \
+         clear it and leave the user with a count and nothing to look at"
+    );
+    assert!(
+        app.editor_find
+            .as_ref()
+            .is_some_and(|s| s.count_truncated()),
+        "and the bar must say the search did not cover the whole file"
+    );
+}
+
+/// #257 round-4 review finding: a CHANGED query must not leave the previous
+/// query's highlight painted. The early return that keeps a match across an
+/// out-of-reach STEP was also firing on the retype path, where the old
+/// position belongs to a query the user has already replaced.
+#[test]
+fn retyping_into_an_out_of_reach_query_clears_the_old_highlight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("far.log");
+    let mut body = String::from("\u{1b}[31mERROR\u{1b}[0m first and only\n");
+    let filler = "quiet line with nothing of interest ".repeat(4);
+    for _ in 0..(crate::log_view::FIND_SCAN_BYTES / filler.len() + 3000) {
+        body.push_str(&filler);
+        body.push('\n');
+    }
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "the match is found while the query still matches"
+    );
+
+    // Extend the query into something that matches nothing reachable.
+    for ch in "ZZQX".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match, None,
+        "the previous query's highlight must not survive under a new query \
+         that found nothing: the bar would say no match while a match stayed \
+         painted"
+    );
+}

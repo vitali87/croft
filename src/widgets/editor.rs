@@ -196,6 +196,7 @@ fn ansi_color_to_tui(c: crate::ansi_text::AnsiColor, theme: crate::theme::Theme)
 /// Paint a rendered ANSI log tab (#257): one buffer line per file line, with
 /// SGR spans resolved through the theme palette. Mutates the view because the
 /// window is refilled around the viewport — the file is never held whole.
+#[allow(clippy::too_many_arguments)]
 fn render_log(
     view: &mut crate::log_view::LogView,
     path: Option<&Path>,
@@ -204,6 +205,8 @@ fn render_log(
     bg: Color,
     theme: crate::theme::Theme,
     scroll: usize,
+    search: Option<(&str, crate::widgets::search::SearchOpts)>,
+    active: Option<(usize, usize, usize)>,
 ) {
     let bg_style = Style::default().bg(bg);
     for y in inner.y..inner.y + inner.height {
@@ -284,6 +287,25 @@ fn render_log(
             let room = (inner.x + inner.width).saturating_sub(x) as usize;
             buf.set_stringn(x, y, text, room, style);
             x = x.saturating_add(text.chars().count().min(room) as u16);
+        }
+        // Find highlight goes over the painted colours, keyed off the same
+        // stripped text the search ran on, so the columns line up with what
+        // the spans put on screen (#257).
+        if let Some((needle, opts)) = search {
+            let active_on_line = active.filter(|(r, _, _)| *r == idx).map(|(_, c, l)| (c, l));
+            paint_search_highlight(
+                buf,
+                inner.x,
+                y,
+                inner.width,
+                &line.text,
+                needle,
+                opts,
+                0,
+                active_on_line,
+                &[],
+                theme,
+            );
         }
     }
 }
@@ -10341,6 +10363,11 @@ impl Widget for &mut Editor {
             return;
         }
         if let Some(view) = self.log.as_mut() {
+            let search = self
+                .search_highlight
+                .as_deref()
+                .map(|t| (t, self.search_highlight_opts));
+            let active = self.active_search_match;
             render_log(
                 view,
                 self.path.as_deref(),
@@ -10349,6 +10376,8 @@ impl Widget for &mut Editor {
                 cbg,
                 self.theme,
                 self.scroll,
+                search,
+                active,
             );
             return;
         }
@@ -14533,6 +14562,49 @@ mod tests {
         e.force_text = false;
         e.open(&p).unwrap();
         assert!(e.log.is_some(), "clearing the override renders again");
+    }
+
+    /// #257: the find highlight must reach the rendered log. The search runs
+    /// on the stripped text, and the renderer paints spans from that same
+    /// text, so the highlight columns land on the match the user searched
+    /// for rather than being shifted by the escapes in the raw bytes.
+    #[test]
+    fn the_find_highlight_paints_over_a_rendered_log_line() {
+        use ratatui::buffer::Buffer;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("build.log");
+        // The escape before `boom` would shift the columns by five if the
+        // highlight were computed against the raw bytes.
+        std::fs::write(&p, "plain\n\u{1b}[31mboom\u{1b}[0m tail\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        e.set_search_highlight(Some(String::from("boom")));
+        e.active_search_match = Some((1, 0, 4));
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+
+        // Body row 1 is file line 1; the log body starts below the header.
+        let y = e.last_inner.y + 2;
+        let cell = &buf[(e.last_inner.x, y)];
+        assert_eq!(cell.symbol(), "b", "the match starts at column 0");
+        assert_eq!(
+            cell.style().bg,
+            Some(Color::Rgb(0xff, 0x8c, 0x2a)),
+            "the ACTIVE match paints orange over the log's own colour"
+        );
+        let after = &buf[(e.last_inner.x + 4, y)];
+        assert_ne!(
+            after.style().bg,
+            Some(Color::Rgb(0xff, 0x8c, 0x2a)),
+            "the highlight stops at the end of the match"
+        );
     }
 
     /// The sniff must not hijack ordinary files: a plain log routes to text,

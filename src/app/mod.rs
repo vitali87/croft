@@ -12295,10 +12295,13 @@ impl App {
                 self.terminals[idx].set_current_match(None, 0);
                 let (lines, _top) = self.terminals[idx].grid_lines();
                 if let Some(state) = self.terminal_find.as_mut() {
-                    state.match_count = crate::widgets::editor_find::count_matches(
-                        &lines,
-                        &state.query,
-                        state.opts,
+                    state.set_match_count(
+                        crate::widgets::editor_find::count_matches(
+                            &lines,
+                            &state.query,
+                            state.opts,
+                        ),
+                        false,
                     );
                     state.match_index = None;
                 }
@@ -30004,11 +30007,10 @@ impl App {
                 .and_then(|d| d.selection_text())
                 .filter(|s| !s.contains('\n'))
                 .unwrap_or_default();
-            self.editor_find = Some(crate::widgets::editor_find::EditorFind {
-                query: String::new(),
+            self.editor_find = Some(crate::widgets::editor_find::EditorFind::new(
+                String::new(),
                 opts,
-                ..Default::default()
-            });
+            ));
             if !initial.is_empty() {
                 self.diff_find_set_query(initial);
             }
@@ -30023,14 +30025,12 @@ impl App {
         } else {
             self.editor.word_before_cursor()
         };
-        let mut state = crate::widgets::editor_find::EditorFind {
-            query: initial.clone(),
-            opts,
-            ..Default::default()
-        };
+        let mut state = crate::widgets::editor_find::EditorFind::new(initial.clone(), opts);
         if !initial.is_empty() {
-            state.match_count =
-                crate::widgets::editor_find::count_matches(&self.editor.lines, &initial, opts);
+            state.set_match_count(
+                crate::widgets::editor_find::count_matches(&self.editor.lines, &initial, opts),
+                false,
+            );
             self.editor
                 .set_search_highlight(Some(initial.clone()), opts);
         }
@@ -30053,12 +30053,11 @@ impl App {
             String::new()
         };
         let (lines, _top) = self.terminal().grid_lines();
-        let mut state = crate::widgets::editor_find::EditorFind {
-            query: initial.clone(),
-            opts,
-            ..Default::default()
-        };
-        state.match_count = crate::widgets::editor_find::count_matches(&lines, &initial, opts);
+        let mut state = crate::widgets::editor_find::EditorFind::new(initial.clone(), opts);
+        state.set_match_count(
+            crate::widgets::editor_find::count_matches(&lines, &initial, opts),
+            false,
+        );
         self.terminal_find = Some(state);
         self.terminal_find_pane = self.active_terminal;
         self.terminal_find_match = None;
@@ -30134,7 +30133,7 @@ impl App {
         let count = crate::widgets::editor_find::count_matches(&lines, &new_query, opts);
         if let Some(state) = self.terminal_find.as_mut() {
             state.query = new_query.clone();
-            state.match_count = count;
+            state.set_match_count(count, false);
             state.match_index = None;
         }
         self.terminal_find_match = None;
@@ -30793,7 +30792,7 @@ impl App {
             diff.find.needle = None;
             diff.find.active = None;
             if let Some(s) = self.editor_find.as_mut() {
-                s.match_count = 0;
+                s.set_match_count(0, false);
                 s.match_index = None;
             }
             return;
@@ -30804,7 +30803,7 @@ impl App {
         if count == 0 {
             diff.find.active = None;
             if let Some(s) = self.editor_find.as_mut() {
-                s.match_count = 0;
+                s.set_match_count(0, false);
                 s.match_index = None;
             }
             return;
@@ -30814,7 +30813,7 @@ impl App {
         diff.find.active = Some(m);
         diff.scroll_to_match(m, viewport_rows, text_cols);
         if let Some(s) = self.editor_find.as_mut() {
-            s.match_count = count;
+            s.set_match_count(count, false);
             s.match_index = Some(pos + 1);
         }
     }
@@ -30847,13 +30846,19 @@ impl App {
             self.diff_find_set_query(new_query);
             return;
         }
+        if self.editor.log.is_some() {
+            self.log_find_set_query(new_query);
+            return;
+        }
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
         state.query = new_query;
         let opts = state.opts;
-        state.match_count =
-            crate::widgets::editor_find::count_matches(&self.editor.lines, &state.query, opts);
+        state.set_match_count(
+            crate::widgets::editor_find::count_matches(&self.editor.lines, &state.query, opts),
+            false,
+        );
         if state.query.is_empty() {
             state.match_index = None;
             self.editor.active_search_match = None;
@@ -30888,6 +30893,10 @@ impl App {
             self.diff_find_apply(self.diff_find_current_pos() + 1);
             return;
         }
+        if self.editor.log.is_some() {
+            self.log_find_step(true);
+            return;
+        }
         let opts = state.opts;
         let needle = state.query.clone();
         if let Some(m) = crate::widgets::editor_find::find_next_match(
@@ -30918,6 +30927,10 @@ impl App {
             self.diff_find_apply(self.diff_find_current_pos() + count - 1);
             return;
         }
+        if self.editor.log.is_some() {
+            self.log_find_step(false);
+            return;
+        }
         let opts = state.opts;
         let needle = state.query.clone();
         if let Some(m) = crate::widgets::editor_find::find_prev_match(
@@ -30930,6 +30943,113 @@ impl App {
         ) {
             self.jump_editor_to_match(m);
             self.refresh_editor_find_index();
+        }
+    }
+
+    /// Find over a rendered ANSI log (#257).
+    ///
+    /// A log tab's `lines` is a one-line stub, because the file stays on disk
+    /// and only a window of it is ever parsed. Running the ordinary find path
+    /// over that stub answers "No results" for a file full of matches, so the
+    /// search goes through the view's own stripped text instead, the same fork
+    /// the diff view already takes.
+    fn log_find_set_query(&mut self, new_query: String) {
+        let Some(state) = self.editor_find.as_mut() else {
+            return;
+        };
+        state.query = new_query;
+        let opts = state.opts;
+        let needle = state.query.clone();
+        if needle.is_empty() {
+            state.set_match_count(0, false);
+            state.match_index = None;
+            self.editor.active_search_match = None;
+            self.editor.set_search_highlight(None, opts);
+            return;
+        }
+        let Some(log) = self.editor.log.as_ref() else {
+            return;
+        };
+        let (count, truncated) = log.count_matches(&needle, opts);
+        // Search from the top of the viewport, so typing finds what is on
+        // screen first rather than jumping to the head of the file.
+        let hit = log.find_next(&needle, opts, self.editor.scroll, 0, false);
+        if let Some(state) = self.editor_find.as_mut() {
+            state.set_match_count(count, truncated);
+            // "N of M" would have to count the matches BEFORE this one, which
+            // for a budgeted scan is a number we may not have; the bar falls
+            // back to "M matches" rather than guessing an index.
+            state.match_index = None;
+        }
+        self.editor.set_search_highlight(Some(needle), opts);
+        // A CHANGED query invalidates the old position outright, so the
+        // active match is cleared before the new step is applied. The early
+        // return for an out-of-reach STEP deliberately keeps the match the
+        // user was on; doing the same here left the previous query's
+        // highlight painted under a new query that could not reach a match
+        // of its own.
+        self.editor.active_search_match = None;
+        self.scroll_log_to_match(hit);
+    }
+
+    /// Enter / Shift+Enter over a rendered log.
+    fn log_find_step(&mut self, forward: bool) {
+        let Some(state) = self.editor_find.as_ref() else {
+            return;
+        };
+        let opts = state.opts;
+        let needle = state.query.clone();
+        let Some(log) = self.editor.log.as_ref() else {
+            return;
+        };
+        // With no active match, walk from the viewport rather than the file
+        // head, so the first step lands near what the user is looking at.
+        let (row, col) = match self.editor.active_search_match {
+            Some((r, c, _)) => (r, c),
+            None => (self.editor.scroll, 0),
+        };
+        let hit = if forward {
+            log.find_next(&needle, opts, row, col, true)
+        } else {
+            log.find_prev(&needle, opts, row, col)
+        };
+        self.scroll_log_to_match(hit);
+    }
+
+    /// Park the viewport on the step's match and mark it active. A log has
+    /// no caret, so the match position is carried by `active_search_match`
+    /// alone and the row is centred rather than merely revealed.
+    ///
+    /// A step that ran out of budget is NOT the same as one that found
+    /// nothing: it leaves the count marked partial, so the bar keeps saying
+    /// how far the search actually reached instead of claiming "No results"
+    /// for a file it never finished reading.
+    fn scroll_log_to_match(&mut self, step: crate::log_view::Step) {
+        if step.out_of_reach() {
+            // Mark the count partial and STOP. Falling through to clear the
+            // active match left the bar reading "1+ matches" with nothing
+            // highlighted and no way back to the match the user was on: a
+            // step that could not reach further must leave them where they
+            // are, not throw away the position it did have.
+            if let Some(state) = self.editor_find.as_mut() {
+                let count = state.match_count;
+                state.set_match_count(count, true);
+            }
+            return;
+        }
+        let Some(m) = step.found() else {
+            self.editor.active_search_match = None;
+            return;
+        };
+        self.editor.active_search_match = Some((m.row, m.col_chars, m.len_chars));
+        // The log body starts one row below the header.
+        let rows = (self.editor.last_inner.height as usize).saturating_sub(1);
+        if rows == 0 {
+            self.editor.scroll = m.row;
+            return;
+        }
+        if m.row < self.editor.scroll || m.row >= self.editor.scroll + rows {
+            self.editor.scroll = m.row.saturating_sub(rows / 2);
         }
     }
 
@@ -31098,8 +31218,10 @@ impl App {
         self.editor.active_search_match = None;
         self.editor.set_search_highlight(Some(needle.clone()), opts);
         if let Some(s) = self.editor_find.as_mut() {
-            s.match_count =
-                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts);
+            s.set_match_count(
+                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts),
+                false,
+            );
         }
         if let Some(m) = crate::widgets::editor_find::find_next_match(
             &self.editor.lines,
@@ -31145,8 +31267,10 @@ impl App {
             // Recount against the new buffer: `a` -> `aa` doubles the
             // matches, and a hard zero would read "No results" over a body
             // still painted full of highlights.
-            s.match_count =
-                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts);
+            s.set_match_count(
+                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts),
+                false,
+            );
             s.match_index = None;
         }
         self.editor.set_search_highlight(Some(needle), opts);

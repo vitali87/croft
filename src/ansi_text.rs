@@ -64,6 +64,21 @@ pub struct AnsiLine {
 /// three lines later paints all three red).
 pub fn parse_line(raw: &str, style: &mut AnsiStyle) -> AnsiLine {
     let mut out = AnsiLine::default();
+    parse_into(raw, style, &mut out);
+    out
+}
+
+/// [`parse_line`] into a caller-owned line, so a bulk scan can reuse one
+/// allocation instead of building a `String` and a span `Vec` per line.
+///
+/// There is ONE implementation of the stripping rules on purpose: a second
+/// "just strip the escapes" copy would be the cheap thing to write and would
+/// drift from this one the first time a sequence is handled differently, and
+/// the two are compared by everything that trusts `text` (find, copy,
+/// `path:line` scanning) to describe the same characters.
+pub fn parse_into(raw: &str, style: &mut AnsiStyle, out: &mut AnsiLine) {
+    out.text.clear();
+    out.spans.clear();
     let mut run_start = 0usize;
     let mut run_style = *style;
     let bytes = raw.as_bytes();
@@ -112,7 +127,7 @@ pub fn parse_line(raw: &str, style: &mut AnsiStyle) -> AnsiLine {
                 if bytes[j] == b'm' {
                     let params = &raw[i + 2..j];
                     let end = out.text.len();
-                    close_run(&mut out, end, run_start, run_style);
+                    close_run(out, end, run_start, run_style);
                     apply_sgr(params, style);
                     run_start = end;
                     run_style = *style;
@@ -171,8 +186,7 @@ pub fn parse_line(raw: &str, style: &mut AnsiStyle) -> AnsiLine {
         }
     }
     let end = out.text.len();
-    close_run(&mut out, end, run_start, run_style);
-    out
+    close_run(out, end, run_start, run_style);
 }
 
 /// The next char boundary at or after `i`, clamped to the string's length.
