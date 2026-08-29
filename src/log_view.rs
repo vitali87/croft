@@ -1133,6 +1133,40 @@ mod tests {
         );
     }
 
+    /// A newline landing exactly on a read-chunk boundary must be found
+    /// once and counted once.
+    ///
+    /// The index reads in `INDEX_CHUNK` blocks and the scan runs per block,
+    /// so an off-by-one at the seam is the failure mode a rewrite of that
+    /// loop can introduce: a line lost, or one counted twice, only for files
+    /// past the first megabyte. Every other test here uses files far smaller
+    /// than one chunk and cannot see it.
+    #[test]
+    fn a_newline_on_a_chunk_boundary_is_counted_exactly_once() {
+        // Fill the first chunk exactly, so its final byte is a newline and
+        // the next chunk begins a fresh line.
+        let mut body = vec![b'a'; INDEX_CHUNK - 1];
+        body.push(b'\n');
+        body.extend_from_slice(b"second\nthird\n");
+        let (_d, p) = write_tmp(&body);
+        let mut v = LogView::open(&p).unwrap();
+        assert_eq!(v.len(), 3, "three lines, no seam duplicate and none lost");
+        v.ensure(1, 2).unwrap();
+        assert_eq!(v.visible_text(1), Some("second"));
+        assert_eq!(v.visible_text(2), Some("third"));
+
+        // And one straddling the seam by a byte, so the newline is the first
+        // byte of the second chunk rather than the last of the first.
+        let mut body = vec![b'b'; INDEX_CHUNK];
+        body.push(b'\n');
+        body.extend_from_slice(b"tail\n");
+        let (_d2, p2) = write_tmp(&body);
+        let mut v2 = LogView::open(&p2).unwrap();
+        assert_eq!(v2.len(), 2);
+        v2.ensure(1, 1).unwrap();
+        assert_eq!(v2.visible_text(1), Some("tail"));
+    }
+
     #[test]
     fn indexes_lines_without_reading_the_file_into_memory() {
         let (_d, p) = write_tmp(b"one\ntwo\nthree\n");
