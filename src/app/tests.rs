@@ -35054,6 +35054,37 @@ fn dragging_over_a_rendered_log_selects_and_copies_the_visible_text() {
         "the copy is the stripped text, not the escapes behind it"
     );
 
+    // What is PAINTED must match what is copied, row for row. Nothing
+    // asserted this before: deleting the entire selection-painting block from
+    // the renderer left the suite green, so the visible half of the feature
+    // had no coverage at all.
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    {
+        use ratatui::widgets::Widget;
+        let area = app.editor.last_area;
+        (&mut app.editor).render(area, &mut buf);
+    }
+    // Frame truth: the rect the render that filled THIS buffer published.
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    let copied_per_row: Vec<usize> = text.split('\n').map(|l| l.chars().count()).collect();
+    for (r, expected) in copied_per_row.iter().enumerate() {
+        let y = body.y + r as u16;
+        let painted = (body.x..body.x + body.width)
+            .filter(|x| buf[(*x, y)].style().bg == Some(selected_bg))
+            .count();
+        assert_eq!(
+            painted, *expected,
+            "row {r}: {painted} cells painted as selected, {expected} characters copied"
+        );
+    }
+
     // Cmd+C puts exactly that on the clipboard.
     app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
         .unwrap();
@@ -35061,5 +35092,77 @@ fn dragging_over_a_rendered_log_selects_and_copies_the_visible_text() {
         app.status.starts_with("Copied"),
         "the copy must report itself, got {:?}",
         app.status
+    );
+}
+
+/// #257: dragging past the end of a SHORT line must paint what it copies.
+///
+/// The renderer painted to the endpoint it was handed while the copy read
+/// `min(len)`, and `log_cell_at` clamped the line but not the column, so a
+/// drag off the right of a short line painted to the pointer and copied to
+/// the line's end. Clamping at the source means both readers see one value
+/// instead of each clamping its own way.
+#[test]
+fn dragging_past_a_short_lines_end_paints_what_it_copies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("short.log");
+    // A coloured line so the view renders, and a very short one to drag off.
+    std::fs::write(&p, "\u{1b}[31mabc\u{1b}[0m\nlonger second line here\n").unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some());
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let body = app.editor.log.as_ref().unwrap().last_body;
+
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        body.x,
+        body.y,
+    ));
+    // Drag far past the end of a three-character line.
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        body.x + 60,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        body.x + 60,
+        body.y,
+    ));
+
+    let (text, _) = app.editor.log.as_ref().unwrap().selection_text();
+    assert_eq!(text, "abc", "the copy stops at the end of the line");
+
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    {
+        use ratatui::widgets::Widget;
+        let area = app.editor.last_area;
+        (&mut app.editor).render(area, &mut buf);
+    }
+    // Frame truth: the rect to read is the one the render that filled THIS
+    // buffer published, not one captured from an earlier frame. Reading the
+    // stale rect pointed at the header row and reported nothing painted.
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    let painted = (body.x..body.x + body.width)
+        .filter(|x| buf[(*x, body.y)].style().bg == Some(selected_bg))
+        .count();
+    assert_eq!(
+        painted,
+        text.chars().count(),
+        "the paint must stop where the copy does, not follow the pointer"
     );
 }

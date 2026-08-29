@@ -618,7 +618,7 @@ impl LogView {
         // Read through the sweep path rather than the viewport cache: a
         // selection routinely runs past the window the reader is looking at,
         // and evicting that window to serve a copy would blank the screen.
-        self.scan_range(sr, er + 1, &mut budget, |row, text| {
+        let cut_short = self.scan_range(sr, er + 1, &mut budget, |row, text| {
             let chars: Vec<char> = text.chars().collect();
             let from = if row == sr { sc.min(chars.len()) } else { 0 };
             let to = if row == er {
@@ -638,6 +638,15 @@ impl LogView {
             }
             true
         });
+        // The sweep's own verdict counts too, and it is the one that fires on
+        // a coloured log. The budget charges RAW bytes (see `scan_range`);
+        // `out.len()` counts what survives stripping. On escape-heavy text the
+        // budget runs out long before the cap, so dropping this returned flag
+        // meant the copy stopped early and reported itself complete: exactly
+        // the silent short clipboard this function's doc promises not to
+        // produce. The escape-free case hid it, because there the two counters
+        // advance in lockstep.
+        clamped |= cut_short;
         if out.len() > MAX_COPY_BYTES {
             out.truncate(MAX_COPY_BYTES);
             clamped = true;
@@ -762,24 +771,66 @@ mod tests {
     /// A selection can span a file this view exists to avoid loading whole,
     /// so the copy is bounded AND says when it hit the bound. A clipboard
     /// holding silently less than was selected is the failure to avoid.
+    ///
+    /// COLOURED, deliberately. The first version of this test used
+    /// `"x".repeat(120)`, escape-free, where the byte budget and the stripped
+    /// length advance in lockstep, so the two counters could not diverge and
+    /// the real defect was STRUCTURALLY invisible to it. On a view whose
+    /// entire subject is colour-bearing text, that was the one fixture shape
+    /// that could not see the bug.
     #[test]
     fn a_selection_larger_than_the_copy_cap_is_clamped_and_reported() {
-        let line = "x".repeat(120) + "\n";
-        let lines = (MAX_COPY_BYTES / line.len()) + 500;
+        // Mostly escape bytes: 190 raw per line against 10 visible, so the
+        // sweep's raw-byte budget runs out at roughly a fifth of the cap.
+        // That gap is the whole defect, and it only exists when the two
+        // counters diverge. My first attempt at this fixture used one escape
+        // pair per 40 characters and never exhausted the budget at all, which
+        // is the same fixture-cannot-reach-the-dimension failure one level
+        // down: the test failed for want of density, not for want of a bug.
+        let line = "\u{1b}[31mx\u{1b}[0m".repeat(20) + "\n";
+        let lines = 30_000;
         let body = line.repeat(lines);
         let (_d, p) = write_tmp(body.as_bytes());
         let mut v = LogView::open(&p).unwrap();
 
-        v.selection = Some(((0, 0), (v.len() - 1, 120)));
+        v.selection = Some(((0, 0), (v.len() - 1, 20)));
         let (text, clamped) = v.selection_text();
         assert!(
             clamped,
-            "a selection past the cap must report itself clamped"
-        );
-        assert!(
-            text.len() <= MAX_COPY_BYTES + 200,
-            "and must actually stop near the cap, got {} bytes",
+            "a coloured selection past the budget must report itself clamped: \
+             gathered {} bytes",
             text.len()
+        );
+        // And it stopped for the BUDGET, not the cap: the visible text is a
+        // fraction of the cap, which is precisely the state that used to be
+        // reported as a complete copy.
+        assert!(
+            text.len() < MAX_COPY_BYTES / 2,
+            "the budget should stop this long before the cap, got {} bytes",
+            text.len()
+        );
+
+        // An escape-free selection of the same visible size, as the control:
+        // there the cap is what stops it, and it must ALSO report clamped.
+        let plain = "y".repeat(40) + "\n";
+        let plain_lines = (MAX_COPY_BYTES / plain.len()) + 500;
+        let (_d2, p2) = write_tmp(plain.repeat(plain_lines).as_bytes());
+        let mut v2 = LogView::open(&p2).unwrap();
+        v2.selection = Some(((0, 0), (v2.len() - 1, 40)));
+        let (plain_text, plain_clamped) = v2.selection_text();
+        assert!(plain_clamped, "and the escape-free case too");
+        assert!(
+            plain_text.len() <= MAX_COPY_BYTES + 200,
+            "the cap is an upper bound: {} bytes",
+            plain_text.len()
+        );
+        // A LOWER bound as well. `<= cap` alone is satisfied by every value
+        // from zero up, including a truncation at a fifth of the cap, so it
+        // cannot tell "stopped at the cap" from "stopped far short of it".
+        assert!(
+            plain_text.len() > MAX_COPY_BYTES / 2,
+            "an escape-free copy should reach most of the cap, got {} bytes",
+            plain_text.len()
         );
     }
 

@@ -41116,9 +41116,21 @@ fn log_cell_at(
     row: u16,
 ) -> (usize, usize) {
     let body = log.last_body;
-    let line = scroll + row.saturating_sub(body.y) as usize;
+    let line = (scroll + row.saturating_sub(body.y) as usize).min(log.len().saturating_sub(1));
     let column = col.saturating_sub(body.x) as usize;
-    (line.min(log.len().saturating_sub(1)), column)
+    // Clamp the COLUMN to the line's own length, not just the line to the
+    // file's. The renderer paints to the endpoint it is given while the copy
+    // reads `min(len)`, so an unclamped column let a drag past the end of a
+    // short line paint sixty cells and copy three characters. Clamping here
+    // means both readers see one value rather than each clamping its own way.
+    //
+    // A line outside the parsed window has no length to clamp against; the
+    // raw column stands, which is what the old behaviour was everywhere.
+    let width = log
+        .visible_text(line)
+        .map(|t| t.chars().count())
+        .unwrap_or(column);
+    (line, column.min(width))
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
