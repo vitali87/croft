@@ -153,14 +153,16 @@ impl LogView {
             if n == 0 {
                 break;
             }
-            for (i, &b) in buf[..n].iter().enumerate() {
-                if b == b'\n' {
-                    if line_starts.len() >= MAX_INDEXED_LINES {
-                        truncated = true;
-                        break;
-                    }
-                    line_starts.push(pos + i as u64 + 1);
+            // `memchr` rather than a byte loop: this is the whole cost of
+            // opening a large log, and the scan is the one part that reads
+            // every byte. A per-byte comparison cannot use the vector
+            // instructions that make a newline search memory-bound.
+            for i in memchr::memchr_iter(b'\n', &buf[..n]) {
+                if line_starts.len() >= MAX_INDEXED_LINES {
+                    truncated = true;
+                    break;
                 }
+                line_starts.push(pos + i as u64 + 1);
             }
             if truncated {
                 break;
