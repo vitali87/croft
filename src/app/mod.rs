@@ -14549,6 +14549,10 @@ impl App {
         if let Some(current) = self.local_drift.as_ref()
             && self.update_status == UpdateStatus::Idle
             && self.self_install.is_none()
+            // The same latch as `f9_update_armed`: while the staged release
+            // builds, F9 is not a rebuild, so the hint must not say so.
+            && self.staged_status != UpdateStatus::InProgress
+            && self.staged_install.is_none()
         {
             // Amber, persistent: the binary predates its own source tree
             // (#242). One keypress rebuilds it in the background.
