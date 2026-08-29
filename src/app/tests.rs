@@ -20617,6 +20617,14 @@ fn an_update_offer_raises_the_bottom_left_toast_and_later_dismisses_it() {
 /// drift Ready must not hand Relaunch a staged binary that was never built.
 #[test]
 fn update_events_are_charged_to_their_own_producer() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        update_events_are_charged_to_their_own_producer_body();
+    });
+}
+
+fn update_events_are_charged_to_their_own_producer_body() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let staged = tmp.path().join("never-built");
@@ -20673,6 +20681,41 @@ fn update_events_are_charged_to_their_own_producer() {
         "9.9.9",
     ));
     assert!(!app.f9_update_armed(), "not while a staged build runs");
+
+    // A staged build that LANDED keeps its Relaunch through an unrelated
+    // failure: the staged channel delivers one Ready only, so resetting
+    // the shared status here would strand a binary the popup still offers.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let landed = tmp.path().join("landed");
+    std::fs::write(&landed, b"bin").unwrap();
+    app.staged_install = Some(crate::update_check::StagedInstall::preloaded(
+        &[
+            crate::update_watch::UpdateEvent::InProgress,
+            crate::update_watch::UpdateEvent::Ready,
+        ],
+        landed.clone(),
+        "9.9.9",
+    ));
+    assert!(app.poll_update_watch());
+    assert_eq!(
+        app.staged_update_binary().as_deref(),
+        Some(landed.as_path())
+    );
+    app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[
+        crate::update_watch::UpdateEvent::Failed,
+    ]));
+    assert!(app.poll_update_watch());
+    assert_eq!(
+        app.update_status,
+        UpdateStatus::Ready,
+        "the rebuild's failure does not disarm the landed release"
+    );
+    assert_eq!(
+        app.staged_update_binary().as_deref(),
+        Some(landed.as_path())
+    );
+    assert!(app.f9_update_armed(), "F9 still relaunches");
+    assert!(app.status.contains("rebuild failed"), "{}", app.status);
 }
 
 /// #333: both corner popups can be up at once; they must not overlap.

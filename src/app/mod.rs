@@ -15922,7 +15922,7 @@ impl App {
         let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
         // The port toast owns the bottom-right band; at ordinary widths
         // this popup's title reaches into it, so stack above it instead.
-        let stack: u16 = if self.port_toast.is_some() { 4 } else { 0 };
+        let stack: u16 = if self.port_toast.is_some() { height } else { 0 };
         if area.width < width + 2 || area.height < height + status_h + 1 + stack {
             return;
         }
@@ -23171,7 +23171,14 @@ impl App {
                     self.status.clear();
                 }
                 crate::update_watch::UpdateEvent::Failed => {
-                    self.update_status = UpdateStatus::Idle;
+                    // The shared status is reset only when the failing
+                    // producer owns it: a drift rebuild failing after the
+                    // staged release landed must not disarm a Relaunch the
+                    // popup still offers (there is no second Ready coming).
+                    let staged_stays_ready = source != UpdateSource::Staged && self.staged_ready;
+                    if !staged_stays_ready {
+                        self.update_status = UpdateStatus::Idle;
+                    }
                     self.update_spinner_start = None;
                     self.status = match source {
                         UpdateSource::Staged => {

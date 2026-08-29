@@ -99,7 +99,9 @@ pub fn latest_from_release_json(json: &str) -> Option<String> {
 /// the last attempt, not the last answer: a failed request counts, so a
 /// blocked endpoint is retried daily rather than on every launch.
 pub fn should_query(cache: &CheckCache, now_secs: u64) -> bool {
-    now_secs.saturating_sub(cache.checked_at) >= CHECK_INTERVAL.as_secs()
+    // A stamp from the future (clock skew, a restored backup) is stale,
+    // not a reason to stay silent until the clock catches up.
+    now_secs < cache.checked_at || now_secs - cache.checked_at >= CHECK_INTERVAL.as_secs()
 }
 
 /// The version to offer, if the cache knows one newer than `current` that
@@ -311,7 +313,24 @@ pub fn apply_staged(staged: &Path, target: &Path) -> std::io::Result<()> {
         ));
     };
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".croft-update-{}", std::process::id()));
+    let tmp = temp_name(dir);
+    apply_staged_at(staged, target, &tmp)
+}
+
+/// The temp file beside the target. PIDs recycle: a croft killed between
+/// open and rename would leave a file that every later process drawing
+/// the same PID trips over, so the name carries a clock reading too.
+/// `create_new` in [`apply_staged_at`] still refuses anything planted at
+/// the name.
+fn temp_name(dir: &Path) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dir.join(format!(".croft-update-{}-{nonce}", std::process::id()))
+}
+
+fn apply_staged_at(staged: &Path, target: &Path, tmp: &Path) -> std::io::Result<()> {
     let result = (|| {
         let mut src = std::fs::File::open(staged)?;
         let mut opts = std::fs::OpenOptions::new();
@@ -321,14 +340,14 @@ pub fn apply_staged(staged: &Path, target: &Path) -> std::io::Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o755);
         }
-        let mut dst = opts.open(&tmp)?;
+        let mut dst = opts.open(tmp)?;
         std::io::copy(&mut src, &mut dst)?;
         dst.sync_all()?;
         drop(dst);
-        std::fs::rename(&tmp, target)
+        std::fs::rename(tmp, target)
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
     }
     result
 }
@@ -369,6 +388,10 @@ mod tests {
         assert!(
             should_query(&CheckCache::default(), 1_700_000_000),
             "a never-stamped cache asks"
+        );
+        assert!(
+            should_query(&fresh, 1_000_000 - 60),
+            "a stamp from the future is stale, not a gag"
         );
     }
 
@@ -454,13 +477,12 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
         let victim = dir.path().join("victim");
         std::fs::write(&victim, b"precious").unwrap();
-        let tmp = target
-            .parent()
-            .unwrap()
-            .join(format!(".croft-update-{}", std::process::id()));
+        // The temp name carries a clock nonce, so plant the symlink at the
+        // exact name the next call will use by exercising the helper.
+        let tmp = temp_name(target.parent().unwrap());
         std::os::unix::fs::symlink(&victim, &tmp).unwrap();
         assert!(
-            apply_staged(&staged, &target).is_err(),
+            apply_staged_at(&staged, &target, &tmp).is_err(),
             "an existing entry is refused"
         );
         assert_eq!(
@@ -468,6 +490,7 @@ mod tests {
             b"precious",
             "the symlink target is untouched"
         );
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
     }
 
