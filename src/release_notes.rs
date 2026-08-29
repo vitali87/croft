@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "Cmd+F now searches a rendered colour log: matches come from the text you can see rather than the escape codes behind it, Enter and Shift+Enter walk them, and the count says N+ when the file is too large to have been searched whole.",
+    summary: "croft import-vscode brings a VS Code profile across: the settings croft has an equivalent for, keybindings whose commands map to croft's, and your snippets. Existing croft values always win, so it is safe to run twice, and every key or chord that could not come across is listed rather than dropped in silence.",
 }];

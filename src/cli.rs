@@ -239,6 +239,22 @@ pub enum CliCommand {
         #[arg(short, long, default_value_t = false)]
         yes: bool,
     },
+    /// Bring a VS Code profile across: settings, keybindings and snippets
+    /// (#351).
+    ///
+    /// Finds your VS Code (or Cursor / VSCodium / Windsurf) user directory,
+    /// converts what croft has an equivalent for, and MERGES the result into
+    /// `~/.config/croft/`: an existing croft value always wins, so running
+    /// this twice changes nothing the second time. Keys and commands croft
+    /// has no equivalent for are listed rather than dropped silently.
+    ImportVscode {
+        /// The VS Code user directory to read (default: auto-detected).
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Print the full report and write nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Configure Ghostty for Croft: forward every croft chord (Cmd+T, Cmd+W,
     /// Cmd+[ / Cmd+], Cmd+1..9, etc.) to croft as a CSI-u sequence instead of
     /// letting Ghostty's own keybinds (new_tab, goto_tab, ...) swallow them.
@@ -475,6 +491,7 @@ impl Cli {
                 Ok(())
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
+            Some(CliCommand::ImportVscode { from, dry_run }) => import_vscode(from, dry_run),
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
             Some(CliCommand::InstallLauncher { path, user, yes }) => {
                 install_launcher(path, user, yes)
@@ -747,6 +764,103 @@ fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> 
         "Quit iTerm2 entirely (cmd+Q) and reopen it. macOS caches plists; iTerm2 must be relaunched to pick up the change."
     );
     Ok(())
+}
+
+/// `croft import-vscode`: convert a VS Code profile into croft's config.
+///
+/// The report is the product, not a side effect. An import that only said
+/// "done" would leave the user unable to tell a setting croft adopted from
+/// one it has no equivalent for, which is the difference between "my
+/// settings came across" and "my settings are gone".
+fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
+    let dir = match from {
+        Some(dir) => dir,
+        None => {
+            let found = crate::import_vscode::discover_profiles();
+            let Some((label, dir)) = found.into_iter().next() else {
+                anyhow::bail!(
+                    "no VS Code user directory found. Pass one with --from \
+                     (e.g. --from ~/.config/Code/User)"
+                );
+            };
+            println!("Reading {label}: {}", dir.display());
+            dir
+        }
+    };
+    let mut report = crate::import_vscode::scan_profile(&dir)?;
+
+    println!(
+        "\n{} setting{} mapped, {} keybinding{} mapped, {} snippet{}",
+        report.settings.len(),
+        plural(report.settings.len()),
+        report.keybindings.len(),
+        plural(report.keybindings.len()),
+        report.snippets.len(),
+        plural(report.snippets.len()),
+    );
+    for (key, value) in &report.settings {
+        println!("  {key} = {value}");
+    }
+    for (key, command) in &report.keybindings {
+        println!("  {key} -> {command}");
+    }
+    if !report.unmapped_settings.is_empty() {
+        println!(
+            "\n{} setting{} croft has no equivalent for:",
+            report.unmapped_settings.len(),
+            plural(report.unmapped_settings.len())
+        );
+        for key in &report.unmapped_settings {
+            println!("  {key}");
+        }
+    }
+    if !report.dropped_keybindings.is_empty() {
+        println!(
+            "\n{} keybinding{} not carried over:",
+            report.dropped_keybindings.len(),
+            plural(report.dropped_keybindings.len())
+        );
+        for row in &report.dropped_keybindings {
+            println!("  {row}");
+        }
+    }
+    for warning in &report.warnings {
+        println!("  warning: {warning}");
+    }
+
+    if dry_run {
+        println!("\nDry run: nothing was written.");
+        return Ok(());
+    }
+    if report.is_empty() {
+        println!("\nNothing to import.");
+        return Ok(());
+    }
+    let written = crate::import_vscode::apply(&mut report)?;
+    if !report.conflicts.is_empty() {
+        println!(
+            "\n{} value{} croft already had, left alone:",
+            report.conflicts.len(),
+            plural(report.conflicts.len())
+        );
+        for conflict in &report.conflicts {
+            println!("  {conflict}");
+        }
+    }
+    if written.is_empty() {
+        println!("\nEverything was already in place; nothing changed.");
+    } else {
+        println!("\nWrote:");
+        for path in &written {
+            println!("  {}", path.display());
+        }
+        println!("\nRestart croft to pick the new configuration up.");
+    }
+    Ok(())
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 fn setup_ghostty(yes: bool) -> Result<()> {

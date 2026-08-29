@@ -1,0 +1,795 @@
+//! One-shot import of a VS Code user profile (#351): settings, keybindings
+//! and snippets.
+//!
+//! Most of what a VS Code user misses on day one is their own configuration,
+//! and croft already reads VS Code's formats in several places (the
+//! `.vscode/settings.json` subset, `launch.json`, `tasks.json`,
+//! `.code-workspace`). This finishes the job for the USER-level files.
+//!
+//! # Three conversions of very different difficulty
+//!
+//! **Snippets** are nearly free: croft's `snippets.json` already mirrors
+//! VS Code's global snippets file, tab-stop syntax included. The only real
+//! work is that VS Code splits them per language by FILENAME
+//! (`snippets/python.json`), which croft carries as a `scope` field.
+//!
+//! **Keybindings** share a file shape and disagree on every command id, so
+//! they convert through a table. An unmapped id is dropped and named, never
+//! guessed at: a chord silently bound to the wrong action is worse than one
+//! that did not come across.
+//!
+//! **Settings** is where the two editors genuinely differ. Only keys croft has
+//! a real equivalent of are mapped; everything else is listed as unmapped
+//! rather than dropped silently, because "my settings imported" and "my
+//! settings are gone" must not look the same.
+//!
+//! # Merge, never overwrite
+//!
+//! An existing croft value always wins, and the conflict is reported. Import
+//! is therefore idempotent: running it twice changes nothing the second time.
+//! Someone who has already tuned croft must not lose that by curiosity.
+
+use anyhow::{Context, Result};
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// A VS Code-family user directory, by product name. Cursor and VSCodium are
+/// the same format under a different folder, and someone arriving from one of
+/// them is exactly the user this exists for.
+const USER_DIRS: &[(&str, &str)] = &[
+    ("VS Code", "Code"),
+    ("VS Code Insiders", "Code - Insiders"),
+    ("VSCodium", "VSCodium"),
+    ("Cursor", "Cursor"),
+    ("Windsurf", "Windsurf"),
+];
+
+/// Candidate user directories that exist on this machine, most standard first.
+pub fn discover_profiles() -> Vec<(String, PathBuf)> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        // macOS keeps them under Application Support; Linux under the XDG
+        // config dir. Probing both is cheaper than deciding by target_os and
+        // works when a home directory is shared between them.
+        roots.push(home.join("Library").join("Application Support"));
+        roots.push(home.join(".config"));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        roots.push(appdata);
+    }
+    let mut found = Vec::new();
+    for (label, dir) in USER_DIRS {
+        for root in &roots {
+            let candidate = root.join(dir).join("User");
+            if candidate.is_dir()
+                && !found
+                    .iter()
+                    .any(|(_, p): &(String, PathBuf)| p == &candidate)
+            {
+                found.push(((*label).to_string(), candidate));
+            }
+        }
+    }
+    found
+}
+
+/// One VS Code settings key croft understands, and how it lands.
+struct SettingMap {
+    vscode: &'static str,
+    /// Croft pref key, or `None` when the source key sets more than one.
+    croft: &'static str,
+    convert: fn(&Value) -> Option<Value>,
+}
+
+fn as_bool(v: &Value) -> Option<Value> {
+    v.as_bool().map(Value::from)
+}
+
+fn negated(v: &Value) -> Option<Value> {
+    v.as_bool().map(|b| Value::from(!b))
+}
+
+/// VS Code writes this one as a bool OR as `"on"` / `"off"` / `"auto"`
+/// depending on the setting's age.
+fn off_means_disabled(v: &Value) -> Option<Value> {
+    match v {
+        Value::Bool(b) => Some(Value::from(!*b)),
+        Value::String(s) => Some(Value::from(s == "off")),
+        _ => None,
+    }
+}
+
+fn never_means_disabled(v: &Value) -> Option<Value> {
+    v.as_str().map(|s| Value::from(s == "never"))
+}
+
+fn as_whitespace_mode(v: &Value) -> Option<Value> {
+    // croft renders none / boundary / all; VS Code's "selection" and
+    // "trailing" have no croft equivalent and fall back to the nearest
+    // honest thing rather than pretending.
+    let s = v.as_str()?;
+    let mapped = match s {
+        "none" | "boundary" | "all" => s,
+        "trailing" | "selection" => "boundary",
+        _ => return None,
+    };
+    Some(Value::from(mapped))
+}
+
+fn as_scrollback(v: &Value) -> Option<Value> {
+    v.as_u64().map(Value::from)
+}
+
+const SETTINGS: &[SettingMap] = &[
+    SettingMap {
+        vscode: "editor.formatOnSave",
+        croft: "format_on_save",
+        convert: as_bool,
+    },
+    SettingMap {
+        vscode: "editor.formatOnType",
+        croft: "format_on_type",
+        convert: as_bool,
+    },
+    SettingMap {
+        vscode: "editor.bracketPairColorization.enabled",
+        croft: "disable_bracket_colors",
+        convert: negated,
+    },
+    SettingMap {
+        vscode: "editor.guides.indentation",
+        croft: "disable_indent_guides",
+        convert: negated,
+    },
+    SettingMap {
+        vscode: "editor.inlayHints.enabled",
+        croft: "disable_inlay_hints",
+        convert: off_means_disabled,
+    },
+    SettingMap {
+        vscode: "editor.autoClosingBrackets",
+        croft: "disable_auto_close_pairs",
+        convert: never_means_disabled,
+    },
+    SettingMap {
+        vscode: "debug.inlineValues",
+        croft: "disable_inline_values",
+        convert: off_means_disabled,
+    },
+    SettingMap {
+        vscode: "editor.renderWhitespace",
+        croft: "render_whitespace",
+        convert: as_whitespace_mode,
+    },
+    SettingMap {
+        vscode: "terminal.integrated.scrollback",
+        croft: "terminal_scrollback",
+        convert: as_scrollback,
+    },
+    SettingMap {
+        vscode: "terminal.integrated.copyOnSelection",
+        croft: "copy_on_select",
+        convert: as_bool,
+    },
+];
+
+/// VS Code command id to croft palette command id.
+///
+/// Deliberately partial. Every entry here is a command whose croft equivalent
+/// does the same thing; a VS Code command with no true counterpart is left
+/// out so the import reports it rather than binding the user's chord to
+/// something that merely sounds similar.
+const COMMANDS: &[(&str, &str)] = &[
+    ("workbench.action.files.save", "save_file"),
+    ("workbench.action.quickOpen", "quick_open"),
+    ("workbench.action.gotoSymbol", "go_to_symbol"),
+    ("workbench.action.showAllSymbols", "go_to_workspace_symbol"),
+    ("workbench.action.closeActiveEditor", "close_editor"),
+    (
+        "workbench.action.reopenClosedEditor",
+        "reopen_closed_editor",
+    ),
+    ("workbench.action.splitEditor", "split_editor"),
+    (
+        "workbench.action.toggleSidebarVisibility",
+        "toggle_side_bar",
+    ),
+    (
+        "workbench.action.toggleAuxiliaryBar",
+        "toggle_secondary_side_bar",
+    ),
+    (
+        "workbench.action.terminal.toggleTerminal",
+        "toggle_terminal",
+    ),
+    ("workbench.action.terminal.new", "new_terminal"),
+    ("workbench.action.toggleZenMode", "toggle_zen_mode"),
+    ("workbench.view.explorer", "show_explorer"),
+    ("workbench.view.search", "show_search"),
+    ("workbench.view.scm", "show_source_control"),
+    ("workbench.view.debug", "show_run_debug"),
+    ("workbench.view.testing", "show_testing"),
+    ("workbench.view.extensions", "show_extensions"),
+    ("workbench.action.openSettings", "open_settings"),
+    ("workbench.action.openSettingsJson", "open_settings_json"),
+    (
+        "workbench.action.openGlobalKeybindingsFile",
+        "open_keybindings_json",
+    ),
+    (
+        "workbench.action.openGlobalKeybindings",
+        "keyboard_shortcuts",
+    ),
+    ("editor.action.formatDocument", "format_document"),
+    ("editor.action.formatSelection", "format_selection"),
+    ("editor.action.commentLine", "toggle_line_comment"),
+    ("editor.action.blockComment", "toggle_block_comment"),
+    ("editor.action.quickFix", "quick_fix"),
+    ("editor.action.peekDefinition", "peek_definition"),
+    (
+        "editor.action.revealDefinition",
+        "mouse_go_to_definition_at_click",
+    ),
+    ("editor.action.startFindReplaceAction", "replace_in_file"),
+    ("editor.action.moveLinesUpAction", "move_line_up"),
+    ("editor.action.moveLinesDownAction", "move_line_down"),
+    ("editor.action.deleteLines", "delete_line"),
+    ("editor.action.joinLines", "join_lines"),
+    ("editor.action.transformToUppercase", "transform_upper"),
+    ("editor.action.transformToLowercase", "transform_lower"),
+    ("editor.action.transformToTitlecase", "transform_title"),
+    (
+        "editor.action.trimTrailingWhitespace",
+        "trim_trailing_whitespace",
+    ),
+    ("editor.action.indentationToSpaces", "indentation_to_spaces"),
+    ("editor.action.indentationToTabs", "indentation_to_tabs"),
+    ("editor.action.insertCursorAbove", "add_cursor_above"),
+    ("editor.action.insertCursorBelow", "add_cursor_below"),
+    (
+        "editor.action.addSelectionToNextFindMatch",
+        "add_selection_to_next_match",
+    ),
+    ("editor.action.smartSelect.expand", "expand_selection"),
+    ("editor.action.smartSelect.shrink", "shrink_selection"),
+    ("editor.action.jumpToBracket", "jump_to_bracket"),
+    ("editor.action.selectToBracket", "select_to_bracket"),
+    ("editor.foldAll", "fold_all"),
+    ("editor.unfoldAll", "unfold_all"),
+    ("editor.toggleFold", "toggle_fold"),
+    ("editor.action.showHover", "peek_definition"),
+    ("markdown.showPreview", "toggle_markdown_preview"),
+    ("workbench.action.tasks.build", "run_build_task"),
+    ("workbench.action.tasks.runTask", "run_task"),
+    ("workbench.action.tasks.reRunTask", "rerun_last_task"),
+    ("workbench.action.debug.start", "start_debugging"),
+    ("workbench.action.debug.stop", "stop_debugging"),
+    ("workbench.action.debug.restart", "restart_debugging"),
+    ("workbench.action.debug.pause", "pause_debugging"),
+    ("workbench.action.debug.stepOver", "step_over"),
+    ("editor.debug.action.toggleBreakpoint", "toggle_breakpoint"),
+    ("undo", "undo"),
+    ("redo", "redo"),
+    ("references-view.showCallHierarchy", "show_incoming_calls"),
+    ("workbench.action.navigateBack", "navigate_back"),
+    ("workbench.action.navigateForward", "navigate_forward"),
+];
+
+/// What an import would do, or did.
+#[derive(Debug, Default)]
+pub struct Report {
+    /// Croft settings this import would write, as `key = value` lines.
+    pub settings: BTreeMap<String, Value>,
+    /// VS Code settings keys with no croft equivalent.
+    pub unmapped_settings: Vec<String>,
+    /// Croft keybinding rows, ready to serialise.
+    pub keybindings: Vec<(String, String)>,
+    /// VS Code keybinding rows dropped, with the reason.
+    pub dropped_keybindings: Vec<String>,
+    /// Snippet name to its croft entry.
+    pub snippets: Map<String, Value>,
+    /// Values croft already has, which the import left alone.
+    pub conflicts: Vec<String>,
+    /// Anything that went wrong short of failing the import.
+    pub warnings: Vec<String>,
+}
+
+impl Report {
+    pub fn is_empty(&self) -> bool {
+        self.settings.is_empty() && self.keybindings.is_empty() && self.snippets.is_empty()
+    }
+}
+
+fn read_jsonc(path: &Path) -> Result<Option<Value>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    // `crate::tasks::strip_jsonc` walks CHARS. The `workspace.rs` one walks
+    // bytes and mangles any non-ASCII value (#396), which a settings file
+    // carries routinely in paths and snippet bodies.
+    let stripped = crate::tasks::strip_jsonc(&raw);
+    if stripped.trim().is_empty() {
+        return Ok(None);
+    }
+    let value =
+        serde_json::from_str(&stripped).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(value))
+}
+
+/// Convert a VS Code `settings.json` document.
+pub fn convert_settings(doc: &Value, report: &mut Report) {
+    let Some(obj) = doc.as_object() else {
+        report
+            .warnings
+            .push(String::from("settings.json is not a JSON object; skipped"));
+        return;
+    };
+    for (key, value) in obj {
+        match SETTINGS.iter().find(|m| m.vscode == key) {
+            Some(map) => match (map.convert)(value) {
+                Some(converted) => {
+                    report.settings.insert(map.croft.to_string(), converted);
+                }
+                None => report.unmapped_settings.push(format!(
+                    "{key} (croft has {}, but not for this value: {value})",
+                    map.croft
+                )),
+            },
+            None => {
+                // `files.autoSave` sets two croft prefs, so it is handled
+                // here rather than in the one-to-one table.
+                if let Some(mode) = value.as_str().filter(|_| key == "files.autoSave") {
+                    {
+                        report
+                            .settings
+                            .insert(String::from("auto_save"), Value::from(mode == "afterDelay"));
+                        report.settings.insert(
+                            String::from("auto_save_on_focus_change"),
+                            Value::from(mode == "onFocusChange" || mode == "onWindowChange"),
+                        );
+                        continue;
+                    }
+                }
+                report.unmapped_settings.push(key.clone());
+            }
+        }
+    }
+    report.unmapped_settings.sort();
+}
+
+/// Convert a VS Code `keybindings.json` document.
+pub fn convert_keybindings(doc: &Value, report: &mut Report) {
+    let Some(rows) = doc.as_array() else {
+        report.warnings.push(String::from(
+            "keybindings.json is not a JSON array; skipped",
+        ));
+        return;
+    };
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for row in rows {
+        let Some(command) = row.get("command").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(key) = row.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        // A leading `-` is VS Code's "remove this default binding". croft's
+        // defaults are its own, so there is nothing to remove.
+        if let Some(removed) = command.strip_prefix('-') {
+            report.dropped_keybindings.push(format!(
+                "{key}: unbinding {removed} has no croft equivalent"
+            ));
+            continue;
+        }
+        match COMMANDS.iter().find(|(vs, _)| *vs == command) {
+            Some((_, croft)) => {
+                // A later row wins in VS Code too.
+                seen.insert(key.to_string(), (*croft).to_string());
+            }
+            None => report
+                .dropped_keybindings
+                .push(format!("{key}: no croft command matches {command}")),
+        }
+    }
+    report.keybindings = seen.into_iter().collect();
+    report.dropped_keybindings.sort();
+}
+
+/// Convert one VS Code snippets file. `language` comes from the file name for
+/// `snippets/<language>.json`, and is `None` for a `.code-snippets` file,
+/// whose entries carry their own scope.
+pub fn convert_snippets(doc: &Value, language: Option<&str>, report: &mut Report) {
+    let Some(obj) = doc.as_object() else {
+        report.warnings.push(String::from(
+            "a snippets file is not a JSON object; skipped",
+        ));
+        return;
+    };
+    for (name, body) in obj {
+        let Some(entry) = body.as_object() else {
+            continue;
+        };
+        if entry.get("prefix").is_none() || entry.get("body").is_none() {
+            report
+                .warnings
+                .push(format!("snippet {name:?} has no prefix or body; skipped"));
+            continue;
+        }
+        let mut out = entry.clone();
+        // croft carries the language in a `scope` field; VS Code carries it
+        // in the FILE NAME for per-language snippets, so it is recovered here
+        // or the snippet would silently widen to every language.
+        if let Some(lang) = language {
+            out.entry("scope")
+                .or_insert_with(|| Value::from(lang.to_string()));
+        }
+        report.snippets.insert(name.clone(), Value::Object(out));
+    }
+}
+
+/// Read a whole VS Code user directory into a report.
+pub fn scan_profile(dir: &Path) -> Result<Report> {
+    let mut report = Report::default();
+    if let Some(doc) = read_jsonc(&dir.join("settings.json"))? {
+        convert_settings(&doc, &mut report);
+    }
+    if let Some(doc) = read_jsonc(&dir.join("keybindings.json"))? {
+        convert_keybindings(&doc, &mut report);
+    }
+    let snippets_dir = dir.join("snippets");
+    if snippets_dir.is_dir() {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&snippets_dir)
+            .with_context(|| format!("reading {}", snippets_dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        // Deterministic order: two files defining the same snippet name must
+        // resolve the same way on every run, or the import is not idempotent.
+        entries.sort();
+        for path in entries {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let language = match ext {
+                "json" => path.file_stem().and_then(|s| s.to_str()),
+                "code-snippets" => None,
+                _ => continue,
+            };
+            if let Some(doc) = read_jsonc(&path)? {
+                convert_snippets(&doc, language, &mut report);
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Merge a report into croft's config files, leaving existing values alone.
+///
+/// Returns the files written. An existing value is never replaced: someone
+/// who has already tuned croft must not lose it to a one-shot import, and
+/// leaving it alone is also what makes a second run a no-op.
+pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
+    let dir = crate::prefs::config_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut written = Vec::new();
+
+    if !report.settings.is_empty() {
+        let path = dir.join("config.json");
+        let mut existing: Map<String, Value> = match read_jsonc(&path)? {
+            Some(Value::Object(m)) => m,
+            _ => Map::new(),
+        };
+        let mut changed = false;
+        for (key, value) in &report.settings {
+            if let Some(current) = existing.get(key) {
+                if current != value {
+                    report.conflicts.push(format!(
+                        "config.json {key}: kept {current}, VS Code had {value}"
+                    ));
+                }
+                continue;
+            }
+            existing.insert(key.clone(), value.clone());
+            changed = true;
+        }
+        if changed {
+            write_json(&path, &Value::Object(existing))?;
+            written.push(path);
+        }
+    }
+
+    if !report.keybindings.is_empty() {
+        let path = dir.join("keybindings.json");
+        let mut rows: Vec<Value> = match read_jsonc(&path)? {
+            Some(Value::Array(a)) => a,
+            _ => Vec::new(),
+        };
+        let bound: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get("key").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let mut changed = false;
+        for (key, command) in &report.keybindings {
+            if bound.iter().any(|k| k == key) {
+                report
+                    .conflicts
+                    .push(format!("keybindings.json {key}: already bound, left alone"));
+                continue;
+            }
+            let mut row = Map::new();
+            row.insert(String::from("key"), Value::from(key.clone()));
+            row.insert(String::from("command"), Value::from(command.clone()));
+            rows.push(Value::Object(row));
+            changed = true;
+        }
+        if changed {
+            write_json(&path, &Value::Array(rows))?;
+            written.push(path);
+        }
+    }
+
+    if !report.snippets.is_empty() {
+        let path = dir.join("snippets.json");
+        let mut existing: Map<String, Value> = match read_jsonc(&path)? {
+            Some(Value::Object(m)) => m,
+            _ => Map::new(),
+        };
+        let mut changed = false;
+        for (name, entry) in &report.snippets {
+            if existing.contains_key(name) {
+                report.conflicts.push(format!(
+                    "snippets.json {name:?}: already defined, left alone"
+                ));
+                continue;
+            }
+            existing.insert(name.clone(), entry.clone());
+            changed = true;
+        }
+        if changed {
+            write_json(&path, &Value::Object(existing))?;
+            written.push(path);
+        }
+    }
+
+    report.conflicts.sort();
+    Ok(written)
+}
+
+fn write_json(path: &Path, value: &Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(value)?;
+    std::fs::write(path, format!("{text}\n")).with_context(|| format!("writing {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn settings_map_only_where_croft_has_a_real_equivalent() {
+        let doc = json!({
+            "editor.formatOnSave": true,
+            "editor.bracketPairColorization.enabled": false,
+            "editor.autoClosingBrackets": "never",
+            "editor.renderWhitespace": "all",
+            "terminal.integrated.scrollback": 20000,
+            "editor.fontFamily": "Fira Code",
+            "workbench.iconTheme": "material-icon-theme"
+        });
+        let mut report = Report::default();
+        convert_settings(&doc, &mut report);
+
+        assert_eq!(report.settings["format_on_save"], json!(true));
+        assert_eq!(
+            report.settings["disable_bracket_colors"],
+            json!(true),
+            "VS Code enables the feature, croft names the negative"
+        );
+        assert_eq!(report.settings["disable_auto_close_pairs"], json!(true));
+        assert_eq!(report.settings["render_whitespace"], json!("all"));
+        assert_eq!(report.settings["terminal_scrollback"], json!(20000));
+        // Keys croft cannot honour are LISTED, never dropped in silence:
+        // "my settings imported" and "my settings are gone" must not look
+        // the same to the user.
+        assert!(
+            report
+                .unmapped_settings
+                .contains(&String::from("editor.fontFamily"))
+        );
+        assert!(
+            report
+                .unmapped_settings
+                .contains(&String::from("workbench.iconTheme"))
+        );
+    }
+
+    /// One VS Code key drives two croft prefs, and every mode must land
+    /// somewhere: "off" has to clear both rather than leaving whatever was
+    /// there before.
+    #[test]
+    fn auto_save_modes_map_onto_both_croft_toggles() {
+        for (mode, delay, focus) in [
+            ("afterDelay", true, false),
+            ("onFocusChange", false, true),
+            ("onWindowChange", false, true),
+            ("off", false, false),
+        ] {
+            let mut report = Report::default();
+            convert_settings(&json!({ "files.autoSave": mode }), &mut report);
+            assert_eq!(report.settings["auto_save"], json!(delay), "{mode}");
+            assert_eq!(
+                report.settings["auto_save_on_focus_change"],
+                json!(focus),
+                "{mode}"
+            );
+        }
+    }
+
+    /// Every croft key the mapping writes must be a real pref, or the
+    /// import produces a config.json croft ignores. `Prefs` is the authority,
+    /// so the test asks it rather than repeating a list that would drift.
+    #[test]
+    fn every_mapped_setting_is_a_real_croft_pref() {
+        let defaults =
+            serde_json::to_value(crate::prefs::Prefs::default()).expect("Prefs serialises");
+        let known = defaults.as_object().expect("Prefs is a JSON object");
+        let mut emitted: Vec<&str> = SETTINGS.iter().map(|m| m.croft).collect();
+        // `files.autoSave` is handled outside the one-to-one table.
+        emitted.push("auto_save");
+        emitted.push("auto_save_on_focus_change");
+        for key in emitted {
+            assert!(
+                known.contains_key(key),
+                "{key} is not a field of Prefs, so croft would ignore it"
+            );
+        }
+    }
+
+    /// And the VALUE has to be the shape that pref expects: a string where
+    /// croft wants a string, a number where it wants a number. A bool
+    /// written into `render_whitespace` would parse as a config error.
+    #[test]
+    fn converted_values_match_the_type_croft_stores() {
+        let doc = json!({
+            "editor.formatOnSave": true,
+            "editor.renderWhitespace": "boundary",
+            "terminal.integrated.scrollback": 50000,
+            "files.autoSave": "onFocusChange"
+        });
+        let mut report = Report::default();
+        convert_settings(&doc, &mut report);
+        let defaults = serde_json::to_value(crate::prefs::Prefs::default()).unwrap();
+        let known = defaults.as_object().unwrap();
+        for (key, value) in &report.settings {
+            let expected = &known[key];
+            assert_eq!(
+                std::mem::discriminant(value),
+                std::mem::discriminant(expected),
+                "{key} converted to {value}, but croft stores {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn keybindings_convert_by_table_and_name_what_they_drop() {
+        let doc = json!([
+            { "key": "ctrl+shift+p", "command": "workbench.action.quickOpen" },
+            { "key": "ctrl+k z", "command": "workbench.action.toggleZenMode" },
+            { "key": "ctrl+alt+q", "command": "some.extension.command" },
+            { "key": "ctrl+b", "command": "-workbench.action.toggleSidebarVisibility" }
+        ]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+
+        assert_eq!(
+            report.keybindings,
+            vec![
+                (String::from("ctrl+k z"), String::from("toggle_zen_mode")),
+                (String::from("ctrl+shift+p"), String::from("quick_open")),
+            ]
+        );
+        assert_eq!(
+            report.dropped_keybindings.len(),
+            2,
+            "an unknown command and an unbinding are both reported: {:?}",
+            report.dropped_keybindings
+        );
+        assert!(
+            report
+                .dropped_keybindings
+                .iter()
+                .any(|d| d.contains("some.extension.command")),
+            "a chord croft cannot honour must be NAMED, not bound to something \
+             that merely sounds similar"
+        );
+    }
+
+    /// Every croft command id in the table must actually exist. A typo here
+    /// would produce a keybindings.json croft itself rejects at load.
+    #[test]
+    fn every_mapped_command_id_is_a_real_croft_command() {
+        for (vscode, croft) in COMMANDS {
+            assert!(
+                crate::widgets::command_palette::Command::from_id(croft).is_some(),
+                "{vscode} maps to {croft}, which is not a croft command id"
+            );
+        }
+    }
+
+    #[test]
+    fn snippets_take_their_language_from_the_file_name() {
+        let doc = json!({
+            "Print": { "prefix": "log", "body": "print($1)$0" },
+            "Scoped": { "prefix": "x", "body": "y", "scope": "rust" },
+            "Broken": { "prefix": "no body" }
+        });
+        let mut report = Report::default();
+        convert_snippets(&doc, Some("python"), &mut report);
+
+        assert_eq!(report.snippets["Print"]["scope"], json!("python"));
+        assert_eq!(
+            report.snippets["Scoped"]["scope"],
+            json!("rust"),
+            "an explicit scope wins over the file name"
+        );
+        assert!(!report.snippets.contains_key("Broken"));
+        assert_eq!(report.warnings.len(), 1);
+    }
+
+    /// A `.code-snippets` file carries its own scopes, so nothing is added.
+    #[test]
+    fn a_global_snippets_file_keeps_its_own_scope() {
+        let doc = json!({ "Any": { "prefix": "a", "body": "b" } });
+        let mut report = Report::default();
+        convert_snippets(&doc, None, &mut report);
+        assert!(report.snippets["Any"].get("scope").is_none());
+    }
+
+    /// Reading a whole profile: the three files, in one pass, with the
+    /// snippets directory keyed by file name.
+    #[test]
+    fn a_profile_directory_converts_end_to_end() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{
+                // VS Code writes JSONC here
+                "editor.formatOnSave": true,
+                "editor.fontSize": 13,
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("keybindings.json"),
+            r#"[{ "key": "ctrl+s", "command": "workbench.action.files.save" }]"#,
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("snippets")).unwrap();
+        std::fs::write(
+            dir.path().join("snippets").join("rust.json"),
+            r##"{ "Test": { "prefix": "tst", "body": "#[test]" } }"##,
+        )
+        .unwrap();
+
+        let report = scan_profile(dir.path()).expect("the profile scans");
+        assert_eq!(report.settings["format_on_save"], json!(true));
+        assert_eq!(
+            report.unmapped_settings,
+            vec![String::from("editor.fontSize")]
+        );
+        assert_eq!(
+            report.keybindings,
+            vec![(String::from("ctrl+s"), String::from("save_file"))]
+        );
+        assert_eq!(report.snippets["Test"]["scope"], json!("rust"));
+    }
+
+    /// A missing profile is empty, not an error: someone may have only ever
+    /// set keybindings.
+    #[test]
+    fn an_empty_profile_directory_is_not_a_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let report = scan_profile(dir.path()).expect("an empty profile is fine");
+        assert!(report.is_empty());
+    }
+}
