@@ -2386,13 +2386,12 @@ impl PtyTerminal {
         // The clicked column as a char index: a wide char's spacer column
         // resolves to the wide char itself (the `line_text_at` rule).
         let vc = vc as usize;
-        // Blank cells past the row's text belong to no char (the colmap
-        // covers every grid column, blanks included): a click there must
-        // not pop the last token's value.
+        // `row_text_and_cols` maps every non-spacer column, blanks
+        // included, so a click on a blank cell resolves to that blank's own
+        // char index - never back into a token. The `rposition` only ever
+        // steps back for a wide char's spacer column, which is the wide
+        // char itself.
         let ci = colmap.iter().rposition(|&gc| gc <= vc)?;
-        if ci >= text.trim_end().chars().count() {
-            return None;
-        }
         crate::triggers::redact_spans(&text, &set)
             .into_iter()
             .find(|s| ci >= s.start && ci < s.start + s.len)
@@ -5613,9 +5612,8 @@ mod tests {
             "off the mask: nothing"
         );
         // A row whose masked token is its LAST text: a click a few cells
-        // right of the mask, still inside the pane, must reveal nothing.
-        // Without the bound the click resolves to the row's last char,
-        // which is inside the mask.
+        // right of the mask, still inside the pane, resolves to that blank
+        // cell's own char (the colmap is dense) and reveals nothing.
         let (ty, tline) = rows
             .iter()
             .enumerate()

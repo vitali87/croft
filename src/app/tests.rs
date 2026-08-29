@@ -20944,16 +20944,20 @@ fn the_session_store_holds_the_mask_not_the_key() {
 
 /// #360: quick-select offers no hint inside a masked span (a hex run or a
 /// number there is a fragment of the secret), while hints elsewhere on
-/// the screen survive.
+/// the screen survive. The masked token here is itself a hex run at a
+/// word boundary, so without the filter it WOULD be a hint.
 #[test]
 fn quick_select_skips_hints_inside_masked_spans() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(
+        r#"[{ "regex": "token \\S+", "action": "redact" }]"#,
+    ));
     let term = crate::widgets::terminal::PtyTerminal::new_with_transcript(
         tmp.path(),
         &[
-            String::from("key AKIA1234567890123456 end"),
-            String::from("commit deadbeefcafe0123 fixed it"),
+            String::from("token deadbeefcafe0123 end"),
+            String::from("commit cafebabe0123456 fixed it"),
         ],
     )
     .unwrap();
@@ -20966,14 +20970,12 @@ fn quick_select_skips_hints_inside_masked_spans() {
         .expect("quick select opened");
     let texts: Vec<&str> = state.hints.iter().map(|h| h.text.as_str()).collect();
     assert!(
-        texts.iter().any(|t| t.contains("deadbeefcafe0123")),
+        texts.iter().any(|t| t.contains("cafebabe0123456")),
         "the ordinary hash is still a hint: {texts:?}"
     );
     assert!(
-        texts
-            .iter()
-            .all(|t| !"AKIA1234567890123456".contains(t) || t.len() < 4),
-        "no hint is a fragment of the masked key: {texts:?}"
+        !texts.iter().any(|t| t.contains("deadbeefcafe0123")),
+        "the hex run inside the masked token is not a hint: {texts:?}"
     );
 }
 

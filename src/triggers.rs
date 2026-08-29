@@ -73,11 +73,11 @@ pub struct Trigger {
     /// Redact only: a copy of a masked span yields the mask, not the value
     /// (`"copy": "masked"`). Default: copies carry the real text.
     pub copy_masked: bool,
-    /// Redact only: the span's BODY (after its last hyphen) must carry a
-    /// digit or an uppercase letter to count. A key body is random
-    /// alphanumerics (all-lowercase-letters is a one-in-a-million shape at
-    /// 16 chars); a hyphenated prose word's last segment is a word. Built-in
-    /// `sk-` uses it; user rules do not.
+    /// Redact only: an UNLABELLED span (prefix plus body, no further
+    /// hyphen) must carry a digit or an uppercase letter to count, so
+    /// `sk-` plus a lowercase word is not a key. A labelled span
+    /// (`sk-ant-api03-…`) always counts. Built-in `sk-` uses it; user rules
+    /// do not.
     pub needs_entropy: bool,
 }
 
@@ -325,13 +325,16 @@ pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
                     None => continue,
                 },
             };
-            // The entropy test looks at the key BODY - the segment after the
-            // last label hyphen - so a digit in a label (`api03`) cannot
-            // vouch for a lowercase-only body, and an all-letter label
-            // cannot sink a real one.
+            // The entropy test applies to an UNLABELLED match only: `sk-` plus
+            // a body that is all lowercase letters is a hyphenated word, but
+            // `sk-ant-api03-…` is a key shape whatever its body looks like.
+            // Masking a rare `sk-word-word` costs a click to reveal; missing
+            // a real key costs the transcript and history it lands in.
+            let labelled = m.as_str().matches('-').count() > 1;
             let body = m.as_str().rsplit('-').next().unwrap_or(m.as_str());
             if m.as_str().is_empty()
                 || (t.needs_entropy
+                    && !labelled
                     && !body
                         .chars()
                         .any(|c| c.is_ascii_digit() || c.is_ascii_uppercase()))
@@ -769,11 +772,17 @@ mod tests {
             "•".repeat(plain_body.len()),
             "no label, mixed body"
         );
-        let label_digit_only = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzabcdef";
+        let lowercase_body = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzabcdef";
         assert_eq!(
-            masked(label_digit_only),
-            label_digit_only,
-            "a digit in the label does not vouch for an all-lowercase body"
+            masked(lowercase_body),
+            "•".repeat(lowercase_body.len()),
+            "a labelled key masks whatever its body looks like"
+        );
+        let labelled_word = "sk-learn-preprocessingtransformerspipeline";
+        assert_eq!(
+            masked(labelled_word),
+            "•".repeat(labelled_word.len()),
+            "a labelled lowercase token masks too: a click reveals it, a missed key never comes back"
         );
         assert_eq!(
             masked(r#"{"Authorization": "Bearer tok_abcdef1234567890"}"#),
@@ -803,7 +812,6 @@ mod tests {
             "Bearer responsibilities matter",
             "run task sk-something-like-this-long",
             "sk-preprocessingtransformerspipeline",
-            "sk-learn-preprocessingtransformerspipeline",
             "the skeleton key",
             "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
         ] {
