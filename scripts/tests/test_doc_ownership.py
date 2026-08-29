@@ -94,6 +94,49 @@ class ItemKinds(unittest.TestCase):
                 f"{decl!r} should be seen as documented item {name!r}",
             )
 
+    def test_declaration_shapes_the_regex_must_not_miss(self):
+        """Shapes that look like edge cases and are ordinary Rust.
+
+        Each was probed rather than assumed: the same-line attribute was
+        genuinely missed before this test existed, which made the item
+        invisible to the gate rather than merely undocumented.
+        """
+        for label, text in [
+            ("attribute on its own line", "/// doc\n#[cfg(test)]\nconst A: u8 = 1;\n"),
+            ("attribute on the same line", "/// doc\n#[cfg(test)] const A: u8 = 1;\n"),
+            ("generic type alias", "/// doc\npub type A<T> = Vec<T>;\n"),
+            ("const fn", "/// doc\npub const fn a() -> u8 { 1 }\n"),
+            ("indented impl method", "impl X {\n    /// doc\n    pub fn a(&self) {}\n}\n"),
+        ]:
+            state = gate.documented(text)
+            self.assertTrue(
+                any(state.values()),
+                f"{label}: nothing was recognised, so the item is invisible "
+                f"to the gate rather than merely undocumented",
+            )
+
+    def test_a_declaration_inside_a_string_is_not_an_item(self):
+        """The regex is line-anchored, so a declaration quoted mid-line is
+        not mistaken for one."""
+        state = gate.documented('/// doc\nconst A: &str = "const B: u8 = 1;";\n')
+        self.assertEqual(state, {"A": True}, "B is inside a string, not an item")
+
+    def test_a_rename_is_not_a_lost_doc(self):
+        """A documented item renamed within a branch must not read as a loss.
+
+        The check requires the name to still EXIST at head, so a rename drops
+        out rather than reporting the old name as undocumented. Pinned because
+        it is the obvious false positive for a name-keyed comparison.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "/// doc\nfn a() {}\n")
+            repo.branch("work")
+            repo.commit("a.rs", "/// doc\nfn b() {}\n")
+            self.assertEqual(
+                repo.exit_code(), 0, "a rename is not a captured doc comment"
+            )
+
     def test_a_const_that_loses_its_doc_is_reported(self):
         """The #395 shape: a const inserted above another const's doc."""
         before = gate.documented(DOCUMENTED_CONST)

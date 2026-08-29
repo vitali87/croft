@@ -30,7 +30,10 @@ import sys
 # name is not unique enough to key on, and its methods are matched as `fn`
 # in their own right.
 ITEM = re.compile(
-    r"^\s*(?:pub(?:\([^)]*\))?\s+)?"
+    # A same-line attribute (`#[cfg(test)] const A: u8 = 1;`) is unusual but
+    # legal, and rustfmt leaves it alone inside macro bodies. Skipping it here
+    # costs nothing and stops the item from being invisible.
+    r"^\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?"
     r"(?:default\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?"
     r"(?:const\s+)?(?:"
     r"fn\s+([A-Za-z_]\w*)"
