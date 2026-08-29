@@ -276,7 +276,7 @@ pub fn parse_workspace_file(path: &Path) -> Result<Vec<PathBuf>, String> {
 /// Strip VS Code's JSONC extras so serde can parse: `//` and `/* */`
 /// comments outside strings, and trailing commas before `]`/`}` (#164
 /// review — `.code-workspace` files legitimately carry all three).
-fn strip_jsonc(src: &str) -> String {
+pub fn strip_jsonc(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
