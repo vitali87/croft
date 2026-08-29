@@ -148,7 +148,14 @@ class Decide(unittest.TestCase):
 
     def test_oversized_integer_confidence_needs_human(self):
         raw = json.dumps(verdict()).replace("0.95", "1" + "0" * 400)
-        self.assertEqual(self.decide(raw).status, "needs-human")
+        self.assertNotIn("0.95", raw, "the fixture's confidence appears exactly once")
+        d = self.decide(raw)
+        self.assertEqual(d.status, "needs-human")
+        self.assertIn("low-confidence", d.flags)
+
+    def test_string_confidence_needs_human(self):
+        # A quoted number is the likely schema slip; float("0.95") must not reach ready.
+        self.assertEqual(self.decide(verdict(confidence="0.95")).status, "needs-human")
 
     def test_confidence_outside_unit_range_needs_human(self):
         for value in (1.5, -0.2):

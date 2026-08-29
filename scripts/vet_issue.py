@@ -233,11 +233,12 @@ def decide(response: dict | None) -> Decision:
         flags = ["unparseable-verdict"]
         return Decision(STATUS_NEEDS_HUMAN, flags, _needs_human_comment(flags, "The screening model's answer was not a verdict."))
 
-    # Fail closed on anything that is not a finite probability: NaN compares
-    # false against every threshold, and infinity clears all of them.
+    # Fail closed on anything that is not a finite probability in 0..1.
+    # A bool is an int subclass and float(True) is 1.0; a quoted number is a
+    # string; an integer too large for a float raises OverflowError; NaN
+    # compares false against every threshold and infinity clears all of
+    # them (the isfinite/range check below).
     raw_confidence = verdict.get("confidence", 0)
-    # bool is an int subclass and float(True) is 1.0; a bool is not a
-    # probability. An integer too large for a float raises OverflowError.
     if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
         confidence = 0.0
     else:
