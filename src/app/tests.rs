@@ -20942,6 +20942,41 @@ fn the_session_store_holds_the_mask_not_the_key() {
     );
 }
 
+/// #360: quick-select offers no hint inside a masked span (a hex run or a
+/// number there is a fragment of the secret), while hints elsewhere on
+/// the screen survive.
+#[test]
+fn quick_select_skips_hints_inside_masked_spans() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let term = crate::widgets::terminal::PtyTerminal::new_with_transcript(
+        tmp.path(),
+        &[
+            String::from("key AKIA1234567890123456 end"),
+            String::from("commit deadbeefcafe0123 fixed it"),
+        ],
+    )
+    .unwrap();
+    app.insert_terminal(term);
+    app.focus_pane(Pane::Terminal);
+    app.open_terminal_quick_select();
+    let state = app
+        .terminal_quick_select
+        .as_ref()
+        .expect("quick select opened");
+    let texts: Vec<&str> = state.hints.iter().map(|h| h.text.as_str()).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("deadbeefcafe0123")),
+        "the ordinary hash is still a hint: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .all(|t| !"AKIA1234567890123456".contains(t) || t.len() < 4),
+        "no hint is a fragment of the masked key: {texts:?}"
+    );
+}
+
 #[test]
 fn clicking_the_problems_tab_switches_the_panel_view() {
     let tmp = tempfile::tempdir().unwrap();

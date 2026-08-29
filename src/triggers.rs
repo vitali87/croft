@@ -73,10 +73,11 @@ pub struct Trigger {
     /// Redact only: a copy of a masked span yields the mask, not the value
     /// (`"copy": "masked"`). Default: copies carry the real text.
     pub copy_masked: bool,
-    /// Redact only: the span must carry a digit or an uppercase letter to
-    /// count. A key body is random alphanumerics (all-lowercase-letters is
-    /// a one-in-a-million shape at 16 chars); a hyphenated prose word never
-    /// has either. Built-in `sk-` uses it; user rules do not.
+    /// Redact only: the span's BODY (after its last hyphen) must carry a
+    /// digit or an uppercase letter to count. A key body is random
+    /// alphanumerics (all-lowercase-letters is a one-in-a-million shape at
+    /// 16 chars); a hyphenated prose word's last segment is a word. Built-in
+    /// `sk-` uses it; user rules do not.
     pub needs_entropy: bool,
 }
 
@@ -324,10 +325,14 @@ pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
                     None => continue,
                 },
             };
+            // The entropy test looks at the key BODY - the segment after the
+            // last label hyphen - so a digit in a label (`api03`) cannot
+            // vouch for a lowercase-only body, and an all-letter label
+            // cannot sink a real one.
+            let body = m.as_str().rsplit('-').next().unwrap_or(m.as_str());
             if m.as_str().is_empty()
                 || (t.needs_entropy
-                    && !m
-                        .as_str()
+                    && !body
                         .chars()
                         .any(|c| c.is_ascii_digit() || c.is_ascii_uppercase()))
             {
@@ -758,6 +763,18 @@ mod tests {
         assert_eq!(masked(ant), "•".repeat(ant.len()), "two labels: Anthropic");
         let or = "sk-or-v1-abcdef1234567890abcdef1234567890";
         assert_eq!(masked(or), "•".repeat(or.len()), "two labels: OpenRouter");
+        let plain_body = "sk-abcdefghijklmnopqrstuvwxyzabcdefgH1";
+        assert_eq!(
+            masked(plain_body),
+            "•".repeat(plain_body.len()),
+            "no label, mixed body"
+        );
+        let label_digit_only = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzabcdef";
+        assert_eq!(
+            masked(label_digit_only),
+            label_digit_only,
+            "a digit in the label does not vouch for an all-lowercase body"
+        );
         assert_eq!(
             masked(r#"{"Authorization": "Bearer tok_abcdef1234567890"}"#),
             r#"{"Authorization": "Bearer ••••••••••••••••••••"}"#,

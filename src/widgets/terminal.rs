@@ -5551,14 +5551,16 @@ mod tests {
             "/bin/sh",
             &[
                 String::from("-c"),
-                String::from("printf 'key AKIAIOSFODNN7EXAMPLE end\\n'; sleep 30"),
+                String::from(
+                    "printf 'key AKIAIOSFODNN7EXAMPLE end\\ntail AKIAIOSFODNN7EXAMPLE\\n'; sleep 30",
+                ),
             ],
             tmp.path(),
         )
         .unwrap();
         // The pane's spawn banner echoes the command line, key included, so
         // wait for the OUTPUT line, which starts at column 0.
-        wait_for_grid(&term, |ls| ls.iter().any(|l| l.starts_with("key AKIA")));
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.starts_with("tail AKIA")));
         term.set_triggers(std::sync::Arc::new(
             crate::triggers::TriggerSet::default().with_builtin_redactions(),
         ));
@@ -5610,9 +5612,25 @@ mod tests {
             None,
             "off the mask: nothing"
         );
-        let past_text = line.trim_end().chars().count() as u16 + 3;
+        // A row whose masked token is its LAST text: a click a few cells
+        // right of the mask, still inside the pane, must reveal nothing.
+        // Without the bound the click resolves to the row's last char,
+        // which is inside the mask.
+        let (ty, tline) = rows
+            .iter()
+            .enumerate()
+            .map(|(y, l)| (y as u16, l.clone()))
+            .find(|(_, l)| l.starts_with("\u{2502}tail "))
+            .expect("the tail line rendered");
+        let tx = tline.chars().position(|c| c == '\u{2022}').unwrap() as u16;
         assert_eq!(
-            term.redacted_at(past_text, y),
+            term.redacted_at(tx, ty).as_deref(),
+            Some("AKIAIOSFODNN7EXAMPLE"),
+            "the last token's mask still reveals on itself"
+        );
+        assert!(tx + 24 < area.width - 1, "the probe stays inside the pane");
+        assert_eq!(
+            term.redacted_at(tx + 24, ty),
             None,
             "blank cells right of the row's text reveal nothing"
         );

@@ -30269,12 +30269,17 @@ impl App {
         // A hex run or a number inside a masked span would be a fragment of
         // the secret one keystroke from the clipboard (#360): no hint there.
         if self.triggers.has_redactions() && !self.redactions_revealed() {
-            matches.retain(|m| {
-                lines.get(m.row).is_none_or(|line| {
+            let clear = |row: usize, start: usize, len: usize| {
+                lines.get(row).is_none_or(|line| {
                     crate::triggers::redact_spans(line, &self.triggers)
                         .iter()
-                        .all(|s| m.start + m.len <= s.start || m.start >= s.start + s.len)
+                        .all(|s| start + len <= s.start || start >= s.start + s.len)
                 })
+            };
+            // A match that wraps the pane edge continues in `tail`; every
+            // segment must be clear, or the fragment past the wrap leaks.
+            matches.retain(|m| {
+                clear(m.row, m.start, m.len) && m.tail.iter().all(|&(r, s, l)| clear(r, s, l))
             });
         }
         if matches.is_empty() {
