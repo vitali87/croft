@@ -41100,6 +41100,15 @@ fn semantic_reply_is_current(seen: Option<u64>, incoming: u64) -> bool {
 /// The absolute (line, char column) a screen cell lands on in a rendered log
 /// body. The body starts one row below the header and the view scrolls by
 /// whole lines, so the mapping is a straight offset.
+///
+/// One cell is treated as one CHARACTER, which is what `render_log` already
+/// assumes: it advances by `chars().count()` rather than by display width,
+/// so a double-width character occupies two cells on screen and one column
+/// in this arithmetic. Selection therefore drifts on a line containing CJK
+/// or emoji, by exactly as much as the painting does. Matching the renderer
+/// is deliberate: a mapping that measured width correctly would disagree
+/// with what is actually on screen, which is worse than agreeing with it
+/// wrongly. Fixing it means teaching the renderer first.
 fn log_cell_at(
     log: &crate::log_view::LogView,
     scroll: usize,
