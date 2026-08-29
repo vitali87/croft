@@ -20492,11 +20492,11 @@ impl App {
             // host (keep checking — take over when that croft exits).
             if self.pair_host_lock.is_none() {
                 match crate::session::try_acquire_pair_host_lock(&self.pair_host_lock_path) {
-                    Some(lock) => {
+                    Ok(lock) => {
                         self.pair_host_lock = Some(lock);
                         self.pair_lock_denied = false;
                     }
-                    None => {
+                    Err(e) => {
                         // Announced ONCE: the takeover poll keeps running
                         // every second, and re-announcing clobbered the
                         // window's status line forever at a 1 Hz repaint.
@@ -20504,10 +20504,21 @@ impl App {
                             return false;
                         }
                         self.pair_lock_denied = true;
-                        self.status = format!(
-                            "Navigator '{}' is hosted by another croft window in this workspace",
-                            record.name
-                        );
+                        // Busy and unopenable read the same from here (no
+                        // host this tick, poll again) but not to the user:
+                        // one has a window to close, the other has a path
+                        // to fix and no window anywhere (#337).
+                        self.status = match e {
+                            crate::session::PairHostLockError::Busy => format!(
+                                "Navigator '{}' is hosted by another croft window in this workspace",
+                                record.name
+                            ),
+                            crate::session::PairHostLockError::Io(e) => format!(
+                                "Navigator '{}': cannot open host lock {}: {e}",
+                                record.name,
+                                self.pair_host_lock_path.display()
+                            ),
+                        };
                         return true;
                     }
                 }

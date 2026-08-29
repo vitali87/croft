@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Task discovery no longer loses a label: a tasks.json entry that reuses a Makefile, Cargo or package.json command under its own name used to drop the convention task entirely, so a preLaunchTask or Tasks: Run Task pick by that name reported \"not found\". Tasks are now de-duplicated by label and command together, so a label the workspace declares always survives.",
+    summary: "A navigator host lock croft cannot create or open (a missing or read-only config directory, an fd limit) is now reported as exactly that, with the path and the error, instead of as \"hosted by another croft window\" when no other window exists.",
 }];
