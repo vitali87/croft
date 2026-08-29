@@ -229,25 +229,53 @@ pub fn looks_destructive(code: &str) -> bool {
 }
 
 /// A `>` that writes somewhere: not `2>&1` / `>&2` (a descriptor dup),
-/// not `>/dev/null`, not an arrow (`->`, `=>`), not in a trailing comment.
+/// not `>/dev/null` (the device itself, not `/dev/nullish`), not an arrow
+/// (`->`, `=>`), not in a trailing comment. Quotes are honoured, so a `#`
+/// or `>` inside `"…"` / `'…'` is text - otherwise
+/// `echo "step #1" > ~/.bashrc` would hide its redirect behind a fake
+/// comment. `<>` counts: it opens its target for writing too.
 fn has_write_redirect(line: &str) -> bool {
-    let code = match line.find(" #") {
-        Some(i) => &line[..i],
-        None => line.strip_prefix('#').map_or(line, |_| ""),
-    };
-    let chars: Vec<char> = code.chars().collect();
-    chars.iter().enumerate().any(|(i, &c)| {
-        if c != '>' {
-            return false;
+    let b = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            // A backslash inside double quotes escapes the next byte.
+            Some(b'"') if c == b'\\' => i += 1,
+            Some(_) => {}
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'#' if i == 0 || b[i - 1].is_ascii_whitespace() => return false,
+                b'>' => {
+                    let prev = if i > 0 { b[i - 1] } else { b' ' };
+                    if prev != b'-' && prev != b'=' {
+                        let mut j = i + 1;
+                        while j < b.len() && b[j] == b'>' {
+                            j += 1;
+                        }
+                        while j < b.len() && b[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        let target = &line[j..];
+                        let dev_null = target.strip_prefix("/dev/null").is_some_and(|rest| {
+                            rest.is_empty()
+                                || rest.starts_with(|r: char| {
+                                    r.is_ascii_whitespace() || ";&|)".contains(r)
+                                })
+                        });
+                        if !(target.starts_with('&') || dev_null) {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            },
         }
-        let prev = if i > 0 { chars[i - 1] } else { ' ' };
-        if prev == '-' || prev == '=' || prev == '<' {
-            return false;
-        }
-        let rest: String = chars[i + 1..].iter().collect();
-        let target = rest.trim_start_matches('>').trim_start();
-        !(target.starts_with('&') || target.starts_with("/dev/null"))
-    })
+        i += 1;
+    }
+    false
 }
 
 /// One local image block in a rendered preview (#176).
@@ -1135,6 +1163,10 @@ mod tests {
             "chmod -R 777 /",
             "echo x > ~/.bashrc",
             "cat payload >> ~/.ssh/authorized_keys",
+            "echo \"setup #1 complete\" > ~/.bashrc",
+            "printf 'step #2\\n' > ~/.zshrc",
+            "exec 3<> /tmp/x",
+            "make > /dev/nullish",
             "git push --force",
             "git reset --hard HEAD~3",
         ] {
@@ -1151,6 +1183,9 @@ mod tests {
             "make >/dev/null",
             "echo a -> b",
             "ls # see https://x -> y",
+            "echo '> quoted' # not a redirect",
+            "echo \"a > b\"",
+            "make >/dev/null 2>&1",
             "if [ 3 -gt 2 ]; then echo yes; fi",
         ] {
             assert!(!looks_destructive(ok), "{ok:?} is ordinary");
