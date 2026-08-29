@@ -527,11 +527,15 @@ pub fn svg(
     let span = if hi > lo { hi - lo } else { 1.0 };
     let left = 48.0;
     let right = w - 12.0;
-    let bottom = h - if ds.labels.is_some() && kind != ChartKind::Spark {
+    let pad_b = if ds.labels.is_some() && kind != ChartKind::Spark {
         22.0
     } else {
         10.0
     };
+    // A height too small for the axis padding yields the padding, not the
+    // plot: a negative plot height would invert every y and draw the whole
+    // chart above the viewBox.
+    let bottom = (h - pad_b).max(top + 1.0);
     let plot_h = bottom - top;
     let y_of = |v: f64| bottom - (v - lo) / span * plot_h;
     // Gridlines and axis labels.
@@ -1001,6 +1005,32 @@ mod tests {
             widths.iter().all(|w| *w == widths[0]),
             "every row the same display width: {rows:?}"
         );
+    }
+
+    /// A height smaller than the axis padding (`--height 1` with labels, a
+    /// titled chart at 40px) must still draw inside the viewBox: every y
+    /// the chart emits lies within `0..=h`.
+    #[test]
+    fn a_tiny_height_keeps_the_chart_inside_the_viewbox() {
+        let p = Palette::default();
+        let d = ds("label,v\na,1\nb,3\nc,2\n");
+        for (title, h) in [(None, 20u32), (Some("t"), 40)] {
+            let out = svg(&d, ChartKind::Bar, title, 600, h, &p);
+            let ys: Vec<f64> = out
+                .split([' ', '/'])
+                .filter_map(|a| {
+                    a.strip_prefix("y=\"")
+                        .or_else(|| a.strip_prefix("y1=\""))
+                        .or_else(|| a.strip_prefix("y2=\""))
+                        .and_then(|v| v.trim_end_matches('"').parse().ok())
+                })
+                .collect();
+            assert!(!ys.is_empty(), "no y coordinates parsed: {out}");
+            assert!(
+                ys.iter().all(|y| *y >= 0.0 && *y <= f64::from(h)),
+                "h={h}: a y escaped the viewBox: {ys:?}"
+            );
+        }
     }
 
     #[test]
