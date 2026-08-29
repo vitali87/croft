@@ -95,9 +95,11 @@ pub fn latest_from_release_json(json: &str) -> Option<String> {
     parse_version(version).map(|_| version.to_string())
 }
 
-/// Whether the cache is stale enough to ask the network again.
+/// Whether the cache is stale enough to ask the network again. Keyed on
+/// the last attempt, not the last answer: a failed request counts, so a
+/// blocked endpoint is retried daily rather than on every launch.
 pub fn should_query(cache: &CheckCache, now_secs: u64) -> bool {
-    cache.latest.is_none() || now_secs.saturating_sub(cache.checked_at) >= CHECK_INTERVAL.as_secs()
+    now_secs.saturating_sub(cache.checked_at) >= CHECK_INTERVAL.as_secs()
 }
 
 /// The version to offer, if the cache knows one newer than `current` that
@@ -144,19 +146,40 @@ impl UpdateCheck {
     /// Consult the cache first; hit the network at most once per
     /// [`CHECK_INTERVAL`]. Everything runs off-thread.
     pub fn start(cache_dir: PathBuf, current_version: String) -> Self {
+        Self::start_with(cache_dir, current_version, fetch_latest)
+    }
+
+    /// [`Self::start`] with the network call injected, so the throttle can
+    /// be exercised without a network.
+    pub fn start_with(
+        cache_dir: PathBuf,
+        current_version: String,
+        fetch: impl FnOnce() -> Option<String> + Send + 'static,
+    ) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let mut cache = CheckCache::load(&cache_dir);
-            if should_query(&cache, now_secs())
-                && let Some(latest) = fetch_latest()
-            {
-                cache.latest = Some(latest);
+            if should_query(&cache, now_secs()) {
+                if let Some(latest) = fetch() {
+                    cache.latest = Some(latest);
+                }
+                // Stamped on failure too: a blocked or rate-limited endpoint
+                // must not be asked again on every launch, and every launch
+                // would otherwise pay the request's timeout.
                 cache.checked_at = now_secs();
                 let _ = cache.save(&cache_dir);
             }
             let _ = tx.send(offer_from(&cache, &current_version));
         });
         Self { rx }
+    }
+
+    /// Block for the verdict (tests only; the app polls with [`Self::take`]).
+    #[cfg(test)]
+    pub fn wait(&self) -> Option<String> {
+        self.rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the check answers")
     }
 
     /// The verdict once it lands; `None` while still checking.
@@ -278,7 +301,9 @@ impl StagedInstall {
 
 /// Put the staged binary in place of `target`: copy beside it, then rename
 /// over, so a crash mid-copy never leaves a half-written croft on PATH and
-/// the running process keeps its own (unlinked) image until it execs.
+/// the running process keeps its own (unlinked) image until it execs. The
+/// temp file is created exclusively (`create_new`), so a pre-planted
+/// symlink at the predictable name is refused rather than followed.
 pub fn apply_staged(staged: &Path, target: &Path) -> std::io::Result<()> {
     let Some(dir) = target.parent() else {
         return Err(std::io::Error::other(
@@ -287,17 +312,25 @@ pub fn apply_staged(staged: &Path, target: &Path) -> std::io::Result<()> {
     };
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".croft-update-{}", std::process::id()));
-    std::fs::copy(staged, &tmp)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    }
-    if let Err(e) = std::fs::rename(&tmp, target) {
+    let result = (|| {
+        let mut src = std::fs::File::open(staged)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o755);
+        }
+        let mut dst = opts.open(&tmp)?;
+        std::io::copy(&mut src, &mut dst)?;
+        dst.sync_all()?;
+        drop(dst);
+        std::fs::rename(&tmp, target)
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -334,8 +367,8 @@ mod tests {
         assert!(!should_query(&fresh, 1_000_000 + 3600));
         assert!(should_query(&fresh, 1_000_000 + CHECK_INTERVAL.as_secs()));
         assert!(
-            should_query(&CheckCache::default(), 5),
-            "an empty cache asks"
+            should_query(&CheckCache::default(), 1_700_000_000),
+            "a never-stamped cache asks"
         );
     }
 
@@ -383,6 +416,59 @@ mod tests {
             CheckCache::default(),
             "a missing file is an empty cache"
         );
+    }
+
+    /// A failed or blocked request is throttled like a successful one:
+    /// the stamp advances so the next launch does not pay the timeout
+    /// again, and the empty answer never offers anything.
+    #[test]
+    fn a_failed_check_is_stamped_and_not_retried_until_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = UpdateCheck::start_with(dir.path().to_path_buf(), "0.1.0".into(), || None);
+        assert_eq!(check.wait(), None);
+        let cache = CheckCache::load(dir.path());
+        assert!(cache.checked_at > 0, "the failed attempt is stamped");
+        assert_eq!(cache.latest, None);
+        assert!(
+            !should_query(&cache, cache.checked_at + 60),
+            "not asked again for a day"
+        );
+        // A later successful fetch after the interval offers normally.
+        let check = UpdateCheck::start_with(dir.path().to_path_buf(), "0.1.0".into(), || {
+            Some("0.2.0".into())
+        });
+        assert_eq!(
+            check.wait(),
+            None,
+            "inside the interval the cache answers, and it is empty"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_a_planted_symlink_at_the_temp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, b"new").unwrap();
+        let target = dir.path().join("bin").join("croft");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"old").unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let tmp = target
+            .parent()
+            .unwrap()
+            .join(format!(".croft-update-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        assert!(
+            apply_staged(&staged, &target).is_err(),
+            "an existing entry is refused"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious",
+            "the symlink target is untouched"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
     }
 
     #[test]

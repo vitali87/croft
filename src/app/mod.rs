@@ -869,6 +869,16 @@ enum UpdateToastAction {
     Relaunch,
 }
 
+/// Which producer an [`crate::update_watch::UpdateEvent`] came from: the
+/// remote install watcher, the drift rebuild, or the staged release build
+/// (#333). They share one event type and one status-bar state machine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpdateSource {
+    Watch,
+    SelfInstall,
+    Staged,
+}
+
 /// State of a background self-update observed by a remote-launched croft.
 /// `Idle` is the steady state; `InProgress` paints an "Updating" hint in
 /// the status bar; `Ready` arms the re-exec into the freshly-shipped binary.
@@ -2995,6 +3005,11 @@ pub struct App {
     /// release. Reported through the same UpdateEvent lifecycle as the
     /// remote watcher; the binary on PATH is untouched until Relaunch.
     staged_install: Option<crate::update_check::StagedInstall>,
+    /// The staged build reported `Ready` itself. `update_status` is shared
+    /// with the remote watcher and the drift rebuild, so it alone cannot
+    /// say WHICH update landed; Relaunch swaps the staged binary in only
+    /// when this is set.
+    staged_ready: bool,
     update_status: UpdateStatus,
     /// When a background self-update is in progress, the instant it started.
     /// Drives the spinning update glyph in the status bar (and the redraw
@@ -4241,6 +4256,7 @@ impl App {
             update_check: None,
             update_toast: None,
             staged_install: None,
+            staged_ready: false,
             update_status: UpdateStatus::Idle,
             update_spinner_start: None,
             pending_reexec: false,
@@ -15904,12 +15920,15 @@ impl App {
         let width = (inner_w + 4).min(area.width.saturating_sub(2));
         let height: u16 = 4;
         let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
-        if area.width < width + 2 || area.height < height + status_h + 1 {
+        // The port toast owns the bottom-right band; at ordinary widths
+        // this popup's title reaches into it, so stack above it instead.
+        let stack: u16 = if self.port_toast.is_some() { 4 } else { 0 };
+        if area.width < width + 2 || area.height < height + status_h + 1 + stack {
             return;
         }
         let rect = Rect {
             x: area.x + 1,
-            y: area.y + area.height - height - status_h - 1,
+            y: area.y + area.height - height - status_h - 1 - stack,
             width,
             height,
         };
@@ -23045,10 +23064,11 @@ impl App {
     /// state machine takes it from here: spinner while cargo runs, then
     /// the popup and the status bar both offer Relaunch.
     fn start_staged_update(&mut self, version: String) {
+        self.staged_ready = false;
         self.staged_install = Some(crate::update_check::StagedInstall::start(
             croft_cache_dir(),
             version,
-            self_install_log_path(),
+            staged_install_log_path(),
         ));
     }
 
@@ -23062,7 +23082,8 @@ impl App {
     /// The staged binary waiting to be swapped in, once its build landed.
     fn staged_update_binary(&self) -> Option<PathBuf> {
         let install = self.staged_install.as_ref()?;
-        (self.update_status == UpdateStatus::Ready).then(|| install.binary().to_path_buf())
+        (self.staged_ready && self.update_status == UpdateStatus::Ready)
+            .then(|| install.binary().to_path_buf())
     }
 
     /// Arm the rebuild hint when the drift probe's verdict lands. The probe
@@ -23107,24 +23128,39 @@ impl App {
                 // is drained - once per outer loop, BEFORE the input drain -
                 // so without this latch two F9s in one crossterm batch spawn
                 // two concurrent `cargo install`s racing cargo's locks
-                // (#245).
-                && self.self_install.is_none())
+                // (#245). The staged release build holds the same cargo
+                // lock, so it latches F9 the same way.
+                && self.self_install.is_none()
+                && self.staged_install.is_none())
     }
 
     pub fn poll_update_watch(&mut self) -> bool {
         let mut changed = self.poll_drift_probe();
         changed |= self.poll_update_check();
-        let mut events: Vec<crate::update_watch::UpdateEvent> = Vec::new();
+        // Three producers share one event vocabulary; each event keeps its
+        // origin so a drift rebuild's failure is never charged to the
+        // staged release build (or the reverse).
+        let mut events: Vec<(UpdateSource, crate::update_watch::UpdateEvent)> = Vec::new();
         if let Some(watch) = self.update_watch.as_ref() {
-            events.extend(watch.drain());
+            events.extend(watch.drain().into_iter().map(|e| (UpdateSource::Watch, e)));
         }
         if let Some(install) = self.self_install.as_ref() {
-            events.extend(install.drain());
+            events.extend(
+                install
+                    .drain()
+                    .into_iter()
+                    .map(|e| (UpdateSource::SelfInstall, e)),
+            );
         }
         if let Some(staged) = self.staged_install.as_ref() {
-            events.extend(staged.drain());
+            events.extend(
+                staged
+                    .drain()
+                    .into_iter()
+                    .map(|e| (UpdateSource::Staged, e)),
+            );
         }
-        for ev in events {
+        for (source, ev) in events {
             changed = true;
             match ev {
                 crate::update_watch::UpdateEvent::InProgress => {
@@ -23137,27 +23173,46 @@ impl App {
                 crate::update_watch::UpdateEvent::Failed => {
                     self.update_status = UpdateStatus::Idle;
                     self.update_spinner_start = None;
-                    self.status = if let Some(staged) = self.staged_install.take() {
-                        // The offer stays declinable: the popup comes back
-                        // so a retry or Later is one click away.
-                        self.update_toast = Some(UpdateToast {
-                            version: staged.version.clone(),
-                            ready: false,
-                            buttons: Vec::new(),
-                        });
-                        format!(
-                            "croft {} could not be built - see {} (still on v{})",
-                            staged.version,
-                            self_install_log_path().display(),
-                            env!("CARGO_PKG_VERSION")
-                        )
-                    } else if self.self_install.take().is_some() {
-                        format!(
-                            "croft rebuild failed - see {} (still on the old binary)",
-                            self_install_log_path().display()
-                        )
-                    } else {
-                        String::from("Background croft update failed; staying on current version")
+                    self.status = match source {
+                        UpdateSource::Staged => {
+                            let version = self
+                                .staged_install
+                                .take()
+                                .map(|s| s.version)
+                                .unwrap_or_default();
+                            self.staged_ready = false;
+                            // The offer stays declinable: the popup comes
+                            // back so a retry or Later is one click away -
+                            // unless the user already said Later to this
+                            // version in an earlier session.
+                            let dismissed =
+                                crate::update_check::CheckCache::load(&croft_cache_dir())
+                                    .dismissed
+                                    .as_deref()
+                                    == Some(version.as_str());
+                            if !dismissed {
+                                self.update_toast = Some(UpdateToast {
+                                    version: version.clone(),
+                                    ready: false,
+                                    buttons: Vec::new(),
+                                });
+                            }
+                            format!(
+                                "croft {version} could not be built - see {} (still on v{})",
+                                staged_install_log_path().display(),
+                                env!("CARGO_PKG_VERSION")
+                            )
+                        }
+                        UpdateSource::SelfInstall => {
+                            self.self_install = None;
+                            format!(
+                                "croft rebuild failed - see {} (still on the old binary)",
+                                self_install_log_path().display()
+                            )
+                        }
+                        UpdateSource::Watch => String::from(
+                            "Background croft update failed; staying on current version",
+                        ),
                     };
                 }
                 crate::update_watch::UpdateEvent::Ready => {
@@ -23171,7 +23226,10 @@ impl App {
                     self.status = String::from(
                         "Update ready - press F9 to relaunch croft (terminals will reset)",
                     );
-                    if let Some(staged) = self.staged_install.as_ref() {
+                    if source == UpdateSource::Staged
+                        && let Some(staged) = self.staged_install.as_ref()
+                    {
+                        self.staged_ready = true;
                         self.update_toast = Some(UpdateToast {
                             version: staged.version.clone(),
                             ready: true,
@@ -40782,6 +40840,12 @@ fn self_install_log_path() -> PathBuf {
     croft_cache_dir().join(format!("self-install-{}.log", std::process::id()))
 }
 
+/// The staged release build's log (#333): its own file, since a drift
+/// rebuild may run in the same process and must not overwrite it.
+fn staged_install_log_path() -> PathBuf {
+    croft_cache_dir().join(format!("staged-install-{}.log", std::process::id()))
+}
+
 /// Resolve the binary to re-exec into after an update. A local self-install
 /// re-execs the exact path cargo reported writing (which honors an
 /// `install.root` from cargo config that env resolution can't see), falling
@@ -41567,12 +41631,14 @@ pub fn run(
         if let Some(staged) = app.staged_update_binary()
             && let Err(err) = crate::update_check::apply_staged(&staged, &target)
         {
+            // The installed binary is untouched (copy-beside + rename), so
+            // relaunching it is still right: the editor must never simply
+            // exit because an update could not be applied.
             eprintln!(
-                "croft update failed: could not replace {} with {}: {err}",
+                "croft update failed: could not replace {} with {}: {err} - relaunching the current version",
                 target.display(),
                 staged.display()
             );
-            return Ok(());
         }
         let mut cmd = std::process::Command::new(target);
         cmd.arg(app.workspace_root())

@@ -20612,6 +20612,91 @@ fn an_update_offer_raises_the_bottom_left_toast_and_later_dismisses_it() {
     });
 }
 
+/// #333: the three update producers share one event type; a drift
+/// rebuild's Failed must not be charged to the staged release build, and a
+/// drift Ready must not hand Relaunch a staged binary that was never built.
+#[test]
+fn update_events_are_charged_to_their_own_producer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let staged = tmp.path().join("never-built");
+    app.staged_install = Some(crate::update_check::StagedInstall::preloaded(
+        &[],
+        staged.clone(),
+        "9.9.9",
+    ));
+    app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[
+        crate::update_watch::UpdateEvent::Failed,
+    ]));
+    assert!(app.poll_update_watch());
+    assert!(
+        app.staged_install.is_some(),
+        "the drift rebuild's failure leaves the staged build running"
+    );
+    assert!(
+        app.self_install.is_none(),
+        "the drift rebuild is the one that ended"
+    );
+    assert!(
+        app.status.contains("rebuild failed") && !app.status.contains("9.9.9"),
+        "the failure names the rebuild, not the release: {}",
+        app.status
+    );
+
+    app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[
+        crate::update_watch::UpdateEvent::Ready,
+    ]));
+    assert!(app.poll_update_watch());
+    assert_eq!(
+        app.update_status,
+        UpdateStatus::Ready,
+        "F9 is armed for the rebuild"
+    );
+    assert_eq!(
+        app.staged_update_binary(),
+        None,
+        "Relaunch must not swap in a staged binary that never landed"
+    );
+    assert!(
+        !app.update_toast.as_ref().is_some_and(|t| t.ready),
+        "the popup does not claim the release is ready"
+    );
+
+    // And F9 stays out of the rebuild path while the staged build holds
+    // cargo's lock (#245's latch, extended).
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.local_drift = Some(String::from("abc123"));
+    assert!(app.f9_update_armed(), "a drift hint arms F9");
+    app.staged_install = Some(crate::update_check::StagedInstall::preloaded(
+        &[],
+        staged,
+        "9.9.9",
+    ));
+    assert!(!app.f9_update_armed(), "not while a staged build runs");
+}
+
+/// #333: both corner popups can be up at once; they must not overlap.
+#[test]
+fn the_update_toast_stacks_above_the_port_toast() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.update_toast = Some(super::UpdateToast {
+        version: String::from("9.9.9"),
+        ready: false,
+        buttons: Vec::new(),
+    });
+    app.show_port_toast(3000, Some("node".into()));
+    let backend = ratatui::backend::TestBackend::new(60, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let update_row = app.update_toast.as_ref().unwrap().buttons[0].0.y;
+    let port_row = app.port_toast.as_ref().unwrap().buttons[0].0.y;
+    assert!(
+        update_row + 4 <= port_row,
+        "the update popup sits a full box above the port toast: {update_row} vs {port_row}"
+    );
+}
+
 /// #333: a staged build that lands turns the popup into a Relaunch offer,
 /// and Relaunch is the same re-exec F9 arms - never automatic.
 #[test]
