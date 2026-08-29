@@ -478,27 +478,26 @@ pub fn convert_file(path: &Path, id_override: Option<&str>) -> Result<Converted>
     convert(merged, id_override, &stem)
 }
 
-/// A theme name reduced to an id: alphanumerics kept, everything else a
-/// separator.
+/// A theme name reduced to an id: letters, digits and the marks that belong
+/// to them are kept, everything else becomes a separator.
 ///
-/// Alphanumeric in the UNICODE sense, not the ASCII one. Keeping only ASCII
-/// made a theme named in any non-Latin script slug to nothing and fail the
-/// import outright, and reduced a mixed name like "\u{4e2d}\u{6587} Dark" to
-/// "dark", dropping the half that distinguishes it and inviting a collision
-/// with every other theme with Dark in its name.
+/// The property is Unicode categories L, N and **M**, not
+/// `char::is_alphanumeric()`, which covers only L and N. Combining marks are
+/// not decoration: Devanagari carries them in NFC, so "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940}"
+/// slugged to "\u{939}\u{93f}\u{928}-\u{926}\u{940}", a word broken in half by a separator, and no amount
+/// of normalising first would have helped. Latin text in NFD hits the same
+/// edge ("Caf\u{65}\u{301}" becoming "cafe-"), and the damage was
+/// position-dependent, since a leading mark survived the `is_empty` guard
+/// while an interior one did not.
 fn slug(s: &str) -> String {
-    let mut out = String::new();
-    let mut dash = false;
-    for c in s.chars() {
-        if c.is_alphanumeric() {
-            out.extend(c.to_lowercase());
-            dash = false;
-        } else if !out.is_empty() && !dash {
-            out.push('-');
-            dash = true;
-        }
-    }
-    out.trim_matches('-').to_string()
+    static SEPARATORS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let separators = SEPARATORS.get_or_init(|| {
+        regex::Regex::new(r"[^\p{L}\p{N}\p{M}]+").expect("a literal class compiles")
+    });
+    separators
+        .replace_all(&s.to_lowercase(), "-")
+        .trim_matches('-')
+        .to_string()
 }
 
 /// The header every generated manifest carries, used to recognise our own
@@ -1459,6 +1458,11 @@ mod tests {
     ///
     /// The round-1 test asserting the non-ASCII LABEL survives passed
     /// throughout: it named a property next to the one that mattered.
+    ///
+    /// And the first version of THIS test used four mark-free scripts, so a
+    /// change to `slug` altering Hindi, German and French output left the
+    /// suite green with nothing edited. A fixture that cannot reach the
+    /// dimension under test is the same failure one level down.
     #[test]
     fn a_theme_named_in_a_non_latin_script_can_be_imported() {
         for (name, want) in [
@@ -1474,6 +1478,20 @@ mod tests {
             // A mixed name keeps BOTH halves: dropping the script half made
             // every "... Dark" theme collide with every other.
             ("\u{4e2d}\u{6587} Dark", "\u{4e2d}\u{6587}-dark"),
+            // COMBINING MARKS. The four scripts above are all mark-free, so
+            // they could not reach the dimension that actually broke: a mark
+            // is category M, not L or N, so `is_alphanumeric` treated it as a
+            // separator and cut a word in half. Devanagari carries marks in
+            // NFC, so normalising first would not have saved it.
+            (
+                "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940}",
+                "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940}",
+            ),
+            // Latin in NFD hits the same edge: "Cafe" + combining acute.
+            ("Cafe\u{301}", "cafe\u{301}"),
+            // And the damage was POSITION-dependent: a leading mark survived
+            // the empty-output guard while an interior one did not.
+            ("U\u{308}ber", "u\u{308}ber"),
         ] {
             let src = format!(
                 r##"{{ "name": "{name}", "type": "dark", "colors": {{ "editor.background": "#101010" }} }}"##
