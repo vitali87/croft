@@ -121,6 +121,41 @@ class ItemKinds(unittest.TestCase):
                 f"to the gate rather than merely undocumented",
             )
 
+    def test_multi_line_attributes_and_block_docs_are_read_correctly(self):
+        """Both shapes made a DOCUMENTED item read as undocumented.
+
+        That is a false accusation, not a miss: the gate would report a loss
+        that never happened, on a branch that had merely reformatted an
+        attribute or used `/** */`. For a gate that is the worse direction,
+        because one that cries wolf stops being read.
+
+        The inner form `/*!` and the ordinary `/*` and `/***` comments must
+        NOT count, or the gate invents documentation instead.
+        """
+        documented_shapes = [
+            ("multi-line attribute", "/// doc\n#[cfg(all(\n    feature = \"x\",\n    unix\n))]\nconst A: u8 = 1;\n"),
+            ("one-line block doc", "/** doc */\nconst A: u8 = 1;\n"),
+            ("multi-line block doc", "/**\n * doc\n */\nconst A: u8 = 1;\n"),
+            ("block doc then attribute", "/** doc */\n#[cfg(test)]\nconst A: u8 = 1;\n"),
+        ]
+        for label, text in documented_shapes:
+            self.assertEqual(
+                gate.documented(text).get("A"), True, f"{label} documents A"
+            )
+
+        undocumented_shapes = [
+            ("inner block doc documents the MODULE", "/*! module */\nconst A: u8 = 1;\n"),
+            ("ordinary block comment", "/* a note */\nconst A: u8 = 1;\n"),
+            ("triple-star rule", "/*** rule ***/\nconst A: u8 = 1;\n"),
+            ("four slashes is a rule", "//// rule\nconst A: u8 = 1;\n"),
+        ]
+        for label, text in undocumented_shapes:
+            self.assertEqual(
+                gate.documented(text).get("A"),
+                False,
+                f"{label} must not count as documentation",
+            )
+
     def test_a_declaration_inside_a_string_is_not_an_item(self):
         """The regex is line-anchored, so a declaration quoted mid-line is
         not mistaken for one."""
@@ -247,6 +282,38 @@ class GitShapes(unittest.TestCase):
             repo.commit("new.rs", CAPTURED_CONST)
             self.assertEqual(
                 repo.exit_code(), 1, "the gate must fail on a captured doc"
+            )
+
+    def test_a_doc_captured_and_then_restored_within_a_branch_passes(self):
+        """A branch whose HEAD is correct must not be blocked by a state it
+        passed through.
+
+        The pairwise pass over branch-added files walks every adjacent pair,
+        so a doc captured in one commit and restored in a later one shows up
+        as a loss between two intermediate revisions. Reporting that blocks a
+        PR that is fine, which is the false accusation that makes a gate
+        untrustworthy: the first thing a maintainer does with a gate that
+        cries wolf is stop reading it.
+
+        Found within an hour of shipping the pairwise pass, on a real PR
+        whose head was correct.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("seed.rs", "fn seed() {}\n")
+            repo.branch("work")
+            repo.commit("new.rs", DOCUMENTED_CONST)
+            repo.commit("new.rs", CAPTURED_CONST)
+            # ... and put it back.
+            repo.commit(
+                "new.rs",
+                "/// Its own doc.\nconst SYNTAX_SEMANTIC: &[&str] = &[\"b\"];\n\n"
+                + DOCUMENTED_CONST,
+            )
+            self.assertEqual(
+                repo.exit_code(),
+                0,
+                "a doc restored before the branch tip is not a loss",
             )
 
     def test_a_branch_that_captures_nothing_passes(self):

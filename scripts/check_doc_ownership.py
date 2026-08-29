@@ -103,6 +103,71 @@ def is_doc(line):
     return s.startswith("///") and not s.startswith("////")
 
 
+# What a line is, for the backward scan. Computed in one FORWARD pass,
+# because both multi-line constructs (an attribute spanning lines, a `/** */`
+# doc block) can only be recognised by reading downward: from below, `))]` and
+# `*/` are indistinguishable from code.
+DOC, ATTR, SKIP, CODE = "doc", "attr", "skip", "code"
+
+
+def classify(lines):
+    """Label every line DOC, ATTR, SKIP (blank or ordinary comment) or CODE.
+
+    Both multi-line shapes were false-ACCUSATION bugs rather than misses: an
+    attribute spanning lines, or a `/** */` block doc, made a documented item
+    read as undocumented and the gate reported a loss that had not happened.
+    For a gate that is the worse direction, since a gate that cries wolf stops
+    being read.
+    """
+    kinds = []
+    attr_depth = 0
+    in_block_doc = False
+    in_block_comment = False
+    for raw in lines:
+        s = raw.strip()
+        if in_block_doc:
+            kinds.append(DOC)
+            if "*/" in s:
+                in_block_doc = False
+            continue
+        if in_block_comment:
+            kinds.append(SKIP)
+            if "*/" in s:
+                in_block_comment = False
+            continue
+        if attr_depth > 0:
+            kinds.append(ATTR)
+            attr_depth += s.count("[") - s.count("]")
+            continue
+        # `/** ... */` is an outer doc comment lowering to the same `#[doc]`
+        # attribute as `///`. `/*! */` is INNER (it documents the enclosing
+        # item, not the next one) and `/***` is an ordinary comment, so
+        # neither counts.
+        if s.startswith("/**") and not s.startswith("/***"):
+            kinds.append(DOC)
+            if "*/" not in s[2:]:
+                in_block_doc = True
+            continue
+        if s.startswith("/*"):
+            kinds.append(SKIP)
+            if "*/" not in s[2:]:
+                in_block_comment = True
+            continue
+        if s.startswith("#["):
+            kinds.append(ATTR)
+            depth = s.count("[") - s.count("]")
+            attr_depth = max(depth, 0)
+            continue
+        if is_doc(raw):
+            kinds.append(DOC)
+            continue
+        if s == "" or s.startswith("//"):
+            kinds.append(SKIP)
+            continue
+        kinds.append(CODE)
+    return kinds
+
+
 def documented(text):
     """Map item name -> True when ANY definition of it carries a doc comment.
 
@@ -120,6 +185,7 @@ def documented(text):
     reported documentation as missing when rustc could see it perfectly well.
     """
     lines = text.splitlines()
+    kinds = classify(lines)
     state = {}
     for i, line in enumerate(lines):
         m = ITEM.match(line)
@@ -128,13 +194,9 @@ def documented(text):
         # Exactly one alternative captures per match.
         name = next(g for g in m.groups() if g)
         j = i - 1
-        while j >= 0:
-            s = lines[j].lstrip()
-            if s.startswith("#[") or s == "" or (s.startswith("//") and not is_doc(lines[j])):
-                j -= 1
-                continue
-            break
-        has_doc = j >= 0 and is_doc(lines[j])
+        while j >= 0 and kinds[j] in (ATTR, SKIP):
+            j -= 1
+        has_doc = j >= 0 and kinds[j] == DOC
         state[name] = state.get(name, False) or has_doc
     return state
 
@@ -162,6 +224,13 @@ def main():
     # commit-by-commit instead, which is the only place their history exists.
     added = [f for f in changed if not git("cat-file", "-e", f"{base}:{f}", allow_missing_path=True, allow_fail=True)]
     if added:
+        # What matters is the state at HEAD. A doc captured in one commit and
+        # restored in a later one is not a loss: the branch is fine, and
+        # reporting it blocks a PR whose head is correct. Without this the
+        # pairwise pass reports every intermediate state a branch passed
+        # through, which is exactly the false accusation that makes a gate
+        # untrustworthy.
+        head_state = {f: documented(git("show", f"{head}:{f}", allow_missing_path=True)) for f in added}
         commits = git("log", f"{base}..{head}", "--format=%H", "--reverse").split()
         for older, newer in zip(commits, commits[1:]):
             for f in added:
@@ -173,6 +242,7 @@ def main():
                         and name in after
                         and not after[name]
                         and (f, name) not in exempt
+                        and not head_state[f].get(name, False)
                         and not any(l[0] == f and l[1] == name for l in losses)
                     ):
                         # Name the commit the doc was last seen at. Saying
