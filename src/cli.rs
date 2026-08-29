@@ -862,8 +862,25 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
             println!("  {conflict}");
         }
     }
+    if !report.refusals.is_empty() {
+        println!(
+            "\n{} file{} croft declined to write:",
+            report.refusals.len(),
+            plural(report.refusals.len())
+        );
+        for refusal in &report.refusals {
+            println!("  {refusal}");
+        }
+    }
     if written.is_empty() {
-        println!("\nEverything was already in place; nothing changed.");
+        // "Nothing needed changing" and "croft refused to write" are
+        // different facts, and saying the first when the second is true tells
+        // the user their settings arrived when they did not.
+        if report.refusals.is_empty() {
+            println!("\nEverything was already in place; nothing changed.");
+        } else {
+            println!("\nNothing was written: see the refusals above.");
+        }
     } else {
         println!("\nWrote:");
         for path in &written {

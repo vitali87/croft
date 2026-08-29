@@ -302,6 +302,13 @@ pub struct Report {
     pub snippets: Map<String, Value>,
     /// Values croft already has, which the import left alone.
     pub conflicts: Vec<String>,
+    /// Files croft DECLINED to write, and why. Separate from `conflicts`
+    /// because they are a different fact: a conflict means croft kept what
+    /// was already there, a refusal means croft wrote nothing at all. Folding
+    /// them together let one heading serve two meanings, and let the closing
+    /// line tell a user "nothing changed because nothing needed to" when the
+    /// truth was "croft declined to write".
+    pub refusals: Vec<String>,
     /// Anything that went wrong short of failing the import.
     pub warnings: Vec<String>,
 }
@@ -525,7 +532,14 @@ pub fn scan_profile(dir: &Path) -> Result<Report> {
     Ok(report)
 }
 
-/// Whether `path` carries comments croft would destroy by rewriting it.
+/// Whether `path` carries JSONC extras croft would destroy by rewriting it:
+/// comments, or the trailing commas of a hand-edited file.
+///
+/// Named for extras rather than comments because that is what it detects. It
+/// compares the raw text against the stripped text, which differs for a
+/// trailing comma as much as for a comment, and calling it `carries_comments`
+/// produced a refusal telling the user their comments were at risk in a file
+/// that had none.
 ///
 /// A merge here parses JSONC and writes back strict JSON, which drops every
 /// comment. That is not hypothetical: croft SEEDS `keybindings.json` and
@@ -534,11 +548,42 @@ pub fn scan_profile(dir: &Path) -> Result<Report> {
 /// header this import would silently delete. Such a file is left alone and
 /// its additions reported instead, which is the same posture as a value
 /// conflict: croft says what it did not do rather than doing it quietly.
-fn carries_comments(path: &Path) -> bool {
+fn carries_jsonc_extras(path: &Path) -> bool {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return false;
     };
     raw != crate::tasks::strip_jsonc(&raw)
+}
+
+/// Read a config file for merging, turning a PARSE failure into a per-file
+/// refusal rather than an aborted run.
+///
+/// `read_jsonc`'s error propagated through `?`, so a single stray comma in
+/// `config.json` stopped the whole import before it reached keybindings or
+/// snippets. A stray comma is far likelier than the wrong JSON shape, so
+/// the rarer half was handled and the common one was not.
+///
+/// `None` means "nothing usable here": either absent, which is ordinary, or
+/// unreadable, which is reported. The caller distinguishes them by whether a
+/// refusal was recorded.
+fn read_or_refuse(path: &Path, report: &mut Report) -> (Option<Value>, bool) {
+    match read_jsonc(path) {
+        Ok(v) => (v, false),
+        Err(e) => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            report.refusals.push(format!(
+                "{name} could not be read ({e}), so it was left untouched"
+            ));
+            // Unusable is NOT absent. Falling through to the absent path
+            // started the merge from an empty map and wrote a fresh file over
+            // the one croft could not read: the same data loss the
+            // wrong-shape guard exists to prevent.
+            (None, true)
+        }
+    }
 }
 
 /// Merge a report into croft's config files, leaving existing values alone.
@@ -562,22 +607,24 @@ pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut written = Vec::new();
 
-    let mut wrong_shape = false;
+    let mut wrong_shape;
     if !report.settings.is_empty() {
         let path = dir.join("config.json");
-        if carries_comments(&path) {
-            report.conflicts.push(String::from(
-                "config.json: left untouched because rewriting it would delete its comments; add the entries above by hand",
+        if carries_jsonc_extras(&path) {
+            report.refusals.push(String::from(
+                "config.json: left untouched, because rewriting it would drop its comments or hand formatting. Add the entries above by hand.",
             ));
         } else {
             // "Parsed, but not the expected shape" is not "absent". Treating
             // them alike OVERWROTE a config.json holding an array or a scalar
             // with a fresh object and discarded the user's content silently,
             // which is the opposite of this module's stated posture.
-            let mut existing: Map<String, Value> = match read_jsonc(&path)? {
+            let (doc, unusable) = read_or_refuse(&path, report);
+            wrong_shape = unusable;
+            let mut existing: Map<String, Value> = match doc {
                 Some(Value::Object(m)) => m,
                 Some(_) => {
-                    report.conflicts.push(String::from(
+                    report.refusals.push(String::from(
                         "config.json is not a JSON object, so it was left untouched",
                     ));
                     wrong_shape = true;
@@ -605,18 +652,19 @@ pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
         }
     }
 
-    wrong_shape = false;
     if !report.keybindings.is_empty() {
         let path = dir.join("keybindings.json");
-        if carries_comments(&path) {
-            report.conflicts.push(String::from(
-                "keybindings.json: left untouched because rewriting it would delete its comments; add the entries above by hand",
+        if carries_jsonc_extras(&path) {
+            report.refusals.push(String::from(
+                "keybindings.json: left untouched, because rewriting it would drop its comments or hand formatting. Add the entries above by hand.",
             ));
         } else {
-            let mut rows: Vec<Value> = match read_jsonc(&path)? {
+            let (doc, unusable) = read_or_refuse(&path, report);
+            wrong_shape = unusable;
+            let mut rows: Vec<Value> = match doc {
                 Some(Value::Array(a)) => a,
                 Some(_) => {
-                    report.conflicts.push(String::from(
+                    report.refusals.push(String::from(
                         "keybindings.json is not a JSON array, so it was left untouched",
                     ));
                     wrong_shape = true;
@@ -649,18 +697,19 @@ pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
         }
     }
 
-    wrong_shape = false;
     if !report.snippets.is_empty() {
         let path = dir.join("snippets.json");
-        if carries_comments(&path) {
-            report.conflicts.push(String::from(
-                "snippets.json: left untouched because rewriting it would delete its comments; add the entries above by hand",
+        if carries_jsonc_extras(&path) {
+            report.refusals.push(String::from(
+                "snippets.json: left untouched, because rewriting it would drop its comments or hand formatting. Add the entries above by hand.",
             ));
         } else {
-            let mut existing: Map<String, Value> = match read_jsonc(&path)? {
+            let (doc, unusable) = read_or_refuse(&path, report);
+            wrong_shape = unusable;
+            let mut existing: Map<String, Value> = match doc {
                 Some(Value::Object(m)) => m,
                 Some(_) => {
-                    report.conflicts.push(String::from(
+                    report.refusals.push(String::from(
                         "snippets.json is not a JSON object, so it was left untouched",
                     ));
                     wrong_shape = true;
@@ -687,6 +736,7 @@ pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
     }
 
     report.conflicts.sort();
+    report.refusals.sort();
     Ok(written)
 }
 
@@ -1008,11 +1058,11 @@ mod tests {
         );
         assert!(
             report
-                .conflicts
+                .refusals
                 .iter()
                 .any(|c| c.contains("keybindings.json") && c.contains("comments")),
             "the user must be told why, got {:?}",
-            report.conflicts
+            report.refusals
         );
 
         // A file with no comments is still written, so the guard is narrow.
@@ -1063,11 +1113,109 @@ mod tests {
                 "{name} must be byte-for-byte untouched"
             );
             assert!(
-                report.conflicts.iter().any(|c| c.starts_with(name)),
-                "{name} must be reported, got {:?}",
-                report.conflicts
+                report.refusals.iter().any(|c| c.starts_with(name)),
+                "{name} must be reported as a refusal, got {:?}",
+                report.refusals
             );
         }
+    }
+
+    /// A file that does not PARSE is refused per file, not aborted per run.
+    ///
+    /// `read_jsonc`'s error propagated through `?`, so one stray comma in
+    /// `config.json` stopped the whole import before it reached keybindings
+    /// or snippets. The test that claimed to cover "per file, not per run"
+    /// used a fixture that PARSES (`[1]`), so it covered the rarer half of
+    /// its own property: a stray comma is far likelier than a JSON array
+    /// where an object belongs.
+    #[test]
+    fn an_unparsable_file_is_refused_without_stopping_the_others() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // The classic hand-edit: one trailing comma too many, and not
+        // recoverable by the JSONC strip.
+        // No comments and no trailing comma, so the JSONC-extras guard does
+        // not claim it first: this file is simply not JSON.
+        std::fs::write(dir.path().join("config.json"), "{ \"a\": }\n").unwrap();
+
+        let mut report = Report::default();
+        report
+            .settings
+            .insert(String::from("format_on_save"), json!(true));
+        report
+            .snippets
+            .insert(String::from("S"), json!({ "prefix": "s", "body": "x" }));
+
+        let written = apply_into(dir.path(), &mut report)
+            .expect("an unreadable file must not fail the whole import");
+        assert!(
+            written.iter().any(|p| p.ends_with("snippets.json")),
+            "the other files must still be written: {written:?}"
+        );
+        assert!(
+            !written.iter().any(|p| p.ends_with("config.json")),
+            "and the unreadable one must not be"
+        );
+        assert!(
+            report
+                .refusals
+                .iter()
+                .any(|r| r.starts_with("config.json") && r.contains("could not be read")),
+            "the user must be told which file and why, got {:?}",
+            report.refusals
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.json")).unwrap(),
+            "{ \"a\": }\n",
+            "and it must be left byte-for-byte alone"
+        );
+    }
+
+    /// A refusal is not a conflict. Reporting them in one list let the CLI
+    /// tell a user "nothing changed because nothing needed to" when the truth
+    /// was that croft declined to write.
+    #[test]
+    fn a_refusal_is_reported_apart_from_a_conflict() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keybindings.json"), crate::keymap::TEMPLATE).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{ "format_on_save": false }"#,
+        )
+        .unwrap();
+
+        let mut report = Report::default();
+        report
+            .settings
+            .insert(String::from("format_on_save"), json!(true));
+        report
+            .keybindings
+            .push((String::from("ctrl+shift+p"), String::from("quick_open")));
+        apply_into(dir.path(), &mut report).expect("apply runs");
+
+        assert!(
+            report
+                .conflicts
+                .iter()
+                .all(|c| !c.contains("left untouched")),
+            "a refusal must not appear as a conflict: {:?}",
+            report.conflicts
+        );
+        assert!(
+            report
+                .refusals
+                .iter()
+                .any(|r| r.contains("keybindings.json")),
+            "the refusal belongs in its own list: {:?}",
+            report.refusals
+        );
+        assert!(
+            report
+                .conflicts
+                .iter()
+                .any(|c| c.contains("format_on_save")),
+            "and the real conflict stays a conflict: {:?}",
+            report.conflicts
+        );
     }
 
     /// One wrong-shaped file must not block the others: the flag is per
