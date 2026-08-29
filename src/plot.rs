@@ -580,11 +580,14 @@ pub fn svg(
                     r#"<polyline points="{}" fill="none" stroke="{colour}" stroke-width="2" stroke-linejoin="round"/>"#,
                     points.trim_end()
                 );
-                // One legend line per series, stacked from the top; a
-                // chart too short for a line leaves it out rather than
-                // drawing it below the viewBox.
+                // One legend line per series, stacked from the top. A chart
+                // too short for the WHOLE legend shows none of it: a legend
+                // naming only the first few series would have a reader map
+                // colours to the wrong names, and a line below the viewBox
+                // is clipped away.
                 let legend_y = top + 12.0 + 12.0 * si as f64;
-                if ds.series.len() > 1 && legend_y <= bottom {
+                let last_legend_y = top + 12.0 + 12.0 * (ds.series.len() - 1) as f64;
+                if ds.series.len() > 1 && last_legend_y <= bottom {
                     let _ = write!(
                         out,
                         r#"<text x="{}" y="{}" fill="{colour}" font-size="10">{}</text>"#,
@@ -1063,6 +1066,40 @@ mod tests {
         assert!(
             tall.contains(">a<") && tall.contains(">b<"),
             "legend at 200px: {tall}"
+        );
+    }
+
+    /// A legend is all or nothing: ten series at a height with room for
+    /// seven names shows no legend rather than a misleading prefix, and
+    /// at a height with room for all ten shows every name.
+    #[test]
+    fn a_legend_that_does_not_fit_whole_is_left_out_whole() {
+        let p = Palette::default();
+        let header = (0..10)
+            .map(|i| format!("s{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let row = |r: usize| {
+            (0..10)
+                .map(|i| (r + i).to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let ten = ds(&format!("{header}\n{}\n{}\n{}\n", row(1), row(2), row(3)));
+        let short = svg(&ten, ChartKind::Line, None, 600, 120, &p);
+        assert_eq!(
+            short.matches("<polyline").count(),
+            10,
+            "every series is drawn: {short}"
+        );
+        assert!(
+            (0..10).all(|i| !short.contains(&format!(">s{i}<"))),
+            "no partial legend at 120px: {short}"
+        );
+        let tall = svg(&ten, ChartKind::Line, None, 600, 300, &p);
+        assert!(
+            (0..10).all(|i| tall.contains(&format!(">s{i}<"))),
+            "the whole legend at 300px: {tall}"
         );
     }
 
