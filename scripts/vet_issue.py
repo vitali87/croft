@@ -53,8 +53,8 @@ MAX_COMMENTS = 20
 # text; a long base64 run is an opaque payload; pipe-to-shell and token names
 # are the two things an issue never legitimately needs to ask for.
 HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-ZERO_WIDTH = re.compile("[​-‏⁠﻿]")
-BIDI_CONTROLS = re.compile("[‪-‮⁦-⁩]")
+ZERO_WIDTH = re.compile("[\u200b-\u200f\u2060\ufeff]")
+BIDI_CONTROLS = re.compile("[\u202a-\u202e\u2066-\u2069]")
 BASE64_BLOB = re.compile(r"[A-Za-z0-9+/=]{200,}")
 PIPE_TO_SHELL = re.compile(r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b")
 SECRET_REFERENCE = re.compile(
@@ -315,8 +315,8 @@ def main(argv: list[str]) -> int:
         if not isinstance(issue, dict) or not isinstance(author, dict):
             print("issue or author JSON missing or malformed", file=sys.stderr)
             return 2
-        comments = _load(args.comments)
-        comments = comments if isinstance(comments, list) else []
+        loaded = _load(args.comments)
+        comments = [c for c in loaded if isinstance(c, dict)] if isinstance(loaded, list) else []
         outcome = prepare(issue, comments, author, args.project)
         if outcome.decision is not None:
             Path(args.out_decision).write_text(json.dumps(outcome.decision.to_json(), indent=2), encoding="utf-8")
