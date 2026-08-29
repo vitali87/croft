@@ -20847,6 +20847,138 @@ fn a_staged_update_offers_relaunch_and_only_relaunch_re_execs() {
     assert!(app.pending_reexec && app.quit, "Relaunch arms the re-exec");
 }
 
+/// #360: the built-in secret rules sit in the trigger set by default,
+/// leave it when the setting is switched off, and come back on; a reveal
+/// window lasts ten seconds and asks for a redraw when it closes.
+#[test]
+fn secret_redaction_toggles_the_builtin_rules_and_reveal_expires() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.secret_redaction, "on by default");
+    assert!(
+        app.triggers.has_redactions(),
+        "the built-in rules are loaded"
+    );
+    assert_eq!(
+        crate::triggers::mask_text("AKIAIOSFODNN7EXAMPLE", &app.triggers, false),
+        "\u{2022}".repeat(20)
+    );
+    app.toggle_secret_redaction();
+    assert!(!app.secret_redaction);
+    assert!(
+        !app.triggers.has_redactions(),
+        "off means no built-in rules"
+    );
+    app.toggle_secret_redaction();
+    assert!(app.triggers.has_redactions());
+
+    assert!(!app.redactions_revealed());
+    app.reveal_redacted_secrets();
+    assert!(app.redactions_revealed());
+    assert!(
+        !app.tick_redaction_reveal(),
+        "still inside the window: no change"
+    );
+    app.redaction_reveal_until = Some(std::time::Instant::now());
+    assert!(
+        app.tick_redaction_reveal(),
+        "the window closing is a redraw"
+    );
+    assert!(!app.redactions_revealed());
+    assert!(app.status.contains("masked again"));
+
+    // The chip reads what was PAINTED: a hidden panel paints nothing, so a
+    // stale count from the last visible frame must not survive it.
+    if let Some(t) = app.terminals.first_mut() {
+        t.redacted_on_screen = 3;
+    }
+    assert_eq!(app.redacted_on_screen(), 3);
+    app.show_terminal = false;
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.redacted_on_screen(), 0, "a hidden pane counts nothing");
+    app.show_terminal = true;
+
+    // The clipboard keeps the real value unless a rule says otherwise; the
+    // scrollback dump always masks.
+    assert_eq!(
+        app.terminal_text_for_copy(String::from("k=AKIAIOSFODNN7EXAMPLE")),
+        "k=AKIAIOSFODNN7EXAMPLE"
+    );
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(
+        r#"[{ "regex": "AKIA[0-9A-Z]{16}", "action": "redact", "copy": "masked" }]"#,
+    ));
+    assert_eq!(
+        app.terminal_text_for_copy(String::from("k=AKIAIOSFODNN7EXAMPLE")),
+        format!("k={}", "\u{2022}".repeat(20))
+    );
+}
+
+/// #360, byte level: the terminal session store is written to disk and
+/// replayed next launch, so a key that was on screen must not be in it.
+#[test]
+fn the_session_store_holds_the_mask_not_the_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_session_path = tmp.path().join("terminal-sessions.json");
+    let term = crate::widgets::terminal::PtyTerminal::new_with_transcript(
+        tmp.path(),
+        &[String::from("key AKIAIOSFODNN7EXAMPLE end")],
+    )
+    .unwrap();
+    // The transcript is painted into the grid during the spawn, before
+    // the child can write, so the save sees it at once.
+    app.insert_terminal(term);
+    app.save_terminal_session();
+    let store = std::fs::read_to_string(&app.terminal_session_path).unwrap();
+    assert!(
+        !store.contains("AKIAIOSFODNN7EXAMPLE"),
+        "the key leaked to disk: {store}"
+    );
+    assert!(
+        store.contains("key \u{2022}"),
+        "the mask was stored in its place: {store}"
+    );
+}
+
+/// #360: quick-select offers no hint inside a masked span (a hex run or a
+/// number there is a fragment of the secret), while hints elsewhere on
+/// the screen survive. The masked token here is itself a hex run at a
+/// word boundary, so without the filter it WOULD be a hint.
+#[test]
+fn quick_select_skips_hints_inside_masked_spans() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(
+        r#"[{ "regex": "token \\S+", "action": "redact" }]"#,
+    ));
+    let term = crate::widgets::terminal::PtyTerminal::new_with_transcript(
+        tmp.path(),
+        &[
+            String::from("token deadbeefcafe0123 end"),
+            String::from("commit cafebabe0123456 fixed it"),
+        ],
+    )
+    .unwrap();
+    app.insert_terminal(term);
+    app.focus_pane(Pane::Terminal);
+    app.open_terminal_quick_select();
+    let state = app
+        .terminal_quick_select
+        .as_ref()
+        .expect("quick select opened");
+    let texts: Vec<&str> = state.hints.iter().map(|h| h.text.as_str()).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("cafebabe0123456")),
+        "the ordinary hash is still a hint: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("deadbeefcafe0123")),
+        "the hex run inside the masked token is not a hint: {texts:?}"
+    );
+}
+
 #[test]
 fn clicking_the_problems_tab_switches_the_panel_view() {
     let tmp = tempfile::tempdir().unwrap();

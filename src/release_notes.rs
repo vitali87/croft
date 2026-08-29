@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "croft now tells you when a newer release is out: a small popup bottom-left offers Update or Later. Update builds the new version in the background without touching the croft on your PATH; when it is ready the popup offers Relaunch, and only that (or F9) switches you over. Later hides that version for good. Set CROFT_NO_UPDATE_CHECK to opt out.",
+    summary: "Secrets in terminal output are masked live: AWS keys, sk-/ghp_/xox tokens, JWTs and bearer tokens paint as •••• while the real text stays in the pane - click a mask to read it, copies keep the real value unless a trigger says otherwise, and the scrollback-to-editor dump is always masked. A new `redact` trigger action adds your own patterns; Settings switches the built-in set off; the status bar counts masks on screen and a palette command reveals them for ten seconds.",
 }];

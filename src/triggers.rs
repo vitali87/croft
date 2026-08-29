@@ -3,9 +3,15 @@
 //! trigger usage (per iTerm2 / kitty marks): **highlight** (recolour every
 //! visible occurrence, live, scrollback included), **notify** (status-bar
 //! notice with `\0`..`\9` capture interpolation), **bell** (status-bar
-//! bell notice), and **capture** (iTerm2's Capture Output: collect every
+//! bell notice), **capture** (iTerm2's Capture Output: collect every
 //! matched line into the CAPTURES panel, where clicking an entry jumps the
-//! pane to that line). Auto-respond / run-command actions are deliberately absent:
+//! pane to that line), and **redact** (#360: paint the match as a run of
+//! `•` of the same width, the grid untouched; a click on the mask pops the
+//! real text; copies yield the real value unless the rule says
+//! `"copy": "masked"`; the scrollback-to-editor dump is always masked). A
+//! built-in redact set for the usual key shapes (AWS, OpenAI `sk-`, GitHub
+//! `ghp_`, Slack `xox`, JWTs, bearer tokens) is on by default and switched
+//! off in Settings. Auto-respond / run-command actions are deliberately absent:
 //! they are the classic security footgun (hostile output typing into your
 //! shell) and iTerm2 itself ships them behind warnings.
 //!
@@ -44,7 +50,14 @@ pub enum TriggerAction {
     /// Collect the matched line into the CAPTURES panel (iTerm2's Capture
     /// Output); the message template labels the entry.
     Capture,
+    /// Mask the matched span (capture group 1 when the regex has one, else
+    /// the whole match) at paint time; see [`redact_spans`].
+    Redact,
 }
+
+/// The glyph a redacted cell shows. One per masked char, so the row keeps
+/// its width and columns line up.
+pub const MASK: char = '\u{2022}';
 
 /// One user trigger, compiled and ready to match.
 #[derive(Clone, Debug)]
@@ -57,6 +70,15 @@ pub struct Trigger {
     pub bg: Option<(u8, u8, u8)>,
     /// Notify message template; `\0` = whole match, `\1`..`\9` = groups.
     pub message: Option<String>,
+    /// Redact only: a copy of a masked span yields the mask, not the value
+    /// (`"copy": "masked"`). Default: copies carry the real text.
+    pub copy_masked: bool,
+    /// Redact only: an UNLABELLED span (prefix plus body, no further
+    /// hyphen) must carry a digit or an uppercase letter to count, so
+    /// `sk-` plus a lowercase word is not a key. A labelled span
+    /// (`sk-ant-api03-…`) always counts. Built-in `sk-` uses it; user rules
+    /// do not.
+    pub needs_entropy: bool,
 }
 
 /// The user's trigger list. Shared read-only between the app, the render
@@ -103,6 +125,10 @@ struct TriggerRow {
     bg: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    /// Redact rows: `"masked"` keeps the mask in copies; anything else
+    /// (or absent) copies the real value.
+    #[serde(default)]
+    copy: Option<String>,
     #[serde(default = "enabled_default")]
     enabled: bool,
 }
@@ -127,13 +153,17 @@ pub const TEMPLATE: &str = r##"// croft terminal triggers: regexes watched on te
 //             "notify"     status-bar notice ("message" template: \0 whole match, \1-\9 groups)
 //             "bell"       status-bar bell notice
 //             "capture"    collect matched lines into the CAPTURES panel (click jumps to the line)
+//             "redact"     mask the match (group 1 if the regex has one) as •••• on screen;
+//                          click the mask to see the value; "copy": "masked" masks copies too.
+//                          Built-in key/token rules run first (Settings: Terminal: Redact Secrets).
 // Highlights repaint live on the visible screen and persist into scrollback.
 // notify/bell/capture fire once per completed output line (never inside full-screen apps).
 // "enabled": false keeps a rule without running it.
 [
   { "regex": "\\b(ERROR|FATAL|panicked)\\b", "action": "highlight", "fg": "#ffffff", "bg": "#c0392b" },
   { "regex": "\\bwarning\\b", "action": "highlight", "fg": "#000000", "bg": "#e5c07b", "enabled": false },
-  { "regex": "(BUILD|Compiling|error): (.+)", "action": "notify", "message": "\\1: \\2", "enabled": false }
+  { "regex": "(BUILD|Compiling|error): (.+)", "action": "notify", "message": "\\1: \\2", "enabled": false },
+  { "regex": "(?i)x-api-key: *(\\S+)", "action": "redact", "copy": "masked", "enabled": false }
 ]
 "##;
 
@@ -159,6 +189,7 @@ impl TriggerSet {
                     "notify" => TriggerAction::Notify,
                     "bell" => TriggerAction::Bell,
                     "capture" => TriggerAction::Capture,
+                    "redact" => TriggerAction::Redact,
                     _ => return None,
                 };
                 Some(Trigger {
@@ -167,6 +198,8 @@ impl TriggerSet {
                     fg: r.fg.as_deref().and_then(parse_hex),
                     bg: r.bg.as_deref().and_then(parse_hex),
                     message: r.message,
+                    copy_masked: r.copy.as_deref() == Some("masked"),
+                    needs_entropy: false,
                 })
             })
             .collect();
@@ -177,19 +210,178 @@ impl TriggerSet {
         self.triggers.is_empty()
     }
 
-    /// Whether any trigger paints (drives the render pass).
+    /// The built-in secret rules in front of the user's own, so a key
+    /// shape the user never thought to list is still masked. Off in
+    /// Settings ("Terminal: Redact Secrets") means this is never called.
+    pub fn with_builtin_redactions(mut self) -> Self {
+        let mut all = builtin_redactions();
+        all.append(&mut self.triggers);
+        self.triggers = all;
+        self
+    }
+
+    /// Whether any trigger paints (drives the render pass): highlight and
+    /// redact both act on the visible rows.
     pub fn has_highlights(&self) -> bool {
         self.triggers
             .iter()
-            .any(|t| t.action == TriggerAction::Highlight)
+            .any(|t| matches!(t.action, TriggerAction::Highlight | TriggerAction::Redact))
+    }
+
+    /// Whether any trigger redacts (drives the copy / dump masking).
+    pub fn has_redactions(&self) -> bool {
+        self.triggers
+            .iter()
+            .any(|t| t.action == TriggerAction::Redact)
     }
 
     /// Whether any trigger fires events (drives the reader-thread scan).
     pub fn has_events(&self) -> bool {
         self.triggers
             .iter()
-            .any(|t| t.action != TriggerAction::Highlight)
+            .any(|t| !matches!(t.action, TriggerAction::Highlight | TriggerAction::Redact))
     }
+}
+
+/// The key and token shapes masked out of the box (#360). Each pattern is
+/// anchored on a distinctive prefix (or, for bearer tokens, the
+/// `Authorization` header) so ordinary words never match; a bearer token
+/// masks only the token (group 1), leaving the header readable. PEM bodies
+/// are not covered: their base64 lines carry no prefix to anchor on, and
+/// masking every long base64 line would eat checksums and blobs. Compiled
+/// once; the set is cloned per trigger reload.
+pub fn builtin_redactions() -> Vec<Trigger> {
+    static RULES: std::sync::LazyLock<Vec<Trigger>> = std::sync::LazyLock::new(|| {
+        // (pattern, the span must carry a digit or an uppercase letter)
+        const PATTERNS: &[(&str, bool)] = &[
+            // AWS access key ids.
+            (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", false),
+            // OpenAI / Anthropic / OpenRouter-style secret keys: `sk-`, up
+            // to three short labels (`sk-proj-`, `sk-ant-api03-`, `sk-or-v1-`)
+            // and a long body. Entropy-gated: `sk-` also opens hyphenated
+            // prose ("sk-learn-preprocessingpipeline"), whose body is all
+            // lowercase letters.
+            (r"\bsk-(?:[A-Za-z0-9]{1,10}-){0,3}[A-Za-z0-9_]{16,}\b", true),
+            // GitHub tokens: classic (ghp_), OAuth (gho_), app (ghu_/ghs_/ghr_), fine-grained.
+            (
+                r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b",
+                false,
+            ),
+            // Slack tokens.
+            (r"\bxox[abpors]-[A-Za-z0-9-]{10,}\b", false),
+            // JWTs: three base64url segments, the first a JSON header.
+            (
+                r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+                false,
+            ),
+            // `Authorization: Bearer <token>` in header or JSON form
+            // (`"Authorization": "Bearer …"`) - only the token is masked.
+            // Anchored on the header so "Bearer" as an English word never
+            // matches; a closing quote, comma or semicolon stays outside.
+            (
+                r#"(?i)\bauthorization"? *: *"?bearer +([^\s'",;]{16,})"#,
+                false,
+            ),
+        ];
+        PATTERNS
+            .iter()
+            .map(|(r, needs_entropy)| Trigger {
+                regex: Regex::new(r).expect("built-in redaction regex compiles"),
+                action: TriggerAction::Redact,
+                fg: None,
+                bg: None,
+                message: None,
+                copy_masked: false,
+                needs_entropy: *needs_entropy,
+            })
+            .collect()
+    });
+    RULES.clone()
+}
+
+/// One masked span on a row, in char indices.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RedactSpan {
+    pub start: usize,
+    pub len: usize,
+    /// Whether a copy of this span keeps the mask.
+    pub copy_masked: bool,
+}
+
+/// Every redact-trigger match on `line`: capture group 1 when the regex
+/// has one (so a rule can name the secret inside a header), else the
+/// whole match. Empty matches are skipped.
+pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
+    let mut out = Vec::new();
+    for t in &set.triggers {
+        if t.action != TriggerAction::Redact {
+            continue;
+        }
+        for caps in t.regex.captures_iter(line) {
+            let m = match caps.get(1) {
+                Some(g) => g,
+                None => match caps.get(0) {
+                    Some(m) => m,
+                    None => continue,
+                },
+            };
+            // The entropy test applies to an UNLABELLED match only: `sk-` plus
+            // a body that is all lowercase letters is a hyphenated word, but
+            // `sk-ant-api03-…` is a key shape whatever its body looks like.
+            // Masking a rare `sk-word-word` costs a click to reveal; missing
+            // a real key costs the transcript and history it lands in.
+            let labelled = m.as_str().matches('-').count() > 1;
+            let body = m.as_str().rsplit('-').next().unwrap_or(m.as_str());
+            if m.as_str().is_empty()
+                || (t.needs_entropy
+                    && !labelled
+                    && !body
+                        .chars()
+                        .any(|c| c.is_ascii_digit() || c.is_ascii_uppercase()))
+            {
+                continue;
+            }
+            out.push(RedactSpan {
+                start: line[..m.start()].chars().count(),
+                len: m.as_str().chars().count(),
+                copy_masked: t.copy_masked,
+            });
+        }
+    }
+    out
+}
+
+/// `text` with every redact-trigger match replaced by [`MASK`] runs of the
+/// same char length, line by line. `copy_only` restricts the masking to
+/// rules marked `"copy": "masked"` (the clipboard path); `false` masks
+/// everything (the scrollback dump, and anything else that leaves the
+/// pane as bytes). Returns the input untouched when nothing matches.
+pub fn mask_text(text: &str, set: &TriggerSet, copy_only: bool) -> String {
+    if !set.has_redactions() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let spans: Vec<RedactSpan> = redact_spans(line, set)
+            .into_iter()
+            .filter(|s| !copy_only || s.copy_masked)
+            .collect();
+        if spans.is_empty() {
+            out.push_str(line);
+            continue;
+        }
+        for (k, c) in line.chars().enumerate() {
+            if spans.iter().any(|s| k >= s.start && k < s.start + s.len) {
+                out.push(MASK);
+            } else {
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// Every highlight-trigger match on `line`, as char-index spans.
@@ -416,7 +608,9 @@ impl TriggerScanner {
         if !self.line.is_empty() {
             let line = String::from_utf8_lossy(&self.line);
             for t in &set.triggers {
-                if t.action == TriggerAction::Highlight {
+                // Paint-only actions never become hits: a redact hit would
+                // carry the secret itself into the status bar.
+                if matches!(t.action, TriggerAction::Highlight | TriggerAction::Redact) {
                     continue;
                 }
                 if let Some(caps) = t.regex.captures(&line) {
@@ -462,6 +656,171 @@ mod tests {
         assert_eq!(s.triggers[0].bg, Some((0xc0, 0x39, 0x2b)));
         assert!(set("total garbage").is_empty());
         assert!(set("").is_empty());
+    }
+
+    #[test]
+    fn redact_rows_parse_with_their_copy_mode() {
+        let s = set(r##"[
+  { "regex": "secret=(\\S+)", "action": "redact", "copy": "masked" },
+  { "regex": "token=\\S+", "action": "redact" }
+]"##);
+        assert_eq!(s.triggers.len(), 2);
+        assert!(s.has_highlights(), "redact rides the paint pass");
+        assert!(s.has_redactions());
+        assert!(
+            !s.has_events(),
+            "redact never wakes the reader-thread scanner"
+        );
+        assert!(s.triggers[0].copy_masked);
+        assert!(!s.triggers[1].copy_masked);
+    }
+
+    #[test]
+    fn redact_spans_mask_group_one_when_present_else_the_whole_match() {
+        let s = set(r##"[
+  { "regex": "secret=(\\S+)", "action": "redact", "copy": "masked" },
+  { "regex": "token=\\S+", "action": "redact" }
+]"##);
+        let spans = redact_spans("naïve secret=abc token=xyz", &s);
+        // "naïve secret=" is 13 chars: the group starts after the '='.
+        assert_eq!(
+            spans,
+            vec![
+                RedactSpan {
+                    start: 13,
+                    len: 3,
+                    copy_masked: true
+                },
+                RedactSpan {
+                    start: 17,
+                    len: 9,
+                    copy_masked: false
+                },
+            ]
+        );
+        assert_eq!(
+            mask_text("naïve secret=abc token=xyz", &s, false),
+            "naïve secret=••• •••••••••",
+            "the dump masks every rule, width preserved"
+        );
+        assert_eq!(
+            mask_text("naïve secret=abc token=xyz", &s, true),
+            "naïve secret=••• token=xyz",
+            "a copy masks only rules marked copy=masked"
+        );
+        assert_eq!(
+            mask_text("line one\nsecret=q\n", &s, false),
+            "line one\nsecret=•\n",
+            "masking is per line and keeps the newlines"
+        );
+    }
+
+    /// A redact rule paints; it must never become a status-bar hit, or the
+    /// bar would print the secret the pane just masked.
+    #[test]
+    fn redact_rules_never_fire_as_hits() {
+        let s = TriggerSet::default().with_builtin_redactions();
+        let mut sc = TriggerScanner::new();
+        let mut out = Vec::new();
+        sc.scan(b"key AKIAIOSFODNN7EXAMPLE end\n", &s, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        let user = set(r##"[{ "regex": "hunter2", "action": "redact" }]"##);
+        sc.scan(b"pw hunter2\n", &user, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(!s.has_events(), "nothing here wakes the scanner");
+    }
+
+    #[test]
+    fn builtin_rules_mask_the_usual_key_shapes_and_leave_prose_alone() {
+        let s = TriggerSet::default().with_builtin_redactions();
+        let masked = |line: &str| mask_text(line, &s, false);
+        assert_eq!(
+            masked("export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"),
+            "export AWS_ACCESS_KEY_ID=••••••••••••••••••••"
+        );
+        let key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123";
+        assert_eq!(
+            masked(&format!("OPENAI_API_KEY={key}")),
+            format!("OPENAI_API_KEY={}", "•".repeat(key.len()))
+        );
+        assert_eq!(
+            masked("token: ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+            "token: ••••••••••••••••••••••••••••••••••••••••"
+        );
+        assert_eq!(
+            masked("xoxb-123456789012-abcdefGHIJ"),
+            "••••••••••••••••••••••••••••"
+        );
+        assert_eq!(
+            masked("ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"),
+            "•".repeat(40),
+            "a real token can be digit-free; the prefix is the anchor"
+        );
+        assert_eq!(masked("xoxb-abcdefghijklmnopqrstuvwx"), "•".repeat(29));
+        assert_eq!(
+            masked("sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGH"),
+            "•".repeat(42),
+            "one labelled segment is a key shape"
+        );
+        let ant = "sk-ant-api03-AbCdEf1234567890AbCdEf1234567890";
+        assert_eq!(masked(ant), "•".repeat(ant.len()), "two labels: Anthropic");
+        let or = "sk-or-v1-abcdef1234567890abcdef1234567890";
+        assert_eq!(masked(or), "•".repeat(or.len()), "two labels: OpenRouter");
+        let plain_body = "sk-abcdefghijklmnopqrstuvwxyzabcdefgH1";
+        assert_eq!(
+            masked(plain_body),
+            "•".repeat(plain_body.len()),
+            "no label, mixed body"
+        );
+        let lowercase_body = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzabcdef";
+        assert_eq!(
+            masked(lowercase_body),
+            "•".repeat(lowercase_body.len()),
+            "a labelled key masks whatever its body looks like"
+        );
+        let labelled_word = "sk-learn-preprocessingtransformerspipeline";
+        assert_eq!(
+            masked(labelled_word),
+            "•".repeat(labelled_word.len()),
+            "a labelled lowercase token masks too: a click reveals it, a missed key never comes back"
+        );
+        assert_eq!(
+            masked(r#"{"Authorization": "Bearer tok_abcdef1234567890"}"#),
+            r#"{"Authorization": "Bearer ••••••••••••••••••••"}"#,
+            "the JSON header form"
+        );
+        assert_eq!(
+            masked("Authorization: Bearer abcdef0123456789ABCDEF, X-Other: 1"),
+            "Authorization: Bearer ••••••••••••••••••••••, X-Other: 1",
+            "a trailing comma stays outside"
+        );
+        assert_eq!(
+            masked("curl -H 'Authorization: Bearer abcdef0123456789ABCDEF' https://x"),
+            "curl -H 'Authorization: Bearer ••••••••••••••••••••••' https://x",
+            "the closing quote stays outside the mask"
+        );
+        assert_eq!(
+            masked("Authorization: Bearer abcdef0123456789ABCDEF"),
+            "Authorization: Bearer ••••••••••••••••••••••",
+            "a bearer header keeps its words, the token goes"
+        );
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        assert_eq!(masked(jwt), "•".repeat(jwt.chars().count()));
+        for prose in [
+            "cargo build --release",
+            "Bearer of bad news",
+            "Bearer responsibilities matter",
+            "run task sk-something-like-this-long",
+            "sk-preprocessingtransformerspipeline",
+            "the skeleton key",
+            "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        ] {
+            assert_eq!(masked(prose), prose, "prose must not be masked");
+        }
+        // The user's own rules come after the built-ins and still apply.
+        let both =
+            set(r##"[{ "regex": "hunter2", "action": "redact" }]"##).with_builtin_redactions();
+        assert_eq!(mask_text("pw hunter2", &both, false), "pw •••••••");
     }
 
     #[test]
