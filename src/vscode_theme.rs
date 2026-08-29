@@ -26,6 +26,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -50,6 +51,12 @@ struct RawTheme {
     colors: BTreeMap<String, String>,
     #[serde(default)]
     token_colors: Vec<TokenColor>,
+    /// `semanticTokenColors`: a map of semantic token type to colour (or to
+    /// an object carrying one). Consulted only where `tokenColors` left a
+    /// role empty, since TextMate scopes are what most themes actually
+    /// design against.
+    #[serde(default)]
+    semantic: BTreeMap<String, Value>,
 }
 
 /// One `tokenColors` rule. `scope` is a string or a list of them, and both
@@ -187,8 +194,17 @@ fn load_chain(path: &Path, depth: usize, out: &mut Vec<RawTheme>) -> Result<()> 
         // path in a downloaded theme has no business being read, and a
         // theme that needs one is broken rather than unsupported.
         let inc_path = Path::new(&inc);
-        if inc_path.is_absolute() {
-            return Err(anyhow!("include must be a relative path, got {inc}"));
+        if inc_path.is_absolute()
+            || inc_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            // A theme extends a sibling base, never something outside its own
+            // directory. Refusing traversal keeps a downloaded theme file
+            // from naming a path it has no business reading.
+            return Err(anyhow!(
+                "include must be a relative path inside the theme's directory, got {inc}"
+            ));
         }
         let base = path
             .parent()
@@ -202,12 +218,24 @@ fn load_chain(path: &Path, depth: usize, out: &mut Vec<RawTheme>) -> Result<()> 
 
 /// Parse one theme document, tolerating VS Code's JSONC extras.
 fn parse_theme(raw: &str) -> Result<RawTheme> {
-    let stripped = crate::workspace::strip_jsonc(raw);
+    // `crate::tasks::strip_jsonc` walks CHARS. The `workspace.rs` one walks
+    // bytes and turns a non-ASCII theme name ("Caf\u{e9} Noir") into mojibake,
+    // which is exactly the sort of theme most likely to carry one.
+    let stripped = crate::tasks::strip_jsonc(raw);
     let value: serde_json::Value = serde_json::from_str(&stripped)?;
     // `tokenColors` is camelCase in the file; take it by hand rather than
     // renaming through serde so a theme using the TextMate `settings` array
     // spelling (older themes) still yields its colours.
     let mut theme: RawTheme = serde_json::from_value(value.clone())?;
+    theme.semantic = value
+        .get("semanticTokenColors")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<BTreeMap<String, Value>>()
+        })
+        .unwrap_or_default();
     let tokens = value
         .get("tokenColors")
         .or_else(|| value.get("settings"))
@@ -221,6 +249,8 @@ fn parse_theme(raw: &str) -> Result<RawTheme> {
 fn merge(base: RawTheme, over: RawTheme) -> RawTheme {
     let mut colors = base.colors;
     colors.extend(over.colors);
+    let mut semantic = base.semantic;
+    semantic.extend(over.semantic);
     let mut token_colors = base.token_colors;
     // Later rules win in TextMate, and the including file is "later".
     token_colors.extend(over.token_colors);
@@ -230,7 +260,29 @@ fn merge(base: RawTheme, over: RawTheme) -> RawTheme {
         include: None,
         colors,
         token_colors,
+        semantic,
     }
+}
+
+/// A semantic token type's colour, if the theme names one.
+///
+/// VS Code writes either `"function": "#rrggbb"` or
+/// `"function": { "foreground": "#rrggbb", "bold": true }`, and a type can
+/// carry modifiers (`"variable.readonly"`), which are matched on the type
+/// before the dot.
+fn semantic_color(theme: &RawTheme, want: &str, over: Rgb) -> Option<Rgb> {
+    theme.semantic.iter().find_map(|(key, value)| {
+        let ty = key.split(['.', ':']).next().unwrap_or(key);
+        if ty != want {
+            return None;
+        }
+        let raw = match value {
+            Value::String(s) => Some(s.as_str()),
+            Value::Object(o) => o.get("foreground").and_then(Value::as_str),
+            _ => None,
+        }?;
+        parse_color(raw, over)
+    })
 }
 
 /// The croft syntax roles, each with the TextMate scopes that fill it, most
@@ -240,6 +292,18 @@ fn merge(base: RawTheme, over: RawTheme) -> RawTheme {
 /// colours it by TextMate scope. The roles do not correspond one-to-one, so
 /// each croft role names the scopes a theme author would have coloured for
 /// the same thing, and the first one the theme actually defines wins.
+/// Semantic token types that fill each croft role when `tokenColors` did
+/// not. Same order as [`SYNTAX_SCOPES`].
+const SYNTAX_SEMANTIC: &[(&str, &[&str])] = &[
+    ("syn_comment", &["comment"]),
+    ("syn_keyword", &["keyword", "modifier"]),
+    ("syn_string", &["string"]),
+    ("syn_constant", &["number", "parameter", "enumMember"]),
+    ("syn_function", &["function", "method"]),
+    ("syn_type", &["type", "class", "struct", "interface"]),
+    ("syn_tag", &["property", "decorator", "macro"]),
+];
+
 const SYNTAX_SCOPES: &[(&str, &[&str])] = &[
     (
         "syn_comment",
@@ -298,6 +362,19 @@ fn scope_color(theme: &RawTheme, scope: &str, over: Rgb) -> Option<Rgb> {
             continue;
         };
         for claimed in rule.scope.scopes() {
+            // A descendant selector ("source.js entity.name.function") scopes
+            // a rule to a context. croft has no context to match against, so
+            // the rule is considered for its LAST element only, and ranked
+            // below any rule that claims that scope outright. Keeping the
+            // selector whole made such rules dead, and whole themes (Tokyo
+            // Night writes most of its rules this way) lost roles to them.
+            let (claimed, contextual) = match claimed.rsplit_once(' ') {
+                Some((_, last)) => (last.trim().to_string(), true),
+                None => (claimed, false),
+            };
+            if claimed.is_empty() {
+                continue;
+            }
             // TextMate matches on dot-separated segments, and only ever
             // DOWNWARD: a rule for `keyword` colours `keyword.control.if`,
             // while a rule for `entity.name.function.decorator` colours
@@ -312,7 +389,14 @@ fn scope_color(theme: &RawTheme, scope: &str, over: Rgb) -> Option<Rgb> {
             if !matches {
                 continue;
             }
-            let specificity = claimed.matches('.').count() + 1;
+            // A contextual rule ranks below every direct one, whatever its
+            // dot depth, so a specific rule for another language cannot
+            // outrank a plain rule for this scope.
+            let specificity = if contextual {
+                0
+            } else {
+                claimed.matches('.').count() + 1
+            };
             if best.map(|(s, _)| specificity >= s).unwrap_or(true) {
                 best = Some((specificity, color));
             }
@@ -324,9 +408,12 @@ fn scope_color(theme: &RawTheme, scope: &str, over: Rgb) -> Option<Rgb> {
 /// The theme's default foreground: its scope-less `tokenColors` rule, then
 /// `editor.foreground`.
 fn default_fg(theme: &RawTheme, over: Rgb) -> Option<Rgb> {
+    // Later rules win in TextMate, so the LAST scope-less rule is the
+    // theme's default foreground, not the first.
     let scopeless = theme
         .token_colors
         .iter()
+        .rev()
         .find(|r| r.scope.scopes().is_empty())
         .and_then(|r| r.settings.foreground.as_deref())
         .and_then(|c| parse_color(c, over));
@@ -389,7 +476,39 @@ fn slug(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Ids already in use, so an import cannot shadow a theme croft ships.
+fn existing_ids() -> Vec<String> {
+    crate::theme::Theme::all()
+        .iter()
+        .map(|t| t.id().to_string())
+        .collect()
+}
+
+/// `wanted`, or `wanted-2`, `wanted-3`, ... until it is free.
+fn unique_id(wanted: String, taken: &[String]) -> String {
+    if !taken.contains(&wanted) {
+        return wanted;
+    }
+    for n in 2..1000 {
+        let candidate = format!("{wanted}-{n}");
+        if !taken.iter().any(|t| *t == candidate) {
+            return candidate;
+        }
+    }
+    wanted
+}
+
 fn convert(theme: RawTheme, id_override: Option<&str>, stem: &str) -> Result<Converted> {
+    let existing = existing_ids();
+    convert_with_ids(theme, id_override, stem, &existing)
+}
+
+fn convert_with_ids(
+    theme: RawTheme,
+    id_override: Option<&str>,
+    stem: &str,
+    taken: &[String],
+) -> Result<Converted> {
     let light = theme
         .kind
         .as_deref()
@@ -462,14 +581,15 @@ fn convert(theme: RawTheme, id_override: Option<&str>, stem: &str) -> Result<Con
             accent
         });
 
-    let tab_strip = pick(&["editorGroupHeader.tabsBackground", "tab.border"])
-        .unwrap_or_else(|| shade(bg, if light { -0.04 } else { 0.06 }));
-    let tab_inactive = pick(&["tab.inactiveBackground"])
-        .unwrap_or_else(|| shade(tab_strip, if light { -0.03 } else { 0.05 }));
-    let tab_active = pick(&["tab.activeBackground"]).unwrap_or(bg);
-    let tab_hover = pick(&["tab.hoverBackground"])
-        .unwrap_or_else(|| shade(tab_inactive, if light { -0.08 } else { 0.12 }));
-    let tab_close_pill = pick(&["tab.activeBorderTop", "tab.activeBorder"]).unwrap_or(accent);
+    // Tab chrome is emitted ONLY where the theme named it. `Theme::from_decl`
+    // derives every omitted tab colour from the palette above, and writing a
+    // derived value into the manifest would freeze croft's guess in place
+    // where croft's own derivation would have tracked the theme.
+    let tab_strip = pick(&["editorGroupHeader.tabsBackground", "tab.border"]);
+    let tab_inactive = pick(&["tab.inactiveBackground"]);
+    let tab_active = pick(&["tab.activeBackground"]);
+    let tab_hover = pick(&["tab.hoverBackground"]);
+    let tab_close_pill = pick(&["tab.activeBorderTop", "tab.activeBorder"]);
 
     // The OSK caps are croft's own surface; no VS Code theme names them.
     let osk_key = pick(&["keybindingLabel.background", "editorWidget.background"])
@@ -504,7 +624,17 @@ fn convert(theme: RawTheme, id_override: Option<&str>, stem: &str) -> Result<Con
 
     let mut syntax: Vec<(String, String)> = Vec::new();
     for (role, scopes) in SYNTAX_SCOPES {
-        match scopes.iter().find_map(|s| scope_color(&theme, s, bg)) {
+        let from_scopes = scopes.iter().find_map(|s| scope_color(&theme, s, bg));
+        // `semanticTokenColors` is the fallback, not the first choice: most
+        // themes still design against TextMate scopes, and a theme that sets
+        // both means the scope colour for anything without semantic tokens.
+        let from_semantic = || {
+            SYNTAX_SEMANTIC
+                .iter()
+                .find(|(r, _)| r == role)
+                .and_then(|(_, types)| types.iter().find_map(|t| semantic_color(&theme, t, bg)))
+        };
+        match from_scopes.or_else(from_semantic) {
             Some(c) => syntax.push(((*role).to_string(), hex_of(c))),
             None => notes.push(format!(
                 "no colour for {}: croft's Base16 default is kept",
@@ -520,12 +650,23 @@ fn convert(theme: RawTheme, id_override: Option<&str>, stem: &str) -> Result<Con
         .name
         .clone()
         .unwrap_or_else(|| stem.replace(['-', '_'], " "));
-    let id = match id_override {
+    let wanted = match id_override {
         Some(id) => slug(id),
         None => slug(&label),
     };
-    if id.is_empty() {
+    if wanted.is_empty() {
         return Err(anyhow!("could not derive a theme id from {label:?}"));
+    }
+    // An id that collides with a theme croft already ships is worse than an
+    // error: the picker resolves the id to the BUILT-IN, so the import
+    // appears to succeed and then does nothing. Importing upstream One Dark
+    // Pro produced "one-dark-pro", which croft already has.
+    let id = unique_id(wanted, taken);
+    if id != slug(id_override.unwrap_or(&label)) {
+        notes.push(format!(
+            "a theme with id {:?} already exists, so this one was installed as {id:?}",
+            slug(id_override.unwrap_or(&label))
+        ));
     }
 
     let mut m = String::new();
@@ -555,14 +696,17 @@ fn convert(theme: RawTheme, id_override: Option<&str>, stem: &str) -> Result<Con
     m.push_str(&format!("osk_key = \"{}\"\n", hex_of(osk_key)));
     m.push_str(&format!("osk_special = \"{}\"\n", hex_of(osk_special)));
     m.push_str(&format!("osk_armed = \"{}\"\n", hex_of(osk_armed)));
-    m.push_str(&format!("tab_strip = \"{}\"\n", hex_of(tab_strip)));
-    m.push_str(&format!("tab_inactive = \"{}\"\n", hex_of(tab_inactive)));
-    m.push_str(&format!("tab_active = \"{}\"\n", hex_of(tab_active)));
-    m.push_str(&format!("tab_hover = \"{}\"\n", hex_of(tab_hover)));
-    m.push_str(&format!(
-        "tab_close_pill = \"{}\"\n",
-        hex_of(tab_close_pill)
-    ));
+    for (key, value) in [
+        ("tab_strip", tab_strip),
+        ("tab_inactive", tab_inactive),
+        ("tab_active", tab_active),
+        ("tab_hover", tab_hover),
+        ("tab_close_pill", tab_close_pill),
+    ] {
+        if let Some(c) = value {
+            m.push_str(&format!("{key} = \"{}\"\n", hex_of(c)));
+        }
+    }
     if !ansi.is_empty() {
         let quoted: Vec<String> = ansi.iter().map(|c| format!("\"{c}\"")).collect();
         m.push_str(&format!("ansi = [{}]\n", quoted.join(", ")));
@@ -582,7 +726,22 @@ fn convert(theme: RawTheme, id_override: Option<&str>, stem: &str) -> Result<Con
 /// Escape a string for a double-quoted TOML value. Theme names carry
 /// quotes and backslashes often enough to matter (`"Andromeda \"Bordered\""`).
 fn toml_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Any other control character has no TOML escape worth guessing
+            // at and no business in a theme name; \u form keeps the file
+            // parseable rather than truncating it at a stray byte.
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Write a converted theme into the user extensions directory, returning the
@@ -875,6 +1034,190 @@ mod tests {
             format!("{err:#}").contains("relative"),
             "the error must say why, got {err:#}"
         );
+    }
+
+    /// Review finding: the byte-walking `strip_jsonc` in `workspace.rs`
+    /// turned every non-ASCII character into mojibake, so a theme called
+    /// "Caf\u{e9} Noir" imported under a mangled name. The chars-based
+    /// stripper in `tasks.rs` is the right one.
+    #[test]
+    fn a_non_ascii_theme_name_survives_the_jsonc_strip() {
+        let src = r##"{
+            // a comment, so the stripper definitely runs
+            "name": "Caf\u00e9 Noir \u2014 \u3086\u3081",
+            "type": "dark",
+            "colors": { "editor.background": "#101010" }
+        }"##;
+        let converted = convert_str(src);
+        assert_eq!(
+            converted.label, "Caf\u{e9} Noir \u{2014} \u{3086}\u{3081}",
+            "the name must come through intact, not as mojibake"
+        );
+        let manifest = crate::lsp::manifest::parse(&converted.manifest).unwrap();
+        assert_eq!(manifest.themes[0].label, converted.label);
+    }
+
+    /// Review finding: a descendant selector was kept whole and matched
+    /// nothing, so themes that write most of their rules that way (Tokyo
+    /// Night) lost roles. It now matches on the last element, and ranks
+    /// below any rule claiming that scope outright.
+    #[test]
+    fn a_descendant_selector_fills_a_role_but_yields_to_a_direct_rule() {
+        let contextual_only = r##"{
+            "type": "dark",
+            "colors": { "editor.background": "#000000" },
+            "tokenColors": [
+                { "scope": "source.js entity.name.function", "settings": { "foreground": "#112233" } }
+            ]
+        }"##;
+        let t = &crate::lsp::manifest::parse(&convert_str(contextual_only).manifest)
+            .unwrap()
+            .themes[0];
+        assert_eq!(
+            t.syn_function, "#112233",
+            "a contextual rule is better than leaving the role unset"
+        );
+
+        let both = r##"{
+            "type": "dark",
+            "colors": { "editor.background": "#000000" },
+            "tokenColors": [
+                { "scope": "source.js entity.name.function.member", "settings": { "foreground": "#112233" } },
+                { "scope": "entity.name.function", "settings": { "foreground": "#445566" } }
+            ]
+        }"##;
+        let t = &crate::lsp::manifest::parse(&convert_str(both).manifest)
+            .unwrap()
+            .themes[0];
+        assert_eq!(
+            t.syn_function, "#445566",
+            "a direct rule outranks a contextual one however deep"
+        );
+    }
+
+    /// `semanticTokenColors` fills a role the TextMate scopes left empty,
+    /// and only that: a theme setting both means the scope colour for
+    /// everything without semantic tokens.
+    #[test]
+    fn semantic_token_colours_are_a_fallback_not_an_override() {
+        let src = r##"{
+            "type": "dark",
+            "colors": { "editor.background": "#000000" },
+            "semanticTokenColors": {
+                "function": "#aabbcc",
+                "keyword": { "foreground": "#ddeeff", "bold": true },
+                "type.defaultLibrary": "#010203"
+            },
+            "tokenColors": [
+                { "scope": "keyword", "settings": { "foreground": "#999999" } }
+            ]
+        }"##;
+        let t = &crate::lsp::manifest::parse(&convert_str(src).manifest)
+            .unwrap()
+            .themes[0];
+        assert_eq!(
+            t.syn_function, "#aabbcc",
+            "no scope rule, so semantic fills it"
+        );
+        assert_eq!(
+            t.syn_keyword, "#999999",
+            "the scope rule wins where the theme set both"
+        );
+        assert_eq!(
+            t.syn_type, "#010203",
+            "a modifier suffix still matches its token type"
+        );
+    }
+
+    /// Review finding: an id colliding with a bundled theme made the import
+    /// UNREACHABLE, since the picker resolves the id to the built-in. The
+    /// import appeared to succeed and changed nothing.
+    #[test]
+    fn an_id_that_collides_with_an_existing_theme_is_suffixed_and_reported() {
+        let src = r##"{ "name": "Dracula", "type": "dark", "colors": { "editor.background": "#282a36" } }"##;
+        let raw = parse_theme(src).unwrap();
+        let taken = vec![String::from("dracula"), String::from("dracula-2")];
+        let converted = convert_with_ids(raw, None, "dracula", &taken).unwrap();
+        assert_eq!(converted.id, "dracula-3");
+        assert!(
+            converted.notes.iter().any(|n| n.contains("already exists")),
+            "the user must be told the id changed: {:?}",
+            converted.notes
+        );
+
+        // Every bundled theme id is taken, so a real import of one of them
+        // cannot shadow it.
+        let ids = existing_ids();
+        assert!(
+            ids.iter().any(|i| i == "black"),
+            "the bundled ids must be what collision is checked against"
+        );
+    }
+
+    /// TextMate takes the LAST scope-less rule as the default foreground.
+    #[test]
+    fn the_last_scopeless_rule_is_the_default_foreground() {
+        let src = r##"{
+            "type": "dark",
+            "colors": { "editor.background": "#000000" },
+            "tokenColors": [
+                { "settings": { "foreground": "#111111" } },
+                { "settings": { "foreground": "#222222" } }
+            ]
+        }"##;
+        let t = &crate::lsp::manifest::parse(&convert_str(src).manifest)
+            .unwrap()
+            .themes[0];
+        assert_eq!(t.syn_fg, "#222222");
+    }
+
+    /// An include may name a sibling, never a path outside the theme's own
+    /// directory.
+    #[test]
+    fn an_include_that_traverses_upwards_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("themes");
+        std::fs::create_dir(&nested).unwrap();
+        let top = nested.join("top.json");
+        std::fs::write(
+            &top,
+            r##"{ "include": "../secrets.json", "type": "dark", "colors": {} }"##,
+        )
+        .unwrap();
+        let err = convert_file(&top, None).expect_err("traversal must be refused");
+        assert!(format!("{err:#}").contains("inside the theme"), "{err:#}");
+    }
+
+    /// Tab chrome is emitted only where the theme named it, so croft's own
+    /// derivation still applies to the rest.
+    #[test]
+    fn tab_colours_are_left_out_when_the_theme_does_not_name_them() {
+        let bare = r##"{ "type": "dark", "colors": { "editor.background": "#101010" } }"##;
+        let converted = convert_str(bare);
+        assert!(
+            !converted.manifest.contains("tab_strip"),
+            "a derived tab colour must not be frozen into the manifest:\n{}",
+            converted.manifest
+        );
+        let named = r##"{
+            "type": "dark",
+            "colors": {
+                "editor.background": "#101010",
+                "tab.activeBackground": "#202020"
+            }
+        }"##;
+        let converted = convert_str(named);
+        assert!(converted.manifest.contains("tab_active = \"#202020\""));
+        assert!(!converted.manifest.contains("tab_hover"));
+    }
+
+    /// A control character in a theme name must not break the manifest.
+    #[test]
+    fn control_characters_in_a_name_stay_parseable() {
+        let src = "{ \"name\": \"Odd\\u0007Name\\tTabbed\", \"type\": \"dark\", \"colors\": {} }";
+        let converted = convert_str(src);
+        crate::lsp::manifest::parse(&converted.manifest)
+            .expect("a control character must not produce an unparseable manifest");
     }
 
     /// Theme names carry characters TOML would otherwise take as syntax.
