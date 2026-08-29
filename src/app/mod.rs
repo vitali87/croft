@@ -877,6 +877,8 @@ enum UpdateSource {
     Watch,
     SelfInstall,
     Staged,
+}
+
 /// A fenced block about to run (#353), parked behind the confirm popup.
 #[derive(Clone, Debug)]
 struct PendingRunBlock {
@@ -15734,7 +15736,17 @@ impl App {
             .code
             .lines()
             .take(8)
-            .map(|l| l.chars().take(inner_w).collect())
+            // A line wider than the popup is cut with a visible mark: what
+            // the popup hides must never look complete.
+            .map(|l| {
+                if l.chars().count() > inner_w {
+                    let mut cut: String = l.chars().take(inner_w.saturating_sub(1)).collect();
+                    cut.push('\u{2026}');
+                    cut
+                } else {
+                    l.to_string()
+                }
+            })
             .collect();
         let more = block.code.lines().count().saturating_sub(shown.len());
         let height =
@@ -25985,10 +25997,20 @@ impl App {
         block: &crate::markdown::MdRunnable,
     ) -> PendingRunBlock {
         let doc = self.editor.path.clone();
+        // The pane is named by the document's path under the workspace, so
+        // two READMEs in one tree do not share `README.md:1`.
+        let root = self.active_workspace_root();
         let file = doc
             .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .map(|rel| rel.display().to_string())
+                    .unwrap_or_else(|_| {
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| String::from("doc"))
+                    })
+            })
             .unwrap_or_else(|| String::from("doc"));
         let cwd = if block.cwd_root {
             self.active_workspace_root()
@@ -39514,7 +39536,13 @@ fn is_markdown_preview_key(key: KeyEvent) -> bool {
 /// Cmd+Enter (#353): run the shell fence under the caret in a Markdown
 /// source buffer.
 fn is_run_fence_key(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Enter) && key.modifiers.contains(KeyModifiers::SUPER)
+    matches!(key.code, KeyCode::Enter)
+        && key.modifiers.contains(KeyModifiers::SUPER)
+        // Cmd+Shift+Enter is "insert line above"; Alt chords stay the
+        // editor's.
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
 }
 
 /// The command typed into a pane for a fenced block (#353): a shell block
