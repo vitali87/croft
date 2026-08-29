@@ -57,6 +57,10 @@ struct RawTheme {
     /// design against.
     #[serde(default)]
     semantic: BTreeMap<String, Value>,
+    /// `tokenColors` entries croft could not read, counted so the import can
+    /// say so rather than quietly colouring less than the theme asked for.
+    #[serde(skip)]
+    dropped_rules: usize,
 }
 
 /// One `tokenColors` rule. `scope` is a string or a list of them, and both
@@ -241,7 +245,18 @@ fn parse_theme(raw: &str) -> Result<RawTheme> {
         .or_else(|| value.get("settings"))
         .cloned()
         .unwrap_or(serde_json::Value::Array(Vec::new()));
-    theme.token_colors = serde_json::from_value(tokens).unwrap_or_default();
+    // Per RULE, not all-or-nothing. Deserialising the whole array at once
+    // means one rule croft cannot read (`{"scope": null}` appears in real
+    // themes) drops EVERY token colour, and `unwrap_or_default` turns that
+    // into an empty list with no diagnostic: the theme imports looking fine
+    // and renders with croft's Base16 palette throughout.
+    let rules: Vec<Value> = serde_json::from_value(tokens).unwrap_or_default();
+    let total = rules.len();
+    theme.token_colors = rules
+        .into_iter()
+        .filter_map(|r| serde_json::from_value::<TokenColor>(r).ok())
+        .collect();
+    theme.dropped_rules = total - theme.token_colors.len();
     Ok(theme)
 }
 
@@ -261,6 +276,7 @@ fn merge(base: RawTheme, over: RawTheme) -> RawTheme {
         colors,
         token_colors,
         semantic,
+        dropped_rules: base.dropped_rules + over.dropped_rules,
     }
 }
 
@@ -635,6 +651,13 @@ fn convert_with_ids(
         ));
     }
 
+    if theme.dropped_rules > 0 {
+        notes.push(format!(
+            "{} tokenColors rule(s) could not be read and were skipped: the code palette may be less complete than the theme intends",
+            theme.dropped_rules
+        ));
+    }
+
     let fg = default_fg(&theme, bg);
     if fg.is_none() {
         notes.push(String::from(
@@ -654,16 +677,21 @@ fn convert_with_ids(
                 .find(|(r, _)| r == role)
                 .and_then(|(_, types)| types.iter().find_map(|t| semantic_color(&theme, t, bg)))
         };
-        match from_scopes.or_else(|| {
-            let c = from_semantic();
-            if c.is_some() {
-                notes.push(format!(
-                    "{} came from semanticTokenColors: the theme sets no TextMate scope for it, so it may differ from VS Code where semantic highlighting is off",
-                    role.trim_start_matches("syn_")
-                ));
-            }
-            c
-        }) {
+        // Decide first, then record. Pushing the note from inside the
+        // `or_else` closure worked only because it is evaluated at most
+        // once, which is a property of the call rather than of the code.
+        let from_semantic = if from_scopes.is_none() {
+            from_semantic()
+        } else {
+            None
+        };
+        if from_semantic.is_some() {
+            notes.push(format!(
+                "{} came from semanticTokenColors: the theme sets no TextMate scope for it, so it may differ from VS Code where semantic highlighting is off",
+                role.trim_start_matches("syn_")
+            ));
+        }
+        match from_scopes.or(from_semantic) {
             Some(c) => syntax.push(((*role).to_string(), hex_of(c))),
             None => notes.push(format!(
                 "no colour for {}: croft's Base16 default is kept",
@@ -1356,6 +1384,38 @@ mod tests {
         assert_eq!(
             scope_roles, semantic_roles,
             "the two tables are read together by role and must stay aligned"
+        );
+    }
+
+    /// Round-3 review finding: parsing `tokenColors` as one array meant a
+    /// single rule croft could not read dropped EVERY token colour, and
+    /// `unwrap_or_default` turned that into an empty list with no
+    /// diagnostic. `{"scope": null}` appears in real themes, so the theme
+    /// imported looking fine and rendered with croft's own palette.
+    #[test]
+    fn one_unreadable_rule_does_not_discard_the_whole_palette() {
+        let src = r##"{
+            "type": "dark",
+            "colors": { "editor.background": "#000000" },
+            "tokenColors": [
+                { "scope": "comment", "settings": { "foreground": "#111111" } },
+                { "scope": null, "settings": { "foreground": "#222222" } },
+                { "scope": "keyword", "settings": { "foreground": "#333333" } }
+            ]
+        }"##;
+        let converted = convert_str(src);
+        let t = &crate::lsp::manifest::parse(&converted.manifest)
+            .unwrap()
+            .themes[0];
+        assert_eq!(t.syn_comment, "#111111", "rules before the bad one survive");
+        assert_eq!(t.syn_keyword, "#333333", "and rules after it");
+        assert!(
+            converted
+                .notes
+                .iter()
+                .any(|n| n.contains("could not be read")),
+            "and the skipped rule is reported: {:?}",
+            converted.notes
         );
     }
 
