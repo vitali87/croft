@@ -31009,11 +31009,20 @@ impl App {
         self.scroll_log_to_match(hit);
     }
 
-    /// Park the viewport on `hit` and mark it the active match. A log has no
-    /// caret, so the match position is carried by `active_search_match`
+    /// Park the viewport on the step's match and mark it active. A log has
+    /// no caret, so the match position is carried by `active_search_match`
     /// alone and the row is centred rather than merely revealed.
-    fn scroll_log_to_match(&mut self, hit: Option<crate::widgets::editor_find::MatchPos>) {
-        let Some(m) = hit else {
+    ///
+    /// A step that ran out of budget is NOT the same as one that found
+    /// nothing: it leaves the count marked partial, so the bar keeps saying
+    /// how far the search actually reached instead of claiming "No results"
+    /// for a file it never finished reading.
+    fn scroll_log_to_match(&mut self, step: crate::log_view::Step) {
+        if let Some(state) = self.editor_find.as_mut().filter(|_| step.out_of_reach()) {
+            let count = state.match_count;
+            state.set_match_count(count, true);
+        }
+        let Some(m) = step.found() else {
             self.editor.active_search_match = None;
             return;
         };

@@ -34873,15 +34873,20 @@ fn a_logs_budgeted_count_does_not_leak_onto_the_next_text_search() {
         "a log too large to search whole must report its count as partial"
     );
 
-    // Now search an ordinary file, which IS counted exhaustively.
-    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
-        .unwrap();
+    // Now search an ordinary file, which IS counted exhaustively. The find
+    // bar deliberately stays OPEN across the tab switch: closing it builds a
+    // fresh EditorFind on the next Cmd+F, and this test then passes against
+    // the very bug it exists to catch (round-2 review finding).
     let text = tmp.path().join("small.txt");
     std::fs::write(&text, "ERROR one\nplain\nERROR two\n").unwrap();
     app.editor.open(&text).unwrap();
     assert!(app.editor.log.is_none(), "a plain file is a text tab");
-    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
-        .unwrap();
+    assert!(
+        app.editor_find.is_some(),
+        "the find bar must still be the one the log search left behind"
+    );
+    // Retype the query into the SAME bar rather than opening a new one.
+    app.editor_find.as_mut().unwrap().query.clear();
     for ch in "ERROR".chars() {
         app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
             .unwrap();

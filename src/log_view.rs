@@ -44,6 +44,39 @@ pub fn scanned_label() -> String {
     format!("{} MiB", FIND_SCAN_BYTES / (1024 * 1024))
 }
 
+/// The outcome of one find step over a windowed file.
+///
+/// A budgeted search has three answers, not two. Collapsing the third into
+/// `None` is what makes "there is no match" and "there is no match I could
+/// reach" indistinguishable, which is the same dishonesty as a partial count
+/// shown as a total, one layer up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// A match, at this position.
+    Found(MatchPos),
+    /// The file genuinely contains no match, searched end to end.
+    Absent,
+    /// The sweep ran out of budget (or hit bytes it could not read) before
+    /// it could answer. The file may still contain a match.
+    OutOfReach,
+}
+
+impl Step {
+    /// The match, if there is one. Callers that cannot act on the difference
+    /// still have to NAME it by calling this.
+    pub fn found(self) -> Option<MatchPos> {
+        match self {
+            Step::Found(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Whether the answer was cut short rather than complete.
+    pub fn out_of_reach(self) -> bool {
+        matches!(self, Step::OutOfReach)
+    }
+}
+
 /// One window of a find sweep: its text, how many COMPLETE lines it covers,
 /// and whether bytes were dropped to the window cap.
 #[derive(Default)]
@@ -343,9 +376,10 @@ impl LogView {
     /// First match at or after (`from_row`, `from_col_chars`), searching
     /// forward and wrapping to the top, like the editor's own find.
     ///
-    /// Unlike the editor's, this one is BUDGETED: a match further into a
-    /// multi-gigabyte log than [`FIND_SCAN_BYTES`] is not found. The budget
-    /// is per direction-leg, so the wrap gets its own.
+    /// Unlike the editor's, this one is BUDGETED, and says so: a match
+    /// further away than [`FIND_SCAN_BYTES`] comes back as
+    /// [`Step::OutOfReach`], never as "no match". The budget is per
+    /// direction-leg, so the wrap gets its own.
     pub fn find_next(
         &self,
         needle: &str,
@@ -353,13 +387,13 @@ impl LogView {
         from_row: usize,
         from_col_chars: usize,
         skip_current: bool,
-    ) -> Option<MatchPos> {
+    ) -> Step {
         if needle.is_empty() || self.is_empty() {
-            return None;
+            return Step::Absent;
         }
         let mut hit = None;
         let mut budget = ScanBudget::new();
-        self.scan_from(from_row, &mut budget, |row, text| {
+        let cut_short = self.scan_from(from_row, &mut budget, |row, text| {
             if !line_may_match(text, needle, opts) {
                 return true;
             }
@@ -383,19 +417,22 @@ impl LogView {
             }
             true
         });
-        if hit.is_some() {
-            return hit;
+        if let Some(m) = hit {
+            return Step::Found(m);
+        }
+        if cut_short {
+            return Step::OutOfReach;
         }
         // Wrap, INCLUDING from row 0: with `skip_current` set, a lone match
         // earlier on the anchor row is skipped by the forward leg, and
-        // returning here would clear the highlight on a one-match log every
+        // stopping here would clear the highlight on a one-match log every
         // time the user pressed Enter.
-        let mut budget = ScanBudget::new();
+        //
         // The wrap takes the FIRST match in the file with no column filter,
-        // including one at the anchor itself. With a single match that is the
-        // whole point: Enter should return to it, the way it does in the
-        // editor, rather than reporting nothing and clearing the highlight.
-        self.scan_range(0, from_row + 1, &mut budget, |row, text| {
+        // including one at the anchor itself, which is what an editor does
+        // with a single match.
+        let mut budget = ScanBudget::new();
+        let cut_short = self.scan_range(0, from_row + 1, &mut budget, |row, text| {
             if row > from_row {
                 return false;
             }
@@ -412,7 +449,11 @@ impl LogView {
             }
             true
         });
-        hit
+        match (hit, cut_short) {
+            (Some(m), _) => Step::Found(m),
+            (None, true) => Step::OutOfReach,
+            (None, false) => Step::Absent,
+        }
     }
 
     /// Last match before (`from_row`, `from_col_chars`), for Shift+Enter.
@@ -423,41 +464,61 @@ impl LogView {
     /// an 11 MiB log every Shift+Enter spent its whole budget re-reading the
     /// head and returned nothing. Cost here is proportional to the DISTANCE
     /// to the previous match, which is what the user is actually asking for.
+    ///
+    /// Each leg (backwards to the head, then the wrap) gets its own budget,
+    /// matching [`Self::find_next`]: a long first leg must not silently
+    /// starve the wrap.
     pub fn find_prev(
         &self,
         needle: &str,
         opts: SearchOpts,
         from_row: usize,
         from_col_chars: usize,
-    ) -> Option<MatchPos> {
+    ) -> Step {
         if needle.is_empty() || self.is_empty() {
-            return None;
+            return Step::Absent;
         }
+        // Leg one: backwards from the anchor to the head, honouring the
+        // anchor column, since only matches BEFORE the caret are "previous".
+        match self.walk_back(
+            needle,
+            opts,
+            from_row + 1,
+            Some((from_row, from_col_chars)),
+            0,
+        ) {
+            Step::Absent => {}
+            other => return other,
+        }
+        // Leg two: wrap to the end of the file and walk back to the anchor
+        // row, with NO column filter. A match LATER on the anchor row is the
+        // previous match once the search has wrapped, and filtering it out
+        // made it unreachable on a file whose only matches share that row.
+        self.walk_back(needle, opts, self.len(), None, from_row)
+    }
+
+    /// Scan `[stop, end)` backwards a chunk at a time, returning the LAST
+    /// match found. `anchor` restricts matches on its own row to those
+    /// strictly before its column.
+    fn walk_back(
+        &self,
+        needle: &str,
+        opts: SearchOpts,
+        end: usize,
+        anchor: Option<(usize, usize)>,
+        stop: usize,
+    ) -> Step {
         let mut budget = ScanBudget::new();
-        let mut end = from_row + 1;
-        // Sweep backwards over the file, then wrap once past the anchor.
-        let mut wrapped = false;
-        loop {
-            if end == 0 {
-                if wrapped {
-                    return None;
-                }
-                wrapped = true;
-                end = self.len();
-                if end <= from_row {
-                    return None;
-                }
-            }
-            let start = end.saturating_sub(SCAN_CHUNK_LINES);
+        let mut end = end.min(self.len());
+        while end > stop {
+            let start = end.saturating_sub(SCAN_CHUNK_LINES).max(stop);
             let mut best: Option<MatchPos> = None;
-            let stopped = self.scan_range(start, end, &mut budget, |row, text| {
+            let cut_short = self.scan_range(start, end, &mut budget, |row, text| {
                 if !line_may_match(text, needle, opts) {
                     return true;
                 }
                 for (col, len) in line_matches(text, opts, needle) {
-                    // On the anchor row itself, only matches strictly before
-                    // the caret count as "previous".
-                    if row == from_row && col >= from_col_chars {
+                    if anchor.is_some_and(|(arow, acol)| row == arow && col >= acol) {
                         break;
                     }
                     best = Some(MatchPos {
@@ -468,15 +529,17 @@ impl LogView {
                 }
                 true
             });
-            if best.is_some() {
-                return best;
+            if let Some(m) = best {
+                return Step::Found(m);
             }
-            if stopped {
-                // Out of budget: report nothing rather than a wrong match.
-                return None;
+            if cut_short {
+                // Out of budget, or bytes we could not read: say so rather
+                // than reporting an absence we never established.
+                return Step::OutOfReach;
             }
             end = start;
         }
+        Step::Absent
     }
 
     /// How many matches the budget could see, and whether it ran out.
@@ -531,14 +594,14 @@ mod tests {
         let v = LogView::open(&p).unwrap();
         let opts = SearchOpts::default();
 
-        let m = v.find_next("red alert", opts, 0, 0, false).unwrap();
+        let m = v.find_next("red alert", opts, 0, 0, false).found().unwrap();
         assert_eq!(
             (m.row, m.col_chars, m.len_chars),
             (1, 0, 9),
             "the match is at column 0 of the stripped line, not past the escape"
         );
         assert!(
-            v.find_next("[31m", opts, 0, 0, false).is_none(),
+            v.find_next("[31m", opts, 0, 0, false).found().is_none(),
             "escape bytes are not searchable text"
         );
     }
@@ -550,20 +613,22 @@ mod tests {
         let v = LogView::open(&p).unwrap();
         let opts = SearchOpts::default();
 
-        let first = v.find_next("hit", opts, 0, 0, false).unwrap();
+        let first = v.find_next("hit", opts, 0, 0, false).found().unwrap();
         assert_eq!(first.row, 0);
         let second = v
             .find_next("hit", opts, first.row, first.col_chars, true)
+            .found()
             .unwrap();
         assert_eq!(second.row, 2, "skip_current steps past the anchor");
         let wrapped = v
             .find_next("hit", opts, second.row, second.col_chars, true)
+            .found()
             .unwrap();
         assert_eq!(wrapped.row, 0, "past the last match, find wraps to the top");
 
-        let back = v.find_prev("hit", opts, 2, 0).unwrap();
+        let back = v.find_prev("hit", opts, 2, 0).found().unwrap();
         assert_eq!(back.row, 0, "prev walks backwards");
-        let back_wrapped = v.find_prev("hit", opts, 0, 0).unwrap();
+        let back_wrapped = v.find_prev("hit", opts, 0, 0).found().unwrap();
         assert_eq!(
             back_wrapped.row, 2,
             "with nothing before the anchor, prev wraps to the last match"
@@ -577,10 +642,107 @@ mod tests {
         let (_d, p) = write_tmp(b"err and err again\n");
         let v = LogView::open(&p).unwrap();
         let opts = SearchOpts::default();
-        let a = v.find_next("err", opts, 0, 0, false).unwrap();
-        let b = v.find_next("err", opts, a.row, a.col_chars, true).unwrap();
+        let a = v.find_next("err", opts, 0, 0, false).found().unwrap();
+        let b = v
+            .find_next("err", opts, a.row, a.col_chars, true)
+            .found()
+            .unwrap();
         assert_eq!((a.col_chars, b.col_chars), (0, 8));
         assert_eq!(v.count_matches("err", opts), (2, false));
+    }
+
+    /// The strongest check available: a log's find must agree with the
+    /// EDITOR's find, position for position, over every anchor.
+    ///
+    /// The editor searches an in-memory buffer with well-tested code, so any
+    /// disagreement on a file small enough for both is a bug in this module.
+    ///
+    /// The fixture list matters as much as the comparison. My first version
+    /// of this harness used only the multi-line case and PASSED against a
+    /// real bug the review had already found: the backward wrap kept the
+    /// anchor-column filter, so a match later on the anchor row was
+    /// unreachable, and with several lines the wrap found a match on some
+    /// other row and hid it. The single-line and single-match fixtures are
+    /// the ones where the anchor row is the only place a match can come
+    /// from, which is exactly where that class of bug lives.
+    #[test]
+    fn find_agrees_with_the_editors_find_from_every_anchor() {
+        let fixtures: [&[&str]; 5] = [
+            &["hit zero hit"],
+            &["only one hit here"],
+            &[
+                "hit zero hit",
+                "nothing here",
+                "hit again",
+                "",
+                "trailing hit",
+            ],
+            &["no matches at all", "still nothing"],
+            &["hit", "hit", "hit"],
+        ];
+        let opts = SearchOpts::default();
+        for lines in fixtures {
+            let body = lines.join("\n") + "\n";
+            let (_d, p) = write_tmp(body.as_bytes());
+            let v = LogView::open(&p).unwrap();
+            let buf: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
+
+            for row in 0..lines.len() {
+                for col in 0..=lines[row].chars().count() {
+                    for skip in [false, true] {
+                        let ours = v.find_next("hit", opts, row, col, skip).found();
+                        let theirs = crate::widgets::editor_find::find_next_match(
+                            &buf, "hit", opts, row, col, skip,
+                        );
+                        assert_eq!(
+                            ours, theirs,
+                            "find_next disagreed at row {row} col {col} skip {skip} on {lines:?}"
+                        );
+                    }
+                    let ours = v.find_prev("hit", opts, row, col).found();
+                    let theirs = crate::widgets::editor_find::find_prev_match(
+                        &buf, "hit", opts, row, col, true,
+                    );
+                    assert_eq!(
+                        ours, theirs,
+                        "find_prev disagreed at row {row} col {col} on {lines:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A search that ran out of budget must not answer "no match": the file
+    /// may well contain one further in. The third answer is the whole point
+    /// of [`Step`].
+    #[test]
+    fn a_search_that_runs_out_of_budget_says_so_rather_than_absent() {
+        let filler = "x".repeat(200);
+        let mut body = String::new();
+        for _ in 0..(FIND_SCAN_BYTES / filler.len() + 4000) {
+            body.push_str(&filler);
+            body.push('\n');
+        }
+        let (_d, p) = write_tmp(body.as_bytes());
+        let v = LogView::open(&p).unwrap();
+        let opts = SearchOpts::default();
+
+        assert_eq!(
+            v.find_next("needle", opts, 0, 0, false),
+            Step::OutOfReach,
+            "a needle past the budget is out of reach, not absent"
+        );
+        assert_eq!(
+            v.find_prev("needle", opts, v.len() - 1, 0),
+            Step::OutOfReach,
+            "and the same walking backwards"
+        );
+
+        // A small file IS searched end to end, so absence there is real.
+        let (_d2, small) = write_tmp(b"nothing here\n");
+        let v2 = LogView::open(&small).unwrap();
+        assert_eq!(v2.find_next("needle", opts, 0, 0, false), Step::Absent);
+        assert_eq!(v2.find_prev("needle", opts, 0, 0), Step::Absent);
     }
 
     /// Review finding: with `skip_current` set, a lone match on the anchor
@@ -592,10 +754,11 @@ mod tests {
         let (_d, p) = write_tmp(b"only hit here\nnothing\n");
         let v = LogView::open(&p).unwrap();
         let opts = SearchOpts::default();
-        let first = v.find_next("hit", opts, 0, 0, false).unwrap();
+        let first = v.find_next("hit", opts, 0, 0, false).found().unwrap();
         assert_eq!((first.row, first.col_chars), (0, 5));
         let again = v
             .find_next("hit", opts, first.row, first.col_chars, true)
+            .found()
             .expect("Enter must land back on the only match, not clear it");
         assert_eq!((again.row, again.col_chars), (0, 5));
     }
@@ -623,6 +786,7 @@ mod tests {
         let anchor = before_marks + 2;
         let prev = v
             .find_prev("needle", SearchOpts::default(), anchor, 0)
+            .found()
             .expect("the previous match is two lines back, budget or not");
         assert_eq!(prev.row, before_marks);
     }
@@ -699,7 +863,7 @@ mod tests {
         let (_d, p) = write_tmp(&body);
         let v = LogView::open(&p).unwrap();
         let opts = SearchOpts::default();
-        let m = v.find_next("findme", opts, 0, 0, false);
+        let m = v.find_next("findme", opts, 0, 0, false).found();
         assert_eq!(
             m.map(|m| m.row),
             Some(1),
