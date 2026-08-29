@@ -42,7 +42,7 @@ pub struct Task {
 
 /// Every task the workspace's manifests declare, in source priority
 /// order (tasks.json first so an explicit VS Code default-build wins).
-/// Duplicate command lines are dropped, first source wins.
+/// A repeated (label, command line) pair is dropped, first source wins.
 pub fn discover_tasks(root: &Path) -> Vec<Task> {
     let mut out = Vec::new();
     out.extend(vscode_tasks(root));
@@ -91,10 +91,13 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
                     line.push_str(a);
                 }
             }
+            // VS Code labels a label-less entry by its full command line,
+            // not the bare program: three label-less `npm` entries must
+            // stay three tasks, not collapse to one "npm".
             let label = t
                 .get("label")
                 .and_then(|l| l.as_str())
-                .unwrap_or(command)
+                .unwrap_or(&line)
                 .to_string();
             let is_build = match t.get("group") {
                 Some(serde_json::Value::String(s)) => s == "build",
@@ -371,11 +374,25 @@ pub(crate) fn strip_jsonc(text: &str) -> String {
     out
 }
 
+/// One task per (label, command line), first source winning. The label is
+/// the identifier everything else keys on (`preLaunchTask`, the Run Task
+/// picker), so a label the workspace declares must survive; the command is
+/// what runs, so a distinct command must survive too. De-duplicating by
+/// command line alone dropped a convention source's label whenever
+/// tasks.json reused its command under another name, and the lookup then
+/// reported "not found" for a task the workspace plainly declared (#336).
+/// The one thing that still collapses is a true repeat: the same label
+/// running the same line. A user who relabels `cargo build` sees it listed
+/// under both names, by design. Two tasks sharing a label with DIFFERENT
+/// commands both survive here; the lookups keyed on the label alone
+/// (`preLaunchTask`, task-pane reuse) then resolve to the first, so a
+/// workspace that reuses a label across commands gets first-source-wins at
+/// the lookup, not in this list.
 fn dedup(tasks: Vec<Task>) -> Vec<Task> {
     let mut seen = BTreeSet::new();
     tasks
         .into_iter()
-        .filter(|t| seen.insert(t.command.clone()))
+        .filter(|t| seen.insert((t.label.clone(), t.command.clone())))
         .collect()
 }
 
@@ -505,6 +522,134 @@ mod tests {
                 .iter()
                 .any(|t| t.command == "cargo build" && t.is_build),
             "cargo build is the build task"
+        );
+    }
+
+    /// Everything that looks a task up does so by label, so de-duplication
+    /// must key on labels too: a tasks.json entry that reuses a convention
+    /// source's command line under its own name must not make the
+    /// convention label unfindable (#336).
+    #[test]
+    fn a_relabelled_command_keeps_the_convention_label_findable() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [ { "label": "Build Project", "type": "shell", "command": "cargo build" } ] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let labels: Vec<&str> = tasks.iter().map(|t| t.label.as_str()).collect();
+        assert!(labels.contains(&"Build Project"), "{labels:?}");
+        assert!(
+            labels.contains(&"cargo build"),
+            "the Cargo label must survive a tasks.json entry with the same command: {labels:?}"
+        );
+    }
+
+    /// A label-less tasks.json entry is labelled by its whole command line
+    /// (VS Code's rule), so several entries sharing a program stay distinct
+    /// tasks instead of collapsing to one bare "npm".
+    #[test]
+    fn label_less_entries_sharing_a_program_stay_distinct() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [
+              { "type": "shell", "command": "npm", "args": ["run", "build"] },
+              { "type": "shell", "command": "npm", "args": ["run", "test"] },
+              { "type": "shell", "command": "npm", "args": ["run", "lint"] }
+            ] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let pairs: Vec<(&str, &str)> = tasks
+            .iter()
+            .map(|t| (t.label.as_str(), t.command.as_str()))
+            .collect();
+        for cmd in ["npm run build", "npm run test", "npm run lint"] {
+            assert!(
+                pairs.contains(&(cmd, cmd)),
+                "{cmd} must survive as its own task, labelled by its line: {pairs:?}"
+            );
+        }
+    }
+
+    /// Only a true repeat collapses: the same label running the same line.
+    /// One that relabels a convention command lists under both names, by
+    /// design.
+    #[test]
+    fn only_a_repeated_label_and_command_pair_collapses() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [
+              { "label": "make build", "type": "shell", "command": "make build" },
+              { "label": "Build", "type": "shell", "command": "make build" }
+            ] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let rows: Vec<(&str, &str, &str)> = tasks
+            .iter()
+            .map(|t| (t.label.as_str(), t.command.as_str(), t.source.as_str()))
+            .collect();
+        let repeats: Vec<_> = rows
+            .iter()
+            .filter(|r| (r.0, r.1) == ("make build", "make build"))
+            .collect();
+        assert_eq!(repeats.len(), 1, "the exact repeat folds to one: {rows:?}");
+        assert_eq!(
+            repeats[0].2, "tasks.json",
+            "and the first source wins over the Makefile's"
+        );
+        assert!(
+            rows.iter().any(|r| (r.0, r.1) == ("Build", "make build")),
+            "a relabelled command keeps its own entry: {rows:?}"
+        );
+    }
+
+    /// A label reused for a DIFFERENT command is not a repeat: both tasks
+    /// survive, and the label-keyed lookup (the `preLaunchTask` rule) takes
+    /// the first declared.
+    #[test]
+    fn a_label_reused_for_a_different_command_keeps_both_and_the_lookup_takes_the_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [
+              { "label": "Build", "type": "shell", "command": "make a" },
+              { "label": "Build", "type": "shell", "command": "make b" }
+            ] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let builds: Vec<&str> = tasks
+            .iter()
+            .filter(|t| t.label == "Build")
+            .map(|t| t.command.as_str())
+            .collect();
+        assert_eq!(
+            builds,
+            ["make a", "make b"],
+            "both survive, declaration order kept"
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|t| t.label == "Build")
+                .map(|t| t.command.as_str()),
+            Some("make a"),
+            "a lookup by label resolves to the first declared"
         );
     }
 
