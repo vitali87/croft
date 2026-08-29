@@ -337,6 +337,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_markdown_preview_key",
             },
             ShortcutEntry {
+                keys: "Cmd+Enter",
+                description: "Markdown: run the shell fence under the caret in a named pane (confirms first)",
+                handler: "is_run_fence_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Opt+Shift+F",
                 description: "Format Document (reformat the whole buffer via the language server)",
                 handler: "is_format_document_key",
