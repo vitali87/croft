@@ -25817,10 +25817,6 @@ impl App {
         self.status = format!("Copied {} chars to clipboard", text.chars().count());
     }
 
-    /// Start a drag-selection in the rendered Markdown/document preview
-    /// when `(col, row)` lands inside it. Returns true when the press was
-    /// consumed, so the normal editor click path is skipped: the source
-    /// buffer is not visible, and a caret there would serve nobody.
     /// Start a mouse selection over a rendered ANSI log (#257).
     ///
     /// Mirrors `begin_preview_selection`: a log tab's `lines` is a one-line
@@ -25908,6 +25904,10 @@ impl App {
         true
     }
 
+    /// Start a drag-selection in the rendered Markdown/document preview
+    /// when `(col, row)` lands inside it. Returns true when the press was
+    /// consumed, so the normal editor click path is skipped: the source
+    /// buffer is not visible, and a caret there would serve nobody.
     fn begin_preview_selection(&mut self, col: u16, row: u16) -> bool {
         let Some(md) = self.editor.markdown_preview.as_mut() else {
             return false;
@@ -25981,6 +25981,10 @@ impl App {
                 copy_to_clipboard(&text);
                 self.status = format!("Copied {} chars to clipboard", text.chars().count());
             }
+            return;
+        }
+        // A rendered log likewise hides its own text behind a stub buffer.
+        if self.editor.log.is_some() && self.copy_log_selection() {
             return;
         }
         if let Some(diff) = self.editor.diff.as_ref() {

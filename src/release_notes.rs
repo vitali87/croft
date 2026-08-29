@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "croft import-vscode brings a VS Code profile across: the settings croft has an equivalent for, keybindings whose commands map to croft's, and your snippets. Existing croft values always win, so it is safe to run twice, and every key or chord that could not come across is listed rather than dropped in silence.",
+    summary: "Drag to select in a rendered colour log and copy it: the clipboard gets the text you can see rather than the escape codes behind it, and a selection too large to copy whole says so instead of quietly handing over less.",
 }];

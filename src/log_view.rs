@@ -587,8 +587,7 @@ impl LogView {
 
     /// Whether a selection covers anything at all.
     pub fn has_selection(&self) -> bool {
-        self.selection
-            .is_some_and(|(a, b)| a != b)
+        self.selection.is_some_and(|(a, b)| a != b)
     }
 
     /// [`Self::ordered_selection`] for the renderer, which needs the same
@@ -622,7 +621,11 @@ impl LogView {
         self.scan_range(sr, er + 1, &mut budget, |row, text| {
             let chars: Vec<char> = text.chars().collect();
             let from = if row == sr { sc.min(chars.len()) } else { 0 };
-            let to = if row == er { ec.min(chars.len()) } else { chars.len() };
+            let to = if row == er {
+                ec.min(chars.len())
+            } else {
+                chars.len()
+            };
             if from < to {
                 out.extend(&chars[from..to]);
             }
@@ -728,6 +731,76 @@ mod tests {
             .unwrap();
         assert_eq!((a.col_chars, b.col_chars), (0, 8));
         assert_eq!(v.count_matches("err", opts), (2, false));
+    }
+
+    /// Copy takes the text the reader SEES: escapes stripped, whole lines in
+    /// the middle, partial at each end.
+    #[test]
+    fn a_selection_copies_the_stripped_text_between_its_endpoints() {
+        let body = b"alpha one\n\x1b[31mbeta two\x1b[0m\ngamma three\n";
+        let (_d, p) = write_tmp(body);
+        let mut v = LogView::open(&p).unwrap();
+
+        // Mid-word on the first line through mid-word on the last.
+        v.selection = Some(((0, 6), (2, 5)));
+        let (text, clamped) = v.selection_text();
+        assert_eq!(text, "one\nbeta two\ngamma");
+        assert!(!clamped, "a small file is copied whole");
+
+        // A backwards drag selects the same text.
+        v.selection = Some(((2, 5), (0, 6)));
+        assert_eq!(v.selection_text().0, "one\nbeta two\ngamma");
+
+        // A single line, and a caret (no area) copies nothing.
+        v.selection = Some(((1, 0), (1, 4)));
+        assert_eq!(v.selection_text().0, "beta");
+        v.selection = Some(((1, 2), (1, 2)));
+        assert_eq!(v.selection_text().0, "");
+        assert!(!v.has_selection());
+    }
+
+    /// A selection can span a file this view exists to avoid loading whole,
+    /// so the copy is bounded AND says when it hit the bound. A clipboard
+    /// holding silently less than was selected is the failure to avoid.
+    #[test]
+    fn a_selection_larger_than_the_copy_cap_is_clamped_and_reported() {
+        let line = "x".repeat(120) + "\n";
+        let lines = (MAX_COPY_BYTES / line.len()) + 500;
+        let body = line.repeat(lines);
+        let (_d, p) = write_tmp(body.as_bytes());
+        let mut v = LogView::open(&p).unwrap();
+
+        v.selection = Some(((0, 0), (v.len() - 1, 120)));
+        let (text, clamped) = v.selection_text();
+        assert!(
+            clamped,
+            "a selection past the cap must report itself clamped"
+        );
+        assert!(
+            text.len() <= MAX_COPY_BYTES + 200,
+            "and must actually stop near the cap, got {} bytes",
+            text.len()
+        );
+    }
+
+    /// Copying must not evict the window the reader is looking at: the cache
+    /// is what the renderer paints from, and a copy that cleared it would
+    /// blank the screen behind the selection.
+    #[test]
+    fn copying_leaves_the_viewport_window_intact() {
+        let body: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let (_d, p) = write_tmp(body.as_bytes());
+        let mut v = LogView::open(&p).unwrap();
+        v.ensure(400, 10).unwrap();
+        assert_eq!(v.visible_text(400), Some("line 400"));
+
+        v.selection = Some(((0, 0), (20, 3)));
+        let _ = v.selection_text();
+        assert_eq!(
+            v.visible_text(400),
+            Some("line 400"),
+            "the copy must not evict the cached viewport"
+        );
     }
 
     /// The strongest check available: a log's find must agree with the

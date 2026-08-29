@@ -301,8 +301,10 @@ fn render_log(
         // Selection goes under the find highlight and over the log's own
         // colours: it is the coarser mark, and a match inside a selection
         // should still read as the match.
-        if let Some(((sr, sc), (er, ec))) = selection {
-            if idx >= sr && idx <= er {
+        if let Some(((sr, sc), (er, ec))) =
+            selection.filter(|((sr, _), (er, _))| idx >= *sr && idx <= *er)
+        {
+            {
                 let from = if idx == sr { sc } else { 0 };
                 let to = if idx == er {
                     ec

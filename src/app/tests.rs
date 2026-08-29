@@ -34994,3 +34994,72 @@ fn retyping_into_an_out_of_reach_query_clears_the_old_highlight() {
          painted"
     );
 }
+
+/// #257: dragging over a rendered ANSI log selects it, and Cmd+C copies what
+/// the reader SEES rather than the escape bytes behind it.
+///
+/// Driven through the real gestures and a real render, so the body rect the
+/// mouse path reads is the one a frame actually painted: a test that set
+/// `last_body` by hand would pass with the renderer never having agreed.
+#[test]
+fn dragging_over_a_rendered_log_selects_and_copies_the_visible_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("run.log");
+    std::fs::write(
+        &p,
+        "\u{1b}[32mINFO\u{1b}[0m starting up\n\u{1b}[31mERROR\u{1b}[0m disk full\nbye\n",
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some(), "the fixture opens rendered");
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    assert!(
+        body.width > 0 && body.height > 0,
+        "the render must have published a body rect for the mouse to hit"
+    );
+
+    // Press on the first body row, drag to the second, release.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        body.x,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        body.x + 10,
+        body.y + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        body.x + 10,
+        body.y + 1,
+    ));
+
+    let log = app.editor.log.as_ref().unwrap();
+    assert!(log.has_selection(), "the drag must leave a selection");
+    assert!(!log.dragging, "and the release must end the drag");
+    let (text, clamped) = log.selection_text();
+    assert!(!clamped);
+    assert_eq!(
+        text, "INFO starting up\nERROR disk",
+        "the copy is the stripped text, not the escapes behind it"
+    );
+
+    // Cmd+C puts exactly that on the clipboard.
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        app.status.starts_with("Copied"),
+        "the copy must report itself, got {:?}",
+        app.status
+    );
+}
