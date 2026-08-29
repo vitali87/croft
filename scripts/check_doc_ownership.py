@@ -23,7 +23,27 @@ import re
 import subprocess
 import sys
 
-FN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?fn\s+([A-Za-z_]\w*)")
+# Every item kind a doc block can sit above. `fn` alone was the original
+# scope and it let the same failure through twice in one day on `const`
+# declarations: a doc block does not care what follows it, so neither can
+# this. `impl` and bare `mod` are deliberately absent - an `impl` block's
+# name is not unique enough to key on, and its methods are matched as `fn`
+# in their own right.
+ITEM = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?"
+    r"(?:default\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?"
+    r"(?:const\s+)?(?:"
+    r"fn\s+([A-Za-z_]\w*)"
+    r"|const\s+([A-Za-z_]\w*)\s*:"
+    r"|static\s+(?:mut\s+)?([A-Za-z_]\w*)\s*:"
+    r"|struct\s+([A-Za-z_]\w*)"
+    r"|enum\s+([A-Za-z_]\w*)"
+    r"|union\s+([A-Za-z_]\w*)"
+    r"|trait\s+([A-Za-z_]\w*)"
+    r"|type\s+([A-Za-z_]\w*)"
+    r"|macro_rules!\s+([A-Za-z_]\w*)"
+    r")"
+)
 
 
 # The one git failure this checker tolerates, in the two spellings git uses:
@@ -35,20 +55,27 @@ MISSING_PATH = re.compile(
 )
 
 
-def git(*args, allow_missing_path=False):
+def git(*args, allow_missing_path=False, allow_fail=False):
     """Run git, failing closed.
 
     A silent failure here is worse than a crash: an errored `git diff` yields
     an empty file list, the checker reports "no documentation lost" and exits
     zero, and the gate has passed by not running.
 
-    `allow_missing_path` narrows that tolerance to exactly the expected case.
+    `allow_missing_path` narrows that tolerance to exactly the expected case,
+    and `allow_fail` is separate and narrower still: it is for a probe whose
+    exit status IS the answer, and its empty return is never read as content.
     Tolerating every non-zero exit would let an invalid revision or a
     malformed object read as empty content, which is the same fail-open bug
     one door further in.
     """
     proc = subprocess.run(["git", *args], capture_output=True, text=True)
     if proc.returncode != 0:
+        # `allow_fail` is for a PROBE whose non-zero exit is the answer
+        # (`cat-file -e` asking whether a path exists), never for a command
+        # whose output is then read as content.
+        if allow_fail:
+            return ""
         if allow_missing_path and MISSING_PATH.search(proc.stderr):
             return ""
         raise SystemExit(
@@ -68,7 +95,7 @@ def is_doc(line):
 
 
 def documented(text):
-    """Map fn name -> True when ANY definition of it carries a doc comment.
+    """Map item name -> True when ANY definition of it carries a doc comment.
 
     Keyed by name because two revisions cannot be lined up by position. Where
     a file defines the same name more than once (`new` across impl blocks),
@@ -86,9 +113,11 @@ def documented(text):
     lines = text.splitlines()
     state = {}
     for i, line in enumerate(lines):
-        m = FN.match(line)
+        m = ITEM.match(line)
         if not m:
             continue
+        # Exactly one alternative captures per match.
+        name = next(g for g in m.groups() if g)
         j = i - 1
         while j >= 0:
             s = lines[j].lstrip()
@@ -97,7 +126,7 @@ def documented(text):
                 continue
             break
         has_doc = j >= 0 and is_doc(lines[j])
-        state[m.group(1)] = state.get(m.group(1), False) or has_doc
+        state[name] = state.get(name, False) or has_doc
     return state
 
 
@@ -118,6 +147,26 @@ def main():
         if f.endswith(".rs")
     ]
     losses = []
+    # A file the branch ADDS has no base version, so `documented(before)` is
+    # empty and no loss can ever be reported in it: a doc captured within the
+    # branch is invisible to a merge-base comparison. Those files are checked
+    # commit-by-commit instead, which is the only place their history exists.
+    added = [f for f in changed if not git("cat-file", "-e", f"{base}:{f}", allow_missing_path=True, allow_fail=True)]
+    if added:
+        commits = git("log", f"{base}..{head}", "--format=%H", "--reverse").split()
+        for older, newer in zip(commits, commits[1:]):
+            for f in added:
+                before = documented(git("show", f"{older}:{f}", allow_missing_path=True))
+                after = documented(git("show", f"{newer}:{f}", allow_missing_path=True))
+                for name, had_doc in before.items():
+                    if (
+                        had_doc
+                        and name in after
+                        and not after[name]
+                        and (f, name) not in exempt
+                        and (f, name) not in losses
+                    ):
+                        losses.append((f, name))
     for f in changed:
         # A path can legitimately be absent on one side: the branch added the
         # file, or deleted it. That is the one git failure this tolerates -
@@ -132,12 +181,12 @@ def main():
     for f, name in losses:
         print(
             f"::error file={f}::`{name}` had a doc comment at {base[:12]} and has none now. "
-            "A doc block above it was most likely captured by a function inserted between the two "
-            "(#314), which hands one function's prose to another with nothing failing. Restore it, "
+            "A doc block above it was most likely captured by an item inserted between the two "
+            "(#314), which hands one item's prose to another with nothing failing. Restore it, "
             "or declare the removal with `doc-removal: " + f"{f}::{name}` in a commit message."
         )
     if losses:
-        print(f"\n{len(losses)} function(s) lost documentation.", file=sys.stderr)
+        print(f"\n{len(losses)} item(s) lost documentation.", file=sys.stderr)
         return 1
     print(f"No documentation lost across {len(changed)} changed Rust file(s).")
     return 0

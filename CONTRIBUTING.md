@@ -65,20 +65,29 @@ A PR that changes anything compiled into the binary (`src/`, `assets/`,
 CI enforces both (the `version bump + release notes` job). Docs, CI, and
 test-only PRs (`src/app/tests.rs`, `tests/`) are exempt.
 
-## After adding a function, check the doc below it
+## Insert new items AFTER a complete item, never above a doc block
 
-Rust attaches a `///` block to whatever item **follows** it. Insert a function
-between an existing one and its doc comment and that prose silently becomes the
-newcomer's: no compiler error, no failing test, no clippy lint. The build stays
-green and the rendered rustdoc is *confidently wrong* rather than absent, which
-is worse - absent docs send a reader to the code, wrong docs stop them looking.
+Rust attaches a `///` block to whatever item **follows** it. Insert anything
+between an existing item and its doc comment and that prose silently becomes
+the newcomer's: no compiler error, no failing test, no clippy lint. The build
+stays green and the rendered rustdoc is *confidently wrong* rather than
+absent, which is worse - absent docs send a reader to the code, wrong docs
+stop them looking.
 
-So after adding a `fn`, confirm the doc block above the **next** `fn` still
-describes that next `fn`.
+The habit that avoids it entirely is positional: add a new item after a
+complete item, not directly above a `///` block. Where that is not possible,
+confirm the doc block above the **next** item still describes that next item.
+
+This is not only about functions. A `const` inserted above another `const`'s
+doc captures it exactly the same way, and did so twice in one day before the
+gate could see it.
 
 CI catches what the habit misses (the `doc comments stay with their function`
-job): a function that had a doc comment at the merge base and has none at your
-head is the fingerprint this insertion leaves. If a removal is deliberate, say
+job): an item that had a doc comment at the merge base and has none at your
+head is the fingerprint this insertion leaves. It covers `fn`, `const`,
+`static`, `struct`, `enum`, `union`, `trait`, `type` and `macro_rules!`, and
+for a file your branch ADDS it compares your commits pairwise, since a file
+with no base version has no merge-base history to lose documentation against. If a removal is deliberate, say
 so in a commit message on the branch:
 
 ```text
