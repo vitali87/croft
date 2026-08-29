@@ -645,6 +645,54 @@ mod tests {
         assert_eq!(m.prefs.host_accents[0].pattern, "dev-*");
     }
 
+    /// An UNRECOGNISED `files.autoSave` value must change nothing.
+    ///
+    /// The mapper this layer used to carry matched three known values with a
+    /// `_ => {}` arm. When the table was consolidated with the importer's,
+    /// any string became authoritative, so a typo in a workspace file emitted
+    /// `auto_save: false` and silently turned the user's own setting off.
+    ///
+    /// This goes through `load_merged_from`, the real chain. The test in
+    /// `import_vscode` that names this agreement calls `map_settings`
+    /// directly and never reaches this layer, so it would pass with the
+    /// consolidation reverted entirely and could not see this regression.
+    #[test]
+    fn an_unrecognised_auto_save_value_does_not_override_the_user() {
+        let (_tmp, user, root) = setup();
+        write(&user.join("config.json"), r#"{ "auto_save": true }"#);
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{ "files.autoSave": "afterDelayy" }"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(
+            m.prefs.auto_save,
+            "a typo in a workspace file must not turn the user's auto-save off"
+        );
+        assert_eq!(layer_of(&m.provenance, "auto_save"), LayerKind::User);
+    }
+
+    /// And `onWindowChange`, which VS Code does define, must reach this layer
+    /// as a focus-change save. The two mappers disagreed on it before they
+    /// were consolidated: the importer mapped it, this layer ignored it.
+    #[test]
+    fn on_window_change_reaches_the_workspace_layer() {
+        let (_tmp, user, root) = setup();
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{ "files.autoSave": "onWindowChange" }"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(
+            m.prefs.auto_save_on_focus_change,
+            "onWindowChange saves when the window loses focus"
+        );
+        assert_eq!(
+            layer_of(&m.provenance, "auto_save_on_focus_change"),
+            LayerKind::VsCodeWorkspace
+        );
+    }
+
     #[test]
     fn vscode_settings_map_a_small_subset_and_lose_to_croft_layers() {
         let (_tmp, user, root) = setup();

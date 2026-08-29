@@ -367,15 +367,27 @@ pub fn map_settings(
                 // `files.autoSave` sets two croft prefs, so it is handled
                 // here rather than in the one-to-one table.
                 if let Some(mode) = value.as_str().filter(|_| key == "files.autoSave") {
-                    {
-                        settings
-                            .insert(String::from("auto_save"), Value::from(mode == "afterDelay"));
-                        settings.insert(
-                            String::from("auto_save_on_focus_change"),
-                            Value::from(mode == "onFocusChange" || mode == "onWindowChange"),
-                        );
-                        continue;
-                    }
+                    // Only the values VS Code actually defines are
+                    // authoritative. Treating any string as one meant a TYPO
+                    // ("afterDelayy") emitted `false, false` and silently
+                    // turned the user's auto-save off through the workspace
+                    // layer; the mapper this replaced matched three values and
+                    // emitted nothing for anything else.
+                    let (delay, focus) = match mode {
+                        "afterDelay" => (true, false),
+                        "onFocusChange" | "onWindowChange" => (false, true),
+                        "off" => (false, false),
+                        _ => {
+                            unmapped.push(format!("{key} (unrecognised value: {value})"));
+                            continue;
+                        }
+                    };
+                    settings.insert(String::from("auto_save"), Value::from(delay));
+                    settings.insert(
+                        String::from("auto_save_on_focus_change"),
+                        Value::from(focus),
+                    );
+                    continue;
                 }
                 unmapped.push(key.clone());
             }
@@ -535,8 +547,19 @@ fn carries_comments(path: &Path) -> bool {
 }
 
 pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
-    let dir = crate::prefs::config_dir();
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    apply_into(&crate::prefs::config_dir(), report)
+}
+
+/// [`apply`] into an explicit config directory.
+///
+/// Split out so a test can drive the REAL write path. The previous test
+/// asserted on `carries_comments`, the predicate, and never called `apply`:
+/// unwiring the guard at all three call sites left every test passing while
+/// the import destroyed croft's own commented templates. Nothing here
+/// touches the environment, because the test binary runs its tests on
+/// threads of one process.
+pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut written = Vec::new();
 
     if !report.settings.is_empty() {
@@ -554,8 +577,8 @@ pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
             for (key, value) in &report.settings {
                 if let Some(current) = existing.get(key) {
                     if current != value {
-                        report.conflicts.push(String::from(
-                            "config.json {key}: kept {current}, VS Code had {value}",
+                        report.conflicts.push(format!(
+                            "config.json {key}: kept {current}, VS Code had {value}"
                         ));
                     }
                     continue;
@@ -620,8 +643,8 @@ pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
             let mut changed = false;
             for (name, entry) in &report.snippets {
                 if existing.contains_key(name) {
-                    report.conflicts.push(String::from(
-                        "snippets.json {name:?}: already defined, left alone",
+                    report.conflicts.push(format!(
+                        "snippets.json {name:?}: already defined, left alone"
                     ));
                     continue;
                 }
@@ -915,26 +938,102 @@ mod tests {
 
     /// croft SEEDS `keybindings.json` and `snippets.json` from commented
     /// templates, so the common case is a file whose header this import would
-    /// destroy by parsing JSONC and writing strict JSON back. Such a file is
-    /// left alone and reported instead.
+    /// destroy by parsing JSONC and writing strict JSON back.
+    ///
+    /// This drives `apply_into`, the real write path. The previous version
+    /// asserted on `carries_comments` alone, so unwiring the guard at all
+    /// three call sites left every test passing while the import ate croft's
+    /// own template header: a surviving mutant on the defect the test is
+    /// named for.
     #[test]
     fn a_commented_config_file_is_never_rewritten() {
         let dir = tempfile::TempDir::new().unwrap();
-        let commented = dir.path().join("keybindings.json");
-        std::fs::write(&commented, crate::keymap::TEMPLATE).unwrap();
+        let keybindings = dir.path().join("keybindings.json");
+        std::fs::write(&keybindings, crate::keymap::TEMPLATE).unwrap();
+        let before = std::fs::read_to_string(&keybindings).unwrap();
         assert!(
-            carries_comments(&commented),
+            before.contains("//"),
             "croft's own template carries comments, which is the whole point"
         );
 
-        let plain = dir.path().join("plain.json");
-        std::fs::write(&plain, "[]\n").unwrap();
-        assert!(!carries_comments(&plain));
+        let mut report = Report::default();
+        report
+            .keybindings
+            .push((String::from("ctrl+shift+p"), String::from("quick_open")));
+        report
+            .snippets
+            .insert(String::from("S"), json!({ "prefix": "s", "body": "x" }));
+        report
+            .settings
+            .insert(String::from("format_on_save"), json!(true));
 
-        let absent = dir.path().join("nothing.json");
+        let written = apply_into(dir.path(), &mut report).expect("apply runs");
+
+        assert_eq!(
+            std::fs::read_to_string(&keybindings).unwrap(),
+            before,
+            "the commented file must be byte-for-byte untouched"
+        );
         assert!(
-            !carries_comments(&absent),
-            "a missing file is not a comment-bearing one"
+            !written.contains(&keybindings),
+            "and must not be reported as written"
+        );
+        assert!(
+            report
+                .conflicts
+                .iter()
+                .any(|c| c.contains("keybindings.json") && c.contains("comments")),
+            "the user must be told why, got {:?}",
+            report.conflicts
+        );
+
+        // A file with no comments is still written, so the guard is narrow.
+        assert!(
+            written.iter().any(|p| p.ends_with("config.json")),
+            "an uncommented file must still be merged: {written:?}"
+        );
+    }
+
+    /// A conflict message must name the setting it kept. Two of these were
+    /// `String::from` with `{}` placeholders, so the user saw literal braces
+    /// where the key and both values belonged, in the report this module's
+    /// own doc calls "the product, not a side effect".
+    #[test]
+    fn a_conflict_message_names_the_value_it_kept() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{ "format_on_save": false }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("snippets.json"),
+            r#"{ "Main": { "prefix": "m", "body": "mine" } }"#,
+        )
+        .unwrap();
+
+        let mut report = Report::default();
+        report
+            .settings
+            .insert(String::from("format_on_save"), json!(true));
+        report.snippets.insert(
+            String::from("Main"),
+            json!({ "prefix": "m", "body": "theirs" }),
+        );
+        apply_into(dir.path(), &mut report).expect("apply runs");
+
+        let joined = report.conflicts.join("\n");
+        assert!(
+            joined.contains("format_on_save") && joined.contains("false"),
+            "the settings conflict must name the key and the kept value: {joined}"
+        );
+        assert!(
+            joined.contains("Main"),
+            "the snippet conflict must name the snippet: {joined}"
+        );
+        assert!(
+            !joined.contains('{') && !joined.contains('}'),
+            "no message may print a literal placeholder: {joined}"
         );
     }
 
