@@ -25821,6 +25821,93 @@ impl App {
     /// when `(col, row)` lands inside it. Returns true when the press was
     /// consumed, so the normal editor click path is skipped: the source
     /// buffer is not visible, and a caret there would serve nobody.
+    /// Start a mouse selection over a rendered ANSI log (#257).
+    ///
+    /// Mirrors `begin_preview_selection`: a log tab's `lines` is a one-line
+    /// stub, so the editor's own selection coordinates cannot describe it and
+    /// the view carries its own, in absolute (line, char column).
+    fn begin_log_selection(&mut self, col: u16, row: u16) -> bool {
+        let scroll = self.editor.scroll;
+        let Some(log) = self.editor.log.as_mut() else {
+            return false;
+        };
+        if !rect_contains(log.last_body, col, row) {
+            if log.has_selection() {
+                log.selection = None;
+                log.dragging = false;
+            }
+            return false;
+        }
+        let cell = log_cell_at(log, scroll, col, row);
+        log.selection = Some((cell, cell));
+        log.dragging = true;
+        self.focus_pane(Pane::Editor);
+        true
+    }
+
+    /// Extend a live log drag and finish it on release.
+    fn update_log_selection(&mut self, m: MouseEvent) -> bool {
+        let scroll = self.editor.scroll;
+        let copy_on_select = self.copy_on_select;
+        let Some(log) = self.editor.log.as_mut() else {
+            return false;
+        };
+        if !log.dragging {
+            return false;
+        }
+        match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let body = log.last_body;
+                // Clamp to the body: dragging past an edge extends to it
+                // rather than dropping the gesture.
+                let col = m
+                    .column
+                    .clamp(body.x, body.x + body.width.saturating_sub(1));
+                let row = m.row.clamp(body.y, body.y + body.height.saturating_sub(1));
+                let head = log_cell_at(log, scroll, col, row);
+                if let Some((anchor, _)) = log.selection {
+                    log.selection = Some((anchor, head));
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                log.dragging = false;
+                if copy_on_select {
+                    self.copy_log_selection();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Put the log selection on the clipboard, saying so when the copy was
+    /// clamped rather than leaving the user with silently less than they
+    /// selected.
+    fn copy_log_selection(&mut self) -> bool {
+        let Some(log) = self.editor.log.as_ref() else {
+            return false;
+        };
+        if !log.has_selection() {
+            return false;
+        }
+        let (text, clamped) = log.selection_text();
+        if text.is_empty() {
+            return false;
+        }
+        let bytes = text.len();
+        copy_to_clipboard(&text);
+        self.status = if clamped {
+            format!(
+                "Copied the first {} MiB of the selection (a log selection is capped)",
+                crate::log_view::MAX_COPY_BYTES / (1024 * 1024)
+            )
+        } else {
+            format!("Copied {bytes} bytes")
+        };
+        true
+    }
+
     fn begin_preview_selection(&mut self, col: u16, row: u16) -> bool {
         let Some(md) = self.editor.markdown_preview.as_mut() else {
             return false;
@@ -32087,6 +32174,11 @@ impl App {
         if self.update_preview_selection(m) {
             return;
         }
+        // A rendered log carries its own selection for the same reason the
+        // preview does: the tab's `lines` is a stub (#257).
+        if self.update_log_selection(m) {
+            return;
+        }
         // The release of a press is not a new gesture, so it keeps the popup:
         // that is what lets a press-and-hold (touch) read the hover after
         // lifting the finger. Every other event dismisses it.
@@ -32493,6 +32585,9 @@ impl App {
                 // the rendered view starts a drag-selection over what the
                 // user can SEE, not the source buffer beneath it.
                 if self.begin_preview_selection(m.column, m.row) {
+                    return;
+                }
+                if self.begin_log_selection(m.column, m.row) {
                     return;
                 }
                 // (H) Go to Definition rides CTRL, matching the terminal pane's
@@ -40996,6 +41091,21 @@ fn sheet_visible_rows(inner: Rect) -> usize {
 /// the content-keyed cache and replayed on every future open.
 fn semantic_reply_is_current(seen: Option<u64>, incoming: u64) -> bool {
     seen.is_none_or(|s| incoming >= s)
+}
+
+/// The absolute (line, char column) a screen cell lands on in a rendered log
+/// body. The body starts one row below the header and the view scrolls by
+/// whole lines, so the mapping is a straight offset.
+fn log_cell_at(
+    log: &crate::log_view::LogView,
+    scroll: usize,
+    col: u16,
+    row: u16,
+) -> (usize, usize) {
+    let body = log.last_body;
+    let line = scroll + row.saturating_sub(body.y) as usize;
+    let column = col.saturating_sub(body.x) as usize;
+    (line.min(log.len().saturating_sub(1)), column)
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {

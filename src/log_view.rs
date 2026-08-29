@@ -91,6 +91,12 @@ impl ScanBudget {
         Self(FIND_SCAN_BYTES)
     }
 
+    /// A budget of a different size, for a sweep with its own bound (a copy
+    /// may gather more than a per-keystroke find may scan).
+    fn new_with(bytes: usize) -> Self {
+        Self(bytes)
+    }
+
     fn charge(&mut self, bytes: usize) {
         self.0 = self.0.saturating_sub(bytes);
     }
@@ -99,6 +105,12 @@ impl ScanBudget {
         self.0 == 0
     }
 }
+
+/// How much text one copy may gather. A log is unbounded and a selection
+/// can span it, so the copy is capped and the caller is told when it hit the
+/// cap: a clipboard that silently holds less than the user selected is worse
+/// than one that says it was clamped.
+pub const MAX_COPY_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct LogView {
     pub path: PathBuf,
@@ -112,6 +124,18 @@ pub struct LogView {
     cache: std::collections::BTreeMap<usize, AnsiLine>,
     /// Line number the cache starts at, for cheap eviction.
     cache_start: usize,
+    /// Anchor and head of a mouse selection, as absolute (line, char column).
+    ///
+    /// Kept here rather than in the editor's own `selection` because those
+    /// coordinates index `lines`, which for a log tab is a one-line stub.
+    /// Same shape the Markdown preview uses for the same reason.
+    pub selection: Option<((usize, usize), (usize, usize))>,
+    /// Whether a drag is in progress, so a move outside the body still
+    /// extends the selection rather than starting a new one.
+    pub dragging: bool,
+    /// The body rect the last frame painted, for mouse hit-testing. Frame
+    /// truth: the renderer writes it, the mouse path reads it.
+    pub last_body: ratatui::layout::Rect,
 }
 
 impl LogView {
@@ -155,6 +179,9 @@ impl LogView {
             truncated,
             cache: std::collections::BTreeMap::new(),
             cache_start: 0,
+            selection: None,
+            dragging: false,
+            last_body: ratatui::layout::Rect::default(),
         })
     }
 
@@ -556,6 +583,57 @@ impl LogView {
             true
         });
         (count, stopped_early)
+    }
+
+    /// Whether a selection covers anything at all.
+    pub fn has_selection(&self) -> bool {
+        self.selection
+            .is_some_and(|(a, b)| a != b)
+    }
+
+    /// The selection with its endpoints in reading order.
+    fn ordered_selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (a, b) = self.selection?;
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
+    /// The selected text, as the user sees it: escapes stripped, no colour.
+    ///
+    /// Returns the text and whether it was clamped at [`MAX_COPY_BYTES`]. A
+    /// selection can span a file this view exists precisely to avoid loading,
+    /// so the copy is bounded, and the bound is reported rather than leaving
+    /// the clipboard quietly holding less than was selected.
+    pub fn selection_text(&self) -> (String, bool) {
+        let Some(((sr, sc), (er, ec))) = self.ordered_selection() else {
+            return (String::new(), false);
+        };
+        let mut out = String::new();
+        let mut clamped = false;
+        let mut budget = ScanBudget::new_with(MAX_COPY_BYTES);
+        // Read through the sweep path rather than the viewport cache: a
+        // selection routinely runs past the window the reader is looking at,
+        // and evicting that window to serve a copy would blank the screen.
+        self.scan_range(sr, er + 1, &mut budget, |row, text| {
+            let chars: Vec<char> = text.chars().collect();
+            let from = if row == sr { sc.min(chars.len()) } else { 0 };
+            let to = if row == er { ec.min(chars.len()) } else { chars.len() };
+            if from < to {
+                out.extend(&chars[from..to]);
+            }
+            if row < er {
+                out.push('\n');
+            }
+            if out.len() >= MAX_COPY_BYTES {
+                clamped = true;
+                return false;
+            }
+            true
+        });
+        if out.len() > MAX_COPY_BYTES {
+            out.truncate(MAX_COPY_BYTES);
+            clamped = true;
+        }
+        (out, clamped)
     }
 
     /// The escape-free text of `idx`, for find, selection, copy, and
