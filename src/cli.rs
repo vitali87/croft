@@ -267,7 +267,6 @@ pub enum CliCommand {
         #[arg(short, long, default_value_t = false)]
         yes: bool,
     },
-<<<<<<< HEAD
     /// Bring a VS Code profile across: settings, keybindings and snippets
     /// (#351).
     ///
@@ -281,7 +280,9 @@ pub enum CliCommand {
         #[arg(long)]
         from: Option<PathBuf>,
         /// Print the full report and write nothing.
-=======
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Import a VS Code colour theme (.json) as a croft theme (#350).
     ///
     /// Reads a theme file you already have (from a cloned theme repo, or an
@@ -298,7 +299,6 @@ pub enum CliCommand {
         #[arg(long)]
         id: Option<String>,
         /// Print the manifest instead of installing it.
->>>>>>> 622b3b7 (feat(themes): import a VS Code colour theme with croft theme-import (#350, v0.1.801))
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
@@ -555,13 +555,10 @@ impl Cli {
                 Ok(())
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
-<<<<<<< HEAD
             Some(CliCommand::ImportVscode { from, dry_run }) => import_vscode(from, dry_run),
-=======
             Some(CliCommand::ThemeImport { file, id, dry_run }) => {
                 theme_import(&file, id.as_deref(), dry_run)
             }
->>>>>>> 622b3b7 (feat(themes): import a VS Code colour theme with croft theme-import (#350, v0.1.801))
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
             Some(CliCommand::InstallLauncher { path, user, yes }) => {
                 install_launcher(path, user, yes)
@@ -921,7 +918,6 @@ fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> 
     Ok(())
 }
 
-<<<<<<< HEAD
 /// `croft import-vscode`: convert a VS Code profile into croft's config.
 ///
 /// The report is the product, not a side effect. An import that only said
@@ -1051,7 +1047,6 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-=======
 /// `croft theme-import <file>`: convert a VS Code theme and install it.
 ///
 /// The notes are printed rather than buried: a converted theme fills croft
@@ -1091,7 +1086,6 @@ fn theme_import(file: &Path, id: Option<&str>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
->>>>>>> 622b3b7 (feat(themes): import a VS Code colour theme with croft theme-import (#350, v0.1.801))
 fn setup_ghostty(yes: bool) -> Result<()> {
     let config_path = crate::ghostty::default_config_path();
     println!(
