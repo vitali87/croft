@@ -395,26 +395,20 @@ fn load_vscode_subset(path: &Path, warnings: &mut Vec<String>) -> Option<Map<Str
         ));
         return None;
     };
-    let mut out = Map::new();
-    if let Some(v) = obj.get("editor.formatOnSave").and_then(Value::as_bool) {
-        out.insert("format_on_save".into(), Value::Bool(v));
-    }
-    if let Some(v) = obj.get("editor.formatOnType").and_then(Value::as_bool) {
-        out.insert("format_on_type".into(), Value::Bool(v));
-    }
-    match obj.get("files.autoSave").and_then(Value::as_str) {
-        Some("afterDelay") => {
-            out.insert("auto_save".into(), Value::Bool(true));
-        }
-        Some("onFocusChange") => {
-            out.insert("auto_save_on_focus_change".into(), Value::Bool(true));
-        }
-        Some("off") => {
-            out.insert("auto_save".into(), Value::Bool(false));
-            out.insert("auto_save_on_focus_change".into(), Value::Bool(false));
-        }
-        _ => {}
-    }
+    // ONE mapping, shared with `croft import-vscode`
+    // (`crate::import_vscode::map_settings`). Keeping a second table here is
+    // how the two came to disagree: this one ignored
+    // `files.autoSave: "onWindowChange"` while the importer mapped it, so the
+    // same file meant different things depending on which path read it.
+    //
+    // A workspace layer may only set the appearance and editor toggles in
+    // `WORKSPACE_ALLOWED_KEYS`, so the shared result is filtered to those
+    // here rather than warning about keys the user never wrote.
+    let (mapped, _unmapped, _warnings) = crate::import_vscode::map_settings(obj);
+    let out: Map<String, Value> = mapped
+        .into_iter()
+        .filter(|(k, _)| WORKSPACE_ALLOWED_KEYS.contains(&k.as_str()))
+        .collect();
     (!out.is_empty()).then_some(out)
 }
 
@@ -649,6 +643,54 @@ mod tests {
             "arrays replace wholesale, they never concatenate"
         );
         assert_eq!(m.prefs.host_accents[0].pattern, "dev-*");
+    }
+
+    /// An UNRECOGNISED `files.autoSave` value must change nothing.
+    ///
+    /// The mapper this layer used to carry matched three known values with a
+    /// `_ => {}` arm. When the table was consolidated with the importer's,
+    /// any string became authoritative, so a typo in a workspace file emitted
+    /// `auto_save: false` and silently turned the user's own setting off.
+    ///
+    /// This goes through `load_merged_from`, the real chain. The test in
+    /// `import_vscode` that names this agreement calls `map_settings`
+    /// directly and never reaches this layer, so it would pass with the
+    /// consolidation reverted entirely and could not see this regression.
+    #[test]
+    fn an_unrecognised_auto_save_value_does_not_override_the_user() {
+        let (_tmp, user, root) = setup();
+        write(&user.join("config.json"), r#"{ "auto_save": true }"#);
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{ "files.autoSave": "afterDelayy" }"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(
+            m.prefs.auto_save,
+            "a typo in a workspace file must not turn the user's auto-save off"
+        );
+        assert_eq!(layer_of(&m.provenance, "auto_save"), LayerKind::User);
+    }
+
+    /// And `onWindowChange`, which VS Code does define, must reach this layer
+    /// as a focus-change save. The two mappers disagreed on it before they
+    /// were consolidated: the importer mapped it, this layer ignored it.
+    #[test]
+    fn on_window_change_reaches_the_workspace_layer() {
+        let (_tmp, user, root) = setup();
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{ "files.autoSave": "onWindowChange" }"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(
+            m.prefs.auto_save_on_focus_change,
+            "onWindowChange saves when the window loses focus"
+        );
+        assert_eq!(
+            layer_of(&m.provenance, "auto_save_on_focus_change"),
+            LayerKind::VsCodeWorkspace
+        );
     }
 
     #[test]

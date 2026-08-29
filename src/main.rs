@@ -20,6 +20,7 @@ mod hex;
 mod highlight;
 mod history;
 mod icons;
+mod import_vscode;
 mod install_session;
 mod iterm2;
 mod iterm2_inline;

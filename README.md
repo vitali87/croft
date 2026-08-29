@@ -82,6 +82,7 @@ croft attach                     # open the current folder as a persistent sessi
 croft attach ~/projects          # ...for a specific folder
 croft attach --solo ~/projects   # join a shared folder in your own viewport (live co-editing)
 croft ls                         # list running persistent sessions
+croft import-vscode              # bring your VS Code settings, keys and snippets across
 croft --help
 ```
 
