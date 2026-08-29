@@ -20683,8 +20683,8 @@ fn update_events_are_charged_to_their_own_producer_body() {
     assert!(!app.f9_update_armed(), "not while a staged build runs");
 
     // A staged build that LANDED keeps its Relaunch through an unrelated
-    // failure: the staged channel delivers one Ready only, so resetting
-    // the shared status here would strand a binary the popup still offers.
+    // rebuild, whatever that rebuild does: the staged channel delivers one
+    // Ready only, so the two lifecycles must never write each other's cell.
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let landed = tmp.path().join("landed");
     std::fs::write(&landed, b"bin").unwrap();
@@ -20701,21 +20701,89 @@ fn update_events_are_charged_to_their_own_producer_body() {
         app.staged_update_binary().as_deref(),
         Some(landed.as_path())
     );
+    // The real sequence a drift rebuild emits: InProgress first, then its
+    // outcome. The staged binary stays swappable throughout.
+    app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[
+        crate::update_watch::UpdateEvent::InProgress,
+    ]));
+    assert!(app.poll_update_watch());
+    assert_eq!(
+        app.staged_update_binary().as_deref(),
+        Some(landed.as_path())
+    );
+    assert!(app.f9_update_armed(), "F9 still relaunches mid-rebuild");
     app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[
         crate::update_watch::UpdateEvent::Failed,
     ]));
     assert!(app.poll_update_watch());
     assert_eq!(
-        app.update_status,
-        UpdateStatus::Ready,
-        "the rebuild's failure does not disarm the landed release"
-    );
-    assert_eq!(
         app.staged_update_binary().as_deref(),
         Some(landed.as_path())
     );
-    assert!(app.f9_update_armed(), "F9 still relaunches");
+    assert!(app.f9_update_armed(), "and after the rebuild fails");
     assert!(app.status.contains("rebuild failed"), "{}", app.status);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let relaunch = app
+        .update_toast
+        .as_ref()
+        .expect("the ready toast")
+        .buttons
+        .iter()
+        .find(|(_, a)| matches!(a, super::UpdateToastAction::Relaunch))
+        .map(|(r, _)| *r)
+        .expect("a Relaunch button");
+    left_click(&mut app, relaunch.x, relaunch.y);
+    assert!(app.pending_reexec && app.quit, "Relaunch still fires");
+
+    // The symmetric case: a drift rebuild that landed survives a staged
+    // build failing.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[
+        crate::update_watch::UpdateEvent::InProgress,
+        crate::update_watch::UpdateEvent::Ready,
+    ]));
+    assert!(app.poll_update_watch());
+    app.staged_install = Some(crate::update_check::StagedInstall::preloaded(
+        &[
+            crate::update_watch::UpdateEvent::InProgress,
+            crate::update_watch::UpdateEvent::Failed,
+        ],
+        tmp.path().join("nope"),
+        "9.9.9",
+    ));
+    assert!(app.poll_update_watch());
+    assert_eq!(
+        app.update_status,
+        UpdateStatus::Ready,
+        "the rebuild's F9 is alive"
+    );
+    assert!(app.f9_update_armed());
+    assert_eq!(app.staged_update_binary(), None);
+
+    // Relaunch on the popup fires only for the STAGED readiness: with a
+    // drift Ready and no staged one, the click does nothing.
+    app.update_toast = Some(super::UpdateToast {
+        version: String::from("9.9.9"),
+        ready: true,
+        buttons: Vec::new(),
+    });
+    term.draw(|f| app.render(f)).unwrap();
+    let relaunch = app
+        .update_toast
+        .as_ref()
+        .unwrap()
+        .buttons
+        .iter()
+        .find(|(_, a)| matches!(a, super::UpdateToastAction::Relaunch))
+        .map(|(r, _)| *r)
+        .expect("a Relaunch button");
+    left_click(&mut app, relaunch.x, relaunch.y);
+    assert!(
+        !app.pending_reexec,
+        "no staged binary: Relaunch does not re-exec a rebuild"
+    );
 }
 
 /// #333: both corner popups can be up at once; they must not overlap.
@@ -20756,7 +20824,8 @@ fn a_staged_update_offers_relaunch_and_only_relaunch_re_execs() {
         "9.9.9",
     ));
     assert!(app.poll_update_watch());
-    assert_eq!(app.update_status, UpdateStatus::Ready);
+    assert_eq!(app.staged_status, UpdateStatus::Ready);
+    assert!(app.any_update_ready());
     assert!(!app.pending_reexec, "landing never relaunches by itself");
     assert_eq!(
         app.staged_update_binary().as_deref(),

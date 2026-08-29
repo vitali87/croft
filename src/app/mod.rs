@@ -3005,11 +3005,12 @@ pub struct App {
     /// release. Reported through the same UpdateEvent lifecycle as the
     /// remote watcher; the binary on PATH is untouched until Relaunch.
     staged_install: Option<crate::update_check::StagedInstall>,
-    /// The staged build reported `Ready` itself. `update_status` is shared
-    /// with the remote watcher and the drift rebuild, so it alone cannot
-    /// say WHICH update landed; Relaunch swaps the staged binary in only
-    /// when this is set.
-    staged_ready: bool,
+    /// The staged release build's own lifecycle (#333). `update_status`
+    /// belongs to the remote watcher and the drift rebuild; the two cells
+    /// are never written by the other's producer, so a rebuild starting or
+    /// failing after the release landed cannot disarm Relaunch, and the
+    /// reverse. Readers that mean "any update" consult both.
+    staged_status: UpdateStatus,
     update_status: UpdateStatus,
     /// When a background self-update is in progress, the instant it started.
     /// Drives the spinning update glyph in the status bar (and the redraw
@@ -4256,7 +4257,7 @@ impl App {
             update_check: None,
             update_toast: None,
             staged_install: None,
-            staged_ready: false,
+            staged_status: UpdateStatus::Idle,
             update_status: UpdateStatus::Idle,
             update_spinner_start: None,
             pending_reexec: false,
@@ -14536,7 +14537,7 @@ impl App {
         if let Some(span) = self.perf.status_span() {
             spans.push(span);
         }
-        if self.update_status == UpdateStatus::Ready {
+        if self.any_update_ready() {
             spans.push(Span::styled(
                 " ⟳ Update ready - F9 to relaunch ",
                 Style::default()
@@ -14562,7 +14563,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        if self.update_status == UpdateStatus::InProgress {
+        if self.any_update_in_progress() {
             // Red + a spinning circular-arrow glyph to draw the eye to the
             // in-progress background update.
             spans.push(Span::styled(
@@ -15884,7 +15885,7 @@ impl App {
         };
         let version = toast.version.clone();
         let ready = toast.ready;
-        let staging = self.update_status == UpdateStatus::InProgress && !ready;
+        let staging = self.staged_status == UpdateStatus::InProgress && !ready;
         let accent = self.theme.accent();
         let btn_bg = self.theme.button();
         let actions: Vec<(String, UpdateToastAction)> = if ready {
@@ -16814,8 +16815,11 @@ impl App {
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 // Alt+F9: toggle break-on-raised-exceptions.
                 self.debug_toggle_raised_exceptions();
-            } else if self.update_status == UpdateStatus::Ready {
-                // A background update has landed: bare F9 re-execs into it.
+            } else if self.any_update_ready() {
+                // A background update has landed (a staged release, the
+                // drift rebuild, or a remote install): bare F9 re-execs
+                // into it. `run()` swaps the staged binary in first when
+                // that is the one that landed.
                 self.pending_reexec = true;
                 self.quit = true;
             } else if self.f9_update_armed() && self.update_status == UpdateStatus::Idle {
@@ -23064,7 +23068,7 @@ impl App {
     /// state machine takes it from here: spinner while cargo runs, then
     /// the popup and the status bar both offer Relaunch.
     fn start_staged_update(&mut self, version: String) {
-        self.staged_ready = false;
+        self.staged_status = UpdateStatus::Idle;
         self.staged_install = Some(crate::update_check::StagedInstall::start(
             croft_cache_dir(),
             version,
@@ -23082,8 +23086,19 @@ impl App {
     /// The staged binary waiting to be swapped in, once its build landed.
     fn staged_update_binary(&self) -> Option<PathBuf> {
         let install = self.staged_install.as_ref()?;
-        (self.staged_ready && self.update_status == UpdateStatus::Ready)
-            .then(|| install.binary().to_path_buf())
+        (self.staged_status == UpdateStatus::Ready).then(|| install.binary().to_path_buf())
+    }
+
+    /// Whether any producer has an update ready to re-exec into: the
+    /// status-bar pill and bare F9 mean "any".
+    fn any_update_ready(&self) -> bool {
+        self.update_status == UpdateStatus::Ready || self.staged_status == UpdateStatus::Ready
+    }
+
+    /// Whether any producer is mid-build (drives the spinner).
+    fn any_update_in_progress(&self) -> bool {
+        self.update_status == UpdateStatus::InProgress
+            || self.staged_status == UpdateStatus::InProgress
     }
 
     /// Arm the rebuild hint when the drift probe's verdict lands. The probe
@@ -23121,9 +23136,10 @@ impl App {
     /// True when bare F9 is claimed by the update flow: either a landed
     /// update waiting to re-exec, or an armed drift hint waiting to rebuild.
     fn f9_update_armed(&self) -> bool {
-        self.update_status == UpdateStatus::Ready
+        self.any_update_ready()
             || (self.local_drift.is_some()
                 && self.update_status == UpdateStatus::Idle
+                && self.staged_status != UpdateStatus::InProgress
                 // `update_status` only leaves Idle when the InProgress event
                 // is drained - once per outer loop, BEFORE the input drain -
                 // so without this latch two F9s in one crossterm batch spawn
@@ -23162,24 +23178,31 @@ impl App {
         }
         for (source, ev) in events {
             changed = true;
+            // Each producer writes ITS cell; the other cell is never
+            // touched, so nothing one build does can strand the other's
+            // landed binary (there is exactly one Ready per channel).
+            let staged = source == UpdateSource::Staged;
             match ev {
                 crate::update_watch::UpdateEvent::InProgress => {
-                    self.update_status = UpdateStatus::InProgress;
+                    if staged {
+                        self.staged_status = UpdateStatus::InProgress;
+                    } else {
+                        self.update_status = UpdateStatus::InProgress;
+                    }
                     // The dedicated red, spinning status-bar span renders the
                     // message now, so the generic status line stays clear.
                     self.update_spinner_start = Some(std::time::Instant::now());
                     self.status.clear();
                 }
                 crate::update_watch::UpdateEvent::Failed => {
-                    // The shared status is reset only when the failing
-                    // producer owns it: a drift rebuild failing after the
-                    // staged release landed must not disarm a Relaunch the
-                    // popup still offers (there is no second Ready coming).
-                    let staged_stays_ready = source != UpdateSource::Staged && self.staged_ready;
-                    if !staged_stays_ready {
+                    if staged {
+                        self.staged_status = UpdateStatus::Idle;
+                    } else {
                         self.update_status = UpdateStatus::Idle;
                     }
-                    self.update_spinner_start = None;
+                    if !self.any_update_in_progress() {
+                        self.update_spinner_start = None;
+                    }
                     self.status = match source {
                         UpdateSource::Staged => {
                             let version = self
@@ -23187,7 +23210,6 @@ impl App {
                                 .take()
                                 .map(|s| s.version)
                                 .unwrap_or_default();
-                            self.staged_ready = false;
                             // The offer stays declinable: the popup comes
                             // back so a retry or Later is one click away -
                             // unless the user already said Later to this
@@ -23223,22 +23245,25 @@ impl App {
                     };
                 }
                 crate::update_watch::UpdateEvent::Ready => {
-                    self.update_spinner_start = None;
+                    if staged {
+                        self.staged_status = UpdateStatus::Ready;
+                    } else {
+                        self.update_status = UpdateStatus::Ready;
+                    }
+                    if !self.any_update_in_progress() {
+                        self.update_spinner_start = None;
+                    }
                     // Do NOT yank the user mid-work: surface a persistent
                     // "Update ready - F9 to relaunch" prompt in the status
                     // bar and let them pick the moment. The re-exec only
                     // fires when they press F9 (handle_key) or click
                     // Relaunch on the popup (#333).
-                    self.update_status = UpdateStatus::Ready;
                     self.status = String::from(
                         "Update ready - press F9 to relaunch croft (terminals will reset)",
                     );
-                    if source == UpdateSource::Staged
-                        && let Some(staged) = self.staged_install.as_ref()
-                    {
-                        self.staged_ready = true;
+                    if staged && let Some(install) = self.staged_install.as_ref() {
                         self.update_toast = Some(UpdateToast {
-                            version: staged.version.clone(),
+                            version: install.version.clone(),
                             ready: true,
                             buttons: Vec::new(),
                         });
@@ -26826,7 +26851,9 @@ impl App {
             }
             UpdateToastAction::Relaunch => {
                 self.update_toast = None;
-                if self.update_status == UpdateStatus::Ready {
+                // The popup describes the staged release: only ITS
+                // readiness may fire it, never a drift rebuild's.
+                if self.staged_update_binary().is_some() {
                     self.pending_reexec = true;
                     self.quit = true;
                 }

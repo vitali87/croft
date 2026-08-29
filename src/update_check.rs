@@ -491,7 +491,6 @@ mod tests {
             "the symlink target is untouched"
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
-        assert_eq!(std::fs::read(&target).unwrap(), b"old");
     }
 
     #[test]
