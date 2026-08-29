@@ -31018,9 +31018,17 @@ impl App {
     /// how far the search actually reached instead of claiming "No results"
     /// for a file it never finished reading.
     fn scroll_log_to_match(&mut self, step: crate::log_view::Step) {
-        if let Some(state) = self.editor_find.as_mut().filter(|_| step.out_of_reach()) {
-            let count = state.match_count;
-            state.set_match_count(count, true);
+        if step.out_of_reach() {
+            // Mark the count partial and STOP. Falling through to clear the
+            // active match left the bar reading "1+ matches" with nothing
+            // highlighted and no way back to the match the user was on: a
+            // step that could not reach further must leave them where they
+            // are, not throw away the position it did have.
+            if let Some(state) = self.editor_find.as_mut() {
+                let count = state.match_count;
+                state.set_match_count(count, true);
+            }
+            return;
         }
         let Some(m) = step.found() else {
             self.editor.active_search_match = None;

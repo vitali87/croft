@@ -34898,3 +34898,55 @@ fn a_logs_budgeted_count_does_not_leak_onto_the_next_text_search() {
         "an exhaustive count must not inherit the log's N+"
     );
 }
+
+/// #257 round-3 review finding: a step that runs out of budget must leave
+/// the user where they are. Marking the count partial and then clearing the
+/// active match left the bar reading "1+ matches" with nothing highlighted
+/// and no way back to the match they were on.
+#[test]
+fn a_step_that_runs_out_of_reach_keeps_the_match_it_already_had() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("far.log");
+    // One match at the very top, then far more filler than a sweep may read,
+    // so stepping forward from it exhausts the budget without finding another.
+    let mut body = String::from("\u{1b}[31mERROR\u{1b}[0m first and only\n");
+    let filler = "quiet line with nothing of interest ".repeat(4);
+    for _ in 0..(crate::log_view::FIND_SCAN_BYTES / filler.len() + 3000) {
+        body.push_str(&filler);
+        body.push('\n');
+    }
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some());
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "typing lands on the only match"
+    );
+
+    // Enter steps forward, runs out of budget, and finds nothing more.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "an out-of-reach step must leave the highlight where it was, not \
+         clear it and leave the user with a count and nothing to look at"
+    );
+    assert!(
+        app.editor_find
+            .as_ref()
+            .is_some_and(|s| s.count_truncated()),
+        "and the bar must say the search did not cover the whole file"
+    );
+}

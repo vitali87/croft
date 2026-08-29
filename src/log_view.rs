@@ -39,11 +39,6 @@ const SCAN_CHUNK_LINES: usize = 4096;
 /// avoid. Same stance as the trigger scanner's `LINE_CAP`, one level up.
 pub const FIND_SCAN_BYTES: usize = 4 * 1024 * 1024;
 
-/// Human label for [`FIND_SCAN_BYTES`], for the find bar's truncated arm.
-pub fn scanned_label() -> String {
-    format!("{} MiB", FIND_SCAN_BYTES / (1024 * 1024))
-}
-
 /// The outcome of one find step over a windowed file.
 ///
 /// A budgeted search has three answers, not two. Collapsing the third into
