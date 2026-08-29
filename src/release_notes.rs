@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "croft plot: pipe numbers, CSV/TSV or JSON lines into an inline chart. `seq 1 100 | awk '{print sin($1/10)}' | croft plot` draws a line chart in the pane on iTerm2 and Kitty terminals and a braille chart everywhere else; --type bar labels bars from the first column, spark fits one row, hist bins the values. Headers are detected, --x/--y pick columns, and 10k rows render in a blink.",
+    summary: "croft theme-import turns a VS Code colour theme (.json) into a croft theme: workbench chrome, the 16 terminal colours, and the code palette, with a note for every colour croft had to derive because the theme did not name it.",
 }];

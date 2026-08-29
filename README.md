@@ -82,7 +82,7 @@ croft attach                     # open the current folder as a persistent sessi
 croft attach ~/projects          # ...for a specific folder
 croft attach --solo ~/projects   # join a shared folder in your own viewport (live co-editing)
 croft ls                         # list running persistent sessions
-seq 1 100 | croft plot           # chart numbers / CSV / JSON lines inline (--type line|bar|spark|hist)
+croft theme-import theme.json    # use a VS Code colour theme in croft
 croft --help
 ```
 
