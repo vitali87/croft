@@ -236,6 +236,12 @@ pub struct Prefs {
     /// matching VS Code.
     #[serde(default)]
     pub copy_on_select: bool,
+    /// Opt-out for the built-in secret redaction rules (#360): AWS keys,
+    /// `sk-`/`ghp_`/`xox` tokens, JWTs and bearer tokens are masked in
+    /// terminal panes by default. Stored as the disable flag so the
+    /// derived `Default` and an older config both mean "masked".
+    #[serde(default)]
+    pub disable_secret_redaction: bool,
     /// Per-host pane accent rules; see [`HostAccentRule`].
     #[serde(default)]
     pub host_accents: Vec<HostAccentRule>,
@@ -377,6 +383,13 @@ pub fn save_format_on_save(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.format_on_save = enabled;
+    prefs.save(&path)
+}
+
+pub fn save_disable_secret_redaction(disabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.disable_secret_redaction = disabled;
     prefs.save(&path)
 }
 

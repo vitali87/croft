@@ -597,6 +597,12 @@ pub struct PtyTerminal {
     /// Paint the right-edge HH:MM:SS gutter (the "Terminal: Toggle
     /// Timestamps" palette command flips this on every pane).
     pub show_timestamps: bool,
+    /// Paint redact-trigger matches as themselves for a moment ("Terminal:
+    /// Reveal Redacted Secrets"); the app sets it on every pane per frame.
+    pub reveal_redactions: bool,
+    /// How many redact-trigger spans the last paint masked, for the
+    /// status-bar chip. Zero while revealing or when nothing matched.
+    pub redacted_on_screen: usize,
     /// User notes pinned to output spans (Cmd+K N on a selection).
     /// Session-scoped, like the scrollback they describe.
     annotations: Vec<PaneAnnotation>,
@@ -1920,6 +1926,8 @@ impl PtyTerminal {
             progress,
             line_times,
             show_timestamps: false,
+            reveal_redactions: false,
+            redacted_on_screen: 0,
             annotations: Vec::new(),
             finished_rx,
             hints: None,
@@ -2357,6 +2365,29 @@ impl PtyTerminal {
                 )
             })
             .collect()
+    }
+
+    /// The real text under a masked (redacted) cell at screen `(col, row)`,
+    /// for the click-to-reveal popup (#360). None off the pane, off a
+    /// mask, or while an alt-screen app owns the viewport.
+    pub fn redacted_at(&self, col: u16, row: u16) -> Option<String> {
+        let (vr, vc) = self.cell_at(col, row)?;
+        let set = self.triggers.lock().unwrap().clone();
+        if !set.has_redactions() {
+            return None;
+        }
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let line = vr as i32 - term.grid().display_offset() as i32;
+        let (text, colmap) = row_text_and_cols(&term, line);
+        drop(term);
+        let vc = vc as usize;
+        crate::triggers::redact_spans(&text, &set)
+            .into_iter()
+            .find(|s| (s.start..s.start + s.len).any(|k| colmap.get(k).is_some_and(|&c| c == vc)))
+            .map(|s| text.chars().skip(s.start).take(s.len).collect())
     }
 
     /// The annotation index + note under screen cell (col, row), if any.
@@ -3996,6 +4027,8 @@ impl Widget for &mut PtyTerminal {
             .current_match
             .map(|(c0, l, c, n)| (l - (self.clock_now(&term) - c0) as i32, c, n));
 
+        let reveal_redactions = self.reveal_redactions;
+        let mut redacted_spans = 0usize;
         for y in 0..rows {
             // Find matches on this row once, then paint them per cell below.
             // Match positions are char indices in the spacer-skipped row text
@@ -4058,7 +4091,29 @@ impl Widget for &mut PtyTerminal {
                     let bg = s.bg.map(|(r, g, b)| Color::Rgb(r, g, b));
                     for k in s.start..s.start + s.len {
                         if let Some(&col) = colmap.get(k) {
-                            paint[col] = Some((fg, bg));
+                            paint[col] = Some(TrigCell {
+                                fg,
+                                bg,
+                                mask: false,
+                            });
+                        }
+                    }
+                }
+                // Redaction (#360) is paint-only too: the grid keeps the
+                // real text, the cell shows a mask glyph. Counted per span
+                // for the status chip; nothing is masked while revealing.
+                if !reveal_redactions {
+                    for s in crate::triggers::redact_spans(&text, &trigger_set) {
+                        redacted_spans += 1;
+                        for k in s.start..s.start + s.len {
+                            if let Some(&col) = colmap.get(k) {
+                                let cell = paint[col].get_or_insert(TrigCell {
+                                    fg: None,
+                                    bg: None,
+                                    mask: false,
+                                });
+                                cell.mask = true;
+                            }
                         }
                     }
                 }
@@ -4099,13 +4154,16 @@ impl Widget for &mut PtyTerminal {
                 // matched span. Cursor / selection / find / quick-select all
                 // paint after this, so they stay visible on top.
                 if let Some(paint) = trig_paint.as_ref()
-                    && let Some(Some((fg, bg))) = paint.get(x as usize)
+                    && let Some(Some(cell)) = paint.get(x as usize)
                 {
-                    if let Some(c) = fg {
-                        style = style.fg(*c);
+                    if let Some(c) = cell.fg {
+                        style = style.fg(c);
                     }
-                    if let Some(c) = bg {
-                        style = style.bg(*c);
+                    if let Some(c) = cell.bg {
+                        style = style.bg(c);
+                    }
+                    if cell.mask {
+                        display_char = crate::triggers::MASK;
                     }
                 }
                 // Annotated spans: amber + underline, under the cursor /
@@ -4200,6 +4258,7 @@ impl Widget for &mut PtyTerminal {
                 target.set_style(style);
             }
         }
+        self.redacted_on_screen = redacted_spans;
         // OSC 9;4 progress gauge along the bottom border (Ghostty/WezTerm
         // parity): a fill in the state's colour over the border glyphs —
         // blue normal, red error, yellow warning — and a sweeping segment
@@ -4396,10 +4455,16 @@ impl Widget for &mut PtyTerminal {
     }
 }
 
-/// Per-cell trigger-highlight paint for one row: `None` = cell untouched,
-/// `Some((fg, bg))` = the matching trigger's colours (either side optional,
-/// leaving that half of the cell style alone).
-type TrigRowPaint = Vec<Option<(Option<Color>, Option<Color>)>>;
+/// Per-cell trigger paint for one row: `None` = cell untouched, `Some` =
+/// the matching trigger's colours (either side optional, leaving that half
+/// of the cell style alone) and whether a redact rule masks the glyph.
+#[derive(Clone, Copy, Debug, Default)]
+struct TrigCell {
+    fg: Option<Color>,
+    bg: Option<Color>,
+    mask: bool,
+}
+type TrigRowPaint = Vec<Option<TrigCell>>;
 
 /// The display offset that brings absolute grid line `abs_line` to the
 /// vertical middle of a `rows`-tall viewport, clamped to `[0, max_off]` (0 =
@@ -5464,6 +5529,85 @@ mod tests {
             Some(Color::Rgb(0x12, 0x34, 0x56)),
             "a palette swap must repaint SGR red with the new color"
         );
+    }
+
+    /// #360: a redact-trigger match paints as a run of mask glyphs of the
+    /// same width while the grid keeps the real text, so a click on the
+    /// mask can still recover it; the count feeds the status chip; a
+    /// reveal window paints the text as typed.
+    #[test]
+    fn redacted_spans_paint_as_masks_and_the_real_text_stays_recoverable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                String::from("printf 'key AKIAIOSFODNN7EXAMPLE end\\n'; sleep 30"),
+            ],
+            tmp.path(),
+        )
+        .unwrap();
+        // The pane's spawn banner echoes the command line, key included, so
+        // wait for the OUTPUT line, which starts at column 0.
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.starts_with("key AKIA")));
+        term.set_triggers(std::sync::Arc::new(
+            crate::triggers::TriggerSet::default().with_builtin_redactions(),
+        ));
+        let area = Rect::new(0, 0, 60, 10);
+        term.last_inner = Rect::new(1, 1, 58, 8);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut term, area, &mut buf);
+        let row_text = |buf: &Buffer, y: u16| -> String {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        };
+        let rows: Vec<String> = (0..area.height).map(|y| row_text(&buf, y)).collect();
+        let (y, line) = rows
+            .iter()
+            .enumerate()
+            .map(|(y, l)| (y as u16, l.clone()))
+            .find(|(_, l)| l.starts_with("\u{2502}key "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the key line rendered: {rows:#?} grid={:?} label={:?}",
+                    term.grid_lines().0,
+                    term.label()
+                )
+            });
+        assert!(
+            line.contains(&"\u{2022}".repeat(20)) && !line.contains("AKIA"),
+            "the key paints as twenty masks: {line:?}"
+        );
+        assert!(
+            line.contains(" end"),
+            "text around the key is untouched: {line:?}"
+        );
+        assert!(
+            term.redacted_on_screen >= 1,
+            "the status chip counts at least the output line's span"
+        );
+
+        // The grid still holds the real text: a click on the mask finds it.
+        // A column, not a byte offset: the border glyph before it is multibyte.
+        let x = line.chars().position(|c| c == '\u{2022}').unwrap() as u16;
+        assert_eq!(
+            term.redacted_at(x, y).as_deref(),
+            Some("AKIAIOSFODNN7EXAMPLE"),
+            "the mask click recovers the value"
+        );
+        assert_eq!(
+            term.redacted_at(x.saturating_sub(2), y),
+            None,
+            "off the mask: nothing"
+        );
+
+        // A reveal window paints the text as typed and counts nothing.
+        term.reveal_redactions = true;
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut term, area, &mut buf);
+        assert!(row_text(&buf, y).contains("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(term.redacted_on_screen, 0);
     }
 
     #[test]

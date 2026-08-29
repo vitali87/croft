@@ -20847,6 +20847,61 @@ fn a_staged_update_offers_relaunch_and_only_relaunch_re_execs() {
     assert!(app.pending_reexec && app.quit, "Relaunch arms the re-exec");
 }
 
+/// #360: the built-in secret rules sit in the trigger set by default,
+/// leave it when the setting is switched off, and come back on; a reveal
+/// window lasts ten seconds and asks for a redraw when it closes.
+#[test]
+fn secret_redaction_toggles_the_builtin_rules_and_reveal_expires() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.secret_redaction, "on by default");
+    assert!(
+        app.triggers.has_redactions(),
+        "the built-in rules are loaded"
+    );
+    assert_eq!(
+        crate::triggers::mask_text("AKIAIOSFODNN7EXAMPLE", &app.triggers, false),
+        "\u{2022}".repeat(20)
+    );
+    app.toggle_secret_redaction();
+    assert!(!app.secret_redaction);
+    assert!(
+        !app.triggers.has_redactions(),
+        "off means no built-in rules"
+    );
+    app.toggle_secret_redaction();
+    assert!(app.triggers.has_redactions());
+
+    assert!(!app.redactions_revealed());
+    app.reveal_redacted_secrets();
+    assert!(app.redactions_revealed());
+    assert!(
+        !app.tick_redaction_reveal(),
+        "still inside the window: no change"
+    );
+    app.redaction_reveal_until = Some(std::time::Instant::now());
+    assert!(
+        app.tick_redaction_reveal(),
+        "the window closing is a redraw"
+    );
+    assert!(!app.redactions_revealed());
+    assert!(app.status.contains("masked again"));
+
+    // The clipboard keeps the real value unless a rule says otherwise; the
+    // scrollback dump always masks.
+    assert_eq!(
+        app.terminal_text_for_copy(String::from("k=AKIAIOSFODNN7EXAMPLE")),
+        "k=AKIAIOSFODNN7EXAMPLE"
+    );
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(
+        r#"[{ "regex": "AKIA[0-9A-Z]{16}", "action": "redact", "copy": "masked" }]"#,
+    ));
+    assert_eq!(
+        app.terminal_text_for_copy(String::from("k=AKIAIOSFODNN7EXAMPLE")),
+        format!("k={}", "\u{2022}".repeat(20))
+    );
+}
+
 #[test]
 fn clicking_the_problems_tab_switches_the_panel_view() {
     let tmp = tempfile::tempdir().unwrap();

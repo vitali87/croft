@@ -2227,6 +2227,13 @@ pub struct App {
     /// mouse selection lands on the clipboard without an explicit Cmd+C.
     /// Loaded from prefs at startup, toggled in the Settings hub.
     copy_on_select: bool,
+    /// Built-in secret redaction rules are in the trigger set (#360).
+    /// Settings "Terminal: Redact Secrets"; stored inverted in config.json
+    /// as `disable_secret_redaction` so the default is on.
+    secret_redaction: bool,
+    /// "Terminal: Reveal Redacted Secrets": masks paint as their real text
+    /// until this instant, then mask again on the next frame.
+    redaction_reveal_until: Option<std::time::Instant>,
     /// VS Code's `files.autoSave: afterDelay`: dirty buffers write
     /// themselves to disk once the delay elapses after the last edit.
     auto_save: bool,
@@ -4012,6 +4019,8 @@ impl App {
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
+            secret_redaction: !loaded_prefs.disable_secret_redaction,
+            redaction_reveal_until: None,
             auto_save: loaded_prefs.auto_save,
             auto_save_on_focus_change: loaded_prefs.auto_save_on_focus_change,
             last_focus_signature: None,
@@ -4305,9 +4314,7 @@ impl App {
                 crate::workspace::folders_store_path()
             },
             terminal_copy_mode: None,
-            triggers: std::sync::Arc::new(crate::triggers::TriggerSet::load(
-                &crate::triggers::triggers_path(),
-            )),
+            triggers: load_trigger_set(!loaded_prefs.disable_secret_redaction),
             matchers,
             watch_set,
             task_matcher_by_pane: std::collections::HashMap::new(),
@@ -12711,6 +12718,59 @@ impl App {
         self.host_accents = compile_host_accents(rules);
     }
 
+    /// Settings / palette "Terminal: Toggle Secret Redaction" (#360): the
+    /// built-in key and token rules leave or rejoin the trigger set; the
+    /// user's own `redact` rows in triggers.json are unaffected.
+    pub fn toggle_secret_redaction(&mut self) {
+        self.secret_redaction = !self.secret_redaction;
+        self.triggers = load_trigger_set(self.secret_redaction);
+        self.status = String::from(if self.secret_redaction {
+            "Secret redaction: on"
+        } else {
+            "Secret redaction: off"
+        });
+        if !cfg!(test) {
+            let _ = crate::prefs::save_disable_secret_redaction(!self.secret_redaction);
+        }
+    }
+
+    /// Palette "Terminal: Reveal Redacted Secrets for 10s": every mask on
+    /// every pane paints as its real text for ten seconds, then masks
+    /// again. Announced so a screen share sees it happen.
+    pub fn reveal_redacted_secrets(&mut self) {
+        self.redaction_reveal_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+        self.status = String::from("Redacted secrets revealed for 10s");
+    }
+
+    /// Whether a reveal window is open right now.
+    fn redactions_revealed(&self) -> bool {
+        self.redaction_reveal_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+    }
+
+    /// Main-loop tick: when the reveal window closes, drop it and ask for
+    /// a redraw so the masks come back without waiting for other input.
+    pub fn tick_redaction_reveal(&mut self) -> bool {
+        if self.redaction_reveal_until.is_some() && !self.redactions_revealed() {
+            self.redaction_reveal_until = None;
+            self.status = String::from("Redacted secrets masked again");
+            return true;
+        }
+        false
+    }
+
+    /// Masks on screen across every pane, as painted last frame.
+    fn redacted_on_screen(&self) -> usize {
+        self.terminals.iter().map(|t| t.redacted_on_screen).sum()
+    }
+
+    /// The clipboard's view of terminal text: rules marked `copy: masked`
+    /// keep their mask, everything else copies as typed (#360).
+    fn terminal_text_for_copy(&self, text: String) -> String {
+        crate::triggers::mask_text(&text, &self.triggers, true)
+    }
+
     /// Palette "Terminal: Toggle Timestamps": show / hide the per-row
     /// arrival-clock gutter on every pane.
     pub fn toggle_terminal_timestamps(&mut self) {
@@ -13718,6 +13778,11 @@ impl App {
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let size = frame.area();
         self.last_frame_area = size;
+        // Redaction reveal is app state; each pane paints from its own copy.
+        let reveal = self.redactions_revealed();
+        for t in self.terminals.iter_mut() {
+            t.reveal_redactions = reveal;
+        }
         // Hit rects must describe the frame being painted, not the last
         // frame that happened to include a section. A section that stops
         // rendering (Explorer's OPEN EDITORS / TIMELINE / DEPENDENCIES /
@@ -14534,6 +14599,30 @@ impl App {
         let scm_status = self.scm_worker().status().clone();
         let mut spans: Vec<Span> = Vec::with_capacity(20);
         spans.extend(brand_spans(self.theme));
+        let redacted = self.redacted_on_screen();
+        if redacted > 0 || self.redactions_revealed() {
+            // How much of what is on screen is masked right now (#360): a
+            // screen-share host wants to know the count is non-zero, and
+            // that a reveal window is open.
+            let (label, bg) = if self.redactions_revealed() {
+                (
+                    format!(" \u{1f441} {redacted} revealed "),
+                    Color::Rgb(0xc0, 0x39, 0x2b),
+                )
+            } else {
+                (
+                    format!(" \u{2022} {redacted} redacted "),
+                    Color::Rgb(0x3a, 0x3f, 0x4b),
+                )
+            };
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .bg(self.theme.ui(bg))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if let Some(span) = self.perf.status_span() {
             spans.push(span);
         }
@@ -22032,6 +22121,7 @@ impl App {
                     "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
+                    "toggle:secret_redaction" => self.toggle_secret_redaction(),
                     "toggle:format_on_type" => self.toggle_format_on_type(),
                     "cmd:color_theme" => {
                         self.open_theme_picker();
@@ -22190,6 +22280,14 @@ impl App {
                     "Terminal: Copy on Selection: {}{}",
                     on_off(self.copy_on_select),
                     prov("copy_on_select")
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:secret_redaction"),
+                label: format!(
+                    "Terminal: Redact Secrets (keys, tokens): {}{}",
+                    on_off(self.secret_redaction),
+                    prov("disable_secret_redaction")
                 ),
             },
             ListRow {
@@ -25357,7 +25455,9 @@ impl App {
             .iter()
             .rposition(|l| !l.trim().is_empty())
             .map_or(0, |i| i + 1);
-        let text = lines[..last].join("\n");
+        // Every redact rule applies here, copy-mode or not: this buffer
+        // leaves the pane as bytes (#360).
+        let text = crate::triggers::mask_text(&lines[..last].join("\n"), &self.triggers, false);
         let pane = self.terminal().label();
         let pane = if pane.is_empty() { "terminal" } else { pane };
         let label = format!("{pane} scrollback");
@@ -25694,7 +25794,7 @@ impl App {
         if !sel.has_area() {
             return;
         }
-        let text = self.terminal().selection_text();
+        let text = self.terminal_text_for_copy(self.terminal().selection_text());
         if text.is_empty() {
             return;
         }
@@ -28720,6 +28820,8 @@ impl App {
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
+            Cmd::ToggleSecretRedaction => self.toggle_secret_redaction(),
+            Cmd::RevealRedactedSecrets => self.reveal_redacted_secrets(),
             Cmd::SearchFromTerminal => self.search_from_last_terminal_command(),
             Cmd::RestoreSnapshot => self.restore_history_snapshot(),
             Cmd::QuickFix => self.start_code_action(),
@@ -30360,7 +30462,7 @@ impl App {
                 return;
             }
             KeyCode::Char('y') | KeyCode::Enter => {
-                let text = self.terminal().selection_text();
+                let text = self.terminal_text_for_copy(self.terminal().selection_text());
                 self.terminal_copy_mode = Some(st);
                 self.close_terminal_copy_mode();
                 if text.is_empty() {
@@ -33670,10 +33772,27 @@ impl App {
                     && self.focus == Pane::Terminal
                     && self.terminal().selection().is_some_and(|s| s.has_area())
                 {
-                    let text = self.terminal().selection_text();
+                    let text = self.terminal_text_for_copy(self.terminal().selection_text());
                     if !text.is_empty() {
                         copy_to_clipboard(&text);
                     }
+                }
+                // A plain click on a redacted span shows the real value in
+                // a popup (#360): the mask is paint-only, so this is the
+                // one way to read it without a reveal window.
+                if self.focus == Pane::Terminal
+                    && !self.terminal().selection().is_some_and(|s| s.has_area())
+                    && let Some(secret) = self.terminal().redacted_at(m.column, m.row)
+                {
+                    self.terminal_drag_from = None;
+                    if self.terminal().selection().is_some() {
+                        self.terminal_mut().clear_selection();
+                    }
+                    self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+                        secret,
+                        (m.column, m.row),
+                    ));
+                    return;
                 }
                 // A plain click on an annotated span pops its note (checked
                 // before click-to-move so a note near the prompt is still
@@ -34551,7 +34670,7 @@ impl App {
             self.snippets = crate::snippets::SnippetSet::load(path);
             self.status = String::from("Snippets reloaded");
         } else if path == crate::triggers::triggers_path() {
-            self.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::load(path));
+            self.triggers = load_trigger_set(self.secret_redaction);
             self.status = format!(
                 "Triggers reloaded ({} active)",
                 self.triggers.triggers.len()
@@ -40861,6 +40980,17 @@ fn remote_persistence_status(is_remote: bool, persistent: bool) -> Option<&'stat
 pub static CACHE_DIR_OVERRIDE_FOR_TEST: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
 
+/// The user's `triggers.json`, with the built-in secret redactions in front
+/// of it when redaction is on (#360).
+fn load_trigger_set(redact_secrets: bool) -> std::sync::Arc<crate::triggers::TriggerSet> {
+    let set = crate::triggers::TriggerSet::load(&crate::triggers::triggers_path());
+    std::sync::Arc::new(if redact_secrets {
+        set.with_builtin_redactions()
+    } else {
+        set
+    })
+}
+
 fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
@@ -42016,6 +42146,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
+        let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
         app.sync_git_gutters();
         app.sync_blame();
@@ -42117,6 +42248,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || connect_changed
             || install_changed
             || update_changed
+            || reveal_changed
             || lsp_changed
             || sig_help_changed
             || hover_changed
