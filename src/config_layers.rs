@@ -395,26 +395,20 @@ fn load_vscode_subset(path: &Path, warnings: &mut Vec<String>) -> Option<Map<Str
         ));
         return None;
     };
-    let mut out = Map::new();
-    if let Some(v) = obj.get("editor.formatOnSave").and_then(Value::as_bool) {
-        out.insert("format_on_save".into(), Value::Bool(v));
-    }
-    if let Some(v) = obj.get("editor.formatOnType").and_then(Value::as_bool) {
-        out.insert("format_on_type".into(), Value::Bool(v));
-    }
-    match obj.get("files.autoSave").and_then(Value::as_str) {
-        Some("afterDelay") => {
-            out.insert("auto_save".into(), Value::Bool(true));
-        }
-        Some("onFocusChange") => {
-            out.insert("auto_save_on_focus_change".into(), Value::Bool(true));
-        }
-        Some("off") => {
-            out.insert("auto_save".into(), Value::Bool(false));
-            out.insert("auto_save_on_focus_change".into(), Value::Bool(false));
-        }
-        _ => {}
-    }
+    // ONE mapping, shared with `croft import-vscode`
+    // (`crate::import_vscode::map_settings`). Keeping a second table here is
+    // how the two came to disagree: this one ignored
+    // `files.autoSave: "onWindowChange"` while the importer mapped it, so the
+    // same file meant different things depending on which path read it.
+    //
+    // A workspace layer may only set the appearance and editor toggles in
+    // `WORKSPACE_ALLOWED_KEYS`, so the shared result is filtered to those
+    // here rather than warning about keys the user never wrote.
+    let (mapped, _unmapped, _warnings) = crate::import_vscode::map_settings(obj);
+    let out: Map<String, Value> = mapped
+        .into_iter()
+        .filter(|(k, _)| WORKSPACE_ALLOWED_KEYS.contains(&k.as_str()))
+        .collect();
     (!out.is_empty()).then_some(out)
 }
 

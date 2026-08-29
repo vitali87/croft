@@ -105,13 +105,23 @@ fn never_means_disabled(v: &Value) -> Option<Value> {
 }
 
 fn as_whitespace_mode(v: &Value) -> Option<Value> {
-    // croft renders none / boundary / all; VS Code's "selection" and
-    // "trailing" have no croft equivalent and fall back to the nearest
-    // honest thing rather than pretending.
+    // VS Code has five whitespace modes; croft has three (WhitespaceMode:
+    // none, selection, all). Only ids croft can actually represent are
+    // emitted.
+    //
+    // An earlier version mapped `selection` and `trailing` onto "boundary",
+    // which croft has NO variant for. `selection` still behaved correctly by
+    // ACCIDENT: `WhitespaceMode::from_pref` sends anything unrecognised to
+    // Selection, so a wrong id landed on the right mode and would have broken
+    // the moment that fallback changed.
     let s = v.as_str()?;
     let mapped = match s {
-        "none" | "boundary" | "all" => s,
-        "trailing" | "selection" => "boundary",
+        "none" | "selection" | "all" => s,
+        // Neither has a croft mode: `boundary` marks whitespace BETWEEN words
+        // and `trailing` only at line ends, so rendering either as `all`
+        // would mark whitespace the user deliberately kept. The honest
+        // nearest is none, and the caller reports the loss.
+        "boundary" | "trailing" => "none",
         _ => return None,
     };
     Some(Value::from(mapped))
@@ -180,6 +190,12 @@ const SETTINGS: &[SettingMap] = &[
 /// does the same thing; a VS Code command with no true counterpart is left
 /// out so the import reports it rather than binding the user's chord to
 /// something that merely sounds similar.
+/// Two VS Code commands are deliberately ABSENT, having been mapped and
+/// then removed: `editor.action.revealDefinition` (F12) has no caret-driven
+/// croft equivalent, only `mouse_go_to_definition_at_click`, which reads the
+/// last POINTER position and would send F12 somewhere unrelated to the
+/// cursor; and `editor.action.showHover` is not `peek_definition`, which
+/// opens a different thing entirely.
 const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.files.save", "save_file"),
     ("workbench.action.quickOpen", "quick_open"),
@@ -227,10 +243,6 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.action.blockComment", "toggle_block_comment"),
     ("editor.action.quickFix", "quick_fix"),
     ("editor.action.peekDefinition", "peek_definition"),
-    (
-        "editor.action.revealDefinition",
-        "mouse_go_to_definition_at_click",
-    ),
     ("editor.action.startFindReplaceAction", "replace_in_file"),
     ("editor.action.moveLinesUpAction", "move_line_up"),
     ("editor.action.moveLinesDownAction", "move_line_down"),
@@ -258,7 +270,6 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.foldAll", "fold_all"),
     ("editor.unfoldAll", "unfold_all"),
     ("editor.toggleFold", "toggle_fold"),
-    ("editor.action.showHover", "peek_definition"),
     ("markdown.showPreview", "toggle_markdown_preview"),
     ("workbench.action.tasks.build", "run_build_task"),
     ("workbench.action.tasks.runTask", "run_task"),
@@ -319,21 +330,35 @@ fn read_jsonc(path: &Path) -> Result<Option<Value>> {
     Ok(Some(value))
 }
 
-/// Convert a VS Code `settings.json` document.
-pub fn convert_settings(doc: &Value, report: &mut Report) {
-    let Some(obj) = doc.as_object() else {
-        report
-            .warnings
-            .push(String::from("settings.json is not a JSON object; skipped"));
-        return;
-    };
+/// Map a VS Code settings object onto croft's keys.
+///
+/// THE mapping, used by both callers: this importer and the
+/// `.vscode/settings.json` workspace layer in [`crate::config_layers`].
+/// They had a table each, and the tables had already drifted (one treated
+/// `files.autoSave: "onWindowChange"` as a save-on-focus-change, the other
+/// ignored it), so the same file meant different things depending on which
+/// path read it.
+///
+/// Returns the croft settings, the VS Code keys with no croft equivalent,
+/// and any lossy conversions worth reporting.
+pub fn map_settings(
+    obj: &Map<String, Value>,
+) -> (BTreeMap<String, Value>, Vec<String>, Vec<String>) {
+    let mut settings: BTreeMap<String, Value> = BTreeMap::new();
+    let mut unmapped: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     for (key, value) in obj {
         match SETTINGS.iter().find(|m| m.vscode == key) {
             Some(map) => match (map.convert)(value) {
                 Some(converted) => {
-                    report.settings.insert(map.croft.to_string(), converted);
+                    if key == "editor.renderWhitespace" && converted != *value {
+                        warnings.push(format!(
+                            "editor.renderWhitespace {value} has no croft mode; using {converted}"
+                        ));
+                    }
+                    settings.insert(map.croft.to_string(), converted);
                 }
-                None => report.unmapped_settings.push(format!(
+                None => unmapped.push(format!(
                     "{key} (croft has {}, but not for this value: {value})",
                     map.croft
                 )),
@@ -343,20 +368,35 @@ pub fn convert_settings(doc: &Value, report: &mut Report) {
                 // here rather than in the one-to-one table.
                 if let Some(mode) = value.as_str().filter(|_| key == "files.autoSave") {
                     {
-                        report
-                            .settings
+                        settings
                             .insert(String::from("auto_save"), Value::from(mode == "afterDelay"));
-                        report.settings.insert(
+                        settings.insert(
                             String::from("auto_save_on_focus_change"),
                             Value::from(mode == "onFocusChange" || mode == "onWindowChange"),
                         );
                         continue;
                     }
                 }
-                report.unmapped_settings.push(key.clone());
+                unmapped.push(key.clone());
             }
         }
     }
+    unmapped.sort();
+    (settings, unmapped, warnings)
+}
+
+/// Convert a VS Code `settings.json` document.
+pub fn convert_settings(doc: &Value, report: &mut Report) {
+    let Some(obj) = doc.as_object() else {
+        report
+            .warnings
+            .push(String::from("settings.json is not a JSON object; skipped"));
+        return;
+    };
+    let (settings, unmapped, warnings) = map_settings(obj);
+    report.settings.extend(settings);
+    report.unmapped_settings.extend(unmapped);
+    report.warnings.extend(warnings);
     report.unmapped_settings.sort();
 }
 
@@ -382,6 +422,16 @@ pub fn convert_keybindings(doc: &Value, report: &mut Report) {
             report.dropped_keybindings.push(format!(
                 "{key}: unbinding {removed} has no croft equivalent"
             ));
+            continue;
+        }
+        // croft's `Chord::parse` splits on `+` only: a VS Code chord SEQUENCE
+        // ("ctrl+k z") is not a chord croft can express, so writing one lands
+        // a row croft skips with a warning at load. Reported here instead, so
+        // every row this import writes is one croft can read.
+        if key.split_whitespace().count() > 1 {
+            report
+                .dropped_keybindings
+                .push(format!("{key}: croft has no multi-key chord sequences"));
             continue;
         }
         match COMMANDS.iter().find(|(vs, _)| *vs == command) {
@@ -468,6 +518,22 @@ pub fn scan_profile(dir: &Path) -> Result<Report> {
 /// Returns the files written. An existing value is never replaced: someone
 /// who has already tuned croft must not lose it to a one-shot import, and
 /// leaving it alone is also what makes a second run a no-op.
+/// Whether `path` carries comments croft would destroy by rewriting it.
+///
+/// A merge here parses JSONC and writes back strict JSON, which drops every
+/// comment. That is not hypothetical: croft SEEDS `keybindings.json` and
+/// `snippets.json` from commented templates (`keymap::TEMPLATE`,
+/// `snippets::TEMPLATE`), so the common case is a file whose explanatory
+/// header this import would silently delete. Such a file is left alone and
+/// its additions reported instead, which is the same posture as a value
+/// conflict: croft says what it did not do rather than doing it quietly.
+fn carries_comments(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    raw != crate::tasks::strip_jsonc(&raw)
+}
+
 pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
     let dir = crate::prefs::config_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -475,79 +541,97 @@ pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
 
     if !report.settings.is_empty() {
         let path = dir.join("config.json");
-        let mut existing: Map<String, Value> = match read_jsonc(&path)? {
-            Some(Value::Object(m)) => m,
-            _ => Map::new(),
-        };
-        let mut changed = false;
-        for (key, value) in &report.settings {
-            if let Some(current) = existing.get(key) {
-                if current != value {
-                    report.conflicts.push(format!(
-                        "config.json {key}: kept {current}, VS Code had {value}"
-                    ));
+        if carries_comments(&path) {
+            report.conflicts.push(String::from(
+                "config.json: left untouched because rewriting it would delete its comments; add the entries above by hand",
+            ));
+        } else {
+            let mut existing: Map<String, Value> = match read_jsonc(&path)? {
+                Some(Value::Object(m)) => m,
+                _ => Map::new(),
+            };
+            let mut changed = false;
+            for (key, value) in &report.settings {
+                if let Some(current) = existing.get(key) {
+                    if current != value {
+                        report.conflicts.push(String::from(
+                            "config.json {key}: kept {current}, VS Code had {value}",
+                        ));
+                    }
+                    continue;
                 }
-                continue;
+                existing.insert(key.clone(), value.clone());
+                changed = true;
             }
-            existing.insert(key.clone(), value.clone());
-            changed = true;
-        }
-        if changed {
-            write_json(&path, &Value::Object(existing))?;
-            written.push(path);
+            if changed {
+                write_json(&path, &Value::Object(existing))?;
+                written.push(path);
+            }
         }
     }
 
     if !report.keybindings.is_empty() {
         let path = dir.join("keybindings.json");
-        let mut rows: Vec<Value> = match read_jsonc(&path)? {
-            Some(Value::Array(a)) => a,
-            _ => Vec::new(),
-        };
-        let bound: Vec<String> = rows
-            .iter()
-            .filter_map(|r| r.get("key").and_then(Value::as_str).map(str::to_string))
-            .collect();
-        let mut changed = false;
-        for (key, command) in &report.keybindings {
-            if bound.iter().any(|k| k == key) {
-                report
-                    .conflicts
-                    .push(format!("keybindings.json {key}: already bound, left alone"));
-                continue;
+        if carries_comments(&path) {
+            report.conflicts.push(String::from(
+                "keybindings.json: left untouched because rewriting it would delete its comments; add the entries above by hand",
+            ));
+        } else {
+            let mut rows: Vec<Value> = match read_jsonc(&path)? {
+                Some(Value::Array(a)) => a,
+                _ => Vec::new(),
+            };
+            let bound: Vec<String> = rows
+                .iter()
+                .filter_map(|r| r.get("key").and_then(Value::as_str).map(str::to_string))
+                .collect();
+            let mut changed = false;
+            for (key, command) in &report.keybindings {
+                if bound.iter().any(|k| k == key) {
+                    report
+                        .conflicts
+                        .push(format!("keybindings.json {key}: already bound, left alone"));
+                    continue;
+                }
+                let mut row = Map::new();
+                row.insert(String::from("key"), Value::from(key.clone()));
+                row.insert(String::from("command"), Value::from(command.clone()));
+                rows.push(Value::Object(row));
+                changed = true;
             }
-            let mut row = Map::new();
-            row.insert(String::from("key"), Value::from(key.clone()));
-            row.insert(String::from("command"), Value::from(command.clone()));
-            rows.push(Value::Object(row));
-            changed = true;
-        }
-        if changed {
-            write_json(&path, &Value::Array(rows))?;
-            written.push(path);
+            if changed {
+                write_json(&path, &Value::Array(rows))?;
+                written.push(path);
+            }
         }
     }
 
     if !report.snippets.is_empty() {
         let path = dir.join("snippets.json");
-        let mut existing: Map<String, Value> = match read_jsonc(&path)? {
-            Some(Value::Object(m)) => m,
-            _ => Map::new(),
-        };
-        let mut changed = false;
-        for (name, entry) in &report.snippets {
-            if existing.contains_key(name) {
-                report.conflicts.push(format!(
-                    "snippets.json {name:?}: already defined, left alone"
-                ));
-                continue;
+        if carries_comments(&path) {
+            report.conflicts.push(String::from(
+                "snippets.json: left untouched because rewriting it would delete its comments; add the entries above by hand",
+            ));
+        } else {
+            let mut existing: Map<String, Value> = match read_jsonc(&path)? {
+                Some(Value::Object(m)) => m,
+                _ => Map::new(),
+            };
+            let mut changed = false;
+            for (name, entry) in &report.snippets {
+                if existing.contains_key(name) {
+                    report.conflicts.push(String::from(
+                        "snippets.json {name:?}: already defined, left alone",
+                    ));
+                    continue;
+                }
+                existing.insert(name.clone(), entry.clone());
+                changed = true;
             }
-            existing.insert(name.clone(), entry.clone());
-            changed = true;
-        }
-        if changed {
-            write_json(&path, &Value::Object(existing))?;
-            written.push(path);
+            if changed {
+                write_json(&path, &Value::Object(existing))?;
+                written.push(path);
+            }
         }
     }
 
@@ -645,29 +729,82 @@ mod tests {
         }
     }
 
-    /// And the VALUE has to be the shape that pref expects: a string where
-    /// croft wants a string, a number where it wants a number. A bool
-    /// written into `render_whitespace` would parse as a config error.
+    /// A converted value must ROUND-TRIP through the consumer that reads it.
+    ///
+    /// The previous version of this test compared `std::mem::discriminant`
+    /// of two `serde_json::Value`s, which cannot tell `"boundary"` from
+    /// `"selection"`: both are `Value::String`, one variant carrying the
+    /// payload inside. So it asserted "a string went where a string goes",
+    /// and it passed while the fixture fed it `"boundary"`, a mode croft has
+    /// no variant for. The test named the bug's own input and went green.
+    ///
+    /// Round-tripping is the property that discriminates: a value croft
+    /// cannot represent does not survive its own parse.
     #[test]
-    fn converted_values_match_the_type_croft_stores() {
-        let doc = json!({
-            "editor.formatOnSave": true,
-            "editor.renderWhitespace": "boundary",
-            "terminal.integrated.scrollback": 50000,
-            "files.autoSave": "onFocusChange"
-        });
-        let mut report = Report::default();
-        convert_settings(&doc, &mut report);
-        let defaults = serde_json::to_value(crate::prefs::Prefs::default()).unwrap();
-        let known = defaults.as_object().unwrap();
-        for (key, value) in &report.settings {
-            let expected = &known[key];
+    fn a_converted_whitespace_mode_round_trips_through_croft() {
+        use crate::widgets::editor::WhitespaceMode;
+
+        // Every VS Code mode, and what croft should store for it.
+        for (vscode, expected) in [
+            ("none", "none"),
+            ("all", "all"),
+            ("selection", "selection"),
+            // No croft mode marks only these, so the honest nearest is none.
+            ("boundary", "none"),
+            ("trailing", "none"),
+        ] {
+            let mut report = Report::default();
+            convert_settings(&json!({ "editor.renderWhitespace": vscode }), &mut report);
+            let stored = report.settings["render_whitespace"].as_str().unwrap();
+            assert_eq!(stored, expected, "{vscode} converted to {stored}");
             assert_eq!(
-                std::mem::discriminant(value),
-                std::mem::discriminant(expected),
-                "{key} converted to {value}, but croft stores {expected}"
+                WhitespaceMode::from_pref(stored).pref_id(),
+                stored,
+                "{stored:?} does not survive croft's own parse: from_pref sends \
+                 anything unrecognised to Selection, so a wrong id can look \
+                 correct while depending on that fallback"
             );
         }
+    }
+
+    /// Every keybinding this import writes must be one croft can LOAD.
+    ///
+    /// The table maps command ids; nothing checked the chord side, and
+    /// `Chord::parse` splits on `+` only, so a VS Code chord SEQUENCE
+    /// ("ctrl+k z") was counted as mapped, written to disk, and skipped at
+    /// load with a warning. Running the output through the real keymap
+    /// parser is the assertion that could not miss it.
+    #[test]
+    fn every_written_keybinding_is_one_croft_can_load() {
+        let doc = json!([
+            { "key": "ctrl+shift+p", "command": "workbench.action.quickOpen" },
+            { "key": "ctrl+k z", "command": "workbench.action.toggleZenMode" },
+            { "key": "f12", "command": "workbench.action.tasks.build" }
+        ]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+
+        assert!(
+            report
+                .dropped_keybindings
+                .iter()
+                .any(|d| d.contains("ctrl+k z")),
+            "a chord sequence croft cannot express must be reported, not \
+             written: {:?}",
+            report.dropped_keybindings
+        );
+
+        let rows: Vec<Value> = report
+            .keybindings
+            .iter()
+            .map(|(key, command)| json!({ "key": key, "command": command }))
+            .collect();
+        let json = serde_json::to_string(&Value::Array(rows)).unwrap();
+        let (_keymap, warnings) = crate::keymap::Keymap::resolve(&json);
+        assert!(
+            warnings.is_empty(),
+            "croft rejected rows this import would have written: {warnings:?}"
+        );
     }
 
     #[test]
@@ -683,15 +820,15 @@ mod tests {
 
         assert_eq!(
             report.keybindings,
-            vec![
-                (String::from("ctrl+k z"), String::from("toggle_zen_mode")),
-                (String::from("ctrl+shift+p"), String::from("quick_open")),
-            ]
+            vec![(String::from("ctrl+shift+p"), String::from("quick_open"))],
+            "only rows croft can both understand and PARSE are written: \
+             `ctrl+k z` is a chord sequence croft cannot express"
         );
         assert_eq!(
             report.dropped_keybindings.len(),
-            2,
-            "an unknown command and an unbinding are both reported: {:?}",
+            3,
+            "an unknown command, an unbinding and a chord sequence are all \
+             reported: {:?}",
             report.dropped_keybindings
         );
         assert!(
@@ -714,6 +851,91 @@ mod tests {
                 "{vscode} maps to {croft}, which is not a croft command id"
             );
         }
+    }
+
+    /// A sweep for the class the round-4 review found three of: a mapping
+    /// that looks right and produces something the consumer cannot use.
+    ///
+    /// Every croft command in the table is checked for taking its target
+    /// from the POINTER rather than the caret. A keyboard shortcut bound to
+    /// a mouse-position command fires somewhere unrelated to the cursor,
+    /// which is how `editor.action.revealDefinition` came to be mapped to
+    /// `mouse_go_to_definition_at_click`.
+    #[test]
+    fn no_keyboard_shortcut_maps_to_a_pointer_driven_command() {
+        for (vscode, croft) in COMMANDS {
+            assert!(
+                !croft.starts_with("mouse_"),
+                "{vscode} maps to {croft}, which acts on the last POINTER \
+                 position: a chord bound to it fires wherever the mouse \
+                 happens to be, not at the caret"
+            );
+        }
+    }
+
+    /// The workspace layer and this importer must read a VS Code settings
+    /// file the SAME way. They had a table each, and the tables had already
+    /// drifted: `files.autoSave: "onWindowChange"` was a save-on-focus-change
+    /// to one and invisible to the other.
+    #[test]
+    fn the_workspace_layer_and_the_importer_agree_on_a_settings_file() {
+        let doc = json!({
+            "files.autoSave": "onWindowChange",
+            "editor.formatOnSave": true,
+            "editor.renderWhitespace": "boundary",
+            "terminal.integrated.scrollback": 9000
+        });
+        let obj = doc.as_object().unwrap();
+        let (shared, _unmapped, _warnings) = map_settings(obj);
+
+        assert_eq!(
+            shared["auto_save_on_focus_change"],
+            json!(true),
+            "onWindowChange saves when the window loses focus, which is what \
+             croft's focus-change toggle means"
+        );
+
+        // The workspace layer sees the same values, minus the keys a
+        // workspace may not set.
+        for key in [
+            "auto_save_on_focus_change",
+            "format_on_save",
+            "render_whitespace",
+        ] {
+            assert!(
+                crate::config_layers::WORKSPACE_ALLOWED_KEYS.contains(&key),
+                "{key} should reach a workspace layer"
+            );
+        }
+        assert!(
+            !crate::config_layers::WORKSPACE_ALLOWED_KEYS.contains(&"terminal_scrollback"),
+            "a workspace must not set the scrollback, so the filter must drop it"
+        );
+    }
+
+    /// croft SEEDS `keybindings.json` and `snippets.json` from commented
+    /// templates, so the common case is a file whose header this import would
+    /// destroy by parsing JSONC and writing strict JSON back. Such a file is
+    /// left alone and reported instead.
+    #[test]
+    fn a_commented_config_file_is_never_rewritten() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let commented = dir.path().join("keybindings.json");
+        std::fs::write(&commented, crate::keymap::TEMPLATE).unwrap();
+        assert!(
+            carries_comments(&commented),
+            "croft's own template carries comments, which is the whole point"
+        );
+
+        let plain = dir.path().join("plain.json");
+        std::fs::write(&plain, "[]\n").unwrap();
+        assert!(!carries_comments(&plain));
+
+        let absent = dir.path().join("nothing.json");
+        assert!(
+            !carries_comments(&absent),
+            "a missing file is not a comment-bearing one"
+        );
     }
 
     #[test]

@@ -93,16 +93,29 @@ Extending the allowlist is a deliberate review decision, not a default.
 
 ## The `.vscode/settings.json` subset
 
-When present, croft maps exactly these keys (and nothing more — broad
-VS Code settings compatibility is a non-goal):
+When present, croft maps the keys below (and nothing more: broad VS Code
+settings compatibility is a non-goal). This is the same table
+`croft import-vscode` uses for your user-level `settings.json`, filtered to
+the keys a workspace layer is allowed to set, so a given VS Code setting
+means the same thing whichever path reads it.
 
 | VS Code | croft |
 |---------|-------|
 | `editor.formatOnSave` | `format_on_save` |
 | `editor.formatOnType` | `format_on_type` |
 | `files.autoSave: "afterDelay"` | `auto_save: true` |
-| `files.autoSave: "onFocusChange"` | `auto_save_on_focus_change: true` |
+| `files.autoSave: "onFocusChange"` / `"onWindowChange"` | `auto_save_on_focus_change: true` |
 | `files.autoSave: "off"` | both auto-save modes off |
+| `editor.renderWhitespace` | `render_whitespace` (`none` / `selection` / `all`; VS Code's `boundary` and `trailing` have no croft mode and map to `none`) |
+| `editor.bracketPairColorization.enabled` | `disable_bracket_colors` (negated) |
+| `editor.guides.indentation` | `disable_indent_guides` (negated) |
+| `editor.inlayHints.enabled` | `disable_inlay_hints` |
+| `editor.autoClosingBrackets: "never"` | `disable_auto_close_pairs` |
+| `terminal.integrated.copyOnSelection` | `copy_on_select` |
+
+Keys croft honours only as user config (a terminal scrollback, say) are
+mapped by `croft import-vscode` but ignored here, since a workspace may not
+set them.
 
 The mapped values sit **below** `.croft/config.json` in the chain, so a
 croft-native workspace file always wins over the VS Code one.
