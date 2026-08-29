@@ -235,10 +235,16 @@ def decide(response: dict | None) -> Decision:
 
     # Fail closed on anything that is not a finite probability: NaN compares
     # false against every threshold, and infinity clears all of them.
-    try:
-        confidence = float(verdict.get("confidence", 0))
-    except (TypeError, ValueError):
+    raw_confidence = verdict.get("confidence", 0)
+    # bool is an int subclass and float(True) is 1.0; a bool is not a
+    # probability. An integer too large for a float raises OverflowError.
+    if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
         confidence = 0.0
+    else:
+        try:
+            confidence = float(raw_confidence)
+        except (OverflowError, ValueError):
+            confidence = 0.0
     if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
         confidence = 0.0
     spec = str(verdict.get("restated_spec") or "").strip()

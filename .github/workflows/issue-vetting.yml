@@ -168,12 +168,13 @@ jobs:
         run: |
           set -euo pipefail
           # gh's built-in --jq takes no --arg, so the owner is bound in standalone jq.
-          gh issue list --state open --limit 500 --json number,author,labels \
+          # No checkout in this job, so gh needs the repository spelled out.
+          gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 500 --json number,author,labels \
           | jq -r --arg owner "$GITHUB_REPOSITORY_OWNER" '
               .[] | select(.author.login != $owner)
                   | select(any(.labels[].name; . == "ready" or . == "needs-human" or . == "rejected") | not)
                   | .number' \
           | while read -r n; do
               echo "dispatching vet for #${n}"
-              gh workflow run issue-vetting.yml -f issue="$n"
+              gh workflow run issue-vetting.yml --repo "$GITHUB_REPOSITORY" -f issue="$n"
             done

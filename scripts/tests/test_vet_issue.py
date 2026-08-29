@@ -142,6 +142,14 @@ class Decide(unittest.TestCase):
                 raw = json.dumps(verdict()).replace("0.95", token)
                 self.assertEqual(self.decide(raw).status, "needs-human")
 
+    def test_boolean_confidence_needs_human(self):
+        # float(True) is 1.0; a bool is not a probability.
+        self.assertEqual(self.decide(verdict(confidence=True)).status, "needs-human")
+
+    def test_oversized_integer_confidence_needs_human(self):
+        raw = json.dumps(verdict()).replace("0.95", "1" + "0" * 400)
+        self.assertEqual(self.decide(raw).status, "needs-human")
+
     def test_confidence_outside_unit_range_needs_human(self):
         for value in (1.5, -0.2):
             with self.subTest(value=value):
