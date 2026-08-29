@@ -602,7 +602,15 @@ pub fn svg(
             // One bar per pixel column at most: 10k rows bucket to the
             // width like the line path, and the labels follow the buckets.
             let slots = ((right - left) as usize).max(2);
-            let shown = n.min(slots);
+            // A group has to be wide enough to hold one bar per series. When
+            // it is not, `bar_w`'s 1px floor makes the group's bars wider than
+            // the group itself, and every series after the first is drawn over
+            // the FOLLOWING group's x positions. Fewer, wider groups is the
+            // honest answer: the chart already buckets to fit the width, and
+            // this is the same bucketing with the series count taken into
+            // account.
+            let per_group = ds.series.len().max(1);
+            let shown = n.min(slots / per_group).max(1);
             debug_assert!(shown <= n, "buckets never outnumber rows");
             // A bucket's bar is the mean of its rows, so its label names the
             // rows it covers: one label for a single row, `first…last` for
@@ -872,6 +880,21 @@ pub fn text(ds: &Dataset, kind: ChartKind, title: Option<&str>, cols: u16, rows:
             }
         }
     }
+    // The text bar and spark paths draw ds.series[0] only, while the SVG
+    // draws every series. Default `--y` selection makes every numeric column
+    // a series, and this path is what a non-TTY, a `--text` run, or a
+    // terminal without an inline image protocol gets, so silently charting
+    // one column of six is the common case rather than an exotic one.
+    // Naming what was left out is cheaper than a second chart layout and
+    // stops the output from being quietly wrong.
+    if matches!(kind, ChartKind::Bar | ChartKind::Hist | ChartKind::Spark) && ds.series.len() > 1 {
+        let shown = &ds.series[0].name;
+        let rest = ds.series.len() - 1;
+        out.push_str(&format!(
+            "(showing {shown}; {rest} more series {} not drawn in text mode)\n",
+            if rest == 1 { "is" } else { "are" }
+        ));
+    }
     out
 }
 
@@ -881,6 +904,94 @@ mod tests {
 
     fn ds(input: &str) -> Dataset {
         parse(input, None, &[]).unwrap()
+    }
+
+    /// Review finding: with several series and many rows, a group could be
+    /// narrower than the bars it hosts, so every series after the first was
+    /// drawn over the FOLLOWING group's x positions.
+    #[test]
+    fn grouped_bars_never_overflow_their_group() {
+        // Six series and far more rows than a narrow chart has columns.
+        let mut input = String::from("a,b,c,d,e,f\n");
+        for i in 0..500 {
+            input.push_str(&format!("{i},{i},{i},{i},{i},{i}\n"));
+        }
+        let d = ds(&input);
+        assert_eq!(d.series.len(), 6);
+
+        let out = svg(&d, ChartKind::Bar, None, 320, 200, &Palette::default());
+
+        // Collect (x, width) for every rect, then drop the ones that are
+        // chart furniture rather than bars. Measuring "the widest rect" alone
+        // picked up the 320px background and compared bars against it, which
+        // is the wrong object: the test failed while the code was right.
+        let rects: Vec<(f64, f64)> = out
+            .split("<rect")
+            .skip(1)
+            .filter_map(|r| {
+                let x = r
+                    .split("x=\"")
+                    .nth(1)?
+                    .split('"')
+                    .next()?
+                    .parse::<f64>()
+                    .ok()?;
+                let w = r
+                    .split("width=\"")
+                    .nth(1)?
+                    .split('"')
+                    .next()?
+                    .parse::<f64>()
+                    .ok()?;
+                Some((x, w))
+            })
+            .collect();
+        let bars: Vec<(f64, f64)> = rects.iter().copied().filter(|(_, w)| *w < 100.0).collect();
+        assert!(bars.len() > 10, "the chart drew bars: {} found", bars.len());
+
+        // The defect's signature is two bars sharing an x: when a group is
+        // narrower than its bars, series `si` of group `i` lands on exactly
+        // the column of series 0 of group `i + si`. Comparing consecutive
+        // gaps against the bar width does NOT see that, because the
+        // overlapping bars are one width apart like every other pair; the
+        // first version of this test made that comparison and passed against
+        // the bug.
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (x, _) in &bars {
+            *seen.entry(format!("{x:.3}")).or_default() += 1;
+        }
+        let shared: Vec<_> = seen.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            shared.is_empty(),
+            "{} x positions carry more than one bar, so bars from different \
+             groups are painted over each other: {:?}",
+            shared.len(),
+            shared.iter().take(3).collect::<Vec<_>>()
+        );
+    }
+
+    /// Review finding: the text bar and spark paths draw the first series
+    /// only, while the SVG draws them all, and the text path is what a
+    /// non-TTY or `--text` run gets. Silently charting one column of six is
+    /// the common case, so the output says what it left out.
+    #[test]
+    fn the_text_chart_names_the_series_it_does_not_draw() {
+        let d = ds("cpu,mem,disk\n1,2,3\n4,5,6\n");
+        assert_eq!(d.series.len(), 3);
+
+        let out = text(&d, ChartKind::Bar, None, 40, 8);
+        assert!(
+            out.contains("cpu") && out.contains("2 more series"),
+            "the note must name what was drawn and how many were not: {out}"
+        );
+
+        // A single series has nothing to report, and must not gain a note.
+        let one = ds("cpu\n1\n4\n");
+        let out = text(&one, ChartKind::Bar, None, 40, 8);
+        assert!(
+            !out.contains("more series"),
+            "a single-series chart drops nothing: {out}"
+        );
     }
 
     #[test]
