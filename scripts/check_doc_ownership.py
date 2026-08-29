@@ -34,8 +34,14 @@ ITEM = re.compile(
     # legal, and rustfmt leaves it alone inside macro bodies. Skipping it here
     # costs nothing and stops the item from being invisible.
     r"^\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?"
-    r"(?:default\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?"
-    r"(?:const\s+)?(?:"
+    # Rust's own qualifier order: default, const, async, unsafe, extern. The
+    # optional `const` here is the one in `const fn`, and it has to sit where
+    # Rust puts it: trailing the others made `pub const unsafe fn f()` match
+    # nothing at all, so the function was invisible to the gate rather than
+    # merely undocumented. The `const A: u8` declaration is a branch below,
+    # reached when this optional one is not taken.
+    r"(?:default\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
+    r"(?:extern\s+\"[^\"]*\"\s+)?(?:"
     r"fn\s+([A-Za-z_]\w*)"
     r"|const\s+([A-Za-z_]\w*)\s*:"
     r"|static\s+(?:mut\s+)?([A-Za-z_]\w*)\s*:"
@@ -167,9 +173,13 @@ def main():
                         and name in after
                         and not after[name]
                         and (f, name) not in exempt
-                        and (f, name) not in losses
+                        and not any(l[0] == f and l[1] == name for l in losses)
                     ):
-                        losses.append((f, name))
+                        # Name the commit the doc was last seen at. Saying
+                        # "at {base}" would be wrong for a file the branch
+                        # ADDED: it does not exist there, and a reader sent
+                        # to that revision finds nothing.
+                        losses.append((f, name, older))
     for f in changed:
         # A path can legitimately be absent on one side: the branch added the
         # file, or deleted it. That is the one git failure this tolerates -
@@ -180,10 +190,10 @@ def main():
         after = documented(git("show", f"{head}:{f}", allow_missing_path=True))
         for name, had_doc in before.items():
             if had_doc and name in after and not after[name] and (f, name) not in exempt:
-                losses.append((f, name))
-    for f, name in losses:
+                losses.append((f, name, base))
+    for f, name, at in losses:
         print(
-            f"::error file={f}::`{name}` had a doc comment at {base[:12]} and has none now. "
+            f"::error file={f}::`{name}` had a doc comment at {at[:12]} and has none now. "
             "A doc block above it was most likely captured by an item inserted between the two "
             "(#314), which hands one item's prose to another with nothing failing. Restore it, "
             "or declare the removal with `doc-removal: " + f"{f}::{name}` in a commit message."

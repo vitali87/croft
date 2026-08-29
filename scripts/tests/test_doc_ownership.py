@@ -107,6 +107,12 @@ class ItemKinds(unittest.TestCase):
             ("generic type alias", "/// doc\npub type A<T> = Vec<T>;\n"),
             ("const fn", "/// doc\npub const fn a() -> u8 { 1 }\n"),
             ("indented impl method", "impl X {\n    /// doc\n    pub fn a(&self) {}\n}\n"),
+            # Rust's qualifier order is default, const, async, unsafe, extern.
+            # Consuming `const` after the others made these match NOTHING, so
+            # the function was invisible rather than undocumented.
+            ("const unsafe fn", "/// doc\npub const unsafe fn a() {}\n"),
+            ("const extern fn", '/// doc\nconst unsafe extern "C" fn a() {}\n'),
+            ("every qualifier", "/// doc\npub default const async unsafe fn a() {}\n"),
         ]:
             state = gate.documented(text)
             self.assertTrue(
@@ -120,6 +126,75 @@ class ItemKinds(unittest.TestCase):
         not mistaken for one."""
         state = gate.documented('/// doc\nconst A: &str = "const B: u8 = 1;";\n')
         self.assertEqual(state, {"A": True}, "B is inside a string, not an item")
+
+    def test_same_named_items_are_merged_which_under_reports(self):
+        """A KNOWN limitation, pinned so it is a decision rather than a bug.
+
+        Two `fn new` in different impl blocks share one key, and "any
+        documented" wins, so a capture on one is invisible while the other
+        keeps its prose. The alternative is an occurrence-unique key, and
+        every candidate (position, index, enclosing type) has to line up
+        across two revisions that may have moved the item; a key that
+        mis-aligns turns a silent miss into a false accusation, which is
+        worse for a gate that blocks merges.
+
+        So the gate under-reports on duplicate names, deliberately. Tracked
+        for a proper fix; pinned here so a future change that alters this
+        behaviour has to look at this test and say which way it went.
+        """
+        both_documented = "/// a\nfn new() {}\n\n/// b\nfn new() {}\n"
+        one_captured = "/// a\nfn other() {}\nfn new() {}\n\n/// b\nfn new() {}\n"
+        self.assertEqual(gate.documented(both_documented), {"new": True})
+        self.assertEqual(
+            gate.documented(one_captured),
+            {"other": True, "new": True},
+            "the surviving doc on the second `new` keeps the key True, so the "
+            "capture on the first is not visible: under-reporting, not a "
+            "false alarm",
+        )
+
+    def test_the_error_names_the_revision_the_doc_was_last_seen_at(self):
+        """For a file the branch ADDED, `base` is the wrong revision to cite.
+
+        The file does not exist there, so a reader sent to it finds nothing.
+        The loss carries the commit it was last documented at.
+        """
+        import contextlib
+        import io
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("seed.rs", "fn seed() {}\n")
+            repo.branch("work")
+            repo.commit("new.rs", DOCUMENTED_CONST)
+            documented_at = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo.path,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            repo.commit("new.rs", CAPTURED_CONST)
+
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            out = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+
+            self.assertEqual(code, 1)
+            printed = out.getvalue()
+            self.assertIn(
+                documented_at[:12],
+                printed,
+                f"the error must name the commit the doc was last seen at, said: {printed}",
+            )
 
     def test_a_rename_is_not_a_lost_doc(self):
         """A documented item renamed within a branch must not read as a loss.
