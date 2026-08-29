@@ -292,18 +292,6 @@ fn semantic_color(theme: &RawTheme, want: &str, over: Rgb) -> Option<Rgb> {
 /// colours it by TextMate scope. The roles do not correspond one-to-one, so
 /// each croft role names the scopes a theme author would have coloured for
 /// the same thing, and the first one the theme actually defines wins.
-/// Semantic token types that fill each croft role when `tokenColors` did
-/// not. Same order as [`SYNTAX_SCOPES`].
-const SYNTAX_SEMANTIC: &[(&str, &[&str])] = &[
-    ("syn_comment", &["comment"]),
-    ("syn_keyword", &["keyword", "modifier"]),
-    ("syn_string", &["string"]),
-    ("syn_constant", &["number", "parameter", "enumMember"]),
-    ("syn_function", &["function", "method"]),
-    ("syn_type", &["type", "class", "struct", "interface"]),
-    ("syn_tag", &["property", "decorator", "macro"]),
-];
-
 const SYNTAX_SCOPES: &[(&str, &[&str])] = &[
     (
         "syn_comment",
@@ -348,6 +336,18 @@ const SYNTAX_SCOPES: &[(&str, &[&str])] = &[
             "support.type.property-name",
         ],
     ),
+];
+
+/// Semantic token types that fill each croft role when `tokenColors` did
+/// not. Same order as [`SYNTAX_SCOPES`].
+const SYNTAX_SEMANTIC: &[(&str, &[&str])] = &[
+    ("syn_comment", &["comment"]),
+    ("syn_keyword", &["keyword", "modifier"]),
+    ("syn_string", &["string"]),
+    ("syn_constant", &["number", "parameter", "enumMember"]),
+    ("syn_function", &["function", "method"]),
+    ("syn_type", &["type", "class", "struct", "interface"]),
+    ("syn_tag", &["property", "decorator", "macro"]),
 ];
 
 /// The colour a theme gives `scope`, by TextMate's specificity rule: the
@@ -476,12 +476,32 @@ fn slug(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// The header every generated manifest carries, used to recognise our own
+/// output when deciding whether an id is really taken.
+const GENERATED_HEADER: &str = "# Imported from a VS Code colour theme by `croft theme-import`.";
+
 /// Ids already in use, so an import cannot shadow a theme croft ships.
+///
+/// A theme THIS importer wrote is not "in use" for the purposes of a
+/// collision: re-importing an updated upstream theme must overwrite its own
+/// manifest, as the generated header promises. Counting it minted
+/// `one-dark-pro-2`, then `-3`, and grew the picker by an entry per run.
 fn existing_ids() -> Vec<String> {
     crate::theme::Theme::all()
         .iter()
         .map(|t| t.id().to_string())
+        .filter(|id| !was_generated_by_import(id))
         .collect()
+}
+
+/// Whether `id`'s manifest is one this importer wrote.
+fn was_generated_by_import(id: &str) -> bool {
+    let path = crate::lsp::manifest::user_extensions_dir()
+        .join(format!("theme-{id}"))
+        .join("extension.toml");
+    std::fs::read_to_string(path)
+        .map(|text| text.starts_with(GENERATED_HEADER))
+        .unwrap_or(false)
 }
 
 /// `wanted`, or `wanted-2`, `wanted-3`, ... until it is free.
@@ -491,7 +511,7 @@ fn unique_id(wanted: String, taken: &[String]) -> String {
     }
     for n in 2..1000 {
         let candidate = format!("{wanted}-{n}");
-        if !taken.iter().any(|t| *t == candidate) {
+        if !taken.contains(&candidate) {
             return candidate;
         }
     }
@@ -634,7 +654,16 @@ fn convert_with_ids(
                 .find(|(r, _)| r == role)
                 .and_then(|(_, types)| types.iter().find_map(|t| semantic_color(&theme, t, bg)))
         };
-        match from_scopes.or_else(from_semantic) {
+        match from_scopes.or_else(|| {
+            let c = from_semantic();
+            if c.is_some() {
+                notes.push(format!(
+                    "{} came from semanticTokenColors: the theme sets no TextMate scope for it, so it may differ from VS Code where semantic highlighting is off",
+                    role.trim_start_matches("syn_")
+                ));
+            }
+            c
+        }) {
             Some(c) => syntax.push(((*role).to_string(), hex_of(c))),
             None => notes.push(format!(
                 "no colour for {}: croft's Base16 default is kept",
@@ -670,7 +699,8 @@ fn convert_with_ids(
     }
 
     let mut m = String::new();
-    m.push_str("# Imported from a VS Code colour theme by `croft theme-import`.\n");
+    m.push_str(GENERATED_HEADER);
+    m.push('\n');
     m.push_str(
         "# Regenerate rather than hand-editing: re-running the import overwrites this file.\n",
     );
@@ -746,13 +776,33 @@ fn toml_escape(s: &str) -> String {
 
 /// Write a converted theme into the user extensions directory, returning the
 /// manifest path.
-pub fn install(converted: &Converted) -> Result<std::path::PathBuf> {
-    let dir = crate::lsp::manifest::user_extensions_dir().join(format!("theme-{}", converted.id));
+pub fn install(converted: &Converted) -> Result<Installed> {
+    install_into(&crate::lsp::manifest::user_extensions_dir(), converted)
+}
+
+/// [`install`] into an explicit extensions directory.
+///
+/// Split out so a test can write somewhere real without touching
+/// `XDG_CONFIG_HOME`: the test binary runs its tests on threads of ONE
+/// process, so an env var set by a test is set for every other test running
+/// beside it, and the failure lands somewhere unrelated.
+pub fn install_into(extensions_dir: &Path, converted: &Converted) -> Result<Installed> {
+    let dir = extensions_dir.join(format!("theme-{}", converted.id));
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join("extension.toml");
+    // Re-importing is how an upstream change is picked up, so this
+    // overwrites, but it must SAY so: a user who did not realise a manifest
+    // was already there cannot otherwise tell an update from a clobbering.
+    let replaced = path.is_file();
     std::fs::write(&path, &converted.manifest)
         .with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    Ok(Installed { path, replaced })
+}
+
+/// Where a converted theme landed, and whether it replaced one already there.
+pub struct Installed {
+    pub path: std::path::PathBuf,
+    pub replaced: bool,
 }
 
 #[cfg(test)]
@@ -1218,6 +1268,95 @@ mod tests {
         let converted = convert_str(src);
         crate::lsp::manifest::parse(&converted.manifest)
             .expect("a control character must not produce an unparseable manifest");
+    }
+
+    /// Re-importing an updated upstream theme must OVERWRITE its own
+    /// manifest, which is what the generated header promises. Counting a
+    /// previously imported theme as a collision minted `-2`, then `-3`, and
+    /// grew the picker by an entry per run.
+    #[test]
+    fn a_reimport_reuses_its_own_id_rather_than_minting_a_new_one() {
+        let manifest = convert_str(dark_fixture()).manifest;
+        assert!(
+            manifest.starts_with(GENERATED_HEADER),
+            "the header is what marks a manifest as ours: {manifest:.80}"
+        );
+
+        // A bundled id IS a collision; one of our own manifests is not.
+        let raw = parse_theme(dark_fixture()).unwrap();
+        let taken = vec![String::from("fixture-dark")];
+        let collided = convert_with_ids(raw, None, "fixture", &taken).unwrap();
+        assert_eq!(collided.id, "fixture-dark-2");
+
+        let raw = parse_theme(dark_fixture()).unwrap();
+        let fresh = convert_with_ids(raw, None, "fixture", &[]).unwrap();
+        assert_eq!(
+            fresh.id, "fixture-dark",
+            "with the id free, the import keeps its natural name"
+        );
+    }
+
+    /// `install` writes where the id says and reports whether it replaced a
+    /// manifest, so a re-import is distinguishable from a first import.
+    ///
+    /// Goes through `install_into` rather than setting `XDG_CONFIG_HOME`:
+    /// tests share one process, so an env var set here would apply to every
+    /// test running alongside it. An earlier version of this test did that
+    /// and took an unrelated navigator test down with it.
+    #[test]
+    fn install_writes_the_manifest_and_reports_a_replacement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let converted = convert_str(dark_fixture());
+
+        let first = install_into(dir.path(), &converted).expect("first install");
+        assert!(first.path.is_file());
+        assert!(!first.replaced, "nothing was there the first time");
+        assert!(
+            std::fs::read_to_string(&first.path)
+                .unwrap()
+                .starts_with(GENERATED_HEADER)
+        );
+
+        let second = install_into(dir.path(), &converted).expect("re-install");
+        assert_eq!(
+            second.path, first.path,
+            "the same id lands in the same file"
+        );
+        assert!(second.replaced, "the second run must say it overwrote");
+    }
+
+    /// A role filled from `semanticTokenColors` is REPORTED, because such a
+    /// theme renders differently in an editor with semantic highlighting off,
+    /// and the user should know which colours came from that path.
+    #[test]
+    fn a_role_filled_from_semantic_tokens_is_reported() {
+        let src = r##"{
+            "type": "dark",
+            "colors": { "editor.background": "#000000" },
+            "semanticTokenColors": { "function": "#aabbcc" }
+        }"##;
+        let converted = convert_str(src);
+        assert!(
+            converted
+                .notes
+                .iter()
+                .any(|n| n.contains("semanticTokenColors") && n.contains("function")),
+            "the note must name the role: {:?}",
+            converted.notes
+        );
+    }
+
+    /// A const inserted between another const and its doc comment silently
+    /// takes that documentation, and the CI gate only inspects functions, so
+    /// nothing else would catch it. This pins the two tables apart.
+    #[test]
+    fn the_scope_and_semantic_tables_cover_the_same_roles() {
+        let scope_roles: Vec<&str> = SYNTAX_SCOPES.iter().map(|(r, _)| *r).collect();
+        let semantic_roles: Vec<&str> = SYNTAX_SEMANTIC.iter().map(|(r, _)| *r).collect();
+        assert_eq!(
+            scope_roles, semantic_roles,
+            "the two tables are read together by role and must stay aligned"
+        );
     }
 
     /// Theme names carry characters TOML would otherwise take as syntax.

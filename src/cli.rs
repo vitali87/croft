@@ -286,7 +286,8 @@ pub enum CliCommand {
     ///
     /// Reads a theme file you already have (from a cloned theme repo, or an
     /// installed VS Code extension's `themes/` directory), converts its
-    /// workbench colours, terminal palette and TextMate token colours into a
+    /// workbench colours, terminal palette, TextMate token colours and
+    /// `semanticTokenColors` (as a fallback where a scope is missing) into a
     /// croft `[[themes]]` manifest, and installs it under
     /// `~/.config/croft/extensions/`. No extension code is downloaded or run.
     /// The theme appears in the picker on croft's next launch.
@@ -1062,12 +1063,20 @@ fn theme_import(file: &Path, id: Option<&str>, dry_run: bool) -> Result<()> {
         print!("{}", converted.manifest);
         return Ok(());
     }
-    let path = crate::vscode_theme::install(&converted)?;
+    let installed = crate::vscode_theme::install(&converted)?;
     println!(
         "Imported \"{}\" as theme id {}",
         converted.label, converted.id
     );
-    println!("  {}", path.display());
+    println!(
+        "  {}{}",
+        installed.path.display(),
+        if installed.replaced {
+            " (replaced the manifest already there)"
+        } else {
+            ""
+        }
+    );
     if !converted.notes.is_empty() {
         println!(
             "\n{} colour{} croft needs were not in the theme and were derived:",
