@@ -2733,10 +2733,12 @@ mod tests {
         harness.wait_until("the ask turn's caret", |h| {
             h.carets().iter().any(|(n, r, _)| n == "asker" && *r == 1)
         });
-        assert!(
-            !asker.caret_sites().is_empty(),
-            "the seat exposes its per-file site ids (its wire identity)"
-        );
+        // The caret reaching the owner and the seat recording its site id
+        // are two arrivals, not one: the assertion must wait for the state
+        // it checks, not for a neighbour that usually lands first (#338).
+        harness.wait_until("the seat's per-file site ids (its wire identity)", |_| {
+            !asker.caret_sites().is_empty()
+        });
 
         let mut cmd = Command::new("cat");
         cmd.stdin(Stdio::piped());

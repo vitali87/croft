@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "A navigator host lock croft cannot create or open (a missing or read-only config directory, an fd limit) is now reported as exactly that, with the path and the error, instead of as \"hosted by another croft window\" when no other window exists.",
+    summary: "No user-facing change: a load-sensitive navigator test now waits for the state it asserts (the seat's per-file site ids) rather than for the caret that usually lands just before it.",
 }];
