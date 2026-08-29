@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "No user-facing change: a load-sensitive navigator test now waits for the state it asserts (the seat's per-file site ids) rather than for the caret that usually lands just before it.",
+    kind: NoteKind::Feature,
+    summary: "croft now tells you when a newer release is out: a small popup bottom-left offers Update or Later. Update builds the new version in the background without touching the croft on your PATH; when it is ready the popup offers Relaunch, and only that (or F9) switches you over. Later hides that version for good. Set CROFT_NO_UPDATE_CHECK to opt out.",
 }];

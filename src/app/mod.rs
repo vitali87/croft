@@ -848,6 +848,37 @@ enum PairLockDenial {
     Io,
 }
 
+/// The bottom-left "a newer croft is available" popup (#333). Click-only
+/// like the port toast: it never takes a keystroke from the editor or a
+/// terminal. `ready` flips it from Update/Later to Relaunch once the staged
+/// build has landed.
+struct UpdateToast {
+    version: String,
+    ready: bool,
+    /// Action button hit rects, recomputed each render.
+    buttons: Vec<(Rect, UpdateToastAction)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpdateToastAction {
+    /// Stage the new version in the background; nothing on PATH changes.
+    Update,
+    /// Dismiss, and never offer this version again.
+    Later,
+    /// Swap the staged binary in and re-exec - the only path that updates.
+    Relaunch,
+}
+
+/// Which producer an [`crate::update_watch::UpdateEvent`] came from: the
+/// remote install watcher, the drift rebuild, or the staged release build
+/// (#333). They share one event type and one status-bar state machine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpdateSource {
+    Watch,
+    SelfInstall,
+    Staged,
+}
+
 /// State of a background self-update observed by a remote-launched croft.
 /// `Idle` is the steady state; `InProgress` paints an "Updating" hint in
 /// the status bar; `Ready` arms the re-exec into the freshly-shipped binary.
@@ -2963,6 +2994,23 @@ pub struct App {
     /// croft after the user pressed F9 on a drift hint. Reported through
     /// the same UpdateEvent lifecycle as the remote watcher.
     self_install: Option<crate::update_watch::SelfInstall>,
+    /// One-shot startup check (#333): is a newer release published than
+    /// the version this binary carries? Local-only, throttled to a daily
+    /// network request by its cache file. Dropped once its verdict lands.
+    update_check: Option<crate::update_check::UpdateCheck>,
+    /// The "vX available" popup, present from the offer landing until the
+    /// user picks Update, Later, or (once staged) Relaunch.
+    update_toast: Option<UpdateToast>,
+    /// A background `cargo install --root <cache>/staged` of the offered
+    /// release. Reported through the same UpdateEvent lifecycle as the
+    /// remote watcher; the binary on PATH is untouched until Relaunch.
+    staged_install: Option<crate::update_check::StagedInstall>,
+    /// The staged release build's own lifecycle (#333). `update_status`
+    /// belongs to the remote watcher and the drift rebuild; the two cells
+    /// are never written by the other's producer, so a rebuild starting or
+    /// failing after the release landed cannot disarm Relaunch, and the
+    /// reverse. Readers that mean "any update" consult both.
+    staged_status: UpdateStatus,
     update_status: UpdateStatus,
     /// When a background self-update is in progress, the instant it started.
     /// Drives the spinning update glyph in the status bar (and the redraw
@@ -4206,6 +4254,10 @@ impl App {
             drift_probe: None,
             local_drift: None,
             self_install: None,
+            update_check: None,
+            update_toast: None,
+            staged_install: None,
+            staged_status: UpdateStatus::Idle,
             update_status: UpdateStatus::Idle,
             update_spinner_start: None,
             pending_reexec: false,
@@ -14485,7 +14537,7 @@ impl App {
         if let Some(span) = self.perf.status_span() {
             spans.push(span);
         }
-        if self.update_status == UpdateStatus::Ready {
+        if self.any_update_ready() {
             spans.push(Span::styled(
                 " ⟳ Update ready - F9 to relaunch ",
                 Style::default()
@@ -14497,6 +14549,10 @@ impl App {
         if let Some(current) = self.local_drift.as_ref()
             && self.update_status == UpdateStatus::Idle
             && self.self_install.is_none()
+            // The same latch as `f9_update_armed`: while the staged release
+            // builds, F9 is not a rebuild, so the hint must not say so.
+            && self.staged_status != UpdateStatus::InProgress
+            && self.staged_install.is_none()
         {
             // Amber, persistent: the binary predates its own source tree
             // (#242). One keypress rebuilds it in the background.
@@ -14511,7 +14567,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        if self.update_status == UpdateStatus::InProgress {
+        if self.any_update_in_progress() {
             // Red + a spinning circular-arrow glyph to draw the eye to the
             // in-progress background update.
             spans.push(Span::styled(
@@ -14864,6 +14920,7 @@ impl App {
             }
         }
         self.render_port_toast(frame);
+        self.render_update_toast(frame);
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);
         self.render_prompt(frame);
@@ -15823,6 +15880,121 @@ impl App {
         }
     }
 
+    /// Paint the update-available popup in the bottom-LEFT corner (the
+    /// port toast owns the right) and record its button rects. Click-only,
+    /// like the port toast: it never captures keystrokes (#333).
+    fn render_update_toast(&mut self, frame: &mut ratatui::Frame) {
+        let Some(toast) = self.update_toast.as_ref() else {
+            return;
+        };
+        let version = toast.version.clone();
+        let ready = toast.ready;
+        let staging = self.staged_status == UpdateStatus::InProgress && !ready;
+        let accent = self.theme.accent();
+        let btn_bg = self.theme.button();
+        let actions: Vec<(String, UpdateToastAction)> = if ready {
+            vec![(" Relaunch ".to_string(), UpdateToastAction::Relaunch)]
+        } else if staging {
+            Vec::new()
+        } else {
+            vec![
+                (" Update ".to_string(), UpdateToastAction::Update),
+                (" Later ".to_string(), UpdateToastAction::Later),
+            ]
+        };
+        let title_line = if ready {
+            format!("\u{27f3} croft v{version} is ready - relaunch to update")
+        } else if staging {
+            format!(
+                "{} building croft v{version} in the background",
+                self.update_spinner_glyph()
+            )
+        } else {
+            format!(
+                "\u{27f3} croft v{version} is available (you have v{})",
+                env!("CARGO_PKG_VERSION")
+            )
+        };
+        let buttons_w: u16 = actions
+            .iter()
+            .map(|(l, _)| l.chars().count() as u16 + 1)
+            .sum::<u16>()
+            + 1;
+        let inner_w = buttons_w.max(title_line.chars().count() as u16);
+        let area = frame.area();
+        let width = (inner_w + 4).min(area.width.saturating_sub(2));
+        let height: u16 = 4;
+        let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
+        // The port toast owns the bottom-right band; at ordinary widths
+        // this popup's title reaches into it, so stack above it instead.
+        let stack: u16 = if self.port_toast.is_some() { height } else { 0 };
+        if area.width < width + 2 || area.height < height + status_h + 1 + stack {
+            return;
+        }
+        let rect = Rect {
+            x: area.x + 1,
+            y: area.y + area.height - height - status_h - 1 - stack,
+            width,
+            height,
+        };
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(accent))
+            .style(Style::default().bg(self.theme.editor_bg()))
+            .title(ratatui::text::Span::styled(
+                " UPDATE ",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let buf = frame.buffer_mut();
+        buf.set_stringn(
+            inner.x,
+            inner.y,
+            &title_line,
+            inner.width as usize,
+            Style::default().fg(self.theme.ui(Color::Rgb(0xCC, 0xCC, 0xCC))),
+        );
+        let mut bx = inner.x;
+        let by = inner.y + 1;
+        let mut rects: Vec<(Rect, UpdateToastAction)> = Vec::new();
+        for (label, action) in &actions {
+            let w = label.chars().count() as u16;
+            if bx + w > inner.x + inner.width {
+                break;
+            }
+            buf.set_stringn(
+                bx,
+                by,
+                label,
+                w as usize,
+                Style::default()
+                    .fg(Color::White)
+                    .bg(btn_bg)
+                    .add_modifier(Modifier::BOLD),
+            );
+            rects.push((
+                Rect {
+                    x: bx,
+                    y: by,
+                    width: w,
+                    height: 1,
+                },
+                *action,
+            ));
+            bx += w + 1;
+        }
+        if let Some(t) = self.update_toast.as_mut() {
+            t.buttons = rects;
+        }
+    }
+
     fn render_prompt(&self, frame: &mut ratatui::Frame) {
         let Some(p) = &self.prompt else { return };
         let area = frame.area();
@@ -16647,8 +16819,11 @@ impl App {
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 // Alt+F9: toggle break-on-raised-exceptions.
                 self.debug_toggle_raised_exceptions();
-            } else if self.update_status == UpdateStatus::Ready {
-                // A background update has landed: bare F9 re-execs into it.
+            } else if self.any_update_ready() {
+                // A background update has landed (a staged release, the
+                // drift rebuild, or a remote install): bare F9 re-execs
+                // into it. `run()` swaps the staged binary in first when
+                // that is the one that landed.
                 self.pending_reexec = true;
                 self.quit = true;
             } else if self.f9_update_armed() && self.update_status == UpdateStatus::Idle {
@@ -22857,6 +23032,79 @@ impl App {
         ));
     }
 
+    /// Start the release-availability check (#333) on a locally-launched
+    /// croft. A remote-launched croft is shipped by its launcher; a build
+    /// with `CROFT_NO_UPDATE_CHECK` set in the environment never asks.
+    fn start_update_check_if_local(&mut self) {
+        if std::env::var_os("CROFT_REMOTE_AUTOUPDATE").is_some()
+            || std::env::var_os("CROFT_NO_UPDATE_CHECK").is_some()
+        {
+            return;
+        }
+        self.update_check = Some(crate::update_check::UpdateCheck::start(
+            croft_cache_dir(),
+            String::from(env!("CARGO_PKG_VERSION")),
+        ));
+    }
+
+    /// Raise the popup when the check finds a newer, undismissed release.
+    /// The check is dropped either way - it only ever answers once.
+    fn poll_update_check(&mut self) -> bool {
+        let Some(check) = self.update_check.as_ref() else {
+            return false;
+        };
+        let Some(verdict) = check.take() else {
+            return false;
+        };
+        self.update_check = None;
+        let Some(version) = verdict else {
+            return false;
+        };
+        self.update_toast = Some(UpdateToast {
+            version,
+            ready: false,
+            buttons: Vec::new(),
+        });
+        true
+    }
+
+    /// Kick off the staged build the popup offered. The existing update
+    /// state machine takes it from here: spinner while cargo runs, then
+    /// the popup and the status bar both offer Relaunch.
+    fn start_staged_update(&mut self, version: String) {
+        self.staged_status = UpdateStatus::Idle;
+        self.staged_install = Some(crate::update_check::StagedInstall::start(
+            croft_cache_dir(),
+            version,
+            staged_install_log_path(),
+        ));
+    }
+
+    /// Decline the offered version for good (until a newer one appears).
+    fn dismiss_update_offer(&mut self, version: &str) {
+        if let Err(e) = crate::update_check::dismiss(&croft_cache_dir(), version) {
+            self.status = format!("Could not remember the dismissed update: {e}");
+        }
+    }
+
+    /// The staged binary waiting to be swapped in, once its build landed.
+    fn staged_update_binary(&self) -> Option<PathBuf> {
+        let install = self.staged_install.as_ref()?;
+        (self.staged_status == UpdateStatus::Ready).then(|| install.binary().to_path_buf())
+    }
+
+    /// Whether any producer has an update ready to re-exec into: the
+    /// status-bar pill and bare F9 mean "any".
+    fn any_update_ready(&self) -> bool {
+        self.update_status == UpdateStatus::Ready || self.staged_status == UpdateStatus::Ready
+    }
+
+    /// Whether any producer is mid-build (drives the spinner).
+    fn any_update_in_progress(&self) -> bool {
+        self.update_status == UpdateStatus::InProgress
+            || self.staged_status == UpdateStatus::InProgress
+    }
+
     /// Arm the rebuild hint when the drift probe's verdict lands. The probe
     /// is dropped either way — it only ever answers once.
     fn poll_drift_probe(&mut self) -> bool {
@@ -22892,58 +23140,138 @@ impl App {
     /// True when bare F9 is claimed by the update flow: either a landed
     /// update waiting to re-exec, or an armed drift hint waiting to rebuild.
     fn f9_update_armed(&self) -> bool {
-        self.update_status == UpdateStatus::Ready
+        self.any_update_ready()
             || (self.local_drift.is_some()
                 && self.update_status == UpdateStatus::Idle
+                && self.staged_status != UpdateStatus::InProgress
                 // `update_status` only leaves Idle when the InProgress event
                 // is drained - once per outer loop, BEFORE the input drain -
                 // so without this latch two F9s in one crossterm batch spawn
                 // two concurrent `cargo install`s racing cargo's locks
-                // (#245).
-                && self.self_install.is_none())
+                // (#245). The staged release build holds the same cargo
+                // lock, so it latches F9 the same way.
+                && self.self_install.is_none()
+                && self.staged_install.is_none())
     }
 
     pub fn poll_update_watch(&mut self) -> bool {
         let mut changed = self.poll_drift_probe();
-        let mut events: Vec<crate::update_watch::UpdateEvent> = Vec::new();
+        changed |= self.poll_update_check();
+        // Three producers share one event vocabulary; each event keeps its
+        // origin so a drift rebuild's failure is never charged to the
+        // staged release build (or the reverse).
+        let mut events: Vec<(UpdateSource, crate::update_watch::UpdateEvent)> = Vec::new();
         if let Some(watch) = self.update_watch.as_ref() {
-            events.extend(watch.drain());
+            events.extend(watch.drain().into_iter().map(|e| (UpdateSource::Watch, e)));
         }
         if let Some(install) = self.self_install.as_ref() {
-            events.extend(install.drain());
+            events.extend(
+                install
+                    .drain()
+                    .into_iter()
+                    .map(|e| (UpdateSource::SelfInstall, e)),
+            );
         }
-        for ev in events {
+        if let Some(staged) = self.staged_install.as_ref() {
+            events.extend(
+                staged
+                    .drain()
+                    .into_iter()
+                    .map(|e| (UpdateSource::Staged, e)),
+            );
+        }
+        for (source, ev) in events {
             changed = true;
+            // Each producer writes ITS cell; the other cell is never
+            // touched, so nothing one build does can strand the other's
+            // landed binary (there is exactly one Ready per channel).
+            let staged = source == UpdateSource::Staged;
             match ev {
                 crate::update_watch::UpdateEvent::InProgress => {
-                    self.update_status = UpdateStatus::InProgress;
+                    if staged {
+                        self.staged_status = UpdateStatus::InProgress;
+                    } else {
+                        self.update_status = UpdateStatus::InProgress;
+                    }
                     // The dedicated red, spinning status-bar span renders the
                     // message now, so the generic status line stays clear.
                     self.update_spinner_start = Some(std::time::Instant::now());
                     self.status.clear();
                 }
                 crate::update_watch::UpdateEvent::Failed => {
-                    self.update_status = UpdateStatus::Idle;
-                    self.update_spinner_start = None;
-                    self.status = if self.self_install.take().is_some() {
-                        format!(
-                            "croft rebuild failed - see {} (still on the old binary)",
-                            self_install_log_path().display()
-                        )
+                    if staged {
+                        self.staged_status = UpdateStatus::Idle;
                     } else {
-                        String::from("Background croft update failed; staying on current version")
+                        self.update_status = UpdateStatus::Idle;
+                    }
+                    if !self.any_update_in_progress() {
+                        self.update_spinner_start = None;
+                    }
+                    self.status = match source {
+                        UpdateSource::Staged => {
+                            let version = self
+                                .staged_install
+                                .take()
+                                .map(|s| s.version)
+                                .unwrap_or_default();
+                            // The offer stays declinable: the popup comes
+                            // back so a retry or Later is one click away -
+                            // unless the user already said Later to this
+                            // version in an earlier session.
+                            let dismissed =
+                                crate::update_check::CheckCache::load(&croft_cache_dir())
+                                    .dismissed
+                                    .as_deref()
+                                    == Some(version.as_str());
+                            if !dismissed {
+                                self.update_toast = Some(UpdateToast {
+                                    version: version.clone(),
+                                    ready: false,
+                                    buttons: Vec::new(),
+                                });
+                            }
+                            format!(
+                                "croft {version} could not be built - see {} (still on v{})",
+                                staged_install_log_path().display(),
+                                env!("CARGO_PKG_VERSION")
+                            )
+                        }
+                        UpdateSource::SelfInstall => {
+                            self.self_install = None;
+                            format!(
+                                "croft rebuild failed - see {} (still on the old binary)",
+                                self_install_log_path().display()
+                            )
+                        }
+                        UpdateSource::Watch => String::from(
+                            "Background croft update failed; staying on current version",
+                        ),
                     };
                 }
                 crate::update_watch::UpdateEvent::Ready => {
-                    self.update_spinner_start = None;
+                    if staged {
+                        self.staged_status = UpdateStatus::Ready;
+                    } else {
+                        self.update_status = UpdateStatus::Ready;
+                    }
+                    if !self.any_update_in_progress() {
+                        self.update_spinner_start = None;
+                    }
                     // Do NOT yank the user mid-work: surface a persistent
                     // "Update ready - F9 to relaunch" prompt in the status
                     // bar and let them pick the moment. The re-exec only
-                    // fires when they press F9 (handle_key).
-                    self.update_status = UpdateStatus::Ready;
+                    // fires when they press F9 (handle_key) or click
+                    // Relaunch on the popup (#333).
                     self.status = String::from(
                         "Update ready - press F9 to relaunch croft (terminals will reset)",
                     );
+                    if staged && let Some(install) = self.staged_install.as_ref() {
+                        self.update_toast = Some(UpdateToast {
+                            version: install.version.clone(),
+                            ready: true,
+                            buttons: Vec::new(),
+                        });
+                    }
                 }
             }
         }
@@ -26497,6 +26825,45 @@ impl App {
             }
         }
         changed
+    }
+
+    /// A click on one of the update popup's buttons (#333). Update stages
+    /// the build and leaves the popup up as a progress line; Later and
+    /// Relaunch both take it down. A click elsewhere returns false.
+    fn handle_update_toast_click(&mut self, x: u16, y: u16) -> bool {
+        let Some(toast) = self.update_toast.as_ref() else {
+            return false;
+        };
+        let Some(action) = toast
+            .buttons
+            .iter()
+            .find(|(r, _)| rect_contains(*r, x, y))
+            .map(|(_, a)| *a)
+        else {
+            return false;
+        };
+        let version = toast.version.clone();
+        match action {
+            UpdateToastAction::Update => {
+                if self.staged_install.is_none() && self.self_install.is_none() {
+                    self.start_staged_update(version);
+                }
+            }
+            UpdateToastAction::Later => {
+                self.update_toast = None;
+                self.dismiss_update_offer(&version);
+            }
+            UpdateToastAction::Relaunch => {
+                self.update_toast = None;
+                // The popup describes the staged release: only ITS
+                // readiness may fire it, never a drift rebuild's.
+                if self.staged_update_binary().is_some() {
+                    self.pending_reexec = true;
+                    self.quit = true;
+                }
+            }
+        }
+        true
     }
 
     fn show_port_toast(&mut self, port: u16, process: Option<String>) {
@@ -30902,7 +31269,8 @@ impl App {
         // before anything else; clicks elsewhere fall through to normal
         // handling, so the toast never blocks the rest of the UI.
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
-            && self.handle_port_toast_click(m.column, m.row)
+            && (self.handle_port_toast_click(m.column, m.row)
+                || self.handle_update_toast_click(m.column, m.row))
         {
             return;
         }
@@ -40510,6 +40878,12 @@ fn self_install_log_path() -> PathBuf {
     croft_cache_dir().join(format!("self-install-{}.log", std::process::id()))
 }
 
+/// The staged release build's log (#333): its own file, since a drift
+/// rebuild may run in the same process and must not overwrite it.
+fn staged_install_log_path() -> PathBuf {
+    croft_cache_dir().join(format!("staged-install-{}.log", std::process::id()))
+}
+
 /// Resolve the binary to re-exec into after an update. A local self-install
 /// re-execs the exact path cargo reported writing (which honors an
 /// `install.root` from cargo config that env resolution can't see), falling
@@ -41148,6 +41522,7 @@ pub fn run(
     }
     app.start_update_watch_if_remote();
     app.start_drift_probe_if_local();
+    app.start_update_check_if_local();
 
     enable_raw_mode().context("enable raw mode")?;
     // Sixel has no env var, so when neither iTerm2 nor Kitty was detected from
@@ -41287,7 +41662,23 @@ pub fn run(
         let session_path = crate::session_state::handoff_path();
         let _ = state.save(&session_path);
         use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new(reexec_binary_path(app.self_install.as_ref()));
+        // A staged release (#333) is swapped over the installed binary
+        // only now, on the user's Relaunch: until this line PATH still
+        // held the old version.
+        let target = reexec_binary_path(app.self_install.as_ref());
+        if let Some(staged) = app.staged_update_binary()
+            && let Err(err) = crate::update_check::apply_staged(&staged, &target)
+        {
+            // The installed binary is untouched (copy-beside + rename), so
+            // relaunching it is still right: the editor must never simply
+            // exit because an update could not be applied.
+            eprintln!(
+                "croft update failed: could not replace {} with {}: {err} - relaunching the current version",
+                target.display(),
+                staged.display()
+            );
+        }
+        let mut cmd = std::process::Command::new(target);
         cmd.arg(app.workspace_root())
             .arg("--restore-session")
             .arg(&session_path);
