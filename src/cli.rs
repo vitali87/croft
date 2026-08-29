@@ -135,8 +135,9 @@ pub enum CliCommand {
     Ls,
     /// Chart numbers, CSV/TSV, or JSON lines from stdin inline in the pane:
     /// `seq 1 100 | awk '{print sin($1/10)}' | croft plot`. Draws an image on
-    /// iTerm2 / Kitty terminals and a braille or block chart anywhere else. Headers are detected; `--x` names the label column, `--y` the
-    /// series (repeatable).
+    /// iTerm2 / Kitty terminals and a braille or block chart anywhere else.
+    /// Headers are detected; `--x` names the label column, `--y` the series
+    /// (repeatable).
     Plot {
         /// Chart shape: line, bar, spark (one row), or hist (histogram of
         /// the first series).

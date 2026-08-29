@@ -135,7 +135,7 @@ fn strip_thousands(t: &str) -> Option<String> {
     };
     let (sign, body) = match t.strip_prefix('-') {
         Some(b) => ("-", b),
-        None => ("", t),
+        None => ("", t.strip_prefix('+').unwrap_or(t)),
     };
     let (int, frac) = match body.find('.') {
         Some(i) => (&body[..i], Some(&body[i..])),
@@ -143,7 +143,15 @@ fn strip_thousands(t: &str) -> Option<String> {
     };
     let mut groups = int.split(sep);
     let first = groups.next()?;
+    // The leading group is 1-3 digits with no leading zero: "0,100" is a
+    // decimal comma or two fields, never one hundred.
     if first.is_empty() || first.len() > 3 || !first.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut groups = groups.peekable();
+    // A leading zero before a separator ("0,100", "01,000") is never a
+    // thousands grouping.
+    if first.starts_with('0') && groups.peek().is_some() {
         return None;
     }
     let mut out = format!("{sign}{first}");
@@ -162,8 +170,8 @@ fn strip_thousands(t: &str) -> Option<String> {
     Some(out)
 }
 
-/// Which separator the first data line uses: tabs beat commas beat runs of
-/// whitespace, so a CSV with spaces inside quoted fields still splits right.
+/// One line's fields under `delim`; a comma-separated line honours quoted
+/// fields, so a CSV with spaces or commas inside quotes still splits right.
 fn split_line(line: &str, delim: Delim) -> Vec<String> {
     match delim {
         Delim::Tab => line.split('\t').map(|s| s.trim().to_string()).collect(),
@@ -194,18 +202,25 @@ enum Delim {
     Space,
 }
 
-/// The delimiter, from the first few lines rather than the first alone: a
-/// CSV whose first row happens to be one column must not be read as
-/// whitespace-separated, which would fold `1,2` into one field.
+/// The delimiter, chosen over the first few lines rather than the first
+/// alone: the one that splits the most sampled lines into several fields
+/// (tabs, then commas, then runs of whitespace), the first line breaking
+/// ties. A CSV whose first row is one column still reads as a CSV; a
+/// whitespace file with one stray comma stays whitespace-separated.
 fn detect_delim(lines: &[&str]) -> Delim {
-    let sample: Vec<&&str> = lines.iter().take(8).collect();
-    if sample.iter().any(|l| l.contains('\t')) {
-        Delim::Tab
-    } else if sample.iter().filter(|l| l.contains(',')).count() * 2 >= sample.len() {
-        Delim::Comma
-    } else {
-        Delim::Space
+    let sample: Vec<&str> = lines.iter().take(8).copied().collect();
+    let splits = |d: Delim| sample.iter().filter(|l| split_line(l, d).len() > 1).count();
+    let first_splits = |d: Delim| sample.first().is_some_and(|l| split_line(l, d).len() > 1);
+    let mut best = Delim::Space;
+    let mut best_score = (0usize, false);
+    for d in [Delim::Tab, Delim::Comma, Delim::Space] {
+        let score = (splits(d), first_splits(d));
+        if score > best_score {
+            best = d;
+            best_score = score;
+        }
     }
+    best
 }
 
 /// Parse stdin's text into a dataset. `x` names (or 0-based indexes) the
@@ -588,10 +603,12 @@ pub fn svg(
                     }
                     let x = left + group_w * i as f64 + group_w * 0.1 + bar_w * si as f64;
                     let y = y_of(*v);
+                    // An exact zero still draws one pixel, as the text
+                    // chart's zero bar keeps one unit.
                     let (y0, hh) = if y < zero {
-                        (y, zero - y)
+                        (y, (zero - y).max(1.0))
                     } else {
-                        (zero, y - zero)
+                        ((zero - 1.0).max(y0_floor(zero, y)), (y - zero).max(1.0))
                     };
                     let _ = write!(
                         out,
@@ -622,6 +639,9 @@ pub fn svg(
 /// else 1 (zero-width combining marks are rare in labels and rounded up).
 fn display_width(c: char) -> usize {
     let u = c as u32;
+    // 2E80..A4CF sweeps in a few narrow blocks (Yijing, Lisu, Vai): the
+    // over-approximation pads a little too much, which never misaligns a
+    // bar the way under-padding would.
     if (0x1100..=0x115F).contains(&u)
         || (0x2E80..=0xA4CF).contains(&u)
         || (0xAC00..=0xD7A3).contains(&u)
@@ -640,6 +660,12 @@ fn display_width(c: char) -> usize {
 
 /// Text-node escaping only: every escaped value lands between tags, never
 /// in an attribute, so quotes need no treatment here.
+/// Where a bar that grows from `zero` starts: at `zero` when it has
+/// height, one pixel above it when the value is exactly zero.
+fn y0_floor(zero: f64, y: f64) -> f64 {
+    if y > zero { zero } else { zero - 1.0 }
+}
+
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -835,6 +861,17 @@ mod tests {
             None,
             "several fields, never one number"
         );
+        assert_eq!(
+            parse_number("+1,000"),
+            Some(1000.0),
+            "an explicit plus is a sign"
+        );
+        assert_eq!(
+            parse_number("0,100"),
+            None,
+            "a leading zero is not a thousands group"
+        );
+        assert_eq!(parse_number("0.5"), Some(0.5));
         assert_eq!(parse_number("1,,,2"), None);
         assert_eq!(parse_number("1_0_0"), None);
         // A CSV whose first row is one column still splits on commas.
@@ -845,6 +882,88 @@ mod tests {
         assert_eq!(d.series[1].values[1..], [2.0, 4.0]);
         let err = parse("k,a\nx,1\ny,2\n", None, &["k".into()]).unwrap_err();
         assert!(err.contains("\"k\" is not numeric"), "{err}");
+        // A whitespace file with one stray comma stays whitespace-separated:
+        // the stray line is one field, which makes the first column a label
+        // column rather than folding "3,4" into a number.
+        let d = ds("1 2\n3,4\n");
+        assert_eq!(
+            d.labels.as_deref(),
+            Some(&[String::from("1"), String::from("3,4")][..]),
+            "{d:?}"
+        );
+        assert_eq!(d.series.len(), 1, "{d:?}");
+        assert_eq!(d.series[0].values[0], 2.0);
+        let d = ds("1 2\n3 4\n5,6\n");
+        assert_eq!(&d.series[0].values[..2], [2.0, 4.0], "{d:?}");
+        assert!(
+            d.series[0].values[2].is_nan(),
+            "the stray line is one unparseable field"
+        );
+    }
+
+    /// The image and text charts agree on a zero bar, a spark keeps its
+    /// one-row aspect without a title, and downsampled bar labels stay
+    /// under their bars.
+    #[test]
+    fn svg_zero_bars_sparks_and_bucketed_labels() {
+        let p = Palette::default();
+        let zeros = Dataset {
+            labels: None,
+            series: vec![Series {
+                name: "v".into(),
+                values: vec![0.0, 0.0, 0.0],
+            }],
+        };
+        let out = svg(&zeros, ChartKind::Bar, None, 600, 300, &p);
+        let heights: Vec<&str> = out
+            .split("<rect")
+            .skip(2)
+            .filter_map(|r| {
+                r.split("height=\"")
+                    .nth(1)
+                    .and_then(|h| h.split('"').next())
+            })
+            .collect();
+        assert_eq!(
+            heights,
+            ["1.0", "1.0", "1.0"],
+            "an exact zero still draws a pixel: {out}"
+        );
+        let spark = svg(&ds("1\n2\n3\n"), ChartKind::Spark, Some("t"), 600, 20, &p);
+        assert!(
+            spark.contains(r#"height="20""#),
+            "the floor is 20px, not 40: {spark}"
+        );
+        assert!(!spark.contains(">t<"), "no room for a title on one row");
+        let titled = svg(&ds("1\n2\n3\n"), ChartKind::Line, Some("t"), 600, 40, &p);
+        assert!(titled.contains(">t<"));
+        // 1000 labelled bars into a 600px chart: fewer rects than rows, and
+        // the labels shown are the ones at the bucket starts.
+        let input: String = (0..1000).map(|i| format!("l{i},{i}\n")).collect();
+        let d = ds(&format!("label,v\n{input}"));
+        let out = svg(&d, ChartKind::Bar, None, 600, 300, &p);
+        assert!(
+            out.matches("<rect").count() < 1000,
+            "bars bucket to the width"
+        );
+        assert!(
+            out.contains(">l0<"),
+            "the first bucket's label survives: {out}"
+        );
+        assert!(
+            !out.contains(">l1<"),
+            "a label inside the first bucket does not"
+        );
+        let wide = text(&ds("k,v\n日本語,2\nααα,1\n"), ChartKind::Bar, None, 20, 2);
+        let rows: Vec<&str> = wide.lines().collect();
+        let widths: Vec<usize> = rows
+            .iter()
+            .map(|r| r.chars().map(display_width).sum())
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "every row the same display width: {rows:?}"
+        );
     }
 
     #[test]
