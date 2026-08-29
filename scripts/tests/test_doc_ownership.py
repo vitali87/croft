@@ -249,6 +249,38 @@ class GitShapes(unittest.TestCase):
                 repo.exit_code(), 1, "the gate must fail on a captured doc"
             )
 
+    def test_a_doc_captured_and_then_restored_within_a_branch_passes(self):
+        """A branch whose HEAD is correct must not be blocked by a state it
+        passed through.
+
+        The pairwise pass over branch-added files walks every adjacent pair,
+        so a doc captured in one commit and restored in a later one shows up
+        as a loss between two intermediate revisions. Reporting that blocks a
+        PR that is fine, which is the false accusation that makes a gate
+        untrustworthy: the first thing a maintainer does with a gate that
+        cries wolf is stop reading it.
+
+        Found within an hour of shipping the pairwise pass, on a real PR
+        whose head was correct.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("seed.rs", "fn seed() {}\n")
+            repo.branch("work")
+            repo.commit("new.rs", DOCUMENTED_CONST)
+            repo.commit("new.rs", CAPTURED_CONST)
+            # ... and put it back.
+            repo.commit(
+                "new.rs",
+                "/// Its own doc.\nconst SYNTAX_SEMANTIC: &[&str] = &[\"b\"];\n\n"
+                + DOCUMENTED_CONST,
+            )
+            self.assertEqual(
+                repo.exit_code(),
+                0,
+                "a doc restored before the branch tip is not a loss",
+            )
+
     def test_a_branch_that_captures_nothing_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Repo(Path(tmp))

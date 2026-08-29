@@ -162,6 +162,13 @@ def main():
     # commit-by-commit instead, which is the only place their history exists.
     added = [f for f in changed if not git("cat-file", "-e", f"{base}:{f}", allow_missing_path=True, allow_fail=True)]
     if added:
+        # What matters is the state at HEAD. A doc captured in one commit and
+        # restored in a later one is not a loss: the branch is fine, and
+        # reporting it blocks a PR whose head is correct. Without this the
+        # pairwise pass reports every intermediate state a branch passed
+        # through, which is exactly the false accusation that makes a gate
+        # untrustworthy.
+        head_state = {f: documented(git("show", f"{head}:{f}", allow_missing_path=True)) for f in added}
         commits = git("log", f"{base}..{head}", "--format=%H", "--reverse").split()
         for older, newer in zip(commits, commits[1:]):
             for f in added:
@@ -173,6 +180,7 @@ def main():
                         and name in after
                         and not after[name]
                         and (f, name) not in exempt
+                        and not head_state[f].get(name, False)
                         and not any(l[0] == f and l[1] == name for l in losses)
                     ):
                         # Name the commit the doc was last seen at. Saying
