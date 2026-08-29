@@ -970,6 +970,11 @@ pub fn build_inline_image(
 /// while the illustration still shows through the panel's transparent reserved
 /// cells. iTerm2's OSC-1337 has no z-index, so on that path the tooltip is
 /// re-painted after the image instead (`App::flush_tooltip_over_image`).
+/// Kitty image/placement id `croft plot` emits under. A CLI run has no
+/// per-overlay slot table; one fixed id keeps its placement distinct from
+/// the editor's own images should both share a terminal.
+pub const KITTY_ID_PLOT: u32 = 900_001;
+
 pub const KITTY_Z_BELOW_TEXT_AND_BG: i32 = -2_000_000_000;
 // The spec threshold for "below non-default background cells" is INT32_MIN/2.
 const _: () = assert!(KITTY_Z_BELOW_TEXT_AND_BG < -1_073_741_824);

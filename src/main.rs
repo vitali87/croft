@@ -41,6 +41,7 @@ mod output;
 mod pair;
 mod pair_host;
 mod pdf;
+mod plot;
 mod port_detect;
 mod prefs;
 mod problem_matchers;
