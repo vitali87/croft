@@ -386,11 +386,17 @@ pub fn save_format_on_save(enabled: bool) -> Result<()> {
     prefs.save(&path)
 }
 
+/// Persist the secret-redaction toggle (#360), preserving other settings.
 pub fn save_disable_secret_redaction(disabled: bool) -> Result<()> {
-    let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    set_disable_secret_redaction(&config_path(), disabled)
+}
+
+/// [`save_disable_secret_redaction`] against an explicit path. Goes through
+/// [`prefs_for_update`] so a malformed config is refused, not replaced.
+fn set_disable_secret_redaction(path: &Path, disabled: bool) -> Result<()> {
+    let mut prefs = prefs_for_update(path)?;
     prefs.disable_secret_redaction = disabled;
-    prefs.save(&path)
+    prefs.save(path)
 }
 
 pub fn save_copy_on_select(enabled: bool) -> Result<()> {
@@ -814,6 +820,39 @@ mod tests {
         };
         p.save(&path).unwrap();
         assert_eq!(prefs_for_update(&path).unwrap().theme, "some-theme");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #360: toggling redaction on a malformed config refuses and leaves
+    /// the file byte-for-byte; on a valid one it keeps the other settings.
+    #[test]
+    fn the_redaction_toggle_never_clobbers_a_corrupt_config() {
+        let dir = std::env::temp_dir().join(format!("croft-prefs-redact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        std::fs::write(&path, "{ this is not json").unwrap();
+        assert!(
+            set_disable_secret_redaction(&path, true).is_err(),
+            "a malformed config is refused, not overwritten with defaults"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ this is not json"
+        );
+
+        let p = Prefs {
+            theme: String::from("some-theme"),
+            ..Default::default()
+        };
+        p.save(&path).unwrap();
+        set_disable_secret_redaction(&path, true).unwrap();
+        let back = Prefs::load(&path).unwrap();
+        assert!(back.disable_secret_redaction);
+        assert_eq!(
+            back.theme, "some-theme",
+            "unrelated settings survive the toggle"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
