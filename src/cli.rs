@@ -774,7 +774,22 @@ fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> 
 /// settings came across" and "my settings are gone".
 fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
     let dir = match from {
-        Some(dir) => dir,
+        Some(dir) => {
+            // A mistyped path must not read as an empty profile. Every file
+            // this scans is optional, so a wrong directory produces "0
+            // settings, 0 keybindings, 0 snippets" and "Nothing to import",
+            // which is exactly what a real but empty profile produces. The
+            // auto-detected branch already fails loudly; this one now does
+            // too.
+            if !dir.is_dir() {
+                anyhow::bail!(
+                    "{} is not a directory. --from wants a VS Code user directory \
+                     (the one holding settings.json), e.g. ~/.config/Code/User",
+                    dir.display()
+                );
+            }
+            dir
+        }
         None => {
             let found = crate::import_vscode::discover_profiles();
             let Some((label, dir)) = found.into_iter().next() else {

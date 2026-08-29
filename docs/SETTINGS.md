@@ -109,7 +109,7 @@ means the same thing whichever path reads it.
 | `editor.renderWhitespace` | `render_whitespace` (`none` / `selection` / `all`; VS Code's `boundary` and `trailing` have no croft mode and map to `none`) |
 | `editor.bracketPairColorization.enabled` | `disable_bracket_colors` (negated) |
 | `editor.guides.indentation` | `disable_indent_guides` (negated) |
-| `editor.inlayHints.enabled` | `disable_inlay_hints` |
+| `editor.inlayHints.enabled` | `disable_inlay_hints` (negated) |
 | `editor.autoClosingBrackets: "never"` | `disable_auto_close_pairs` |
 | `terminal.integrated.copyOnSelection` | `copy_on_select` |
 

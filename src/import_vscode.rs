@@ -525,11 +525,6 @@ pub fn scan_profile(dir: &Path) -> Result<Report> {
     Ok(report)
 }
 
-/// Merge a report into croft's config files, leaving existing values alone.
-///
-/// Returns the files written. An existing value is never replaced: someone
-/// who has already tuned croft must not lose it to a one-shot import, and
-/// leaving it alone is also what makes a second run a no-op.
 /// Whether `path` carries comments croft would destroy by rewriting it.
 ///
 /// A merge here parses JSONC and writes back strict JSON, which drops every
@@ -546,6 +541,11 @@ fn carries_comments(path: &Path) -> bool {
     raw != crate::tasks::strip_jsonc(&raw)
 }
 
+/// Merge a report into croft's config files, leaving existing values alone.
+///
+/// Returns the files written. An existing value is never replaced: someone
+/// who has already tuned croft must not lose it to a one-shot import, and
+/// leaving it alone is also what makes a second run a no-op.
 pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
     apply_into(&crate::prefs::config_dir(), report)
 }
@@ -562,6 +562,7 @@ pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut written = Vec::new();
 
+    let mut wrong_shape = false;
     if !report.settings.is_empty() {
         let path = dir.join("config.json");
         if carries_comments(&path) {
@@ -569,9 +570,20 @@ pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
                 "config.json: left untouched because rewriting it would delete its comments; add the entries above by hand",
             ));
         } else {
+            // "Parsed, but not the expected shape" is not "absent". Treating
+            // them alike OVERWROTE a config.json holding an array or a scalar
+            // with a fresh object and discarded the user's content silently,
+            // which is the opposite of this module's stated posture.
             let mut existing: Map<String, Value> = match read_jsonc(&path)? {
                 Some(Value::Object(m)) => m,
-                _ => Map::new(),
+                Some(_) => {
+                    report.conflicts.push(String::from(
+                        "config.json is not a JSON object, so it was left untouched",
+                    ));
+                    wrong_shape = true;
+                    Map::new()
+                }
+                None => Map::new(),
             };
             let mut changed = false;
             for (key, value) in &report.settings {
@@ -586,13 +598,14 @@ pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
                 existing.insert(key.clone(), value.clone());
                 changed = true;
             }
-            if changed {
+            if changed && !wrong_shape {
                 write_json(&path, &Value::Object(existing))?;
                 written.push(path);
             }
         }
     }
 
+    wrong_shape = false;
     if !report.keybindings.is_empty() {
         let path = dir.join("keybindings.json");
         if carries_comments(&path) {
@@ -602,7 +615,14 @@ pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
         } else {
             let mut rows: Vec<Value> = match read_jsonc(&path)? {
                 Some(Value::Array(a)) => a,
-                _ => Vec::new(),
+                Some(_) => {
+                    report.conflicts.push(String::from(
+                        "keybindings.json is not a JSON array, so it was left untouched",
+                    ));
+                    wrong_shape = true;
+                    Vec::new()
+                }
+                None => Vec::new(),
             };
             let bound: Vec<String> = rows
                 .iter()
@@ -622,13 +642,14 @@ pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
                 rows.push(Value::Object(row));
                 changed = true;
             }
-            if changed {
+            if changed && !wrong_shape {
                 write_json(&path, &Value::Array(rows))?;
                 written.push(path);
             }
         }
     }
 
+    wrong_shape = false;
     if !report.snippets.is_empty() {
         let path = dir.join("snippets.json");
         if carries_comments(&path) {
@@ -638,7 +659,14 @@ pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
         } else {
             let mut existing: Map<String, Value> = match read_jsonc(&path)? {
                 Some(Value::Object(m)) => m,
-                _ => Map::new(),
+                Some(_) => {
+                    report.conflicts.push(String::from(
+                        "snippets.json is not a JSON object, so it was left untouched",
+                    ));
+                    wrong_shape = true;
+                    Map::new()
+                }
+                None => Map::new(),
             };
             let mut changed = false;
             for (name, entry) in &report.snippets {
@@ -651,7 +679,7 @@ pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
                 existing.insert(name.clone(), entry.clone());
                 changed = true;
             }
-            if changed {
+            if changed && !wrong_shape {
                 write_json(&path, &Value::Object(existing))?;
                 written.push(path);
             }
@@ -992,6 +1020,77 @@ mod tests {
             written.iter().any(|p| p.ends_with("config.json")),
             "an uncommented file must still be merged: {written:?}"
         );
+    }
+
+    /// A file that parses but is the WRONG SHAPE must be reported, not
+    /// replaced. Treating "not an object" the same as "absent" started the
+    /// merge from an empty map and overwrote the user's content silently,
+    /// which is the opposite of this module's posture.
+    #[test]
+    fn a_wrong_shaped_config_file_is_reported_rather_than_overwritten() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Each file parses as JSON and is the wrong shape for its purpose.
+        let cases = [
+            ("config.json", "[1, 2, 3]\n"),
+            ("keybindings.json", "{ \"not\": \"an array\" }\n"),
+            ("snippets.json", "\"a bare string\"\n"),
+        ];
+        for (name, body) in cases {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+
+        let mut report = Report::default();
+        report
+            .settings
+            .insert(String::from("format_on_save"), json!(true));
+        report
+            .keybindings
+            .push((String::from("ctrl+shift+p"), String::from("quick_open")));
+        report
+            .snippets
+            .insert(String::from("S"), json!({ "prefix": "s", "body": "x" }));
+
+        let written = apply_into(dir.path(), &mut report).expect("apply runs");
+
+        assert!(
+            written.is_empty(),
+            "nothing may be written over a wrong-shaped file: {written:?}"
+        );
+        for (name, body) in cases {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(name)).unwrap(),
+                body,
+                "{name} must be byte-for-byte untouched"
+            );
+            assert!(
+                report.conflicts.iter().any(|c| c.starts_with(name)),
+                "{name} must be reported, got {:?}",
+                report.conflicts
+            );
+        }
+    }
+
+    /// One wrong-shaped file must not block the others: the flag is per
+    /// file, not per run.
+    #[test]
+    fn a_wrong_shaped_file_does_not_stop_the_other_two() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("config.json"), "[1]\n").unwrap();
+
+        let mut report = Report::default();
+        report
+            .settings
+            .insert(String::from("format_on_save"), json!(true));
+        report
+            .snippets
+            .insert(String::from("S"), json!({ "prefix": "s", "body": "x" }));
+
+        let written = apply_into(dir.path(), &mut report).expect("apply runs");
+        assert!(
+            written.iter().any(|p| p.ends_with("snippets.json")),
+            "the snippets file is fine and must still be written: {written:?}"
+        );
+        assert!(!written.iter().any(|p| p.ends_with("config.json")));
     }
 
     /// A conflict message must name the setting it kept. Two of these were
