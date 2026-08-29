@@ -44,6 +44,17 @@ pub fn scanned_label() -> String {
     format!("{} MiB", FIND_SCAN_BYTES / (1024 * 1024))
 }
 
+/// One window of a find sweep: its text, how many COMPLETE lines it covers,
+/// and whether bytes were dropped to the window cap.
+#[derive(Default)]
+struct Window {
+    text: String,
+    consumed: usize,
+    /// Set when the read stopped inside a line, so the sweep saw only part
+    /// of the content in this range.
+    partial: bool,
+}
+
 /// Bytes a single find sweep has left.
 struct ScanBudget(usize);
 
@@ -210,10 +221,10 @@ impl LogView {
     /// Style carry works like [`Self::ensure`]: each read restarts from the
     /// default style rather than rescanning from byte zero. Find only reads
     /// the stripped text, which no style affects, so that is invisible here.
-    fn read_window(&self, first: usize, count: usize) -> std::io::Result<(String, usize)> {
+    fn read_window(&self, first: usize, count: usize) -> std::io::Result<Window> {
         let last = (first + count).min(self.len());
         if first >= last {
-            return Ok((String::new(), 0));
+            return Ok(Window::default());
         }
         let (start, _) = self.line_range(first).unwrap_or((0, 0));
         let (_, end) = self.line_range(last - 1).unwrap_or((0, 0));
@@ -241,58 +252,92 @@ impl LogView {
         } else {
             text.split('\n').count().min(last - first)
         };
-        Ok((text, consumed))
+        Ok(Window {
+            text,
+            consumed,
+            // A window that stopped mid-line searched only the prefix that
+            // fit. Saying so is the whole contract: an answer computed from
+            // part of the file must never come back looking complete.
+            partial: short,
+        })
     }
 
-    /// Walk the file in bounded chunks from `first`, handing each stripped
-    /// line to `visit`. Stops when `visit` returns `false`, the budget runs
-    /// out, or the file ends. Returns `true` if it stopped on the BUDGET,
-    /// i.e. the answer covers only part of the file.
-    fn scan_from(
+    /// Walk `[first, last)` in bounded chunks, handing each stripped line to
+    /// `visit`. Stops when `visit` returns `false`, the budget runs out, or
+    /// the range ends.
+    ///
+    /// Returns whether the sweep was INCOMPLETE: it ran out of budget, or a
+    /// line wider than the read window meant only its prefix was searched.
+    /// Both mean the same thing to a caller, and it is the thing a caller
+    /// must not paper over: an answer drawn from part of the file has to be
+    /// reported as partial, or "no matches" and "no matches I could reach"
+    /// become indistinguishable.
+    fn scan_range(
         &self,
         first: usize,
+        last: usize,
         budget: &mut ScanBudget,
         mut visit: impl FnMut(usize, &str) -> bool,
     ) -> bool {
+        let last = last.min(self.len());
         let mut idx = first;
         // One scratch line for the whole sweep: the parser writes into it and
         // it is cleared per line, so a megabyte-wide scan allocates per WINDOW
         // rather than per line. That is most of the sweep's cost.
         let mut scratch = AnsiLine::default();
-        while idx < self.len() {
+        let mut incomplete = false;
+        while idx < last {
             if budget.spent() {
                 return true;
             }
-            let (text, consumed) = match self.read_window(idx, SCAN_CHUNK_LINES) {
+            let want = SCAN_CHUNK_LINES.min(last - idx);
+            let window = match self.read_window(idx, want) {
                 Ok(v) => v,
                 // An unreadable window ends the sweep rather than spinning on
                 // it; a log being rotated underneath us is the normal cause.
-                Err(_) => return false,
+                // The caller is told, since the answer is now partial.
+                Err(_) => return true,
             };
-            if text.is_empty() {
-                return false;
+            if window.text.is_empty() {
+                return incomplete;
             }
+            incomplete |= window.partial;
             let mut style = AnsiStyle::default();
-            for (k, raw) in text.split('\n').enumerate() {
-                if idx + k >= self.len() {
+            for (k, raw) in window.text.split('\n').enumerate() {
+                if idx + k >= last {
                     break;
                 }
+                // Charge the RAW bytes, not the stripped text. The budget
+                // exists to bound IO, and a densely coloured log is mostly
+                // escape bytes: charging what survives stripping let a sweep
+                // read many times its budget on exactly the files this view
+                // is for.
+                budget.charge(raw.len().max(1));
                 parse_into(
                     raw.strip_suffix('\r').unwrap_or(raw),
                     &mut style,
                     &mut scratch,
                 );
-                budget.charge(scratch.text.len());
                 if !visit(idx + k, &scratch.text) {
-                    return false;
+                    return incomplete;
                 }
                 if budget.spent() {
                     return true;
                 }
             }
-            idx += consumed.max(1);
+            idx += window.consumed.max(1);
         }
-        false
+        incomplete
+    }
+
+    /// [`Self::scan_range`] to the end of the file.
+    fn scan_from(
+        &self,
+        first: usize,
+        budget: &mut ScanBudget,
+        visit: impl FnMut(usize, &str) -> bool,
+    ) -> bool {
+        self.scan_range(first, self.len(), budget, visit)
     }
 
     /// First match at or after (`from_row`, `from_col_chars`), searching
@@ -338,22 +383,26 @@ impl LogView {
             }
             true
         });
-        if hit.is_some() || from_row == 0 {
+        if hit.is_some() {
             return hit;
         }
-        // Wrap: re-scan the head, stopping before the row we started at.
+        // Wrap, INCLUDING from row 0: with `skip_current` set, a lone match
+        // earlier on the anchor row is skipped by the forward leg, and
+        // returning here would clear the highlight on a one-match log every
+        // time the user pressed Enter.
         let mut budget = ScanBudget::new();
-        self.scan_from(0, &mut budget, |row, text| {
+        // The wrap takes the FIRST match in the file with no column filter,
+        // including one at the anchor itself. With a single match that is the
+        // whole point: Enter should return to it, the way it does in the
+        // editor, rather than reporting nothing and clearing the highlight.
+        self.scan_range(0, from_row + 1, &mut budget, |row, text| {
             if row > from_row {
                 return false;
             }
             if !line_may_match(text, needle, opts) {
                 return true;
             }
-            for (col, len) in line_matches(text, opts, needle) {
-                if row == from_row && col >= from_col_chars {
-                    continue;
-                }
+            if let Some((col, len)) = line_matches(text, opts, needle).into_iter().next() {
                 hit = Some(MatchPos {
                     row,
                     col_chars: col,
@@ -368,10 +417,12 @@ impl LogView {
 
     /// Last match before (`from_row`, `from_col_chars`), for Shift+Enter.
     ///
-    /// Walking backwards over a windowed file cheaply is not possible, so
-    /// this scans forward from the top and keeps the last match seen before
-    /// the anchor. That makes "previous" cost a head scan rather than a seek,
-    /// which is why it carries the same budget.
+    /// Walks BACKWARDS a chunk at a time from the anchor, rather than
+    /// scanning forward from the head and keeping the last hit. The forward
+    /// version is simpler and useless on the files this view exists for: on
+    /// an 11 MiB log every Shift+Enter spent its whole budget re-reading the
+    /// head and returned nothing. Cost here is proportional to the DISTANCE
+    /// to the previous match, which is what the user is actually asking for.
     pub fn find_prev(
         &self,
         needle: &str,
@@ -382,46 +433,50 @@ impl LogView {
         if needle.is_empty() || self.is_empty() {
             return None;
         }
-        let mut best: Option<MatchPos> = None;
         let mut budget = ScanBudget::new();
-        let stopped_early = self.scan_from(0, &mut budget, |row, text| {
-            if row > from_row {
-                return false;
-            }
-            if !line_may_match(text, needle, opts) {
-                return true;
-            }
-            for (col, len) in line_matches(text, opts, needle) {
-                if row == from_row && col >= from_col_chars {
-                    break;
+        let mut end = from_row + 1;
+        // Sweep backwards over the file, then wrap once past the anchor.
+        let mut wrapped = false;
+        loop {
+            if end == 0 {
+                if wrapped {
+                    return None;
                 }
-                best = Some(MatchPos {
-                    row,
-                    col_chars: col,
-                    len_chars: len,
-                });
+                wrapped = true;
+                end = self.len();
+                if end <= from_row {
+                    return None;
+                }
             }
-            true
-        });
-        if best.is_some() || stopped_early {
-            return best;
+            let start = end.saturating_sub(SCAN_CHUNK_LINES);
+            let mut best: Option<MatchPos> = None;
+            let stopped = self.scan_range(start, end, &mut budget, |row, text| {
+                if !line_may_match(text, needle, opts) {
+                    return true;
+                }
+                for (col, len) in line_matches(text, opts, needle) {
+                    // On the anchor row itself, only matches strictly before
+                    // the caret count as "previous".
+                    if row == from_row && col >= from_col_chars {
+                        break;
+                    }
+                    best = Some(MatchPos {
+                        row,
+                        col_chars: col,
+                        len_chars: len,
+                    });
+                }
+                true
+            });
+            if best.is_some() {
+                return best;
+            }
+            if stopped {
+                // Out of budget: report nothing rather than a wrong match.
+                return None;
+            }
+            end = start;
         }
-        // Nothing before the anchor: wrap to the last match in the file.
-        let mut budget = ScanBudget::new();
-        self.scan_from(from_row, &mut budget, |row, text| {
-            if !line_may_match(text, needle, opts) {
-                return true;
-            }
-            for (col, len) in line_matches(text, opts, needle) {
-                best = Some(MatchPos {
-                    row,
-                    col_chars: col,
-                    len_chars: len,
-                });
-            }
-            true
-        });
-        best
     }
 
     /// How many matches the budget could see, and whether it ran out.
@@ -526,6 +581,87 @@ mod tests {
         let b = v.find_next("err", opts, a.row, a.col_chars, true).unwrap();
         assert_eq!((a.col_chars, b.col_chars), (0, 8));
         assert_eq!(v.count_matches("err", opts), (2, false));
+    }
+
+    /// Review finding: with `skip_current` set, a lone match on the anchor
+    /// row was skipped by the forward leg and the wrap was suppressed for
+    /// `from_row == 0`, so Enter on a one-match log cleared the highlight
+    /// and never found it again.
+    #[test]
+    fn stepping_wraps_back_onto_the_only_match_in_the_file() {
+        let (_d, p) = write_tmp(b"only hit here\nnothing\n");
+        let v = LogView::open(&p).unwrap();
+        let opts = SearchOpts::default();
+        let first = v.find_next("hit", opts, 0, 0, false).unwrap();
+        assert_eq!((first.row, first.col_chars), (0, 5));
+        let again = v
+            .find_next("hit", opts, first.row, first.col_chars, true)
+            .expect("Enter must land back on the only match, not clear it");
+        assert_eq!((again.row, again.col_chars), (0, 5));
+    }
+
+    /// Review finding: `find_prev` scanned forward from the head and spent
+    /// its whole budget before reaching the anchor, so Shift+Enter did
+    /// nothing on a large log. It now walks backwards from the anchor, so
+    /// cost tracks the DISTANCE to the previous match.
+    #[test]
+    fn stepping_back_works_past_the_budget_from_the_head() {
+        // Comfortably more than one budget of filler before the matches.
+        let filler = "x".repeat(200);
+        let mut body = String::new();
+        for _ in 0..(FIND_SCAN_BYTES / filler.len() + 2000) {
+            body.push_str(&filler);
+            body.push('\n');
+        }
+        let before_marks = body.lines().count();
+        body.push_str("needle one\n");
+        body.push_str("filler\n");
+        body.push_str("needle two\n");
+        let (_d, p) = write_tmp(body.as_bytes());
+        let v = LogView::open(&p).unwrap();
+
+        let anchor = before_marks + 2;
+        let prev = v
+            .find_prev("needle", SearchOpts::default(), anchor, 0)
+            .expect("the previous match is two lines back, budget or not");
+        assert_eq!(prev.row, before_marks);
+    }
+
+    /// Blocker: a line wider than the read window is searched only as far as
+    /// the window reaches, so an answer drawn from it MUST report itself as
+    /// partial. It used to come back as a complete count of zero.
+    #[test]
+    fn a_match_beyond_the_window_makes_the_count_report_itself_partial() {
+        let mut body = vec![b'a'; WINDOW_BYTES + 4096];
+        body.extend_from_slice(b"needle\n");
+        let (_d, p) = write_tmp(&body);
+        let v = LogView::open(&p).unwrap();
+        let (count, truncated) = v.count_matches("needle", SearchOpts::default());
+        assert!(
+            truncated,
+            "the needle sits in the dropped tail, so the count is partial: got {count} \
+             reported as complete"
+        );
+    }
+
+    /// The budget bounds IO, so it charges the RAW bytes read. Charging the
+    /// stripped text let a densely coloured log read many times its budget:
+    /// escapes are most of such a file and survive stripping as nothing.
+    #[test]
+    fn the_budget_charges_raw_bytes_not_what_survives_stripping() {
+        // Each line is ~99% escape bytes: tiny stripped, huge raw.
+        let noisy = "\u{1b}[31m\u{1b}[0m".repeat(200) + "x\n";
+        let lines = (FIND_SCAN_BYTES / noisy.len()) + 200;
+        let body = noisy.repeat(lines);
+        let (_d, p) = write_tmp(body.as_bytes());
+        let v = LogView::open(&p).unwrap();
+
+        let (_count, truncated) = v.count_matches("zzz-not-present", SearchOpts::default());
+        assert!(
+            truncated,
+            "a file this much larger than the budget must exhaust it; charging only \
+             the stripped text would have read the whole file and called it complete"
+        );
     }
 
     /// The count is budgeted, and a budgeted count says so. A partial total

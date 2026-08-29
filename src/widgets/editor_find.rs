@@ -24,13 +24,48 @@ pub struct EditorFind {
     pub match_index: Option<usize>,
     /// Set when `match_count` covers only part of the searched content, so
     /// the bar says `N+` rather than presenting a partial count as a total.
-    /// Only the windowed log view (#257) can set it: every other surface
+    /// Only the windowed log view (#257) sets it true: every other surface
     /// counts an in-memory buffer exhaustively.
-    pub count_truncated: bool,
+    ///
+    /// Written only through [`EditorFind::set_match_count`], so a surface
+    /// that counts exhaustively cannot inherit a `N+` left behind by a log
+    /// tab searched a moment earlier.
+    count_truncated: bool,
     /// Second input row (VS Code's expanded find widget, `Cmd+Opt+F`).
     pub replace_visible: bool,
     pub replace: String,
     pub focus: FindField,
+}
+
+impl EditorFind {
+    /// A fresh find bar over `query` with `opts`, counting nothing yet.
+    ///
+    /// A constructor rather than a struct literal so the count and its
+    /// truncation flag stay unreachable from outside: they are one fact,
+    /// written only through [`EditorFind::set_match_count`].
+    pub fn new(query: String, opts: SearchOpts) -> Self {
+        Self {
+            query,
+            opts,
+            ..Default::default()
+        }
+    }
+
+    /// Record a match count together with whether it covers everything that
+    /// was searched.
+    ///
+    /// The two travel together because they are one fact. Setting the count
+    /// alone is what let a log tab's budgeted `N+` survive onto the next
+    /// text tab, where the count was exact and the `+` was a lie.
+    pub fn set_match_count(&mut self, count: usize, truncated: bool) {
+        self.match_count = count;
+        self.count_truncated = truncated;
+    }
+
+    /// Whether the last count stopped short of the whole content.
+    pub fn count_truncated(&self) -> bool {
+        self.count_truncated
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,14 +407,14 @@ pub fn render_editor_find(
     Widget::render(Clear, rect, buf);
     // A budgeted count (the windowed log view) reports what it could see
     // plus a `+`, so a partial total is never shown as a whole one.
-    let total_txt = if state.count_truncated {
+    let total_txt = if state.count_truncated() {
         format!("{}+", state.match_count)
     } else {
         state.match_count.to_string()
     };
     let title = match (state.match_count, state.match_index) {
         (0, _) if state.query.is_empty() => String::from(" Find "),
-        (0, _) if state.count_truncated => format!(
+        (0, _) if state.count_truncated() => format!(
             " Find: no match in the first {} scanned ",
             crate::log_view::scanned_label()
         ),

@@ -340,12 +340,6 @@ pub fn search_workspace(root: &Path, query: &str, opts: SearchOpts) -> Vec<Searc
         .unwrap_or_default()
 }
 
-/// Split `line` into `(segment, is_match)` runs against `needle` honouring
-/// the supplied `opts`, so highlights in result rows / the editor stay
-/// consistent with what `collect_matches_in_text` would actually match.
-/// Concatenating the segments reproduces the original line byte-for-byte.
-/// Empty needle, no match, or invalid regex all return the whole line as
-/// a single non-match segment.
 /// Cheap "could this line match at all?" pre-filter for bulk scans.
 ///
 /// [`split_for_highlight`] copies the whole line (twice, when the search is
@@ -375,6 +369,12 @@ pub fn line_may_match(line: &str, needle: &str, opts: SearchOpts) -> bool {
     hay.windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat))
 }
 
+/// Split `line` into `(segment, is_match)` runs against `needle` honouring
+/// the supplied `opts`, so highlights in result rows / the editor stay
+/// consistent with what `collect_matches_in_text` would actually match.
+/// Concatenating the segments reproduces the original line byte-for-byte.
+/// Empty needle, no match, or invalid regex all return the whole line as
+/// a single non-match segment.
 pub fn split_for_highlight(line: &str, needle: &str, opts: SearchOpts) -> Vec<(String, bool)> {
     if needle.is_empty() {
         return vec![(line.to_string(), false)];
@@ -3848,11 +3848,11 @@ mod tests {
         for case_sensitive in [true, false] {
             for whole_word in [true, false] {
                 for use_regex in [true, false] {
-                    let mut o = SearchOpts::default();
-                    o.case_sensitive = case_sensitive;
-                    o.whole_word = whole_word;
-                    o.use_regex = use_regex;
-                    opt_sets.push(o);
+                    opt_sets.push(SearchOpts {
+                        case_sensitive,
+                        whole_word,
+                        use_regex,
+                    });
                 }
             }
         }
@@ -3886,8 +3886,10 @@ mod tests {
             "a longer needle than the line",
             opts
         ));
-        let mut ci = SearchOpts::default();
-        ci.case_sensitive = false;
+        let ci = SearchOpts {
+            case_sensitive: false,
+            ..SearchOpts::default()
+        };
         assert!(line_may_match("ERROR here", "error", ci), "case folds");
         assert!(!line_may_match("ERROR here", "warning", ci));
     }

@@ -12295,10 +12295,13 @@ impl App {
                 self.terminals[idx].set_current_match(None, 0);
                 let (lines, _top) = self.terminals[idx].grid_lines();
                 if let Some(state) = self.terminal_find.as_mut() {
-                    state.match_count = crate::widgets::editor_find::count_matches(
-                        &lines,
-                        &state.query,
-                        state.opts,
+                    state.set_match_count(
+                        crate::widgets::editor_find::count_matches(
+                            &lines,
+                            &state.query,
+                            state.opts,
+                        ),
+                        false,
                     );
                     state.match_index = None;
                 }
@@ -30004,11 +30007,10 @@ impl App {
                 .and_then(|d| d.selection_text())
                 .filter(|s| !s.contains('\n'))
                 .unwrap_or_default();
-            self.editor_find = Some(crate::widgets::editor_find::EditorFind {
-                query: String::new(),
+            self.editor_find = Some(crate::widgets::editor_find::EditorFind::new(
+                String::new(),
                 opts,
-                ..Default::default()
-            });
+            ));
             if !initial.is_empty() {
                 self.diff_find_set_query(initial);
             }
@@ -30023,14 +30025,12 @@ impl App {
         } else {
             self.editor.word_before_cursor()
         };
-        let mut state = crate::widgets::editor_find::EditorFind {
-            query: initial.clone(),
-            opts,
-            ..Default::default()
-        };
+        let mut state = crate::widgets::editor_find::EditorFind::new(initial.clone(), opts);
         if !initial.is_empty() {
-            state.match_count =
-                crate::widgets::editor_find::count_matches(&self.editor.lines, &initial, opts);
+            state.set_match_count(
+                crate::widgets::editor_find::count_matches(&self.editor.lines, &initial, opts),
+                false,
+            );
             self.editor
                 .set_search_highlight(Some(initial.clone()), opts);
         }
@@ -30053,12 +30053,11 @@ impl App {
             String::new()
         };
         let (lines, _top) = self.terminal().grid_lines();
-        let mut state = crate::widgets::editor_find::EditorFind {
-            query: initial.clone(),
-            opts,
-            ..Default::default()
-        };
-        state.match_count = crate::widgets::editor_find::count_matches(&lines, &initial, opts);
+        let mut state = crate::widgets::editor_find::EditorFind::new(initial.clone(), opts);
+        state.set_match_count(
+            crate::widgets::editor_find::count_matches(&lines, &initial, opts),
+            false,
+        );
         self.terminal_find = Some(state);
         self.terminal_find_pane = self.active_terminal;
         self.terminal_find_match = None;
@@ -30134,7 +30133,7 @@ impl App {
         let count = crate::widgets::editor_find::count_matches(&lines, &new_query, opts);
         if let Some(state) = self.terminal_find.as_mut() {
             state.query = new_query.clone();
-            state.match_count = count;
+            state.set_match_count(count, false);
             state.match_index = None;
         }
         self.terminal_find_match = None;
@@ -30793,7 +30792,7 @@ impl App {
             diff.find.needle = None;
             diff.find.active = None;
             if let Some(s) = self.editor_find.as_mut() {
-                s.match_count = 0;
+                s.set_match_count(0, false);
                 s.match_index = None;
             }
             return;
@@ -30804,7 +30803,7 @@ impl App {
         if count == 0 {
             diff.find.active = None;
             if let Some(s) = self.editor_find.as_mut() {
-                s.match_count = 0;
+                s.set_match_count(0, false);
                 s.match_index = None;
             }
             return;
@@ -30814,7 +30813,7 @@ impl App {
         diff.find.active = Some(m);
         diff.scroll_to_match(m, viewport_rows, text_cols);
         if let Some(s) = self.editor_find.as_mut() {
-            s.match_count = count;
+            s.set_match_count(count, false);
             s.match_index = Some(pos + 1);
         }
     }
@@ -30856,8 +30855,10 @@ impl App {
         };
         state.query = new_query;
         let opts = state.opts;
-        state.match_count =
-            crate::widgets::editor_find::count_matches(&self.editor.lines, &state.query, opts);
+        state.set_match_count(
+            crate::widgets::editor_find::count_matches(&self.editor.lines, &state.query, opts),
+            false,
+        );
         if state.query.is_empty() {
             state.match_index = None;
             self.editor.active_search_match = None;
@@ -30960,8 +30961,7 @@ impl App {
         let opts = state.opts;
         let needle = state.query.clone();
         if needle.is_empty() {
-            state.match_count = 0;
-            state.count_truncated = false;
+            state.set_match_count(0, false);
             state.match_index = None;
             self.editor.active_search_match = None;
             self.editor.set_search_highlight(None, opts);
@@ -30975,8 +30975,7 @@ impl App {
         // screen first rather than jumping to the head of the file.
         let hit = log.find_next(&needle, opts, self.editor.scroll, 0, false);
         if let Some(state) = self.editor_find.as_mut() {
-            state.match_count = count;
-            state.count_truncated = truncated;
+            state.set_match_count(count, truncated);
             // "N of M" would have to count the matches BEFORE this one, which
             // for a budgeted scan is a number we may not have; the bar falls
             // back to "M matches" rather than guessing an index.
@@ -31195,8 +31194,10 @@ impl App {
         self.editor.active_search_match = None;
         self.editor.set_search_highlight(Some(needle.clone()), opts);
         if let Some(s) = self.editor_find.as_mut() {
-            s.match_count =
-                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts);
+            s.set_match_count(
+                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts),
+                false,
+            );
         }
         if let Some(m) = crate::widgets::editor_find::find_next_match(
             &self.editor.lines,
@@ -31242,8 +31243,10 @@ impl App {
             // Recount against the new buffer: `a` -> `aa` doubles the
             // matches, and a hard zero would read "No results" over a body
             // still painted full of highlights.
-            s.match_count =
-                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts);
+            s.set_match_count(
+                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts),
+                false,
+            );
             s.match_index = None;
         }
         self.editor.set_search_highlight(Some(needle), opts);

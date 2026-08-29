@@ -34843,3 +34843,53 @@ fn enter_steps_through_matches_in_a_rendered_log() {
         "Shift+Enter walks back, wrapping to the last match"
     );
 }
+
+/// #257 review finding: the find bar's `N+` belonged to the log tab that
+/// earned it and leaked onto the next search. A text buffer is counted
+/// exhaustively, so showing `N+` there claims a limit that does not exist.
+#[test]
+fn a_logs_budgeted_count_does_not_leak_onto_the_next_text_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("huge.log");
+    // Past FIND_SCAN_BYTES, so the count genuinely runs out of budget.
+    let line = "\u{1b}[31mERROR\u{1b}[0m ".to_string() + &"pad ".repeat(40) + "\n";
+    let body = line.repeat((crate::log_view::FIND_SCAN_BYTES / line.len()) + 2000);
+    std::fs::write(&log, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&log).unwrap();
+    assert!(app.editor.log.is_some(), "the fixture must open rendered");
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert!(
+        app.editor_find
+            .as_ref()
+            .is_some_and(|s| s.count_truncated()),
+        "a log too large to search whole must report its count as partial"
+    );
+
+    // Now search an ordinary file, which IS counted exhaustively.
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    let text = tmp.path().join("small.txt");
+    std::fs::write(&text, "ERROR one\nplain\nERROR two\n").unwrap();
+    app.editor.open(&text).unwrap();
+    assert!(app.editor.log.is_none(), "a plain file is a text tab");
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let state = app.editor_find.as_ref().expect("the find bar is open");
+    assert_eq!(state.match_count, 2);
+    assert!(
+        !state.count_truncated(),
+        "an exhaustive count must not inherit the log's N+"
+    );
+}
