@@ -406,7 +406,7 @@ pub const TABLE: &[Mapping] = &[
         vscode: "github.github-vscode-theme",
         croft: "themes",
         status: Status::Builtin,
-        note: "import the theme JSON with croft theme-import",
+        note: "GitHub Dark ships built in; other variants import with croft theme-import",
     },
     Mapping {
         vscode: "zhuangtongfa.material-theme",
@@ -424,7 +424,7 @@ pub const TABLE: &[Mapping] = &[
         vscode: "enkia.tokyo-night",
         croft: "themes",
         status: Status::Builtin,
-        note: "import the theme JSON with croft theme-import",
+        note: "Tokyo Night ships built in",
     },
     Mapping {
         vscode: "pkief.material-icon-theme",
@@ -442,19 +442,19 @@ pub const TABLE: &[Mapping] = &[
         vscode: "formulahendry.code-runner",
         croft: "tasks",
         status: Status::Builtin,
-        note: "run through tasks.json, the terminal, or a runnable Markdown fence",
+        note: "run through tasks.json or the terminal; runnable Markdown fences are tracked in #353",
     },
     Mapping {
         vscode: "formulahendry.auto-rename-tag",
         croft: "lsp-html",
         status: Status::Builtin,
-        note: "the HTML language server renames paired tags",
+        note: "paired tags rename together through the language server's linked editing",
     },
     Mapping {
         vscode: "formulahendry.auto-close-tag",
-        croft: "lsp-html",
-        status: Status::Builtin,
-        note: "the HTML language server closes tags",
+        croft: "",
+        status: Status::None,
+        note: "no tag auto-close; brackets and quotes auto-close (disable_auto_close_pairs)",
     },
     Mapping {
         vscode: "streetsidesoftware.code-spell-checker",
