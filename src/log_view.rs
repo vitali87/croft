@@ -2,8 +2,19 @@
 //!
 //! Logs are the worst case for size, so the file is NEVER loaded whole. This
 //! keeps only a line-offset index plus a small byte window around the
-//! viewport, exactly the posture [`crate::hex`] uses: opening a multi-gigabyte
-//! log costs one index pass, and scrolling costs one bounded read per refill.
+//! viewport, exactly the posture [`crate::hex`] uses: scrolling costs one
+//! bounded read per refill, and the index is the one pass that reads every
+//! byte.
+//!
+//! That pass is split so the open is not gated on it (#394). [`LogView::open`]
+//! indexes the first [`HEAD_INDEX_BYTES`] synchronously, which is many
+//! screens, and hands the rest to a background thread that streams line
+//! starts back in batches; [`LogView::poll_index`] folds them in from the
+//! main loop. Until the pass is done, [`LogView::len`] is a lower bound that
+//! grows, and every sweep that reaches the moving end says so (a find that
+//! ran out of index is [`Step::OutOfReach`], never "no match"), because a
+//! reader cannot tell "not there" from "not indexed yet" and the view must
+//! not collapse them.
 //!
 //! The index stores a `u64` offset per line. That is the one cost that scales
 //! with line COUNT rather than viewport size, so it is capped: past
@@ -26,8 +37,16 @@ const WINDOW_BYTES: usize = 256 * 1024;
 /// Beyond it the view is explicitly truncated, never silently short.
 pub const MAX_INDEXED_LINES: usize = 10_000_000;
 
-/// Bytes read while building the index, per chunk.
+/// Bytes read while building the index, per chunk. The background pass sends
+/// one batch per chunk, so this is also how far behind the file the reader's
+/// line count can lag at any moment.
 const INDEX_CHUNK: usize = 1024 * 1024;
+
+/// How much of the file `open` indexes before it returns (#394). Enough that
+/// the first screens paint off a complete index and a short log is complete
+/// on open; small enough that a multi-gigabyte log opens in the time this
+/// many bytes take to scan rather than the time the whole file does.
+pub const HEAD_INDEX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Lines requested per find-sweep read. The read is clamped to
 /// [`WINDOW_BYTES`] regardless, so this only bounds the index arithmetic.
@@ -120,6 +139,10 @@ pub struct LogView {
     /// True when the file has more lines than [`MAX_INDEXED_LINES`], so the
     /// UI can say so instead of pretending the tail does not exist.
     pub truncated: bool,
+    /// The background index pass, while one is running (#394). `None` once
+    /// the index is complete, which is the only state in which `len()` is a
+    /// total rather than a lower bound.
+    index_rx: Option<std::sync::mpsc::Receiver<IndexBatch>>,
     /// Parsed lines for the current window, keyed by absolute line number.
     cache: std::collections::BTreeMap<usize, AnsiLine>,
     /// Line number the cache starts at, for cheap eviction.
@@ -138,53 +161,216 @@ pub struct LogView {
     pub last_body: ratatui::layout::Rect,
 }
 
+/// One increment of the index from the background pass (#394).
+struct IndexBatch {
+    /// Line starts found in this increment, in file order.
+    starts: Vec<u64>,
+    /// How far into the file the pass has scanned, in bytes.
+    scanned_to: u64,
+    /// The pass hit [`MAX_INDEXED_LINES`] and stopped.
+    truncated: bool,
+    /// This is the last batch: end of file, the cap, or a read failure.
+    done: bool,
+}
+
+/// The newline scan behind both halves of the index: the synchronous head
+/// pass in [`LogView::open`] and the background pass that continues it.
+struct Indexer {
+    reader: BufReader<File>,
+    buf: Vec<u8>,
+    /// Bytes scanned so far.
+    pos: u64,
+    /// Lines indexed so far, counting the seed at offset zero.
+    indexed: usize,
+}
+
+/// What one chunk of the scan found.
+enum Scan {
+    /// More file to scan.
+    More,
+    /// End of file.
+    Eof,
+    /// [`MAX_INDEXED_LINES`] reached; the scan stops here.
+    Capped,
+}
+
+impl Indexer {
+    /// Scan one chunk, appending each line start it finds to `out`.
+    fn chunk(&mut self, out: &mut Vec<u64>) -> std::io::Result<Scan> {
+        let n = self.reader.read(&mut self.buf)?;
+        if n == 0 {
+            return Ok(Scan::Eof);
+        }
+        // `memchr` rather than a byte loop: this is the whole cost of
+        // indexing a large log, and the scan is the one part that reads
+        // every byte. A per-byte comparison cannot use the vector
+        // instructions that make a newline search memory-bound.
+        for i in memchr::memchr_iter(b'\n', &self.buf[..n]) {
+            if self.indexed >= MAX_INDEXED_LINES {
+                return Ok(Scan::Capped);
+            }
+            out.push(self.pos + i as u64 + 1);
+            self.indexed += 1;
+        }
+        self.pos += n as u64;
+        Ok(Scan::More)
+    }
+}
+
 impl LogView {
     /// Index `path`'s line offsets without reading its contents into memory.
+    ///
+    /// The first [`HEAD_INDEX_BYTES`] are indexed before this returns; a file
+    /// no longer than that is complete on open. Past it, the pass continues
+    /// on a background thread and [`Self::poll_index`] folds its batches in,
+    /// so a large log opens in the time its head takes to scan (#394).
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
-        let mut reader = BufReader::new(file);
-        let mut line_starts = vec![0u64];
-        let mut buf = vec![0u8; INDEX_CHUNK];
-        let mut pos = 0u64;
-        let mut truncated = false;
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            // `memchr` rather than a byte loop: this is the whole cost of
-            // opening a large log, and the scan is the one part that reads
-            // every byte. A per-byte comparison cannot use the vector
-            // instructions that make a newline search memory-bound.
-            for i in memchr::memchr_iter(b'\n', &buf[..n]) {
-                if line_starts.len() >= MAX_INDEXED_LINES {
-                    truncated = true;
-                    break;
-                }
-                line_starts.push(pos + i as u64 + 1);
-            }
-            if truncated {
-                break;
-            }
-            pos += n as u64;
-        }
-        // A trailing newline produces an empty final entry; drop it so
-        // `len()` matches what a reader would call the line count.
-        if line_starts.len() > 1 && line_starts.last() == Some(&file_len) {
-            line_starts.pop();
-        }
-        Ok(Self {
+        let mut indexer = Indexer {
+            reader: BufReader::new(file),
+            buf: vec![0u8; INDEX_CHUNK],
+            pos: 0,
+            indexed: 1,
+        };
+        let mut view = Self {
             path: path.to_path_buf(),
             file_len,
-            line_starts,
-            truncated,
+            line_starts: vec![0u64],
+            truncated: false,
+            index_rx: None,
             cache: std::collections::BTreeMap::new(),
             cache_start: 0,
             selection: None,
             dragging: false,
             last_body: ratatui::layout::Rect::default(),
-        })
+        };
+        // The head pass: synchronous, so the first screens never paint off
+        // an empty index and a short file needs no thread at all.
+        while indexer.pos < HEAD_INDEX_BYTES {
+            match indexer.chunk(&mut view.line_starts)? {
+                Scan::More => {}
+                Scan::Eof => {
+                    view.finish(indexer.pos);
+                    return Ok(view);
+                }
+                Scan::Capped => {
+                    view.truncated = true;
+                    view.finish(indexer.pos);
+                    return Ok(view);
+                }
+            }
+        }
+        // The rest streams in. One batch per chunk keeps the reader's line
+        // count at most a chunk behind the scan; the channel is unbounded
+        // because what it holds IS the index, which is bounded by the cap.
+        let (tx, rx) = std::sync::mpsc::channel();
+        view.index_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("croft-log-index".into())
+            .spawn(move || {
+                loop {
+                    let mut starts = Vec::new();
+                    let (truncated, done) = match indexer.chunk(&mut starts) {
+                        Ok(Scan::More) => (false, false),
+                        Ok(Scan::Eof) => (false, true),
+                        Ok(Scan::Capped) => (true, true),
+                        // A read that fails mid-file (the log rotated under
+                        // us) ends the pass where it is: the lines already
+                        // indexed stay readable, and the view stops saying
+                        // it is still indexing.
+                        Err(_) => (false, true),
+                    };
+                    let batch = IndexBatch {
+                        starts,
+                        scanned_to: indexer.pos,
+                        truncated,
+                        done,
+                    };
+                    // A closed receiver means the view was dropped (the tab
+                    // closed, or another file opened): stop scanning for it.
+                    if tx.send(batch).is_err() || done {
+                        break;
+                    }
+                }
+            })?;
+        Ok(view)
+    }
+
+    /// Whether the background index pass is still running, in which case
+    /// [`Self::len`] is a lower bound rather than the file's line count.
+    pub fn indexing(&self) -> bool {
+        self.index_rx.is_some()
+    }
+
+    /// Fold in whatever the background pass has produced since the last
+    /// call, without blocking. Returns whether the index changed, which is
+    /// the caller's cue to repaint: the header's line count and the scroll
+    /// range both moved.
+    pub fn poll_index(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(rx) = self.index_rx.take() {
+            match rx.try_recv() {
+                Ok(batch) => {
+                    changed = true;
+                    self.index_rx = Some(rx);
+                    self.apply(batch);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.index_rx = Some(rx);
+                    break;
+                }
+                // The worker is gone without a final batch (it panicked):
+                // keep what it sent and stop claiming more is coming.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    changed = true;
+                    let end = self.file_len;
+                    self.finish(end);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Block until the index is complete. For callers that need the total
+    /// rather than a lower bound; the main loop uses [`Self::poll_index`].
+    pub fn finish_index(&mut self) {
+        while let Some(rx) = self.index_rx.take() {
+            match rx.recv() {
+                Ok(batch) => {
+                    self.index_rx = Some(rx);
+                    self.apply(batch);
+                }
+                Err(_) => {
+                    let end = self.file_len;
+                    self.finish(end);
+                }
+            }
+        }
+    }
+
+    fn apply(&mut self, batch: IndexBatch) {
+        self.line_starts.extend(batch.starts);
+        self.truncated |= batch.truncated;
+        if batch.done {
+            self.finish(batch.scanned_to);
+        }
+    }
+
+    /// The index is complete through `scanned_to` bytes: settle the file
+    /// length and the trailing-newline case, and drop the channel so
+    /// `indexing()` turns false.
+    fn finish(&mut self, scanned_to: u64) {
+        // A log being appended to under the pass is the normal case, so the
+        // scan's own reach, not the size at open, is the length the index
+        // describes.
+        self.file_len = self.file_len.max(scanned_to);
+        // A trailing newline produces an empty final entry; drop it so
+        // `len()` matches what a reader would call the line count.
+        if self.line_starts.len() > 1 && self.line_starts.last() == Some(&self.file_len) {
+            self.line_starts.pop();
+        }
+        self.index_rx = None;
     }
 
     pub fn len(&self) -> usize {
@@ -388,13 +574,18 @@ impl LogView {
     }
 
     /// [`Self::scan_range`] to the end of the file.
+    ///
+    /// While the background pass is still running, "the end" is the end of
+    /// the INDEX, not the file, so a sweep that gets there without stopping
+    /// is incomplete by construction: the lines it did not see exist, they
+    /// are just not addressable yet (#394).
     fn scan_from(
         &self,
         first: usize,
         budget: &mut ScanBudget,
         visit: impl FnMut(usize, &str) -> bool,
     ) -> bool {
-        self.scan_range(first, self.len(), budget, visit)
+        self.scan_range(first, self.len(), budget, visit) || self.indexing()
     }
 
     /// First match at or after (`from_row`, `from_col_chars`), searching
@@ -518,7 +709,12 @@ impl LogView {
         // row, with NO column filter. A match LATER on the anchor row is the
         // previous match once the search has wrapped, and filtering it out
         // made it unreachable on a file whose only matches share that row.
-        self.walk_back(needle, opts, self.len(), None, from_row)
+        match self.walk_back(needle, opts, self.len(), None, from_row) {
+            // The wrap started from the end of an index that is still
+            // growing: the tail it could not walk is unindexed, not empty.
+            Step::Absent if self.indexing() => Step::OutOfReach,
+            other => other,
+        }
     }
 
     /// Scan `[stop, end)` backwards a chunk at a time, returning the LAST
@@ -684,6 +880,127 @@ mod tests {
         let mut f = File::create(&p).unwrap();
         f.write_all(body).unwrap();
         (dir, p)
+    }
+
+    /// A body a little past the head budget: `open` returns on a partial
+    /// index and the rest arrives from the background pass. The needle is
+    /// on the LAST line, past everything the head pass indexed.
+    fn past_the_head(tail: &str) -> (Vec<u8>, usize) {
+        let mut body = Vec::new();
+        let mut lines = 0usize;
+        while (body.len() as u64) < HEAD_INDEX_BYTES + 1024 * 1024 {
+            body.extend_from_slice(format!("line{lines} some padding text\n").as_bytes());
+            lines += 1;
+        }
+        body.extend_from_slice(tail.as_bytes());
+        body.push(b'\n');
+        (body, lines + 1)
+    }
+
+    /// #394: a file within the head budget is complete when `open` returns,
+    /// with no thread behind it.
+    #[test]
+    fn a_short_log_is_fully_indexed_on_open() {
+        let (_d, p) = write_tmp(b"one\ntwo\nthree\n");
+        let v = LogView::open(&p).unwrap();
+        assert!(!v.indexing(), "nothing left to index");
+        assert_eq!(v.len(), 3, "the trailing newline is not a fourth line");
+    }
+
+    /// #394: past the head budget, `open` returns on a partial index that is
+    /// readable at once and grows as the background pass reports in, and the
+    /// finished index matches a whole-file count exactly.
+    #[test]
+    fn a_large_log_opens_on_a_partial_index_that_grows_to_the_total() {
+        let (body, total) = past_the_head("the very last line");
+        let (_d, p) = write_tmp(&body);
+        let mut v = LogView::open(&p).unwrap();
+        assert!(v.indexing(), "the tail is still being indexed");
+        let head = v.len();
+        assert!(
+            head > 0 && head < total,
+            "a lower bound, not zero and not the total"
+        );
+        v.ensure(0, 2).unwrap();
+        assert_eq!(
+            v.visible_text(0),
+            Some("line0 some padding text"),
+            "the head is readable before the pass finishes"
+        );
+
+        v.finish_index();
+        assert!(!v.indexing());
+        assert_eq!(
+            v.len(),
+            total,
+            "the finished index is the file's line count"
+        );
+        let last = total - 1;
+        v.ensure(last, 1).unwrap();
+        assert_eq!(v.visible_text(last), Some("the very last line"));
+    }
+
+    /// #394: the pass is fed to the reader in batches, so `poll_index` on
+    /// the main loop makes progress without blocking, reports whether the
+    /// index moved, and ends with the same total the blocking wait gives.
+    #[test]
+    fn polling_folds_in_batches_until_the_index_is_complete() {
+        let (body, total) = past_the_head("tail");
+        let (_d, p) = write_tmp(&body);
+        let mut v = LogView::open(&p).unwrap();
+        let mut grew = false;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "the background log index",
+            || {
+                grew |= v.poll_index();
+                !v.indexing()
+            },
+        );
+        assert!(grew, "at least one batch arrived through poll_index");
+        assert_eq!(v.len(), total);
+        assert!(
+            !v.poll_index(),
+            "a complete index has nothing more to fold in"
+        );
+    }
+
+    /// #394: a find that reaches the end of an UNFINISHED index has not
+    /// established an absence. Forward, backward, and the count all say
+    /// out-of-reach / partial until the pass is done, and then find the
+    /// needle that was there all along.
+    #[test]
+    fn find_over_an_unfinished_index_is_out_of_reach_not_absent() {
+        let (body, total) = past_the_head("NEEDLE here");
+        let (_d, p) = write_tmp(&body);
+        let mut v = LogView::open(&p).unwrap();
+        let opts = SearchOpts::default();
+        let from = v.len().saturating_sub(3);
+        let ahead = v.find_next("NEEDLE", opts, from, 0, false);
+        assert!(
+            ahead.out_of_reach(),
+            "forward reached the moving end: {ahead:?}"
+        );
+        let back = v.find_prev("NEEDLE", opts, 0, 0);
+        assert!(
+            back.out_of_reach(),
+            "the wrap started short of the tail: {back:?}"
+        );
+        let (count, partial) = v.count_matches("NEEDLE", opts);
+        assert_eq!(
+            (count, partial),
+            (0, true),
+            "a partial count, reported as one"
+        );
+
+        v.finish_index();
+        let hit = v
+            .find_next("NEEDLE", opts, total - 3, 0, false)
+            .found()
+            .expect("the needle is on the last line once it is indexed");
+        assert_eq!(hit.row, total - 1);
+        let back = v.find_prev("NEEDLE", opts, 0, 0).found().unwrap();
+        assert_eq!(back.row, total - 1, "and the wrap now reaches it");
     }
 
     /// Find runs on the STRIPPED text: a needle that spans an escape in the
@@ -1206,7 +1523,10 @@ mod tests {
     fn a_file_past_the_line_cap_reports_truncation_rather_than_a_prefix() {
         let body = vec![b'\n'; MAX_INDEXED_LINES + 1];
         let (_d, p) = write_tmp(&body);
-        let v = LogView::open(&p).unwrap();
+        let mut v = LogView::open(&p).unwrap();
+        // The file is past the head budget, so the cap is hit by the
+        // background pass (#394); truncation is known once it reports in.
+        v.finish_index();
         assert!(
             v.truncated,
             "the view must say it did not index the whole file"
