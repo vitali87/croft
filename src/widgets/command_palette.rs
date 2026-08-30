@@ -185,6 +185,9 @@ pub enum Command {
     /// the instruction box; the navigator may edit on the resulting turn).
     AskNavigator,
     AskNavigatorAboutCapture,
+    /// Have the navigator fix the diagnostic under the caret as a streamed,
+    /// cancellable edit (#374).
+    FixProblemWithNavigator,
     /// Send the `.http` request under the caret; the response opens as a
     /// tab (#370).
     SendHttpRequest,
@@ -363,6 +366,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::CollabCancelStream,
     Command::AskNavigator,
     Command::AskNavigatorAboutCapture,
+    Command::FixProblemWithNavigator,
     Command::SendHttpRequest,
     Command::CopyHttpRequestAsCurl,
     Command::YieldToNavigator,
@@ -532,6 +536,7 @@ impl Command {
             Command::CollabCancelStream => "Collab: Cancel AI Stream",
             Command::AskNavigator => "Navigator: Ask About Line or Selection",
             Command::AskNavigatorAboutCapture => "Captures: Ask Navigator About This Line",
+            Command::FixProblemWithNavigator => "Problems: Fix With Navigator",
             Command::SendHttpRequest => "HTTP: Send Request Under Caret",
             Command::CopyHttpRequestAsCurl => "HTTP: Copy Request as curl",
             Command::YieldToNavigator => "Navigator: Yield the Turn",
@@ -703,6 +708,7 @@ impl Command {
             Command::CollabCancelStream => "Cmd+K X",
             Command::AskNavigator => "Cmd+K Q",
             Command::AskNavigatorAboutCapture => "",
+            Command::FixProblemWithNavigator => "",
             Command::SendHttpRequest => "Cmd+Enter",
             Command::CopyHttpRequestAsCurl => "",
             Command::YieldToNavigator => "Cmd+K Y",
@@ -871,6 +877,7 @@ impl Command {
             Command::CollabCancelStream => "collab_cancel_stream",
             Command::AskNavigator => "navigator_ask",
             Command::AskNavigatorAboutCapture => "captures_ask_navigator",
+            Command::FixProblemWithNavigator => "problems_fix_navigator",
             Command::SendHttpRequest => "http_send_request",
             Command::CopyHttpRequestAsCurl => "http_copy_curl",
             Command::YieldToNavigator => "navigator_yield",

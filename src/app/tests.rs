@@ -35993,6 +35993,170 @@ fn a_large_log_opens_before_its_index_is_complete_and_the_loop_finishes_it() {
     );
 }
 
+/// #374: Fix with Navigator from PROBLEMS. With no navigator seated the
+/// action lands on the diagnostic and says the navigator is not active
+/// rather than doing nothing; the caret-side entry points resolve the
+/// diagnostic under the caret with its server as the source; the palette
+/// carries the command; and the Quick Fix picker offers the navigator row
+/// after the server's own actions.
+#[test]
+fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "use std::io;\nfn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("rust-analyzer"),
+        vec![crate::lsp::manager::Diagnostic {
+            start_line: 0,
+            start_char: 4,
+            end_line: 0,
+            end_char: 11,
+            severity: DiagnosticSeverity::Warning,
+            message: String::from("unused import: `std::io`"),
+        }],
+    );
+    app.lsp_diagnostics.insert(file.clone(), by_server);
+    assert!(app.drain_lsp_diagnostics());
+    assert!(app.rebuild_problems());
+    let (path, item) = {
+        let groups = app.problems.groups();
+        (groups[0].path.clone(), groups[0].items[0].clone())
+    };
+    assert_eq!(item.source, "rust-analyzer");
+
+    // Move the caret away, then fix: with no navigator the action refuses
+    // up front and has no side effect, so the caret stays where it was
+    // rather than jumping to a diagnostic nothing is going to fix.
+    app.editor.cursor_row = 1;
+    app.fix_problem_with_navigator(path.clone(), item.clone(), Vec::new());
+    assert!(
+        app.status.to_lowercase().contains("not active"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(file.as_path()));
+    assert_eq!(app.editor.cursor_row, 1, "a refusal moves nothing");
+    assert!(
+        app.problems.fixing.is_none(),
+        "no turn was sent, so no spinner"
+    );
+    app.editor.cursor_row = 0;
+
+    // The caret-side candidate is the same diagnostic, with its server.
+    let (cpath, citem) = app
+        .navigator_fix_candidate()
+        .expect("the caret sits on a diagnostic");
+    assert_eq!(cpath, file);
+    assert_eq!(citem.message, item.message);
+    assert_eq!(citem.source, "rust-analyzer");
+    assert!(citem.col_utf16);
+    app.editor.cursor_row = 1;
+    assert!(
+        app.navigator_fix_candidate().is_none(),
+        "no diagnostic on the second line"
+    );
+    app.editor.cursor_row = 0;
+
+    // The Quick Fix picker: server actions first, the navigator row last.
+    app.open_code_action_picker(vec![crate::lsp::manager::CodeActionItem {
+        title: String::from("Remove unused import"),
+        server: String::from("rust-analyzer"),
+        edits: Vec::new(),
+        command: None,
+        needs_resolve: false,
+        resolve_action: None,
+        is_preferred: false,
+    }]);
+    let picker = app.list_picker.as_ref().expect("the picker opened");
+    let labels: Vec<String> = picker.rows.iter().map(|r| r.label.clone()).collect();
+    assert_eq!(labels, vec!["Remove unused import", "Fix with Navigator"]);
+    assert_eq!(picker.rows[1].id, "navigator");
+
+    // Confirming the navigator row must route to the navigator, never to
+    // the server's first action: the picker's shared numeric-id decode
+    // parses "navigator" to 0 (#374 review, the blocker).
+    if let Some(picker) = app.list_picker.as_mut() {
+        picker.select_next();
+        assert_eq!(picker.selected_row().unwrap().id, "navigator");
+    }
+    app.status.clear();
+    app.confirm_list_picker();
+    assert!(
+        app.status.to_lowercase().contains("not active"),
+        "the navigator row reached the navigator path: {}",
+        app.status
+    );
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "use std::io;\nfn main() {}",
+        "and no server action touched the buffer"
+    );
+
+    // The control: the server row still applies the server action.
+    app.open_code_action_picker(vec![crate::lsp::manager::CodeActionItem {
+        title: String::from("Remove unused import"),
+        server: String::from("rust-analyzer"),
+        edits: Vec::new(),
+        command: None,
+        needs_resolve: false,
+        resolve_action: None,
+        is_preferred: false,
+    }]);
+    app.status.clear();
+    app.confirm_list_picker();
+    assert!(
+        !app.status.to_lowercase().contains("not active"),
+        "row 0 is the server's, not the navigator's: {}",
+        app.status
+    );
+
+    // Deactivating the seat clears the marker (#374 review): with the
+    // navigator gone no TurnDone can arrive, so the unseat path is the
+    // only thing standing between the row and an eternal spinner.
+    app.problems.fixing = Some((file.clone(), 0));
+    app.problems_fix_started = Some(std::time::Instant::now());
+    app.last_pair_check = None;
+    app.maybe_seat_navigator();
+    assert!(
+        app.problems.fixing.is_none(),
+        "the deactivation teardown clears the fix marker"
+    );
+    assert_eq!(app.problems_fix_spinner_phase(), 0);
+
+    // The palette carries the command; the menu entry has no chord.
+    assert!(
+        crate::widgets::command_palette::ALL_COMMANDS
+            .contains(&crate::widgets::command_palette::Command::FixProblemWithNavigator)
+    );
+    assert_eq!(
+        crate::widgets::command_palette::Command::FixProblemWithNavigator.id(),
+        "problems_fix_navigator"
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::FixProblemWithNavigator {
+            path: path.clone(),
+            item: item.clone()
+        }),
+        None
+    );
+
+    // The spinner stops with the turn, however it ended (#374): the same
+    // clear runs on TurnDone, on the seat dying, and on unseat.
+    app.problems.fixing = Some((path, item.line));
+    app.problems_fix_started = Some(std::time::Instant::now());
+    assert!(app.problems_fix_spinner_phase() < 100);
+    app.clear_problem_fix();
+    assert!(app.problems.fixing.is_none());
+    assert_eq!(
+        app.problems_fix_spinner_phase(),
+        0,
+        "idle never wakes the renderer"
+    );
+}
 /// #370: a `.http` file runs the request under the caret. The variables
 /// substitute from `.http.env.json` on the WIRE only: the status line,
 /// history entry, and response tab all carry the raw `{{name}}` form, so
