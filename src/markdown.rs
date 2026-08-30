@@ -263,8 +263,6 @@ enum RedirectScan {
     Unterminated,
 }
 
-/// One pass of [`has_write_redirect`] over a whole block; `quotes` says
-/// whether `'` and `"` open a string or are ordinary bytes.
 /// Whether `prev` ends a shell word, so a `#` immediately after it opens a
 /// comment rather than sitting mid-token.
 ///
@@ -298,6 +296,8 @@ fn ends_a_word(prev: u8) -> bool {
     prev.is_ascii_whitespace() || matches!(prev, b'|' | b';' | b'&' | b'(' | b')')
 }
 
+/// One pass of [`has_write_redirect`] over a whole block; `quotes` says
+/// whether `'` and `"` open a string or are ordinary bytes.
 fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
     let b = code.as_bytes();
     let mut quote: Option<u8> = None;
@@ -361,9 +361,27 @@ fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
                         // untouched. dash refuses it ("Bad fd number"), but
                         // croft's terminal is the user's shell, and on the
                         // two shells most people have it writes.
-                        let dup = b.get(j) == Some(&b'&')
-                            && b.get(j + 1)
-                                .is_some_and(|n| n.is_ascii_digit() || *n == b'-');
+                        // And the digits must run to a WORD BOUNDARY.
+                        // Checking only the byte after `&` left the same
+                        // defect one byte along: `echo overwritten >&2x`
+                        // writes the file `./2x` (measured: a 17-byte file
+                        // became 12 bytes reading "overwritten") while
+                        // `>&2` followed by anything non-word is a real dup.
+                        let dup = b.get(j) == Some(&b'&') && {
+                            let mut k = j + 1;
+                            if b.get(k) == Some(&b'-') {
+                                k += 1;
+                            } else {
+                                while k < b.len() && b[k].is_ascii_digit() {
+                                    k += 1;
+                                }
+                            }
+                            // At least one digit or a `-`, then nothing that
+                            // could continue the word.
+                            k > j + 1
+                                && b.get(k)
+                                    .is_none_or(|n| n.is_ascii_whitespace() || b";&|)".contains(n))
+                        };
                         while j < b.len() && b[j].is_ascii_whitespace() {
                             j += 1;
                         }
@@ -1299,6 +1317,9 @@ mod tests {
             // file. An 18-byte target went to 1 byte under bash.
             "echo '' >& ~/.bashrc",
             "cp id_rsa >& /tmp/out",
+            // The digits must run to a word boundary: `>&2x` writes `./2x`.
+            "echo overwritten >&2x",
+            "echo x >&12ab",
             "echo a=#x > /tmp/y",
             "echo a-#x > /tmp/y",
             "git push --force",
@@ -1318,6 +1339,8 @@ mod tests {
             // descriptor dup and writes no file.
             "echo a >&2",
             "exec 2>&-",
+            "echo a >&2 && echo done",
+            "echo a >&2; echo done",
             "make >/dev/null",
             "echo a -> b",
             "ls # see https://x -> y",
