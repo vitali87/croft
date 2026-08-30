@@ -523,12 +523,13 @@ The PORTS tab in the bottom panel group lists the loopback ports croft has notic
 
 ## Captures
 
-The CAPTURES tab collects output lines matched by `capture` triggers in `triggers.json` (iTerm2's Capture Output): point a rule at your compiler's error format and every hit funnels into one clickable list, however much output scrolled past.
+The CAPTURES tab collects output lines matched by `capture` triggers in `triggers.json` (iTerm2's Capture Output): point a rule at your compiler's error format and every hit funnels into one clickable list, however much output scrolled past. With a row selected, `n` (or right-click → "Ask Navigator About This Line", or the palette's "Captures: Ask Navigator About This Line") sends the line, the trigger that caught it, and the redacted pane rows around it to the resident Navigator; when the line carries a `path:line` that resolves to an existing file (relative to the pane's cwd, then the workspace), that file opens first so the reply lands as a comment box there; otherwise the ask anchors on the active file, and with none open it says so.
 
 | Keys | Action |
 |------|--------|
 | `↑` / `↓` | Move the selection |
 | `Enter` / click a row | Jump the capturing pane back to that line: the TERMINAL tab activates, the pane scrolls the line into view and selects it |
+| `n` | Ask the resident Navigator about the selected line (the pane rows around it ride along, redacted) |
 | `x` | Remove the selected entry |
 | `c` | Clear the list |
 | `Esc` | Focus the editor |

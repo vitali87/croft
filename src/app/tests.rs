@@ -24391,6 +24391,24 @@ fn capture_triggers_collect_into_the_captures_panel_and_jump_to_the_line() {
         sel.contains("err-7 broke"),
         "jump must land the selection on the captured line, got {sel:?}"
     );
+
+    // `n` asks the Navigator about the line (#372); with none seated it
+    // says so rather than doing nothing, and the palette carries the same
+    // command.
+    app.ask_navigator_about_capture();
+    assert!(
+        app.status.to_lowercase().contains("not active"),
+        "{}",
+        app.status
+    );
+    assert!(
+        crate::widgets::command_palette::ALL_COMMANDS
+            .contains(&crate::widgets::command_palette::Command::AskNavigatorAboutCapture)
+    );
+    assert_eq!(
+        crate::widgets::command_palette::Command::AskNavigatorAboutCapture.id(),
+        "captures_ask_navigator"
+    );
 }
 
 #[test]
