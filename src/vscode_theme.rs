@@ -507,12 +507,15 @@ fn slug(s: &str) -> String {
     // + a combining acute) render identically and are the same theme to
     // anyone; only their bytes differ, by which editor last saved the file.
     // Without this they minted two ids and installed twice (#407). NFC is
-    // applied on both sides of the lowercase: lowercasing can expose a
+    // applied AFTER the lowercase, because lowercasing can expose a
     // composition the uppercase spelling had no precomposed character for
-    // (`H` + U+0331 has none, so the first pass leaves it; its lowercase
-    // `h` + U+0331 composes to U+1E96 `ẖ`). A name already in NFC
-    // normalises to itself, so no existing single-form id changes.
-    let lowered: String = s.nfc().collect::<String>().to_lowercase().nfc().collect();
+    // (`H` + U+0331 has none; its lowercase `h` + U+0331 composes to
+    // U+1E96 `ẖ`). A pass before the lowercase would add nothing: case
+    // mapping preserves canonical equivalence, so NFC(lower(s)) already
+    // equals NFC(lower(NFC(s))) (swept over every code point and every
+    // base + mark pair in review). A name already in NFC normalises to
+    // itself, so no existing single-form id changes.
+    let lowered: String = s.to_lowercase().nfc().collect();
     let slug = separators
         .replace_all(&lowered, "-")
         .trim_matches('-')
