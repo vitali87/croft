@@ -528,6 +528,7 @@ The CAPTURES tab collects output lines matched by `capture` triggers in `trigger
 |------|--------|
 | `↑` / `↓` | Move the selection |
 | `Enter` / click a row | Jump the capturing pane back to that line: the TERMINAL tab activates, the pane scrolls the line into view and selects it |
+| `n` | Ask the resident Navigator about the selected line (the pane rows around it ride along, redacted) |
 | `x` | Remove the selected entry |
 | `c` | Clear the list |
 | `Esc` | Focus the editor |

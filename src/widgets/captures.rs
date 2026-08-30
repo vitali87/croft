@@ -64,16 +64,28 @@ pub fn first_file_ref(line: &str) -> Option<crate::file_ref::FileRef> {
 
 /// The instruction and excerpt an "Ask Navigator about this line" sends:
 /// which pane and trigger the line came from, the line itself, and the
-/// (already redacted) context rows, capped at [`ASK_CONTEXT_CHARS`].
-pub fn ask_prompt(entry: &CapturedLine, context: &[String]) -> (String, String) {
+/// context rows, capped at [`ASK_CONTEXT_CHARS`]. `mask` is the redaction
+/// every text that leaves a pane goes through (#360); it is applied HERE,
+/// to the captured line and the trigger message as much as to the context,
+/// because a capture is stored raw and the line a `capture` rule matched is
+/// the one most likely to carry the secret.
+pub fn ask_prompt(
+    entry: &CapturedLine,
+    context: &[String],
+    mask: impl Fn(&str) -> String,
+) -> (String, String) {
     let instruction = format!(
         "This line was captured from terminal pane {:?} by the trigger {:?}:\n{}\nExplain what \
          went wrong and propose the fix; the excerpt after it is the surrounding pane output.",
         entry.pane,
-        entry.message,
-        entry.line.trim_end()
+        mask(&entry.message),
+        mask(entry.line.trim_end())
     );
-    let mut excerpt = context.join("\n");
+    let mut excerpt = context
+        .iter()
+        .map(|row| mask(row))
+        .collect::<Vec<_>>()
+        .join("\n");
     if excerpt.chars().count() > ASK_CONTEXT_CHARS {
         excerpt = excerpt.chars().take(ASK_CONTEXT_CHARS).collect::<String>() + "\n[excerpt cut]";
     }
@@ -262,7 +274,7 @@ impl Widget for &mut CapturesPanel {
             buf.set_stringn(
                 area.x,
                 area.y + area.height - 1,
-                "  ⏎ jump to line   ·   x remove   ·   c clear all",
+                "  ⏎ jump to line   ·   n ask navigator   ·   x remove   ·   c clear all",
                 area.width as usize,
                 Style::default().fg(self.theme.ui(COLOR_DIM)),
             );
@@ -316,13 +328,36 @@ mod tests {
             line: "error: could not compile `croft`".into(),
         };
         let context: Vec<String> = (0..3).map(|i| format!("ctx {i}")).collect();
-        let (instruction, excerpt) = ask_prompt(&entry, &context);
+        let (instruction, excerpt) = ask_prompt(&entry, &context, |t| t.to_string());
         assert!(instruction.contains("Terminal 2") && instruction.contains("build failed"));
         assert!(instruction.contains("could not compile `croft`"));
         assert_eq!(excerpt, "ctx 0\nctx 1\nctx 2");
         let long: Vec<String> = vec!["x".repeat(ASK_CONTEXT_CHARS * 2)];
-        let (_, cut) = ask_prompt(&entry, &long);
+        let (_, cut) = ask_prompt(&entry, &long, |t| t.to_string());
         assert!(cut.ends_with("[excerpt cut]"));
         assert!(cut.chars().count() <= ASK_CONTEXT_CHARS + 20);
+    }
+
+    /// The ask leaves the process, so #360's masking applies to every part
+    /// of it: the captured line and the trigger message (stored raw, and the
+    /// line a rule matched is the likeliest to carry the secret) as much as
+    /// the context rows.
+    #[test]
+    fn a_capture_ask_never_ships_an_unmasked_secret() {
+        let entry = CapturedLine {
+            pane: "Terminal 1".into(),
+            shell_pid: None,
+            message: "AKIAIOSFODNN7EXAMPLE".into(),
+            line: "curl -H 'Authorization: Bearer AKIAIOSFODNN7EXAMPLE' failed".into(),
+        };
+        let context = vec![String::from("export TOKEN=AKIAIOSFODNN7EXAMPLE")];
+        let mask = |t: &str| t.replace("AKIAIOSFODNN7EXAMPLE", "\u{2022}\u{2022}\u{2022}\u{2022}");
+        let (instruction, excerpt) = ask_prompt(&entry, &context, mask);
+        assert!(
+            !instruction.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the line and the message are masked: {instruction}"
+        );
+        assert!(!excerpt.contains("AKIAIOSFODNN7EXAMPLE"), "{excerpt}");
+        assert!(instruction.contains("\u{2022}\u{2022}\u{2022}\u{2022}"));
     }
 }

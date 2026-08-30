@@ -27422,10 +27422,6 @@ impl App {
             },
             None => vec![entry.line.clone()],
         };
-        let context: Vec<String> = context
-            .iter()
-            .map(|l| crate::triggers::mask_text(l, &self.triggers, false))
-            .collect();
         // Anchor: the file the line names, else the active file.
         let referenced = crate::widgets::captures::first_file_ref(&entry.line)
             .and_then(|fr| self.resolve_pane_path(idx, &fr.path).map(|abs| (abs, fr)))
@@ -27447,20 +27443,29 @@ impl App {
         };
         let row = self.editor.cursor_row;
         let range = (row, row);
-        let (instruction, selection) = crate::widgets::captures::ask_prompt(&entry, &context);
+        // Every part of the ask is masked here, the line and the trigger
+        // message included: a capture is stored raw (#360).
+        let triggers = self.triggers.clone();
+        let (instruction, selection) =
+            crate::widgets::captures::ask_prompt(&entry, &context, |t| {
+                crate::triggers::mask_text(t, &triggers, false)
+            });
         let content = self.editor.lines.join("\n");
         let Some(host) = &self.pair_host else {
+            // Unreachable today (nothing above touches the host), but a
+            // silent return would leave the jump's status reading as success.
+            self.status = String::from("Navigator is not active");
             return;
         };
         match host.send_ask_turn(&file, range, &selection, &instruction, &content) {
             Ok(()) => {
+                // Always name the anchor: when the line's own file did not
+                // open, the ask went to the active file and the user must
+                // see which.
                 self.status = format!(
-                    "Asked {name} about the captured line{}",
-                    if opened {
-                        format!(" at {file}:{}", row + 1)
-                    } else {
-                        String::new()
-                    }
+                    "Asked {name} about the captured line, anchored at {file}:{}{}",
+                    row + 1,
+                    if opened { "" } else { " (the active file)" }
                 );
                 self.pair_turn_origin = Some((file, row));
             }
