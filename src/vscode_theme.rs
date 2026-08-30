@@ -566,6 +566,12 @@ fn existing_ids() -> Vec<String> {
 /// the loader which file an id came from, rather than adding a second
 /// convention beside it.
 fn was_generated_by_import(id: &str) -> bool {
+    // Hermetic under test, for the same reason `Theme::all()` is: reading
+    // the developer's real ~/.config/croft made a conversion depend on
+    // machine state, and a test that imports a theme must not.
+    if cfg!(test) {
+        return false;
+    }
     let path = crate::lsp::manifest::user_extensions_dir()
         .join(format!("theme-{id}"))
         .join("extension.toml");

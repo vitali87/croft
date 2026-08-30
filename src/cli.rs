@@ -971,6 +971,17 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
     for (key, command) in &report.keybindings {
         println!("  {key} -> {command}");
     }
+    if let Some(theme) = &report.theme {
+        println!(
+            "\nworkbench.colorTheme {:?} converts to croft theme {:?} (from {})",
+            theme.label,
+            theme.converted.id,
+            theme.path.display()
+        );
+        for note in &theme.converted.notes {
+            println!("  - {note}");
+        }
+    }
     if !report.unmapped_settings.is_empty() {
         println!(
             "\n{} setting{} croft has no equivalent for:",
