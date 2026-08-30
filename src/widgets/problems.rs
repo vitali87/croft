@@ -212,6 +212,13 @@ pub struct ProblemsPanel {
 
     pub last_area: Rect,
     pub last_scrollbar: Rect,
+    /// The diagnostic a Fix with Navigator turn is streaming for, as
+    /// `(file, line)` (#374). Its row wears the spinner until the turn
+    /// ends; the app clears it on the turn's end, cancel, or unseat.
+    pub fixing: Option<(PathBuf, u32)>,
+    /// The spinner frame to paint on that row this frame. The app picks it
+    /// from its own clock so every spinner in the UI runs in step.
+    pub fix_glyph: &'static str,
 
     // Toolbar hit rects, recomputed each render.
     filter_rect: Rect,
@@ -239,6 +246,8 @@ impl ProblemsPanel {
             hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
+            fixing: None,
+            fix_glyph: "",
             filter_rect: Rect::default(),
             group_rect: Rect::default(),
             rows: Vec::new(),
@@ -436,6 +445,26 @@ impl ProblemsPanel {
         }
     }
 
+    /// The diagnostic on the row painted at `y`, with its file, for actions
+    /// that need the whole item rather than a jump target (#374).
+    pub fn diagnostic_at(&self, y: u16) -> Option<(PathBuf, ProblemItem)> {
+        if self.visible_rows == 0 || y < self.first_row_y {
+            return None;
+        }
+        let offset = (y - self.first_row_y) as usize;
+        if offset >= self.visible_rows as usize {
+            return None;
+        }
+        match self.rows.get(self.scroll + offset)? {
+            RenderRow::Header(_) => None,
+            RenderRow::Diag(g, i) => {
+                let group = self.groups.get(*g)?;
+                let item = group.items.get(*i)?;
+                Some((group.path.clone(), item.clone()))
+            }
+        }
+    }
+
     /// Rebuild the flat row list for the current filter, collapse state, and
     /// grouping. Called at the top of `render` so `rows` always matches what
     /// was painted.
@@ -493,6 +522,39 @@ impl Default for ProblemsPanel {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The instruction a Fix with Navigator turn carries (#374). The ask turn's
+/// composer appends the whole numbered buffer, so this does not repeat the
+/// code: it names what was reported, by whom, and where, hands over the
+/// server's own quick fixes as hints, and bounds the edit.
+pub fn fix_prompt(item: &ProblemItem, rel_path: &str, hints: &[String]) -> String {
+    let kind = match item.severity {
+        DiagnosticSeverity::Error => "error",
+        DiagnosticSeverity::Warning => "warning",
+        DiagnosticSeverity::Information | DiagnosticSeverity::Hint => "diagnostic",
+    };
+    let source = if item.source.is_empty() {
+        String::from("a diagnostic tool")
+    } else {
+        item.source.clone()
+    };
+    let mut text = format!(
+        "Fix the {kind} reported by {source} at {rel_path}:{}:{}: {}",
+        item.line + 1,
+        item.col + 1,
+        item.message.trim().replace('\n', " ")
+    );
+    if !hints.is_empty() {
+        text.push_str("\nThe server offers these quick fixes; apply one if it is the right fix: ");
+        text.push_str(&hints.join("; "));
+    }
+    text.push_str(
+        "\nEdit the buffer with the smallest change that resolves the diagnostic and \
+         keeps the code's behaviour. If it cannot be fixed safely, say why in a note \
+         instead of editing.",
+    );
+    text
 }
 
 fn severity_glyph(severity: DiagnosticSeverity, theme: crate::theme::Theme) -> (char, Color) {
@@ -758,8 +820,23 @@ impl ProblemsPanel {
         let (glyph, color) = severity_glyph(item.severity, self.theme);
         // The message can span several lines on the wire; collapse to one row.
         let message = item.message.replace('\n', " ");
+        // A row the navigator is fixing wears the spinner in place of its
+        // severity glyph (#374): the fix is a live stream, and the row is
+        // where the user looks for it.
+        let fixing = self
+            .fixing
+            .as_ref()
+            .is_some_and(|(path, line)| *path == self.groups[g].path && *line == item.line);
+        let lead = if fixing && !self.fix_glyph.is_empty() {
+            Span::styled(
+                format!("   {} ", self.fix_glyph),
+                Style::default().fg(self.theme.ui(COLOR_INFO)),
+            )
+        } else {
+            Span::styled(format!("   {glyph} "), Style::default().fg(color))
+        };
         let mut spans = vec![
-            Span::styled(format!("   {glyph} "), Style::default().fg(color)),
+            lead,
             Span::styled(message, Style::default().fg(self.theme.ui(COLOR_MSG))),
         ];
         if !item.source.is_empty() {
@@ -1222,5 +1299,91 @@ mod tests {
         let text = render(&mut p, 80, 4);
         assert!(text.contains("function `run` is never used"), "{text:?}");
         assert!(text.contains("Ln 5"), "one-based line: {text:?}");
+    }
+
+    /// #374: the fix instruction names the diagnostic precisely and carries
+    /// the server's quick fixes as hints; it never repeats the buffer, which
+    /// the turn composer appends itself.
+    #[test]
+    fn fix_prompt_names_the_diagnostic_and_carries_the_servers_hints() {
+        let mut item = diag(
+            6,
+            DiagnosticSeverity::Error,
+            "unused import: `std::io`\nremove it",
+        );
+        item.col = 4;
+        let text = fix_prompt(&item, "src/lib.rs", &[]);
+        assert!(
+            text.starts_with("Fix the error reported by rustc at src/lib.rs:7:5: unused import")
+        );
+        assert!(
+            text.contains("unused import: `std::io` remove it"),
+            "a multi-line message collapses to one line: {text}"
+        );
+        assert!(!text.contains("quick fixes"), "no hints, no hint line");
+        assert!(text.contains("smallest change"));
+
+        let hinted = fix_prompt(
+            &item,
+            "src/lib.rs",
+            &[
+                String::from("Remove unused import"),
+                String::from("Fix all"),
+            ],
+        );
+        assert!(hinted.contains("quick fixes"));
+        assert!(hinted.contains("Remove unused import; Fix all"));
+
+        item.source.clear();
+        item.severity = DiagnosticSeverity::Hint;
+        let anon = fix_prompt(&item, "a.py", &[]);
+        assert!(anon.starts_with("Fix the diagnostic reported by a diagnostic tool at a.py:7:5"));
+    }
+
+    /// #374: the row being fixed wears the spinner instead of its severity
+    /// glyph, and only that row.
+    #[test]
+    fn the_row_being_fixed_wears_the_spinner() {
+        let mut p = ProblemsPanel::new();
+        let path = PathBuf::from("/w/src/a.rs");
+        p.set_groups(vec![ProblemGroup {
+            path: path.clone(),
+            name: "a.rs".into(),
+            rel_dir: "src".into(),
+            items: vec![
+                diag(3, DiagnosticSeverity::Error, "first"),
+                diag(9, DiagnosticSeverity::Error, "second"),
+            ],
+        }]);
+        let before = render(&mut p, 60, 6);
+        assert!(
+            !before.contains('\u{25DC}'),
+            "no spinner while nothing is being fixed"
+        );
+
+        p.fixing = Some((path.clone(), 9));
+        p.fix_glyph = "\u{25DC}";
+        let out = render(&mut p, 60, 6);
+        let rows: Vec<&str> = out.lines().collect();
+        let first = rows.iter().find(|r| r.contains("first")).unwrap();
+        let second = rows.iter().find(|r| r.contains("second")).unwrap();
+        assert!(
+            !first.contains('\u{25DC}'),
+            "the other row keeps its glyph: {first}"
+        );
+        assert!(
+            second.contains('\u{25DC}'),
+            "the fixing row shows the spinner: {second}"
+        );
+        assert!(
+            !second.contains(GLYPH_ERROR),
+            "in place of its severity glyph: {second}"
+        );
+
+        assert_eq!(
+            p.diagnostic_at(2).map(|(pth, item)| (pth, item.line)),
+            Some((path, 3)),
+            "the row under the pointer resolves to its whole diagnostic"
+        );
     }
 }
