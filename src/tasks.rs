@@ -734,6 +734,31 @@ mod tests {
         assert_eq!(v["b"], 1);
     }
 
+    /// The non-ASCII guarantee belongs on the function that carries it.
+    ///
+    /// Seven modules route their JSONC through here, and #396 was a second
+    /// copy in `workspace.rs` that walked BYTES: it rebuilt every multi-byte
+    /// character one byte at a time, so `caf\u{e9}` came back as `caf\u{c3}\u{a9}`
+    /// and the JSON still parsed. That copy is gone, but the only tests that
+    /// covered this were in the CALLERS, and each of those reaches this
+    /// function through file IO and a JSON parse. A future rewrite of this
+    /// stripper could reintroduce the defect for every module whose own
+    /// tests happen to be ASCII, which was all of them.
+    ///
+    /// Non-ASCII in a key as well as a value: a mangled key does not merely
+    /// arrive wrong, it makes the document fail to parse outright.
+    #[test]
+    fn strip_jsonc_preserves_non_ascii() {
+        let cleaned = strip_jsonc(
+            "{\n  // a comment, so the comment path actually runs\n  \"caf\u{e9}\": \"\u{4e2d}\u{6587} \u{444}\u{430}\u{439}\u{43b}\",\n}",
+        );
+        let v: serde_json::Value = serde_json::from_str(&cleaned).expect("valid strict JSON");
+        assert_eq!(
+            v["caf\u{e9}"],
+            "\u{4e2d}\u{6587} \u{444}\u{430}\u{439}\u{43b}"
+        );
+    }
+
     #[test]
     fn empty_workspace_has_no_tasks() {
         let tmp = tempfile::tempdir().unwrap();

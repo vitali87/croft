@@ -12,8 +12,11 @@ comment and now has none is the exact fingerprint the insertion leaves behind,
 and it is what both known instances did.
 
 Deliberate removals are rare and are declared: put
-`doc-removal: <path>::<fn name>` in a commit message on the branch. The path
-qualifier keeps one declared removal from excusing a same-named function
+`doc-removal: <path>::<item key>` in a commit message on the branch, where
+the key is the one the gate's own error names: a bare name for a free item
+(`src/foo.rs::bar`), or the enclosing impl header for a method
+(`src/foo.rs::Foo::new`, `src/foo.rs::Display for Foo::fmt`). The path
+qualifier keeps one declared removal from excusing a same-named item
 elsewhere.
 
 Usage: check_doc_ownership.py <base-rev> <head-rev>
@@ -64,33 +67,194 @@ MISSING_PATH = re.compile(
 )
 
 
-def git(*args, allow_missing_path=False, allow_fail=False):
+# The head of an `impl` or `trait` block. Its methods are keyed
+# `<header>::<name>` so that `new` in two impl blocks is two items, not one
+# merged key whose "any documented" reading hides a capture on either
+# (#405). The whole header is the key rather than the type alone: `impl
+# Display for X` and `impl Debug for X` both define `fmt`. A trait's own
+# method declarations get the same treatment, keyed `trait Foo::id`, since
+# two traits declaring `id` are the same shape. Generics and lifetimes are
+# stripped so a branch that reformats them does not move every method to a
+# new key.
+BLOCK_HEADER = re.compile(
+    r"^\s*(?:(?:pub(?:\([^)]*\))?\s+)?trait|(?:unsafe\s+)?impl)\b(?P<rest>.*)$"
+)
+
+# Everything on a CODE line that is not block structure, in the order a
+# left-to-right scan meets it: a complete raw string (`r#"{"#` is not a
+# `"..."` and its braces are content), a complete ordinary string, a char
+# literal (exactly one, possibly escaped, character between quotes, which
+# is what keeps a lifetime `'a` from opening one), a raw string that runs
+# past its line, an ordinary one that does (a `"...\` continuation), and a
+# `//` comment. `format!("{x}")` is on most lines that matter, and one
+# miscounted brace keys every item after it to the wrong block.
+TOKEN = re.compile(
+    r'(?P<raw>b?r(?P<hashes>#*)"(?:(?!"(?P=hashes)).)*"(?P=hashes))'
+    r'|(?P<plain>b?"(?:\\.|[^"\\])*")'
+    r"|(?P<char>b?'(?:\\.|[^'\\])')"
+    r'|(?P<open_raw>b?r(?P<open_hashes>#*)")'
+    r'|(?P<open_plain>")'
+    r"|(?P<comment>//)"
+)
+
+# The first `"` not escaped by a backslash: where an ordinary string that
+# ran past its line ends.
+UNESCAPED_QUOTE = re.compile(r'(?<!\\)(?:\\\\)*"')
+
+
+def strip_generics(text):
+    """Drop every `<...>` group, nested ones included."""
+    out, depth = [], 0
+    for ch in text:
+        if ch == "<":
+            depth += 1
+        elif ch == ">" and depth > 0:
+            depth -= 1
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+
+def block_key(kind, header):
+    """`impl<T> fmt::Display for Foo<T> where T: X {` -> `fmt::Display for Foo`;
+    `trait Foo: Bar {` -> `trait Foo`.
+
+    Everything from the first `where` or `{` on is the block's body or
+    bounds, not its identity. A trait keeps its keyword so `trait Foo` and an
+    inherent `impl Foo` on a same-named type stay distinct.
+    """
+    rest = strip_generics(header)
+    rest = re.split(r"\bwhere\b|\{|:", rest, maxsplit=1)[0] if kind == "trait" else re.split(r"\bwhere\b|\{", rest, maxsplit=1)[0]
+    rest = " ".join(rest.split())
+    return f"trait {rest}" if kind == "trait" else rest
+
+
+class BlockTracker:
+    """Which `impl`/`trait` block each line of a file is in.
+
+    Fed CODE lines in order. Counts braces after removing literals and a
+    trailing `//` comment; a string that runs past its line puts the tracker
+    in "content" mode until the terminator, so a multi-line raw string full
+    of JSON braces is invisible to it. A header whose `{` comes later (a
+    `where` clause, a rustfmt-wrapped `impl<T>\n Trait for X<T>\n{`) is
+    accumulated until that brace opens. A body-less `impl Eq for X {}` opens
+    and closes on one line and must not leak its key onto the next block.
+
+    The counter is line-based and therefore fallible in principle; the
+    invariants a caller can check are `depth == 0` and no open blocks at
+    EOF, and the test-suite asserts both over every file in `src/`. Depth is
+    floored at zero so one miscount cannot corrupt every later block.
+    """
+
+    def __init__(self):
+        self.depth = 0
+        # (depth the block opened at, key or None for a `mod`/`fn` body).
+        self.blocks = []
+        # Header text accumulated while waiting for its opening brace.
+        self.pending = None
+        # Terminator of a string that ran past its line, or None.
+        self.open_string = None
+
+    def scope(self):
+        """The innermost impl/trait key, or None. A block with no key (a
+        nested `fn` or `mod`) is transparent: it still lives in the impl."""
+        return next((k for _, k in reversed(self.blocks) if k), None)
+
+    def _code_of(self, line):
+        """The line with literals and comments removed, tracking strings
+        that span lines."""
+        if self.open_string is not None:
+            if self.open_string == '"':
+                m = UNESCAPED_QUOTE.search(line)
+                if not m:
+                    return ""
+                line = line[m.end():]
+            else:
+                at = line.find(self.open_string)
+                if at < 0:
+                    return ""
+                line = line[at + len(self.open_string):]
+            self.open_string = None
+        out = []
+        pos = 0
+        for m in TOKEN.finditer(line):
+            out.append(line[pos:m.start()])
+            pos = m.end()
+            if m.group("comment"):
+                return "".join(out)
+            if m.group("open_raw"):
+                self.open_string = '"' + m.group("open_hashes")
+                return "".join(out)
+            if m.group("open_plain"):
+                self.open_string = '"'
+                return "".join(out)
+        out.append(line[pos:])
+        return "".join(out)
+
+    def feed(self, line):
+        header = BLOCK_HEADER.match(line) if self.open_string is None else None
+        code = self._code_of(line)
+        if header:
+            kind = "trait" if "trait" in header.group(0)[: header.start("rest")] else "impl"
+            self.pending = (kind, header.group("rest"))
+        elif self.pending is not None and "{" not in code:
+            # Still inside a wrapped header: `impl<T>` / `Trait for X<T>`.
+            self.pending = (self.pending[0], self.pending[1] + " " + line.strip())
+        delta = code.count("{") - code.count("}")
+        if "{" in code:
+            if delta > 0:
+                key = block_key(*self.pending) if self.pending else None
+                self.blocks.append((self.depth, key))
+            # Opened and closed on one line (`impl Eq for X {}`): the header
+            # is spent either way.
+            self.pending = None
+        self.depth = max(self.depth + delta, 0)
+        while self.blocks and self.blocks[-1][0] >= self.depth:
+            self.blocks.pop()
+
+
+def git(*args, allow_missing_path=False):
     """Run git, failing closed.
 
     A silent failure here is worse than a crash: an errored `git diff` yields
     an empty file list, the checker reports "no documentation lost" and exits
     zero, and the gate has passed by not running.
 
-    `allow_missing_path` narrows that tolerance to exactly the expected case,
-    and `allow_fail` is separate and narrower still: it is for a probe whose
-    exit status IS the answer, and its empty return is never read as content.
+    `allow_missing_path` narrows that tolerance to exactly the expected case.
     Tolerating every non-zero exit would let an invalid revision or a
     malformed object read as empty content, which is the same fail-open bug
-    one door further in.
+    one door further in. A probe whose exit status IS the answer does not go
+    through here at all: see `exists_at`.
     """
     proc = subprocess.run(["git", *args], capture_output=True, text=True)
     if proc.returncode != 0:
-        # `allow_fail` is for a PROBE whose non-zero exit is the answer
-        # (`cat-file -e` asking whether a path exists), never for a command
-        # whose output is then read as content.
-        if allow_fail:
-            return ""
         if allow_missing_path and MISSING_PATH.search(proc.stderr):
             return ""
         raise SystemExit(
             f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
         )
     return proc.stdout
+
+
+def exists_at(rev, path):
+    """Whether `path` is present at `rev`.
+
+    A probe: `git cat-file -e` prints nothing either way and answers with
+    its exit status. Reading its stdout, as the added-file detection once
+    did, made every changed file look branch-added: each took the pairwise
+    commit walk (minutes on a real branch, for nothing) and a capture in an
+    existing file was reported twice, once per loop.
+    """
+    proc = subprocess.run(
+        ["git", "cat-file", "-e", f"{rev}:{path}"], capture_output=True, text=True
+    )
+    return proc.returncode == 0
+
+
+def added_files(base, changed):
+    """The changed files that do not exist at `base`: the branch added them,
+    so their history lives only in its own commits."""
+    return [f for f in changed if not exists_at(base, f)]
 
 
 def is_doc(line):
@@ -169,12 +333,20 @@ def classify(lines):
 
 
 def documented(text):
-    """Map item name -> True when ANY definition of it carries a doc comment.
+    """Map item key -> True when ANY definition under it carries a doc comment.
 
-    Keyed by name because two revisions cannot be lined up by position. Where
-    a file defines the same name more than once (`new` across impl blocks),
-    "any documented" is the deliberately conservative reading: the check fires
-    only when every definition of that name has lost its prose.
+    Keyed by name because two revisions cannot be lined up by position, and
+    a method's name is qualified by its enclosing `impl` or `trait` header
+    (`Foo::new`, `Display for Foo::fmt`) because a bare name is not unique
+    where it matters most: `new` across impl blocks is the common shape,
+    and merging them let a capture on one hide behind the other's surviving
+    prose (#405). Items outside any impl, and items in a `mod` or a `fn`
+    body, keep the bare name, so every pre-existing key for those survives.
+    Where one key still covers several definitions (a `cfg`-gated pair, say)
+    "any documented" remains the deliberately conservative reading: the
+    check fires only when every definition under that key has lost its
+    prose. Under-reporting there is the safer direction for a gate that
+    blocks merges; a mis-aligned key would turn it into a false accusation.
 
     `///` lowers to an outer `#[doc]` attribute, and an attribute is not
     detached from its item by blank lines or ordinary comments - verified
@@ -187,12 +359,21 @@ def documented(text):
     lines = text.splitlines()
     kinds = classify(lines)
     state = {}
+    tracker = BlockTracker()
     for i, line in enumerate(lines):
+        # The scope an item belongs to is the one in force BEFORE its own
+        # line: `trait A {` is itself an item, keyed to whatever encloses
+        # it, not to the block it opens.
+        scope = tracker.scope()
+        if kinds[i] == CODE:
+            tracker.feed(line)
         m = ITEM.match(line)
         if not m:
             continue
         # Exactly one alternative captures per match.
         name = next(g for g in m.groups() if g)
+        if scope:
+            name = f"{scope}::{name}"
         j = i - 1
         while j >= 0 and kinds[j] in (ATTR, SKIP):
             j -= 1
@@ -210,7 +391,8 @@ def main():
     exempt = {
         (path, name)
         for path, name in re.findall(
-            r"doc-removal:\s*([\w./-]+\.rs)::([A-Za-z_]\w*)", declared
+            r"doc-removal:\s*([\w./-]+\.rs)::((?:(?:trait )?[A-Za-z_][\w:]*(?: for [A-Za-z_][\w:]*)?::)?[A-Za-z_]\w*)",
+            declared,
         )
     }
     changed = [
@@ -222,7 +404,7 @@ def main():
     # empty and no loss can ever be reported in it: a doc captured within the
     # branch is invisible to a merge-base comparison. Those files are checked
     # commit-by-commit instead, which is the only place their history exists.
-    added = [f for f in changed if not git("cat-file", "-e", f"{base}:{f}", allow_missing_path=True, allow_fail=True)]
+    added = added_files(base, changed)
     if added:
         # What matters is the state at HEAD. A doc captured in one commit and
         # restored in a later one is not a loss: the branch is fine, and
@@ -253,9 +435,9 @@ def main():
     for f in changed:
         # A path can legitimately be absent on one side: the branch added the
         # file, or deleted it. That is the one git failure this tolerates -
-        # `allow_fail` exists for exactly it, and not passing it here made the
-        # gate abort on every PR that adds a Rust file, which is how it failed
-        # on the first one that did.
+        # `allow_missing_path` exists for exactly it, and not passing it here
+        # made the gate abort on every PR that adds a Rust file, which is how
+        # it failed on the first one that did.
         before = documented(git("show", f"{base}:{f}", allow_missing_path=True))
         after = documented(git("show", f"{head}:{f}", allow_missing_path=True))
         for name, had_doc in before.items():

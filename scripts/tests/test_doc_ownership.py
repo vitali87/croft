@@ -9,6 +9,9 @@ about parsing: what a merge base can see, and what it cannot.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -162,31 +165,199 @@ class ItemKinds(unittest.TestCase):
         state = gate.documented('/// doc\nconst A: &str = "const B: u8 = 1;";\n')
         self.assertEqual(state, {"A": True}, "B is inside a string, not an item")
 
-    def test_same_named_items_are_merged_which_under_reports(self):
-        """A KNOWN limitation, pinned so it is a decision rather than a bug.
+    def test_methods_are_keyed_by_their_enclosing_impl(self):
+        """Two `fn new` in different impl blocks are two items (#405).
 
-        Two `fn new` in different impl blocks share one key, and "any
-        documented" wins, so a capture on one is invisible while the other
-        keeps its prose. The alternative is an occurrence-unique key, and
-        every candidate (position, index, enclosing type) has to line up
-        across two revisions that may have moved the item; a key that
-        mis-aligns turns a silent miss into a false accusation, which is
-        worse for a gate that blocks merges.
-
-        So the gate under-reports on duplicate names, deliberately. Tracked
-        for a proper fix; pinned here so a future change that alters this
-        behaviour has to look at this test and say which way it went.
+        Keyed by bare name, "any documented" merged them and a capture on
+        one was invisible while the other kept its prose. The enclosing
+        `impl` header is the occurrence-unique key that still lines up
+        across revisions: an edit above the block moves it, but does not
+        change what it is an impl of.
         """
-        both_documented = "/// a\nfn new() {}\n\n/// b\nfn new() {}\n"
-        one_captured = "/// a\nfn other() {}\nfn new() {}\n\n/// b\nfn new() {}\n"
-        self.assertEqual(gate.documented(both_documented), {"new": True})
+        both_documented = (
+            "impl A {\n    /// a\n    fn new() {}\n}\n\n"
+            "impl B {\n    /// b\n    fn new() {}\n}\n"
+        )
+        one_captured = (
+            "impl A {\n    /// a\n    fn other() {}\n    fn new() {}\n}\n\n"
+            "impl B {\n    /// b\n    fn new() {}\n}\n"
+        )
+        self.assertEqual(
+            gate.documented(both_documented), {"A::new": True, "B::new": True}
+        )
         self.assertEqual(
             gate.documented(one_captured),
-            {"other": True, "new": True},
-            "the surviving doc on the second `new` keeps the key True, so the "
-            "capture on the first is not visible: under-reporting, not a "
-            "false alarm",
+            {"A::other": True, "A::new": False, "B::new": True},
+            "the capture on A::new is visible even though B::new kept its doc",
         )
+
+    def test_trait_impls_for_the_same_type_are_distinct_blocks(self):
+        """`impl Display for X` and `impl Debug for X` both define `fmt`;
+        the type alone is not a unique key, so the whole header is."""
+        text = (
+            "impl fmt::Display for X {\n    /// d\n    fn fmt(&self) {}\n}\n"
+            "impl fmt::Debug for X {\n    fn fmt(&self) {}\n}\n"
+        )
+        self.assertEqual(
+            gate.documented(text),
+            {"fmt::Display for X::fmt": True, "fmt::Debug for X::fmt": False},
+        )
+
+    def test_impl_header_shapes(self):
+        """Generics, lifetimes, a `where` clause with the brace on its own
+        line, and a trait impl: each still yields the same key, so a branch
+        that reformats the header does not move the item to a new key."""
+        for label, header in [
+            ("plain", "impl Foo {"),
+            ("generic", "impl<'a, T: Clone> Foo<'a, T> {"),
+            ("where clause, brace on the next line", "impl<T> Foo<T>\nwhere\n    T: Clone,\n{"),
+            ("unsafe impl", "unsafe impl Foo {"),
+        ]:
+            state = gate.documented(f"{header}\n    /// doc\n    fn new() {{}}\n}}\n")
+            self.assertEqual(state, {"Foo::new": True}, label)
+        state = gate.documented(
+            "impl<T> Iterator for Foo<T> {\n    /// doc\n    fn next(&mut self) {}\n}\n"
+        )
+        self.assertEqual(state, {"Iterator for Foo::next": True})
+
+    def test_braces_in_strings_and_chars_do_not_break_block_tracking(self):
+        """Format strings are full of braces. Counting them would leave the
+        scanner inside a block that has closed, and key the next top-level
+        item to an impl it is not in."""
+        text = (
+            "impl Foo {\n"
+            "    /// doc\n"
+            '    fn new() { let _ = format!("{{ {x} }}"); let c = \'{\'; }\n'
+            "}\n"
+            "/// top\n"
+            "fn top() {}\n"
+        )
+        self.assertEqual(gate.documented(text), {"Foo::new": True, "top": True})
+
+    def test_items_outside_any_impl_keep_the_bare_name(self):
+        """Top-level items, and items inside `mod` or `fn` bodies, are keyed
+        by name as before: the impl header is the only qualifier, so every
+        existing key for a free item survives unchanged."""
+        text = (
+            "/// a\nfn a() {}\n"
+            "mod m {\n    /// b\n    pub fn b() {}\n}\n"
+            "impl X {\n    /// c\n    fn c() {}\n}\n"
+            "/// d\nfn d() {}\n"
+        )
+        self.assertEqual(
+            gate.documented(text), {"a": True, "b": True, "X::c": True, "d": True}
+        )
+
+    def test_a_bodyless_impl_does_not_qualify_the_next_block(self):
+        """`impl Eq for X {}` opens and closes on one line. Its header must
+        not survive onto the next block, or a `mod` after a marker impl has
+        every item keyed to that impl, and a capture inside it is filed under
+        a key the base revision never had: a missed report, on the exact
+        shape (`src/widgets/file_finder.rs`) the repo contains."""
+        text = "impl Eq for X {}\nmod util {\n    /// doc\n    pub fn go() {}\n}\n"
+        self.assertEqual(gate.documented(text), {"go": True})
+        # And the base-vs-head comparison still reports the capture.
+        captured = (
+            "impl Eq for X {}\nmod util {\n    /// doc\n    pub fn newcomer() {}\n"
+            "    pub fn go() {}\n}\n"
+        )
+        after = gate.documented(captured)
+        self.assertEqual(after.get("go"), False, f"go lost its doc: {after}")
+
+    def test_raw_strings_do_not_break_block_tracking(self):
+        """`r#"{"#` is not a `"..."`, and a multi-line raw string of JSON is
+        braces all the way down. Both left the counter inside a block that
+        had closed, on seven real files under src/."""
+        single = (
+            'impl Foo {\n    /// doc\n    fn m() {\n'
+            '        let j = r#"[{"key": "click"}]"#;\n    }\n}\n'
+            "/// top\nfn top() {}\n"
+        )
+        self.assertEqual(gate.documented(single), {"Foo::m": True, "top": True})
+        multi = (
+            'impl Foo {\n    /// doc\n    fn m() {\n'
+            '        let j = r#"{ "tasks": [\n'
+            '            { "label": "x" }\n'
+            '        ] }"#;\n    }\n}\n'
+            "/// top\nfn top() {}\n"
+        )
+        self.assertEqual(gate.documented(multi), {"Foo::m": True, "top": True})
+        plain_multi = (
+            'impl Foo {\n    /// doc\n    fn m() {\n'
+            '        let s = "{ opens here\n'
+            '            and closes here }";\n    }\n}\n'
+            "/// top\nfn top() {}\n"
+        )
+        self.assertEqual(gate.documented(plain_multi), {"Foo::m": True, "top": True})
+
+    def test_a_header_wrapped_by_rustfmt_keeps_its_key(self):
+        """`impl<T>` alone on the first line strips to nothing; the key must
+        come from the whole header, or a rewrap moves every method to a
+        bare key and a capture in that PR goes unreported."""
+        text = "impl<T>\n    Trait for X<T>\n{\n    /// doc\n    fn m() {}\n}\n"
+        self.assertEqual(gate.documented(text), {"Trait for X::m": True})
+
+    def test_trait_methods_are_keyed_by_their_trait(self):
+        """Two traits declaring `id` are the same shape as two impls
+        defining `new`."""
+        text = (
+            "trait A {\n    /// a\n    fn id(&self);\n}\n"
+            "trait B: Clone {\n    /// b\n    fn id(&self);\n}\n"
+        )
+        self.assertEqual(
+            gate.documented(text),
+            {"A": False, "trait A::id": True, "B": False, "trait B::id": True},
+            "the traits are items in their own scope; their methods are in theirs",
+        )
+
+    def test_the_block_tracker_is_balanced_at_eof_on_every_real_file(self):
+        """The counter is line-based, so the only proof it kept up with a
+        file is that it ends where it started: depth zero, no open block.
+        Run over every Rust file in the repo, so a new literal shape that
+        desyncs it fails here before it mis-keys anything."""
+        src = Path(__file__).resolve().parents[2] / "src"
+        files = sorted(src.rglob("*.rs"))
+        self.assertGreater(len(files), 50, "the control corpus is missing")
+        unbalanced = []
+        for f in files:
+            lines = f.read_text().splitlines()
+            kinds = gate.classify(lines)
+            t = gate.BlockTracker()
+            for line, kind in zip(lines, kinds):
+                if kind == gate.CODE:
+                    t.feed(line)
+            if t.depth != 0 or t.blocks or t.open_string is not None:
+                unbalanced.append((str(f.relative_to(src)), t.depth, t.blocks, t.open_string))
+        self.assertEqual(unbalanced, [], "the tracker lost count in these files")
+
+    def test_same_named_items_in_the_same_scope_are_still_merged(self):
+        """Two definitions under ONE key (a `cfg`-gated pair, say) keep the
+        conservative "any documented" reading: the gate under-reports there
+        rather than accusing the wrong twin."""
+        text = "/// a\nfn new() {}\n\n/// b\nfn new() {}\n"
+        one_captured = "/// a\nfn other() {}\nfn new() {}\n\n/// b\nfn new() {}\n"
+        self.assertEqual(gate.documented(text), {"new": True})
+        self.assertEqual(gate.documented(one_captured), {"other": True, "new": True})
+
+    def test_a_capture_on_one_impl_of_a_shared_method_name_is_reported(self):
+        """End to end: the #405 shape blocks the merge."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit(
+                "a.rs",
+                "impl A {\n    /// a\n    fn new() {}\n}\n"
+                "impl B {\n    /// b\n    fn new() {}\n}\n",
+            )
+            repo.branch("work")
+            repo.commit(
+                "a.rs",
+                "impl A {\n    /// a\n    fn other() {}\n    fn new() {}\n}\n"
+                "impl B {\n    /// b\n    fn new() {}\n}\n",
+            )
+            self.assertEqual(repo.exit_code(), 1, "A::new lost its doc")
+            # The declared-removal escape hatch takes the qualified key.
+            repo.commit("a.rs", "// nudge\n" + (repo.path / "a.rs").read_text(), "ok\n\ndoc-removal: a.rs::A::new")
+            self.assertEqual(repo.exit_code(), 0, "a declared A::new removal is exempt")
 
     def test_the_error_names_the_revision_the_doc_was_last_seen_at(self):
         """For a file the branch ADDED, `base` is the wrong revision to cite.
@@ -265,6 +436,54 @@ class GitShapes(unittest.TestCase):
             repo.commit("a.rs", CAPTURED_CONST)
             self.assertEqual(
                 repo.exit_code(), 1, "the gate must fail on a captured doc"
+            )
+
+    def test_a_file_present_at_the_base_is_not_treated_as_added(self):
+        """`git cat-file -e` prints nothing on success, so a probe that read
+        its stdout took every changed file for a branch-added one: each
+        went through the pairwise commit walk (the slow path, minutes on a
+        real branch) and a capture in an existing file was reported twice,
+        once per loop. The probe must read the exit status."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", DOCUMENTED_CONST)
+            repo.branch("work")
+            repo.commit("a.rs", CAPTURED_CONST)
+            repo.commit("new.rs", "/// n\nfn n() {}\n")
+            cwd = os.getcwd()
+            os.chdir(repo.path)
+            try:
+                self.assertTrue(gate.exists_at("main", "a.rs"))
+                self.assertFalse(gate.exists_at("main", "new.rs"))
+                self.assertEqual(gate.added_files("main", ["a.rs", "new.rs"]), ["new.rs"])
+            finally:
+                os.chdir(cwd)
+
+    def test_a_capture_in_an_existing_file_is_reported_exactly_once(self):
+        """Two commits on the branch, so the pairwise walk has a pair to
+        compare: with every file mistaken for branch-added, the capture
+        was reported by that walk AND by the base comparison."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", DOCUMENTED_CONST)
+            repo.branch("work")
+            repo.commit("a.rs", DOCUMENTED_CONST + "\n/// Extra.\nconst EXTRA: u8 = 1;\n")
+            repo.commit("a.rs", CAPTURED_CONST + "\n/// Extra.\nconst EXTRA: u8 = 1;\n")
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            out = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            self.assertEqual(
+                out.getvalue().count("::error"),
+                1,
+                f"one loss, one annotation: {out.getvalue()}",
             )
 
     def test_a_capture_inside_a_file_the_branch_added_is_reported(self):
