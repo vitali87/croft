@@ -41001,22 +41001,16 @@ fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
         s = s[1..s.len() - 1].to_string();
     }
     if let Some(rest) = s.strip_prefix("file://") {
-        let mut path = String::with_capacity(rest.len());
-        let bytes = rest.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%'
-                && i + 2 < bytes.len()
-                && let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
-            {
-                path.push((h * 16 + l) as char);
-                i += 3;
-                continue;
-            }
-            path.push(bytes[i] as char);
-            i += 1;
-        }
-        s = path;
+        // Decode into BYTES and build the string once. A `%xx` escape is one
+        // byte of a UTF-8 sequence, not a character; pushing it `as char`
+        // read it as Latin-1 and opened a path that does not exist (#414).
+        // A sequence that is not valid UTF-8 names no path this process can
+        // open, so per this function's contract the token is dropped rather
+        // than turned into a plausible-looking path of replacement
+        // characters, which would pass every caller's "is this a path"
+        // screen and open the wrong thing.
+        let decoded = crate::shell_integration::percent_decode(rest.as_bytes());
+        s = String::from_utf8(decoded).ok()?;
     }
     let mut unescaped = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -41055,15 +41049,6 @@ fn append_to_relay_log(log_path: &Path, payload: &str) -> std::io::Result<()> {
     f.write_all(payload.as_bytes())?;
     f.sync_data().ok();
     Ok(())
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Map a screen cell to a sheet grid cell (#177) using the frame-truth
@@ -41164,14 +41149,11 @@ fn semantic_reply_is_current(seen: Option<u64>, incoming: u64) -> bool {
 /// body. The body starts one row below the header and the view scrolls by
 /// whole lines, so the mapping is a straight offset.
 ///
-/// One cell is treated as one CHARACTER, which is what `render_log` already
-/// assumes: it advances by `chars().count()` rather than by display width,
-/// so a double-width character occupies two cells on screen and one column
-/// in this arithmetic. Selection therefore drifts on a line containing CJK
-/// or emoji, by exactly as much as the painting does. Matching the renderer
-/// is deliberate: a mapping that measured width correctly would disagree
-/// with what is actually on screen, which is worse than agreeing with it
-/// wrongly. Fixing it means teaching the renderer first.
+/// A cell is mapped back to a character through the same `CellMap` the
+/// renderer painted with (#404): a double-width character is two cells and
+/// one column, and a click on either half is a click on that character.
+/// The two must move together; a mapping that measured width differently
+/// from the painter would disagree with what is actually on screen.
 fn log_cell_at(
     log: &crate::log_view::LogView,
     scroll: usize,
@@ -41180,20 +41162,23 @@ fn log_cell_at(
 ) -> (usize, usize) {
     let body = log.last_body;
     let line = (scroll + row.saturating_sub(body.y) as usize).min(log.len().saturating_sub(1));
-    let column = col.saturating_sub(body.x) as usize;
+    let cell = col.saturating_sub(body.x);
     // Clamp the COLUMN to the line's own length, not just the line to the
     // file's. The renderer paints to the endpoint it is given while the copy
     // reads `min(len)`, so an unclamped column let a drag past the end of a
     // short line paint sixty cells and copy three characters. Clamping here
     // means both readers see one value rather than each clamping its own way.
+    // `char_at_cell` already answers the character count for a cell past
+    // the end, which is that clamp.
     //
-    // A line outside the parsed window has no length to clamp against; the
-    // raw column stands, which is what the old behaviour was everywhere.
-    let width = log
+    // A line outside the parsed window has no text to map through; the raw
+    // cell stands as the column, which is what the old behaviour was
+    // everywhere.
+    let column = log
         .visible_text(line)
-        .map(|t| t.chars().count())
-        .unwrap_or(column);
-    (line, column.min(width))
+        .map(|t| crate::cell_map::CellMap::new(t).char_at_cell(cell))
+        .unwrap_or(cell as usize);
+    (line, column)
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
