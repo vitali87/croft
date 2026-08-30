@@ -35452,9 +35452,10 @@ fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
         Some((0, 0, 5)),
         "typing lands on the first match, at its own column"
     );
-    assert!(
-        app.editor_find.as_ref().unwrap().match_count > 0,
-        "the match is counted"
+    assert_eq!(
+        app.editor_find.as_ref().unwrap().match_count,
+        2,
+        "both head matches are counted, not merely some"
     );
 
     // Forward to the SECOND match, which is within budget, so this leg
@@ -35515,8 +35516,8 @@ fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
             .unwrap();
     }
     assert_eq!(
-        app.editor.active_search_match.map(|(r, _, _)| r),
-        Some(0),
-        "a query that matches again must paint its match"
+        app.editor.active_search_match,
+        Some((0, 0, 5)),
+        "a query that matches again must paint its match, whole"
     );
 }
