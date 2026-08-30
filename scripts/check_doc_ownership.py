@@ -64,6 +64,54 @@ MISSING_PATH = re.compile(
 )
 
 
+# The head of an `impl` block. Its methods are keyed `<header>::<name>` so
+# that `new` in two impl blocks is two items, not one merged key whose "any
+# documented" reading hides a capture on either (#405). The whole header is
+# the key rather than the type alone: `impl Display for X` and `impl Debug
+# for X` both define `fmt`. Generics and lifetimes are stripped so a branch
+# that reformats them does not move every method to a new key.
+IMPL_HEADER = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?impl\b(?P<rest>.*)$"
+)
+
+# String and char literals, so the braces inside them are not counted as
+# block structure. `format!("{x}")` is on most lines that matter, and one
+# miscounted brace keys every item after it to the wrong block.
+LITERAL = re.compile(r'"(?:\\.|[^"\\])*"' + r"|'(?:\\.|[^'\\])'")
+
+
+def strip_generics(text):
+    """Drop every `<...>` group, nested ones included."""
+    out, depth = [], 0
+    for ch in text:
+        if ch == "<":
+            depth += 1
+        elif ch == ">" and depth > 0:
+            depth -= 1
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+
+def impl_key(header):
+    """`impl<T> fmt::Display for Foo<T> where T: X {` -> `fmt::Display for Foo`.
+
+    Everything from the first `where` or `{` on is the block's body or
+    bounds, not its identity.
+    """
+    rest = strip_generics(header)
+    rest = re.split(r"\bwhere\b|\{", rest, maxsplit=1)[0]
+    return " ".join(rest.split())
+
+
+def brace_delta(line):
+    """Net `{` minus `}` on a CODE line, ignoring literals and a trailing
+    `//` comment."""
+    code = LITERAL.sub("", line)
+    code = code.split("//", 1)[0]
+    return code.count("{") - code.count("}")
+
+
 def git(*args, allow_missing_path=False, allow_fail=False):
     """Run git, failing closed.
 
@@ -169,12 +217,20 @@ def classify(lines):
 
 
 def documented(text):
-    """Map item name -> True when ANY definition of it carries a doc comment.
+    """Map item key -> True when ANY definition under it carries a doc comment.
 
-    Keyed by name because two revisions cannot be lined up by position. Where
-    a file defines the same name more than once (`new` across impl blocks),
-    "any documented" is the deliberately conservative reading: the check fires
-    only when every definition of that name has lost its prose.
+    Keyed by name because two revisions cannot be lined up by position, and
+    a method's name is qualified by its enclosing `impl` header
+    (`Foo::new`, `Display for Foo::fmt`) because a bare name is not unique
+    where it matters most: `new` across impl blocks is the common shape,
+    and merging them let a capture on one hide behind the other's surviving
+    prose (#405). Items outside any impl, and items in a `mod` or a `fn`
+    body, keep the bare name, so every pre-existing key for those survives.
+    Where one key still covers several definitions (a `cfg`-gated pair, say)
+    "any documented" remains the deliberately conservative reading: the
+    check fires only when every definition under that key has lost its
+    prose. Under-reporting there is the safer direction for a gate that
+    blocks merges; a mis-aligned key would turn it into a false accusation.
 
     `///` lowers to an outer `#[doc]` attribute, and an attribute is not
     detached from its item by blank lines or ordinary comments - verified
@@ -187,12 +243,35 @@ def documented(text):
     lines = text.splitlines()
     kinds = classify(lines)
     state = {}
+    # Enclosing blocks as (depth the block opened at, impl key or None).
+    # A `mod` or `fn` body pushes None so that only an impl qualifies.
+    blocks = []
+    depth = 0
+    # An impl header whose `{` is on a later line (a `where` clause), held
+    # until the brace that opens its body arrives.
+    pending = None
     for i, line in enumerate(lines):
+        if kinds[i] == CODE:
+            header = IMPL_HEADER.match(line)
+            if header:
+                pending = impl_key(header.group("rest"))
+            delta = brace_delta(line)
+            if delta > 0:
+                blocks.append((depth, pending))
+                pending = None
+            depth += delta
+            while blocks and blocks[-1][0] >= depth:
+                blocks.pop()
         m = ITEM.match(line)
         if not m:
             continue
         # Exactly one alternative captures per match.
         name = next(g for g in m.groups() if g)
+        # The innermost impl on the stack, if any. A block with no key (a
+        # nested `fn` or `mod`) is transparent: it still lives in the impl.
+        scope = next((k for _, k in reversed(blocks) if k), None)
+        if scope:
+            name = f"{scope}::{name}"
         j = i - 1
         while j >= 0 and kinds[j] in (ATTR, SKIP):
             j -= 1
@@ -210,7 +289,8 @@ def main():
     exempt = {
         (path, name)
         for path, name in re.findall(
-            r"doc-removal:\s*([\w./-]+\.rs)::([A-Za-z_]\w*)", declared
+            r"doc-removal:\s*([\w./-]+\.rs)::((?:[A-Za-z_][\w:]*(?: for [A-Za-z_][\w:]*)?::)?[A-Za-z_]\w*)",
+            declared,
         )
     }
     changed = [
