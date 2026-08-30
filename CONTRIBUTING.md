@@ -55,6 +55,10 @@ for real on this repo in a single day, and they share one shape: **the thing
 that would have told you was absent rather than wrong.** A check that cannot
 fail in the case you need it for is not a check.
 
+Where this section and an untracked `/CLAUDE.md` disagree, **this file wins**:
+`/CLAUDE.md` is gitignored, so a fresh clone never sees it and it drifts
+per-machine.
+
 **An all-green check list can mean CI never started.** As CI
 gets faster this gets more dangerous, not less: a check-settled test that polls
 until nothing is pending passes instantly against an empty list, because the
@@ -105,6 +109,9 @@ gh api graphql -f query='
   reviewThreads(first:50) { nodes { isResolved isOutdated path } } } } }'
 ```
 
+`first: 50` is a cap, not a promise: a PR with more threads than that returns a
+short list, which is this section's own failure mode wearing a page size.
+
 `isOutdated` earns its place beside `isResolved`: a thread on a file your branch
 no longer owns appears there, and no code change will ever resolve it.
 
@@ -119,10 +126,8 @@ gh api repos/<repo>/rules/branches/main
 
 On this repo that is where `required_review_thread_resolution` lives, which is
 why a PR with every check green and every finding fixed in code still refuses
-to merge until the threads themselves are resolved. Fixing the code does not
-resolve a thread, and a thread on a file your branch no longer owns cannot be
-resolved by any code change at all — reply saying where the point was addressed,
-then resolve it.
+to merge until the threads themselves are resolved. Fixing the code does not resolve a thread: reply saying where the point was
+addressed, then resolve it.
 
 **Your version was valid when you branched and is stale by the time you merge.**
 The release gate compares your head against the merge base, so it passes as
@@ -131,8 +136,6 @@ legitimately and only the second to merge conflicts. Re-read
 `git show origin/main:Cargo.toml` in the same breath as the final
 `gh pr checks`, which is one command.
 
-This rule is repeated in `CLAUDE.md`, and this copy is the one to trust:
-`/CLAUDE.md` is gitignored, so a fresh clone never sees it.
 
 ## Every shipped change is a release
 
