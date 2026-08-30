@@ -1,3 +1,4 @@
+mod agents;
 mod ansi_text;
 mod app;
 mod archive;
