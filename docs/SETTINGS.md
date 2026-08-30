@@ -141,7 +141,7 @@ Events are `command_finished` (a command in a pane you are not focused on,
 lasting at least `min_duration_secs`, default 10), `tests_failed` (once per
 red Test Explorer run), `osc9` (a terminal's own notification), and
 `agent_waiting` (reserved for #344). An empty `events` takes all of them.
-`ntfy` posts to `server` (default `https://ntfy.sh`) under `topic`;
+`ntfy` posts to `server` (default `https://ntfy.sh`) under `topic`; both `ntfy` and `webhook` endpoints must be `https`, or `http` only to localhost — a plain-http endpoint across a network is refused and named in the channel;
 `webhook` posts JSON `{event, title, body, workspace, host, link}` with your
 `headers`; `termux` runs `termux-notification`; `command` runs `argv` with
 the notification in `CROFT_TITLE`, `CROFT_BODY`, `CROFT_LINK`, and

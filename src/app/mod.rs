@@ -26762,12 +26762,13 @@ impl App {
                 rang = Some(t.label().to_string());
             }
             for msg in t.drain_notifications() {
+                let cwd = t.local_shell_cwd();
                 self.notifier.emit(
                     crate::notifications::Event::Osc9 {
                         pane: t.label().to_string(),
                         message: msg.clone(),
                     },
-                    self.roots.primary(),
+                    self.root_for_path(cwd.as_deref()),
                     &remote_host_label(),
                 );
                 notes.push(msg);
@@ -26821,7 +26822,7 @@ impl App {
                         cwd: f.cwd.clone(),
                         host: f.host.clone(),
                     },
-                    self.roots.primary(),
+                    self.root_for_path(f.cwd.as_deref()),
                     &remote_host_label(),
                 );
                 if f.dur < LONG_COMMAND_NOTIFY {
@@ -27184,6 +27185,15 @@ impl App {
     /// lookups (the slow part) run on a one-shot background thread, keyed by
     /// shell pid so results land on the right pane even if panes moved. Returns
     /// whether any label changed (for redraw).
+    /// The workspace root a path belongs to, for a notification's title and
+    /// deep link (#358): in a multi-root session an event from a pane in a
+    /// secondary root must name that root, not the primary. The primary is
+    /// the fallback for a path outside every root, or no path at all.
+    fn root_for_path(&self, path: Option<&Path>) -> &Path {
+        path.and_then(|p| self.roots.iter().find(|r| p.starts_with(r)))
+            .unwrap_or_else(|| self.roots.primary())
+    }
+
     fn refresh_terminal_labels(&mut self) -> bool {
         let mut changed = false;
         // Apply whatever the last background lookup resolved.

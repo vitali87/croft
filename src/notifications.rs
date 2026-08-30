@@ -184,6 +184,29 @@ pub struct Request {
     pub body: String,
 }
 
+/// Whether an endpoint may carry a notification: HTTPS, or plain HTTP to
+/// the loopback host only. A webhook's headers can hold a token and the
+/// body names the workspace and host; sending either in cleartext across
+/// a network is not a configuration croft should honour quietly.
+pub fn endpoint_allowed(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix("http://") {
+        let host = host_of(rest);
+        // Drop a port: `[::1]:9` keeps its brackets' content, `localhost:8080`
+        // its first segment.
+        let bare = if let Some(inner) = host.strip_prefix('[') {
+            inner.split(']').next().unwrap_or("")
+        } else {
+            host.split(':').next().unwrap_or(&host)
+        };
+        return matches!(bare, "localhost" | "127.0.0.1" | "::1");
+    }
+    false
+}
+
 /// ntfy: POST the body to `<server>/<topic>`, title and click link in
 /// headers (ntfy's own scheme), tagged by event.
 pub fn ntfy_request(sink: &NotificationSink, n: &Notification) -> Option<Request> {
@@ -197,6 +220,9 @@ pub fn ntfy_request(sink: &NotificationSink, n: &Notification) -> Option<Request
         .map(|s| s.trim_end_matches('/'))
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_NTFY_SERVER);
+    if !endpoint_allowed(server) {
+        return None;
+    }
     Some(Request {
         url: format!("{server}/{topic}"),
         headers: vec![
@@ -212,7 +238,7 @@ pub fn ntfy_request(sink: &NotificationSink, n: &Notification) -> Option<Request
 /// headers are sent as given (that is where a bearer token lives).
 pub fn webhook_request(sink: &NotificationSink, n: &Notification) -> Option<Request> {
     let url = sink.url.as_deref()?.trim();
-    if url.is_empty() {
+    if url.is_empty() || !endpoint_allowed(url) {
         return None;
     }
     let body = serde_json::json!({
@@ -293,11 +319,24 @@ pub fn deliver(sink: &NotificationSink, n: &Notification) -> Result<(), Failure>
                 webhook_request(sink, n)
             }
             .ok_or_else(|| {
-                Failure::fixed(format!(
-                    "{} sink is missing its {}",
-                    sink.kind,
-                    if sink.kind == "ntfy" { "topic" } else { "url" }
-                ))
+                let target = if sink.kind == "ntfy" {
+                    sink.server.as_deref().unwrap_or(DEFAULT_NTFY_SERVER)
+                } else {
+                    sink.url.as_deref().unwrap_or("")
+                };
+                Failure::fixed(if !target.is_empty() && !endpoint_allowed(target) {
+                    format!(
+                        "{} sink refuses a plain-http endpoint ({}): use https, or http only to localhost",
+                        sink.kind,
+                        host_of(target)
+                    )
+                } else {
+                    format!(
+                        "{} sink is missing its {}",
+                        sink.kind,
+                        if sink.kind == "ntfy" { "topic" } else { "url" }
+                    )
+                })
             })?;
             post(&req)
         }
@@ -441,6 +480,25 @@ impl Notifier {
     pub fn new(sinks: &[NotificationSink]) -> Self {
         let mut keep = Vec::new();
         for s in sinks {
+            let endpoint = match s.kind.as_str() {
+                "ntfy" => Some(s.server.as_deref().unwrap_or(DEFAULT_NTFY_SERVER)),
+                "webhook" => s.url.as_deref(),
+                _ => None,
+            };
+            if let Some(url) = endpoint
+                && !url.trim().is_empty()
+                && !endpoint_allowed(url)
+            {
+                output::push(
+                    CHANNEL_NOTIFICATIONS,
+                    OutputLevel::Warn,
+                    &format!(
+                        "notifications: {} sink at {} is plain http and will be refused; use https, or http only to localhost",
+                        s.kind,
+                        host_of(url)
+                    ),
+                );
+            }
             match s.kind.as_str() {
                 "ntfy" | "webhook" | "termux" | "command" => keep.push(s.clone()),
                 other => output::push(
@@ -740,6 +798,45 @@ mod tests {
             "waited {:?}",
             started.elapsed()
         );
+    }
+
+    /// A token in a webhook header, and the workspace and host in every
+    /// body, must not cross a network in cleartext: https, or http only to
+    /// the loopback host.
+    #[test]
+    fn a_plain_http_endpoint_is_refused_unless_it_is_loopback() {
+        for ok in [
+            "https://ntfy.sh",
+            "https://hooks.example.org/x",
+            "http://localhost:8080/hook",
+            "http://127.0.0.1/hook",
+            "http://[::1]:9/x",
+        ] {
+            assert!(endpoint_allowed(ok), "{ok}");
+        }
+        for bad in [
+            "http://ntfy.example.org",
+            "http://10.0.0.5:8080/x",
+            "ftp://x",
+            "hooks.example.org",
+        ] {
+            assert!(!endpoint_allowed(bad), "{bad}");
+        }
+        let n = Notification::new(&finished(30), Path::new("/w"), "h");
+        let mut s = sink("webhook");
+        s.url = Some("http://hooks.example.org/x".into());
+        assert_eq!(webhook_request(&s, &n), None);
+        let err = deliver(&s, &n).unwrap_err();
+        assert!(
+            err.message.contains("plain-http") && !err.transient,
+            "{err:?}"
+        );
+        let mut t = sink("ntfy");
+        t.topic = Some("x".into());
+        t.server = Some("http://ntfy.example.org".into());
+        assert_eq!(ntfy_request(&t, &n), None);
+        t.server = Some("http://localhost:2586".into());
+        assert_eq!(ntfy_request(&t, &n).unwrap().url, "http://localhost:2586/x");
     }
 
     #[test]
