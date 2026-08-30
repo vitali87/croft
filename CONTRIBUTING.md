@@ -54,11 +54,30 @@ A PR that changes anything compiled into the binary (`src/`, `assets/`,
 
 * **bump `version` in `Cargo.toml`** — two different binaries must never share
   a version and differ only in commit hash, and
-* **replace the highlights in `src/release_notes.rs`** — the welcome panel's
-  "IN THIS RELEASE" card describes the single version it is baked into, so a
-  stale list means the panel lies about what the running build ships.
+* **write `src/release_notes/<version>.md`** — one file per version, named
+  for the version in `Cargo.toml`. The welcome panel's "IN THIS RELEASE" card
+  describes the single version it is baked into, so a missing or stale list
+  means the panel lies about what the running build ships.
 
-CI enforces both (the `version bump + release notes` job). Docs, CI, and
+One highlight per line, each prefixed `feature:` or `fix:`, which selects the
+card's glyph and tint. Blank lines and `#` headings are ignored:
+
+```text
+feature: Cmd+F now searches a rendered colour log.
+fix: A copy larger than the cap no longer splits a character.
+```
+
+A missing file for the current version is a **build** error, not an empty
+panel, so a binary always describes itself.
+
+Notes live in one file per version rather than one shared file because two
+versions' notes never conflict in content, only in the file they shared: with
+several PRs open, every merge forced a rebase through it, and the version
+number had to be reserved by hand between contributors (#399). Only the
+current version's file may change in a PR: an older one describes a release
+that has already shipped.
+
+CI enforces all of it (the `version bump + release notes` job). Docs, CI, and
 test-only PRs (`src/app/tests.rs`, `tests/`) are exempt.
 
 ## Insert new items AFTER a complete item, never above a doc block
