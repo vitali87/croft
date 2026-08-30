@@ -143,6 +143,10 @@ pub struct LogView {
     /// the index is complete, which is the only state in which `len()` is a
     /// total rather than a lower bound.
     index_rx: Option<std::sync::mpsc::Receiver<IndexBatch>>,
+    /// How far into the file the index folded in so far reaches, in bytes:
+    /// the frontier the batches have been applied through. This, not the
+    /// size at open, is what a pass that ends early is complete through.
+    scanned_to: u64,
     /// Parsed lines for the current window, keyed by absolute line number.
     cache: std::collections::BTreeMap<usize, AnsiLine>,
     /// Line number the cache starts at, for cheap eviction.
@@ -207,6 +211,10 @@ impl Indexer {
         // instructions that make a newline search memory-bound.
         for i in memchr::memchr_iter(b'\n', &self.buf[..n]) {
             if self.indexed >= MAX_INDEXED_LINES {
+                // The chunk was read, so `pos` still means "bytes scanned"
+                // on the way out; the offsets above were computed before
+                // the advance and are unaffected.
+                self.pos += n as u64;
                 return Ok(Scan::Capped);
             }
             out.push(self.pos + i as u64 + 1);
@@ -239,6 +247,7 @@ impl LogView {
             line_starts: vec![0u64],
             truncated: false,
             index_rx: None,
+            scanned_to: 0,
             cache: std::collections::BTreeMap::new(),
             cache_start: 0,
             selection: None,
@@ -266,11 +275,16 @@ impl LogView {
         // because what it holds IS the index, which is bounded by the cap.
         let (tx, rx) = std::sync::mpsc::channel();
         view.index_rx = Some(rx);
+        view.scanned_to = indexer.pos;
         std::thread::Builder::new()
             .name("croft-log-index".into())
             .spawn(move || {
+                let mut expect = 0usize;
                 loop {
-                    let mut starts = Vec::new();
+                    // Sized from the last batch: a chunk of similar lines
+                    // yields a similar count, so the hot path stops
+                    // reallocating as each batch grows.
+                    let mut starts = Vec::with_capacity(expect);
                     let (truncated, done) = match indexer.chunk(&mut starts) {
                         Ok(Scan::More) => (false, false),
                         Ok(Scan::Eof) => (false, true),
@@ -281,6 +295,7 @@ impl LogView {
                         // it is still indexing.
                         Err(_) => (false, true),
                     };
+                    expect = starts.len();
                     let batch = IndexBatch {
                         starts,
                         scanned_to: indexer.pos,
@@ -321,10 +336,12 @@ impl LogView {
                     break;
                 }
                 // The worker is gone without a final batch (it panicked):
-                // keep what it sent and stop claiming more is coming.
+                // keep what it sent and stop claiming more is coming. The
+                // index is complete through the frontier it reached, not
+                // through the file.
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     changed = true;
-                    let end = self.file_len;
+                    let end = self.scanned_to;
                     self.finish(end);
                 }
             }
@@ -342,7 +359,7 @@ impl LogView {
                     self.apply(batch);
                 }
                 Err(_) => {
-                    let end = self.file_len;
+                    let end = self.scanned_to;
                     self.finish(end);
                 }
             }
@@ -352,6 +369,7 @@ impl LogView {
     fn apply(&mut self, batch: IndexBatch) {
         self.line_starts.extend(batch.starts);
         self.truncated |= batch.truncated;
+        self.scanned_to = batch.scanned_to;
         if batch.done {
             self.finish(batch.scanned_to);
         }
@@ -361,10 +379,18 @@ impl LogView {
     /// length and the trailing-newline case, and drop the channel so
     /// `indexing()` turns false.
     fn finish(&mut self, scanned_to: u64) {
-        // A log being appended to under the pass is the normal case, so the
-        // scan's own reach, not the size at open, is the length the index
-        // describes.
-        self.file_len = self.file_len.max(scanned_to);
+        // The scan's own reach, not the size at open, is the length the
+        // index describes, in BOTH directions: a log appended to under the
+        // pass grows it, one truncated under the pass shrinks it (`max`
+        // here kept the stale length and a phantom trailing line). The one
+        // exception is the cap, where the scan stopped short of the file on
+        // purpose and the file's own length still bounds the last line.
+        self.file_len = if self.truncated {
+            self.file_len.max(scanned_to)
+        } else {
+            scanned_to
+        };
+        self.scanned_to = scanned_to;
         // A trailing newline produces an empty final entry; drop it so
         // `len()` matches what a reader would call the line count.
         if self.line_starts.len() > 1 && self.line_starts.last() == Some(&self.file_len) {
@@ -938,6 +964,70 @@ mod tests {
         let last = total - 1;
         v.ensure(last, 1).unwrap();
         assert_eq!(v.visible_text(last), Some("the very last line"));
+    }
+
+    /// #394: the length the index describes is the scan's reach, in both
+    /// directions. A log truncated under the pass ends with no phantom
+    /// trailing line and a length the scan actually reached; one appended
+    /// to grows to cover the new lines.
+    ///
+    /// The truncation races the background pass on purpose: whether the cut
+    /// lands before or after the scan's frontier, the invariants hold, and
+    /// the assertions are written against what the scan read rather than
+    /// against the cut.
+    #[test]
+    fn a_log_that_changes_under_the_pass_settles_to_the_scans_reach() {
+        let (body, total) = past_the_head("tail");
+        let (_d, p) = write_tmp(&body);
+        let mut v = LogView::open(&p).unwrap();
+        assert!(v.indexing());
+        // Truncate to a whole-line boundary a little past the head.
+        let cut = body[..(HEAD_INDEX_BYTES as usize + 4096)]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .unwrap() as u64
+            + 1;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_len(cut)
+            .unwrap();
+        v.finish_index();
+        let reach = v.file_len;
+        assert!(
+            reach >= cut && reach < body.len() as u64,
+            "the length is what the scan read, never the size at open: {reach}"
+        );
+        assert_eq!(v.scanned_to, reach);
+        // Everything the scan read was a prefix of the original body, so the
+        // line count is that prefix's, with no phantom entry at its end.
+        let prefix = &body[..reach as usize];
+        let mut expected = prefix.iter().filter(|&&b| b == b'\n').count();
+        if !prefix.ends_with(b"\n") {
+            expected += 1;
+        }
+        assert_eq!(v.len(), expected, "no phantom trailing line past the cut");
+        assert_ne!(v.line_starts.last().copied(), Some(reach));
+        assert!(v.len() < total);
+
+        // Append under the pass: the new lines are counted and readable.
+        let (body, total) = past_the_head("tail");
+        let (_d2, p2) = write_tmp(&body);
+        let mut v2 = LogView::open(&p2).unwrap();
+        assert!(v2.indexing());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&p2)
+            .unwrap()
+            .write_all(b"appended one\nappended two\n")
+            .unwrap();
+        v2.finish_index();
+        assert_eq!(v2.len(), total + 2, "the appended lines are in the index");
+        assert!(v2.file_len > body.len() as u64);
+        let last = v2.len() - 1;
+        v2.ensure(last, 1).unwrap();
+        assert_eq!(v2.visible_text(last), Some("appended two"));
     }
 
     /// #394: the pass is fed to the reader in batches, so `poll_index` on
