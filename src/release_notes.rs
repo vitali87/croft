@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "A .code-workspace file whose folder paths carry non-ASCII characters (accents, CJK, Cyrillic) now opens with those names intact instead of mojibake.",
+    kind: NoteKind::Feature,
+    summary: "Agent lanes: a pane running Claude Code, Codex, aider, or gemini-cli wears a badge with its status (working, waiting for you, idle), the status bar counts them with a click to reach the waiting one, and agents.json teaches croft more without a rebuild.",
 }];

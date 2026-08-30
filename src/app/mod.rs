@@ -3078,6 +3078,13 @@ pub struct App {
     /// The user's terminal trigger set (`triggers.json`), pushed into every
     /// pane on the drain tick and swapped wholesale on config reload.
     pub triggers: std::sync::Arc<crate::triggers::TriggerSet>,
+    /// The agents croft recognises in a pane's foreground (#344): built in
+    /// plus `agents.json`, reloaded on save.
+    agents: crate::agents::AgentTable,
+    /// Agent transitions from the last sample, drained on the tick.
+    agent_events: std::collections::VecDeque<crate::agents::AgentEvent>,
+    /// Hit rect of the status bar's agents chip; empty when no agent is seated.
+    status_agents_rect: Rect,
     /// User-defined problem matchers (#252): `matchers.json` (user config
     /// dir + workspace `.croft/`), batch-scanned at the FinishedCommand
     /// boundary alongside the built-in table. Swapped wholesale on reload.
@@ -4315,6 +4322,9 @@ impl App {
             },
             terminal_copy_mode: None,
             triggers: load_trigger_set(!loaded_prefs.disable_secret_redaction),
+            agents: crate::agents::AgentTable::load(&crate::agents::agents_path()),
+            agent_events: std::collections::VecDeque::new(),
+            status_agents_rect: Rect::default(),
             matchers,
             watch_set,
             task_matcher_by_pane: std::collections::HashMap::new(),
@@ -14462,6 +14472,17 @@ impl App {
                             let receiving = self.broadcast_input
                                 && (i == self.active_terminal
                                     || !self.terminals[i].broadcast_excluded);
+                            // An agent pane wears its badge in the pill
+                            // (`◆ claude ◐`, #344); the badge takes the room
+                            // first and the label is clipped to what is left.
+                            let badge = self.terminals[i]
+                                .agent()
+                                .map(|a| format!("\u{25c6} {} {}", a.name, a.status.glyph()));
+                            let label = match &badge {
+                                Some(b) if label.is_empty() => b.clone(),
+                                Some(b) => format!("{b} {label}"),
+                                None => label,
+                            };
                             if (!label.is_empty() || receiving) && room >= 3 {
                                 let shown: String = label.chars().take(room).collect();
                                 let mut text = if receiving && shown.is_empty() {
@@ -14881,7 +14902,7 @@ impl App {
         // controls and commentary stop sharing a costume; the clickable ones
         // take a hover fill under the pointer (spans are built after `rx` is
         // known, below, so hover can be computed against this frame's rects).
-        let seg_texts: [String; 5] = [
+        let mut seg_texts: Vec<String> = vec![
             format!(
                 " Ln {}, Col {} ",
                 self.editor.cursor_row + 1,
@@ -14892,6 +14913,20 @@ impl App {
             format!(" {} ", self.editor.eol.label()),
             format!(" {} ", self.editor.language_label()),
         ];
+        // `2 agents · 1 waiting` (#344), only while an agent is seated; a
+        // click focuses the waiting pane.
+        let (seated, waiting) = self.agent_counts();
+        if seated > 0 {
+            seg_texts.push(format!(
+                " \u{25c6} {seated} agent{}{} ",
+                if seated == 1 { "" } else { "s" },
+                if waiting > 0 {
+                    format!(" \u{b7} {waiting} waiting")
+                } else {
+                    String::new()
+                }
+            ));
+        }
         let widths: Vec<u16> = seg_texts.iter().map(|s| s.chars().count() as u16).collect();
         let right_total: u16 = widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1);
         // The right cluster paints OVER the left paragraph, so an over-long
@@ -14937,6 +14972,7 @@ impl App {
         self.status_encoding_rect = Rect::default();
         self.status_eol_rect = Rect::default();
         self.status_language_rect = Rect::default();
+        self.status_agents_rect = Rect::default();
         if status_h > 0 && right_total > 0 && right_total <= status_rect.width {
             let rx = status_rect.right() - right_total;
             // The right cluster paints OVER the left paragraph, so the
@@ -14986,6 +15022,7 @@ impl App {
                     2 => self.status_encoding_rect = r,
                     3 => self.status_eol_rect = r,
                     4 => self.status_language_rect = r,
+                    5 => self.status_agents_rect = r,
                     _ => {}
                 }
                 cx = cx.saturating_add(widths[i]);
@@ -27099,21 +27136,112 @@ impl App {
     /// lookups (the slow part) run on a one-shot background thread, keyed by
     /// shell pid so results land on the right pane even if panes moved. Returns
     /// whether any label changed (for redraw).
+    /// Seat, re-judge, or unseat the agent in each sampled pane (#344), from
+    /// the same `(shell_pid, process_name)` pairs the pill uses, and queue
+    /// the transitions. `quiet_after` is the working/quiet threshold
+    /// ([`crate::agents::QUIET_AFTER`]; tests pass zero). Returns whether any
+    /// pane's lane changed.
+    pub(crate) fn apply_agent_samples(
+        &mut self,
+        samples: &[(i32, String)],
+        quiet_after: std::time::Duration,
+    ) -> bool {
+        let mut changed = false;
+        for (shell_pid, name) in samples {
+            let Some(t) = self
+                .terminals
+                .iter_mut()
+                .find(|t| t.shell_pid() == Some(*shell_pid))
+            else {
+                continue;
+            };
+            let next = self
+                .agents
+                .classify(name)
+                .map(|kind| crate::agents::AgentLane {
+                    name: kind.name.clone(),
+                    status: crate::agents::judge(kind, t.quiet_for(), &t.tail_rows(6), quiet_after),
+                });
+            let prev = t.agent().cloned();
+            if prev == next {
+                continue;
+            }
+            let pane = t.label().to_string();
+            self.agent_events.extend(crate::agents::transition(
+                &pane,
+                prev.as_ref(),
+                next.as_ref(),
+            ));
+            t.set_agent(next);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Consume the agent transitions the last sample queued: a waiting agent
+    /// is announced in the status bar (the chip and the pill already show
+    /// it). Returns whether anything was said.
+    fn drain_agent_events(&mut self) -> bool {
+        let mut said = false;
+        while let Some(ev) = self.agent_events.pop_front() {
+            if let crate::agents::AgentEvent::Waiting { pane, agent } = ev {
+                self.status = format!("{agent} in {pane} is waiting for your input");
+                said = true;
+            }
+        }
+        said
+    }
+
+    /// `(agents seated, of which waiting)` across every pane, for the chip.
+    fn agent_counts(&self) -> (usize, usize) {
+        let seated = self
+            .terminals
+            .iter()
+            .filter(|t| t.agent().is_some())
+            .count();
+        let waiting = self
+            .terminals
+            .iter()
+            .filter(|t| {
+                t.agent()
+                    .is_some_and(|a| a.status == crate::agents::AgentStatus::Waiting)
+            })
+            .count();
+        (seated, waiting)
+    }
+
+    /// Focus the first waiting agent's pane, else the first seated one.
+    fn focus_agent_pane(&mut self) {
+        let pick = self
+            .terminals
+            .iter()
+            .position(|t| {
+                t.agent()
+                    .is_some_and(|a| a.status == crate::agents::AgentStatus::Waiting)
+            })
+            .or_else(|| self.terminals.iter().position(|t| t.agent().is_some()));
+        if let Some(idx) = pick {
+            self.active_terminal = idx;
+            self.focus_pane(Pane::Terminal);
+        }
+    }
+
     fn refresh_terminal_labels(&mut self) -> bool {
         let mut changed = false;
         // Apply whatever the last background lookup resolved.
         if let Some(labels) = self.label_rx.try_iter().last() {
-            for (shell_pid, name) in labels {
+            for (shell_pid, name) in &labels {
                 if let Some(t) = self
                     .terminals
                     .iter_mut()
-                    .find(|t| t.shell_pid() == Some(shell_pid))
+                    .find(|t| t.shell_pid() == Some(*shell_pid))
                     && t.label() != name
                 {
-                    t.set_auto_label(name);
+                    t.set_auto_label(name.clone());
                     changed = true;
                 }
             }
+            changed |= self.apply_agent_samples(&labels, crate::agents::QUIET_AFTER);
         }
         if self.last_label_refresh.elapsed() >= TERMINAL_LABEL_INTERVAL
             && !self
@@ -29484,6 +29612,8 @@ impl App {
                 crate::snippets::snippets_path(),
                 ConfigFileSeed::Snippets,
             ),
+            Cmd::OpenAgentsJson => self
+                .open_config_file_in_editor(crate::agents::agents_path(), ConfigFileSeed::Agents),
             Cmd::OpenTriggersJson => self.open_config_file_in_editor(
                 crate::triggers::triggers_path(),
                 ConfigFileSeed::Triggers,
@@ -29512,6 +29642,7 @@ impl App {
                 ConfigFileSeed::Keybindings => crate::keymap::TEMPLATE.to_string(),
                 ConfigFileSeed::Snippets => crate::snippets::TEMPLATE.to_string(),
                 ConfigFileSeed::Triggers => crate::triggers::TEMPLATE.to_string(),
+                ConfigFileSeed::Agents => crate::agents::TEMPLATE.to_string(),
                 ConfigFileSeed::Matchers => crate::problem_matchers::TEMPLATE.to_string(),
             };
             if let Err(e) = std::fs::write(&path, contents) {
@@ -29542,6 +29673,9 @@ impl App {
             }
             ConfigFileSeed::Triggers => {
                 String::from("Editing triggers.json — save to apply immediately")
+            }
+            ConfigFileSeed::Agents => {
+                String::from("Editing agents.json — save to apply immediately")
             }
             ConfigFileSeed::Matchers => {
                 String::from("Editing matchers.json — save to apply immediately")
@@ -31742,6 +31876,10 @@ impl App {
             }
             if rect_contains(self.status_diag_rect, m.column, m.row) {
                 self.set_bottom_panel_tab(BottomPanelTab::Problems);
+                return;
+            }
+            if rect_contains(self.status_agents_rect, m.column, m.row) {
+                self.focus_agent_pane();
                 return;
             }
         }
@@ -34937,6 +35075,12 @@ impl App {
         } else if path == crate::snippets::snippets_path() {
             self.snippets = crate::snippets::SnippetSet::load(path);
             self.status = String::from("Snippets reloaded");
+        } else if path == crate::agents::agents_path() {
+            self.agents = crate::agents::AgentTable::load(path);
+            self.status = format!(
+                "Agent lanes reloaded ({} agents known)",
+                self.agents.names().len()
+            );
         } else if path == crate::triggers::triggers_path() {
             self.triggers = load_trigger_set(self.secret_redaction);
             self.status = format!(
@@ -39999,6 +40143,7 @@ enum ConfigFileSeed {
     Snippets,
     Triggers,
     Matchers,
+    Agents,
 }
 
 /// Starter contents for a fresh settings overlay layer.
@@ -42444,7 +42589,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let session_typing_changed = app.poll_session_typing();
         let collab_changed = app.poll_collab();
         let bells_changed = app.drain_terminal_bells();
-        let labels_changed = app.refresh_terminal_labels();
+        let labels_changed = app.refresh_terminal_labels() | app.drain_agent_events();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
         let connect_changed = app.poll_connect_dialog();

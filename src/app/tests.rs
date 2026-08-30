@@ -35228,3 +35228,85 @@ fn a_log_that_paints_nothing_publishes_no_body_rect() {
          mouse path to hit-test against"
     );
 }
+
+/// #344: a pane whose foreground process is a coding agent is badged, its
+/// status is read off the screen once it goes quiet, and the `Waiting`
+/// transition fires exactly once per prompt. The fake agent is a shell that
+/// prints a permission question and then sits; the sample names it `claude`
+/// the way the label sampler would.
+#[test]
+fn an_agent_pane_is_badged_and_a_prompt_fires_waiting_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from(
+                "printf 'Edited src/main.rs\\nDo you want to proceed? (y/n)\\n'; sleep 30",
+            ),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    let shell_pid = app.terminals[0]
+        .shell_pid()
+        .expect("a running pane has a pid");
+    let mut waited = 0;
+    while !app.terminals[0].visible_text().contains("proceed") && waited < 8000 {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        waited += 40;
+    }
+    assert!(waited < 8000, "the fake agent never painted its prompt");
+    let zero = std::time::Duration::ZERO;
+
+    // First sample: seated straight into a prompt.
+    let samples = vec![(shell_pid, String::from("claude"))];
+    assert!(app.apply_agent_samples(&samples, zero), "the lane changed");
+    let lane = app.terminals[0].agent().cloned().expect("badged");
+    assert_eq!(lane.name, "claude");
+    assert_eq!(lane.status, crate::agents::AgentStatus::Waiting);
+    assert!(app.drain_agent_events(), "a waiting agent is announced");
+    assert!(
+        app.status.contains("claude") && app.status.contains("waiting"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.agent_counts(), (1, 1));
+
+    // The same prompt on the next sample: no second Waiting.
+    app.status.clear();
+    assert!(!app.apply_agent_samples(&samples, zero), "nothing changed");
+    assert!(!app.drain_agent_events(), "the prompt fires once");
+    assert!(app.status.is_empty());
+
+    // The pill wears the badge and the chip counts it.
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.split_terminal().unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let text: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("\u{25c6} claude \u{25d0}"),
+        "the pill wears the badge:\n{text}"
+    );
+    assert!(
+        text.contains("1 agent \u{b7} 1 waiting"),
+        "the chip counts it:\n{text}"
+    );
+    assert!(app.status_agents_rect.width > 0, "and is clickable");
+
+    // The agent leaving the foreground unseats it.
+    let gone = vec![(shell_pid, String::from("zsh"))];
+    assert!(app.apply_agent_samples(&gone, zero));
+    assert!(app.terminals[0].agent().is_none());
+    assert_eq!(app.agent_counts(), (0, 0));
+}
