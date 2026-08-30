@@ -35322,6 +35322,22 @@ fn every_find_bar_title_fits_the_bar_it_is_painted_in() {
         let row: String = (rect.x..rect.x + rect.width)
             .map(|x| buf[(x, rect.y)].symbol().to_string())
             .collect();
+        // THE BAR'S TITLE AREA, not the buffer. Two renderers paint this
+        // title and they clip differently: `Block` clips to its own title
+        // area (`rect.width - 2`), while the gradient re-stamp in
+        // `render_editor_find` uses `set_span`, whose clamp is the BUFFER's
+        // right edge. `Theme::BLACK.gradient()` is true, so the second one
+        // runs, and a title between 38 and 47 cells overruns the block
+        // silently: it writes over the bar's own top-right corner and out
+        // past the inner area, while a comparison anchored to the painted
+        // row still matches, because the overrun is exactly the text the
+        // comparison wanted. The width assertion is what makes that visible.
+        assert!(
+            expected.chars().count() <= (rect.width as usize).saturating_sub(2),
+            "the {}-cell title does not fit a {}-cell bar's title area",
+            expected.chars().count(),
+            rect.width
+        );
         // Exactly, at the position the block paints it: one cell in from
         // the left corner. `contains` would be weaker in both directions -
         // it cannot see a clipped tail when the wanted text is a fragment,
@@ -35332,6 +35348,14 @@ fn every_find_bar_title_fits_the_bar_it_is_painted_in() {
             painted, expected,
             "the title did not fit whole in a {}-cell bar, the row painted {row:?}",
             rect.width
+        );
+        // And the bar is still a bar. The corner is the first thing an
+        // overrunning title destroys, so it is the cheapest witness that the
+        // title stayed inside the box it was painted in.
+        assert_eq!(
+            buf[(rect.x + rect.width - 1, rect.y)].symbol(),
+            "\u{256e}",
+            "the title overran the bar and ate its top-right corner: {row:?}"
         );
     }
 }
@@ -35362,18 +35386,52 @@ fn every_find_bar_title_fits_the_bar_it_is_painted_in() {
 /// HALF A PAIR. These pin `count == 0` with nothing painted. The other
 /// direction, a count that survives while the highlight is thrown away, is
 /// pinned by `a_step_that_runs_out_of_reach_keeps_the_match_it_already_had`.
+///
+/// WHICH CHECKPOINTS ARE NEW. Three of them re-assert what
+/// `a_step_that_runs_out_of_reach_keeps_the_match_it_already_had` and
+/// `retyping_into_an_out_of_reach_query_clears_the_old_highlight` already
+/// cover; they are carried along because this test's subject is the
+/// SEQUENCE, and a state is only reached by passing through them. The two
+/// that no sibling covers are the backward step and the final backspace
+/// into a query that matches again. A reader counting five independent
+/// facts here would be counting wrong.
+///
+/// TWO REACHABLE MATCHES, not one. With a single match the Shift+Enter
+/// checkpoint asserted nothing: `find_prev`'s leg 1 rejects the anchor's own
+/// match, leg 2 walks back from EOF and runs out of budget before reaching
+/// row 0, and `scroll_log_to_match` returns on `out_of_reach` WITHOUT
+/// touching `active_search_match`. The assertion passed because the field
+/// was never written. Measured: making `find_prev` return
+/// `Found(row 0, col 999, len 5)` unconditionally left the test green. A
+/// second match on row 1 puts a real backward step within budget, so the
+/// checkpoint now fails if `find_prev`'s anchor filter or its column
+/// arithmetic regresses.
 #[test]
 fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path().join("budgeted.log");
-    let mut body = String::from("\u{1b}[31mERROR\u{1b}[0m first and only\n");
+    // TWO matches at the head, both inside the budget, so a backward step
+    // has somewhere to land. Row 1 puts ERROR at character column 3, which
+    // makes a wrong column visible rather than coincidentally right.
+    let mut body = String::from("\u{1b}[31mERROR\u{1b}[0m first\n");
+    body.push_str("no \u{1b}[31mERROR\u{1b}[0m second\n");
     let filler = "quiet line with nothing of interest ".repeat(4);
-    // Just past the budget: enough for the sweep to run out, no more.
-    for _ in 0..(crate::log_view::FIND_SCAN_BYTES / filler.len() + 200) {
+    // Comfortably past the budget, matching the margin the sibling tests use
+    // (+3000 lines, ~11%). The earlier +200 was 1.4% over, and while the
+    // budget is a pure byte counter with no timing in it, a change to window
+    // accounting or to the stripped length of the colour header could flip
+    // the sweep from OutOfReach to Absent and quietly change what four
+    // assertions mean without any of them failing.
+    for _ in 0..(crate::log_view::FIND_SCAN_BYTES / filler.len() + 3000) {
         body.push_str(&filler);
         body.push('\n');
     }
     std::fs::write(&p, &body).unwrap();
+    assert!(
+        body.len() > crate::log_view::FIND_SCAN_BYTES,
+        "the fixture must outrun the sweep budget or the out-of-reach \
+         checkpoints test nothing"
+    );
 
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Editor);
@@ -35386,24 +35444,36 @@ fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
         app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
             .unwrap();
     }
+    // The WHOLE tuple, not just the row. A wrong column or length paints the
+    // band in the wrong place, which is the defect class this test is for,
+    // and comparing only the row cannot see it.
     assert_eq!(
-        app.editor.active_search_match.map(|(r, _, _)| r),
-        Some(0),
-        "typing lands on the only match"
+        app.editor.active_search_match,
+        Some((0, 0, 5)),
+        "typing lands on the first match, at its own column"
     );
     assert!(
         app.editor_find.as_ref().unwrap().match_count > 0,
         "the match is counted"
     );
 
-    // Step forward WHILE THE QUERY STILL MATCHES, so the step does something:
-    // the next match is past the budget, so this exercises the out-of-reach
-    // branch, which is where round 3's defect lived.
+    // Forward to the SECOND match, which is within budget, so this leg
+    // asserts a real step rather than a refusal.
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(
-        app.editor.active_search_match.map(|(r, _, _)| r),
-        Some(0),
+        app.editor.active_search_match,
+        Some((1, 3, 5)),
+        "the next match is row 1 at column 3, past the \"no \" prefix"
+    );
+
+    // Forward again: nothing further is reachable, so this exercises the
+    // out-of-reach branch, which is where round 3's defect lived.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((1, 3, 5)),
         "a step that cannot reach further keeps the match it had"
     );
     assert!(
@@ -35411,12 +35481,16 @@ fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
         "and the bar reports that the search did not cover the file"
     );
 
+    // Backward from row 1 to row 0: within budget, so `find_prev`'s leg 1
+    // answers and its result is actually consumed. With one match this leg
+    // ran out of budget and `scroll_log_to_match` returned without writing
+    // anything, so the assertion passed on an untouched field.
     app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
         .unwrap();
     assert_eq!(
-        app.editor.active_search_match.map(|(r, _, _)| r),
-        Some(0),
-        "stepping back over a single match returns to it"
+        app.editor.active_search_match,
+        Some((0, 0, 5)),
+        "stepping back lands on the previous match, not on the current one"
     );
 
     // Only now retype into something unmatchable, so the transition from a
