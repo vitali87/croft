@@ -233,8 +233,8 @@ pub fn looks_destructive(code: &str) -> bool {
 }
 
 /// A `>` anywhere in the block that writes somewhere: not `2>&1` / `>&2`
-/// (a descriptor dup),
-/// not `>/dev/null` (the device itself, not `/dev/nullish`), not an arrow
+/// (a descriptor dup), not `>/dev/null` (the device itself, not
+/// `/dev/nullish`), not an arrow
 /// (`->`, `=>`), not in a trailing comment. Quotes are honoured, so a `#`
 /// or `>` inside `"…"` / `'…'` is text - otherwise
 /// `echo "step #1" > ~/.bashrc` would hide its redirect behind a fake
@@ -249,11 +249,12 @@ fn has_write_redirect(code: &str) -> bool {
     match redirect_scan(code, true) {
         RedirectScan::Found => true,
         RedirectScan::Clean => false,
-        RedirectScan::Unterminated => redirect_scan(code, false) == RedirectScan::Found,
+        RedirectScan::Unterminated => {
+            matches!(redirect_scan(code, false), RedirectScan::Found)
+        }
     }
 }
 
-#[derive(PartialEq, Eq)]
 enum RedirectScan {
     Found,
     Clean,
@@ -265,9 +266,20 @@ enum RedirectScan {
 /// One pass of [`has_write_redirect`] over a whole block; `quotes` says
 /// whether `'` and `"` open a string or are ordinary bytes.
 fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
-    let line = code;
-    let b = line.as_bytes();
+    let b = code.as_bytes();
     let mut quote: Option<u8> = None;
+    // The last byte that the shell would see BEFORE the current one, with a
+    // `\`-continuation and the newline it swallows skipped over: a
+    // continuation joins the two physical lines, so what precedes the join
+    // is what decides whether a `#` after it opens a comment. Start of input
+    // counts as whitespace, so a leading `#` is a comment.
+    //
+    // This is the whole reason the flag is not simply "a continuation just
+    // happened". `echo a\` + `#x > /tmp/y` joins to `echo a#x > …`, where the
+    // `#` is mid-word and all three of sh, bash and zsh write the file;
+    // `echo a \` + `#x > /tmp/y` joins to `echo a #x > …`, where it is a real
+    // comment and none of them write. The two differ only by that space.
+    let mut prev = b' ';
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
@@ -276,12 +288,20 @@ fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
             Some(b'"') if c == b'\\' => i += 1,
             Some(_) => {}
             None => match c {
-                b'\\' => i += 1,
+                b'\\' => {
+                    // Skip the escaped byte, and leave `prev` alone: across a
+                    // continuation the shell sees the byte before the
+                    // backslash, not the backslash or the newline.
+                    i += 2;
+                    continue;
+                }
                 b'\'' | b'"' if quotes => quote = Some(c),
                 // A `#` starts a comment only when quotes are being
                 // honoured: the quote-blind rescan runs because a string
-                // was left open, and a `#` inside that string is text.
-                b'#' if quotes && (i == 0 || b[i - 1].is_ascii_whitespace()) => {
+                // was left open, and a `#` inside that string is text. And
+                // never immediately after a line continuation, where the
+                // joined word puts the `#` mid-token.
+                b'#' if quotes && prev.is_ascii_whitespace() => {
                     // A comment runs to the end of its line; the block goes on.
                     while i < b.len() && b[i] != b'\n' {
                         i += 1;
@@ -298,7 +318,7 @@ fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
                         while j < b.len() && b[j].is_ascii_whitespace() {
                             j += 1;
                         }
-                        let target = &line[j..];
+                        let target = &code[j..];
                         let dev_null = target.strip_prefix("/dev/null").is_some_and(|rest| {
                             rest.is_empty()
                                 || rest.starts_with(|r: char| {
@@ -313,6 +333,7 @@ fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
                 _ => {}
             },
         }
+        prev = c;
         i += 1;
     }
     if quote.is_some() {
@@ -1219,6 +1240,10 @@ mod tests {
             "echo \"hello\nworld # note\" > /tmp/x",
             // Fail-open: a quote left open makes the rescan read `#` as text.
             "echo don't # > ~/.bashrc",
+            // A `\` continuation JOINS the lines, so the `#` opening the
+            // next physical line is mid-word and not a comment. `sh`, `bash`
+            // and `zsh` all write the file for this one.
+            "echo a\\\n#x > /tmp/y",
             "git push --force",
             "git reset --hard HEAD~3",
         ] {
@@ -1239,6 +1264,14 @@ mod tests {
             "echo \"a > b\"",
             "make >/dev/null 2>&1",
             "echo hi # writes > nothing\necho done",
+            // A SPACE before the backslash ends the word, so the `#` on the
+            // next line really does start a comment. Paired with the
+            // positive above so the continuation rule cannot be
+            // over-applied: the two differ by exactly that space.
+            "echo a \\\n#x > /tmp/y",
+            // A `>` genuinely inside a multi-line string writes nothing, and
+            // `sh` agrees. Nothing pinned this direction before.
+            "echo \"open\necho x > ~/.bashrc\nmore\"",
             "if [ 3 -gt 2 ]; then echo yes; fi",
         ] {
             assert!(!looks_destructive(ok), "{ok:?} is ordinary");
