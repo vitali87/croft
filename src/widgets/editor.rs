@@ -4201,6 +4201,8 @@ impl Editor {
             built_seq: self.edit_seq,
             images,
             anchor_rows: Vec::new(),
+            runnables: Vec::new(),
+            run_rows: Vec::new(),
             wrap_key: (0, 0),
             last_area: Rect::default(),
             notebook: false,
@@ -4268,6 +4270,8 @@ impl Editor {
             built_seq: self.edit_seq,
             images,
             anchor_rows: Vec::new(),
+            runnables: Vec::new(),
+            run_rows: Vec::new(),
             wrap_key: (0, 0),
             last_area: Rect::default(),
             notebook: false,
@@ -4915,7 +4919,7 @@ impl Editor {
                 .path
                 .as_ref()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (lines, images) = crate::markdown::render_markdown_with_images(
+            let (lines, images, runnables) = crate::markdown::render_markdown_full(
                 &text,
                 self.theme,
                 &mut self.registry,
@@ -4924,6 +4928,7 @@ impl Editor {
             if let Some(md) = self.markdown_preview.as_mut() {
                 md.lines = lines;
                 md.images = images;
+                md.runnables = runnables;
                 md.built_seq = self.edit_seq;
             }
         }
@@ -5347,7 +5352,7 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images) = crate::markdown::render_markdown_with_images(
+        let (lines, images, runnables) = crate::markdown::render_markdown_full(
             &text,
             self.theme,
             &mut self.registry,
@@ -5362,6 +5367,8 @@ impl Editor {
             built_seq: self.edit_seq,
             images,
             anchor_rows: Vec::new(),
+            runnables,
+            run_rows: Vec::new(),
             wrap_key: (0, 0),
             last_area: Rect::default(),
             notebook: false,
@@ -5402,6 +5409,8 @@ impl Editor {
             built_seq: self.edit_seq,
             images,
             anchor_rows: Vec::new(),
+            runnables: Vec::new(),
+            run_rows: Vec::new(),
             wrap_key: (0, 0),
             last_area: Rect::default(),
             notebook: true,
@@ -11607,7 +11616,7 @@ impl Editor {
                 .path
                 .as_ref()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (lines, images) = crate::markdown::render_markdown_with_images(
+            let (lines, images, runnables) = crate::markdown::render_markdown_full(
                 &text,
                 self.theme,
                 &mut self.registry,
@@ -11616,6 +11625,7 @@ impl Editor {
             if let Some(md) = self.markdown_preview.as_mut() {
                 md.lines = lines;
                 md.images = images;
+                md.runnables = runnables;
                 md.built_seq = self.edit_seq;
             }
         }
@@ -11640,15 +11650,23 @@ impl Editor {
         // (built_seq, width) - blank lines never wrap, so the prefix
         // line_count is exact.
         if md.wrap_key != (md.built_seq, text_area.width) {
+            let visual_row = |first_line: usize| {
+                let prefix: Vec<Line> = md.lines[..first_line].to_vec();
+                Paragraph::new(Text::from(prefix))
+                    .wrap(Wrap { trim: false })
+                    .line_count(text_area.width)
+            };
             md.anchor_rows = md
                 .images
                 .iter()
-                .map(|img| {
-                    let prefix: Vec<Line> = md.lines[..img.first_line].to_vec();
-                    Paragraph::new(Text::from(prefix))
-                        .wrap(Wrap { trim: false })
-                        .line_count(text_area.width)
-                })
+                .map(|img| visual_row(img.first_line))
+                .collect();
+            // Same mapping for the play glyphs (#353); a glyph line can
+            // wrap, but its first visual row is where the glyph paints.
+            md.run_rows = md
+                .runnables
+                .iter()
+                .map(|r| visual_row(r.first_line))
                 .collect();
             md.wrap_key = (md.built_seq, text_area.width);
         }
