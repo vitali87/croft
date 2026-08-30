@@ -287,9 +287,104 @@ const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.navigateForward", "navigate_forward"),
 ];
 
+/// Where each VS Code-family product keeps its installed extensions: beside
+/// its own dot-directory in the home, not under the user directory being
+/// imported. Keyed by the product folder that holds `User`.
+const EXTENSION_DIRS: &[(&str, &str)] = &[
+    ("Code", ".vscode"),
+    ("Code - Insiders", ".vscode-insiders"),
+    ("VSCodium", ".vscode-oss"),
+    ("Cursor", ".cursor"),
+    ("Windsurf", ".windsurf"),
+];
+
+/// The extensions directories to search for the profile's colour theme.
+///
+/// A user directory that belongs to a known product yields that product's
+/// directory alone, so a Cursor import does not pick up a same-named theme
+/// from a stale VS Code install. Anything else (a `--from` pointing at a
+/// copy) probes every product, most standard first.
+pub fn theme_extension_dirs_under(home: &Path, user_dir: &Path) -> Vec<PathBuf> {
+    let product = user_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+    if let Some(dot) = product.and_then(|p| {
+        EXTENSION_DIRS
+            .iter()
+            .find(|(name, _)| *name == p)
+            .map(|(_, dot)| *dot)
+    }) {
+        return vec![home.join(dot).join("extensions")];
+    }
+    EXTENSION_DIRS
+        .iter()
+        .map(|(_, dot)| home.join(dot).join("extensions"))
+        .collect()
+}
+
+/// [`theme_extension_dirs_under`] for this machine's home.
+pub fn theme_extension_dirs(user_dir: &Path) -> Vec<PathBuf> {
+    match std::env::var_os("HOME").map(PathBuf::from) {
+        Some(home) => theme_extension_dirs_under(&home, user_dir),
+        None => Vec::new(),
+    }
+}
+
+/// Find the theme JSON an installed extension contributes under `label`.
+///
+/// `workbench.colorTheme` holds the theme's picker label, or its `id` when
+/// the extension declares one, so both are matched. Extensions are read from
+/// `<dir>/<publisher.name-version>/package.json`, in sorted order so two
+/// versions of one extension resolve the same way on every run.
+pub fn find_installed_theme(label: &str, extension_dirs: &[PathBuf]) -> Option<PathBuf> {
+    for dir in extension_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut extensions: Vec<PathBuf> =
+            entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        extensions.sort();
+        for ext in extensions {
+            let Ok(raw) = std::fs::read_to_string(ext.join("package.json")) else {
+                continue;
+            };
+            let Ok(pkg) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let Some(themes) = pkg["contributes"]["themes"].as_array() else {
+                continue;
+            };
+            for theme in themes {
+                let named =
+                    theme["id"].as_str() == Some(label) || theme["label"].as_str() == Some(label);
+                if let Some(rel) = theme["path"].as_str().filter(|_| named) {
+                    return Some(ext.join(rel));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The VS Code colour theme an import resolved: where it came from and what
+/// `croft theme-import` made of it.
+#[derive(Debug, Clone)]
+pub struct ThemeSource {
+    /// The `workbench.colorTheme` value.
+    pub label: String,
+    /// The theme JSON inside the installed extension.
+    pub path: PathBuf,
+    /// The croft theme, ready to install.
+    pub converted: crate::vscode_theme::Converted,
+}
+
 /// What an import would do, or did.
 #[derive(Debug, Default)]
 pub struct Report {
+    /// The colour theme, when `workbench.colorTheme` named an installed
+    /// extension theme. Its id is also in `settings` under `theme`.
+    pub theme: Option<ThemeSource>,
     /// Croft settings this import would write, as `key = value` lines.
     pub settings: BTreeMap<String, Value>,
     /// VS Code settings keys with no croft equivalent.
@@ -499,11 +594,60 @@ pub fn convert_snippets(doc: &Value, language: Option<&str>, report: &mut Report
     }
 }
 
+/// Turn `workbench.colorTheme` into a croft theme, when it can be.
+///
+/// The setting is the one the user sees all day, and listing it as "croft
+/// has no equivalent" when the theme is sitting in their extensions
+/// directory is the wrong answer. When the label names an installed
+/// extension theme, it goes through the same conversion as `croft
+/// theme-import` and croft's `theme` setting follows the converted id. VS
+/// Code's built-in themes (Dark+, Light Modern, ...) live inside the app
+/// bundle rather than the extensions directory, so they are not found; the
+/// key stays unmapped and a warning says how to import the file by hand.
+fn resolve_color_theme(label: &str, extension_dirs: &[PathBuf], report: &mut Report) {
+    let Some(path) = find_installed_theme(label, extension_dirs) else {
+        report.warnings.push(format!(
+            "workbench.colorTheme {label:?} is not an installed extension theme (a built-in VS \
+             Code theme lives in the app, not the extensions directory); to bring it over, run \
+             `croft theme-import <theme.json>` on its file"
+        ));
+        return;
+    };
+    match crate::vscode_theme::convert_file(&path, None) {
+        Ok(converted) => {
+            report
+                .settings
+                .insert(String::from("theme"), Value::from(converted.id.clone()));
+            report
+                .unmapped_settings
+                .retain(|k| k != "workbench.colorTheme");
+            report.theme = Some(ThemeSource {
+                label: label.to_string(),
+                path,
+                converted,
+            });
+        }
+        Err(err) => report.warnings.push(format!(
+            "workbench.colorTheme {label:?} was found at {} but could not be converted: {err:#}",
+            path.display()
+        )),
+    }
+}
+
 /// Read a whole VS Code user directory into a report.
 pub fn scan_profile(dir: &Path) -> Result<Report> {
+    scan_profile_with_extensions(dir, &theme_extension_dirs(dir))
+}
+
+/// [`scan_profile`] with explicit extension directories to resolve the
+/// colour theme from.
+pub fn scan_profile_with_extensions(dir: &Path, extension_dirs: &[PathBuf]) -> Result<Report> {
     let mut report = Report::default();
     if let Some(doc) = read_jsonc(&dir.join("settings.json"))? {
         convert_settings(&doc, &mut report);
+        if let Some(label) = doc["workbench.colorTheme"].as_str() {
+            resolve_color_theme(label, extension_dirs, &mut report);
+        }
     }
     if let Some(doc) = read_jsonc(&dir.join("keybindings.json"))? {
         convert_keybindings(&doc, &mut report);
@@ -592,7 +736,11 @@ fn read_or_refuse(path: &Path, report: &mut Report) -> (Option<Value>, bool) {
 /// who has already tuned croft must not lose it to a one-shot import, and
 /// leaving it alone is also what makes a second run a no-op.
 pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
-    apply_into(&crate::prefs::config_dir(), report)
+    apply_into_dirs(
+        &crate::prefs::config_dir(),
+        &crate::lsp::manifest::user_extensions_dir(),
+        report,
+    )
 }
 
 /// [`apply`] into an explicit config directory.
@@ -603,9 +751,29 @@ pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
 /// the import destroyed croft's own commented templates. Nothing here
 /// touches the environment, because the test binary runs its tests on
 /// threads of one process.
+#[cfg(test)]
 pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
+    apply_into_dirs(dir, &dir.join("extensions"), report)
+}
+
+/// [`apply_into`] with the extensions directory a converted theme is
+/// installed into named explicitly.
+pub fn apply_into_dirs(
+    dir: &Path,
+    extensions_dir: &Path,
+    report: &mut Report,
+) -> Result<Vec<PathBuf>> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut written = Vec::new();
+
+    // The theme goes in first: `settings` already carries `theme = <id>`,
+    // and a config that names a theme whose manifest is missing is worse
+    // than one that names none.
+    if let Some(theme) = &report.theme {
+        let installed = crate::vscode_theme::install_into(extensions_dir, &theme.converted)
+            .with_context(|| format!("installing theme {:?}", theme.label))?;
+        written.push(installed.path);
+    }
 
     let mut wrong_shape;
     if !report.settings.is_empty() {
@@ -1350,6 +1518,145 @@ mod tests {
             vec![(String::from("ctrl+s"), String::from("save_file"))]
         );
         assert_eq!(report.snippets["Test"]["scope"], json!("rust"));
+    }
+
+    /// Build a VS Code extensions directory holding one colour theme.
+    fn fixture_extensions(root: &Path, label: &str) -> PathBuf {
+        let ext = root.join("extensions").join("acme.fixture-theme-1.2.0");
+        std::fs::create_dir_all(ext.join("themes")).unwrap();
+        std::fs::write(
+            ext.join("package.json"),
+            format!(
+                r##"{{ "name": "fixture-theme", "contributes": {{ "themes": [
+                    {{ "label": "{label}", "uiTheme": "vs-dark", "path": "./themes/fixture.json" }}
+                ] }} }}"##
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            ext.join("themes").join("fixture.json"),
+            format!(
+                r##"{{ "name": "{label}", "type": "dark", "colors": {{ "editor.background": "#101820" }} }}"##
+            ),
+        )
+        .unwrap();
+        root.join("extensions")
+    }
+
+    /// `workbench.colorTheme` names a theme by its picker label. When that
+    /// theme is an installed extension, the import converts it through
+    /// `croft theme-import` and points croft's `theme` at the result, so
+    /// the user arrives with the colours they had rather than a line saying
+    /// croft has no equivalent for the one setting they see all day.
+    #[test]
+    fn an_installed_vscode_theme_is_converted_and_selected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("User");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(
+            profile.join("settings.json"),
+            r#"{ "workbench.colorTheme": "Fixture Dark", "editor.formatOnSave": true }"#,
+        )
+        .unwrap();
+        let extensions = fixture_extensions(dir.path(), "Fixture Dark");
+
+        let mut report =
+            scan_profile_with_extensions(&profile, &[extensions]).expect("the profile scans");
+        let theme = report.theme.as_ref().expect("the theme was resolved");
+        assert_eq!(theme.label, "Fixture Dark");
+        assert_eq!(theme.converted.id, "fixture-dark");
+        assert_eq!(
+            report.settings["theme"],
+            json!("fixture-dark"),
+            "croft's theme setting follows the converted id"
+        );
+        assert!(
+            !report
+                .unmapped_settings
+                .iter()
+                .any(|k| k == "workbench.colorTheme"),
+            "a resolved theme is mapped, not listed as missing: {:?}",
+            report.unmapped_settings
+        );
+
+        // Applying installs the manifest where croft's picker reads it, and
+        // writes the theme key with the rest of the settings.
+        let croft = tempfile::TempDir::new().unwrap();
+        let croft_ext = croft.path().join("extensions");
+        let written = apply_into_dirs(croft.path(), &croft_ext, &mut report).expect("apply runs");
+        let manifest = croft_ext.join("theme-fixture-dark").join("extension.toml");
+        assert!(manifest.is_file(), "the converted theme was installed");
+        assert!(
+            written.contains(&manifest),
+            "and reported as written: {written:?}"
+        );
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(croft.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["theme"], json!("fixture-dark"));
+    }
+
+    /// A theme croft cannot find as an installed extension (VS Code's own
+    /// built-ins live inside the app bundle, not the extensions dir) stays
+    /// unmapped, and the report says why rather than leaving the user to
+    /// wonder whether the key was read at all.
+    #[test]
+    fn a_built_in_or_absent_theme_stays_unmapped_with_the_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("User");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(
+            profile.join("settings.json"),
+            r#"{ "workbench.colorTheme": "Dark+" }"#,
+        )
+        .unwrap();
+        let extensions = fixture_extensions(dir.path(), "Something Else");
+
+        let report =
+            scan_profile_with_extensions(&profile, &[extensions]).expect("the profile scans");
+        assert!(report.theme.is_none());
+        assert!(!report.settings.contains_key("theme"));
+        assert_eq!(
+            report.unmapped_settings,
+            vec![String::from("workbench.colorTheme")]
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("Dark+") && w.contains("theme-import")),
+            "the warning names the theme and the way to import it by hand: {:?}",
+            report.warnings
+        );
+    }
+
+    /// Each VS Code-family product keeps its extensions beside its own
+    /// dot-directory, not under the user directory being imported.
+    #[test]
+    fn extension_dirs_follow_the_product_of_the_user_directory() {
+        let home = Path::new("/home/t");
+        for (user_dir, expected) in [
+            ("/home/t/.config/Code/User", ".vscode/extensions"),
+            (
+                "/home/t/.config/Code - Insiders/User",
+                ".vscode-insiders/extensions",
+            ),
+            ("/home/t/.config/VSCodium/User", ".vscode-oss/extensions"),
+            ("/home/t/.config/Cursor/User", ".cursor/extensions"),
+            ("/home/t/.config/Windsurf/User", ".windsurf/extensions"),
+        ] {
+            assert_eq!(
+                theme_extension_dirs_under(home, Path::new(user_dir)),
+                vec![home.join(expected)],
+                "{user_dir}"
+            );
+        }
+        // An unrecognised directory (a --from pointing anywhere) probes every
+        // product, most standard first.
+        let all = theme_extension_dirs_under(home, Path::new("/tmp/somewhere"));
+        assert_eq!(all[0], home.join(".vscode/extensions"));
+        assert_eq!(all.len(), 5);
     }
 
     /// A missing profile is empty, not an error: someone may have only ever
