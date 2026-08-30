@@ -498,12 +498,27 @@ pub fn convert_file(path: &Path, id_override: Option<&str>) -> Result<Converted>
 /// position-dependent, since a leading mark survived the `is_empty` guard
 /// while an interior one did not.
 fn slug(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
     static SEPARATORS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let separators = SEPARATORS.get_or_init(|| {
         regex::Regex::new(r"[^\p{L}\p{N}\p{M}]+").expect("a literal class compiles")
     });
+    // Two names that are canonically equivalent (`Café` precomposed, `Cafe`
+    // + a combining acute) render identically and are the same theme to
+    // anyone; only their bytes differ, by which editor last saved the file.
+    // Without this they minted two ids and installed twice (#407). NFC is
+    // applied AFTER the lowercase, because lowercasing can expose a
+    // composition the uppercase spelling had no precomposed character for
+    // (`H` + U+0331 has none; its lowercase `h` + U+0331 composes to
+    // U+1E96 `ẖ`). A pass before the lowercase would add nothing: case
+    // mapping preserves canonical equivalence, so NFC(lower(s)) already
+    // equals NFC(lower(NFC(s))) (swept over every code point and every
+    // base + mark pair in review). A name already in NFC normalises to
+    // itself, so no existing single-form id changes.
+    let lowered: String = s.to_lowercase().nfc().collect();
     let slug = separators
-        .replace_all(&s.to_lowercase(), "-")
+        .replace_all(&lowered, "-")
         .trim_matches('-')
         .to_string();
     // A name of nothing BUT combining marks has no letter or digit to stand
@@ -551,6 +566,12 @@ fn existing_ids() -> Vec<String> {
 /// the loader which file an id came from, rather than adding a second
 /// convention beside it.
 fn was_generated_by_import(id: &str) -> bool {
+    // Hermetic under test, for the same reason `Theme::all()` is: reading
+    // the developer's real ~/.config/croft made a conversion depend on
+    // machine state, and a test that imports a theme must not.
+    if cfg!(test) {
+        return false;
+    }
     let path = crate::lsp::manifest::user_extensions_dir()
         .join(format!("theme-{id}"))
         .join("extension.toml");
@@ -1507,10 +1528,12 @@ mod tests {
                 "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940}",
             ),
             // Latin in NFD hits the same edge: "Cafe" + combining acute.
-            ("Cafe\u{301}", "cafe\u{301}"),
+            // Since #407 the id is the NFC form, the same one the precomposed
+            // spelling mints, so the mark is folded rather than kept.
+            ("Cafe\u{301}", "caf\u{e9}"),
             // And the damage was POSITION-dependent: a leading mark survived
             // the empty-output guard while an interior one did not.
-            ("U\u{308}ber", "u\u{308}ber"),
+            ("U\u{308}ber", "\u{fc}ber"),
         ] {
             let src = format!(
                 r##"{{ "name": "{name}", "type": "dark", "colors": {{ "editor.background": "#101010" }} }}"##
@@ -1581,7 +1604,41 @@ mod tests {
             slug("\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940}"),
             "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940}"
         );
-        assert_eq!(slug("Cafe\u{301}"), "cafe\u{301}");
+        assert_eq!(slug("Cafe\u{301}"), "café");
+    }
+
+    /// Two names that are canonically equivalent (#407) are the same theme
+    /// to a user: they render identically and compare equal under NFC. The
+    /// id must not depend on which encoding the theme file happened to use,
+    /// or importing the same theme from two sources installs it twice.
+    #[test]
+    fn canonically_equivalent_names_share_an_id() {
+        // Precomposed é (NFC) and e + combining acute (NFD).
+        assert_eq!(slug("Café Dark"), "café-dark");
+        assert_eq!(slug("Cafe\u{301} Dark"), "café-dark");
+        // Lowercasing İ (U+0130) yields i + U+0307; a name spelled that way
+        // from the start must land on the same id.
+        assert_eq!(slug("İstanbul"), slug("i\u{307}stanbul"));
+        // The trailing NFC is load-bearing: "H" + U+0331 has no precomposed
+        // uppercase, so the first pass leaves it, and its lowercase
+        // "h" + U+0331 composes to U+1E96. Without the second pass the two
+        // spellings mint two ids, the #407 bug surviving its own fix.
+        assert_eq!(slug("H\u{331}ana"), slug("\u{1e96}ana"));
+        assert_eq!(slug("H\u{331}ana"), "\u{1e96}ana");
+        // A name already in NFC is unchanged by the normalisation, so every
+        // existing single-form id survives.
+        assert_eq!(slug("One Dark Pro"), "one-dark-pro");
+        assert_eq!(slug("Ñandú"), "ñandú");
+
+        // And the two forms resolve to ONE installed theme, not a suffixed pair.
+        let nfc =
+            parse_theme(r##"{ "name": "Café Dark", "type": "dark", "colors": {} }"##).unwrap();
+        let nfd =
+            parse_theme(r##"{ "name": "Café Dark", "type": "dark", "colors": {} }"##).unwrap();
+        let a = convert_with_ids(nfc, None, "", &[]).expect("converts");
+        let b = convert_with_ids(nfd, None, "", &[]).expect("converts");
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.id, "café-dark");
     }
 
     /// `unique_id` must never hand back the value it just proved is taken:

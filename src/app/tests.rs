@@ -35383,6 +35383,151 @@ fn dragging_past_a_short_lines_end_paints_what_it_copies() {
     );
 }
 
+/// #404: a double-width character occupies two cells, so every span after
+/// it must be painted, and every click after it hit-tested, by display
+/// width rather than by character count.
+///
+/// The painter advanced `x` by `chars().count()`, so after a CJK pair the
+/// next span landed two cells to the left of where the terminal had put
+/// the pair, overpainting its second half, and `log_cell_at` matched the
+/// drift by design. Fixed together so the two never disagree.
+#[test]
+fn double_width_characters_keep_log_columns_aligned() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use ratatui::widgets::Widget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("wide.log");
+    // "\u{4e2d}\u{6587}" is two characters and four cells; then a space and
+    // a coloured X, which must land on cell 5 (character column 3).
+    std::fs::write(
+        &p,
+        "\u{1b}[31m\u{4e2d}\u{6587}\u{1b}[0m \u{1b}[32mX\u{1b}[0m\n",
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some());
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let body = app.editor.log.as_ref().unwrap().last_body;
+
+    // Click the X and release on it: a one-character selection.
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        body.x + 5,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        body.x + 6,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        body.x + 6,
+        body.y,
+    ));
+    let (text, _) = app.editor.log.as_ref().unwrap().selection_text();
+    assert_eq!(text, "X", "cell 5 is the X, two cells past the wide pair");
+
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    {
+        let area = app.editor.last_area;
+        (&mut app.editor).render(area, &mut buf);
+    }
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let row: Vec<&str> = (body.x..body.x + 7)
+        .map(|x| buf[(x, body.y)].symbol())
+        .collect();
+    assert_eq!(
+        buf[(body.x + 2, body.y)].symbol(),
+        "\u{6587}",
+        "the second wide character keeps its cells: {row:?}"
+    );
+    assert_eq!(
+        buf[(body.x + 5, body.y)].symbol(),
+        "X",
+        "the span after the pair starts where the terminal put it: {row:?}"
+    );
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    let painted: Vec<u16> = (body.x..body.x + body.width)
+        .filter(|x| buf[(*x, body.y)].style().bg == Some(selected_bg))
+        .collect();
+    assert_eq!(
+        painted,
+        vec![body.x + 5],
+        "the selection band sits on the X's cell, not on character column 3"
+    );
+}
+
+/// #404 review: a wide character whose first half lands on the body's last
+/// cell does not fit whole, and `set_stringn` drops it entirely. The
+/// selection band must not colour that cell, or the annotator paints where
+/// the painter deliberately put nothing, the same disagreement the cell map
+/// exists to close, at the boundary.
+#[test]
+fn a_wide_character_clipped_at_the_right_edge_gets_no_selection_band() {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 8,
+    };
+    // Learn the body width from a probe render, so the fixture puts the
+    // wide character exactly on the last cell whatever the chrome costs.
+    let probe = tmp.path().join("probe.log");
+    std::fs::write(&probe, "\u{1b}[31mx\u{1b}[0m\n").unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&probe).unwrap();
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut e).render(area, &mut buf);
+    let width = e.log.as_ref().unwrap().last_body.width as usize;
+    assert!(width > 2);
+
+    let p = tmp.path().join("edge.log");
+    let text = format!("{}\u{4e2d}", "x".repeat(width - 1));
+    std::fs::write(&p, format!("\u{1b}[31m{text}\u{1b}[0m\n")).unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&p).unwrap();
+    let chars = text.chars().count();
+    e.log.as_mut().unwrap().selection = Some(((0, 0), (0, chars)));
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut e).render(area, &mut buf);
+    let body = e.log.as_ref().unwrap().last_body;
+    let last = body.x + body.width - 1;
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    assert_eq!(
+        buf[(last, body.y)].symbol(),
+        " ",
+        "the painter drops a wide character that does not fit whole"
+    );
+    assert_ne!(
+        buf[(last, body.y)].style().bg,
+        Some(selected_bg),
+        "so the band must not colour the cell it left blank"
+    );
+    assert_eq!(
+        buf[(last - 1, body.y)].style().bg,
+        Some(selected_bg),
+        "while the character before it is selected as usual"
+    );
+}
+
 /// #257: a frame that paints no log body must publish no body rect.
 ///
 /// `render_log` returned early for a zero-sized area WITHOUT clearing
@@ -35735,5 +35880,234 @@ fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
         app.editor.active_search_match,
         Some((0, 0, 5)),
         "a query that matches again must paint its match, whole"
+    );
+}
+
+/// #414: a dropped `file://` URL naming a non-ASCII path must decode to that
+/// path, not to one char per byte.
+///
+/// The decoder pushed each `%xx` byte, and each literal byte, `as char`,
+/// which maps a byte to the Latin-1 code point of the same value, so every
+/// multi-byte UTF-8 sequence came out as mojibake and the drop opened a
+/// path that does not exist. The same defect class as #396, in the drop
+/// path.
+#[test]
+fn a_dropped_file_url_with_a_non_ascii_path_decodes_to_utf8() {
+    use std::path::PathBuf;
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/caf%C3%A9/%E4%B8%AD%E6%96%87.txt"),
+        Some(PathBuf::from("/tmp/caf\u{e9}/\u{4e2d}\u{6587}.txt")),
+        "percent-encoded UTF-8 reassembles into the characters it encodes"
+    );
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/caf\u{e9}"),
+        Some(PathBuf::from("/tmp/caf\u{e9}")),
+        "a literal non-ASCII character in the URL survives too"
+    );
+    // The ASCII cases the decoder always handled are unchanged.
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/a%20b"),
+        Some(PathBuf::from("/tmp/a b"))
+    );
+    assert_eq!(
+        super::normalise_dropped_token("'/tmp/x y'"),
+        Some(PathBuf::from("/tmp/x y"))
+    );
+    // `+` is not a space in a file URL (form encoding does not apply), and a
+    // `%` that is not an escape passes through literally, wherever it sits.
+    for (url, want) in [
+        ("file:///tmp/a+b", "/tmp/a+b"),
+        ("file:///tmp/a%zzb", "/tmp/a%zzb"),
+        ("file:///tmp/a%2", "/tmp/a%2"),
+        ("file:///tmp/a%", "/tmp/a%"),
+    ] {
+        assert_eq!(
+            super::normalise_dropped_token(url),
+            Some(PathBuf::from(want)),
+            "{url}"
+        );
+    }
+}
+
+/// A `file://` URL whose escapes do not form valid UTF-8 names no path this
+/// process can open. The decoder used to read each byte as Latin-1 and open
+/// the wrong path; a lossy decode would instead open a path with U+FFFD in
+/// it, which is just as wrong and passes every "is this a path" screen. The
+/// function's contract is to drop what is not a plausible path, so it does.
+#[test]
+fn a_dropped_file_url_with_invalid_utf8_is_dropped() {
+    assert_eq!(super::normalise_dropped_token("file:///tmp/%FF"), None);
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/%C3"),
+        None,
+        "a truncated multi-byte lead is not a path either"
+    );
+}
+
+/// #352: a workspace's `.vscode/extensions.json` recommendations appear in the
+/// Extensions panel under FROM VS CODE with what croft has for each.
+#[test]
+fn workspace_extension_recommendations_show_under_from_vscode() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode").join("extensions.json"),
+        r#"{ "recommendations": ["rust-lang.rust-analyzer", "nobody.nothing"] }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.refresh_extensions();
+    let ids: Vec<String> = app
+        .extensions
+        .items()
+        .iter()
+        .filter(|i| i.vscode)
+        .map(|i| i.id.clone())
+        .collect();
+    assert_eq!(ids, ["rust-lang.rust-analyzer", "nobody.nothing"]);
+
+    // Toggling a built-in row is an answer, not an install: the status names
+    // the extension and what croft has for it, and nothing is disabled.
+    let visible = app.extensions.visible_indices();
+    let pos = visible
+        .iter()
+        .position(|&i| app.extensions.items()[i].id == "rust-lang.rust-analyzer")
+        .expect("the row is visible");
+    app.extensions.select(pos);
+    let before = app.disabled_extensions.clone();
+    app.toggle_selected_extension();
+    assert!(
+        app.status
+            .starts_with("rust-lang.rust-analyzer: built in: lsp-rust"),
+        "the status restates the row: {}",
+        app.status
+    );
+    assert_eq!(app.disabled_extensions, before, "nothing was toggled");
+}
+
+/// #344: a pane whose foreground process is a coding agent is badged, its
+/// status is read off the screen once it goes quiet, and the `Waiting`
+/// transition fires exactly once per prompt. The fake agent is a shell that
+/// prints a permission question and then sits; the sample names it `claude`
+/// the way the label sampler would.
+#[test]
+fn an_agent_pane_is_badged_and_a_prompt_fires_waiting_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from(
+                "printf 'Edited src/main.rs\\nDo you want to proceed? (y/n)\\n'; sleep 30",
+            ),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    let shell_pid = app.terminals[0]
+        .shell_pid()
+        .expect("a running pane has a pid");
+    let mut waited = 0;
+    while !app.terminals[0].visible_text().contains("proceed") && waited < 8000 {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        waited += 40;
+    }
+    assert!(waited < 8000, "the fake agent never painted its prompt");
+    let zero = std::time::Duration::ZERO;
+
+    // First sample: seated straight into a prompt.
+    let samples = vec![(shell_pid, String::from("claude"))];
+    assert!(app.apply_agent_samples(&samples, zero), "the lane changed");
+    let lane = app.terminals[0].agent().cloned().expect("badged");
+    assert_eq!(lane.name, "claude");
+    assert_eq!(lane.status, crate::agents::AgentStatus::Waiting);
+    assert!(app.drain_agent_events(), "a waiting agent is announced");
+    assert!(
+        app.status.contains("claude") && app.status.contains("waiting"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.agent_counts(), (1, 1));
+
+    // The same prompt on the next sample: no second Waiting.
+    app.status.clear();
+    assert!(!app.apply_agent_samples(&samples, zero), "nothing changed");
+    assert!(!app.drain_agent_events(), "the prompt fires once");
+    assert!(app.status.is_empty());
+
+    // The pill wears the badge and the chip counts it.
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.split_terminal().unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let text: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("\u{25c6} claude \u{25d0}"),
+        "the pill wears the badge:\n{text}"
+    );
+    assert!(
+        text.contains("1 agent \u{b7} 1 waiting"),
+        "the chip counts it:\n{text}"
+    );
+    assert!(app.status_agents_rect.width > 0, "and is clickable");
+
+    // Clicking the chip from the editor with the panel collapsed reveals
+    // the pane, not just focuses it.
+    app.show_terminal = false;
+    app.focus_pane(Pane::Editor);
+    term.draw(|frame| app.render(frame)).unwrap();
+    let chip = app.status_agents_rect;
+    assert!(
+        chip.width > 0,
+        "the chip is painted while the panel is hidden"
+    );
+    app.handle_mouse(mouse(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        chip.x,
+        chip.y,
+    ));
+    assert!(app.show_terminal, "the click reveals the panel");
+    assert!(matches!(app.focus, Pane::Terminal), "and focuses the pane");
+
+    // The agent leaving the foreground unseats it: the shell reclaiming the
+    // pane is one way, and a pane that produced no sample at all (the agent
+    // took the shell with it, or the pid was missed) is the other.
+    let gone = vec![(shell_pid, String::from("zsh"))];
+    assert!(app.apply_agent_samples(&gone, zero));
+    assert!(app.terminals[0].agent().is_none());
+    assert_eq!(app.agent_counts(), (0, 0));
+    assert!(app.apply_agent_samples(&samples, zero), "re-seated");
+    assert!(app.apply_agent_samples(&[], zero), "no sample unseats");
+    assert!(app.terminals[0].agent().is_none());
+    assert!(
+        matches!(
+            app.agent_events.back(),
+            Some(crate::agents::AgentEvent::Gone { .. })
+        ),
+        "and says so: {:?}",
+        app.agent_events
+    );
+
+    // A pane that has not output yet is quiet since it spawned, not since
+    // 1970, so a just-launched agent reads as working.
+    let fresh = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
+    assert!(
+        fresh.quiet_for() < std::time::Duration::from_secs(5),
+        "quiet for {:?}",
+        fresh.quiet_for()
     );
 }

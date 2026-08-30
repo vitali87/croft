@@ -47,6 +47,8 @@ pub const CHANNEL_DAP: &str = "Debug Adapter";
 pub const CHANNEL_GIT: &str = "Git";
 pub const CHANNEL_PROVISION: &str = "Server Provisioning";
 pub const CHANNEL_TESTS: &str = "Test Runner";
+/// Notification-sink delivery failures (#358).
+pub const CHANNEL_NOTIFICATIONS: &str = "Notifications";
 
 /// One line in a channel: when it arrived, how severe, and the text.
 #[derive(Clone, Debug, PartialEq)]
