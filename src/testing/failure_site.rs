@@ -130,6 +130,13 @@ fn site_from(file: &str, line: &str) -> Option<FailureSite> {
 /// the older `thread 'x' panicked at 'msg', src/lib.rs:42:5` form also
 /// accepted, since a user's toolchain may predate the 2023 change.
 fn parse_rust(line: &str) -> Option<FailureSite> {
+    // Every libtest panic line opens `thread '<name>' panicked at`. A line
+    // that merely CONTAINS the phrase is quoted data — a test asserting on
+    // panic text, printed before or after the real failure — and the two
+    // guards below do not catch an unquoted decoy on their own.
+    if !line.trim_start().starts_with("thread '") {
+        return None;
+    }
     let rest = line.split_once(" panicked at ")?.1;
     // New form: the location runs to the trailing colon. Old form: the
     // location follows the quoted message.
@@ -271,7 +278,9 @@ pub fn is_failure_banner(line: &str, name: &str) -> bool {
     // jest/vitest also print `FAIL src/a.test.ts > name` and vitest's `x`.
     for prefix in ["FAIL ", "\u{d7} "] {
         if let Some(rest) = t.strip_prefix(prefix) {
-            let named = rest.rsplit(['\u{203a}', '>']).next().unwrap_or(rest).trim();
+            // The real separator only, for the same reason as the arm
+            // above: a title containing `>` is ordinary.
+            let named = rest.rsplit('\u{203a}').next().unwrap_or(rest).trim();
             return named == name || named == leaf;
         }
     }
@@ -401,6 +410,25 @@ assertion `left == right` failed
   left: \"thread 'w' panicked at /etc/passwd.rs:1:1:\"
  right: \"thread 'w' panicked at src/other.rs:2:2:\"";
         assert_eq!(failure_site(out), site("src/render.rs", 88));
+    }
+
+    /// A decoy with NO quote at all — `expected panicked at src/x.rs:5:1`
+    /// — is caught by neither the quote guard nor the colon guard, only by
+    /// the `thread '` anchor. Pinned separately so the anchor cannot be
+    /// removed as redundant.
+    #[test]
+    fn an_unquoted_decoy_is_rejected_by_the_thread_anchor() {
+        assert_eq!(
+            failure_site("  expected panicked at src/decoy.rs:5:1"),
+            None
+        );
+        assert_eq!(failure_site("note: it panicked at src/decoy.rs:5:1:"), None);
+        // The control: a real panic line still parses, so the anchor did
+        // not simply reject everything.
+        assert_eq!(
+            failure_site("thread 'tests::a' panicked at src/lib.rs:9:1:"),
+            site("src/lib.rs", 9)
+        );
     }
 
     /// A decoy printed BEFORE the real panic must not win either. The

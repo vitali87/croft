@@ -18352,6 +18352,10 @@ impl App {
     fn launch_lldb_test_debug(&mut self, binary: &Path, name: &str) {
         use std::collections::BTreeMap;
         if self.dap_session.is_some() {
+            // The build took minutes and the user started another session
+            // meanwhile: this launch is abandoned, so the breakpoint it
+            // armed has nothing to clean up after it (#373).
+            self.disarm_failure_breakpoint();
             self.status = String::from("A debug session is already running (Shift+F5 stops it)");
             return;
         }
@@ -18381,8 +18385,9 @@ impl App {
                 self.dap_session = Some(session);
                 self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
-                self.status =
-                    format!("Debugging test {name} via lldb-dap — F5 continue · Shift+F5 stop");
+                self.status = self.with_failure_note(format!(
+                    "Debugging test {name} via lldb-dap — F5 continue · Shift+F5 stop"
+                ));
                 self.reveal_debug_view();
             }
             Err(e) => self.debug_error(format!("Failed to start lldb-dap: {e}")),
