@@ -36,6 +36,7 @@ mod media;
 mod merge;
 mod merge_editor;
 mod notebook;
+mod notify;
 mod outline_syntax;
 mod output;
 mod pair;

@@ -64,6 +64,9 @@ pub struct TestingPanel {
     /// Failed case still sits in the tree — the "run failed" marker keys on
     /// this, not on the (possibly stale) failed tally.
     run_reported_failed: bool,
+    /// A run just ended red; consumed once by the app (#358), so a failing
+    /// run notifies once, not once per test.
+    failed_run: bool,
     /// Latest cargo build-status line while busy (e.g. "Compiling ratatui"), so
     /// a long compile shows movement instead of a static "Discovering tests".
     progress: Option<String>,
@@ -97,6 +100,7 @@ impl TestingPanel {
             activity: Activity::Idle,
             last_run_ok: None,
             run_reported_failed: false,
+            failed_run: false,
             progress: None,
             refused: false,
             prerun: Vec::new(),
@@ -244,6 +248,14 @@ impl TestingPanel {
         if ok.is_some() {
             self.last_run_ok = ok;
         }
+        if ok == Some(false) {
+            self.failed_run = true;
+        }
+    }
+
+    /// Consume the failed-run latch (one notification per red run).
+    pub fn take_failed_run(&mut self) -> bool {
+        std::mem::take(&mut self.failed_run)
     }
 
     /// The worker refused a queued request because no enabled runner claims
@@ -305,7 +317,7 @@ impl TestingPanel {
             .count()
     }
 
-    fn counts(&self) -> (usize, usize, usize) {
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
         let mut passed = 0;
         let mut failed = 0;
         let mut skipped = 0;
