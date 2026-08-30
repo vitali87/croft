@@ -35249,46 +35249,58 @@ fn every_find_bar_title_fits_the_bar_it_is_painted_in() {
     };
     let opts = crate::widgets::search::SearchOpts::default();
 
-    // Every arm of the title match, with the fragment that must survive
-    // whole. `match_index` matters as much as the count: the "N of M" arm is
-    // reached ONLY when it is Some, and `set_match_count` does not touch it,
-    // so the first version of this test never rendered that arm at all,
-    // while claiming in its name to cover every one. It is also the arm
-    // whose width grows with TWO runtime numbers, which makes it the most
-    // able to overrun the bar.
-    /// A title arm: the fragment that must survive, and how to reach it.
+    // Every arm of the title match, with the WHOLE title it must paint, and
+    // how to reach it. `match_index` matters as much as the count: the
+    // "N of M" arm is reached ONLY when it is Some, and `set_match_count`
+    // does not touch it, so the first version of this test never rendered
+    // that arm at all while claiming in its name to cover every one. It is
+    // also the arm whose width grows with TWO runtime numbers, which makes
+    // it the most able to overrun the bar.
+    //
+    // The expected string is the ENTIRE title, never a fragment of it. A
+    // fragment cannot detect an overrun: text added BEFORE the fragment
+    // pushes the tail off the end while leaving the fragment itself intact,
+    // so `contains` still passes. Measured rather than reasoned: against the
+    // fragment "9876543 of 9876543+", widening that arm to
+    // " Find - match {idx} of {total} found in this whole file " (59 cells
+    // painted into a 48-cell bar) left this test green. Only the full title
+    // makes the clip observable, because the clip removes its end.
+    //
+    // Written out rather than rebuilt from the code's own format strings on
+    // purpose: sharing the construction with the code under test would make
+    // any widening agree with itself and pass.
     type TitleCase = (&'static str, Box<dyn Fn(&mut EditorFind)>);
 
     let cases: Vec<TitleCase> = vec![
-        // The empty-query arm is the BARE title. Asserting it contains
-        // "Find" proved nothing: every arm does. It is identified by what it
-        // must NOT carry.
-        ("Find", Box::new(|s: &mut EditorFind| s.query.clear())),
+        // The empty-query arm is the BARE title, and it is asserted whole
+        // for the same reason as the rest: every other arm also contains
+        // "Find", so a fragment could not tell this arm from a wrong one.
+        (" Find ", Box::new(|s: &mut EditorFind| s.query.clear())),
         (
-            "No results",
+            " Find — No results ",
             Box::new(|s: &mut EditorFind| s.set_match_count(0, false)),
         ),
         (
-            "no match in the part searched",
+            " Find: no match in the part searched ",
             Box::new(|s: &mut EditorFind| s.set_match_count(0, true)),
         ),
         (
-            "1234 matches",
+            " Find — 1234 matches ",
             Box::new(|s: &mut EditorFind| s.set_match_count(1234, false)),
         ),
         (
-            "1234+ matches",
+            " Find — 1234+ matches ",
             Box::new(|s: &mut EditorFind| s.set_match_count(1234, true)),
         ),
         (
-            "7 of 1234",
+            " Find — 7 of 1234 ",
             Box::new(|s: &mut EditorFind| {
                 s.set_match_count(1234, false);
                 s.match_index = Some(7);
             }),
         ),
         (
-            "9876543 of 9876543+",
+            " Find — 9876543 of 9876543+ ",
             Box::new(|s: &mut EditorFind| {
                 // Both numbers as wide as they plausibly get on a log, since
                 // this arm's length grows with each independently.
@@ -35298,7 +35310,7 @@ fn every_find_bar_title_fits_the_bar_it_is_painted_in() {
         ),
     ];
 
-    for (fragment, prepare) in cases {
+    for (expected, prepare) in cases {
         let mut state = EditorFind::new(String::from("needle"), opts);
         prepare(&mut state);
         let mut buf = Buffer::empty(area);
@@ -35309,20 +35321,17 @@ fn every_find_bar_title_fits_the_bar_it_is_painted_in() {
         let row: String = (rect.x..rect.x + rect.width)
             .map(|x| buf[(x, rect.y)].symbol().to_string())
             .collect();
-        assert!(
-            row.contains(fragment),
-            "the title was clipped: wanted {fragment:?} whole, painted {row:?}"
+        // Exactly, at the position the block paints it: one cell in from
+        // the left corner. `contains` would be weaker in both directions -
+        // it cannot see a clipped tail when the wanted text is a fragment,
+        // and for the bare " Find " arm every other title contains it too,
+        // so a completely wrong title would satisfy it.
+        let painted: String = row.chars().skip(1).take(expected.chars().count()).collect();
+        assert_eq!(
+            painted, expected,
+            "the title did not fit whole in a {}-cell bar, the row painted {row:?}",
+            rect.width
         );
-        if fragment == "Find" {
-            // Every arm contains "Find", so containment alone cannot tell
-            // this arm from the others: a completely wrong bare title passed.
-            for other in ["of", "matches", "No results", "no match"] {
-                assert!(
-                    !row.contains(other),
-                    "the empty-query title must be bare, painted {row:?}"
-                );
-            }
-        }
     }
 }
 
