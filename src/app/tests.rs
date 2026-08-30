@@ -21690,9 +21690,9 @@ fn dark_blue_theme_terminal_button_keeps_navy_chip() {
     assert_eq!(buf[(add.x + 1, add.y)].bg, navy);
 }
 
-/// A long fixed note for the welcome-card tests: RELEASE_NOTES is replaced
-/// every version bump, so pinning against the live note would let a future
-/// one-line note quietly gut these tests. The distinctive final word is the
+/// A long fixed note for the welcome-card tests: the live notes are rewritten
+/// every version bump (`src/release_notes/<version>.md`), so pinning against
+/// them would let a future one-line note quietly gut these tests. The distinctive final word is the
 /// clip detector.
 fn long_test_note() -> Vec<crate::release_notes::ReleaseNote> {
     vec![crate::release_notes::ReleaseNote {
@@ -35229,6 +35229,297 @@ fn a_log_that_paints_nothing_publishes_no_body_rect() {
     );
 }
 
+/// #257 follow-up: the find bar's title must FIT the bar.
+///
+/// The truncated-count arm shipped at 51 characters in a bar capped at 48
+/// and painted as "...in the part that could be searc". Nothing rendered the
+/// title, so nothing could catch it, and the replacement is protected only
+/// by arithmetic no one re-runs. This renders every arm at the real width.
+#[test]
+fn every_find_bar_title_fits_the_bar_it_is_painted_in() {
+    use crate::widgets::editor_find::{EditorFind, render_editor_find};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: 12,
+    };
+    let opts = crate::widgets::search::SearchOpts::default();
+
+    // Every arm of the title match, with the WHOLE title it must paint, and
+    // how to reach it. `match_index` matters as much as the count: the
+    // "N of M" arm is reached ONLY when it is Some, and `set_match_count`
+    // does not touch it, so the first version of this test never rendered
+    // that arm at all while claiming in its name to cover every one. It is
+    // also the arm whose width grows with TWO runtime numbers, which makes
+    // it the most able to overrun the bar.
+    //
+    // The expected string is the ENTIRE title, never a fragment of it. A
+    // fragment cannot detect an overrun: text added BEFORE the fragment
+    // pushes the tail off the end while leaving the fragment itself intact,
+    // so `contains` still passes. Measured rather than reasoned: against the
+    // fragment "9876543 of 9876543+", widening that arm to
+    // " Find - match {idx} of {total} found in this whole file " (59 cells
+    // painted into a 48-cell bar) left this test green. Only the full title
+    // makes the clip observable, because the clip removes its end.
+    //
+    // Written out rather than rebuilt from the code's own format strings on
+    // purpose: sharing the construction with the code under test would make
+    // any widening agree with itself and pass.
+    /// A title arm: the whole title it must paint, and how to reach it.
+    type TitleCase = (&'static str, Box<dyn Fn(&mut EditorFind)>);
+
+    let cases: Vec<TitleCase> = vec![
+        // The empty-query arm is the BARE title, and it is asserted whole
+        // for the same reason as the rest: every other arm also contains
+        // "Find", so a fragment could not tell this arm from a wrong one.
+        (" Find ", Box::new(|s: &mut EditorFind| s.query.clear())),
+        (
+            " Find — No results ",
+            Box::new(|s: &mut EditorFind| s.set_match_count(0, false)),
+        ),
+        (
+            " Find: no match in the part searched ",
+            Box::new(|s: &mut EditorFind| s.set_match_count(0, true)),
+        ),
+        (
+            " Find — 1234 matches ",
+            Box::new(|s: &mut EditorFind| s.set_match_count(1234, false)),
+        ),
+        (
+            " Find — 1234+ matches ",
+            Box::new(|s: &mut EditorFind| s.set_match_count(1234, true)),
+        ),
+        (
+            " Find — 7 of 1234 ",
+            Box::new(|s: &mut EditorFind| {
+                s.set_match_count(1234, false);
+                s.match_index = Some(7);
+            }),
+        ),
+        (
+            " Find — 9876543 of 9876543+ ",
+            Box::new(|s: &mut EditorFind| {
+                // Both numbers as wide as they plausibly get on a log, since
+                // this arm's length grows with each independently.
+                s.set_match_count(9_876_543, true);
+                s.match_index = Some(9_876_543);
+            }),
+        ),
+    ];
+
+    for (expected, prepare) in cases {
+        let mut state = EditorFind::new(String::from("needle"), opts);
+        prepare(&mut state);
+        let mut buf = Buffer::empty(area);
+        render_editor_find(&mut state, area, &mut buf, crate::theme::Theme::BLACK);
+
+        let rect = state.last_rect;
+        assert!(rect.width > 0, "the bar must have been painted");
+        let row: String = (rect.x..rect.x + rect.width)
+            .map(|x| buf[(x, rect.y)].symbol().to_string())
+            .collect();
+        // THE BAR'S TITLE AREA, not the buffer. Two renderers paint this
+        // title and they clip differently: `Block` clips to its own title
+        // area (`rect.width - 2`), while the gradient re-stamp in
+        // `render_editor_find` uses `set_span`, whose clamp is the BUFFER's
+        // right edge. `Theme::BLACK.gradient()` is true, so the second one
+        // runs, and a title between 38 and 47 cells overruns the block
+        // silently: it writes over the bar's own top-right corner and out
+        // past the inner area, while a comparison anchored to the painted
+        // row still matches, because the overrun is exactly the text the
+        // comparison wanted. The width assertion is what makes that visible.
+        assert!(
+            expected.chars().count() <= (rect.width as usize).saturating_sub(2),
+            "the {}-cell title does not fit a {}-cell bar's title area",
+            expected.chars().count(),
+            rect.width
+        );
+        // Exactly, at the position the block paints it: one cell in from
+        // the left corner. `contains` would be weaker in both directions -
+        // it cannot see a clipped tail when the wanted text is a fragment,
+        // and for the bare " Find " arm every other title contains it too,
+        // so a completely wrong title would satisfy it.
+        let painted: String = row.chars().skip(1).take(expected.chars().count()).collect();
+        assert_eq!(
+            painted, expected,
+            "the title did not fit whole in a {}-cell bar, the row painted {row:?}",
+            rect.width
+        );
+        // And the bar is still a bar. The corner is the first thing an
+        // overrunning title destroys, so it is the cheapest witness that the
+        // title stayed inside the box it was painted in.
+        assert_eq!(
+            buf[(rect.x + rect.width - 1, rect.y)].symbol(),
+            "\u{256e}",
+            "the title overran the bar and ate its top-right corner: {row:?}"
+        );
+    }
+}
+
+/// #257 follow-up: the count and the highlight must agree at every step of
+/// a search over a budgeted log.
+///
+/// Rounds 3, 4 and 5 of #393 each found one instance of a single class: the
+/// bar's count and the painted highlight disagreeing. This walks the whole
+/// gesture sequence and asserts the exact state after each one: type, step
+/// forward into the out-of-reach branch (where round 3's defect lived),
+/// step back, retype into a query that matches nothing, delete back.
+///
+/// NO SEPARATE INVARIANT HELPER, deliberately. An earlier version carried a
+/// closure asserting `match_count == 0 => active_search_match.is_none()` at
+/// each checkpoint, which reads as the general property behind the three
+/// defects. It could not fail: `match_count == 0` holds at exactly one
+/// checkpoint, and there the concrete assertion already fixes the highlight
+/// to `None`, which is strictly stronger. Neutering the closure entirely
+/// left the test green. Extending it over a prefix walk did not help either,
+/// because the code has no per-length behaviour, so every state the walk
+/// visits is behaviourally identical to one already enumerated.
+///
+/// A dead assertion whose name announces a property is worse than no
+/// assertion: it makes a reader believe the class is covered. The concrete
+/// assertions ARE the property, made checkable one state at a time.
+///
+/// HALF A PAIR. These pin `count == 0` with nothing painted. The other
+/// direction, a count that survives while the highlight is thrown away, is
+/// pinned by `a_step_that_runs_out_of_reach_keeps_the_match_it_already_had`.
+///
+/// WHICH CHECKPOINTS ARE NEW. Three of them re-assert what
+/// `a_step_that_runs_out_of_reach_keeps_the_match_it_already_had` and
+/// `retyping_into_an_out_of_reach_query_clears_the_old_highlight` already
+/// cover; they are carried along because this test's subject is the
+/// SEQUENCE, and a state is only reached by passing through them. The two
+/// that no sibling covers are the backward step and the final backspace
+/// into a query that matches again. A reader counting five independent
+/// facts here would be counting wrong.
+///
+/// TWO REACHABLE MATCHES, not one. With a single match the Shift+Enter
+/// checkpoint asserted nothing: `find_prev`'s leg 1 rejects the anchor's own
+/// match, leg 2 walks back from EOF and runs out of budget before reaching
+/// row 0, and `scroll_log_to_match` returns on `out_of_reach` WITHOUT
+/// touching `active_search_match`. The assertion passed because the field
+/// was never written. Measured: making `find_prev` return
+/// `Found(row 0, col 999, len 5)` unconditionally left the test green. A
+/// second match on row 1 puts a real backward step within budget, so the
+/// checkpoint now fails if `find_prev`'s anchor filter or its column
+/// arithmetic regresses.
+#[test]
+fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("budgeted.log");
+    // TWO matches at the head, both inside the budget, so a backward step
+    // has somewhere to land. Row 1 puts ERROR at character column 3, which
+    // makes a wrong column visible rather than coincidentally right.
+    let mut body = String::from("\u{1b}[31mERROR\u{1b}[0m first\n");
+    body.push_str("no \u{1b}[31mERROR\u{1b}[0m second\n");
+    let filler = "quiet line with nothing of interest ".repeat(4);
+    // Comfortably past the budget, matching the margin the sibling tests use
+    // (+3000 lines, ~11%). The earlier +200 was 1.4% over, and while the
+    // budget is a pure byte counter with no timing in it, a change to window
+    // accounting or to the stripped length of the colour header could flip
+    // the sweep from OutOfReach to Absent and quietly change what four
+    // assertions mean without any of them failing.
+    for _ in 0..(crate::log_view::FIND_SCAN_BYTES / filler.len() + 3000) {
+        body.push_str(&filler);
+        body.push('\n');
+    }
+    std::fs::write(&p, &body).unwrap();
+    assert!(
+        body.len() > crate::log_view::FIND_SCAN_BYTES,
+        "the fixture must outrun the sweep budget or the out-of-reach \
+         checkpoints test nothing"
+    );
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some(), "the fixture opens rendered");
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    // The WHOLE tuple, not just the row. A wrong column or length paints the
+    // band in the wrong place, which is the defect class this test is for,
+    // and comparing only the row cannot see it.
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((0, 0, 5)),
+        "typing lands on the first match, at its own column"
+    );
+    assert_eq!(
+        app.editor_find.as_ref().unwrap().match_count,
+        2,
+        "both head matches are counted, not merely some"
+    );
+
+    // Forward to the SECOND match, which is within budget, so this leg
+    // asserts a real step rather than a refusal.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((1, 3, 5)),
+        "the next match is row 1 at column 3, past the \"no \" prefix"
+    );
+
+    // Forward again: nothing further is reachable, so this exercises the
+    // out-of-reach branch, which is where round 3's defect lived.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((1, 3, 5)),
+        "a step that cannot reach further keeps the match it had"
+    );
+    assert!(
+        app.editor_find.as_ref().unwrap().count_truncated(),
+        "and the bar reports that the search did not cover the file"
+    );
+
+    // Backward from row 1 to row 0: within budget, so `find_prev`'s leg 1
+    // answers and its result is actually consumed. With one match this leg
+    // ran out of budget and `scroll_log_to_match` returned without writing
+    // anything, so the assertion passed on an untouched field.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((0, 0, 5)),
+        "stepping back lands on the previous match, not on the current one"
+    );
+
+    // Only now retype into something unmatchable, so the transition from a
+    // painted match to none is itself a checkpoint.
+    for ch in "ZZQX".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor_find.as_ref().unwrap().match_count,
+        0,
+        "the new query matches nothing"
+    );
+    assert_eq!(
+        app.editor.active_search_match, None,
+        "so nothing may stay painted"
+    );
+
+    // And back: the highlight must return rather than staying cleared.
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((0, 0, 5)),
+        "a query that matches again must paint its match, whole"
+    );
 /// #352: a workspace's `.vscode/extensions.json` recommendations appear in the
 /// Extensions panel under FROM VS CODE with what croft has for each.
 #[test]
