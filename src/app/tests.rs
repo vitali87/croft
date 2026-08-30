@@ -35666,3 +35666,64 @@ fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
         "a query that matches again must paint its match, whole"
     );
 }
+
+/// #414: a dropped `file://` URL naming a non-ASCII path must decode to that
+/// path, not to one char per byte.
+///
+/// The decoder pushed each `%xx` byte, and each literal byte, `as char`,
+/// which maps a byte to the Latin-1 code point of the same value, so every
+/// multi-byte UTF-8 sequence came out as mojibake and the drop opened a
+/// path that does not exist. The same defect class as #396, in the drop
+/// path.
+#[test]
+fn a_dropped_file_url_with_a_non_ascii_path_decodes_to_utf8() {
+    use std::path::PathBuf;
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/caf%C3%A9/%E4%B8%AD%E6%96%87.txt"),
+        Some(PathBuf::from("/tmp/caf\u{e9}/\u{4e2d}\u{6587}.txt")),
+        "percent-encoded UTF-8 reassembles into the characters it encodes"
+    );
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/caf\u{e9}"),
+        Some(PathBuf::from("/tmp/caf\u{e9}")),
+        "a literal non-ASCII character in the URL survives too"
+    );
+    // The ASCII cases the decoder always handled are unchanged.
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/a%20b"),
+        Some(PathBuf::from("/tmp/a b"))
+    );
+    assert_eq!(
+        super::normalise_dropped_token("'/tmp/x y'"),
+        Some(PathBuf::from("/tmp/x y"))
+    );
+    // `+` is not a space in a file URL (form encoding does not apply), and a
+    // `%` that is not an escape passes through literally, wherever it sits.
+    for (url, want) in [
+        ("file:///tmp/a+b", "/tmp/a+b"),
+        ("file:///tmp/a%zzb", "/tmp/a%zzb"),
+        ("file:///tmp/a%2", "/tmp/a%2"),
+        ("file:///tmp/a%", "/tmp/a%"),
+    ] {
+        assert_eq!(
+            super::normalise_dropped_token(url),
+            Some(PathBuf::from(want)),
+            "{url}"
+        );
+    }
+}
+
+/// A `file://` URL whose escapes do not form valid UTF-8 names no path this
+/// process can open. The decoder used to read each byte as Latin-1 and open
+/// the wrong path; a lossy decode would instead open a path with U+FFFD in
+/// it, which is just as wrong and passes every "is this a path" screen. The
+/// function's contract is to drop what is not a plausible path, so it does.
+#[test]
+fn a_dropped_file_url_with_invalid_utf8_is_dropped() {
+    assert_eq!(super::normalise_dropped_token("file:///tmp/%FF"), None);
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/%C3"),
+        None,
+        "a truncated multi-byte lead is not a path either"
+    );
+}

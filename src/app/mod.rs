@@ -40945,22 +40945,16 @@ fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
         s = s[1..s.len() - 1].to_string();
     }
     if let Some(rest) = s.strip_prefix("file://") {
-        let mut path = String::with_capacity(rest.len());
-        let bytes = rest.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%'
-                && i + 2 < bytes.len()
-                && let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
-            {
-                path.push((h * 16 + l) as char);
-                i += 3;
-                continue;
-            }
-            path.push(bytes[i] as char);
-            i += 1;
-        }
-        s = path;
+        // Decode into BYTES and build the string once. A `%xx` escape is one
+        // byte of a UTF-8 sequence, not a character; pushing it `as char`
+        // read it as Latin-1 and opened a path that does not exist (#414).
+        // A sequence that is not valid UTF-8 names no path this process can
+        // open, so per this function's contract the token is dropped rather
+        // than turned into a plausible-looking path of replacement
+        // characters, which would pass every caller's "is this a path"
+        // screen and open the wrong thing.
+        let decoded = crate::shell_integration::percent_decode(rest.as_bytes());
+        s = String::from_utf8(decoded).ok()?;
     }
     let mut unescaped = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -40999,15 +40993,6 @@ fn append_to_relay_log(log_path: &Path, payload: &str) -> std::io::Result<()> {
     f.write_all(payload.as_bytes())?;
     f.sync_data().ok();
     Ok(())
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Map a screen cell to a sheet grid cell (#177) using the frame-truth
