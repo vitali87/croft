@@ -364,7 +364,7 @@ pub const TABLE: &[Mapping] = &[
         vscode: "github.copilot",
         croft: "navigator",
         status: Status::Builtin,
-        note: "the Navigator (Cmd+I) and agent terminals cover code assistance",
+        note: "the Navigator (Cmd+I) covers code assistance; agent-aware panes are tracked in #344",
     },
     Mapping {
         vscode: "github.copilot-chat",
@@ -376,19 +376,19 @@ pub const TABLE: &[Mapping] = &[
         vscode: "continue.continue",
         croft: "navigator",
         status: Status::Builtin,
-        note: "the Navigator (Cmd+I) and agent terminals cover it",
+        note: "the Navigator (Cmd+I) covers it; agent-aware panes are tracked in #344",
     },
     Mapping {
         vscode: "saoudrizwan.claude-dev",
         croft: "navigator",
         status: Status::Builtin,
-        note: "run Claude Code in a terminal pane; croft badges agent panes",
+        note: "run Claude Code in a terminal pane; agent-aware panes are tracked in #344",
     },
     Mapping {
         vscode: "anthropic.claude-code",
         croft: "navigator",
         status: Status::Builtin,
-        note: "run Claude Code in a terminal pane; croft badges agent panes",
+        note: "run Claude Code in a terminal pane; agent-aware panes are tracked in #344",
     },
     Mapping {
         vscode: "tabnine.tabnine-vscode",
