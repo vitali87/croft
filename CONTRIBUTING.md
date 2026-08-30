@@ -6,24 +6,20 @@ Thanks for hacking on croft. Build, run, and platform setup live in the
 developer workflow concerns that do not belong in any of those.
 
 Everything in this guide applies to AI agents too, including the two sections
-below on claiming work and on verifying that a review happened. Agents often
+below on coordinating work and on verifying that a review happened. Agents often
 also keep a `CLAUDE.md` at the root for their own preferences, but it is
 deliberately untracked and clone-local: a fresh checkout will not have one, and
 nothing here depends on it.
 
-## Claiming work, so concurrent sessions do not collide
+## Coordinating work, so concurrent sessions do not collide
 
-Several agent sessions work this repo at once. Two signals say a piece of work
-is taken, and **neither covers the other**:
+Several agent sessions work this repo at once. There is no lock or claim
+label: an open PR against an issue is the only signal that the work is taken.
+Check before starting — `gh pr list --search "<issue number>"` is one call, and
+skipping it is how the same issue gets solved twice.
 
-* the issue carries a `claimed` label — that records *intent*;
-* a PR is open against it — that records *work*.
-
-Check both before starting. `gh pr list --search "<issue number>"` is one call,
-and skipping it is how the same issue gets solved twice.
-
-**A claim holds only while someone is behind it.** If nothing has moved, it is
-not a reservation:
+**A PR holds the work only while someone is behind it.** If nothing has moved,
+it is not a reservation:
 
 1. Age the work by its **last commit**, not `updatedAt` — a comment bumps
    `updatedAt`, so a stale branch can look active:
@@ -34,7 +30,7 @@ not a reservation:
 
 When you do take something over, say so on the PR with your reasons, and leave
 the branch untouched and reopenable — no force-push, no rewriting someone
-else's history. Being first is a real claim right up until nobody is behind it.
+else's history.
 
 ## Verifying a review actually happened
 
@@ -58,32 +54,66 @@ A PR that changes anything compiled into the binary (`src/`, `assets/`,
 
 * **bump `version` in `Cargo.toml`** — two different binaries must never share
   a version and differ only in commit hash, and
-* **replace the highlights in `src/release_notes.rs`** — the welcome panel's
-  "IN THIS RELEASE" card describes the single version it is baked into, so a
-  stale list means the panel lies about what the running build ships.
+* **write `src/release_notes/<version>.md`** — one file per version, named
+  for the version in `Cargo.toml`. The welcome panel's "IN THIS RELEASE" card
+  describes the single version it is baked into, so a missing or stale list
+  means the panel lies about what the running build ships.
 
-CI enforces both (the `version bump + release notes` job). Docs, CI, and
+One highlight per line, each prefixed `feature:` or `fix:`, which selects the
+card's glyph and tint. Blank lines and `#` headings are ignored:
+
+```text
+feature: Cmd+F now searches a rendered colour log.
+fix: A copy larger than the cap no longer splits a character.
+```
+
+A missing file for the current version is a **build** error, not an empty
+panel, so a binary always describes itself.
+
+Notes live in one file per version rather than one shared file because two
+versions' notes never conflict in content, only in the file they shared: with
+several PRs open, every merge forced a rebase through it, and the version
+number had to be reserved by hand between contributors (#399). Only the
+current version's file may change in a PR: an older one describes a release
+that has already shipped.
+
+CI enforces all of it (the `version bump + release notes` job). Docs, CI, and
 test-only PRs (`src/app/tests.rs`, `tests/`) are exempt.
 
-## After adding a function, check the doc below it
+## Insert new items AFTER a complete item, never above a doc block
 
-Rust attaches a `///` block to whatever item **follows** it. Insert a function
-between an existing one and its doc comment and that prose silently becomes the
-newcomer's: no compiler error, no failing test, no clippy lint. The build stays
-green and the rendered rustdoc is *confidently wrong* rather than absent, which
-is worse - absent docs send a reader to the code, wrong docs stop them looking.
+Rust attaches a `///` block to whatever item **follows** it. Insert anything
+between an existing item and its doc comment and that prose silently becomes
+the newcomer's: no compiler error, no failing test, no clippy lint. The build
+stays green and the rendered rustdoc is *confidently wrong* rather than
+absent, which is worse - absent docs send a reader to the code, wrong docs
+stop them looking.
 
-So after adding a `fn`, confirm the doc block above the **next** `fn` still
-describes that next `fn`.
+The habit that avoids it entirely is positional: add a new item after a
+complete item, not directly above a `///` block. Where that is not possible,
+confirm the doc block above the **next** item still describes that next item.
+
+This is not only about functions. A `const` inserted above another `const`'s
+doc captures it exactly the same way, and did so twice in one day before the
+gate could see it.
 
 CI catches what the habit misses (the `doc comments stay with their function`
-job): a function that had a doc comment at the merge base and has none at your
-head is the fingerprint this insertion leaves. If a removal is deliberate, say
+job): an item that had a doc comment at the merge base and has none at your
+head is the fingerprint this insertion leaves. It covers `fn`, `const`,
+`static`, `struct`, `enum`, `union`, `trait`, `type` and `macro_rules!`, and
+for a file your branch ADDS it compares your commits pairwise, since a file
+with no base version has no merge-base history to lose documentation against. If a removal is deliberate, say
 so in a commit message on the branch:
 
 ```text
 doc-removal: src/path/to/file.rs::some_function_name
+doc-removal: src/path/to/file.rs::SomeType::method_name
 ```
+
+The key after the path is the one the gate's own error names: a bare name
+for a free item, or the enclosing `impl` header for a method (`Foo::new`,
+`Display for Foo::fmt`), so a declared removal of one `new` cannot excuse
+another.
 
 The file qualifier matters: an exemption keyed on the bare name would excuse
 every function of that name in every changed file, so a deliberate removal of

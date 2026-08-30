@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.1.799"
+version = "0.1.820"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -96,6 +96,9 @@ base64 = "0.22"
 ring = "0.17"
 sha2 = "0.10"
 regex = "1.12"
+# Already in the tree via regex; taken directly for the log index, whose
+# newline scan is the one hot loop in opening a multi-gigabyte file.
+memchr = "2.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 # NeuQuant colour quantiser, already in the tree via image's gif feature. Used
 # directly by the hand-rolled sixel encoder (src/iterm2_inline.rs) to fit an

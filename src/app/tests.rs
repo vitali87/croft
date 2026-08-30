@@ -21906,9 +21906,9 @@ fn dark_blue_theme_terminal_button_keeps_navy_chip() {
     assert_eq!(buf[(add.x + 1, add.y)].bg, navy);
 }
 
-/// A long fixed note for the welcome-card tests: RELEASE_NOTES is replaced
-/// every version bump, so pinning against the live note would let a future
-/// one-line note quietly gut these tests. The distinctive final word is the
+/// A long fixed note for the welcome-card tests: the live notes are rewritten
+/// every version bump (`src/release_notes/<version>.md`), so pinning against
+/// them would let a future one-line note quietly gut these tests. The distinctive final word is the
 /// clip detector.
 fn long_test_note() -> Vec<crate::release_notes::ReleaseNote> {
     vec![crate::release_notes::ReleaseNote {
@@ -34949,4 +34949,791 @@ fn auto_hide_recovers_after_the_activity_bar_comes_back() {
          rather than the feature staying dead for the session"
     );
     assert!(!app.show_tree, "and the sidebar actually collapsed");
+}
+
+/// #257: Cmd+F in a rendered colour log must search what the user SEES.
+///
+/// The log view keeps the file windowed, so a log tab's `lines` is a stub
+/// and the ordinary find path reads an empty buffer: the bar answers "No
+/// results" over a file full of matches. `LogView::visible_text` was
+/// written for exactly these consumers and had none.
+#[test]
+fn find_in_a_rendered_color_log_matches_the_visible_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("build.log");
+    let mut body = String::new();
+    for i in 0..200 {
+        body.push_str(&format!("\u{1b}[32mINFO\u{1b}[0m step {i} ok\n"));
+    }
+    body.push_str("\u{1b}[31mERROR\u{1b}[0m disk full\n");
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(
+        app.editor.log.is_some(),
+        "the fixture must open as a rendered log"
+    );
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "disk".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+
+    let state = app
+        .editor_find
+        .as_ref()
+        .expect("Cmd+F opens the find bar over a log");
+    assert_eq!(
+        state.match_count, 1,
+        "the one ERROR line must be found through the stripped text"
+    );
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(200),
+        "the match is the last line of the file"
+    );
+    assert!(
+        app.editor.scroll > 0,
+        "the view must scroll to reveal the match, not sit at the top"
+    );
+}
+
+/// #257: Enter and Shift+Enter step through a log's matches. The log has no
+/// caret to carry the position, so the walk is anchored on the active match
+/// alone; without that anchor every Enter would re-find the same line.
+#[test]
+fn enter_steps_through_matches_in_a_rendered_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("run.log");
+    std::fs::write(
+        &p,
+        "\u{1b}[31mFAIL\u{1b}[0m one\nok\n\u{1b}[31mFAIL\u{1b}[0m two\nok\n",
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some());
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "FAIL".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor_find.as_ref().map(|s| s.match_count),
+        Some(2),
+        "both FAIL lines are counted through the stripped text"
+    );
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "typing lands on the first match"
+    );
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(2),
+        "Enter steps to the second match rather than re-finding the first"
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "past the last match, Enter wraps to the top"
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(2),
+        "Shift+Enter walks back, wrapping to the last match"
+    );
+}
+
+/// #257 review finding: the find bar's `N+` belonged to the log tab that
+/// earned it and leaked onto the next search. A text buffer is counted
+/// exhaustively, so showing `N+` there claims a limit that does not exist.
+#[test]
+fn a_logs_budgeted_count_does_not_leak_onto_the_next_text_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("huge.log");
+    // Past FIND_SCAN_BYTES, so the count genuinely runs out of budget.
+    let line = "\u{1b}[31mERROR\u{1b}[0m ".to_string() + &"pad ".repeat(40) + "\n";
+    let body = line.repeat((crate::log_view::FIND_SCAN_BYTES / line.len()) + 2000);
+    std::fs::write(&log, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&log).unwrap();
+    assert!(app.editor.log.is_some(), "the fixture must open rendered");
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert!(
+        app.editor_find
+            .as_ref()
+            .is_some_and(|s| s.count_truncated()),
+        "a log too large to search whole must report its count as partial"
+    );
+
+    // Now search an ordinary file, which IS counted exhaustively. The find
+    // bar deliberately stays OPEN across the tab switch: closing it builds a
+    // fresh EditorFind on the next Cmd+F, and this test then passes against
+    // the very bug it exists to catch (round-2 review finding).
+    let text = tmp.path().join("small.txt");
+    std::fs::write(&text, "ERROR one\nplain\nERROR two\n").unwrap();
+    app.editor.open(&text).unwrap();
+    assert!(app.editor.log.is_none(), "a plain file is a text tab");
+    assert!(
+        app.editor_find.is_some(),
+        "the find bar must still be the one the log search left behind"
+    );
+    // Retype the query into the SAME bar rather than opening a new one.
+    app.editor_find.as_mut().unwrap().query.clear();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let state = app.editor_find.as_ref().expect("the find bar is open");
+    assert_eq!(state.match_count, 2);
+    assert!(
+        !state.count_truncated(),
+        "an exhaustive count must not inherit the log's N+"
+    );
+}
+
+/// #257 round-3 review finding: a step that runs out of budget must leave
+/// the user where they are. Marking the count partial and then clearing the
+/// active match left the bar reading "1+ matches" with nothing highlighted
+/// and no way back to the match they were on.
+#[test]
+fn a_step_that_runs_out_of_reach_keeps_the_match_it_already_had() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("far.log");
+    // One match at the very top, then far more filler than a sweep may read,
+    // so stepping forward from it exhausts the budget without finding another.
+    let mut body = String::from("\u{1b}[31mERROR\u{1b}[0m first and only\n");
+    let filler = "quiet line with nothing of interest ".repeat(4);
+    for _ in 0..(crate::log_view::FIND_SCAN_BYTES / filler.len() + 3000) {
+        body.push_str(&filler);
+        body.push('\n');
+    }
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some());
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "typing lands on the only match"
+    );
+
+    // Enter steps forward, runs out of budget, and finds nothing more.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "an out-of-reach step must leave the highlight where it was, not \
+         clear it and leave the user with a count and nothing to look at"
+    );
+    assert!(
+        app.editor_find
+            .as_ref()
+            .is_some_and(|s| s.count_truncated()),
+        "and the bar must say the search did not cover the whole file"
+    );
+}
+
+/// #257 round-4 review finding: a CHANGED query must not leave the previous
+/// query's highlight painted. The early return that keeps a match across an
+/// out-of-reach STEP was also firing on the retype path, where the old
+/// position belongs to a query the user has already replaced.
+#[test]
+fn retyping_into_an_out_of_reach_query_clears_the_old_highlight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("far.log");
+    let mut body = String::from("\u{1b}[31mERROR\u{1b}[0m first and only\n");
+    let filler = "quiet line with nothing of interest ".repeat(4);
+    for _ in 0..(crate::log_view::FIND_SCAN_BYTES / filler.len() + 3000) {
+        body.push_str(&filler);
+        body.push('\n');
+    }
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "the match is found while the query still matches"
+    );
+
+    // Extend the query into something that matches nothing reachable.
+    for ch in "ZZQX".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match, None,
+        "the previous query's highlight must not survive under a new query \
+         that found nothing: the bar would say no match while a match stayed \
+         painted"
+    );
+}
+
+/// #257: dragging over a rendered ANSI log selects it, and Cmd+C copies what
+/// the reader SEES rather than the escape bytes behind it.
+///
+/// Driven through the real gestures and a real render, so the body rect the
+/// mouse path reads is the one a frame actually painted: a test that set
+/// `last_body` by hand would pass with the renderer never having agreed.
+#[test]
+fn dragging_over_a_rendered_log_selects_and_copies_the_visible_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("run.log");
+    std::fs::write(
+        &p,
+        "\u{1b}[32mINFO\u{1b}[0m starting up\n\u{1b}[31mERROR\u{1b}[0m disk full\nbye\n",
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some(), "the fixture opens rendered");
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    assert!(
+        body.width > 0 && body.height > 0,
+        "the render must have published a body rect for the mouse to hit"
+    );
+
+    // Press on the first body row, drag to the second, release.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        body.x,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        body.x + 10,
+        body.y + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        body.x + 10,
+        body.y + 1,
+    ));
+
+    let log = app.editor.log.as_ref().unwrap();
+    assert!(log.has_selection(), "the drag must leave a selection");
+    assert!(!log.dragging, "and the release must end the drag");
+    let (text, clamped) = log.selection_text();
+    assert!(!clamped);
+    assert_eq!(
+        text, "INFO starting up\nERROR disk",
+        "the copy is the stripped text, not the escapes behind it"
+    );
+
+    // What is PAINTED must match what is copied, row for row. Nothing
+    // asserted this before: deleting the entire selection-painting block from
+    // the renderer left the suite green, so the visible half of the feature
+    // had no coverage at all.
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    {
+        use ratatui::widgets::Widget;
+        let area = app.editor.last_area;
+        (&mut app.editor).render(area, &mut buf);
+    }
+    // Frame truth: the rect the render that filled THIS buffer published.
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    let copied_per_row: Vec<usize> = text.split('\n').map(|l| l.chars().count()).collect();
+    for (r, expected) in copied_per_row.iter().enumerate() {
+        let y = body.y + r as u16;
+        let painted = (body.x..body.x + body.width)
+            .filter(|x| buf[(*x, y)].style().bg == Some(selected_bg))
+            .count();
+        assert_eq!(
+            painted, *expected,
+            "row {r}: {painted} cells painted as selected, {expected} characters copied"
+        );
+    }
+
+    // Cmd+C puts exactly that on the clipboard.
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        app.status.starts_with("Copied"),
+        "the copy must report itself, got {:?}",
+        app.status
+    );
+}
+
+/// #257: dragging past the end of a SHORT line must paint what it copies.
+///
+/// The renderer painted to the endpoint it was handed while the copy read
+/// `min(len)`, and `log_cell_at` clamped the line but not the column, so a
+/// drag off the right of a short line painted to the pointer and copied to
+/// the line's end. Clamping at the source means both readers see one value
+/// instead of each clamping its own way.
+#[test]
+fn dragging_past_a_short_lines_end_paints_what_it_copies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("short.log");
+    // A coloured line so the view renders, and a very short one to drag off.
+    std::fs::write(&p, "\u{1b}[31mabc\u{1b}[0m\nlonger second line here\n").unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some());
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let body = app.editor.log.as_ref().unwrap().last_body;
+
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        body.x,
+        body.y,
+    ));
+    // Drag far past the end of a three-character line.
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        body.x + 60,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        body.x + 60,
+        body.y,
+    ));
+
+    let (text, _) = app.editor.log.as_ref().unwrap().selection_text();
+    assert_eq!(text, "abc", "the copy stops at the end of the line");
+
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    {
+        use ratatui::widgets::Widget;
+        let area = app.editor.last_area;
+        (&mut app.editor).render(area, &mut buf);
+    }
+    // Frame truth: the rect to read is the one the render that filled THIS
+    // buffer published, not one captured from an earlier frame. Reading the
+    // stale rect pointed at the header row and reported nothing painted.
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    let painted = (body.x..body.x + body.width)
+        .filter(|x| buf[(*x, body.y)].style().bg == Some(selected_bg))
+        .count();
+    assert_eq!(
+        painted,
+        text.chars().count(),
+        "the paint must stop where the copy does, not follow the pointer"
+    );
+}
+
+/// #257: a frame that paints no log body must publish no body rect.
+///
+/// `render_log` returned early for a zero-sized area WITHOUT clearing
+/// `last_body`, so after a resize the mouse path could accept a click inside
+/// a rectangle this frame had not painted. Frame truth cuts both ways: the
+/// rect is a claim about what was drawn, and drawing nothing is a claim too.
+#[test]
+fn a_log_that_paints_nothing_publishes_no_body_rect() {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("run.log");
+    std::fs::write(&p, "\u{1b}[31mERROR\u{1b}[0m boom\nsecond\n").unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&p).unwrap();
+
+    // A real frame publishes a real rect.
+    let mut buf = ratatui::buffer::Buffer::empty(Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 8,
+    });
+    (&mut e).render(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        },
+        &mut buf,
+    );
+    assert!(
+        e.log.as_ref().unwrap().last_body.height > 0,
+        "a painted frame publishes its body"
+    );
+
+    // A frame with no room paints nothing, so it must claim nothing.
+    let mut narrow = ratatui::buffer::Buffer::empty(Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 8,
+    });
+    (&mut e).render(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        },
+        &mut narrow,
+    );
+    assert_eq!(
+        e.log.as_ref().unwrap().last_body,
+        Rect::default(),
+        "a frame that painted nothing must not leave a stale rect for the \
+         mouse path to hit-test against"
+    );
+}
+
+/// #257 follow-up: the find bar's title must FIT the bar.
+///
+/// The truncated-count arm shipped at 51 characters in a bar capped at 48
+/// and painted as "...in the part that could be searc". Nothing rendered the
+/// title, so nothing could catch it, and the replacement is protected only
+/// by arithmetic no one re-runs. This renders every arm at the real width.
+#[test]
+fn every_find_bar_title_fits_the_bar_it_is_painted_in() {
+    use crate::widgets::editor_find::{EditorFind, render_editor_find};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: 12,
+    };
+    let opts = crate::widgets::search::SearchOpts::default();
+
+    // Every arm of the title match, with the WHOLE title it must paint, and
+    // how to reach it. `match_index` matters as much as the count: the
+    // "N of M" arm is reached ONLY when it is Some, and `set_match_count`
+    // does not touch it, so the first version of this test never rendered
+    // that arm at all while claiming in its name to cover every one. It is
+    // also the arm whose width grows with TWO runtime numbers, which makes
+    // it the most able to overrun the bar.
+    //
+    // The expected string is the ENTIRE title, never a fragment of it. A
+    // fragment cannot detect an overrun: text added BEFORE the fragment
+    // pushes the tail off the end while leaving the fragment itself intact,
+    // so `contains` still passes. Measured rather than reasoned: against the
+    // fragment "9876543 of 9876543+", widening that arm to
+    // " Find - match {idx} of {total} found in this whole file " (59 cells
+    // painted into a 48-cell bar) left this test green. Only the full title
+    // makes the clip observable, because the clip removes its end.
+    //
+    // Written out rather than rebuilt from the code's own format strings on
+    // purpose: sharing the construction with the code under test would make
+    // any widening agree with itself and pass.
+    /// A title arm: the whole title it must paint, and how to reach it.
+    type TitleCase = (&'static str, Box<dyn Fn(&mut EditorFind)>);
+
+    let cases: Vec<TitleCase> = vec![
+        // The empty-query arm is the BARE title, and it is asserted whole
+        // for the same reason as the rest: every other arm also contains
+        // "Find", so a fragment could not tell this arm from a wrong one.
+        (" Find ", Box::new(|s: &mut EditorFind| s.query.clear())),
+        (
+            " Find — No results ",
+            Box::new(|s: &mut EditorFind| s.set_match_count(0, false)),
+        ),
+        (
+            " Find: no match in the part searched ",
+            Box::new(|s: &mut EditorFind| s.set_match_count(0, true)),
+        ),
+        (
+            " Find — 1234 matches ",
+            Box::new(|s: &mut EditorFind| s.set_match_count(1234, false)),
+        ),
+        (
+            " Find — 1234+ matches ",
+            Box::new(|s: &mut EditorFind| s.set_match_count(1234, true)),
+        ),
+        (
+            " Find — 7 of 1234 ",
+            Box::new(|s: &mut EditorFind| {
+                s.set_match_count(1234, false);
+                s.match_index = Some(7);
+            }),
+        ),
+        (
+            " Find — 9876543 of 9876543+ ",
+            Box::new(|s: &mut EditorFind| {
+                // Both numbers as wide as they plausibly get on a log, since
+                // this arm's length grows with each independently.
+                s.set_match_count(9_876_543, true);
+                s.match_index = Some(9_876_543);
+            }),
+        ),
+    ];
+
+    for (expected, prepare) in cases {
+        let mut state = EditorFind::new(String::from("needle"), opts);
+        prepare(&mut state);
+        let mut buf = Buffer::empty(area);
+        render_editor_find(&mut state, area, &mut buf, crate::theme::Theme::BLACK);
+
+        let rect = state.last_rect;
+        assert!(rect.width > 0, "the bar must have been painted");
+        let row: String = (rect.x..rect.x + rect.width)
+            .map(|x| buf[(x, rect.y)].symbol().to_string())
+            .collect();
+        // THE BAR'S TITLE AREA, not the buffer. Two renderers paint this
+        // title and they clip differently: `Block` clips to its own title
+        // area (`rect.width - 2`), while the gradient re-stamp in
+        // `render_editor_find` uses `set_span`, whose clamp is the BUFFER's
+        // right edge. `Theme::BLACK.gradient()` is true, so the second one
+        // runs, and a title between 38 and 47 cells overruns the block
+        // silently: it writes over the bar's own top-right corner and out
+        // past the inner area, while a comparison anchored to the painted
+        // row still matches, because the overrun is exactly the text the
+        // comparison wanted. The width assertion is what makes that visible.
+        assert!(
+            expected.chars().count() <= (rect.width as usize).saturating_sub(2),
+            "the {}-cell title does not fit a {}-cell bar's title area",
+            expected.chars().count(),
+            rect.width
+        );
+        // Exactly, at the position the block paints it: one cell in from
+        // the left corner. `contains` would be weaker in both directions -
+        // it cannot see a clipped tail when the wanted text is a fragment,
+        // and for the bare " Find " arm every other title contains it too,
+        // so a completely wrong title would satisfy it.
+        let painted: String = row.chars().skip(1).take(expected.chars().count()).collect();
+        assert_eq!(
+            painted, expected,
+            "the title did not fit whole in a {}-cell bar, the row painted {row:?}",
+            rect.width
+        );
+        // And the bar is still a bar. The corner is the first thing an
+        // overrunning title destroys, so it is the cheapest witness that the
+        // title stayed inside the box it was painted in.
+        assert_eq!(
+            buf[(rect.x + rect.width - 1, rect.y)].symbol(),
+            "\u{256e}",
+            "the title overran the bar and ate its top-right corner: {row:?}"
+        );
+    }
+}
+
+/// #257 follow-up: the count and the highlight must agree at every step of
+/// a search over a budgeted log.
+///
+/// Rounds 3, 4 and 5 of #393 each found one instance of a single class: the
+/// bar's count and the painted highlight disagreeing. This walks the whole
+/// gesture sequence and asserts the exact state after each one: type, step
+/// forward into the out-of-reach branch (where round 3's defect lived),
+/// step back, retype into a query that matches nothing, delete back.
+///
+/// NO SEPARATE INVARIANT HELPER, deliberately. An earlier version carried a
+/// closure asserting `match_count == 0 => active_search_match.is_none()` at
+/// each checkpoint, which reads as the general property behind the three
+/// defects. It could not fail: `match_count == 0` holds at exactly one
+/// checkpoint, and there the concrete assertion already fixes the highlight
+/// to `None`, which is strictly stronger. Neutering the closure entirely
+/// left the test green. Extending it over a prefix walk did not help either,
+/// because the code has no per-length behaviour, so every state the walk
+/// visits is behaviourally identical to one already enumerated.
+///
+/// A dead assertion whose name announces a property is worse than no
+/// assertion: it makes a reader believe the class is covered. The concrete
+/// assertions ARE the property, made checkable one state at a time.
+///
+/// HALF A PAIR. These pin `count == 0` with nothing painted. The other
+/// direction, a count that survives while the highlight is thrown away, is
+/// pinned by `a_step_that_runs_out_of_reach_keeps_the_match_it_already_had`.
+///
+/// WHICH CHECKPOINTS ARE NEW. Three of them re-assert what
+/// `a_step_that_runs_out_of_reach_keeps_the_match_it_already_had` and
+/// `retyping_into_an_out_of_reach_query_clears_the_old_highlight` already
+/// cover; they are carried along because this test's subject is the
+/// SEQUENCE, and a state is only reached by passing through them. The two
+/// that no sibling covers are the backward step and the final backspace
+/// into a query that matches again. A reader counting five independent
+/// facts here would be counting wrong.
+///
+/// TWO REACHABLE MATCHES, not one. With a single match the Shift+Enter
+/// checkpoint asserted nothing: `find_prev`'s leg 1 rejects the anchor's own
+/// match, leg 2 walks back from EOF and runs out of budget before reaching
+/// row 0, and `scroll_log_to_match` returns on `out_of_reach` WITHOUT
+/// touching `active_search_match`. The assertion passed because the field
+/// was never written. Measured: making `find_prev` return
+/// `Found(row 0, col 999, len 5)` unconditionally left the test green. A
+/// second match on row 1 puts a real backward step within budget, so the
+/// checkpoint now fails if `find_prev`'s anchor filter or its column
+/// arithmetic regresses.
+#[test]
+fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("budgeted.log");
+    // TWO matches at the head, both inside the budget, so a backward step
+    // has somewhere to land. Row 1 puts ERROR at character column 3, which
+    // makes a wrong column visible rather than coincidentally right.
+    let mut body = String::from("\u{1b}[31mERROR\u{1b}[0m first\n");
+    body.push_str("no \u{1b}[31mERROR\u{1b}[0m second\n");
+    let filler = "quiet line with nothing of interest ".repeat(4);
+    // Comfortably past the budget, matching the margin the sibling tests use
+    // (+3000 lines, ~11%). The earlier +200 was 1.4% over, and while the
+    // budget is a pure byte counter with no timing in it, a change to window
+    // accounting or to the stripped length of the colour header could flip
+    // the sweep from OutOfReach to Absent and quietly change what four
+    // assertions mean without any of them failing.
+    for _ in 0..(crate::log_view::FIND_SCAN_BYTES / filler.len() + 3000) {
+        body.push_str(&filler);
+        body.push('\n');
+    }
+    std::fs::write(&p, &body).unwrap();
+    assert!(
+        body.len() > crate::log_view::FIND_SCAN_BYTES,
+        "the fixture must outrun the sweep budget or the out-of-reach \
+         checkpoints test nothing"
+    );
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some(), "the fixture opens rendered");
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    // The WHOLE tuple, not just the row. A wrong column or length paints the
+    // band in the wrong place, which is the defect class this test is for,
+    // and comparing only the row cannot see it.
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((0, 0, 5)),
+        "typing lands on the first match, at its own column"
+    );
+    assert_eq!(
+        app.editor_find.as_ref().unwrap().match_count,
+        2,
+        "both head matches are counted, not merely some"
+    );
+
+    // Forward to the SECOND match, which is within budget, so this leg
+    // asserts a real step rather than a refusal.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((1, 3, 5)),
+        "the next match is row 1 at column 3, past the \"no \" prefix"
+    );
+
+    // Forward again: nothing further is reachable, so this exercises the
+    // out-of-reach branch, which is where round 3's defect lived.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((1, 3, 5)),
+        "a step that cannot reach further keeps the match it had"
+    );
+    assert!(
+        app.editor_find.as_ref().unwrap().count_truncated(),
+        "and the bar reports that the search did not cover the file"
+    );
+
+    // Backward from row 1 to row 0: within budget, so `find_prev`'s leg 1
+    // answers and its result is actually consumed. With one match this leg
+    // ran out of budget and `scroll_log_to_match` returned without writing
+    // anything, so the assertion passed on an untouched field.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((0, 0, 5)),
+        "stepping back lands on the previous match, not on the current one"
+    );
+
+    // Only now retype into something unmatchable, so the transition from a
+    // painted match to none is itself a checkpoint.
+    for ch in "ZZQX".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor_find.as_ref().unwrap().match_count,
+        0,
+        "the new query matches nothing"
+    );
+    assert_eq!(
+        app.editor.active_search_match, None,
+        "so nothing may stay painted"
+    );
+
+    // And back: the highlight must return rather than staying cleared.
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match,
+        Some((0, 0, 5)),
+        "a query that matches again must paint its match, whole"
+    );
 }

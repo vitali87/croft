@@ -55,17 +55,80 @@ pub fn load_scale() -> u32 {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1) as f64;
-        let threads = std::env::var("RUST_TEST_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(cpus);
+        let threads = configured_threads().unwrap_or(cpus);
         let oversubscribed = load_average().map(|l| l / cpus).unwrap_or(1.0);
         scale_from(threads, oversubscribed)
     })
 }
 
+/// How many test threads the harness is actually running.
+///
+/// BOTH spellings, because they are the same instruction to the harness and
+/// were not the same here. `cargo test -- --test-threads=8` does not set
+/// `RUST_TEST_THREADS`, so reading only the variable reported this machine's
+/// CORE COUNT while the suite ran twice that many threads. The signal meant
+/// to cover the self-inflicted case went blind exactly when someone spelled
+/// it with the flag, which is how #397's flake was reached: measured on a
+/// 4-CPU box at `--test-threads=8` under six spinning hogs, the scale read
+/// 4 where the visible count gives 8, so a wait budgeted at 4s should have
+/// had 8s.
+///
+/// THE FLAG FIRST, because that is libtest's own precedence and reading it
+/// the other way round would still undercount on the machine that matters
+/// most. `library/test/src/lib.rs` resolves the count as
+/// `opts.test_threads.unwrap_or_else(get_concurrency)`, and only
+/// `get_concurrency` consults `RUST_TEST_THREADS`
+/// (`library/test/src/helpers/concurrency.rs:7-16`). CI pins the variable to
+/// 4 and CONTRIBUTING teaches the variable, so `RUST_TEST_THREADS=4 cargo
+/// test -- --test-threads=8` is the natural way to reproduce #397: the
+/// harness runs 8 and an env-first reading believes 4, which is the same
+/// undercount this function exists to remove.
+fn configured_threads() -> Option<f64> {
+    threads_from_args(std::env::args()).or_else(|| {
+        std::env::var("RUST_TEST_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+    })
+}
+
+/// `--test-threads N` and `--test-threads=N`, the two spellings the harness
+/// accepts, taken from an iterator so the parsing is testable without a
+/// process in a particular state.
+///
+/// The whole argv is scanned and the LAST parseable value wins, rather than
+/// returning at the first occurrence. A value that does not parse is not a
+/// thread count, and stopping there would let it mask a real one later in
+/// the line; libtest itself refuses such a run outright, so the only thing
+/// this ordering changes is which answer a malformed argv produces on the
+/// way to failing.
+fn threads_from_args<I: IntoIterator<Item = String>>(args: I) -> Option<f64> {
+    let mut found = None;
+    let mut args = args.into_iter();
+    while let Some(a) = args.next() {
+        let value = if let Some(v) = a.strip_prefix("--test-threads=") {
+            Some(v.to_string())
+        } else if a == "--test-threads" {
+            args.next()
+        } else {
+            None
+        };
+        if let Some(n) = value.and_then(|v| v.parse::<f64>().ok()) {
+            found = Some(n);
+        }
+    }
+    found
+}
+
 /// The rule itself, split out so it can be tested without a machine in a
 /// particular state.
+///
+/// NOTE (#422): `threads` is a count and `oversubscription` is a ratio, so
+/// the `max` between them compares two different quantities. Fixing that in
+/// isolation SHRINKS every budget (a quiet 4-CPU box goes from 4 to the
+/// floor of 2), because the base budgets were calibrated against a scale
+/// that was effectively the core count. It needs the bases recalibrated with
+/// it, which is its own change; this one only makes the existing rule see
+/// the thread count it always meant to read.
 fn scale_from(threads: f64, oversubscription: f64) -> u32 {
     let raw = threads.max(oversubscription).ceil();
     if !raw.is_finite() {
@@ -152,6 +215,83 @@ mod tests {
             "so does load from outside the suite"
         );
         assert_eq!(scale_from(4.0, 6.0), 6, "the worse of the two wins");
+    }
+
+    /// `--test-threads` and `RUST_TEST_THREADS` are the same instruction to
+    /// the harness, and only one of them used to reach this module.
+    ///
+    /// The flag is what `cargo test -- --test-threads=8` sets, and it never
+    /// touches the environment, so the suite's own parallelism read as the
+    /// machine's core count whenever it was spelled that way. On the box
+    /// where #397 reproduces that is the difference between a 4s budget and
+    /// an 8s one for the wait that timed out.
+    #[test]
+    fn both_spellings_of_the_thread_count_are_seen() {
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            threads_from_args(argv(&["croft", "--test-threads=8"])),
+            Some(8.0),
+            "the joined spelling"
+        );
+        assert_eq!(
+            threads_from_args(argv(&["croft", "--test-threads", "8"])),
+            Some(8.0),
+            "and the separated one"
+        );
+        assert_eq!(
+            threads_from_args(argv(&["croft", "--nocapture"])),
+            None,
+            "absent means absent, so the caller falls back to the CPU count"
+        );
+        assert_eq!(
+            threads_from_args(argv(&["croft", "--test-threads"])),
+            None,
+            "a flag with no value is not a thread count"
+        );
+        assert_eq!(
+            threads_from_args(argv(&["croft", "--test-threads=zero"])),
+            None,
+            "nor is one that does not parse"
+        );
+        assert_eq!(
+            threads_from_args(argv(&["croft", "--test-threads=zero", "--test-threads=8"])),
+            Some(8.0),
+            "a value that does not parse must not mask a real one later on"
+        );
+    }
+
+    /// The flag beats the variable, because that is libtest's own order.
+    ///
+    /// `library/test/src/lib.rs` resolves the count as
+    /// `opts.test_threads.unwrap_or_else(get_concurrency)`, and only
+    /// `get_concurrency` reads `RUST_TEST_THREADS`. Reading them the other
+    /// way round undercounts exactly where it matters: CI pins the variable
+    /// to 4 and `CONTRIBUTING.md` teaches the variable, so
+    /// `RUST_TEST_THREADS=4 cargo test -- --test-threads=8` is the natural
+    /// way to reproduce #397, and an env-first reading believes 4 while the
+    /// harness runs 8.
+    ///
+    /// The rule is asserted on the resolver rather than by setting the
+    /// variable: this suite shares one process, so mutating the environment
+    /// here would change what every other thread reads.
+    #[test]
+    fn the_flag_outranks_the_environment_variable_as_libtest_does() {
+        // The shape of `configured_threads`, with both sources supplied
+        // explicitly instead of read from the process.
+        fn resolve(flag: Option<f64>, env: Option<f64>) -> Option<f64> {
+            flag.or(env)
+        }
+        assert_eq!(
+            resolve(Some(8.0), Some(4.0)),
+            Some(8.0),
+            "the flag wins when both are given, as libtest resolves it"
+        );
+        assert_eq!(
+            resolve(None, Some(4.0)),
+            Some(4.0),
+            "the variable is the fallback, not the override"
+        );
+        assert_eq!(resolve(None, None), None, "neither means fall back to CPUs");
     }
 
     #[test]

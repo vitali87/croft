@@ -133,6 +133,34 @@ pub enum CliCommand {
     },
     /// List the running persistent croft sessions started with `croft attach`.
     Ls,
+    /// Chart numbers, CSV/TSV, or JSON lines from stdin inline in the pane:
+    /// `seq 1 100 | awk '{print sin($1/10)}' | croft plot`. Draws an image on
+    /// iTerm2 / Kitty terminals and a braille or block chart anywhere else.
+    /// Headers are detected; `--x` names the label column, `--y` the series
+    /// (repeatable).
+    Plot {
+        /// Chart shape: line, bar, spark (one row), or hist (histogram of
+        /// the first series).
+        #[arg(long = "type", default_value = "line")]
+        kind: String,
+        /// Column (name or 0-based index) that labels the points.
+        #[arg(long)]
+        x: Option<String>,
+        /// Column(s) to plot; default: every numeric column.
+        #[arg(long)]
+        y: Vec<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// Width in terminal columns.
+        #[arg(long, default_value_t = 60)]
+        width: u16,
+        /// Height in terminal rows.
+        #[arg(long, default_value_t = 15)]
+        height: u16,
+        /// Always print the text chart, even where an image would render.
+        #[arg(long, default_value_t = false)]
+        text: bool,
+    },
     /// Internal: the multiplayer session host/client (croft's dtach
     /// replacement; see docs/MULTIPLAYER.md). `croft attach` and the remote
     /// launcher drive this; it is not intended for manual use.
@@ -239,6 +267,41 @@ pub enum CliCommand {
         #[arg(short, long, default_value_t = false)]
         yes: bool,
     },
+    /// Bring a VS Code profile across: settings, keybindings and snippets
+    /// (#351).
+    ///
+    /// Finds your VS Code (or Cursor / VSCodium / Windsurf) user directory,
+    /// converts what croft has an equivalent for, and MERGES the result into
+    /// `~/.config/croft/`: an existing croft value always wins, so running
+    /// this twice changes nothing the second time. Keys and commands croft
+    /// has no equivalent for are listed rather than dropped silently.
+    ImportVscode {
+        /// The VS Code user directory to read (default: auto-detected).
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Print the full report and write nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    /// Import a VS Code colour theme (.json) as a croft theme (#350).
+    ///
+    /// Reads a theme file you already have (from a cloned theme repo, or an
+    /// installed VS Code extension's `themes/` directory), converts its
+    /// workbench colours, terminal palette, TextMate token colours and
+    /// `semanticTokenColors` (as a fallback where a scope is missing) into a
+    /// croft `[[themes]]` manifest, and installs it under
+    /// `~/.config/croft/extensions/`. No extension code is downloaded or run.
+    /// The theme appears in the picker on croft's next launch.
+    ThemeImport {
+        /// Path to the theme JSON (JSONC and `include` chains are handled).
+        file: PathBuf,
+        /// Theme id to use instead of one derived from the theme's name.
+        #[arg(long)]
+        id: Option<String>,
+        /// Print the manifest instead of installing it.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Configure Ghostty for Croft: forward every croft chord (Cmd+T, Cmd+W,
     /// Cmd+[ / Cmd+], Cmd+1..9, etc.) to croft as a CSI-u sequence instead of
     /// letting Ghostty's own keybinds (new_tab, goto_tab, ...) swallow them.
@@ -309,6 +372,23 @@ impl Cli {
             }
             Some(CliCommand::Attach { path, solo }) => crate::session::attach(path, solo),
             Some(CliCommand::Ls) => crate::session::list(),
+            Some(CliCommand::Plot {
+                kind,
+                x,
+                y,
+                title,
+                width,
+                height,
+                text,
+            }) => plot(
+                &kind,
+                x.as_deref(),
+                &y,
+                title.as_deref(),
+                width,
+                height,
+                text,
+            ),
             Some(CliCommand::SessionHost {
                 probe,
                 serve,
@@ -475,6 +555,10 @@ impl Cli {
                 Ok(())
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
+            Some(CliCommand::ImportVscode { from, dry_run }) => import_vscode(from, dry_run),
+            Some(CliCommand::ThemeImport { file, id, dry_run }) => {
+                theme_import(&file, id.as_deref(), dry_run)
+            }
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
             Some(CliCommand::InstallLauncher { path, user, yes }) => {
                 install_launcher(path, user, yes)
@@ -488,6 +572,91 @@ impl Cli {
             }
         }
     }
+}
+
+/// `croft plot` (#361): parse stdin, draw, and print either an inline image
+/// or the text chart. The image path is taken only when the terminal
+/// advertises an inline protocol in the environment (iTerm2/Kitty); the
+/// sixel DA1 probe needs a raw-mode tty on stdin, and stdin is the data
+/// pipe here, so sixel hosts get the text chart. Everything else, and
+/// `--text`, gets braille/blocks.
+/// Exit 1 with the parse error on bad input rather than drawing a blank.
+fn plot(
+    kind: &str,
+    x: Option<&str>,
+    y: &[String],
+    title: Option<&str>,
+    width: u16,
+    height: u16,
+    text_only: bool,
+) -> Result<()> {
+    use std::io::{IsTerminal, Read, Write};
+    let kind: crate::plot::ChartKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .context("reading stdin")?;
+    let dataset = crate::plot::parse(&input, x, y).map_err(|e| anyhow::anyhow!(e))?;
+    if dataset.is_empty() {
+        anyhow::bail!("no rows to plot");
+    }
+    let rows = if kind == crate::plot::ChartKind::Spark {
+        1
+    } else {
+        height
+    };
+    let mut out = std::io::stdout();
+    if !text_only && out.is_terminal() {
+        let protocol = crate::iterm2_inline::detect_inline_image_protocol();
+        if protocol != crate::iterm2_inline::InlineImageProtocol::None {
+            let palette = plot_palette();
+            // Cells are roughly 1:2, so the raster keeps the on-screen aspect.
+            let svg = crate::plot::svg(
+                &dataset,
+                kind,
+                title,
+                width as u32 * 10,
+                rows as u32 * 20,
+                &palette,
+            );
+            let (png, _, _) =
+                crate::svg::rasterize(svg.as_bytes()).map_err(|e| anyhow::anyhow!(e))?;
+            if let Some(seq) = crate::iterm2_inline::build_inline_image(
+                protocol,
+                &png,
+                width,
+                rows,
+                true,
+                crate::iterm2_inline::KITTY_ID_PLOT,
+            ) {
+                out.write_all(seq.as_bytes())?;
+                // Kitty leaves the cursor on the image's first row (C=1):
+                // newlines, not a cursor-down, so an image emitted near the
+                // bottom scrolls up instead of the prompt landing on it.
+                if protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
+                    out.write_all("\n".repeat(rows as usize).as_bytes())?;
+                } else {
+                    out.write_all(b"\n")?;
+                }
+                return out.flush().context("writing the chart");
+            }
+        }
+    }
+    out.write_all(crate::plot::text(&dataset, kind, title, width, rows).as_bytes())?;
+    out.flush().context("writing the chart")
+}
+
+/// The chart palette from the active theme: its editor background and
+/// accent, with the rest of the series colours fixed so they stay
+/// distinguishable on any background.
+fn plot_palette() -> crate::plot::Palette {
+    let mut palette = crate::plot::Palette::default();
+    if let Ok(prefs) = crate::prefs::Prefs::load(&crate::prefs::config_path()) {
+        let theme = prefs.theme();
+        palette.background = theme.editor_bg_rgb();
+        palette.series[0] = theme.accent_rgb();
+    }
+    palette
 }
 
 /// Resolve the pair provider flags as recorded: `--base-url` alone implies
@@ -746,6 +915,174 @@ fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> 
     println!(
         "Quit iTerm2 entirely (cmd+Q) and reopen it. macOS caches plists; iTerm2 must be relaunched to pick up the change."
     );
+    Ok(())
+}
+
+/// `croft import-vscode`: convert a VS Code profile into croft's config.
+///
+/// The report is the product, not a side effect. An import that only said
+/// "done" would leave the user unable to tell a setting croft adopted from
+/// one it has no equivalent for, which is the difference between "my
+/// settings came across" and "my settings are gone".
+fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
+    let dir = match from {
+        Some(dir) => {
+            // A mistyped path must not read as an empty profile. Every file
+            // this scans is optional, so a wrong directory produces "0
+            // settings, 0 keybindings, 0 snippets" and "Nothing to import",
+            // which is exactly what a real but empty profile produces. The
+            // auto-detected branch already fails loudly; this one now does
+            // too.
+            if !dir.is_dir() {
+                anyhow::bail!(
+                    "{} is not a directory. --from wants a VS Code user directory \
+                     (the one holding settings.json), e.g. ~/.config/Code/User",
+                    dir.display()
+                );
+            }
+            dir
+        }
+        None => {
+            let found = crate::import_vscode::discover_profiles();
+            let Some((label, dir)) = found.into_iter().next() else {
+                anyhow::bail!(
+                    "no VS Code user directory found. Pass one with --from \
+                     (e.g. --from ~/.config/Code/User)"
+                );
+            };
+            println!("Reading {label}: {}", dir.display());
+            dir
+        }
+    };
+    let mut report = crate::import_vscode::scan_profile(&dir)?;
+
+    println!(
+        "\n{} setting{} mapped, {} keybinding{} mapped, {} snippet{}",
+        report.settings.len(),
+        plural(report.settings.len()),
+        report.keybindings.len(),
+        plural(report.keybindings.len()),
+        report.snippets.len(),
+        plural(report.snippets.len()),
+    );
+    for (key, value) in &report.settings {
+        println!("  {key} = {value}");
+    }
+    for (key, command) in &report.keybindings {
+        println!("  {key} -> {command}");
+    }
+    if !report.unmapped_settings.is_empty() {
+        println!(
+            "\n{} setting{} croft has no equivalent for:",
+            report.unmapped_settings.len(),
+            plural(report.unmapped_settings.len())
+        );
+        for key in &report.unmapped_settings {
+            println!("  {key}");
+        }
+    }
+    if !report.dropped_keybindings.is_empty() {
+        println!(
+            "\n{} keybinding{} not carried over:",
+            report.dropped_keybindings.len(),
+            plural(report.dropped_keybindings.len())
+        );
+        for row in &report.dropped_keybindings {
+            println!("  {row}");
+        }
+    }
+    for warning in &report.warnings {
+        println!("  warning: {warning}");
+    }
+
+    if dry_run {
+        println!("\nDry run: nothing was written.");
+        return Ok(());
+    }
+    if report.is_empty() {
+        println!("\nNothing to import.");
+        return Ok(());
+    }
+    let written = crate::import_vscode::apply(&mut report)?;
+    if !report.conflicts.is_empty() {
+        println!(
+            "\n{} value{} croft already had, left alone:",
+            report.conflicts.len(),
+            plural(report.conflicts.len())
+        );
+        for conflict in &report.conflicts {
+            println!("  {conflict}");
+        }
+    }
+    if !report.refusals.is_empty() {
+        println!(
+            "\n{} file{} croft declined to write:",
+            report.refusals.len(),
+            plural(report.refusals.len())
+        );
+        for refusal in &report.refusals {
+            println!("  {refusal}");
+        }
+    }
+    if written.is_empty() {
+        // "Nothing needed changing" and "croft refused to write" are
+        // different facts, and saying the first when the second is true tells
+        // the user their settings arrived when they did not.
+        if report.refusals.is_empty() {
+            println!("\nEverything was already in place; nothing changed.");
+        } else {
+            println!("\nNothing was written: see the refusals above.");
+        }
+    } else {
+        println!("\nWrote:");
+        for path in &written {
+            println!("  {}", path.display());
+        }
+        println!("\nRestart croft to pick the new configuration up.");
+    }
+    Ok(())
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// `croft theme-import <file>`: convert a VS Code theme and install it.
+///
+/// The notes are printed rather than buried: a converted theme fills croft
+/// slots the source never named, and a user comparing it against VS Code
+/// deserves to know which colours were derived rather than designed.
+fn theme_import(file: &Path, id: Option<&str>, dry_run: bool) -> Result<()> {
+    let converted = crate::vscode_theme::convert_file(file, id)?;
+    if dry_run {
+        print!("{}", converted.manifest);
+        return Ok(());
+    }
+    let installed = crate::vscode_theme::install(&converted)?;
+    println!(
+        "Imported \"{}\" as theme id {}",
+        converted.label, converted.id
+    );
+    println!(
+        "  {}{}",
+        installed.path.display(),
+        if installed.replaced {
+            " (replaced the manifest already there)"
+        } else {
+            ""
+        }
+    );
+    if !converted.notes.is_empty() {
+        println!(
+            "\n{} note{} about this import:",
+            converted.notes.len(),
+            if converted.notes.len() == 1 { "" } else { "s" }
+        );
+        for note in &converted.notes {
+            println!("  - {note}");
+        }
+    }
+    println!("\nPick it under the gear menu on croft's next launch.");
     Ok(())
 }
 

@@ -196,6 +196,7 @@ fn ansi_color_to_tui(c: crate::ansi_text::AnsiColor, theme: crate::theme::Theme)
 /// Paint a rendered ANSI log tab (#257): one buffer line per file line, with
 /// SGR spans resolved through the theme palette. Mutates the view because the
 /// window is refilled around the viewport — the file is never held whole.
+#[allow(clippy::too_many_arguments)]
 fn render_log(
     view: &mut crate::log_view::LogView,
     path: Option<&Path>,
@@ -204,6 +205,8 @@ fn render_log(
     bg: Color,
     theme: crate::theme::Theme,
     scroll: usize,
+    search: Option<(&str, crate::widgets::search::SearchOpts)>,
+    active: Option<(usize, usize, usize)>,
 ) {
     let bg_style = Style::default().bg(bg);
     for y in inner.y..inner.y + inner.height {
@@ -213,6 +216,11 @@ fn render_log(
         }
     }
     if inner.height == 0 || inner.width == 0 {
+        // Frame truth cuts both ways: a frame that paints nothing must
+        // publish nothing. Returning with the previous rect still stored let
+        // the mouse path accept a click in an area this frame did not paint,
+        // after a resize or a layout change.
+        view.last_body = Rect::default();
         return;
     }
     let name = path
@@ -239,8 +247,18 @@ fn render_log(
     let body_top = inner.y + 1;
     let rows = inner.height.saturating_sub(1) as usize;
     if rows == 0 {
+        view.last_body = Rect::default();
         return;
     }
+    // Frame truth: the mouse path reads the body rect this frame painted,
+    // rather than recomputing the header offset in a second place.
+    view.last_body = Rect {
+        x: inner.x,
+        y: body_top,
+        width: inner.width,
+        height: rows as u16,
+    };
+    let selection = view.ordered_selection_public();
     // Refill the window around the viewport: one bounded read per scroll.
     let _ = view.ensure(scroll, rows);
     for r in 0..rows {
@@ -284,6 +302,48 @@ fn render_log(
             let room = (inner.x + inner.width).saturating_sub(x) as usize;
             buf.set_stringn(x, y, text, room, style);
             x = x.saturating_add(text.chars().count().min(room) as u16);
+        }
+        // Selection goes under the find highlight and over the log's own
+        // colours: it is the coarser mark, and a match inside a selection
+        // should still read as the match.
+        if let Some(((sr, sc), (er, ec))) =
+            selection.filter(|((sr, _), (er, _))| idx >= *sr && idx <= *er)
+        {
+            {
+                let from = if idx == sr { sc } else { 0 };
+                let to = if idx == er {
+                    ec
+                } else {
+                    line.text.chars().count()
+                };
+                for c in from..to {
+                    let x = inner.x.saturating_add(c as u16);
+                    if x >= inner.x + inner.width {
+                        break;
+                    }
+                    let cell = &mut buf[(x, y)];
+                    cell.set_style(cell.style().bg(theme.selection()));
+                }
+            }
+        }
+        // Find highlight goes over the painted colours, keyed off the same
+        // stripped text the search ran on, so the columns line up with what
+        // the spans put on screen (#257).
+        if let Some((needle, opts)) = search {
+            let active_on_line = active.filter(|(r, _, _)| *r == idx).map(|(_, c, l)| (c, l));
+            paint_search_highlight(
+                buf,
+                inner.x,
+                y,
+                inner.width,
+                &line.text,
+                needle,
+                opts,
+                0,
+                active_on_line,
+                &[],
+                theme,
+            );
         }
     }
 }
@@ -10307,6 +10367,14 @@ impl Widget for &mut Editor {
         self.last_scrollbar = Rect::default();
         self.last_hscrollbar = Rect::default();
         self.merge_action_spans.clear();
+        // Every rect this frame publishes is cleared up front, so a frame
+        // that paints nothing leaves nothing behind for the mouse path to
+        // hit-test against. `render_log` sets its own when it paints; the
+        // early return below means it may never run at all, which is the
+        // case a reset inside `render_log` cannot cover.
+        if let Some(log) = self.log.as_mut() {
+            log.last_body = Rect::default();
+        }
 
         if inner.height == 0 {
             return;
@@ -10350,6 +10418,11 @@ impl Widget for &mut Editor {
             return;
         }
         if let Some(view) = self.log.as_mut() {
+            let search = self
+                .search_highlight
+                .as_deref()
+                .map(|t| (t, self.search_highlight_opts));
+            let active = self.active_search_match;
             render_log(
                 view,
                 self.path.as_deref(),
@@ -10358,6 +10431,8 @@ impl Widget for &mut Editor {
                 cbg,
                 self.theme,
                 self.scroll,
+                search,
+                active,
             );
             return;
         }
@@ -14551,6 +14626,49 @@ mod tests {
         e.force_text = false;
         e.open(&p).unwrap();
         assert!(e.log.is_some(), "clearing the override renders again");
+    }
+
+    /// #257: the find highlight must reach the rendered log. The search runs
+    /// on the stripped text, and the renderer paints spans from that same
+    /// text, so the highlight columns land on the match the user searched
+    /// for rather than being shifted by the escapes in the raw bytes.
+    #[test]
+    fn the_find_highlight_paints_over_a_rendered_log_line() {
+        use ratatui::buffer::Buffer;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("build.log");
+        // The escape before `boom` would shift the columns by five if the
+        // highlight were computed against the raw bytes.
+        std::fs::write(&p, "plain\n\u{1b}[31mboom\u{1b}[0m tail\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        e.set_search_highlight(Some(String::from("boom")));
+        e.active_search_match = Some((1, 0, 4));
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+
+        // Body row 1 is file line 1; the log body starts below the header.
+        let y = e.last_inner.y + 2;
+        let cell = &buf[(e.last_inner.x, y)];
+        assert_eq!(cell.symbol(), "b", "the match starts at column 0");
+        assert_eq!(
+            cell.style().bg,
+            Some(Color::Rgb(0xff, 0x8c, 0x2a)),
+            "the ACTIVE match paints orange over the log's own colour"
+        );
+        let after = &buf[(e.last_inner.x + 4, y)];
+        assert_ne!(
+            after.style().bg,
+            Some(Color::Rgb(0xff, 0x8c, 0x2a)),
+            "the highlight stops at the end of the match"
+        );
     }
 
     /// The sniff must not hijack ordinary files: a plain log routes to text,
