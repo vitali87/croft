@@ -31644,6 +31644,35 @@ impl App {
         self.scroll_log_to_match(hit);
     }
 
+    /// Fold in the background index of an open rendered log (#394).
+    ///
+    /// Returns whether a repaint is due: the header's line count and the
+    /// scroll range moved. When the pass finishes, an open find bar has its
+    /// count re-run, since the count it shows was taken against a partial
+    /// index and flagged as such; a step the user makes next reaches the
+    /// tail on its own.
+    pub fn poll_log_index(&mut self) -> bool {
+        let Some(log) = self.editor.log.as_mut() else {
+            return false;
+        };
+        if !log.indexing() {
+            return false;
+        }
+        let changed = log.poll_index();
+        if log.indexing() {
+            return changed;
+        }
+        if let Some(state) = self.editor_find.as_ref()
+            && !state.query.is_empty()
+        {
+            let (count, truncated) = log.count_matches(&state.query, state.opts);
+            if let Some(state) = self.editor_find.as_mut() {
+                state.set_match_count(count, truncated);
+            }
+        }
+        true
+    }
+
     /// Enter / Shift+Enter over a rendered log.
     fn log_find_step(&mut self, forward: bool) {
         let Some(state) = self.editor_find.as_ref() else {
@@ -43041,6 +43070,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
         let search_changed = app.drain_search_results();
+        let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let ports_changed = app.drain_ports_and_poll();
@@ -43157,6 +43187,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || spinner_changed
             || ext_index_changed
             || search_changed
+            || log_index_changed
             || remote_changed
             || pulls_changed
             || ports_changed

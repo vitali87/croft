@@ -229,8 +229,12 @@ fn render_log(
         .unwrap_or_else(|| String::from("log"));
     let truncated = view.truncated;
     let total = view.len();
+    // While the background pass runs the count is a lower bound (#394); the
+    // header says so rather than presenting a moving number as a total.
     let header = if truncated {
         format!(" {name} — rendered log, {total} lines shown (file truncated at the index cap) ")
+    } else if view.indexing() {
+        format!(" {name} — rendered log, {total} lines so far, indexing… ")
     } else {
         format!(" {name} — rendered log, {total} lines ")
     };
