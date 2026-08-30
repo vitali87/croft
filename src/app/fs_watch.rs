@@ -46,6 +46,11 @@ pub struct FsDrain {
     pub touched_open_file: bool,
     pub dirs_changed: bool,
     pub finder_relevant: bool,
+    /// Workspace FILES whose content an event mutated, for the agent lane
+    /// ledger (#345). Directories and pure metadata events are excluded:
+    /// the ledger asks "what content changed", and a chmod is not a change
+    /// a reviewer needs to see.
+    pub changed_files: BTreeSet<PathBuf>,
 }
 
 pub struct FsWatch {
@@ -180,6 +185,11 @@ impl FsWatch {
                 for path in &ev.event.paths {
                     if mutates_content && editor.matches_open_path(path) {
                         out.touched_open_file = true;
+                    }
+                    // The ledger wants files, not the directories whose
+                    // mtime moved because a file inside them changed.
+                    if mutates_content && !is_path_under_noise_dir(path) && !path.is_dir() {
+                        out.changed_files.insert(path.clone());
                     }
                     if let Some(dir) = affected_dir_for_event(path, &self.watch_root) {
                         affected.insert(dir);

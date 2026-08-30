@@ -185,6 +185,12 @@ pub enum Command {
     /// the instruction box; the navigator may edit on the resulting turn).
     AskNavigator,
     AskNavigatorAboutCapture,
+    /// Mark every file every agent changed as reviewed (#345).
+    MarkAgentLaneReviewed,
+    /// Summarise each agent's review queue (#345).
+    ShowAgentLane,
+    /// Mark the active file reviewed in every agent lane holding it (#345).
+    MarkAgentFileReviewed,
     /// Have the navigator fix the diagnostic under the caret as a streamed,
     /// cancellable edit (#374).
     FixProblemWithNavigator,
@@ -361,6 +367,9 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::CollabCancelStream,
     Command::AskNavigator,
     Command::AskNavigatorAboutCapture,
+    Command::MarkAgentLaneReviewed,
+    Command::ShowAgentLane,
+    Command::MarkAgentFileReviewed,
     Command::FixProblemWithNavigator,
     Command::YieldToNavigator,
     Command::ToggleNavigator,
@@ -529,6 +538,9 @@ impl Command {
             Command::CollabCancelStream => "Collab: Cancel AI Stream",
             Command::AskNavigator => "Navigator: Ask About Line or Selection",
             Command::AskNavigatorAboutCapture => "Captures: Ask Navigator About This Line",
+            Command::MarkAgentLaneReviewed => "Agents: Mark Changed Files Reviewed",
+            Command::ShowAgentLane => "Agents: Show Changed Files",
+            Command::MarkAgentFileReviewed => "Agents: Mark This File Reviewed",
             Command::FixProblemWithNavigator => "Problems: Fix With Navigator",
             Command::YieldToNavigator => "Navigator: Yield the Turn",
             Command::ToggleNavigator => "Navigator: Activate or Deactivate",
@@ -699,6 +711,9 @@ impl Command {
             Command::CollabCancelStream => "Cmd+K X",
             Command::AskNavigator => "Cmd+K Q",
             Command::AskNavigatorAboutCapture => "",
+            Command::MarkAgentLaneReviewed => "",
+            Command::ShowAgentLane => "",
+            Command::MarkAgentFileReviewed => "",
             Command::FixProblemWithNavigator => "",
             Command::YieldToNavigator => "Cmd+K Y",
             Command::ToggleNavigator => "",
@@ -866,6 +881,9 @@ impl Command {
             Command::CollabCancelStream => "collab_cancel_stream",
             Command::AskNavigator => "navigator_ask",
             Command::AskNavigatorAboutCapture => "captures_ask_navigator",
+            Command::MarkAgentLaneReviewed => "agents_mark_reviewed",
+            Command::ShowAgentLane => "agents_show_lane",
+            Command::MarkAgentFileReviewed => "agents_mark_file_reviewed",
             Command::FixProblemWithNavigator => "problems_fix_navigator",
             Command::YieldToNavigator => "navigator_yield",
             Command::ToggleNavigator => "navigator_toggle",

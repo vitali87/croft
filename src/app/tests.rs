@@ -36157,3 +36157,121 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
         "idle never wakes the renderer"
     );
 }
+
+/// #345: the agent lane attributes workspace writes to whichever agents
+/// were WORKING when they landed, keeps a review baseline per file, and
+/// never blames an agent for the user's own saves.
+#[test]
+fn the_agent_lane_ledger_attributes_writes_and_tracks_review_baselines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let touched = tmp.path().join("touched.rs");
+    std::fs::write(&touched, "fn a() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // With no agent working, a write belongs to the user: no lane at all.
+    let mut changed = std::collections::BTreeSet::new();
+    changed.insert(touched.clone());
+    assert!(!app.attribute_writes_to_working_agents(&changed));
+    assert!(app.agent_ledger.agents().is_empty());
+
+    // Seat a WORKING agent in the pane, then replay the same write.
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+    assert_eq!(app.working_agents(), vec![String::from("claude")]);
+    assert!(app.attribute_writes_to_working_agents(&changed));
+    assert_eq!(app.agent_ledger.unreviewed_count("claude"), 1);
+    assert!(app.agent_ledger.is_unreviewed(&touched));
+
+    // A file OUTSIDE the workspace is not this workspace's review queue.
+    let outside = tempfile::tempdir().unwrap();
+    let stray = outside.path().join("elsewhere.rs");
+    std::fs::write(&stray, "x\n").unwrap();
+    let mut outside_set = std::collections::BTreeSet::new();
+    outside_set.insert(stray.clone());
+    assert!(!app.attribute_writes_to_working_agents(&outside_set));
+    assert!(!app.agent_ledger.is_unreviewed(&stray));
+
+    // Reviewing baselines the content on disk NOW, so a later edit by the
+    // user does not resurrect the row but a later agent write does.
+    assert!(app.mark_agent_file_reviewed("claude", &touched));
+    assert_eq!(app.agent_ledger.unreviewed_count("claude"), 0);
+    std::fs::write(&touched, "fn a() { todo!() }\n").unwrap();
+    assert!(app.attribute_writes_to_working_agents(&changed));
+    assert_eq!(
+        app.agent_ledger.unreviewed_count("claude"),
+        1,
+        "a fresh agent write re-queues the file"
+    );
+
+    // A QUIET agent stops being attributed: only Working counts.
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Idle,
+    }));
+    assert!(app.working_agents().is_empty());
+    std::fs::write(&touched, "fn a() { 1 }\n").unwrap();
+    assert!(!app.attribute_writes_to_working_agents(&changed));
+
+    // Mark-all clears the lane and says how much it cleared.
+    assert_eq!(app.mark_agent_lane_reviewed("claude"), 1);
+    assert!(
+        app.status.contains("1 file marked reviewed"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.agent_ledger.total_unreviewed(), 0);
+    assert_eq!(app.mark_agent_lane_reviewed("claude"), 0);
+    assert!(app.status.contains("nothing waiting"), "{}", app.status);
+
+    // The lane summary names each agent, its count, and any shared row.
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+    std::fs::write(&touched, "fn a() { 2 }\n").unwrap();
+    assert!(app.attribute_writes_to_working_agents(&changed));
+    app.run_command(crate::widgets::command_palette::Command::ShowAgentLane);
+    assert!(
+        app.status.contains("claude: 1 to review") && app.status.contains("touched.rs"),
+        "{}",
+        app.status
+    );
+
+    // "Mark this file reviewed" acts on the ACTIVE file, in every lane
+    // holding it, and refuses when there is nothing waiting.
+    app.editor.open_pinned(&touched).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::MarkAgentFileReviewed);
+    assert!(
+        app.status.contains("marked reviewed in 1 agent lane"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.agent_ledger.total_unreviewed(), 0);
+    app.run_command(crate::widgets::command_palette::Command::MarkAgentFileReviewed);
+    assert!(
+        app.status.contains("No agent change waiting"),
+        "{}",
+        app.status
+    );
+
+    // The palette commands are registered.
+    for (cmd, id) in [
+        (
+            crate::widgets::command_palette::Command::MarkAgentLaneReviewed,
+            "agents_mark_reviewed",
+        ),
+        (
+            crate::widgets::command_palette::Command::ShowAgentLane,
+            "agents_show_lane",
+        ),
+        (
+            crate::widgets::command_palette::Command::MarkAgentFileReviewed,
+            "agents_mark_file_reviewed",
+        ),
+    ] {
+        assert!(crate::widgets::command_palette::ALL_COMMANDS.contains(&cmd));
+        assert_eq!(cmd.id(), id);
+    }
+}
