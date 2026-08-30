@@ -261,16 +261,18 @@ fn render_log(
     let selection = view.ordered_selection_public();
     // Refill the window around the viewport: one bounded read per scroll.
     let _ = view.ensure(scroll, rows);
+    // Where each character lands, by display width: a CJK pair is four
+    // cells, and the span after it starts on the fifth (#404). Advancing
+    // by `chars().count()` put it on the third, over the pair's second
+    // half, and the drift grew with every wide character on the line. One
+    // map, refilled per row, so the redraw path allocates nothing.
+    let mut cells = crate::cell_map::CellMap::default();
+    let right = inner.x + inner.width;
     for r in 0..rows {
         let idx = scroll + r;
         let Some(line) = view.line(idx) else { break };
         let y = body_top + r as u16;
-        // Where each character lands, by display width: a CJK pair is four
-        // cells, and the span after it starts on the fifth (#404). Advancing
-        // by `chars().count()` put it on the third, over the pair's second
-        // half, and the drift grew with every wide character on the line.
-        let cells = crate::cell_map::CellMap::new(&line.text);
-        let right = inner.x + inner.width;
+        cells.build_into(&line.text);
         for span in &line.spans {
             let x = inner.x.saturating_add(cells.cell_of_byte(span.start));
             if x >= right {
@@ -335,27 +337,20 @@ fn render_log(
         // the spans put on screen (#257).
         if let Some((needle, opts)) = search {
             let active_on_line = active.filter(|(r, _, _)| *r == idx).map(|(_, c, l)| (c, l));
-            let (inactive_style, active_style) = search_highlight_styles(theme);
-            let segments = crate::widgets::search::split_for_highlight(&line.text, needle, opts);
-            let mut abs_col: usize = 0;
-            'segments: for (chunk, is_match) in segments {
-                let chunk_cols = chunk.chars().count();
-                if is_match {
-                    let is_active =
-                        active_on_line.is_some_and(|(c, l)| c == abs_col && l == chunk_cols);
-                    let style = if is_active {
-                        active_style
-                    } else {
-                        inactive_style
-                    };
-                    for c in abs_col..abs_col + chunk_cols {
-                        if !paint_log_cells(buf, inner.x, right, y, &cells, c, |_| style) {
-                            break 'segments;
-                        }
-                    }
-                }
-                abs_col = abs_col.saturating_add(chunk_cols);
-            }
+            paint_search_highlight(
+                buf,
+                inner.x,
+                y,
+                inner.width,
+                &line.text,
+                needle,
+                opts,
+                0,
+                active_on_line,
+                &[],
+                Some(&cells),
+                theme,
+            );
         }
     }
 }
@@ -375,14 +370,19 @@ fn paint_log_cells(
     restyle: impl Fn(Style) -> Style,
 ) -> bool {
     let first = left.saturating_add(cells.cell_of_char(col));
-    for x in first..first.saturating_add(cells.width_of_char(col)) {
-        if x >= right {
-            return false;
-        }
+    let width = cells.width_of_char(col);
+    // A character that does not fit WHOLE is one `set_stringn` dropped
+    // entirely, so a band on its first half would colour a cell the painter
+    // deliberately left blank: the same painter/annotator disagreement this
+    // module exists to close, at the boundary.
+    if first >= right || first.saturating_add(width) > right {
+        return false;
+    }
+    for x in first..first + width {
         let cell = &mut buf[(x, y)];
         cell.set_style(restyle(cell.style()));
     }
-    first < right
+    true
 }
 
 /// Paint a hex tab (#172): header row, `offset  hex  |ascii|` body rows,
@@ -1399,6 +1399,7 @@ fn render_diff(
                     diff.scroll_x,
                     active,
                     &[],
+                    None,
                     theme,
                 );
             }
@@ -1417,6 +1418,7 @@ fn render_diff(
                     diff.scroll_x,
                     active,
                     &[],
+                    None,
                     theme,
                 );
             }
@@ -11262,6 +11264,7 @@ impl Widget for &mut Editor {
                     row_start,
                     active_on_line,
                     &hint_cells,
+                    None,
                     self.theme,
                 );
             }
@@ -11946,6 +11949,7 @@ fn paint_search_highlight(
     scroll_col: usize,
     active_match_on_line: Option<(usize, usize)>,
     hints: &[(usize, usize)],
+    cells: Option<&crate::cell_map::CellMap>,
     theme: crate::theme::Theme,
 ) {
     if needle.is_empty() {
@@ -11970,6 +11974,23 @@ fn paint_search_highlight(
             for c in 0..chunk_cols {
                 let absolute = abs_col + c;
                 if absolute < scroll_col {
+                    continue;
+                }
+                // A rendered log paints by display width (#404), so its
+                // band goes through the same cell map the text did; the
+                // editor's text path is one cell per character.
+                if let Some(cells) = cells {
+                    if !paint_log_cells(
+                        buf,
+                        text_x,
+                        text_x + text_width,
+                        y,
+                        cells,
+                        absolute,
+                        |_| style,
+                    ) {
+                        break;
+                    }
                     continue;
                 }
                 let col = (absolute + inlay_cells_before(hints, absolute) - scroll_col) as u16;

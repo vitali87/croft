@@ -35255,6 +35255,63 @@ fn double_width_characters_keep_log_columns_aligned() {
     );
 }
 
+/// #404 review: a wide character whose first half lands on the body's last
+/// cell does not fit whole, and `set_stringn` drops it entirely. The
+/// selection band must not colour that cell, or the annotator paints where
+/// the painter deliberately put nothing, the same disagreement the cell map
+/// exists to close, at the boundary.
+#[test]
+fn a_wide_character_clipped_at_the_right_edge_gets_no_selection_band() {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 8,
+    };
+    // Learn the body width from a probe render, so the fixture puts the
+    // wide character exactly on the last cell whatever the chrome costs.
+    let probe = tmp.path().join("probe.log");
+    std::fs::write(&probe, "\u{1b}[31mx\u{1b}[0m\n").unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&probe).unwrap();
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut e).render(area, &mut buf);
+    let width = e.log.as_ref().unwrap().last_body.width as usize;
+    assert!(width > 2);
+
+    let p = tmp.path().join("edge.log");
+    let text = format!("{}\u{4e2d}", "x".repeat(width - 1));
+    std::fs::write(&p, format!("\u{1b}[31m{text}\u{1b}[0m\n")).unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&p).unwrap();
+    let chars = text.chars().count();
+    e.log.as_mut().unwrap().selection = Some(((0, 0), (0, chars)));
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut e).render(area, &mut buf);
+    let body = e.log.as_ref().unwrap().last_body;
+    let last = body.x + body.width - 1;
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    assert_eq!(
+        buf[(last, body.y)].symbol(),
+        " ",
+        "the painter drops a wide character that does not fit whole"
+    );
+    assert_ne!(
+        buf[(last, body.y)].style().bg,
+        Some(selected_bg),
+        "so the band must not colour the cell it left blank"
+    );
+    assert_eq!(
+        buf[(last - 1, body.y)].style().bg,
+        Some(selected_bg),
+        "while the character before it is selected as usual"
+    );
+}
+
 /// #257: a frame that paints no log body must publish no body rect.
 ///
 /// `render_log` returned early for a zero-sized area WITHOUT clearing

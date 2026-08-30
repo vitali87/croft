@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 /// Where each character of a line lands on screen, in cells from the line's
 /// left edge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CellMap {
     /// Per character: its byte offset, the first cell it occupies, and how
     /// many cells it occupies. A character after the first in a grapheme
@@ -27,7 +27,21 @@ pub(crate) struct CellMap {
 
 impl CellMap {
     pub(crate) fn new(text: &str) -> Self {
-        let mut chars = Vec::with_capacity(text.len());
+        let mut map = Self::default();
+        map.build_into(text);
+        map
+    }
+
+    /// Refill the map for `text`, reusing the allocation.
+    ///
+    /// The log painter maps every visible row on every frame; one map
+    /// hoisted out of the row loop and refilled here costs nothing after
+    /// the first frame, where a fresh `Vec` per row (sized by BYTE length,
+    /// three times too large for the CJK lines this exists for) put
+    /// hundreds of kilobytes of allocation on the redraw path. The same
+    /// shape as `ansi_text::parse_into`, for the same reason.
+    pub(crate) fn build_into(&mut self, text: &str) {
+        self.chars.clear();
         let mut cell: u16 = 0;
         for (byte, grapheme) in text.grapheme_indices(true) {
             let width = if grapheme.contains(char::is_control) {
@@ -37,14 +51,15 @@ impl CellMap {
             };
             for (i, (offset, _)) in grapheme.char_indices().enumerate() {
                 if i == 0 {
-                    chars.push((byte + offset, cell, width));
+                    self.chars.push((byte + offset, cell, width));
                 } else {
-                    chars.push((byte + offset, cell.saturating_add(width), 0));
+                    self.chars
+                        .push((byte + offset, cell.saturating_add(width), 0));
                 }
             }
             cell = cell.saturating_add(width);
         }
-        Self { chars, total: cell }
+        self.total = cell;
     }
 
     /// The first cell character `col` occupies; the line's total width at or
