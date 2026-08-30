@@ -188,6 +188,11 @@ pub enum Command {
     /// Have the navigator fix the diagnostic under the caret as a streamed,
     /// cancellable edit (#374).
     FixProblemWithNavigator,
+    /// Send the `.http` request under the caret; the response opens as a
+    /// tab (#370).
+    SendHttpRequest,
+    /// Copy the `.http` request under the caret as a curl command (#370).
+    CopyHttpRequestAsCurl,
     /// Hand the navigator the floor on the active file: a comment-only
     /// review turn, its say anchored as comment boxes.
     YieldToNavigator,
@@ -362,6 +367,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::AskNavigator,
     Command::AskNavigatorAboutCapture,
     Command::FixProblemWithNavigator,
+    Command::SendHttpRequest,
+    Command::CopyHttpRequestAsCurl,
     Command::YieldToNavigator,
     Command::ToggleNavigator,
     Command::ClearNavigatorNotes,
@@ -530,6 +537,8 @@ impl Command {
             Command::AskNavigator => "Navigator: Ask About Line or Selection",
             Command::AskNavigatorAboutCapture => "Captures: Ask Navigator About This Line",
             Command::FixProblemWithNavigator => "Problems: Fix With Navigator",
+            Command::SendHttpRequest => "HTTP: Send Request Under Caret",
+            Command::CopyHttpRequestAsCurl => "HTTP: Copy Request as curl",
             Command::YieldToNavigator => "Navigator: Yield the Turn",
             Command::ToggleNavigator => "Navigator: Activate or Deactivate",
             Command::ClearNavigatorNotes => "Navigator: Clear Comments",
@@ -700,6 +709,8 @@ impl Command {
             Command::AskNavigator => "Cmd+K Q",
             Command::AskNavigatorAboutCapture => "",
             Command::FixProblemWithNavigator => "",
+            Command::SendHttpRequest => "Cmd+Enter",
+            Command::CopyHttpRequestAsCurl => "",
             Command::YieldToNavigator => "Cmd+K Y",
             Command::ToggleNavigator => "",
             Command::ClearNavigatorNotes => "",
@@ -867,6 +878,8 @@ impl Command {
             Command::AskNavigator => "navigator_ask",
             Command::AskNavigatorAboutCapture => "captures_ask_navigator",
             Command::FixProblemWithNavigator => "problems_fix_navigator",
+            Command::SendHttpRequest => "http_send_request",
+            Command::CopyHttpRequestAsCurl => "http_copy_curl",
             Command::YieldToNavigator => "navigator_yield",
             Command::ToggleNavigator => "navigator_toggle",
             Command::ClearNavigatorNotes => "navigator_clear_notes",
