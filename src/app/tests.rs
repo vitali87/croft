@@ -35228,3 +35228,34 @@ fn a_log_that_paints_nothing_publishes_no_body_rect() {
          mouse path to hit-test against"
     );
 }
+
+/// #414: a dropped `file://` URL naming a non-ASCII path must decode to that
+/// path, not to one char per byte.
+///
+/// The decoder pushed each `%xx` byte, and each literal byte, `as char`,
+/// which maps a byte to the Latin-1 code point of the same value, so every
+/// multi-byte UTF-8 sequence came out as mojibake and the drop opened a
+/// path that does not exist. The #396 defect class, in the drop path.
+#[test]
+fn a_dropped_file_url_with_a_non_ascii_path_decodes_to_utf8() {
+    use std::path::PathBuf;
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/caf%C3%A9/%E4%B8%AD%E6%96%87.txt"),
+        Some(PathBuf::from("/tmp/caf\u{e9}/\u{4e2d}\u{6587}.txt")),
+        "percent-encoded UTF-8 reassembles into the characters it encodes"
+    );
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/caf\u{e9}"),
+        Some(PathBuf::from("/tmp/caf\u{e9}")),
+        "a literal non-ASCII character in the URL survives too"
+    );
+    // The ASCII cases the decoder always handled are unchanged.
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/a%20b"),
+        Some(PathBuf::from("/tmp/a b"))
+    );
+    assert_eq!(
+        super::normalise_dropped_token("'/tmp/x y'"),
+        Some(PathBuf::from("/tmp/x y"))
+    );
+}

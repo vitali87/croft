@@ -40945,7 +40945,13 @@ fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
         s = s[1..s.len() - 1].to_string();
     }
     if let Some(rest) = s.strip_prefix("file://") {
-        let mut path = String::with_capacity(rest.len());
+        // Decode into BYTES and build the string once at the end. A `%xx`
+        // escape is one byte of a UTF-8 sequence, not a character: pushing
+        // it `as char` mapped it to the Latin-1 code point of the same
+        // value, so `caf%C3%A9` became `cafÃ©` and the drop opened a path
+        // that does not exist (#414). A literal non-ASCII byte in the URL
+        // took the same wrong turn.
+        let mut path: Vec<u8> = Vec::with_capacity(rest.len());
         let bytes = rest.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -40953,14 +40959,17 @@ fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
                 && i + 2 < bytes.len()
                 && let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
             {
-                path.push((h * 16 + l) as char);
+                path.push(h * 16 + l);
                 i += 3;
                 continue;
             }
-            path.push(bytes[i] as char);
+            path.push(bytes[i]);
             i += 1;
         }
-        s = path;
+        // An escape sequence that is not valid UTF-8 (a Latin-1 filename
+        // percent-encoded raw) has no faithful spelling; the replacement
+        // character keeps the rest of the path rather than dropping it.
+        s = String::from_utf8_lossy(&path).into_owned();
     }
     let mut unescaped = String::with_capacity(s.len());
     let mut chars = s.chars();
