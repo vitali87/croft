@@ -213,33 +213,48 @@ class BlockTracker:
             self.blocks.pop()
 
 
-def git(*args, allow_missing_path=False, allow_fail=False):
+def git(*args, allow_missing_path=False):
     """Run git, failing closed.
 
     A silent failure here is worse than a crash: an errored `git diff` yields
     an empty file list, the checker reports "no documentation lost" and exits
     zero, and the gate has passed by not running.
 
-    `allow_missing_path` narrows that tolerance to exactly the expected case,
-    and `allow_fail` is separate and narrower still: it is for a probe whose
-    exit status IS the answer, and its empty return is never read as content.
+    `allow_missing_path` narrows that tolerance to exactly the expected case.
     Tolerating every non-zero exit would let an invalid revision or a
     malformed object read as empty content, which is the same fail-open bug
-    one door further in.
+    one door further in. A probe whose exit status IS the answer does not go
+    through here at all: see `exists_at`.
     """
     proc = subprocess.run(["git", *args], capture_output=True, text=True)
     if proc.returncode != 0:
-        # `allow_fail` is for a PROBE whose non-zero exit is the answer
-        # (`cat-file -e` asking whether a path exists), never for a command
-        # whose output is then read as content.
-        if allow_fail:
-            return ""
         if allow_missing_path and MISSING_PATH.search(proc.stderr):
             return ""
         raise SystemExit(
             f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
         )
     return proc.stdout
+
+
+def exists_at(rev, path):
+    """Whether `path` is present at `rev`.
+
+    A probe: `git cat-file -e` prints nothing either way and answers with
+    its exit status. Reading its stdout, as the added-file detection once
+    did, made every changed file look branch-added: each took the pairwise
+    commit walk (minutes on a real branch, for nothing) and a capture in an
+    existing file was reported twice, once per loop.
+    """
+    proc = subprocess.run(
+        ["git", "cat-file", "-e", f"{rev}:{path}"], capture_output=True, text=True
+    )
+    return proc.returncode == 0
+
+
+def added_files(base, changed):
+    """The changed files that do not exist at `base`: the branch added them,
+    so their history lives only in its own commits."""
+    return [f for f in changed if not exists_at(base, f)]
 
 
 def is_doc(line):
@@ -389,7 +404,7 @@ def main():
     # empty and no loss can ever be reported in it: a doc captured within the
     # branch is invisible to a merge-base comparison. Those files are checked
     # commit-by-commit instead, which is the only place their history exists.
-    added = [f for f in changed if not git("cat-file", "-e", f"{base}:{f}", allow_missing_path=True, allow_fail=True)]
+    added = added_files(base, changed)
     if added:
         # What matters is the state at HEAD. A doc captured in one commit and
         # restored in a later one is not a loss: the branch is fine, and
@@ -420,9 +435,9 @@ def main():
     for f in changed:
         # A path can legitimately be absent on one side: the branch added the
         # file, or deleted it. That is the one git failure this tolerates -
-        # `allow_fail` exists for exactly it, and not passing it here made the
-        # gate abort on every PR that adds a Rust file, which is how it failed
-        # on the first one that did.
+        # `allow_missing_path` exists for exactly it, and not passing it here
+        # made the gate abort on every PR that adds a Rust file, which is how
+        # it failed on the first one that did.
         before = documented(git("show", f"{base}:{f}", allow_missing_path=True))
         after = documented(git("show", f"{head}:{f}", allow_missing_path=True))
         for name, had_doc in before.items():

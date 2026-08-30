@@ -9,6 +9,9 @@ about parsing: what a merge base can see, and what it cannot.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -433,6 +436,54 @@ class GitShapes(unittest.TestCase):
             repo.commit("a.rs", CAPTURED_CONST)
             self.assertEqual(
                 repo.exit_code(), 1, "the gate must fail on a captured doc"
+            )
+
+    def test_a_file_present_at_the_base_is_not_treated_as_added(self):
+        """`git cat-file -e` prints nothing on success, so a probe that read
+        its stdout took every changed file for a branch-added one: each
+        went through the pairwise commit walk (the slow path, minutes on a
+        real branch) and a capture in an existing file was reported twice,
+        once per loop. The probe must read the exit status."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", DOCUMENTED_CONST)
+            repo.branch("work")
+            repo.commit("a.rs", CAPTURED_CONST)
+            repo.commit("new.rs", "/// n\nfn n() {}\n")
+            cwd = os.getcwd()
+            os.chdir(repo.path)
+            try:
+                self.assertTrue(gate.exists_at("main", "a.rs"))
+                self.assertFalse(gate.exists_at("main", "new.rs"))
+                self.assertEqual(gate.added_files("main", ["a.rs", "new.rs"]), ["new.rs"])
+            finally:
+                os.chdir(cwd)
+
+    def test_a_capture_in_an_existing_file_is_reported_exactly_once(self):
+        """Two commits on the branch, so the pairwise walk has a pair to
+        compare: with every file mistaken for branch-added, the capture
+        was reported by that walk AND by the base comparison."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", DOCUMENTED_CONST)
+            repo.branch("work")
+            repo.commit("a.rs", DOCUMENTED_CONST + "\n/// Extra.\nconst EXTRA: u8 = 1;\n")
+            repo.commit("a.rs", CAPTURED_CONST + "\n/// Extra.\nconst EXTRA: u8 = 1;\n")
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            out = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            self.assertEqual(
+                out.getvalue().count("::error"),
+                1,
+                f"one loss, one annotation: {out.getvalue()}",
             )
 
     def test_a_capture_inside_a_file_the_branch_added_is_reported(self):
