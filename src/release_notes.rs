@@ -60,6 +60,6 @@ pub struct ReleaseNote {
 
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Fix,
-    summary: "A .code-workspace file whose folder paths carry non-ASCII characters (accents, CJK, Cyrillic) now opens with those names intact instead of mojibake.",
+    kind: NoteKind::Feature,
+    summary: "CAPTURES: press n on a captured error line (or right-click it) to ask the resident Navigator about it, with the pane rows around it; a path:line in the line opens that file so the answer lands there as a comment box.",
 }];

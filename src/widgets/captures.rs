@@ -40,6 +40,46 @@ pub struct CapturedLine {
     pub line: String,
 }
 
+/// Rows of pane context on each side of a captured line that ride an ask
+/// to the Navigator (#372), and the most characters the whole excerpt may
+/// carry: a capture is one line, the question is about that line, and a
+/// screenful of unrelated output would only dilute it.
+pub const ASK_CONTEXT_ROWS: usize = 4;
+pub const ASK_CONTEXT_CHARS: usize = 2000;
+
+/// The rows around `hit` in `lines`, `radius` on each side, clipped to the
+/// buffer.
+pub fn context_window(lines: &[String], hit: usize, radius: usize) -> Vec<String> {
+    let start = hit.saturating_sub(radius);
+    let end = hit.saturating_add(radius + 1).min(lines.len());
+    lines[start.min(end)..end].to_vec()
+}
+
+/// The first `path:line[:col]` (or traceback `File "x", line N`) reference
+/// anywhere in `line`. `file_ref_at` is column-scoped, so every column is
+/// tried until one answers.
+pub fn first_file_ref(line: &str) -> Option<crate::file_ref::FileRef> {
+    (0..line.chars().count()).find_map(|col| crate::file_ref::file_ref_at(line, col))
+}
+
+/// The instruction and excerpt an "Ask Navigator about this line" sends:
+/// which pane and trigger the line came from, the line itself, and the
+/// (already redacted) context rows, capped at [`ASK_CONTEXT_CHARS`].
+pub fn ask_prompt(entry: &CapturedLine, context: &[String]) -> (String, String) {
+    let instruction = format!(
+        "This line was captured from terminal pane {:?} by the trigger {:?}:\n{}\nExplain what \
+         went wrong and propose the fix; the excerpt after it is the surrounding pane output.",
+        entry.pane,
+        entry.message,
+        entry.line.trim_end()
+    );
+    let mut excerpt = context.join("\n");
+    if excerpt.chars().count() > ASK_CONTEXT_CHARS {
+        excerpt = excerpt.chars().take(ASK_CONTEXT_CHARS).collect::<String>() + "\n[excerpt cut]";
+    }
+    (instruction, excerpt)
+}
+
 pub struct CapturesPanel {
     entries: Vec<CapturedLine>,
     selected: usize,
@@ -233,4 +273,56 @@ impl Widget for &mut CapturesPanel {
 /// First `max` chars, clipped plainly.
 fn truncated(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_capture_ask_carries_the_line_a_bounded_window_and_a_file_ref() {
+        let lines: Vec<String> = (0..20).map(|i| format!("row {i}")).collect();
+        assert_eq!(context_window(&lines, 10, 2), lines[8..13]);
+        assert_eq!(
+            context_window(&lines, 0, 4),
+            lines[0..5],
+            "clipped at the top"
+        );
+        assert_eq!(
+            context_window(&lines, 19, 4),
+            lines[15..20],
+            "clipped at the bottom"
+        );
+        assert!(context_window(&[], 3, 4).is_empty());
+
+        let fr = first_file_ref("error[E0308]: mismatched types --> src/main.rs:12:3").unwrap();
+        assert_eq!(
+            (fr.path.as_str(), fr.line, fr.column),
+            ("src/main.rs", 12, Some(3))
+        );
+        // `host.com:443` is a lookalike the reference syntax admits on
+        // purpose; the caller drops it when no such file exists, the same
+        // way the Cmd+click on a pane does.
+        assert_eq!(
+            first_file_ref("connect to host.com:443 failed").map(|f| f.path),
+            Some(String::from("host.com"))
+        );
+        assert!(first_file_ref("plain text").is_none());
+
+        let entry = CapturedLine {
+            pane: "Terminal 2".into(),
+            shell_pid: None,
+            message: "build failed".into(),
+            line: "error: could not compile `croft`".into(),
+        };
+        let context: Vec<String> = (0..3).map(|i| format!("ctx {i}")).collect();
+        let (instruction, excerpt) = ask_prompt(&entry, &context);
+        assert!(instruction.contains("Terminal 2") && instruction.contains("build failed"));
+        assert!(instruction.contains("could not compile `croft`"));
+        assert_eq!(excerpt, "ctx 0\nctx 1\nctx 2");
+        let long: Vec<String> = vec!["x".repeat(ASK_CONTEXT_CHARS * 2)];
+        let (_, cut) = ask_prompt(&entry, &long);
+        assert!(cut.ends_with("[excerpt cut]"));
+        assert!(cut.chars().count() <= ASK_CONTEXT_CHARS + 20);
+    }
 }
