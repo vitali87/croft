@@ -36845,3 +36845,97 @@ fn the_watcher_reports_rescans_and_keeps_directories_out_of_the_ledger() {
     app.status = String::from("something else entirely");
     assert!(app.agent_ledger.may_be_incomplete());
 }
+
+/// #373: "Debug This Test" breaks where the test last failed, without the
+/// user setting a breakpoint — and takes that breakpoint back out when the
+/// session ends, so it never outlives the run that asked for it.
+#[test]
+fn debugging_a_test_breaks_at_its_last_failure_and_cleans_up_after() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    let src = tmp.path().join("src/lib.rs");
+    std::fs::write(&src, "fn a() {}\nfn b() {}\nassert!(false);\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // The runner's output for a failing test, as it reaches the channel.
+    crate::output::clear(crate::output::CHANNEL_TESTS);
+    for line in [
+        "---- tests::adds stdout ----",
+        "thread 'tests::adds' panicked at src/lib.rs:3:5:",
+        "assertion failed: false",
+    ] {
+        crate::output::push(
+            crate::output::CHANNEL_TESTS,
+            crate::output::OutputLevel::Info,
+            line,
+        );
+    }
+
+    let site = app
+        .failure_site_of("tests::adds")
+        .expect("the panic line names a place in the user's own code");
+    assert_eq!(site.line, 3);
+    assert_eq!(site.resolve(tmp.path()), Some((src.clone(), 3)));
+
+    // Arming sets the breakpoint and says where.
+    assert!(app.editor.breakpoints.is_empty());
+    app.arm_failure_breakpoint("tests::adds", tmp.path());
+    assert_eq!(
+        app.editor.breakpoints.get(&src).map(|l| l.contains(&3)),
+        Some(true),
+        "the assertion's line carries a breakpoint the user never set"
+    );
+    assert!(
+        app.status.contains("breaking where it failed"),
+        "{}",
+        app.status
+    );
+
+    // Disarming takes back exactly that one, leaving no empty entry.
+    app.disarm_failure_breakpoint();
+    assert!(
+        app.editor.breakpoints.is_empty(),
+        "the temporary breakpoint does not outlive its session"
+    );
+
+    // A breakpoint the USER set at the same line is theirs: arming must not
+    // adopt it, and disarming must not delete their work.
+    app.editor
+        .breakpoints
+        .entry(src.clone())
+        .or_default()
+        .insert(3);
+    app.arm_failure_breakpoint("tests::adds", tmp.path());
+    app.disarm_failure_breakpoint();
+    assert_eq!(
+        app.editor.breakpoints.get(&src).map(|l| l.contains(&3)),
+        Some(true),
+        "the user's own breakpoint survives a debug session that shared its line"
+    );
+    app.editor.breakpoints.clear();
+
+    // A failure in a dependency names nothing actionable, so nothing is set.
+    crate::output::clear(crate::output::CHANNEL_TESTS);
+    for line in [
+        "---- tests::deps stdout ----",
+        "thread 'tests::deps' panicked at /Users/me/.cargo/registry/src/x-1.0/lib.rs:9:1:",
+    ] {
+        crate::output::push(
+            crate::output::CHANNEL_TESTS,
+            crate::output::OutputLevel::Info,
+            line,
+        );
+    }
+    assert!(app.failure_site_of("tests::deps").is_none());
+    app.arm_failure_breakpoint("tests::deps", tmp.path());
+    assert!(
+        app.editor.breakpoints.is_empty(),
+        "a location inside a dependency is not offered as a breakpoint"
+    );
+
+    // The palette carries the command that reaches all of this.
+    assert!(
+        crate::widgets::command_palette::ALL_COMMANDS
+            .contains(&crate::widgets::command_palette::Command::DebugTestAtCursor)
+    );
+}

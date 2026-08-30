@@ -2973,6 +2973,13 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// A breakpoint croft set itself at the assertion the last run failed
+    /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
+    /// breakpoints: it is added to the launch set, rendered hollow-red like
+    /// any unverified one, and removed when the session ends — a debugger
+    /// that silently left breakpoints behind would be worse than one that
+    /// set none.
+    debug_temp_breakpoint: Option<(PathBuf, usize)>,
     /// Per-agent ledger of files changed while an agent was working (#345),
     /// and the review baselines that decide which of them still need a
     /// look.
@@ -4469,6 +4476,7 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            debug_temp_breakpoint: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
             problems_fix_started: None,
             http_run: None,
@@ -18205,6 +18213,13 @@ impl App {
             return;
         }
         let root = self.tree.root.clone();
+        // #373: if the last run of this test failed and named a place in
+        // the user's own code, break there — the whole point of "debug this
+        // test" is landing on the assertion without being asked to find it
+        // first. Set BEFORE the launch set is collected so it travels with
+        // the user's own breakpoints, and recorded so it can be taken back
+        // out when the session ends.
+        self.arm_failure_breakpoint(&name, &root);
         let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
             .editor
             .breakpoints
@@ -18607,6 +18622,11 @@ impl App {
             Some(SessionPhase::Terminated) => {
                 self.editor.stop_line = None;
                 self.editor.unverified_breakpoints.clear();
+                // A session that ends on its own must take croft's own
+                // breakpoint with it, exactly as Shift+F5 does (#373):
+                // this is the path a passing test takes, so it is the
+                // common one, not the exceptional one.
+                self.disarm_failure_breakpoint();
                 self.reset_watch_runtime();
                 self.clear_inline_values();
                 // Reply to the adapter's own `terminated`/`exited` with the
@@ -19173,6 +19193,84 @@ impl App {
             return;
         }
         self.launch_resolved_config(rc);
+    }
+
+    /// Where the last run of `name` failed, if the runner named a place in
+    /// the user's own code (#373). Read back from the Test Runner output
+    /// channel, which already holds every line the run printed.
+    ///
+    /// Scoped to the failing test's own block: a run of the whole suite
+    /// prints many failures, and breaking on another test's assertion would
+    /// stop the debugger somewhere the user did not ask about. The block
+    /// starts at the runner's "failures:"-style banner for this test and
+    /// ends at the next test's banner.
+    fn failure_site_of(&self, name: &str) -> Option<crate::testing::failure_site::FailureSite> {
+        let lines = crate::output::snapshot(crate::output::CHANNEL_TESTS)?;
+        let leaf = name.rsplit("::").next().unwrap_or(name);
+        // Walk backwards to the most recent block naming this test, so a
+        // re-run's output wins over an earlier one in the same channel.
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        let start = texts
+            .iter()
+            .rposition(|t| t.contains(name) || t.contains(leaf))?;
+        // The block runs to the next line naming a DIFFERENT test, or to
+        // the end of the channel.
+        let end = texts[start + 1..]
+            .iter()
+            .position(|t| {
+                (t.starts_with("---- ") || t.starts_with("test "))
+                    && !t.contains(name)
+                    && !t.contains(leaf)
+            })
+            .map(|i| start + 1 + i)
+            .unwrap_or(texts.len());
+        crate::testing::failure_site::failure_site(&texts[start..end].join("\n"))
+    }
+
+    /// Set a TEMPORARY breakpoint at the assertion the last run of `name`
+    /// failed on (#373), unless the user already has one there.
+    ///
+    /// Recorded in `debug_temp_breakpoint` so [`Self::disarm_failure_breakpoint`]
+    /// can take exactly this one back out: a breakpoint croft set and then
+    /// left behind would be indistinguishable from one the user set, and
+    /// would keep stopping them on a line they never chose.
+    fn arm_failure_breakpoint(&mut self, name: &str, root: &Path) {
+        self.disarm_failure_breakpoint();
+        let Some((file, line)) = self
+            .failure_site_of(name)
+            .and_then(|site| site.resolve(root))
+        else {
+            return;
+        };
+        let line = line as usize;
+        let lines = self.editor.breakpoints.entry(file.clone()).or_default();
+        // The user's own breakpoint there is left alone: it is theirs, it
+        // outlives the session, and removing it on stop would delete work.
+        if !lines.insert(line) {
+            return;
+        }
+        self.debug_temp_breakpoint = Some((file.clone(), line));
+        self.status = format!(
+            "Debugging {name}, breaking where it failed: {}:{line}",
+            file.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+    }
+
+    /// Remove the breakpoint [`Self::arm_failure_breakpoint`] set, if it is
+    /// still ours. The user may have removed it themselves mid-session, in
+    /// which case there is nothing to take back.
+    fn disarm_failure_breakpoint(&mut self) {
+        let Some((file, line)) = self.debug_temp_breakpoint.take() else {
+            return;
+        };
+        if let Some(lines) = self.editor.breakpoints.get_mut(&file) {
+            lines.remove(&line);
+            if lines.is_empty() {
+                self.editor.breakpoints.remove(&file);
+            }
+        }
     }
 
     /// The editor's breakpoints in launch shape, shared by every session
@@ -19826,6 +19924,9 @@ impl App {
         ));
         self.editor.stop_line = None;
         self.editor.unverified_breakpoints.clear();
+        // The breakpoint croft set at the failing assertion goes with the
+        // session that asked for it (#373).
+        self.disarm_failure_breakpoint();
         self.clear_inline_values();
         self.status = String::from("Debug session stopped");
         // Clear the paused-state feedback ("Paused (breakpoint)") so the
