@@ -68,8 +68,15 @@ SHA you are about to merge. "Nothing is failing" and "nothing has run" are the
 same reading.
 
 ```bash
-gh pr checks <n> --json name --jq 'length'   # 0 means nothing ran, not nothing failed
+head=$(gh pr view <n> --json headRefOid --jq .headRefOid)
+gh run list --commit "$head" --json databaseId --jq 'length'   # 0 = nothing ran
 ```
+
+Count **runs**, not checks. A check is not a run: a rate-limited review bot
+posts a status context without any workflow behind it, so on this repo PR #335
+returns `1` from `gh pr checks --json name --jq 'length'` while having zero
+runs for its head. The reader who most needs this item — the one whose CI never
+started — is exactly the one that count misleads.
 
 **A `CONFLICTING` pull request gets no workflow runs at all.** GitHub cannot
 compute the merge commit, so it never creates them. Four pushes over an hour
