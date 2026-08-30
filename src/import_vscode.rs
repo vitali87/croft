@@ -325,26 +325,50 @@ pub fn theme_extension_dirs_under(home: &Path, user_dir: &Path) -> Vec<PathBuf> 
 
 /// [`theme_extension_dirs_under`] for this machine's home.
 pub fn theme_extension_dirs(user_dir: &Path) -> Vec<PathBuf> {
-    match std::env::var_os("HOME").map(PathBuf::from) {
+    // `discover_profiles` finds a Windows profile through APPDATA, where
+    // HOME is usually unset; the extensions live under the user profile.
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    match home.map(PathBuf::from) {
         Some(home) => theme_extension_dirs_under(&home, user_dir),
         None => Vec::new(),
     }
 }
 
-/// Find the theme JSON an installed extension contributes under `label`.
+/// The `(name, version)` of an extension directory, `publisher.name-1.2.3`,
+/// for ordering: name ascending, version descending, so the first match is
+/// the newest install. VS Code prunes old versions lazily, so two side by
+/// side is the ordinary state, and byte order would put `1.10.0` before
+/// `1.9.0` and `2.0.0`.
+fn extension_order(dir: &Path) -> (String, std::cmp::Reverse<Vec<u64>>) {
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let (stem, version) = name.rsplit_once('-').unwrap_or((name, ""));
+    let parts: Vec<u64> = version
+        .split('.')
+        .map(|p| {
+            p.trim_end_matches(|c: char| !c.is_ascii_digit())
+                .parse()
+                .unwrap_or(0)
+        })
+        .collect();
+    (stem.to_string(), std::cmp::Reverse(parts))
+}
+
+/// Every theme JSON an installed extension contributes under `label`,
+/// newest install of each extension first.
 ///
 /// `workbench.colorTheme` holds the theme's picker label, or its `id` when
-/// the extension declares one, so both are matched. Extensions are read from
-/// `<dir>/<publisher.name-version>/package.json`, in sorted order so two
-/// versions of one extension resolve the same way on every run.
-pub fn find_installed_theme(label: &str, extension_dirs: &[PathBuf]) -> Option<PathBuf> {
+/// the extension declares one, so both are matched. A `path` that is
+/// absolute or climbs out of its extension directory is skipped: the
+/// manifest is trusted to describe its own files, not to name others.
+pub fn find_installed_themes(label: &str, extension_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
     for dir in extension_dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         let mut extensions: Vec<PathBuf> =
             entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
-        extensions.sort();
+        extensions.sort_by_key(|p| extension_order(p));
         for ext in extensions {
             let Ok(raw) = std::fs::read_to_string(ext.join("package.json")) else {
                 continue;
@@ -358,13 +382,21 @@ pub fn find_installed_theme(label: &str, extension_dirs: &[PathBuf]) -> Option<P
             for theme in themes {
                 let named =
                     theme["id"].as_str() == Some(label) || theme["label"].as_str() == Some(label);
-                if let Some(rel) = theme["path"].as_str().filter(|_| named) {
-                    return Some(ext.join(rel));
+                let Some(rel) = theme["path"].as_str().filter(|_| named) else {
+                    continue;
+                };
+                let rel = Path::new(rel);
+                let escapes = rel.is_absolute()
+                    || rel
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir));
+                if !escapes {
+                    found.push(ext.join(rel));
                 }
             }
         }
     }
-    None
+    found
 }
 
 /// The VS Code colour theme an import resolved: where it came from and what
@@ -605,7 +637,8 @@ pub fn convert_snippets(doc: &Value, language: Option<&str>, report: &mut Report
 /// bundle rather than the extensions directory, so they are not found; the
 /// key stays unmapped and a warning says how to import the file by hand.
 fn resolve_color_theme(label: &str, extension_dirs: &[PathBuf], report: &mut Report) {
-    let Some(path) = find_installed_theme(label, extension_dirs) else {
+    let mut matches = find_installed_themes(label, extension_dirs).into_iter();
+    let Some(path) = matches.next() else {
         report.warnings.push(format!(
             "workbench.colorTheme {label:?} is not an installed extension theme (a built-in VS \
              Code theme lives in the app, not the extensions directory); to bring it over, run \
@@ -613,6 +646,17 @@ fn resolve_color_theme(label: &str, extension_dirs: &[PathBuf], report: &mut Rep
         ));
         return;
     };
+    // A label is not unique across extensions (several ship a "Dark"), so
+    // say which one was taken when there was a choice.
+    let alternates: Vec<String> = matches.map(|p| p.display().to_string()).collect();
+    if !alternates.is_empty() {
+        report.warnings.push(format!(
+            "workbench.colorTheme {label:?} matches more than one installed theme; took {} \
+             and ignored {}",
+            path.display(),
+            alternates.join(", ")
+        ));
+    }
     match crate::vscode_theme::convert_file(&path, None) {
         Ok(converted) => {
             report
@@ -743,7 +787,14 @@ pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
     )
 }
 
-/// [`apply`] into an explicit config directory.
+/// [`apply_into_dirs`] with the theme installed under `<dir>/extensions`,
+/// for tests.
+#[cfg(test)]
+pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
+    apply_into_dirs(dir, &dir.join("extensions"), report)
+}
+
+/// [`apply`] into an explicit config directory and extensions directory.
 ///
 /// Split out so a test can drive the REAL write path. The previous test
 /// asserted on `carries_comments`, the predicate, and never called `apply`:
@@ -751,13 +802,6 @@ pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
 /// the import destroyed croft's own commented templates. Nothing here
 /// touches the environment, because the test binary runs its tests on
 /// threads of one process.
-#[cfg(test)]
-pub fn apply_into(dir: &Path, report: &mut Report) -> Result<Vec<PathBuf>> {
-    apply_into_dirs(dir, &dir.join("extensions"), report)
-}
-
-/// [`apply_into`] with the extensions directory a converted theme is
-/// installed into named explicitly.
 pub fn apply_into_dirs(
     dir: &Path,
     extensions_dir: &Path,
@@ -804,9 +848,18 @@ pub fn apply_into_dirs(
             for (key, value) in &report.settings {
                 if let Some(current) = existing.get(key) {
                     if current != value {
-                        report.conflicts.push(format!(
-                            "config.json {key}: kept {current}, VS Code had {value}"
-                        ));
+                        // The converted theme is installed either way (it is
+                        // selectable), but the config still names the old
+                        // one; a plain "kept X" reads as if nothing happened.
+                        report.conflicts.push(if key == "theme" && report.theme.is_some() {
+                            format!(
+                                "config.json theme: kept {current}; the converted theme {value} \
+                                 is installed and selectable under the gear menu, set \
+                                 theme = {value} to switch"
+                            )
+                        } else {
+                            format!("config.json {key}: kept {current}, VS Code had {value}")
+                        });
                     }
                     continue;
                 }
@@ -1629,6 +1682,132 @@ mod tests {
             "the warning names the theme and the way to import it by hand: {:?}",
             report.warnings
         );
+    }
+
+    /// A theme that resolves but whose JSON does not convert degrades to a
+    /// warning, not a failed import: the other settings still land.
+    #[test]
+    fn a_theme_that_does_not_convert_is_a_warning_not_a_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("User");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(
+            profile.join("settings.json"),
+            r#"{ "workbench.colorTheme": "Broken", "editor.formatOnSave": true }"#,
+        )
+        .unwrap();
+        let extensions = fixture_extensions(dir.path(), "Broken");
+        std::fs::write(
+            extensions
+                .join("acme.fixture-theme-1.2.0")
+                .join("themes")
+                .join("fixture.json"),
+            "{ not json",
+        )
+        .unwrap();
+        let report =
+            scan_profile_with_extensions(&profile, &[extensions]).expect("the profile scans");
+        assert!(report.theme.is_none());
+        assert_eq!(report.settings["format_on_save"], json!(true));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("could not be converted")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    /// A config.json that already names a theme keeps it (merge, never
+    /// overwrite), and the report says the converted one is installed and
+    /// how to switch, rather than a bare "kept" beside a line that reads as
+    /// if the theme changed.
+    #[test]
+    fn an_existing_theme_setting_is_kept_and_the_conflict_says_how_to_switch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("User");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(
+            profile.join("settings.json"),
+            r#"{ "workbench.colorTheme": "Fixture Dark" }"#,
+        )
+        .unwrap();
+        let extensions = fixture_extensions(dir.path(), "Fixture Dark");
+        let mut report =
+            scan_profile_with_extensions(&profile, &[extensions]).expect("the profile scans");
+
+        let croft = tempfile::TempDir::new().unwrap();
+        std::fs::write(croft.path().join("config.json"), r#"{ "theme": "nord" }"#).unwrap();
+        let croft_ext = croft.path().join("extensions");
+        let written = apply_into_dirs(croft.path(), &croft_ext, &mut report).expect("apply runs");
+        assert!(
+            croft_ext
+                .join("theme-fixture-dark")
+                .join("extension.toml")
+                .is_file()
+        );
+        assert!(
+            !written.contains(&croft.path().join("config.json")),
+            "config.json is untouched"
+        );
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(croft.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["theme"], json!("nord"));
+        assert!(
+            report
+                .conflicts
+                .iter()
+                .any(|c| c.contains("installed and selectable") && c.contains("fixture-dark")),
+            "{:?}",
+            report.conflicts
+        );
+    }
+
+    /// VS Code leaves old versions of an extension in place; the newest
+    /// wins, by version, not by byte order (where `1.10.0` sorts before
+    /// `1.9.0`). A theme path that climbs out of its extension is skipped.
+    #[test]
+    fn the_newest_installed_version_wins_and_an_escaping_path_is_skipped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("extensions");
+        for (version, file) in [
+            ("1.9.0", "old.json"),
+            ("1.10.0", "new.json"),
+            ("1.2.0", "older.json"),
+        ] {
+            let ext = root.join(format!("acme.fixture-theme-{version}"));
+            std::fs::create_dir_all(ext.join("themes")).unwrap();
+            std::fs::write(
+                ext.join("package.json"),
+                format!(
+                    r##"{{ "contributes": {{ "themes": [ {{ "label": "Fixture Dark", "uiTheme": "vs-dark", "path": "./themes/{file}" }} ] }} }}"##
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                ext.join("themes").join(file),
+                r##"{ "name": "Fixture Dark", "type": "dark", "colors": {} }"##,
+            )
+            .unwrap();
+        }
+        let found = find_installed_themes("Fixture Dark", std::slice::from_ref(&root));
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["new.json", "old.json", "older.json"]);
+
+        let escaping = root.join("evil.theme-1.0.0");
+        std::fs::create_dir_all(&escaping).unwrap();
+        std::fs::write(
+            escaping.join("package.json"),
+            r##"{ "contributes": { "themes": [ { "label": "Evil", "path": "../../../etc/passwd" }, { "label": "Evil", "path": "/etc/passwd" } ] } }"##,
+        )
+        .unwrap();
+        assert!(find_installed_themes("Evil", &[root]).is_empty());
     }
 
     /// Each VS Code-family product keeps its extensions beside its own

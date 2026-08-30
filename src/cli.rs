@@ -973,7 +973,7 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
     }
     if let Some(theme) = &report.theme {
         println!(
-            "\nworkbench.colorTheme {:?} -> croft theme {:?}, converted from {}",
+            "\nworkbench.colorTheme {:?} converts to croft theme {:?} (from {})",
             theme.label,
             theme.converted.id,
             theme.path.display()
