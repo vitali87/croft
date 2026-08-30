@@ -971,13 +971,15 @@ mod tests {
     /// trailing line and a length the scan actually reached; one appended
     /// to grows to cover the new lines.
     ///
-    /// The truncation races the background pass on purpose: whether the cut
-    /// lands before or after the scan's frontier, the invariants hold, and
-    /// the assertions are written against what the scan read rather than
-    /// against the cut.
+    /// Both halves race the background pass on purpose, and THREE orderings
+    /// are possible each time: the change lands before the frontier, after
+    /// it, or after the pass has already reached EOF. The assertions are
+    /// written against what the scan actually read, so they hold in all
+    /// three; the fixtures are shaped to make the interesting ordering the
+    /// overwhelmingly likely one, never the required one.
     #[test]
     fn a_log_that_changes_under_the_pass_settles_to_the_scans_reach() {
-        let (body, total) = past_the_head("tail");
+        let (body, _total) = past_the_head("tail");
         let (_d, p) = write_tmp(&body);
         let mut v = LogView::open(&p).unwrap();
         assert!(v.indexing());
@@ -996,8 +998,8 @@ mod tests {
         v.finish_index();
         let reach = v.file_len;
         assert!(
-            reach >= cut && reach < body.len() as u64,
-            "the length is what the scan read, never the size at open: {reach}"
+            reach >= cut && reach <= body.len() as u64,
+            "the length is a reach the scan achieved, never a stale size: {reach}"
         );
         assert_eq!(v.scanned_to, reach);
         // Everything the scan read was a prefix of the original body, so the
@@ -1009,10 +1011,16 @@ mod tests {
         }
         assert_eq!(v.len(), expected, "no phantom trailing line past the cut");
         assert_ne!(v.line_starts.last().copied(), Some(reach));
-        assert!(v.len() < total);
 
-        // Append under the pass: the new lines are counted and readable.
-        let (body, total) = past_the_head("tail");
+        // Append under the pass. A few extra MiB of tail keep the pass busy
+        // long past the append's microseconds, but the assertions still
+        // admit the EOF-first ordering rather than depend on losing it.
+        let (mut body, mut total) = past_the_head("tail");
+        while body.len() < (HEAD_INDEX_BYTES as usize) + 5 * 1024 * 1024 {
+            body.extend_from_slice(format!("pad{total} line\n").as_bytes());
+            total += 1;
+        }
+        let appendix = b"appended one\nappended two\n";
         let (_d2, p2) = write_tmp(&body);
         let mut v2 = LogView::open(&p2).unwrap();
         assert!(v2.indexing());
@@ -1020,14 +1028,26 @@ mod tests {
             .append(true)
             .open(&p2)
             .unwrap()
-            .write_all(b"appended one\nappended two\n")
+            .write_all(appendix)
             .unwrap();
         v2.finish_index();
-        assert_eq!(v2.len(), total + 2, "the appended lines are in the index");
-        assert!(v2.file_len > body.len() as u64);
-        let last = v2.len() - 1;
-        v2.ensure(last, 1).unwrap();
-        assert_eq!(v2.visible_text(last), Some("appended two"));
+        let reach = v2.file_len;
+        assert!(
+            reach == body.len() as u64 || reach == (body.len() + appendix.len()) as u64,
+            "the reach is the file as scanned, before or after the append: {reach}"
+        );
+        if reach > body.len() as u64 {
+            assert_eq!(v2.len(), total + 2, "the appended lines are in the index");
+            let last = v2.len() - 1;
+            v2.ensure(last, 1).unwrap();
+            assert_eq!(v2.visible_text(last), Some("appended two"));
+        } else {
+            assert_eq!(
+                v2.len(),
+                total,
+                "a pass that finished first describes what it read"
+            );
+        }
     }
 
     /// #394: the pass is fed to the reader in batches, so `poll_index` on
@@ -1611,12 +1631,23 @@ mod tests {
     /// that `memchr` walks in one pass.
     #[test]
     fn a_file_past_the_line_cap_reports_truncation_rather_than_a_prefix() {
-        let body = vec![b'\n'; MAX_INDEXED_LINES + 1];
+        let mut body = vec![b'\n'; MAX_INDEXED_LINES + 1];
+        // A tail of unindexed bytes past the cap, bigger than one index
+        // chunk: the capped scan stops short of it on purpose, and the
+        // settled length must stay the FILE's, not the scan frontier's,
+        // or the last indexed line would be cut at a chunk boundary
+        // (#394's finish() keeps the max exactly when truncated).
+        body.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
         let (_d, p) = write_tmp(&body);
         let mut v = LogView::open(&p).unwrap();
         // The file is past the head budget, so the cap is hit by the
         // background pass (#394); truncation is known once it reports in.
         v.finish_index();
+        assert_eq!(
+            v.file_len,
+            body.len() as u64,
+            "a capped view keeps the file's own length past the frontier"
+        );
         assert!(
             v.truncated,
             "the view must say it did not index the whole file"
