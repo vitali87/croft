@@ -59,6 +59,13 @@ pub struct AgentLedger {
     /// Ticks once per recorded write, so every row can be ordered against
     /// every other regardless of lane.
     write_seq: u64,
+    /// The file watcher overflowed at least once since the queue was last
+    /// emptied, so every count is a LOWER BOUND: writes happened that never
+    /// reached a lane. Carried here rather than only announced in a status
+    /// line, because a transient line the next keystroke clears would leave
+    /// the user believing a partial queue is a complete one — the one thing
+    /// this module must never do.
+    may_be_incomplete: bool,
 }
 
 /// Files above this are not hashed: the ledger runs on the frame loop
@@ -126,9 +133,12 @@ pub fn read_baseline(path: &Path) -> Baseline {
 }
 
 /// The stand-in hash for a file too large to read on the frame loop: its
-/// length and mtime. Weaker than content addressing — a same-size write in
-/// the same mtime granule is missed — but it is bounded, and the
-/// alternative is reading hundreds of megabytes during a draw.
+/// length and mtime, or `None` when the mtime is unavailable — in which
+/// case the caller reads the file rather than standing in with a
+/// length-only stamp that would hide every same-size write. Weaker than
+/// content addressing (a same-size write inside one mtime granule is
+/// missed) but bounded, and the alternative is reading hundreds of
+/// megabytes during a draw.
 fn stamp_hash(meta: &std::fs::Metadata) -> Option<u64> {
     let mtime = meta.modified().ok()?;
     let since = mtime.duration_since(std::time::UNIX_EPOCH).ok()?;
@@ -140,6 +150,17 @@ fn stamp_hash(meta: &std::fs::Metadata) -> Option<u64> {
 impl AgentLedger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record that the watcher dropped events: every count from here on is
+    /// a lower bound until the queue is next emptied.
+    pub fn note_dropped_events(&mut self) {
+        self.may_be_incomplete = true;
+    }
+
+    /// Whether the queue may be missing files the watcher never reported.
+    pub fn may_be_incomplete(&self) -> bool {
+        self.may_be_incomplete
     }
 
     /// Attribute one write of `path` (already hashed) to every agent in
@@ -256,8 +277,9 @@ impl AgentLedger {
         true
     }
 
-    /// Mark every file in one lane reviewed, using `hash_of` to read each
-    /// file's current content. Returns how many rows were cleared.
+    /// Mark every file in one lane reviewed, using `read` to see each
+    /// file's current content.
+    ///
     /// Returns `(reviewed, dropped)`: rows whose current content became the
     /// baseline, and rows removed because the file is gone. They are counted
     /// apart because telling the user a deleted file was "reviewed" claims
@@ -294,7 +316,18 @@ impl AgentLedger {
         for path in &gone {
             lane.remove(path);
         }
+        self.settle_if_empty();
         (cleared, gone.len())
+    }
+
+    /// An empty queue has nothing left to be wrong about, so a
+    /// dropped-event window stops mattering once every row is reviewed.
+    /// Anything still waiting keeps the doubt, since a dropped write may be
+    /// among it.
+    fn settle_if_empty(&mut self) {
+        if self.may_be_incomplete && self.total_unreviewed() == 0 {
+            self.may_be_incomplete = false;
+        }
     }
 
     /// Drop `path` from every lane — the file is gone, so there is nothing
@@ -303,6 +336,9 @@ impl AgentLedger {
         let mut any = false;
         for lane in self.lanes.values_mut() {
             any |= lane.remove(path).is_some();
+        }
+        if any {
+            self.settle_if_empty();
         }
         any
     }
@@ -515,6 +551,37 @@ mod tests {
         led.mark_reviewed("claude", &p("/w/a.rs"), 3);
         assert_eq!(led.lane("claude")[0].path, p("/w/z.rs"));
         assert_eq!(led.lane("claude")[1].path, p("/w/a.rs"));
+    }
+
+    /// A dropped-events window makes every count a LOWER BOUND, and says
+    /// so until the queue is empty — a warning the next keystroke erases
+    /// would leave the user believing a partial queue was complete.
+    #[test]
+    fn a_dropped_event_window_marks_the_queue_a_lower_bound() {
+        let mut led = AgentLedger::new();
+        let a = vec![String::from("claude")];
+        assert!(!led.may_be_incomplete());
+
+        led.record_write(&p("/w/a.rs"), 1, &a);
+        led.note_dropped_events();
+        assert!(
+            led.may_be_incomplete(),
+            "the watcher overflowed: counts are a floor"
+        );
+
+        // Reviewing SOME of the queue keeps the doubt: a dropped write may
+        // be among what is left.
+        led.record_write(&p("/w/b.rs"), 2, &a);
+        led.mark_reviewed("claude", &p("/w/a.rs"), 1);
+        assert!(led.may_be_incomplete());
+
+        // Emptying it settles the question: nothing is left to be wrong.
+        let (reviewed, _) = led.mark_lane_reviewed("claude", |_| Baseline::Hash(2));
+        assert_eq!(reviewed, 1);
+        assert!(
+            !led.may_be_incomplete(),
+            "an empty queue has nothing left to be a lower bound of"
+        );
     }
 
     /// A file that cannot be READ right now is not reviewed. Clearing it

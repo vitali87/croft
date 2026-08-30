@@ -36290,3 +36290,85 @@ fn the_agent_lane_ledger_attributes_writes_and_tracks_review_baselines() {
         assert_eq!(cmd.id(), id);
     }
 }
+
+/// #345: the watcher's three ledger-facing behaviours, driven through the
+/// real drain rather than asserted about by reading it.
+///
+/// A rescan means events were DROPPED, so the queue is a lower bound and
+/// the ledger must record that durably; a removed directory is not a file
+/// and must not enter a file-only ledger; and a removed FILE must still be
+/// reported, so the row can leave the queue.
+#[test]
+fn the_watcher_reports_rescans_and_keeps_directories_out_of_the_ledger() {
+    use notify::Event as NotifyEvent;
+    use notify::event::{EventKind, ModifyKind, RemoveKind};
+    use notify_debouncer_full::DebouncedEvent;
+    use std::sync::mpsc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("touched.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    let doomed_dir = tmp.path().join("subdir");
+    std::fs::create_dir(&doomed_dir).unwrap();
+    let doomed_file = tmp.path().join("removed.rs");
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+
+    let (tx, rx) = mpsc::channel();
+    app.fs_watch.set_test_events(rx);
+
+    // A removed directory, a removed file, and an ordinary write.
+    let mut dir_gone = NotifyEvent::new(EventKind::Remove(RemoveKind::Folder));
+    dir_gone = dir_gone.add_path(doomed_dir.clone());
+    let mut file_gone = NotifyEvent::new(EventKind::Remove(RemoveKind::File));
+    file_gone = file_gone.add_path(doomed_file.clone());
+    let mut written = NotifyEvent::new(EventKind::Modify(ModifyKind::Any));
+    written = written.add_path(file.clone());
+    let now = std::time::Instant::now();
+    tx.send(Ok(vec![
+        DebouncedEvent::new(dir_gone, now),
+        DebouncedEvent::new(file_gone, now),
+        DebouncedEvent::new(written, now),
+    ]))
+    .unwrap();
+    app.drain_fs_events();
+
+    assert!(
+        app.agent_ledger.is_unreviewed(&file),
+        "the written file is attributed to the working agent"
+    );
+    assert!(
+        !app.agent_ledger.is_unreviewed(&doomed_dir),
+        "a removed DIRECTORY must not enter a file-only ledger"
+    );
+    assert!(
+        !app.agent_ledger.may_be_incomplete(),
+        "no rescan yet, so the queue is not a lower bound"
+    );
+
+    // Now a rescan: the watcher overflowed and dropped events.
+    let (tx2, rx2) = mpsc::channel();
+    app.fs_watch.set_test_events(rx2);
+    let rescan = NotifyEvent::new(EventKind::Modify(ModifyKind::Any))
+        .add_path(file.clone())
+        .set_flag(notify::event::Flag::Rescan);
+    tx2.send(Ok(vec![DebouncedEvent::new(
+        rescan,
+        std::time::Instant::now(),
+    )]))
+    .unwrap();
+    app.drain_fs_events();
+    assert!(
+        app.agent_ledger.may_be_incomplete(),
+        "a rescan makes every count a lower bound, durably"
+    );
+
+    // And the doubt survives an unrelated status change, which is the
+    // point of holding it in the ledger rather than the status line.
+    app.status = String::from("something else entirely");
+    assert!(app.agent_ledger.may_be_incomplete());
+}

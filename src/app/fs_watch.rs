@@ -596,12 +596,23 @@ pub(super) fn offload_drop<T: Send + 'static>(value: T) {
     std::thread::spawn(move || drop(value));
 }
 
-/// Whether the event is the removal of a DIRECTORY. After the removal the
-/// path no longer stats as one, so only the kind can say.
+/// Whether the event is a removal whose target may have been a DIRECTORY.
+/// Once the path is gone `is_dir()` is false, so only the kind can say —
+/// and only two of notify's backends say it precisely: FSEvents and
+/// inotify emit `RemoveKind::Folder`, while kqueue, the Windows watcher
+/// and the poll fallback emit `RemoveKind::Any` for everything they
+/// remove. Treating `Any` as "may be a directory" is the safe reading: a
+/// removed FILE excluded here is one the ledger would have dropped from
+/// every lane anyway (its baseline reads `Gone`), so the cost is a row
+/// that leaves on the next write rather than this instant, while the
+/// alternative is a directory sitting in a file-only queue.
 fn removes_a_directory(kind: &notify::EventKind) -> bool {
     use notify::EventKind;
     use notify::event::RemoveKind;
-    matches!(kind, EventKind::Remove(RemoveKind::Folder))
+    matches!(
+        kind,
+        EventKind::Remove(RemoveKind::Folder) | EventKind::Remove(RemoveKind::Any)
+    )
 }
 
 fn event_mutates_content(kind: &notify::EventKind) -> bool {

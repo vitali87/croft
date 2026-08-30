@@ -11267,13 +11267,20 @@ impl App {
         if !drain.changed_files.is_empty() {
             self.attribute_writes_to_working_agents(&drain.changed_files);
         }
-        // A rescan means the watcher dropped events, so the queue this tick
-        // built is a lower bound. Say so once rather than let a short list
-        // read as a complete one (#345).
-        if drain.rescan_dropped_events && !self.working_agents().is_empty() {
-            self.status = String::from(
-                "File watcher overflowed: some agent changes may be missing from the review queue",
-            );
+        // A rescan means the watcher dropped events, so the queue is a
+        // LOWER BOUND from here until it is emptied (#345). Recorded in the
+        // ledger rather than only announced: a status line the next
+        // keystroke clears would leave a partial queue looking complete.
+        // Unconditional on whether an agent is working right now — the
+        // dropped writes may have landed a moment ago, while the pane's
+        // sampled status has since flipped to idle.
+        if drain.rescan_dropped_events {
+            self.agent_ledger.note_dropped_events();
+            if !self.working_agents().is_empty() {
+                self.status = String::from(
+                    "File watcher overflowed: some agent changes may be missing from the review queue",
+                );
+            }
         }
         let polled = self.poll_filesystem_changes();
         drain.got_any || init_changed || polled
@@ -15045,7 +15052,16 @@ impl App {
                 String::new()
             };
             let review_part = if unreviewed > 0 {
-                format!("{unreviewed} to review")
+                // A "+" when the watcher dropped events: the count is a
+                // floor, and a bare number would read as a total.
+                format!(
+                    "{unreviewed}{} to review",
+                    if self.agent_ledger.may_be_incomplete() {
+                        "+"
+                    } else {
+                        ""
+                    }
+                )
             } else {
                 String::new()
             };
@@ -30220,6 +30236,11 @@ impl App {
                     .collect();
                 self.status = if rows.is_empty() {
                     String::from("No agent has changed anything yet")
+                } else if self.agent_ledger.may_be_incomplete() {
+                    format!(
+                        "{} \u{b7} at least: the file watcher overflowed",
+                        rows.join(" \u{b7} ")
+                    )
                 } else {
                     rows.join(" \u{b7} ")
                 };
