@@ -2163,6 +2163,11 @@ pub struct App {
     test_worker: crate::testing::worker::TestWorker,
     /// The Extensions side panel: bundled + installed extensions with toggles.
     pub extensions: crate::widgets::extensions::ExtensionsPanel,
+    /// Extension ids VS Code reported installed, from the last
+    /// "Extensions: Compare with VS Code" (#352). Empty until the user asks,
+    /// since listing them spawns `code`. Workspace recommendations are read
+    /// from `.vscode/extensions.json` on every refresh instead.
+    pub vscode_listed: Vec<String>,
     /// The Explorer's OPEN EDITORS section: the open editor tabs, projected
     /// from the active `editor` group each frame. See [`OpenEditorsPanel`].
     pub open_editors: OpenEditorsPanel,
@@ -4003,6 +4008,7 @@ impl App {
             testing: crate::widgets::testing::TestingPanel::new(),
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             extensions,
+            vscode_listed: Vec::new(),
             disabled_extensions,
             // Built from `loaded_keymap` above, which applies the same
             // cfg!(test) guard main landed here independently: the
@@ -11978,8 +11984,42 @@ impl App {
     /// view is shown or a toggle flips, so the list always reflects the manifests
     /// on disk and the current disable set.
     fn refresh_extensions(&mut self) {
-        let items = build_extension_items(&self.disabled_extensions);
+        let mut vscode: Vec<String> = self
+            .roots
+            .iter()
+            .flat_map(crate::vscode_extensions::workspace_recommendations)
+            .collect();
+        vscode.extend(self.vscode_listed.iter().cloned());
+        let compared = crate::vscode_extensions::compare(vscode);
+        let items = build_extension_items(&self.disabled_extensions, &compared);
         self.extensions.set_items(items);
+    }
+
+    /// Extensions: Compare with VS Code (#352). Lists what VS Code has
+    /// installed (one `code --list-extensions`, which is why it is a command
+    /// and not a refresh), merges it with the workspace's recommendations,
+    /// and shows the panel with the FROM VS CODE group filled in.
+    fn compare_extensions_with_vscode(&mut self) {
+        self.vscode_listed = crate::vscode_extensions::installed_via_code();
+        self.refresh_extensions();
+        self.set_sidebar_view(SidebarView::Extensions);
+        let n = self
+            .extensions
+            .items()
+            .iter()
+            .filter(|it| it.vscode)
+            .count();
+        self.status = if self.vscode_listed.is_empty() {
+            format!(
+                "{n} VS Code extension{} from this workspace's recommendations; `code` was not found on PATH, so the installed list is not included",
+                if n == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "{n} VS Code extension{} compared under FROM VS CODE",
+                if n == 1 { "" } else { "s" }
+            )
+        };
     }
 
     fn pane_visible(&self, p: Pane) -> bool {
@@ -17615,10 +17655,25 @@ impl App {
         let Some(id) = self.extensions.selected_id().map(str::to_string) else {
             return;
         };
+        // A FROM VS CODE row with nothing to install is an answer, not a
+        // control: say what croft has for it and stop.
+        if let Some(item) = self.extensions.selected_item()
+            && item.vscode
+            && item.install.is_none()
+        {
+            self.status = format!("{}: {}", item.id, item.description);
+            return;
+        }
         // AVAILABLE catalog rows: the toggle "adds" (installs) rather than
         // enables. Materialize the manifest into the user extensions dir, then
-        // refresh so it moves into INSTALLED (enabled by default).
+        // refresh so it moves into INSTALLED (enabled by default). A FROM VS
+        // CODE row installs its croft equivalent, not its own (VS Code) id.
         if self.extensions.selected_available() {
+            let id = self
+                .extensions
+                .selected_install_target()
+                .map(str::to_string)
+                .unwrap_or(id);
             match crate::mcp::catalog::install(&id) {
                 Ok(_) => {
                     self.refresh_extensions();
@@ -29405,6 +29460,7 @@ impl App {
             Cmd::ShowRunDebug => self.set_sidebar_view(SidebarView::RunDebug),
             Cmd::ShowRemote => self.set_sidebar_view(SidebarView::Remote),
             Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
+            Cmd::CompareExtensionsWithVscode => self.compare_extensions_with_vscode(),
             Cmd::ShowTesting => self.open_testing_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
@@ -41359,6 +41415,7 @@ fn sidebar_view_from_label(label: &str) -> Option<SidebarView> {
 /// up without a relaunch.
 fn build_extension_items(
     disabled: &std::collections::BTreeSet<String>,
+    vscode: &[crate::vscode_extensions::Comparison],
 ) -> Vec<crate::widgets::extensions::ExtensionItem> {
     use crate::lsp::manifest;
     let user = manifest::read_extension_sources(&manifest::user_extensions_dir());
@@ -41376,6 +41433,8 @@ fn build_extension_items(
     items.extend(crate::widgets::extensions::items_from_available(
         crate::mcp::catalog::available(),
     ));
+    // And what VS Code has that croft covers, or does not (#352).
+    items.extend(crate::widgets::extensions::items_from_vscode(vscode));
     items
 }
 

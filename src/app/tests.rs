@@ -35727,3 +35727,44 @@ fn a_dropped_file_url_with_invalid_utf8_is_dropped() {
         "a truncated multi-byte lead is not a path either"
     );
 }
+
+/// #352: a workspace's `.vscode/extensions.json` recommendations appear in the
+/// Extensions panel under FROM VS CODE with what croft has for each.
+#[test]
+fn workspace_extension_recommendations_show_under_from_vscode() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode").join("extensions.json"),
+        r#"{ "recommendations": ["rust-lang.rust-analyzer", "nobody.nothing"] }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.refresh_extensions();
+    let ids: Vec<String> = app
+        .extensions
+        .items()
+        .iter()
+        .filter(|i| i.vscode)
+        .map(|i| i.id.clone())
+        .collect();
+    assert_eq!(ids, ["rust-lang.rust-analyzer", "nobody.nothing"]);
+
+    // Toggling a built-in row is an answer, not an install: the status names
+    // the extension and what croft has for it, and nothing is disabled.
+    let visible = app.extensions.visible_indices();
+    let pos = visible
+        .iter()
+        .position(|&i| app.extensions.items()[i].id == "rust-lang.rust-analyzer")
+        .expect("the row is visible");
+    app.extensions.select(pos);
+    let before = app.disabled_extensions.clone();
+    app.toggle_selected_extension();
+    assert!(
+        app.status
+            .starts_with("rust-lang.rust-analyzer: built in: lsp-rust"),
+        "the status restates the row: {}",
+        app.status
+    );
+    assert_eq!(app.disabled_extensions, before, "nothing was toggled");
+}

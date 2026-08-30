@@ -72,6 +72,7 @@ mod update_check;
 mod update_watch;
 mod vim;
 mod voice;
+mod vscode_extensions;
 mod vscode_theme;
 mod widgets;
 mod workspace;
