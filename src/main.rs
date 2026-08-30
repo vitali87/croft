@@ -22,6 +22,7 @@ mod gui_path;
 mod hex;
 mod highlight;
 mod history;
+mod http_file;
 mod icons;
 mod import_vscode;
 mod install_session;

