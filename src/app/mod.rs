@@ -41093,14 +41093,11 @@ fn semantic_reply_is_current(seen: Option<u64>, incoming: u64) -> bool {
 /// body. The body starts one row below the header and the view scrolls by
 /// whole lines, so the mapping is a straight offset.
 ///
-/// One cell is treated as one CHARACTER, which is what `render_log` already
-/// assumes: it advances by `chars().count()` rather than by display width,
-/// so a double-width character occupies two cells on screen and one column
-/// in this arithmetic. Selection therefore drifts on a line containing CJK
-/// or emoji, by exactly as much as the painting does. Matching the renderer
-/// is deliberate: a mapping that measured width correctly would disagree
-/// with what is actually on screen, which is worse than agreeing with it
-/// wrongly. Fixing it means teaching the renderer first.
+/// A cell is mapped back to a character through the same `CellMap` the
+/// renderer painted with (#404): a double-width character is two cells and
+/// one column, and a click on either half is a click on that character.
+/// The two must move together; a mapping that measured width differently
+/// from the painter would disagree with what is actually on screen.
 fn log_cell_at(
     log: &crate::log_view::LogView,
     scroll: usize,
@@ -41109,20 +41106,23 @@ fn log_cell_at(
 ) -> (usize, usize) {
     let body = log.last_body;
     let line = (scroll + row.saturating_sub(body.y) as usize).min(log.len().saturating_sub(1));
-    let column = col.saturating_sub(body.x) as usize;
+    let cell = col.saturating_sub(body.x);
     // Clamp the COLUMN to the line's own length, not just the line to the
     // file's. The renderer paints to the endpoint it is given while the copy
     // reads `min(len)`, so an unclamped column let a drag past the end of a
     // short line paint sixty cells and copy three characters. Clamping here
     // means both readers see one value rather than each clamping its own way.
+    // `char_at_cell` already answers the character count for a cell past
+    // the end, which is that clamp.
     //
-    // A line outside the parsed window has no length to clamp against; the
-    // raw column stands, which is what the old behaviour was everywhere.
-    let width = log
+    // A line outside the parsed window has no text to map through; the raw
+    // cell stands as the column, which is what the old behaviour was
+    // everywhere.
+    let column = log
         .visible_text(line)
-        .map(|t| t.chars().count())
-        .unwrap_or(column);
-    (line, column.min(width))
+        .map(|t| crate::cell_map::CellMap::new(t).char_at_cell(cell))
+        .unwrap_or(cell as usize);
+    (line, column)
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {

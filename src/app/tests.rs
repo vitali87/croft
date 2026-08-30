@@ -35167,6 +35167,151 @@ fn dragging_past_a_short_lines_end_paints_what_it_copies() {
     );
 }
 
+/// #404: a double-width character occupies two cells, so every span after
+/// it must be painted, and every click after it hit-tested, by display
+/// width rather than by character count.
+///
+/// The painter advanced `x` by `chars().count()`, so after a CJK pair the
+/// next span landed two cells to the left of where the terminal had put
+/// the pair, overpainting its second half, and `log_cell_at` matched the
+/// drift by design. Fixed together so the two never disagree.
+#[test]
+fn double_width_characters_keep_log_columns_aligned() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use ratatui::widgets::Widget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("wide.log");
+    // "\u{4e2d}\u{6587}" is two characters and four cells; then a space and
+    // a coloured X, which must land on cell 5 (character column 3).
+    std::fs::write(
+        &p,
+        "\u{1b}[31m\u{4e2d}\u{6587}\u{1b}[0m \u{1b}[32mX\u{1b}[0m\n",
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some());
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let body = app.editor.log.as_ref().unwrap().last_body;
+
+    // Click the X and release on it: a one-character selection.
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        body.x + 5,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        body.x + 6,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        body.x + 6,
+        body.y,
+    ));
+    let (text, _) = app.editor.log.as_ref().unwrap().selection_text();
+    assert_eq!(text, "X", "cell 5 is the X, two cells past the wide pair");
+
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    {
+        let area = app.editor.last_area;
+        (&mut app.editor).render(area, &mut buf);
+    }
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let row: Vec<&str> = (body.x..body.x + 7)
+        .map(|x| buf[(x, body.y)].symbol())
+        .collect();
+    assert_eq!(
+        buf[(body.x + 2, body.y)].symbol(),
+        "\u{6587}",
+        "the second wide character keeps its cells: {row:?}"
+    );
+    assert_eq!(
+        buf[(body.x + 5, body.y)].symbol(),
+        "X",
+        "the span after the pair starts where the terminal put it: {row:?}"
+    );
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    let painted: Vec<u16> = (body.x..body.x + body.width)
+        .filter(|x| buf[(*x, body.y)].style().bg == Some(selected_bg))
+        .collect();
+    assert_eq!(
+        painted,
+        vec![body.x + 5],
+        "the selection band sits on the X's cell, not on character column 3"
+    );
+}
+
+/// #404 review: a wide character whose first half lands on the body's last
+/// cell does not fit whole, and `set_stringn` drops it entirely. The
+/// selection band must not colour that cell, or the annotator paints where
+/// the painter deliberately put nothing, the same disagreement the cell map
+/// exists to close, at the boundary.
+#[test]
+fn a_wide_character_clipped_at_the_right_edge_gets_no_selection_band() {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 8,
+    };
+    // Learn the body width from a probe render, so the fixture puts the
+    // wide character exactly on the last cell whatever the chrome costs.
+    let probe = tmp.path().join("probe.log");
+    std::fs::write(&probe, "\u{1b}[31mx\u{1b}[0m\n").unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&probe).unwrap();
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut e).render(area, &mut buf);
+    let width = e.log.as_ref().unwrap().last_body.width as usize;
+    assert!(width > 2);
+
+    let p = tmp.path().join("edge.log");
+    let text = format!("{}\u{4e2d}", "x".repeat(width - 1));
+    std::fs::write(&p, format!("\u{1b}[31m{text}\u{1b}[0m\n")).unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&p).unwrap();
+    let chars = text.chars().count();
+    e.log.as_mut().unwrap().selection = Some(((0, 0), (0, chars)));
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut e).render(area, &mut buf);
+    let body = e.log.as_ref().unwrap().last_body;
+    let last = body.x + body.width - 1;
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    assert_eq!(
+        buf[(last, body.y)].symbol(),
+        " ",
+        "the painter drops a wide character that does not fit whole"
+    );
+    assert_ne!(
+        buf[(last, body.y)].style().bg,
+        Some(selected_bg),
+        "so the band must not colour the cell it left blank"
+    );
+    assert_eq!(
+        buf[(last - 1, body.y)].style().bg,
+        Some(selected_bg),
+        "while the character before it is selected as usual"
+    );
+}
+
 /// #257: a frame that paints no log body must publish no body rect.
 ///
 /// `render_log` returned early for a zero-sized area WITHOUT clearing
