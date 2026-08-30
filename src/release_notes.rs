@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "A .code-workspace file whose folder paths carry non-ASCII characters (accents, CJK, Cyrillic) now opens with those names intact instead of mojibake.",
+    summary: "Opening a large colour log is about three times faster: the line index now scans for newlines with vector instructions instead of comparing one byte at a time, which is the whole cost of opening a file the view otherwise never reads.",
 }];
