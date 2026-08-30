@@ -2163,6 +2163,11 @@ pub struct App {
     test_worker: crate::testing::worker::TestWorker,
     /// The Extensions side panel: bundled + installed extensions with toggles.
     pub extensions: crate::widgets::extensions::ExtensionsPanel,
+    /// Extension ids VS Code reported installed, from the last
+    /// "Extensions: Compare with VS Code" (#352). Empty until the user asks,
+    /// since listing them spawns `code`. Workspace recommendations are read
+    /// from `.vscode/extensions.json` on every refresh instead.
+    pub vscode_listed: Vec<String>,
     /// The Explorer's OPEN EDITORS section: the open editor tabs, projected
     /// from the active `editor` group each frame. See [`OpenEditorsPanel`].
     pub open_editors: OpenEditorsPanel,
@@ -4005,6 +4010,7 @@ impl App {
             testing: crate::widgets::testing::TestingPanel::new(),
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             extensions,
+            vscode_listed: Vec::new(),
             disabled_extensions,
             // Built from `loaded_keymap` above, which applies the same
             // cfg!(test) guard main landed here independently: the
@@ -11981,8 +11987,42 @@ impl App {
     /// view is shown or a toggle flips, so the list always reflects the manifests
     /// on disk and the current disable set.
     fn refresh_extensions(&mut self) {
-        let items = build_extension_items(&self.disabled_extensions);
+        let mut vscode: Vec<String> = self
+            .roots
+            .iter()
+            .flat_map(crate::vscode_extensions::workspace_recommendations)
+            .collect();
+        vscode.extend(self.vscode_listed.iter().cloned());
+        let compared = crate::vscode_extensions::compare(vscode);
+        let items = build_extension_items(&self.disabled_extensions, &compared);
         self.extensions.set_items(items);
+    }
+
+    /// Extensions: Compare with VS Code (#352). Lists what VS Code has
+    /// installed (one `code --list-extensions`, which is why it is a command
+    /// and not a refresh), merges it with the workspace's recommendations,
+    /// and shows the panel with the FROM VS CODE group filled in.
+    fn compare_extensions_with_vscode(&mut self) {
+        self.vscode_listed = crate::vscode_extensions::installed_via_code();
+        self.refresh_extensions();
+        self.set_sidebar_view(SidebarView::Extensions);
+        let n = self
+            .extensions
+            .items()
+            .iter()
+            .filter(|it| it.vscode)
+            .count();
+        self.status = if self.vscode_listed.is_empty() {
+            format!(
+                "{n} VS Code extension{} from this workspace's recommendations; `code` was not found on PATH, so the installed list is not included",
+                if n == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "{n} VS Code extension{} compared under FROM VS CODE",
+                if n == 1 { "" } else { "s" }
+            )
+        };
     }
 
     fn pane_visible(&self, p: Pane) -> bool {
@@ -17618,10 +17658,25 @@ impl App {
         let Some(id) = self.extensions.selected_id().map(str::to_string) else {
             return;
         };
+        // A FROM VS CODE row with nothing to install is an answer, not a
+        // control: say what croft has for it and stop.
+        if let Some(item) = self.extensions.selected_item()
+            && item.vscode
+            && item.install.is_none()
+        {
+            self.status = format!("{}: {}", item.id, item.description);
+            return;
+        }
         // AVAILABLE catalog rows: the toggle "adds" (installs) rather than
         // enables. Materialize the manifest into the user extensions dir, then
-        // refresh so it moves into INSTALLED (enabled by default).
+        // refresh so it moves into INSTALLED (enabled by default). A FROM VS
+        // CODE row installs its croft equivalent, not its own (VS Code) id.
         if self.extensions.selected_available() {
+            let id = self
+                .extensions
+                .selected_install_target()
+                .map(str::to_string)
+                .unwrap_or(id);
             match crate::mcp::catalog::install(&id) {
                 Ok(_) => {
                     self.refresh_extensions();
@@ -29435,6 +29490,7 @@ impl App {
             Cmd::ShowRunDebug => self.set_sidebar_view(SidebarView::RunDebug),
             Cmd::ShowRemote => self.set_sidebar_view(SidebarView::Remote),
             Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
+            Cmd::CompareExtensionsWithVscode => self.compare_extensions_with_vscode(),
             Cmd::ShowTesting => self.open_testing_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
@@ -40976,22 +41032,16 @@ fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
         s = s[1..s.len() - 1].to_string();
     }
     if let Some(rest) = s.strip_prefix("file://") {
-        let mut path = String::with_capacity(rest.len());
-        let bytes = rest.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%'
-                && i + 2 < bytes.len()
-                && let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
-            {
-                path.push((h * 16 + l) as char);
-                i += 3;
-                continue;
-            }
-            path.push(bytes[i] as char);
-            i += 1;
-        }
-        s = path;
+        // Decode into BYTES and build the string once. A `%xx` escape is one
+        // byte of a UTF-8 sequence, not a character; pushing it `as char`
+        // read it as Latin-1 and opened a path that does not exist (#414).
+        // A sequence that is not valid UTF-8 names no path this process can
+        // open, so per this function's contract the token is dropped rather
+        // than turned into a plausible-looking path of replacement
+        // characters, which would pass every caller's "is this a path"
+        // screen and open the wrong thing.
+        let decoded = crate::shell_integration::percent_decode(rest.as_bytes());
+        s = String::from_utf8(decoded).ok()?;
     }
     let mut unescaped = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -41030,15 +41080,6 @@ fn append_to_relay_log(log_path: &Path, payload: &str) -> std::io::Result<()> {
     f.write_all(payload.as_bytes())?;
     f.sync_data().ok();
     Ok(())
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Map a screen cell to a sheet grid cell (#177) using the frame-truth
@@ -41139,14 +41180,11 @@ fn semantic_reply_is_current(seen: Option<u64>, incoming: u64) -> bool {
 /// body. The body starts one row below the header and the view scrolls by
 /// whole lines, so the mapping is a straight offset.
 ///
-/// One cell is treated as one CHARACTER, which is what `render_log` already
-/// assumes: it advances by `chars().count()` rather than by display width,
-/// so a double-width character occupies two cells on screen and one column
-/// in this arithmetic. Selection therefore drifts on a line containing CJK
-/// or emoji, by exactly as much as the painting does. Matching the renderer
-/// is deliberate: a mapping that measured width correctly would disagree
-/// with what is actually on screen, which is worse than agreeing with it
-/// wrongly. Fixing it means teaching the renderer first.
+/// A cell is mapped back to a character through the same `CellMap` the
+/// renderer painted with (#404): a double-width character is two cells and
+/// one column, and a click on either half is a click on that character.
+/// The two must move together; a mapping that measured width differently
+/// from the painter would disagree with what is actually on screen.
 fn log_cell_at(
     log: &crate::log_view::LogView,
     scroll: usize,
@@ -41155,20 +41193,23 @@ fn log_cell_at(
 ) -> (usize, usize) {
     let body = log.last_body;
     let line = (scroll + row.saturating_sub(body.y) as usize).min(log.len().saturating_sub(1));
-    let column = col.saturating_sub(body.x) as usize;
+    let cell = col.saturating_sub(body.x);
     // Clamp the COLUMN to the line's own length, not just the line to the
     // file's. The renderer paints to the endpoint it is given while the copy
     // reads `min(len)`, so an unclamped column let a drag past the end of a
     // short line paint sixty cells and copy three characters. Clamping here
     // means both readers see one value rather than each clamping its own way.
+    // `char_at_cell` already answers the character count for a cell past
+    // the end, which is that clamp.
     //
-    // A line outside the parsed window has no length to clamp against; the
-    // raw column stands, which is what the old behaviour was everywhere.
-    let width = log
+    // A line outside the parsed window has no text to map through; the raw
+    // cell stands as the column, which is what the old behaviour was
+    // everywhere.
+    let column = log
         .visible_text(line)
-        .map(|t| t.chars().count())
-        .unwrap_or(column);
-    (line, column.min(width))
+        .map(|t| crate::cell_map::CellMap::new(t).char_at_cell(cell))
+        .unwrap_or(cell as usize);
+    (line, column)
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
@@ -41405,6 +41446,7 @@ fn sidebar_view_from_label(label: &str) -> Option<SidebarView> {
 /// up without a relaunch.
 fn build_extension_items(
     disabled: &std::collections::BTreeSet<String>,
+    vscode: &[crate::vscode_extensions::Comparison],
 ) -> Vec<crate::widgets::extensions::ExtensionItem> {
     use crate::lsp::manifest;
     let user = manifest::read_extension_sources(&manifest::user_extensions_dir());
@@ -41422,6 +41464,8 @@ fn build_extension_items(
     items.extend(crate::widgets::extensions::items_from_available(
         crate::mcp::catalog::available(),
     ));
+    // And what VS Code has that croft covers, or does not (#352).
+    items.extend(crate::widgets::extensions::items_from_vscode(vscode));
     items
 }
 
