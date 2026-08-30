@@ -1155,8 +1155,8 @@ mod tests {
         assert_eq!(v.visible_text(1), Some("second"));
         assert_eq!(v.visible_text(2), Some("third"));
 
-        // And one straddling the seam by a byte, so the newline is the first
-        // byte of the second chunk rather than the last of the first.
+        // The other alignment: the newline is the FIRST byte of the second
+        // chunk rather than the last of the first.
         let mut body = vec![b'b'; INDEX_CHUNK];
         body.push(b'\n');
         body.extend_from_slice(b"tail\n");
@@ -1165,6 +1165,57 @@ mod tests {
         assert_eq!(v2.len(), 2);
         v2.ensure(1, 1).unwrap();
         assert_eq!(v2.visible_text(1), Some("tail"));
+
+        // And a genuinely STRADDLING character: a 3-byte CJK sequence with
+        // its first byte at the end of one chunk and its other two at the
+        // start of the next. The index does not care, because `memchr`
+        // matches bytes and no byte of a multi-byte sequence can be 0x0A,
+        // but the windowed reader that follows does: a window boundary that
+        // fell mid-sequence would hand `visible_text` invalid UTF-8. The
+        // fixtures above are all ASCII and cannot reach this.
+        // Short lines throughout, so the parsed window can hold the one
+        // being read: a single line the size of a chunk would exceed the
+        // 256 KiB window and prove nothing about the seam.
+        let unit = b"0123456789\n";
+        let full = (INDEX_CHUNK - 1) / unit.len();
+        let mut body = unit.repeat(full);
+        body.extend(std::iter::repeat_n(b'c', INDEX_CHUNK - 1 - body.len()));
+        assert_eq!(body.len(), INDEX_CHUNK - 1, "the next byte starts the CJK");
+        body.extend_from_slice("\u{4e2d}\u{6587} tail\n".as_bytes());
+        let (_d3, p3) = write_tmp(&body);
+        let mut v3 = LogView::open(&p3).unwrap();
+        let last = v3.len() - 1;
+        v3.ensure(last, 1).unwrap();
+        let text = v3.visible_text(last).expect("the line reads back");
+        assert!(
+            text.ends_with("\u{4e2d}\u{6587} tail"),
+            "the straddling characters survived the seam: {text:?}"
+        );
+    }
+
+    /// Past `MAX_INDEXED_LINES` the view reports truncation rather than
+    /// showing a prefix as if it were the whole file.
+    ///
+    /// The cap is the one branch in the index loop that the rewrite moved,
+    /// and nothing covered it: every other fixture here is a handful of
+    /// lines. Tested with a real file rather than by making the cap
+    /// injectable, because a cap that exists only so a test can lower it is
+    /// a second definition of the limit, and the file is 10 MB of newlines
+    /// that `memchr` walks in one pass.
+    #[test]
+    fn a_file_past_the_line_cap_reports_truncation_rather_than_a_prefix() {
+        let body = vec![b'\n'; MAX_INDEXED_LINES + 1];
+        let (_d, p) = write_tmp(&body);
+        let v = LogView::open(&p).unwrap();
+        assert!(
+            v.truncated,
+            "the view must say it did not index the whole file"
+        );
+        assert_eq!(
+            v.len(),
+            MAX_INDEXED_LINES,
+            "and it must stop AT the cap, not one past it"
+        );
     }
 
     #[test]
