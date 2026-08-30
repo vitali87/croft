@@ -6,24 +6,20 @@ Thanks for hacking on croft. Build, run, and platform setup live in the
 developer workflow concerns that do not belong in any of those.
 
 Everything in this guide applies to AI agents too, including the two sections
-below on claiming work and on verifying that a review happened. Agents often
+below on coordinating work and on verifying that a review happened. Agents often
 also keep a `CLAUDE.md` at the root for their own preferences, but it is
 deliberately untracked and clone-local: a fresh checkout will not have one, and
 nothing here depends on it.
 
-## Claiming work, so concurrent sessions do not collide
+## Coordinating work, so concurrent sessions do not collide
 
-Several agent sessions work this repo at once. Two signals say a piece of work
-is taken, and **neither covers the other**:
+Several agent sessions work this repo at once. There is no lock or claim
+label: an open PR against an issue is the only signal that the work is taken.
+Check before starting — `gh pr list --search "<issue number>"` is one call, and
+skipping it is how the same issue gets solved twice.
 
-* the issue carries a `claimed` label — that records *intent*;
-* a PR is open against it — that records *work*.
-
-Check both before starting. `gh pr list --search "<issue number>"` is one call,
-and skipping it is how the same issue gets solved twice.
-
-**A claim holds only while someone is behind it.** If nothing has moved, it is
-not a reservation:
+**A PR holds the work only while someone is behind it.** If nothing has moved,
+it is not a reservation:
 
 1. Age the work by its **last commit**, not `updatedAt` — a comment bumps
    `updatedAt`, so a stale branch can look active:
@@ -34,7 +30,7 @@ not a reservation:
 
 When you do take something over, say so on the PR with your reasons, and leave
 the branch untouched and reopenable — no force-push, no rewriting someone
-else's history. Being first is a real claim right up until nobody is behind it.
+else's history.
 
 ## Verifying a review actually happened
 
