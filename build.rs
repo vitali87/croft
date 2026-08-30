@@ -1,8 +1,9 @@
 // The welcome panel used to bake `git log` output (`CROFT_RELEASE_COMMITS`)
 // and the repository remote (`CROFT_REPOSITORY_REMOTE`) into the binary at
 // build time. Both are gone: the panel now renders hand-curated release
-// highlights from `src/release_notes.rs` (compiled-in data, zero network,
-// never derived from a forge).
+// highlights from `src/release_notes/<version>.md`, baked in by
+// `bake_release_notes` below (compiled-in data, zero network, never derived
+// from a forge).
 //
 // What IS baked now is build provenance — the short git hash (`-dirty` when
 // the tree has uncommitted changes) and the UTC build time — for `--version`
