@@ -20876,6 +20876,10 @@ impl App {
             // then `croft pair` (or a palette off/on) re-activates.
             self.navigator_down = false;
             self.pair_lock_denied = None;
+            // A fix stream cannot outlive the seat: with the navigator
+            // deactivated no TurnDone can arrive, and a marker left here
+            // spun the row (and woke the renderer) forever (#374 review).
+            self.clear_problem_fix();
             if let Some(host) = self.pair_host.take() {
                 // Drop tears the seat down; its parked caret goes with it.
                 let sites = host.caret_sites();
@@ -22111,19 +22115,22 @@ impl App {
                 self.resolve_merge_at_cursor(res);
             }
             ListPurpose::CodeAction => {
-                if let Some(item) = self.pending_code_actions.get(index).cloned() {
+                // The navigator row's id is not numeric, and the shared
+                // `index` above parses non-numbers to 0 — routing through
+                // it would silently apply the server's FIRST action
+                // instead. Branch on the id itself (#374 review).
+                if row.id == "navigator" {
+                    if let Some((path, item)) = self.navigator_fix_candidate() {
+                        // The server's titles ride along as hints.
+                        let hints = self
+                            .pending_code_actions
+                            .iter()
+                            .map(|a| a.title.clone())
+                            .collect();
+                        self.fix_problem_with_navigator(path, item, hints);
+                    }
+                } else if let Some(item) = self.pending_code_actions.get(index).cloned() {
                     self.apply_code_action(item);
-                } else if index == self.pending_code_actions.len()
-                    && let Some((path, item)) = self.navigator_fix_candidate()
-                {
-                    // The row past the server's actions (#374): the
-                    // server's titles ride along as hints.
-                    let hints = self
-                        .pending_code_actions
-                        .iter()
-                        .map(|a| a.title.clone())
-                        .collect();
-                    self.fix_problem_with_navigator(path, item, hints);
                 }
                 self.pending_code_actions.clear();
             }

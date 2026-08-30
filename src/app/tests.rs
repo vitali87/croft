@@ -35997,6 +35997,57 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
     assert_eq!(labels, vec!["Remove unused import", "Fix with Navigator"]);
     assert_eq!(picker.rows[1].id, "navigator");
 
+    // Confirming the navigator row must route to the navigator, never to
+    // the server's first action: the picker's shared numeric-id decode
+    // parses "navigator" to 0 (#374 review, the blocker).
+    if let Some(picker) = app.list_picker.as_mut() {
+        picker.select_next();
+        assert_eq!(picker.selected_row().unwrap().id, "navigator");
+    }
+    app.status.clear();
+    app.confirm_list_picker();
+    assert!(
+        app.status.to_lowercase().contains("not active"),
+        "the navigator row reached the navigator path: {}",
+        app.status
+    );
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "use std::io;\nfn main() {}",
+        "and no server action touched the buffer"
+    );
+
+    // The control: the server row still applies the server action.
+    app.open_code_action_picker(vec![crate::lsp::manager::CodeActionItem {
+        title: String::from("Remove unused import"),
+        server: String::from("rust-analyzer"),
+        edits: Vec::new(),
+        command: None,
+        needs_resolve: false,
+        resolve_action: None,
+        is_preferred: false,
+    }]);
+    app.status.clear();
+    app.confirm_list_picker();
+    assert!(
+        !app.status.to_lowercase().contains("not active"),
+        "row 0 is the server's, not the navigator's: {}",
+        app.status
+    );
+
+    // Deactivating the seat clears the marker (#374 review): with the
+    // navigator gone no TurnDone can arrive, so the unseat path is the
+    // only thing standing between the row and an eternal spinner.
+    app.problems.fixing = Some((file.clone(), 0));
+    app.problems_fix_started = Some(std::time::Instant::now());
+    app.last_pair_check = None;
+    app.maybe_seat_navigator();
+    assert!(
+        app.problems.fixing.is_none(),
+        "the deactivation teardown clears the fix marker"
+    );
+    assert_eq!(app.problems_fix_spinner_phase(), 0);
+
     // The palette carries the command; the menu entry has no chord.
     assert!(
         crate::widgets::command_palette::ALL_COMMANDS
