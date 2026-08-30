@@ -2973,6 +2973,16 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// A breakpoint croft set itself at the assertion the last run failed
+    /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
+    /// breakpoints: it is added to the launch set, rendered hollow-red like
+    /// any unverified one, and removed when the session ends — a debugger
+    /// that silently left breakpoints behind would be worse than one that
+    /// set none.
+    debug_temp_breakpoint: Option<(PathBuf, usize)>,
+    /// Human-readable note about that breakpoint, folded into whichever
+    /// launch message the user actually ends up seeing.
+    debug_temp_note: Option<String>,
     /// Per-agent ledger of files changed while an agent was working (#345),
     /// and the review baselines that decide which of them still need a
     /// look.
@@ -4469,6 +4479,8 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            debug_temp_breakpoint: None,
+            debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
             problems_fix_started: None,
             http_run: None,
@@ -18093,6 +18105,8 @@ impl App {
         self.active_test_root = root.clone();
         self.test_worker.set_root(root);
         self.testing.reset();
+        // The build this armed for is being dropped (#373).
+        self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
@@ -18205,6 +18219,13 @@ impl App {
             return;
         }
         let root = self.tree.root.clone();
+        // #373: if the last run of this test failed and named a place in
+        // the user's own code, break there — the whole point of "debug this
+        // test" is landing on the assertion without being asked to find it
+        // first. Set BEFORE the launch set is collected so it travels with
+        // the user's own breakpoints, and recorded so it can be taken back
+        // out when the session ends.
+        self.arm_failure_breakpoint(&name, &root);
         let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
             .editor
             .breakpoints
@@ -18235,9 +18256,9 @@ impl App {
                         self.dap_session = Some(session);
                         self.run_debug.feedback = Some(format!("Debugging test {name}"));
                         self.run_debug.feedback_is_error = false;
-                        self.status = format!(
+                        self.status = self.with_failure_note(format!(
                             "Debugging test {name} — F5 continue · F10 step over · Shift+F5 stop"
-                        );
+                        ));
                         self.reveal_debug_view();
                     }
                     Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
@@ -18254,10 +18275,14 @@ impl App {
                 self.start_test_binary_build(root, name, source);
             }
             Some(crate::testing::worker::Runner::Vitest | crate::testing::worker::Runner::Jest) => {
+                // No session will start, so the armed breakpoint has nothing
+                // to be cleaned up by (#373).
+                self.disarm_failure_breakpoint();
                 self.status =
                     String::from("Debugging JS tests is not wired yet — the play glyph runs them");
             }
             None => {
+                self.disarm_failure_breakpoint();
                 self.status = String::from("No test runner detected in this workspace");
             }
         }
@@ -18270,10 +18295,12 @@ impl App {
     /// it. The drain launches the debugger when the binary arrives.
     fn start_test_binary_build(&mut self, root: PathBuf, name: String, source: Option<PathBuf>) {
         if self.pending_test_debug.is_some() {
+            // The launch this armed for is not happening (#373).
+            self.disarm_failure_breakpoint();
             self.status = String::from("A test binary is already building");
             return;
         }
-        self.status = format!("Building test binary for {name}");
+        self.status = self.with_failure_note(format!("Building test binary for {name}"));
         let (tx, rx) = std::sync::mpsc::channel();
         {
             let name = name.clone();
@@ -18306,6 +18333,8 @@ impl App {
         // Re-rooting the Explorer mid-build would otherwise launch the old
         // workspace's binary with the new workspace's cwd and breakpoints.
         if build_root != self.tree.root {
+            // No launch, so nothing will clean up after it (#373).
+            self.disarm_failure_breakpoint();
             self.status = format!(
                 "Test binary for {name} finished, but the workspace changed — debug it again from its workspace"
             );
@@ -18323,6 +18352,10 @@ impl App {
     fn launch_lldb_test_debug(&mut self, binary: &Path, name: &str) {
         use std::collections::BTreeMap;
         if self.dap_session.is_some() {
+            // The build took minutes and the user started another session
+            // meanwhile: this launch is abandoned, so the breakpoint it
+            // armed has nothing to clean up after it (#373).
+            self.disarm_failure_breakpoint();
             self.status = String::from("A debug session is already running (Shift+F5 stops it)");
             return;
         }
@@ -18352,8 +18385,9 @@ impl App {
                 self.dap_session = Some(session);
                 self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
-                self.status =
-                    format!("Debugging test {name} via lldb-dap — F5 continue · Shift+F5 stop");
+                self.status = self.with_failure_note(format!(
+                    "Debugging test {name} via lldb-dap — F5 continue · Shift+F5 stop"
+                ));
                 self.reveal_debug_view();
             }
             Err(e) => self.debug_error(format!("Failed to start lldb-dap: {e}")),
@@ -18607,6 +18641,11 @@ impl App {
             Some(SessionPhase::Terminated) => {
                 self.editor.stop_line = None;
                 self.editor.unverified_breakpoints.clear();
+                // A session that ends on its own must take croft's own
+                // breakpoint with it, exactly as Shift+F5 does (#373):
+                // this is the path a passing test takes, so it is the
+                // common one, not the exceptional one.
+                self.disarm_failure_breakpoint();
                 self.reset_watch_runtime();
                 self.clear_inline_values();
                 // Reply to the adapter's own `terminated`/`exited` with the
@@ -18976,6 +19015,10 @@ impl App {
     /// silently whenever the user is looking at any other sidebar — which read
     /// as "F5 does nothing" on a remote with no debug adapter installed.
     fn debug_error(&mut self, msg: String) {
+        // A launch that never happened leaves no session to clean up after,
+        // so any breakpoint croft armed for it comes out here (#373) —
+        // otherwise it survives in the editor as if the user had set it.
+        self.disarm_failure_breakpoint();
         self.run_debug.feedback = Some(msg.clone());
         self.run_debug.feedback_is_error = true;
         self.status = msg;
@@ -19173,6 +19216,99 @@ impl App {
             return;
         }
         self.launch_resolved_config(rc);
+    }
+
+    /// Where the last run of `name` failed, if the runner named a place in
+    /// the user's own code (#373). Read back from the Test Runner output
+    /// channel, which already holds every line the run printed.
+    ///
+    /// Scoped to the failing test's own block: a run of the whole suite
+    /// prints many failures, and breaking on another test's assertion would
+    /// stop the debugger somewhere the user did not ask about. The block
+    /// starts at the runner's "failures:"-style banner for this test and
+    /// ends at the next test's banner.
+    fn failure_site_of(&self, name: &str) -> Option<crate::testing::failure_site::FailureSite> {
+        use crate::testing::failure_site::is_failure_banner;
+        let lines = crate::output::snapshot(crate::output::CHANNEL_TESTS)?;
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        // Walk backwards to the most recent BANNER for this test, so a
+        // re-run's output wins over an earlier one in the same channel.
+        // Anchoring on the banner rather than on any mention is what makes
+        // this work against real output: libtest reprints every failing
+        // name in its trailing `failures:` summary, so "the last line
+        // mentioning the name" lands after every block and finds nothing.
+        let start = texts.iter().rposition(|t| is_failure_banner(t, name))?;
+        // The block runs to the next test's banner, or to the end.
+        let end = texts[start + 1..]
+            .iter()
+            .position(|t| {
+                (t.trim_start().starts_with("---- ")
+                    || t.trim_start().starts_with('_')
+                    || t.trim_start().starts_with('\u{25cf}'))
+                    && !is_failure_banner(t, name)
+            })
+            .map(|i| start + 1 + i)
+            .unwrap_or(texts.len());
+        crate::testing::failure_site::failure_site(&texts[start..end].join("\n"))
+    }
+
+    /// Set a TEMPORARY breakpoint at the assertion the last run of `name`
+    /// failed on (#373), unless the user already has one there.
+    ///
+    /// Recorded in `debug_temp_breakpoint` so [`Self::disarm_failure_breakpoint`]
+    /// can take exactly this one back out: a breakpoint croft set and then
+    /// left behind would be indistinguishable from one the user set, and
+    /// would keep stopping them on a line they never chose.
+    fn arm_failure_breakpoint(&mut self, name: &str, root: &Path) {
+        self.disarm_failure_breakpoint();
+        let Some((file, line)) = self
+            .failure_site_of(name)
+            .and_then(|site| site.resolve(root))
+        else {
+            return;
+        };
+        let line = line as usize;
+        let lines = self.editor.breakpoints.entry(file.clone()).or_default();
+        // The user's own breakpoint there is left alone: it is theirs, it
+        // outlives the session, and removing it on stop would delete work.
+        if !lines.insert(line) {
+            return;
+        }
+        self.debug_temp_breakpoint = Some((file.clone(), line));
+        // Recorded for the caller to append to whatever message it shows:
+        // setting `status` here would be overwritten moments later by the
+        // launch's own ("Building test binary…"), so the user would never
+        // learn a breakpoint had been set for them.
+        self.debug_temp_note = Some(format!(
+            "breaking at {}:{line} where it last failed",
+            file.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+    }
+
+    /// Append the armed-breakpoint note to `msg`, if one was armed (#373).
+    fn with_failure_note(&self, msg: String) -> String {
+        match &self.debug_temp_note {
+            Some(note) => format!("{msg} — {note}"),
+            None => msg,
+        }
+    }
+
+    /// Remove the breakpoint [`Self::arm_failure_breakpoint`] set, if it is
+    /// still ours. The user may have removed it themselves mid-session, in
+    /// which case there is nothing to take back.
+    fn disarm_failure_breakpoint(&mut self) {
+        self.debug_temp_note = None;
+        let Some((file, line)) = self.debug_temp_breakpoint.take() else {
+            return;
+        };
+        if let Some(lines) = self.editor.breakpoints.get_mut(&file) {
+            lines.remove(&line);
+            if lines.is_empty() {
+                self.editor.breakpoints.remove(&file);
+            }
+        }
     }
 
     /// The editor's breakpoints in launch shape, shared by every session
@@ -19826,6 +19962,9 @@ impl App {
         ));
         self.editor.stop_line = None;
         self.editor.unverified_breakpoints.clear();
+        // The breakpoint croft set at the failing assertion goes with the
+        // session that asked for it (#373).
+        self.disarm_failure_breakpoint();
         self.clear_inline_values();
         self.status = String::from("Debug session stopped");
         // Clear the paused-state feedback ("Paused (breakpoint)") so the
@@ -37058,6 +37197,7 @@ impl App {
         // Drop any in-flight `cargo test --no-run`: the drain would refuse
         // its root-mismatched binary anyway, but the occupied slot kept
         // refusing NEW debug builds until the stale compile finished.
+        self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();

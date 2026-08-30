@@ -8,6 +8,7 @@
 //! tick. Test-tool output is parsed into [`model::TestCase`]s; the suite tree
 //! and the failing-count badge are derived in the UI layer.
 
+pub mod failure_site;
 pub mod locate;
 pub mod model;
 pub mod parse;
