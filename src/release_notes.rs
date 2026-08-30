@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Fix,
-    summary: "Opening a large colour log is about three times faster: the line index now scans for newlines with vector instructions instead of comparing one byte at a time, which is the whole cost of opening a file the view otherwise never reads.",
+    summary: "The test suite's load budgets now see a thread count given as `--test-threads`, not only as an environment variable, so a run that spells it with the flag stops timing out waits it had twice the room for.",
 }];
