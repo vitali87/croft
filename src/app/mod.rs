@@ -2953,6 +2953,10 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// The in-flight `.http` request's channel (#370). One at a time: the
+    /// worker owns the socket, the drain owns the tab, and a second send
+    /// while one runs is refused rather than queued.
+    http_run: Option<std::sync::mpsc::Receiver<HttpRunOutcome>>,
     /// The presentation edits behind the open Change Color Presentation
     /// picker (#254), indexed by row id; cleared after a pick.
     pending_color_presentations: Vec<(String, Vec<crate::widgets::editor::TextSpanEdit>)>,
@@ -4433,6 +4437,7 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            http_run: None,
             pending_color_presentations: Vec::new(),
             pending_color_context: None,
             color_presentations_request: None,
@@ -24079,6 +24084,22 @@ impl App {
             self.open_editor_replace();
             return;
         }
+        // `.http`/`.rest` (#370): Cmd/Ctrl+Enter sends the request under
+        // the caret, REST Client's own chord. Claimed only in request
+        // files, so Enter keeps its meaning everywhere else.
+        if matches!(key.code, KeyCode::Enter)
+            && key
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL)
+            && self
+                .editor
+                .path
+                .as_deref()
+                .is_some_and(crate::http_file::is_http_file)
+        {
+            self.send_http_request_under_caret();
+            return;
+        }
         // Markdown: Toggle Preview (Cmd/Ctrl+Shift+V, the VS Code default).
         if is_markdown_preview_key(key) {
             self.toggle_markdown_preview();
@@ -25588,6 +25609,193 @@ impl App {
 
     /// Ctrl+Shift+H: open the durable command-history search over the
     /// active pane's context (atuin's enhanced Ctrl+R, embedded).
+    /// `.http`/`.rest` (#370): send the request under the caret. The env
+    /// file's values are substituted before the send; a hole with no value
+    /// refuses to send rather than leaking `{{name}}` to a server. The send
+    /// runs on a worker thread and [`Self::drain_http_responses`] opens the
+    /// response tab when it lands.
+    pub(crate) fn send_http_request_under_caret(&mut self) {
+        let Some((req, resolved, path)) = self.http_request_under_caret() else {
+            return;
+        };
+        if self.http_run.is_some() {
+            self.status = String::from("An HTTP request is already in flight");
+            return;
+        }
+        // History records the RAW line: what the user wrote, secrets still
+        // folded inside their {{names}}.
+        let raw_line = format!("{} {}", req.method, req.url);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let file = path.clone();
+        let line = raw_line.clone();
+        let spawned = std::thread::Builder::new()
+            .name(String::from("croft-http"))
+            .spawn(move || {
+                let result = crate::http_file::send(&resolved, crate::http_file::REQUEST_TIMEOUT);
+                let _ = tx.send(HttpRunOutcome {
+                    file,
+                    raw_line: line,
+                    result,
+                });
+            });
+        if spawned.is_err() {
+            self.status = String::from("HTTP: could not start the request worker");
+            return;
+        }
+        self.http_run = Some(rx);
+        self.status = format!("Sending {raw_line}");
+    }
+
+    /// `.http` (#370): put the request under the caret on the clipboard as
+    /// a curl command, variables substituted — the clipboard is the user's
+    /// own hand, unlike history and the response tab.
+    pub(crate) fn copy_http_request_as_curl(&mut self) {
+        let Some((_, resolved, _)) = self.http_request_under_caret() else {
+            return;
+        };
+        copy_to_clipboard(&crate::http_file::to_curl(&resolved));
+        self.status = String::from("curl command copied");
+    }
+
+    /// The parsed and variable-resolved request under the caret, or a
+    /// status naming why there is none (wrong file, no block, or a
+    /// `{{name}}` with no value in `.http.env.json` / the environment).
+    fn http_request_under_caret(
+        &mut self,
+    ) -> Option<(
+        crate::http_file::HttpRequest,
+        crate::http_file::ResolvedRequest,
+        PathBuf,
+    )> {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file open");
+            return None;
+        };
+        if !crate::http_file::is_http_file(&path) {
+            self.status = String::from("Not a .http/.rest file");
+            return None;
+        }
+        let text = self.editor.lines.join("\n");
+        let requests = crate::http_file::parse_requests(&text);
+        let Some(req) = crate::http_file::request_at(&requests, self.editor.cursor_row).cloned()
+        else {
+            self.status = String::from("No request under the caret");
+            return None;
+        };
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let vars = crate::http_file::load_env(&dir);
+        let (resolved, missing) = crate::http_file::resolve(&req, &vars);
+        if !missing.is_empty() {
+            let holes: Vec<String> = missing.iter().map(|m| format!("{{{{{m}}}}}")).collect();
+            self.status = format!(
+                "HTTP: no value for {} (add it to {} beside the file, or $env)",
+                holes.join(", "),
+                crate::http_file::ENV_FILE
+            );
+            return None;
+        }
+        Some((req, resolved, path))
+    }
+
+    /// Fold in a finished `.http` request (#370): record it in the durable
+    /// command history (raw line, status as the exit, elapsed as the
+    /// duration), materialise the response under the cache, and open it —
+    /// a text document with status/headers as comments, or the image
+    /// itself. Returns whether a repaint is due.
+    pub fn drain_http_responses(&mut self) -> bool {
+        let Some(rx) = self.http_run.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(o) => o,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.http_run = None;
+                self.status = String::from("HTTP: the request worker died");
+                return true;
+            }
+        };
+        self.http_run = None;
+        let cwd = outcome
+            .file
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        match outcome.result {
+            Err(e) => {
+                self.command_history
+                    .append(crate::command_history::HistoryEntry {
+                        cmd: format!("http {}", outcome.raw_line),
+                        cwd,
+                        host: String::new(),
+                        exit: None,
+                        dur_ms: 0,
+                        ts,
+                    });
+                self.status = format!("HTTP: {} failed: {e}", outcome.raw_line);
+            }
+            Ok(resp) => {
+                self.command_history
+                    .append(crate::command_history::HistoryEntry {
+                        cmd: format!("http {}", outcome.raw_line),
+                        cwd,
+                        host: String::new(),
+                        exit: Some(i32::from(resp.status)),
+                        dur_ms: resp.elapsed_ms,
+                        ts,
+                    });
+                let dir = croft_cache_dir().join("http");
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    self.status = format!("HTTP: cannot write the response: {e}");
+                    return true;
+                }
+                let slug: String = outcome
+                    .raw_line
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                    .collect::<String>()
+                    .trim_matches('-')
+                    .chars()
+                    .take(48)
+                    .collect();
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let (file, bytes): (PathBuf, Vec<u8>) =
+                    match crate::http_file::response_kind(&resp.content_type()) {
+                        crate::http_file::ResponseKind::Image(ext) => {
+                            (dir.join(format!("{slug}-{stamp}.{ext}")), resp.body.clone())
+                        }
+                        crate::http_file::ResponseKind::Text(_) => {
+                            let (ext, doc) =
+                                crate::http_file::response_doc(&outcome.raw_line, &resp);
+                            (dir.join(format!("{slug}-{stamp}.{ext}")), doc.into_bytes())
+                        }
+                    };
+                if let Err(e) = std::fs::write(&file, &bytes) {
+                    self.status = format!("HTTP: cannot write the response: {e}");
+                    return true;
+                }
+                match self.editor.open_pinned(&file) {
+                    Ok(()) => {
+                        self.focus_pane(Pane::Editor);
+                        self.status = format!(
+                            "{} \u{2192} {} {} \u{00b7} {} ms",
+                            outcome.raw_line, resp.status, resp.status_text, resp.elapsed_ms
+                        );
+                    }
+                    Err(e) => self.status = format!("HTTP: response open failed: {e}"),
+                }
+            }
+        }
+        true
+    }
+
     fn open_command_history(&mut self) {
         let mut pop = crate::widgets::history_popup::HistoryPopup::new();
         pop.cwd = self
@@ -29795,6 +30003,8 @@ impl App {
             Cmd::SessionParticipants => self.open_participants_picker(),
             Cmd::CollabCancelStream => self.collab_cancel_stream(),
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
+            Cmd::SendHttpRequest => self.send_http_request_under_caret(),
+            Cmd::CopyHttpRequestAsCurl => self.copy_http_request_as_curl(),
             Cmd::AskNavigator => {
                 let (range, selection) = match self.editor.selection_rows() {
                     Some(rows) => (rows, self.editor.selection_text()),
@@ -41698,6 +41908,15 @@ fn load_trigger_set(redact_secrets: bool) -> std::sync::Arc<crate::triggers::Tri
     })
 }
 
+/// What the `.http` worker hands back (#370): the file it ran from, the
+/// RAW request line (variables unresolved, so a secret can never land in a
+/// status line, history entry, or response tab through it), and the result.
+struct HttpRunOutcome {
+    file: PathBuf,
+    raw_line: String,
+    result: Result<crate::http_file::HttpResponse, String>,
+}
+
 fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
@@ -42857,6 +43076,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
+        let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
         app.sync_git_gutters();
@@ -42974,6 +43194,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || connect_changed
             || install_changed
             || update_changed
+            || http_changed
             || reveal_changed
             || lsp_changed
             || sig_help_changed

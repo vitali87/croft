@@ -185,6 +185,11 @@ pub enum Command {
     /// the instruction box; the navigator may edit on the resulting turn).
     AskNavigator,
     AskNavigatorAboutCapture,
+    /// Send the `.http` request under the caret; the response opens as a
+    /// tab (#370).
+    SendHttpRequest,
+    /// Copy the `.http` request under the caret as a curl command (#370).
+    CopyHttpRequestAsCurl,
     /// Hand the navigator the floor on the active file: a comment-only
     /// review turn, its say anchored as comment boxes.
     YieldToNavigator,
@@ -358,6 +363,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::CollabCancelStream,
     Command::AskNavigator,
     Command::AskNavigatorAboutCapture,
+    Command::SendHttpRequest,
+    Command::CopyHttpRequestAsCurl,
     Command::YieldToNavigator,
     Command::ToggleNavigator,
     Command::ClearNavigatorNotes,
@@ -525,6 +532,8 @@ impl Command {
             Command::CollabCancelStream => "Collab: Cancel AI Stream",
             Command::AskNavigator => "Navigator: Ask About Line or Selection",
             Command::AskNavigatorAboutCapture => "Captures: Ask Navigator About This Line",
+            Command::SendHttpRequest => "HTTP: Send Request Under Caret",
+            Command::CopyHttpRequestAsCurl => "HTTP: Copy Request as curl",
             Command::YieldToNavigator => "Navigator: Yield the Turn",
             Command::ToggleNavigator => "Navigator: Activate or Deactivate",
             Command::ClearNavigatorNotes => "Navigator: Clear Comments",
@@ -694,6 +703,8 @@ impl Command {
             Command::CollabCancelStream => "Cmd+K X",
             Command::AskNavigator => "Cmd+K Q",
             Command::AskNavigatorAboutCapture => "",
+            Command::SendHttpRequest => "Cmd+Enter",
+            Command::CopyHttpRequestAsCurl => "",
             Command::YieldToNavigator => "Cmd+K Y",
             Command::ToggleNavigator => "",
             Command::ClearNavigatorNotes => "",
@@ -860,6 +871,8 @@ impl Command {
             Command::CollabCancelStream => "collab_cancel_stream",
             Command::AskNavigator => "navigator_ask",
             Command::AskNavigatorAboutCapture => "captures_ask_navigator",
+            Command::SendHttpRequest => "http_send_request",
+            Command::CopyHttpRequestAsCurl => "http_copy_curl",
             Command::YieldToNavigator => "navigator_yield",
             Command::ToggleNavigator => "navigator_toggle",
             Command::ClearNavigatorNotes => "navigator_clear_notes",

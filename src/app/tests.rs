@@ -35992,3 +35992,144 @@ fn a_large_log_opens_before_its_index_is_complete_and_the_loop_finishes_it() {
         "a finished index asks for no more repaints"
     );
 }
+
+/// #370: a `.http` file runs the request under the caret. The variables
+/// substitute from `.http.env.json` on the WIRE only: the status line,
+/// history entry, and response tab all carry the raw `{{name}}` form, so
+/// the token never leaves the env file. A JSON response opens pretty-printed
+/// as `.jsonc`; a PNG response opens through the image path.
+#[test]
+fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
+    use std::io::{Read as _, Write as _};
+    let tmp = tempfile::tempdir().unwrap();
+    *CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() =
+        Some(std::env::temp_dir().join(format!("croft-http-test-cache-{}", std::process::id())));
+
+    // A 1x1 PNG via the image crate, so the decode on open genuinely works.
+    let png_bytes = {
+        let img: image::RgbaImage = image::ImageBuffer::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    };
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen2 = seen.clone();
+    let png_served = png_bytes.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let mut buf = vec![0u8; 8192];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let (body, ct): (Vec<u8>, &str) = if req.starts_with("GET /users") {
+                (
+                    b"{\"users\":[{\"id\":1,\"name\":\"ada\"}]}".to_vec(),
+                    "application/json",
+                )
+            } else {
+                (png_served.clone(), "image/png")
+            };
+            seen2.lock().unwrap().push(req);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(&body);
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    });
+
+    let http = tmp.path().join("api.http");
+    std::fs::write(
+        &http,
+        "GET {{host}}/users\nAuthorization: Bearer {{token}}\n\n###\nGET {{host}}/logo.png\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(crate::http_file::ENV_FILE),
+        format!("{{\"host\": \"http://127.0.0.1:{port}\", \"token\": \"super-secret-token\"}}"),
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 1;
+    app.send_http_request_under_caret();
+    assert!(
+        app.status.starts_with("Sending GET {{host}}/users"),
+        "the status carries the RAW line: {}",
+        app.status
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the HTTP response",
+        || {
+            app.drain_http_responses();
+            app.http_run.is_none()
+        },
+    );
+    let opened = app.editor.path.clone().expect("a response tab opened");
+    assert_eq!(opened.extension().and_then(|e| e.to_str()), Some("jsonc"));
+    let doc = app.editor.lines.join("\n");
+    assert!(
+        doc.contains("// GET {{host}}/users \u{2192} HTTP/1.1 200 OK"),
+        "{doc}"
+    );
+    assert!(doc.contains("\"users\": ["), "pretty-printed: {doc}");
+    assert!(
+        !doc.contains("super-secret-token"),
+        "the token never reaches the tab"
+    );
+    assert!(
+        seen.lock().unwrap()[0].contains("Bearer super-secret-token"),
+        "but the wire DID carry the substituted value"
+    );
+    let hits = app.command_history.search(
+        "http GET",
+        crate::command_history::HistoryScope::All,
+        "",
+        "",
+    );
+    assert_eq!(
+        hits[0].cmd, "http GET {{host}}/users",
+        "history keeps the raw line"
+    );
+    assert_eq!(hits[0].exit, Some(200));
+    assert!(!hits[0].cmd.contains("super-secret-token"));
+
+    // The PNG block renders through the image path.
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 4;
+    app.send_http_request_under_caret();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the PNG response",
+        || {
+            app.drain_http_responses();
+            app.http_run.is_none()
+        },
+    );
+    assert!(
+        app.editor.image.is_some(),
+        "a PNG response opens as an image, not bytes in a text tab: {:?}",
+        app.editor.path
+    );
+
+    // A hole with no value refuses to send rather than leaking the hole.
+    app.editor.open_pinned(&http).unwrap();
+    std::fs::remove_file(tmp.path().join(crate::http_file::ENV_FILE)).unwrap();
+    app.editor.cursor_row = 0;
+    app.send_http_request_under_caret();
+    assert!(
+        app.status.contains("no value for {{host}}, {{token}}"),
+        "{}",
+        app.status
+    );
+    assert!(app.http_run.is_none(), "nothing was sent");
+}
