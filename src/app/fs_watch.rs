@@ -46,6 +46,17 @@ pub struct FsDrain {
     pub touched_open_file: bool,
     pub dirs_changed: bool,
     pub finder_relevant: bool,
+    /// Workspace FILES whose content an event mutated, for the agent lane
+    /// ledger (#345). Directories and pure metadata events are excluded:
+    /// the ledger asks "what content changed", and a chmod is not a change
+    /// a reviewer needs to see.
+    pub changed_files: BTreeSet<PathBuf>,
+    /// The watcher reported a RESCAN: it overflowed its queue and events
+    /// were dropped, so `changed_files` is a lower bound rather than the
+    /// whole story (#345). A ledger that quietly showed a short list would
+    /// be telling the reviewer they had seen everything, which is the one
+    /// thing it must never do.
+    pub rescan_dropped_events: bool,
 }
 
 pub struct FsWatch {
@@ -176,10 +187,24 @@ impl FsWatch {
                 Err(_) => continue,
             };
             for ev in events {
+                if ev.event.need_rescan() {
+                    out.rescan_dropped_events = true;
+                }
                 let mutates_content = event_mutates_content(&ev.event.kind);
                 for path in &ev.event.paths {
                     if mutates_content && editor.matches_open_path(path) {
                         out.touched_open_file = true;
+                    }
+                    // The ledger wants files, not the directories whose
+                    // mtime moved because a file inside them changed. A
+                    // REMOVED directory needs the event kind to tell it
+                    // apart: `is_dir()` is already false once it is gone.
+                    if mutates_content
+                        && !removes_a_directory(&ev.event.kind)
+                        && !is_path_under_noise_dir(path)
+                        && !path.is_dir()
+                    {
+                        out.changed_files.insert(path.clone());
                     }
                     if let Some(dir) = affected_dir_for_event(path, &self.watch_root) {
                         affected.insert(dir);
@@ -569,6 +594,25 @@ impl Drop for FsWatch {
 // UI never joins; `T: Send + 'static` lets the watcher move across the boundary.
 pub(super) fn offload_drop<T: Send + 'static>(value: T) {
     std::thread::spawn(move || drop(value));
+}
+
+/// Whether the event is the removal of a path known to have been a
+/// DIRECTORY. Once it is gone `is_dir()` is false, so only the kind can
+/// say — and only FSEvents and inotify say it precisely, with
+/// `RemoveKind::Folder`; kqueue, the Windows watcher and the poll fallback
+/// emit `RemoveKind::Any` for everything they remove.
+///
+/// `Any` is deliberately NOT excluded. Letting it through costs nothing —
+/// a removed directory reaching the ledger resolves to `Baseline::Gone`
+/// and `forget_path`, which is a no-op for a path no lane holds — while
+/// excluding it would strand a removed FILE in the queue on those three
+/// backends, since a deleted file generates no later write to clear it.
+/// Both cases end correct this way; excluding `Any` would trade a wrong
+/// row for a wrong row.
+fn removes_a_directory(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    use notify::event::RemoveKind;
+    matches!(kind, EventKind::Remove(RemoveKind::Folder))
 }
 
 fn event_mutates_content(kind: &notify::EventKind) -> bool {
