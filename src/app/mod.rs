@@ -11720,18 +11720,6 @@ impl App {
                 }
                 row_y = row_y.saturating_add(lines.len().max(1) as u16);
             }
-
-            // The ambient wave (#312), painted LAST and only into cells the
-            // notes left blank, so the card's text always wins and a release
-            // with a lot to say simply pushes the field out of view.
-            let wave_area = Rect {
-                x: inner_x,
-                y: inner_y,
-                width: inner_w_actual,
-                height: box_rect.height.saturating_sub(2),
-            };
-            let theme = self.theme;
-            crate::gradient::paint_card_wave(frame.buffer_mut(), wave_area, |c| theme.ui(c));
         }
     }
 
