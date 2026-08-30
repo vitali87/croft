@@ -987,16 +987,27 @@ pub fn render_markdown_full(
         .max()
         .unwrap_or(0);
     let mut removed_front = 0usize;
+    // Runnables are anchored to a row exactly as images are, so the guard
+    // and the shift below have to cover both. They did not: a runnable's
+    // `first_line` survived the trim unshifted, so an empty leading block
+    // quote moved the fence up a row while the glyph's recorded row stayed
+    // put, and a preview click landed on the wrong line.
     while r.out.first().is_some_and(|l| l.spans.is_empty())
         && r.images
             .first()
             .is_none_or(|i| removed_front < i.first_line)
+        && r.runnables
+            .first()
+            .is_none_or(|b| removed_front < b.first_line)
     {
         r.out.remove(0);
         removed_front += 1;
     }
     for img in &mut r.images {
         img.first_line -= removed_front;
+    }
+    for run in &mut r.runnables {
+        run.first_line -= removed_front;
     }
     while r.out.len() > reserved_end.saturating_sub(removed_front)
         && r.out.last().is_some_and(|l| l.spans.is_empty())
@@ -1288,6 +1299,30 @@ mod tests {
         let blank = "```sh\n   \n```\n";
         let (_, _, runs) = render_markdown_full(blank, Theme::default(), &mut reg, None);
         assert!(runs.is_empty());
+    }
+
+    /// A runnable's recorded row must survive the leading-blank trim.
+    ///
+    /// `first_line` is taken while the document is being built, and the
+    /// renderer then removes empty rows off the front. Images were shifted
+    /// to match and runnables were not, so a document that opens with an
+    /// empty block quote moved the fence up a row while the glyph's
+    /// recorded row stayed put, and a preview click landed one line off.
+    #[test]
+    fn a_runnables_row_survives_the_leading_blank_trim() {
+        // `>` alone renders as an empty row, which the front trim removes.
+        let md = ">\n\n```sh\necho one\n```\n";
+        let mut reg = crate::highlight::LangRegistry::new();
+        let (lines, _, runs) = render_markdown_full(md, Theme::default(), &mut reg, None);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let row = &lines[runs[0].first_line];
+        assert_eq!(
+            row.spans[0].content.as_ref(),
+            RUN_GLYPH,
+            "the recorded row must be the row the glyph is painted on: {row:?}"
+        );
+        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("echo one"), "{text:?}");
     }
 
     /// The matcher's positives include the canonical install-script and

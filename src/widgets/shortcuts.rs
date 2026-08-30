@@ -338,7 +338,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+Enter",
-                description: "Markdown: run the shell fence under the caret in a named pane (confirms first)",
+                description: "Markdown: run the runnable fence under the caret in a named pane, new or reused (confirms first)",
                 handler: "is_run_fence_key",
             },
             ShortcutEntry {

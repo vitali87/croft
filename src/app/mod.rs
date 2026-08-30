@@ -26351,8 +26351,13 @@ impl App {
                 // this repo's block into the other repo's shell, which is
                 // the outcome the comment above forbids. The copy in
                 // `run_project_task` predates this and is left alone.
-                && t.kernel_shell_cwd()
-                    .is_some_and(|cwd| cwd.starts_with(&root))
+                // EXACTLY the block's directory, not merely under it.
+                // `starts_with` accepted any descendant, so a pane whose
+                // shell had cd'd into a subdirectory was reused and the
+                // block ran there while the confirm popup showed
+                // `block.cwd`. A pane is only this block's pane if its
+                // shell is standing where the block says it will run.
+                && t.kernel_shell_cwd().is_some_and(|cwd| cwd == root)
         }) {
             self.active_terminal = idx;
             self.terminals[idx].write_input(bytes.as_bytes());
