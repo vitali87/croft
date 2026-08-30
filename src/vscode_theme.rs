@@ -24,7 +24,7 @@
 //! derivation is reported in [`Converted::notes`] so the user can see which
 //! colours were chosen for them rather than by their theme's author.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -1398,9 +1398,11 @@ mod tests {
         let first = install_into(dir.path(), &converted).expect("first install");
         assert!(first.path.is_file());
         assert!(!first.replaced, "nothing was there the first time");
-        assert!(std::fs::read_to_string(&first.path)
-            .unwrap()
-            .starts_with(GENERATED_HEADER));
+        assert!(
+            std::fs::read_to_string(&first.path)
+                .unwrap()
+                .starts_with(GENERATED_HEADER)
+        );
 
         let second = install_into(dir.path(), &converted).expect("re-install");
         assert_eq!(
