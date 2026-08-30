@@ -2999,6 +2999,10 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// Per-agent ledger of files changed while an agent was working (#345),
+    /// and the review baselines that decide which of them still need a
+    /// look.
+    pub agent_ledger: crate::agent_lane::AgentLedger,
     /// When the running Fix with Navigator turn started (#374): the clock
     /// its PROBLEMS-row spinner runs on, and the flag that keeps the main
     /// loop repainting while it runs. `None` when no fix is streaming.
@@ -4500,6 +4504,7 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            agent_ledger: crate::agent_lane::AgentLedger::new(),
             problems_fix_started: None,
             http_run: None,
             pending_color_presentations: Vec::new(),
@@ -11293,6 +11298,11 @@ impl App {
             drain.touched_open_file |= d.touched_open_file;
             drain.dirs_changed |= d.dirs_changed;
             drain.finder_relevant |= d.finder_relevant;
+            // A secondary root's writes are an agent's writes too: dropping
+            // them here would silently give a multi-root workspace an empty
+            // review queue for every folder but the first (#345).
+            drain.changed_files.extend(d.changed_files);
+            drain.rescan_dropped_events |= d.rescan_dropped_events;
         }
         if drain.dirs_changed {
             self.refresh_git_status_debounced();
@@ -11307,6 +11317,27 @@ impl App {
         // no-op and won't clobber selection or reload spuriously.
         if drain.got_any {
             self.reload_open_file_after_external_change();
+        }
+        // Attribute the writes to whichever agents were working when they
+        // landed (#345). Done after the reload so an agent's write to the
+        // ACTIVE tab is hashed from the content the user is about to see.
+        if !drain.changed_files.is_empty() {
+            self.attribute_writes_to_working_agents(&drain.changed_files);
+        }
+        // A rescan means the watcher dropped events, so the queue is a
+        // LOWER BOUND from here until it is emptied (#345). Recorded in the
+        // ledger rather than only announced: a status line the next
+        // keystroke clears would leave a partial queue looking complete.
+        // Unconditional on whether an agent is working right now — the
+        // dropped writes may have landed a moment ago, while the pane's
+        // sampled status has since flipped to idle.
+        if drain.rescan_dropped_events {
+            self.agent_ledger.note_dropped_events();
+            if !self.working_agents().is_empty() {
+                self.status = String::from(
+                    "File watcher overflowed: some agent changes may be missing from the review queue",
+                );
+            }
         }
         let polled = self.poll_filesystem_changes();
         drain.got_any || init_changed || polled
@@ -15068,16 +15099,47 @@ impl App {
         // `2 agents · 1 waiting` (#344), only while an agent is seated; a
         // click focuses the waiting pane.
         let (seated, waiting) = self.agent_counts();
-        if seated > 0 {
-            seg_texts.push(format!(
-                " \u{25c6} {seated} agent{}{} ",
-                if seated == 1 { "" } else { "s" },
-                if waiting > 0 {
-                    format!(" \u{b7} {waiting} waiting")
-                } else {
-                    String::new()
-                }
-            ));
+        // The review queue rides the same chip (#345): a file an agent
+        // changed while you were looking elsewhere is the thing you most
+        // need to be told about, and it outlives the agent's own pane.
+        let unreviewed = self.agent_ledger.unreviewed_files();
+        if seated > 0 || unreviewed > 0 {
+            // With nothing seated the agent half would read "0 agents",
+            // which is not what the chip is reporting any more: the queue
+            // outlives the pane, so the chip becomes the queue's.
+            let agents_part = if seated > 0 {
+                format!(
+                    "{seated} agent{}{}",
+                    if seated == 1 { "" } else { "s" },
+                    if waiting > 0 {
+                        format!(" \u{b7} {waiting} waiting")
+                    } else {
+                        String::new()
+                    }
+                )
+            } else {
+                String::new()
+            };
+            let review_part = if unreviewed > 0 {
+                // A "+" when the watcher dropped events: the count is a
+                // floor, and a bare number would read as a total.
+                format!(
+                    "{unreviewed}{} to review",
+                    if self.agent_ledger.may_be_incomplete() {
+                        "+"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                String::new()
+            };
+            let joined = match (agents_part.is_empty(), review_part.is_empty()) {
+                (false, false) => format!("{agents_part} \u{b7} {review_part}"),
+                (false, true) => agents_part,
+                _ => review_part,
+            };
+            seg_texts.push(format!(" \u{25c6} {joined} "));
         }
         let widths: Vec<u16> = seg_texts.iter().map(|s| s.chars().count() as u16).collect();
         let right_total: u16 = widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1);
@@ -28096,6 +28158,22 @@ impl App {
     fn drain_agent_events(&mut self) -> bool {
         let mut said = false;
         while let Some(ev) = self.agent_events.pop_front() {
+            // A gone agent with nothing left to review takes its lane with
+            // it; one with a queue keeps it, since the files it changed
+            // still need looking at (#345). The event is per PANE while the
+            // lane is per NAME, so a second pane still running the same
+            // agent — or an agent swap in one pane, which fires Gone then
+            // Seated — must not take the shared lane down with it.
+            if let crate::agents::AgentEvent::Gone { agent, .. } = &ev
+                && self.agent_ledger.unreviewed_count(agent) == 0
+                && !self
+                    .terminals
+                    .iter()
+                    .any(|t| t.agent().is_some_and(|a| a.name == *agent))
+            {
+                let agent = agent.clone();
+                self.agent_ledger.forget(&agent);
+            }
             if let crate::agents::AgentEvent::Waiting { pane, agent } = ev {
                 self.status = format!("{agent} in {pane} is waiting for your input");
                 said = true;
@@ -28122,6 +28200,106 @@ impl App {
         (seated, waiting)
     }
 
+    /// The agents whose panes are producing output right now (#345). A
+    /// merely SEATED agent does not count: a quiet agent's pane is no
+    /// reason to blame it for the user's own save.
+    fn working_agents(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .terminals
+            .iter()
+            .filter_map(|t| t.agent())
+            .filter(|lane| lane.status == crate::agents::AgentStatus::Working)
+            .map(|lane| lane.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Record each changed file against every working agent, hashing its
+    /// current content. A file that cannot be read right now is skipped
+    /// rather than recorded at a stale hash.
+    ///
+    /// A DELETION is processed whether or not an agent is working: a file
+    /// can be removed after its agent goes idle, and the row would
+    /// otherwise sit in the queue forever pointing at a file that is not
+    /// there (its lane staying visible with it). Only attribution — adding
+    /// or updating a row — needs a working agent to attribute to.
+    fn attribute_writes_to_working_agents(
+        &mut self,
+        changed: &std::collections::BTreeSet<PathBuf>,
+    ) -> bool {
+        let working = self.working_agents();
+        let mut any = false;
+        for path in changed {
+            // Only workspace files: an agent editing its own config under
+            // $HOME is not part of this workspace's review queue. ANY root
+            // counts, not just the primary — a secondary folder's files are
+            // as much this session's work as the first folder's (#345).
+            if self.roots.owning_root(path).is_none() {
+                continue;
+            }
+            match crate::agent_lane::read_baseline(path) {
+                // Attribution needs someone to attribute to; a quiet
+                // agent's pane is no reason to blame it for the user's
+                // own save.
+                crate::agent_lane::Baseline::Hash(hash) if !working.is_empty() => {
+                    any |= self.agent_ledger.record_write(path, hash, &working);
+                }
+                crate::agent_lane::Baseline::Hash(_) => {}
+                // The agent deleted it: the row goes, rather than sitting in
+                // the queue forever pointing at a file that is not there.
+                crate::agent_lane::Baseline::Gone => {
+                    any |= self.agent_ledger.forget_path(path);
+                }
+                // Unreadable this instant; the next write re-reports it.
+                crate::agent_lane::Baseline::Unreadable => {}
+            }
+        }
+        any
+    }
+
+    /// Mark one file reviewed in one agent's lane (#345): the content on
+    /// DISK now becomes the baseline, so the row returns only on a later
+    /// write.
+    pub(crate) fn mark_agent_file_reviewed(&mut self, agent: &str, path: &Path) -> bool {
+        match crate::agent_lane::read_baseline(path) {
+            crate::agent_lane::Baseline::Hash(hash) => {
+                self.agent_ledger.mark_reviewed(agent, path, hash)
+            }
+            // Nothing left to review: drop the row rather than baselining a
+            // file that is not there.
+            crate::agent_lane::Baseline::Gone => self.agent_ledger.forget_path(path),
+            // Unreadable right now is NOT reviewed: say so instead of
+            // clearing content the user has not seen.
+            crate::agent_lane::Baseline::Unreadable => {
+                self.status = format!("Could not read {} to mark it reviewed", path.display());
+                false
+            }
+        }
+    }
+
+    /// Mark an agent's whole lane reviewed (#345).
+    pub(crate) fn mark_agent_lane_reviewed(&mut self, agent: &str) -> usize {
+        let (reviewed, dropped) = self
+            .agent_ledger
+            .mark_lane_reviewed(agent, crate::agent_lane::read_baseline);
+        // A file that vanished was not REVIEWED; saying so would tell the
+        // user they looked at something that is not there.
+        let gone = match dropped {
+            0 => String::new(),
+            1 => String::from(", 1 gone"),
+            n => format!(", {n} gone"),
+        };
+        self.status = match reviewed {
+            0 if dropped == 0 => format!("{agent}: nothing waiting for review"),
+            0 => format!("{agent}: nothing to review{gone}"),
+            1 => format!("{agent}: 1 file marked reviewed{gone}"),
+            n => format!("{agent}: {n} files marked reviewed{gone}"),
+        };
+        reviewed + dropped
+    }
+
     /// Focus the first waiting agent's pane, else the first seated one. Goes
     /// through `set_bottom_panel_tab` like `captures_open_selected`, so a
     /// click from the editor with the panel collapsed reveals the pane
@@ -28135,9 +28313,15 @@ impl App {
                     .is_some_and(|a| a.status == crate::agents::AgentStatus::Waiting)
             })
             .or_else(|| self.terminals.iter().position(|t| t.agent().is_some()));
-        if let Some(idx) = pick {
-            self.active_terminal = idx;
-            self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+        match pick {
+            Some(idx) => {
+                self.active_terminal = idx;
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+            }
+            // The chip is showing a review queue whose agents have all gone:
+            // a click that silently did nothing was the worst of the three
+            // options (#345 review).
+            None => self.run_command(crate::widgets::command_palette::Command::ShowAgentLane),
         }
     }
 
@@ -30170,7 +30354,7 @@ impl App {
     /// editor buffer; view / navigation commands defer to the same methods
     /// their dedicated chords use, so the palette can never drift from the
     /// keyboard surface.
-    fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
+    pub(crate) fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
         use crate::widgets::command_palette::Command as Cmd;
         use crate::widgets::editor::CaseTransform;
         match cmd {
@@ -30761,6 +30945,103 @@ impl App {
             Cmd::SessionParticipants => self.open_participants_picker(),
             Cmd::CollabCancelStream => self.collab_cancel_stream(),
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
+            Cmd::MarkAgentFileReviewed => {
+                match self.editor.path.clone() {
+                    None => self.status = String::from("No file open"),
+                    Some(path) if !self.agent_ledger.is_unreviewed(&path) => {
+                        self.status =
+                            String::from("No agent change waiting for review on this file");
+                    }
+                    Some(path) => {
+                        // Every lane holding it: a file two agents both
+                        // touched is reviewed once, for both.
+                        let agents: Vec<String> = self
+                            .agent_ledger
+                            .agents()
+                            .into_iter()
+                            .map(String::from)
+                            .collect();
+                        let mut n = 0;
+                        for agent in &agents {
+                            if self.mark_agent_file_reviewed(agent, &path) {
+                                n += 1;
+                            }
+                        }
+                        let name = path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        self.status = format!(
+                            "{name} marked reviewed in {n} agent lane{}",
+                            if n == 1 { "" } else { "s" }
+                        );
+                    }
+                }
+            }
+            Cmd::ShowAgentLane => {
+                let rows: Vec<String> = self
+                    .agent_ledger
+                    .agents()
+                    .into_iter()
+                    .map(|agent| {
+                        let n = self.agent_ledger.unreviewed_count(agent);
+                        let files: Vec<String> = self
+                            .agent_ledger
+                            .lane(agent)
+                            .into_iter()
+                            .filter(|f| f.unreviewed())
+                            .take(3)
+                            .map(|f| {
+                                let name = f
+                                    .path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                if f.shared {
+                                    format!("{name} (shared)")
+                                } else {
+                                    name
+                                }
+                            })
+                            .collect();
+                        format!("{agent}: {n} to review ({})", files.join(", "))
+                    })
+                    .collect();
+                self.status = if rows.is_empty() {
+                    String::from("No agent has changed anything yet")
+                } else if self.agent_ledger.may_be_incomplete() {
+                    format!(
+                        "{} \u{b7} at least: the file watcher overflowed",
+                        rows.join(" \u{b7} ")
+                    )
+                } else {
+                    rows.join(" \u{b7} ")
+                };
+            }
+            Cmd::MarkAgentLaneReviewed => {
+                let agents: Vec<String> = self
+                    .agent_ledger
+                    .agents()
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                match agents.len() {
+                    0 => self.status = String::from("No agent has changed anything yet"),
+                    _ => {
+                        let mut total = 0;
+                        for agent in &agents {
+                            total += self.mark_agent_lane_reviewed(agent);
+                        }
+                        // Each lane set its own status; the summary is the
+                        // one the user is left with.
+                        self.status = match total {
+                            0 => String::from("Nothing waiting for review"),
+                            1 => String::from("1 file marked reviewed"),
+                            n => format!("{n} files marked reviewed"),
+                        };
+                    }
+                }
+            }
             Cmd::FixProblemWithNavigator => match self.navigator_fix_candidate() {
                 Some((path, item)) => self.fix_problem_with_navigator(path, item, Vec::new()),
                 None => self.status = String::from("No diagnostic at the caret to fix"),

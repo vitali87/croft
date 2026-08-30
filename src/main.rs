@@ -1,3 +1,4 @@
+mod agent_lane;
 mod agents;
 mod ansi_text;
 mod app;
