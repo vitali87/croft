@@ -27492,15 +27492,23 @@ impl App {
 
     /// Mark an agent's whole lane reviewed (#345).
     pub(crate) fn mark_agent_lane_reviewed(&mut self, agent: &str) -> usize {
-        let cleared = self
+        let (reviewed, dropped) = self
             .agent_ledger
             .mark_lane_reviewed(agent, crate::agent_lane::read_baseline);
-        self.status = match cleared {
-            0 => format!("{agent}: nothing waiting for review"),
-            1 => format!("{agent}: 1 file marked reviewed"),
-            n => format!("{agent}: {n} files marked reviewed"),
+        // A file that vanished was not REVIEWED; saying so would tell the
+        // user they looked at something that is not there.
+        let gone = match dropped {
+            0 => String::new(),
+            1 => String::from(", 1 gone"),
+            n => format!(", {n} gone"),
         };
-        cleared
+        self.status = match reviewed {
+            0 if dropped == 0 => format!("{agent}: nothing waiting for review"),
+            0 => format!("{agent}: nothing to review{gone}"),
+            1 => format!("{agent}: 1 file marked reviewed{gone}"),
+            n => format!("{agent}: {n} files marked reviewed{gone}"),
+        };
+        reviewed + dropped
     }
 
     /// Focus the first waiting agent's pane, else the first seated one. Goes

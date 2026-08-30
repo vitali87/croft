@@ -111,7 +111,12 @@ pub fn read_baseline(path: &Path) -> Baseline {
         Err(_) => return Baseline::Unreadable,
     };
     if meta.len() > MAX_HASH_BYTES {
-        return Baseline::Hash(stamp_hash(&meta));
+        // With no mtime the stamp would be the LENGTH alone, and every
+        // same-size write to a large file would be invisible with no
+        // signal at all. Fall through to the honest read instead.
+        if let Some(stamp) = stamp_hash(&meta) {
+            return Baseline::Hash(stamp);
+        }
     }
     match std::fs::read(path) {
         Ok(bytes) => Baseline::Hash(content_hash(&bytes)),
@@ -124,14 +129,12 @@ pub fn read_baseline(path: &Path) -> Baseline {
 /// length and mtime. Weaker than content addressing — a same-size write in
 /// the same mtime granule is missed — but it is bounded, and the
 /// alternative is reading hundreds of megabytes during a draw.
-fn stamp_hash(meta: &std::fs::Metadata) -> u64 {
+fn stamp_hash(meta: &std::fs::Metadata) -> Option<u64> {
+    let mtime = meta.modified().ok()?;
+    let since = mtime.duration_since(std::time::UNIX_EPOCH).ok()?;
     let mut bytes = meta.len().to_le_bytes().to_vec();
-    if let Ok(mtime) = meta.modified()
-        && let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH)
-    {
-        bytes.extend_from_slice(&d.as_nanos().to_le_bytes());
-    }
-    content_hash(&bytes)
+    bytes.extend_from_slice(&since.as_nanos().to_le_bytes());
+    Some(content_hash(&bytes))
 }
 
 impl AgentLedger {
@@ -255,9 +258,17 @@ impl AgentLedger {
 
     /// Mark every file in one lane reviewed, using `hash_of` to read each
     /// file's current content. Returns how many rows were cleared.
-    pub fn mark_lane_reviewed(&mut self, agent: &str, read: impl Fn(&Path) -> Baseline) -> usize {
+    /// Returns `(reviewed, dropped)`: rows whose current content became the
+    /// baseline, and rows removed because the file is gone. They are counted
+    /// apart because telling the user a deleted file was "reviewed" claims
+    /// they looked at something that is not there.
+    pub fn mark_lane_reviewed(
+        &mut self,
+        agent: &str,
+        read: impl Fn(&Path) -> Baseline,
+    ) -> (usize, usize) {
         let Some(lane) = self.lanes.get_mut(agent) else {
-            return 0;
+            return (0, 0);
         };
         let mut cleared = 0;
         let mut gone: Vec<PathBuf> = Vec::new();
@@ -282,9 +293,8 @@ impl AgentLedger {
         }
         for path in &gone {
             lane.remove(path);
-            cleared += 1;
         }
-        cleared
+        (cleared, gone.len())
     }
 
     /// Drop `path` from every lane — the file is gone, so there is nothing
@@ -302,14 +312,14 @@ impl AgentLedger {
         self.lanes.remove(agent).is_some()
     }
 
-    /// Total unreviewed ROWS across every lane (the per-lane badges sum to
-    /// this). Exposed for the sidebar section that will render those badges;
-    /// the single global chip uses [`Self::unreviewed_files`] instead.
-    #[cfg_attr(not(test), allow(dead_code))]
     /// Total unreviewed ROWS across every lane — the per-lane badges sum to
     /// this, so a file two agents both touched counts twice, once in each
     /// lane. For "how many files must the user look at", which is what a
     /// single global badge means, use [`Self::unreviewed_files`].
+    ///
+    /// Exposed for the deferred sidebar section that will render those
+    /// badges; nothing in production reads it yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn total_unreviewed(&self) -> usize {
         self.lanes
             .values()
@@ -389,12 +399,24 @@ mod tests {
         assert!(led.lane("claude")[0].shared);
         assert!(led.lane("codex")[0].shared);
         assert_eq!(led.total_unreviewed(), 2, "the file sits in both lanes");
+        assert_eq!(
+            led.unreviewed_files(),
+            1,
+            "but it is ONE file to open: a chip that drops by two when the \
+             user reviews one file is telling them something untrue"
+        );
 
         // Reviewing it in one lane leaves the other's row standing: each
         // agent's queue is its own.
         led.mark_reviewed("claude", &p("/w/x.rs"), 7);
         assert_eq!(led.unreviewed_count("claude"), 0);
         assert_eq!(led.unreviewed_count("codex"), 1);
+        assert_eq!(led.total_unreviewed(), 1, "one row left");
+        assert_eq!(
+            led.unreviewed_files(),
+            1,
+            "the chip holds at one file until EVERY lane holding it clears"
+        );
         assert!(
             led.is_unreviewed(&p("/w/x.rs")),
             "the tree dot stays while ANY lane has it unreviewed"
@@ -435,14 +457,19 @@ mod tests {
 
         // `a.rs` moved on disk since the agent's write (the user edited it);
         // `gone.rs` no longer exists.
-        let cleared = led.mark_lane_reviewed("claude", |path| {
+        let (cleared, dropped) = led.mark_lane_reviewed("claude", |path| {
             if path == p("/w/a.rs") {
                 Baseline::Hash(42)
             } else {
                 Baseline::Gone
             }
         });
-        assert_eq!(cleared, 2);
+        assert_eq!(
+            (cleared, dropped),
+            (1, 1),
+            "one file was reviewed and one was gone: reporting two as \
+             reviewed would claim the user looked at a file that is not there"
+        );
         assert_eq!(led.unreviewed_count("claude"), 0);
         let rows = led.lane("claude");
         assert!(
@@ -500,9 +527,13 @@ mod tests {
         led.record_write(&p("/w/locked.rs"), 100, &[String::from("claude")]);
         assert_eq!(led.unreviewed_count("claude"), 1);
 
-        // The disk really holds different content; the read fails now.
-        let cleared = led.mark_lane_reviewed("claude", |_| Baseline::Unreadable);
-        assert_eq!(cleared, 0, "an unreadable file is not a cleared one");
+        // The read fails this instant, whatever the disk holds.
+        let (cleared, dropped) = led.mark_lane_reviewed("claude", |_| Baseline::Unreadable);
+        assert_eq!(
+            (cleared, dropped),
+            (0, 0),
+            "an unreadable file is neither reviewed nor gone"
+        );
         assert_eq!(
             led.unreviewed_count("claude"),
             1,
@@ -510,7 +541,10 @@ mod tests {
         );
 
         // And it is still recoverable once the read succeeds.
-        assert_eq!(led.mark_lane_reviewed("claude", |_| Baseline::Hash(555)), 1);
+        assert_eq!(
+            led.mark_lane_reviewed("claude", |_| Baseline::Hash(555)),
+            (1, 0)
+        );
         assert_eq!(led.unreviewed_count("claude"), 0);
     }
 
@@ -534,7 +568,7 @@ mod tests {
         assert!(matches!(stamped, Baseline::Hash(_)));
         assert_ne!(
             stamped,
-            Baseline::Hash(content_hash(&vec![0u8; (MAX_HASH_BYTES + 1) as usize])),
+            Baseline::Hash(content_hash(b"")),
             "past the cap the stamp stands in for the content, never reading it"
         );
         // The stamp still moves when the file does.
