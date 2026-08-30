@@ -502,6 +502,16 @@ thread 'tests::formats' panicked at src/render.rs:88:9:
             "FAIL src/sum.test.ts \u{203a} adds",
             "adds"
         ));
+        // The shapes that regressed silently once: a `>` in the TITLE must
+        // survive all three, not just the bullet form.
+        assert!(is_failure_banner(
+            "FAIL src/a.test.ts \u{203a} handles a > b",
+            "handles a > b"
+        ));
+        assert!(is_failure_banner(
+            "\u{d7} sum \u{203a} handles a > b",
+            "handles a > b"
+        ));
         assert!(is_failure_banner(
             "\u{25cf} suite \u{203a} test_adds",
             "test_adds"
