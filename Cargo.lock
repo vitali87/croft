@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "croft-software"
-version = "0.1.807"
+version = "0.1.810"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -663,6 +663,8 @@ dependencies = [
  "tree-sitter-yaml",
  "tui-input",
  "umya-spreadsheet",
+ "unicode-segmentation",
+ "unicode-width",
  "ureq 2.12.1",
  "ureq 3.3.0",
  "url",

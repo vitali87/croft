@@ -265,9 +265,15 @@ fn render_log(
         let idx = scroll + r;
         let Some(line) = view.line(idx) else { break };
         let y = body_top + r as u16;
-        let mut x = inner.x;
+        // Where each character lands, by display width: a CJK pair is four
+        // cells, and the span after it starts on the fifth (#404). Advancing
+        // by `chars().count()` put it on the third, over the pair's second
+        // half, and the drift grew with every wide character on the line.
+        let cells = crate::cell_map::CellMap::new(&line.text);
+        let right = inner.x + inner.width;
         for span in &line.spans {
-            if x >= inner.x + inner.width {
+            let x = inner.x.saturating_add(cells.cell_of_byte(span.start));
+            if x >= right {
                 break;
             }
             let text = &line.text[span.start..span.end];
@@ -299,9 +305,8 @@ fn render_log(
             if span.style.underline {
                 style = style.add_modifier(Modifier::UNDERLINED);
             }
-            let room = (inner.x + inner.width).saturating_sub(x) as usize;
+            let room = right.saturating_sub(x) as usize;
             buf.set_stringn(x, y, text, room, style);
-            x = x.saturating_add(text.chars().count().min(room) as u16);
         }
         // Selection goes under the find highlight and over the log's own
         // colours: it is the coarser mark, and a match inside a selection
@@ -317,12 +322,11 @@ fn render_log(
                     line.text.chars().count()
                 };
                 for c in from..to {
-                    let x = inner.x.saturating_add(c as u16);
-                    if x >= inner.x + inner.width {
+                    if !paint_log_cells(buf, inner.x, right, y, &cells, c, |s| {
+                        s.bg(theme.selection())
+                    }) {
                         break;
                     }
-                    let cell = &mut buf[(x, y)];
-                    cell.set_style(cell.style().bg(theme.selection()));
                 }
             }
         }
@@ -331,21 +335,54 @@ fn render_log(
         // the spans put on screen (#257).
         if let Some((needle, opts)) = search {
             let active_on_line = active.filter(|(r, _, _)| *r == idx).map(|(_, c, l)| (c, l));
-            paint_search_highlight(
-                buf,
-                inner.x,
-                y,
-                inner.width,
-                &line.text,
-                needle,
-                opts,
-                0,
-                active_on_line,
-                &[],
-                theme,
-            );
+            let (inactive_style, active_style) = search_highlight_styles(theme);
+            let segments = crate::widgets::search::split_for_highlight(&line.text, needle, opts);
+            let mut abs_col: usize = 0;
+            'segments: for (chunk, is_match) in segments {
+                let chunk_cols = chunk.chars().count();
+                if is_match {
+                    let is_active =
+                        active_on_line.is_some_and(|(c, l)| c == abs_col && l == chunk_cols);
+                    let style = if is_active {
+                        active_style
+                    } else {
+                        inactive_style
+                    };
+                    for c in abs_col..abs_col + chunk_cols {
+                        if !paint_log_cells(buf, inner.x, right, y, &cells, c, |_| style) {
+                            break 'segments;
+                        }
+                    }
+                }
+                abs_col = abs_col.saturating_add(chunk_cols);
+            }
         }
     }
+}
+
+/// Restyle every cell character `col` occupies on a rendered log row, using
+/// the same cell map the painter used so a band lands on the character it
+/// names rather than on its character index. `restyle` is given the cell's
+/// current style. Returns false once the row's right edge is reached, so a
+/// caller walking columns can stop.
+fn paint_log_cells(
+    buf: &mut Buffer,
+    left: u16,
+    right: u16,
+    y: u16,
+    cells: &crate::cell_map::CellMap,
+    col: usize,
+    restyle: impl Fn(Style) -> Style,
+) -> bool {
+    let first = left.saturating_add(cells.cell_of_char(col));
+    for x in first..first.saturating_add(cells.width_of_char(col)) {
+        if x >= right {
+            return false;
+        }
+        let cell = &mut buf[(x, y)];
+        cell.set_style(restyle(cell.style()));
+    }
+    first < right
 }
 
 /// Paint a hex tab (#172): header row, `offset  hex  |ascii|` body rows,
@@ -11880,6 +11917,20 @@ fn inlay_text_segment<'a>(
     build_line_spans(seg, &shifted)
 }
 
+/// The (inactive, active) find-highlight styles, shared by the editor's
+/// highlighter and the rendered log's so the two tabs read the same.
+fn search_highlight_styles(theme: crate::theme::Theme) -> (Style, Style) {
+    let inactive = Style::default()
+        .fg(Color::Black)
+        .bg(theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
+        .add_modifier(Modifier::BOLD);
+    let active = Style::default()
+        .fg(Color::Black)
+        .bg(theme.ui(Color::Rgb(0xff, 0x8c, 0x2a)))
+        .add_modifier(Modifier::BOLD);
+    (inactive, active)
+}
+
 // Render helper: each argument is an independent painting input (buffer,
 // geometry, text, styling); bundling them into a struct would add indirection
 // without improving clarity.
@@ -11900,14 +11951,7 @@ fn paint_search_highlight(
     if needle.is_empty() {
         return;
     }
-    let inactive_style = Style::default()
-        .fg(Color::Black)
-        .bg(theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
-        .add_modifier(Modifier::BOLD);
-    let active_style = Style::default()
-        .fg(Color::Black)
-        .bg(theme.ui(Color::Rgb(0xff, 0x8c, 0x2a)))
-        .add_modifier(Modifier::BOLD);
+    let (inactive_style, active_style) = search_highlight_styles(theme);
     let segments = crate::widgets::search::split_for_highlight(raw_line, needle, opts);
     // `abs_col` tracks the absolute character index in the original line.
     // Visible columns are `abs_col - scroll_col`, painted only when
