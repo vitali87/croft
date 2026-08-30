@@ -27131,11 +27131,6 @@ impl App {
         });
     }
 
-    /// Refresh each pane's auto-label from its live foreground process. The
-    /// `tcgetpgrp` reads are cheap and stay on the loop; the `sysinfo` name
-    /// lookups (the slow part) run on a one-shot background thread, keyed by
-    /// shell pid so results land on the right pane even if panes moved. Returns
-    /// whether any label changed (for redraw).
     /// Seat, re-judge, or unseat the agent in each sampled pane (#344), from
     /// the same `(shell_pid, process_name)` pairs the pill uses, and queue
     /// the transitions. `quiet_after` is the working/quiet threshold
@@ -27226,6 +27221,11 @@ impl App {
         }
     }
 
+    /// Refresh each pane's auto-label from its live foreground process. The
+    /// `tcgetpgrp` reads are cheap and stay on the loop; the `sysinfo` name
+    /// lookups (the slow part) run on a one-shot background thread, keyed by
+    /// shell pid so results land on the right pane even if panes moved. Returns
+    /// whether any label changed (for redraw).
     fn refresh_terminal_labels(&mut self) -> bool {
         let mut changed = false;
         // Apply whatever the last background lookup resolved.
