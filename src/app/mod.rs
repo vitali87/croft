@@ -11689,6 +11689,18 @@ impl App {
                 }
                 row_y = row_y.saturating_add(lines.len().max(1) as u16);
             }
+
+            // The ambient wave (#312), painted LAST and only into cells the
+            // notes left blank, so the card's text always wins and a release
+            // with a lot to say simply pushes the field out of view.
+            let wave_area = Rect {
+                x: inner_x,
+                y: inner_y,
+                width: inner_w_actual,
+                height: box_rect.height.saturating_sub(2),
+            };
+            let theme = self.theme;
+            crate::gradient::paint_card_wave(frame.buffer_mut(), wave_area, |c| theme.ui(c));
         }
     }
 
@@ -26732,6 +26744,17 @@ impl App {
                 return false;
             };
             let decorations = term.command_decorations();
+            // `command_decorations` is a SLIDING WINDOW: marks past the
+            // scrollback floor are collected, which shifts every index down.
+            // A block whose own output evicts older marks would otherwise
+            // settle on an unrelated later command - and under `{persist}`
+            // write that stranger's output to the user's file. A shrunken
+            // list is exactly that eviction, so the capture is abandoned
+            // rather than guessed at: no box is strictly better than the
+            // wrong box, and far better than the wrong bytes on disk.
+            if decorations.len() < c.seen {
+                return false;
+            }
             if let Some(d) = decorations.get(c.seen) {
                 settled.push((
                     c.pane_name.clone(),
@@ -26788,12 +26811,22 @@ impl App {
     /// rebuilt, so a box appears without the user touching anything.
     fn publish_block_outputs(&mut self) {
         let prefix = self.block_pane_prefix();
-        self.editor.md_outputs = self
+        let narrowed: crate::markdown::BlockOutputs = self
             .block_outputs
             .iter()
             .filter(|((pane, _), _)| pane.starts_with(&prefix))
             .map(|((_, line), out)| (*line, out.clone()))
             .collect();
+        // Idempotent, so the tick can call it unconditionally and a
+        // DOCUMENT SWITCH is picked up without every switch path having to
+        // remember to. Keying only by source line meant `B.md`'s line-12
+        // fence rendered `A.md`'s capture until something else rebuilt the
+        // preview; narrowing by pane prefix fixes that only if it actually
+        // re-runs, which is what this comparison buys.
+        if narrowed == self.editor.md_outputs {
+            return;
+        }
+        self.editor.md_outputs = narrowed;
         if self.editor.markdown_preview.is_some() {
             self.editor.rebuild_markdown_preview();
         }
@@ -43857,6 +43890,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let bells_changed = app.drain_terminal_bells();
         // A block whose command has finished gets its output box (#354).
         let captures_changed = app.settle_block_captures();
+        // Every tick, not only when a capture settles: this is what notices
+        // the editor has moved to another document (#354 review).
+        app.publish_block_outputs();
         let labels_changed = app.refresh_terminal_labels() | app.drain_agent_events();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();

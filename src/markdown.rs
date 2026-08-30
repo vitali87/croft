@@ -186,6 +186,28 @@ fn output_spans(
 /// nothing in every Markdown viewer including this one.
 pub const OUTPUT_MARKER: &str = "<!-- croft:output -->";
 
+/// A fence opener's delimiter and run length, or `None` when the line does
+/// not open one. `~~~` and ``` ``` ``` are both openers; which one it is
+/// matters, because a fence is closed only by its own delimiter.
+fn fence_open(line: &str) -> Option<(char, usize)> {
+    let t = line.trim_start();
+    let d = t.chars().next().filter(|&c| c == '`' || c == '~')?;
+    let n = t.chars().take_while(|&c| c == d).count();
+    (n >= 3).then_some((d, n))
+}
+
+/// Whether `line` closes a fence opened with `delim` at `width`.
+///
+/// CommonMark: a closer is the SAME character, at least as long as its
+/// opener, and carries nothing else. All three conditions matter here - the
+/// delimiter because a `~~~` inside a backtick block is content, and the
+/// length because croft widens its own output fence past any backtick run
+/// the capture contains.
+fn closes_fence(line: &str, delim: char, width: usize) -> bool {
+    let t = line.trim();
+    t.len() >= width && t.chars().all(|c| c == delim)
+}
+
 /// Put `output` into `text` as the output fence for the block whose opener
 /// is at `block_line` (#354), replacing a previous one if it is there.
 ///
@@ -203,34 +225,59 @@ pub const OUTPUT_MARKER: &str = "<!-- croft:output -->";
 pub fn replace_output_fence(text: &str, block_line: usize, output: &str) -> Option<String> {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let opener = lines.get(block_line)?;
-    if !opener.trim_start().starts_with("```") {
-        return None;
-    }
-    // The block's closer: the next line that is a bare fence.
-    let close = (block_line + 1..lines.len())
-        .find(|&i| lines[i].trim() == "```" || lines[i].trim() == "~~~")?;
+    // EITHER delimiter opens a fence. A `~~~` block is as runnable as a
+    // backtick one (the renderer never distinguished them), so refusing it
+    // here reported "the document changed" about a line that is a perfectly
+    // good fence opener - a false claim, not merely a missed feature.
+    let (delim, width) = fence_open(opener)?;
+    // The block's closer must match the delimiter that OPENED it. Accepting
+    // either meant a `~~~` line inside a backtick block - a runbook that
+    // heredocs a tilde-fenced snippet - was read as that block's closer, and
+    // the output fence was then injected into the middle of the script.
+    let close = (block_line + 1..lines.len()).find(|&i| closes_fence(lines[i], delim, width))?;
     let mut after = close + 1;
     // Skip one blank line, then take a marked pair if it is there.
     let blank = lines.get(after).is_some_and(|l| l.trim().is_empty());
     let probe = if blank { after + 1 } else { after };
     if lines.get(probe).is_some_and(|l| l.trim() == OUTPUT_MARKER)
-        && let Some(end) =
-            (probe + 1..lines.len()).find(|&i| lines[i].trim() == "```" || lines[i].trim() == "~~~")
+        // The closer must be AT LEAST AS WIDE as croft's opener. The output
+        // may itself contain a bare ``` (a command that printed Markdown),
+        // and taking the first closer of any width would end the fence
+        // inside the capture and leave its tail loose in the document.
+        && let Some((odelim, owidth)) = lines.get(probe + 1).and_then(|l| fence_open(l))
+        && let Some(end) = (probe + 2..lines.len())
+            .find(|&i| closes_fence(lines[i], odelim, owidth))
     {
         after = end + 1;
     }
+    // The fence must be LONGER than any backtick run the output contains,
+    // or a command that prints ``` closes its own fence and the rest of the
+    // capture becomes prose. CommonMark allows any run of three or more, and
+    // a closer must be at least as long as its opener, so counting the
+    // longest run in the output and going one better is sufficient.
+    let longest = output
+        .lines()
+        .map(|l| l.trim().chars().take_while(|&c| c == delim).count())
+        .max()
+        .unwrap_or(0);
+    // Wider than anything the capture contains AND at least as wide as the
+    // block's own fence, in the block's own delimiter.
+    let fence: String = std::iter::repeat_n(delim, longest.max(width - 1).max(2) + 1).collect();
     let mut out = String::with_capacity(text.len() + output.len() + 64);
     for l in &lines[..close + 1] {
         out.push_str(l);
     }
     out.push('\n');
     out.push_str(OUTPUT_MARKER);
-    out.push_str("\n```text\n");
+    out.push('\n');
+    out.push_str(&fence);
+    out.push_str("text\n");
     for line in output.lines() {
         out.push_str(line);
         out.push('\n');
     }
-    out.push_str("```\n");
+    out.push_str(&fence);
+    out.push('\n');
     for l in &lines[after..] {
         out.push_str(l);
     }
@@ -1651,6 +1698,92 @@ mod tests {
             replace_output_fence(doc, 99, "hi\n"),
             None,
             "and a line past the end is refused rather than appended to"
+        );
+    }
+
+    /// Output that itself contains a fence must not escape its own (#354).
+    ///
+    /// A command whose output mentions Markdown prints ``` and, with a
+    /// three-backtick wrapper, closes the fence croft just opened: the rest
+    /// of the capture becomes prose and the document's structure is wrong
+    /// from there down. The wrapper is widened past the longest backtick run
+    /// in the output, and the replace path finds a closer of any width.
+    #[test]
+    fn output_containing_a_fence_does_not_escape_it() {
+        let doc = "```sh\ncat README.md\n```\n\nprose after\n";
+        let printed = "here is a fence:\n```\nnested\n```\ndone\n";
+        let first = replace_output_fence(doc, 0, printed).expect("the opener is a fence");
+        assert!(
+            first.contains("````text"),
+            "the wrapper is wider than the output's own fence: {first}"
+        );
+        assert!(first.contains("nested"), "{first}");
+        assert!(
+            first.contains("prose after"),
+            "the document past the block survives: {first}"
+        );
+
+        // And the widened fence is still found and replaced next time.
+        let second = replace_output_fence(&first, 0, "quiet\n").expect("still a fence");
+        assert_eq!(
+            second.matches(OUTPUT_MARKER).count(),
+            1,
+            "the wide fence was replaced, not stacked: {second}"
+        );
+        assert!(!second.contains("nested"), "{second}");
+        assert!(second.contains("prose after"), "{second}");
+    }
+
+    /// A `~~~` line INSIDE a backtick block is content, not that block's
+    /// closer (#354 review).
+    ///
+    /// A runbook that heredocs a tilde-fenced snippet was having the output
+    /// fence injected into the middle of its shell script, stranding the
+    /// heredoc terminator and everything after it outside the block. A fence
+    /// is closed only by its own delimiter.
+    #[test]
+    fn a_tilde_line_inside_a_backtick_block_is_not_its_closer() {
+        let doc = "```sh\ncat <<EOF\n~~~\nsnippet\n~~~\nEOF\n```\n\nprose after\n";
+        let out = replace_output_fence(doc, 0, "done\n").expect("the opener is a fence");
+        assert!(
+            out.contains("cat <<EOF") && out.contains("EOF\n```"),
+            "the script survives whole, terminator included: {out}"
+        );
+        // The marker lands after the BLOCK's closer, not inside the heredoc.
+        let marker_at = out.find(OUTPUT_MARKER).expect("written");
+        let script_end = out.find("EOF\n```").expect("the block closes");
+        assert!(
+            marker_at > script_end,
+            "the output fence goes after the block, not into it: {out}"
+        );
+        assert!(out.contains("prose after"), "{out}");
+    }
+
+    /// A `~~~`-opened runnable fence is a fence (#354 review).
+    ///
+    /// It was refused, and refused with the WRONG reason: "the document
+    /// changed since the block ran", about a line that is a perfectly good
+    /// opener. The renderer never distinguished the delimiters, so those
+    /// blocks are runnable and their captures must be writable.
+    #[test]
+    fn a_tilde_opened_block_takes_an_output_fence() {
+        let doc = "~~~sh\necho hi\n~~~\n\nprose after\n";
+        let out = replace_output_fence(doc, 0, "FIRSTRUN\n").expect("`~~~` opens a fence too");
+        assert!(out.contains(OUTPUT_MARKER), "{out}");
+        assert!(
+            out.contains("~~~text") || out.contains("~~~~text"),
+            "the output fence uses the block's own delimiter: {out}"
+        );
+        assert!(out.contains("FIRSTRUN"), "{out}");
+        assert!(out.contains("prose after"), "{out}");
+
+        // And replacing it finds the tilde closer rather than giving up.
+        let second = replace_output_fence(&out, 0, "bye\n").expect("still a fence");
+        assert_eq!(second.matches(OUTPUT_MARKER).count(), 1, "{second}");
+        assert!(second.contains("bye"), "{second}");
+        assert!(
+            !second.contains("FIRSTRUN"),
+            "the previous capture was replaced, not kept: {second}"
         );
     }
 
