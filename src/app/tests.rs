@@ -35520,6 +35520,8 @@ fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
         Some((0, 0, 5)),
         "a query that matches again must paint its match, whole"
     );
+}
+
 /// #352: a workspace's `.vscode/extensions.json` recommendations appear in the
 /// Extensions panel under FROM VS CODE with what croft has for each.
 #[test]
