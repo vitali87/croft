@@ -1,4 +1,4 @@
-//! Notification sinks (#358): forward what croft already notices — a long
+//! Notification sinks (#358), the `notifications` config key: forward what croft already notices — a long
 //! command finishing in a pane you are not watching, a red test run, a
 //! terminal's OSC 9 notice — to a phone or a chat, so a remote session is
 //! something you can walk away from.
@@ -39,12 +39,20 @@ pub enum Event {
         cwd: Option<PathBuf>,
         host: Option<String>,
     },
-    /// A Test Explorer run ended with failures (once per run).
-    TestsFailed { failed: usize, passed: usize },
+    /// A Test Explorer run ended red (once per run). `reported` is false
+    /// when no case reported at all — a compile error or a runner that
+    /// died — so the counts are meaningless and the body must say so
+    /// rather than "0 failed".
+    TestsFailed {
+        failed: usize,
+        passed: usize,
+        reported: bool,
+    },
     /// A terminal sent an OSC 9 notification.
     Osc9 { pane: String, message: String },
     /// An agent in a pane is waiting for input. Declared so a sink's
     /// `events` filter can name it today; fired once #344 lands.
+    // TODO(#344): construct this from the agent-lane sampler and drop the allow.
     #[allow(dead_code)]
     AgentWaiting { pane: String },
 }
@@ -102,8 +110,18 @@ impl Notification {
                 }
                 s
             }
-            Event::TestsFailed { failed, passed } => {
-                format!("Tests: {failed} failed, {passed} passed")
+            Event::TestsFailed {
+                failed,
+                passed,
+                reported,
+            } => {
+                if *reported {
+                    format!("Tests: {failed} failed, {passed} passed")
+                } else {
+                    String::from(
+                        "Test run failed before reporting any result (compile error, or the runner died)",
+                    )
+                }
             }
             Event::Osc9 { pane, message } => format!("{pane}: {message}"),
             Event::AgentWaiting { pane } => format!("Agent in {pane} is waiting for input"),
@@ -124,7 +142,8 @@ impl Notification {
     }
 }
 
-/// Percent-encode for the deep link's query: everything but unreserved.
+/// Percent-encode for the deep link's query: everything but unreserved,
+/// with `/` kept so a path stays readable (it is not a general encoder).
 fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -234,9 +253,38 @@ pub fn command_argv(sink: &NotificationSink, n: &Notification) -> Option<Vec<Str
     }
 }
 
+/// Why a delivery failed, and whether trying again could help. A missing
+/// topic or a program that is not there will not fix itself in two
+/// seconds; a socket that timed out might.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub message: String,
+    pub transient: bool,
+}
+
+impl Failure {
+    fn fixed(message: String) -> Self {
+        Self {
+            message,
+            transient: false,
+        }
+    }
+    fn transient(message: String) -> Self {
+        Self {
+            message,
+            transient: true,
+        }
+    }
+}
+
+/// How long a `command`/`termux` sink's program may run before it is
+/// killed: a sink is a notifier, not a job, and a hung one must not pin the
+/// delivery worker.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Send `n` through `sink` once. Errors name the sink and the failure, never
 /// a header value.
-pub fn deliver(sink: &NotificationSink, n: &Notification) -> Result<(), String> {
+pub fn deliver(sink: &NotificationSink, n: &Notification) -> Result<(), Failure> {
     match sink.kind.as_str() {
         "ntfy" | "webhook" => {
             let req = if sink.kind == "ntfy" {
@@ -245,36 +293,70 @@ pub fn deliver(sink: &NotificationSink, n: &Notification) -> Result<(), String> 
                 webhook_request(sink, n)
             }
             .ok_or_else(|| {
-                format!(
+                Failure::fixed(format!(
                     "{} sink is missing its {}",
                     sink.kind,
                     if sink.kind == "ntfy" { "topic" } else { "url" }
-                )
+                ))
             })?;
             post(&req)
         }
         "termux" | "command" => {
             let argv = command_argv(sink, n)
-                .ok_or_else(|| String::from("command sink has an empty argv"))?;
+                .ok_or_else(|| Failure::fixed(String::from("command sink has an empty argv")))?;
             let mut cmd = std::process::Command::new(&argv[0]);
             cmd.args(&argv[1..])
                 .env("CROFT_TITLE", &n.title)
                 .env("CROFT_BODY", &n.body)
                 .env("CROFT_LINK", &n.link)
                 .env("CROFT_EVENT", n.event)
-                .stdin(std::process::Stdio::null());
-            match cmd.output() {
-                Ok(out) if out.status.success() => Ok(()),
-                Ok(out) => Err(format!(
-                    "{} exited {}: {}",
-                    argv[0],
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )),
-                Err(e) => Err(format!("{} not runnable: {e}", argv[0])),
-            }
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped());
+            run_bounded(cmd, &argv[0], COMMAND_TIMEOUT)
         }
-        other => Err(format!("unknown sink kind {other:?}")),
+        other => Err(Failure::fixed(format!("unknown sink kind {other:?}"))),
+    }
+}
+
+/// Run `cmd` to completion or `timeout`, whichever is first; a child that
+/// outlives the bound is killed and reported as a (transient) failure.
+fn run_bounded(
+    mut cmd: std::process::Command,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), Failure> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Failure::fixed(format!("{name} not runnable: {e}")))?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+                }
+                return Err(Failure::transient(format!(
+                    "{name} exited {status}: {}",
+                    stderr.trim()
+                )));
+            }
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Failure::transient(format!(
+                    "{name} did not finish within {timeout:?} and was killed"
+                )));
+            }
+            Err(e) => return Err(Failure::fixed(format!("{name}: {e}"))),
+        }
     }
 }
 
@@ -282,7 +364,7 @@ pub fn deliver(sink: &NotificationSink, n: &Notification) -> Result<(), String> 
 /// carrying a secret is never replayed to another host, and a non-2xx
 /// reported with its status rather than its body (which could echo the
 /// request).
-fn post(req: &Request) -> Result<(), String> {
+fn post(req: &Request) -> Result<(), Failure> {
     let agent = ureq3::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .max_redirects(0)
@@ -299,20 +381,54 @@ fn post(req: &Request) -> Result<(), String> {
     }
     let resp = post
         .send(req.body.as_str())
-        .map_err(|e| format!("{}: {e}", host_of(&req.url)))?;
+        .map_err(|e| Failure::transient(format!("{}: {e}", host_of(&req.url))))?;
     let status = resp.status().as_u16();
     if (200..300).contains(&status) {
         Ok(())
+    } else if (500..600).contains(&status) || status == 429 {
+        Err(Failure::transient(format!(
+            "{}: HTTP {status}",
+            host_of(&req.url)
+        )))
     } else {
-        Err(format!("{}: HTTP {status}", host_of(&req.url)))
+        Err(Failure::fixed(format!(
+            "{}: HTTP {status}",
+            host_of(&req.url)
+        )))
     }
 }
 
-/// The host part of a URL, for a log line that must not echo a path or
-/// query that could carry a token.
+/// The host (and port) of a URL, for a log line that must not echo a
+/// path, query, fragment, or userinfo that could carry a token.
 fn host_of(url: &str) -> String {
     let rest = url.split("://").nth(1).unwrap_or(url);
-    rest.split('/').next().unwrap_or(rest).to_string()
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .to_string()
+}
+
+/// One delivery worker for the whole process, fed by a bounded queue: a
+/// burst of events (a terminal printing OSC 9 in a loop) costs at most
+/// [`QUEUE_DEPTH`] pending jobs and one thread, never a thread per event.
+/// Overflow drops the newest job and says so in the channel.
+const QUEUE_DEPTH: usize = 64;
+
+type Job = (Vec<NotificationSink>, Notification);
+
+fn worker() -> &'static std::sync::mpsc::SyncSender<Job> {
+    static TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<Job>> = std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(QUEUE_DEPTH);
+        std::thread::spawn(move || {
+            while let Ok((sinks, n)) = rx.recv() {
+                deliver_all(&sinks, &n);
+            }
+        });
+        tx
+    })
 }
 
 /// The live sink list, rebuilt whenever config is (re)loaded.
@@ -346,34 +462,56 @@ impl Notifier {
             .collect()
     }
 
-    /// Deliver `event` to every sink that wants it, on a background thread:
-    /// one attempt, one retry, then a line in the Notifications channel.
-    /// Nothing here is awaited by the caller.
+    /// Queue `event` for every sink that wants it. Nothing here blocks:
+    /// the queue is bounded and a full one drops the job with a channel
+    /// line rather than waiting.
     pub fn emit(&self, event: Event, workspace: &Path, host: &str) {
         let sinks = self.matching(&event);
         if sinks.is_empty() {
             return;
         }
         let n = Notification::new(&event, workspace, host);
-        std::thread::spawn(move || deliver_all(&sinks, &n));
+        if let Err(std::sync::mpsc::TrySendError::Full(_)) = worker().try_send((sinks, n)) {
+            output::push(
+                CHANNEL_NOTIFICATIONS,
+                OutputLevel::Warn,
+                &format!(
+                    "notifications: {} pending deliveries, dropped a {} event",
+                    QUEUE_DEPTH,
+                    event.kind()
+                ),
+            );
+        }
     }
 }
 
-/// Deliver to each sink with one retry, logging outcomes. Synchronous, so a
-/// test can drive it without a thread.
+/// Deliver to each sink, retrying a transient failure once after a pause,
+/// and logging what finally failed. Synchronous, so a test can drive it.
 pub fn deliver_all(sinks: &[NotificationSink], n: &Notification) {
     for sink in sinks {
-        if deliver(sink, n).is_ok() {
-            continue;
-        }
-        std::thread::sleep(RETRY_AFTER);
-        let Err(err) = deliver(sink, n) else {
-            continue;
+        let first = match deliver(sink, n) {
+            Ok(()) => continue,
+            Err(f) => f,
+        };
+        let last = if first.transient {
+            std::thread::sleep(RETRY_AFTER);
+            match deliver(sink, n) {
+                Ok(()) => continue,
+                Err(f) => f,
+            }
+        } else {
+            first
         };
         output::push(
             CHANNEL_NOTIFICATIONS,
             OutputLevel::Warn,
-            &format!("{} sink failed twice for {}: {err}", sink.kind, n.event),
+            &format!(
+                "{} sink failed for {}{}: {}",
+                sink.kind,
+                n.event,
+                if last.transient { " (twice)" } else { "" },
+                last.message
+            ),
         );
     }
 }
@@ -414,7 +552,8 @@ mod tests {
             &s,
             &Event::TestsFailed {
                 failed: 1,
-                passed: 9
+                passed: 9,
+                reported: true
             }
         ));
         s.events = vec![String::from("command_finished"), String::from("osc9")];
@@ -448,12 +587,29 @@ mod tests {
             &Event::TestsFailed {
                 failed: 2,
                 passed: 40,
+                reported: true,
             },
             Path::new("/w"),
             "h",
         );
         assert_eq!(n.body, "Tests: 2 failed, 40 passed");
         assert_eq!(n.event, "tests_failed");
+        // A compile error reports nothing; "0 failed, 0 passed" would be a
+        // lie, so the body says what happened instead.
+        let n = Notification::new(
+            &Event::TestsFailed {
+                failed: 0,
+                passed: 0,
+                reported: false,
+            },
+            Path::new("/w"),
+            "h",
+        );
+        assert!(
+            n.body.starts_with("Test run failed before reporting"),
+            "{}",
+            n.body
+        );
     }
 
     #[test]
@@ -556,18 +712,71 @@ mod tests {
             "echo nope >&2; exit 3".into(),
         ];
         let err = deliver(&c, &n).unwrap_err();
-        assert!(err.contains("exited") && err.contains("nope"), "{err}");
+        assert!(
+            err.message.contains("exited") && err.message.contains("nope"),
+            "{err:?}"
+        );
+        assert!(err.transient, "a failing program may pass next time");
         c.argv = vec!["/definitely/not/here".into()];
-        assert!(deliver(&c, &n).unwrap_err().contains("not runnable"));
+        let err = deliver(&c, &n).unwrap_err();
+        assert!(err.message.contains("not runnable"));
+        assert!(
+            !err.transient,
+            "a missing program will not appear in two seconds"
+        );
+    }
+
+    /// A sink's program is a notifier, not a job: one that hangs is killed
+    /// at the bound rather than pinning the delivery worker.
+    #[test]
+    fn a_hung_command_sink_is_killed_at_the_bound() {
+        let started = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30"]);
+        let err = run_bounded(cmd, "/bin/sh", Duration::from_millis(300)).unwrap_err();
+        assert!(err.message.contains("was killed"), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
-    fn a_log_line_names_the_host_never_the_path() {
+    fn a_log_line_names_the_host_never_the_path_query_or_userinfo() {
         assert_eq!(
             host_of("https://hooks.example.org/T0K3N/abc"),
             "hooks.example.org"
         );
         assert_eq!(host_of("http://10.0.0.5:8080/x?token=1"), "10.0.0.5:8080");
+        assert_eq!(host_of("https://user:pass@host.io/x"), "host.io");
+        assert_eq!(host_of("https://h.io?token=zz"), "h.io");
+        assert_eq!(host_of("https://h.io#frag"), "h.io");
+        assert_eq!(host_of("https://u:p@h.io"), "h.io");
+    }
+
+    /// The queue delivers: an event with a command sink lands in the file
+    /// the program writes, from the worker thread, without the caller
+    /// waiting on anything.
+    #[test]
+    fn emit_delivers_through_the_worker_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("hit.txt");
+        let mut c = sink("command");
+        c.min_duration_secs = Some(0);
+        c.argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("printf '%s' \"$CROFT_EVENT\" > '{}'", out.display()),
+        ];
+        let notifier = Notifier::new(&[c]);
+        notifier.emit(finished(1), dir.path(), "h");
+        let mut waited = 0;
+        while !out.exists() && waited < 8000 {
+            std::thread::sleep(Duration::from_millis(40));
+            waited += 40;
+        }
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "command_finished");
     }
 
     #[test]
@@ -583,7 +792,8 @@ mod tests {
         assert_eq!(
             notifier.matching(&Event::TestsFailed {
                 failed: 1,
-                passed: 0
+                passed: 0,
+                reported: true
             }),
             vec![ntfy]
         );

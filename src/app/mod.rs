@@ -3108,7 +3108,7 @@ pub struct App {
     /// Toggle Timestamps"). Session-scoped, off by default.
     pub show_terminal_timestamps: bool,
     /// Notification sinks from config.json `notifications` (#358).
-    notifier: crate::notify::Notifier,
+    notifier: crate::notifications::Notifier,
     /// Compiled per-host pane accent rules from config.json `host_accents`.
     /// First match wins.
     host_accents: Vec<HostAccent>,
@@ -4324,7 +4324,7 @@ impl App {
             broadcast_input: false,
             pending_broadcast_enable: false,
             show_terminal_timestamps: false,
-            notifier: crate::notify::Notifier::new(&loaded_prefs.notifications),
+            notifier: crate::notifications::Notifier::new(&loaded_prefs.notifications),
             host_accents: compile_host_accents(&loaded_prefs.host_accents),
             closed_terminals: Vec::new(),
             closed_tabs: Vec::new(),
@@ -26708,7 +26708,7 @@ impl App {
             }
             for msg in t.drain_notifications() {
                 self.notifier.emit(
-                    crate::notify::Event::Osc9 {
+                    crate::notifications::Event::Osc9 {
                         pane: t.label().to_string(),
                         message: msg.clone(),
                     },
@@ -26758,7 +26758,7 @@ impl App {
                 // The sinks decide by their own threshold (#358); the
                 // status-bar notice keeps the fixed one below.
                 self.notifier.emit(
-                    crate::notify::Event::CommandFinished {
+                    crate::notifications::Event::CommandFinished {
                         pane: t.label().to_string(),
                         cmd: crate::triggers::mask_text(f.cmd.trim(), &self.triggers, false),
                         exit: f.exit,
@@ -35011,7 +35011,7 @@ impl App {
     /// individual toggles do, minus their persistence (the values already
     /// live in config files) and minus their status chatter.
     fn apply_merged_settings(&mut self, p: &crate::prefs::Prefs) {
-        self.notifier = crate::notify::Notifier::new(&p.notifications);
+        self.notifier = crate::notifications::Notifier::new(&p.notifications);
         let theme = p.theme();
         if theme != self.theme {
             // Visuals only: a workspace-set theme must not be written back
@@ -42543,7 +42543,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         if app.testing.take_failed_run() {
             let (passed, failed, _) = app.testing.counts();
             app.notifier.emit(
-                crate::notify::Event::TestsFailed { failed, passed },
+                crate::notifications::Event::TestsFailed {
+                    failed,
+                    passed,
+                    reported: app.testing.run_reported_failed(),
+                },
                 app.roots.primary(),
                 &remote_host_label(),
             );
