@@ -100,6 +100,36 @@ pub struct HostAccentRule {
     pub badge: Option<String>,
 }
 
+/// One notification sink (#358): where an event goes and which events.
+///
+/// `kind` is `ntfy` (`topic`, optional `server`), `webhook` (`url`,
+/// optional `headers`), `termux` (runs `termux-notification`), or
+/// `command` (`argv`, with the notification in `CROFT_*` environment
+/// variables). `events` names the kinds it takes — `command_finished`,
+/// `tests_failed`, `osc9`, `agent_waiting` — or is empty for all of them;
+/// `min_duration_secs` is the threshold for a finished command (default
+/// 10). Webhook headers may carry a secret: keep them in
+/// `config.local.json`, the machine-local layer that is never synced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NotificationSink {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub min_duration_secs: Option<u64>,
+}
+
 /// `#rrggbb` → bytes; anything else is treated as unset.
 pub fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
     let hex = s.strip_prefix('#')?;
@@ -250,6 +280,11 @@ pub struct Prefs {
     /// means the built-in 5000. Applies to panes opened after the change.
     #[serde(default)]
     pub terminal_scrollback: usize,
+    /// Notification sinks; see [`NotificationSink`]. User layers only: not
+    /// in `WORKSPACE_ALLOWED_KEYS`, so a cloned repo cannot make croft run
+    /// a command or post to a URL.
+    #[serde(default)]
+    pub notifications: Vec<NotificationSink>,
 }
 
 impl Prefs {
