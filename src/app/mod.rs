@@ -11241,6 +11241,10 @@ impl App {
             drain.touched_open_file |= d.touched_open_file;
             drain.dirs_changed |= d.dirs_changed;
             drain.finder_relevant |= d.finder_relevant;
+            // A secondary root's writes are an agent's writes too: dropping
+            // them here would silently give a multi-root workspace an empty
+            // review queue for every folder but the first (#345).
+            drain.changed_files.extend(d.changed_files);
         }
         if drain.dirs_changed {
             self.refresh_git_status_debounced();
@@ -27412,12 +27416,13 @@ impl App {
         if working.is_empty() {
             return false;
         }
-        let root = self.workspace_root().to_path_buf();
         let mut any = false;
         for path in changed {
             // Only workspace files: an agent editing its own config under
-            // $HOME is not part of this workspace's review queue.
-            if !path.starts_with(&root) {
+            // $HOME is not part of this workspace's review queue. ANY root
+            // counts, not just the primary — a secondary folder's files are
+            // as much this session's work as the first folder's (#345).
+            if self.roots.owning_root(path).is_none() {
                 continue;
             }
             let Some(hash) = crate::agent_lane::hash_file(path) else {

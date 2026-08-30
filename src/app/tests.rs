@@ -36184,6 +36184,21 @@ fn the_agent_lane_ledger_attributes_writes_and_tracks_review_baselines() {
     assert_eq!(app.agent_ledger.unreviewed_count("claude"), 1);
     assert!(app.agent_ledger.is_unreviewed(&touched));
 
+    // A SECONDARY workspace root's files are attributed too: a multi-root
+    // session must not have an empty queue for every folder but the first.
+    let second = tempfile::tempdir().unwrap();
+    let in_second = second.path().join("lib.rs");
+    std::fs::write(&in_second, "fn b() {}\n").unwrap();
+    app.roots.add(second.path().to_path_buf());
+    let mut second_set = std::collections::BTreeSet::new();
+    second_set.insert(in_second.clone());
+    assert!(
+        app.attribute_writes_to_working_agents(&second_set),
+        "a write under a secondary root is still the agent's"
+    );
+    assert!(app.agent_ledger.is_unreviewed(&in_second));
+    app.mark_agent_file_reviewed("claude", &in_second);
+
     // A file OUTSIDE the workspace is not this workspace's review queue.
     let outside = tempfile::tempdir().unwrap();
     let stray = outside.path().join("elsewhere.rs");
