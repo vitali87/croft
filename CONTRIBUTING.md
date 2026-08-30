@@ -5,8 +5,9 @@ Thanks for hacking on croft. Build, run, and platform setup live in the
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). This guide covers the day to day
 developer workflow concerns that do not belong in any of those.
 
-Everything in this guide applies to AI agents too, including the two sections
-below on coordinating work and on verifying that a review happened. Agents often
+Everything in this guide applies to AI agents too, including the three
+sections below on coordinating work, on verifying that a review happened, and
+on verifying that the checks actually ran. Agents often
 also keep a `CLAUDE.md` at the root for their own preferences, but it is
 deliberately untracked and clone-local: a fresh checkout will not have one, and
 nothing here depends on it.
@@ -66,6 +67,10 @@ run has not been created yet. Count the jobs and require all of them for the
 SHA you are about to merge. "Nothing is failing" and "nothing has run" are the
 same reading.
 
+```bash
+gh pr checks <n> --json name --jq 'length'   # 0 means nothing ran, not nothing failed
+```
+
 **A `CONFLICTING` pull request gets no workflow runs at all.** GitHub cannot
 compute the merge commit, so it never creates them. Four pushes over an hour
 produced zero runs while `gh pr checks` showed one row the whole time — a
@@ -73,9 +78,13 @@ review bot's no-op — which reads exactly like a healthy PR early in its cycle.
 The tell is the pair:
 
 ```bash
-gh pr view <n> --json mergeable          # CONFLICTING
-gh run list --branch <branch> --limit 3  # nothing for the head SHA
+head=$(gh pr view <n> --json headRefOid --jq .headRefOid)
+gh pr view <n> --json mergeable    # CONFLICTING
+gh run list --commit "$head"       # empty: no run exists for this commit
 ```
+
+`--commit`, not `--branch`: a branch filter happily returns an older run and
+answers a question you did not ask.
 
 Either alone is ambiguous; together they are conclusive. This is worse than the
 empty-list case above, because a single green row survives a glance that an
@@ -104,13 +113,20 @@ Read them with the GraphQL `reviewThreads` query rather than
 resolution is what the ruleset below gates on.
 
 ```bash
-gh api graphql -f query='
-{ repository(owner:"OWNER", name:"REPO") { pullRequest(number:N) {
-  reviewThreads(first:50) { nodes { isResolved isOutdated path } } } } }'
+gh api graphql -F owner=OWNER -F repo=REPO -F number=N -f query='
+query($owner:String!, $repo:String!, $number:Int!, $after:String) {
+  repository(owner:$owner, name:$repo) { pullRequest(number:$number) {
+    reviewThreads(first:100, after:$after) {
+      pageInfo { hasNextPage endCursor }
+      nodes { isResolved isOutdated path }
+    } } } }'
 ```
 
-`first: 50` is a cap, not a promise: a PR with more threads than that returns a
-short list, which is this section's own failure mode wearing a page size.
+Variables, not literals spliced into the query: `number:N` is not an `Int!` and
+the call fails outright, which is at least loud. **Page it.** `first:` is a cap,
+not a promise, and a PR with more threads than the page size returns a short
+list — this section's own failure mode wearing a page size. Follow `endCursor`
+while `hasNextPage` is true.
 
 `isOutdated` earns its place beside `isResolved`: a thread on a file your branch
 no longer owns appears there, and no code change will ever resolve it.
