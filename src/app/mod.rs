@@ -3112,6 +3112,8 @@ pub struct App {
     /// Paint the terminal panes' right-edge arrival-time gutter ("Terminal:
     /// Toggle Timestamps"). Session-scoped, off by default.
     pub show_terminal_timestamps: bool,
+    /// Notification sinks from config.json `notifications` (#358).
+    notifier: crate::notifications::Notifier,
     /// Compiled per-host pane accent rules from config.json `host_accents`.
     /// First match wins.
     host_accents: Vec<HostAccent>,
@@ -4328,6 +4330,7 @@ impl App {
             broadcast_input: false,
             pending_broadcast_enable: false,
             show_terminal_timestamps: false,
+            notifier: crate::notifications::Notifier::new(&loaded_prefs.notifications),
             host_accents: compile_host_accents(&loaded_prefs.host_accents),
             closed_terminals: Vec::new(),
             closed_tabs: Vec::new(),
@@ -26758,7 +26761,18 @@ impl App {
             if t.take_bell() {
                 rang = Some(t.label().to_string());
             }
-            notes.extend(t.drain_notifications());
+            for msg in t.drain_notifications() {
+                let cwd = t.local_shell_cwd();
+                self.notifier.emit(
+                    crate::notifications::Event::Osc9 {
+                        pane: t.label().to_string(),
+                        message: msg.clone(),
+                    },
+                    self.root_for_path(cwd.as_deref()),
+                    &remote_host_label(),
+                );
+                notes.push(msg);
+            }
             // Always drain so completions never pile up unseen.
             for f in t.drain_finished_commands() {
                 if !f.output.is_empty() {
@@ -26794,7 +26808,24 @@ impl App {
                 {
                     settled_launch = Some(f.exit);
                 }
-                if t.focused || f.dur < LONG_COMMAND_NOTIFY {
+                if t.focused {
+                    continue;
+                }
+                // The sinks decide by their own threshold (#358); the
+                // status-bar notice keeps the fixed one below.
+                self.notifier.emit(
+                    crate::notifications::Event::CommandFinished {
+                        pane: t.label().to_string(),
+                        cmd: crate::triggers::mask_text(f.cmd.trim(), &self.triggers, false),
+                        exit: f.exit,
+                        dur: f.dur,
+                        cwd: f.cwd.clone(),
+                        host: f.host.clone(),
+                    },
+                    self.root_for_path(f.cwd.as_deref()),
+                    &remote_host_label(),
+                );
+                if f.dur < LONG_COMMAND_NOTIFY {
                     continue;
                 }
                 let code = f.exit.map_or_else(|| String::from("?"), |c| c.to_string());
@@ -27147,6 +27178,15 @@ impl App {
             shown_at: std::time::Instant::now(),
             buttons: Vec::new(),
         });
+    }
+
+    /// The workspace root a path belongs to, for a notification's title and
+    /// deep link (#358): in a multi-root session an event from a pane in a
+    /// secondary root must name that root, not the primary. The primary is
+    /// the fallback for a path outside every root, or no path at all.
+    fn root_for_path(&self, path: Option<&Path>) -> &Path {
+        path.and_then(|p| self.roots.iter().find(|r| p.starts_with(r)))
+            .unwrap_or_else(|| self.roots.primary())
     }
 
     /// Refresh each pane's auto-label from its live foreground process. The
@@ -35037,6 +35077,7 @@ impl App {
     /// individual toggles do, minus their persistence (the values already
     /// live in config files) and minus their status chatter.
     fn apply_merged_settings(&mut self, p: &crate::prefs::Prefs) {
+        self.notifier = crate::notifications::Notifier::new(&p.notifications);
         let theme = p.theme();
         if theme != self.theme {
             // Visuals only: a workspace-set theme must not be written back
@@ -42550,6 +42591,20 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // check) rolled its cases back in the drain; say why nothing ran.
         if app.testing.take_refusal() {
             app.status = String::from(crate::testing::NO_RUNNER_STATUS);
+        }
+        // One notification per red run (#358), from the latch the panel
+        // sets when a run ends, never per test case.
+        if app.testing.take_failed_run() {
+            let (passed, failed, _) = app.testing.counts();
+            app.notifier.emit(
+                crate::notifications::Event::TestsFailed {
+                    failed,
+                    passed,
+                    reported: app.testing.run_reported_failed(),
+                },
+                app.roots.primary(),
+                &remote_host_label(),
+            );
         }
         let mcp_changed = app.poll_mcp();
         let pair_changed =
