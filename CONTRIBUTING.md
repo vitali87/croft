@@ -55,7 +55,7 @@ for real on this repo in a single day, and they share one shape: **the thing
 that would have told you was absent rather than wrong.** A check that cannot
 fail in the case you need it for is not a check.
 
-**Require the head's full check set to EXIST, not merely to be green.** As CI
+**An all-green check list can mean CI never started.** As CI
 gets faster this gets more dangerous, not less: a check-settled test that polls
 until nothing is pending passes instantly against an empty list, because the
 run has not been created yet. Count the jobs and require all of them for the
@@ -77,15 +77,36 @@ Either alone is ambiguous; together they are conclusive. This is worse than the
 empty-list case above, because a single green row survives a glance that an
 empty list would not.
 
-**An earlier read of the review threads expires.** The rule above about a bot
-whose check says pass while no review ran has a second direction, which is the
-one that nearly landed a major on #392: a bot that has been genuinely silent
-can start producing findings at any moment, and its check row looks identical
-before and after. That PR was eight-of-eight green with an approval in hand
-when a pre-merge re-fetch turned up five inline threads, one of them a command
-running in a directory other than the one the confirm popup named. Re-fetch
-`gh api repos/<repo>/pulls/<n>/comments` immediately before merging. An
-approval that predates your last push is stale for the same reason.
+**A job that never got a runner reports `pending`, exactly like one that is
+running.** `gh run view <id> --json jobs` is the right command, but read
+`status`, not `completedAt`. That field is Go's zero `time.Time`
+(`0001-01-01T00:00:00Z`) for every job that has not finished, `in_progress` and
+`queued` alike, so it separates finished from unfinished — which is not the
+question. `startedAt` is populated on queued jobs too. What distinguishes them
+is a job still `queued` while its siblings in the same run have moved to
+`in_progress` or `completed`.
+
+**Threads can appear after everything is green, and an earlier read of them
+expires.** The rule above about a bot whose check says pass while no review ran
+has a second direction, and it nearly landed a major on #392: a bot that has
+been genuinely silent can start producing findings at any moment, and its check
+row looks identical before and after. That PR was eight-of-eight green — where
+one of the eight was the review bot's own `pass`, annotated "Review rate
+limited" — when a pre-merge re-fetch turned up five inline threads, one of them
+a command running in a directory other than the one its confirm popup named.
+
+Read them with the GraphQL `reviewThreads` query rather than
+`pulls/<n>/comments`: the REST payload carries no resolution state at all, and
+resolution is what the ruleset below gates on.
+
+```bash
+gh api graphql -f query='
+{ repository(owner:"OWNER", name:"REPO") { pullRequest(number:N) {
+  reviewThreads(first:50) { nodes { isResolved isOutdated path } } } } }'
+```
+
+`isOutdated` earns its place beside `isResolved`: a thread on a file your branch
+no longer owns appears there, and no code change will ever resolve it.
 
 **`mergeStateStatus: BLOCKED` names no reason, and the obvious endpoint lies.**
 Classic branch protection can report zero required checks and zero required
@@ -103,12 +124,15 @@ resolve a thread, and a thread on a file your branch no longer owns cannot be
 resolved by any code change at all — reply saying where the point was addressed,
 then resolve it.
 
-**Re-read the version at merge time, in the same breath as the final checks.**
+**Your version was valid when you branched and is stale by the time you merge.**
 The release gate compares your head against the merge base, so it passes as
 long as your branch is above main *at that point*. Two branches can both pass
-legitimately and only the second to merge conflicts. When several PRs are in
-flight the number you reserved when you branched is routinely stale by the time
-you merge; `git show origin/main:Cargo.toml` costs one command.
+legitimately and only the second to merge conflicts. Re-read
+`git show origin/main:Cargo.toml` in the same breath as the final
+`gh pr checks`, which is one command.
+
+This rule is repeated in `CLAUDE.md`, and this copy is the one to trust:
+`/CLAUDE.md` is gitignored, so a fresh clone never sees it.
 
 ## Every shipped change is a release
 
