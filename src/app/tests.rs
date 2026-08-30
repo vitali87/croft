@@ -35519,6 +35519,9 @@ fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
         app.editor.active_search_match,
         Some((0, 0, 5)),
         "a query that matches again must paint its match, whole"
+    );
+}
+
 /// #344: a pane whose foreground process is a coding agent is badged, its
 /// status is read off the screen once it goes quiet, and the `Waiting`
 /// transition fires exactly once per prompt. The fake agent is a shell that
