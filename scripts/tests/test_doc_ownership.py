@@ -245,6 +245,88 @@ class ItemKinds(unittest.TestCase):
             gate.documented(text), {"a": True, "b": True, "X::c": True, "d": True}
         )
 
+    def test_a_bodyless_impl_does_not_qualify_the_next_block(self):
+        """`impl Eq for X {}` opens and closes on one line. Its header must
+        not survive onto the next block, or a `mod` after a marker impl has
+        every item keyed to that impl, and a capture inside it is filed under
+        a key the base revision never had: a missed report, on the exact
+        shape (`src/widgets/file_finder.rs`) the repo contains."""
+        text = "impl Eq for X {}\nmod util {\n    /// doc\n    pub fn go() {}\n}\n"
+        self.assertEqual(gate.documented(text), {"go": True})
+        # And the base-vs-head comparison still reports the capture.
+        captured = (
+            "impl Eq for X {}\nmod util {\n    /// doc\n    pub fn newcomer() {}\n"
+            "    pub fn go() {}\n}\n"
+        )
+        after = gate.documented(captured)
+        self.assertEqual(after.get("go"), False, f"go lost its doc: {after}")
+
+    def test_raw_strings_do_not_break_block_tracking(self):
+        """`r#"{"#` is not a `"..."`, and a multi-line raw string of JSON is
+        braces all the way down. Both left the counter inside a block that
+        had closed, on seven real files under src/."""
+        single = (
+            'impl Foo {\n    /// doc\n    fn m() {\n'
+            '        let j = r#"[{"key": "click"}]"#;\n    }\n}\n'
+            "/// top\nfn top() {}\n"
+        )
+        self.assertEqual(gate.documented(single), {"Foo::m": True, "top": True})
+        multi = (
+            'impl Foo {\n    /// doc\n    fn m() {\n'
+            '        let j = r#"{ "tasks": [\n'
+            '            { "label": "x" }\n'
+            '        ] }"#;\n    }\n}\n'
+            "/// top\nfn top() {}\n"
+        )
+        self.assertEqual(gate.documented(multi), {"Foo::m": True, "top": True})
+        plain_multi = (
+            'impl Foo {\n    /// doc\n    fn m() {\n'
+            '        let s = "{ opens here\n'
+            '            and closes here }";\n    }\n}\n'
+            "/// top\nfn top() {}\n"
+        )
+        self.assertEqual(gate.documented(plain_multi), {"Foo::m": True, "top": True})
+
+    def test_a_header_wrapped_by_rustfmt_keeps_its_key(self):
+        """`impl<T>` alone on the first line strips to nothing; the key must
+        come from the whole header, or a rewrap moves every method to a
+        bare key and a capture in that PR goes unreported."""
+        text = "impl<T>\n    Trait for X<T>\n{\n    /// doc\n    fn m() {}\n}\n"
+        self.assertEqual(gate.documented(text), {"Trait for X::m": True})
+
+    def test_trait_methods_are_keyed_by_their_trait(self):
+        """Two traits declaring `id` are the same shape as two impls
+        defining `new`."""
+        text = (
+            "trait A {\n    /// a\n    fn id(&self);\n}\n"
+            "trait B: Clone {\n    /// b\n    fn id(&self);\n}\n"
+        )
+        self.assertEqual(
+            gate.documented(text),
+            {"A": False, "trait A::id": True, "B": False, "trait B::id": True},
+            "the traits are items in their own scope; their methods are in theirs",
+        )
+
+    def test_the_block_tracker_is_balanced_at_eof_on_every_real_file(self):
+        """The counter is line-based, so the only proof it kept up with a
+        file is that it ends where it started: depth zero, no open block.
+        Run over every Rust file in the repo, so a new literal shape that
+        desyncs it fails here before it mis-keys anything."""
+        src = Path(__file__).resolve().parents[2] / "src"
+        files = sorted(src.rglob("*.rs"))
+        self.assertGreater(len(files), 50, "the control corpus is missing")
+        unbalanced = []
+        for f in files:
+            lines = f.read_text().splitlines()
+            kinds = gate.classify(lines)
+            t = gate.BlockTracker()
+            for line, kind in zip(lines, kinds):
+                if kind == gate.CODE:
+                    t.feed(line)
+            if t.depth != 0 or t.blocks or t.open_string is not None:
+                unbalanced.append((str(f.relative_to(src)), t.depth, t.blocks, t.open_string))
+        self.assertEqual(unbalanced, [], "the tracker lost count in these files")
+
     def test_same_named_items_in_the_same_scope_are_still_merged(self):
         """Two definitions under ONE key (a `cfg`-gated pair, say) keep the
         conservative "any documented" reading: the gate under-reports there
