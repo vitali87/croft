@@ -36373,3 +36373,212 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
         "idle never wakes the renderer"
     );
 }
+/// #370: a `.http` file runs the request under the caret. The variables
+/// substitute from `.http.env.json` on the WIRE only: the status line,
+/// history entry, and response tab all carry the raw `{{name}}` form, so
+/// the token never leaves the env file. A JSON response opens pretty-printed
+/// as `.jsonc`; a PNG response opens through the image path.
+#[test]
+fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
+    use std::io::{Read as _, Write as _};
+    let tmp = tempfile::tempdir().unwrap();
+    // The cache-dir override is a process-wide global shared with the relay
+    // family: hold their lock and restore via RAII, exactly as
+    // `with_relay_home` does, so a panic cannot leak the redirect into
+    // later tests (#428 review).
+    struct RestoreCacheDir;
+    impl Drop for RestoreCacheDir {
+        fn drop(&mut self) {
+            *CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+        }
+    }
+    let _cache_lock = relay_test_lock().lock().unwrap();
+    let _restore = RestoreCacheDir;
+    *CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
+
+    // A 1x1 PNG via the image crate, so the decode on open genuinely works.
+    let png_bytes = {
+        let img: image::RgbaImage = image::ImageBuffer::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    };
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen2 = seen.clone();
+    let png_served = png_bytes.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let mut buf = vec![0u8; 8192];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let (body, ct): (Vec<u8>, &str) = if req.starts_with("GET /users") {
+                (
+                    b"{\"users\":[{\"id\":1,\"name\":\"ada\"}]}".to_vec(),
+                    "application/json",
+                )
+            } else {
+                (png_served.clone(), "image/png")
+            };
+            seen2.lock().unwrap().push(req);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(&body);
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    });
+
+    let http = tmp.path().join("api.http");
+    std::fs::write(
+        &http,
+        "GET {{host}}/users\nAuthorization: Bearer {{token}}\n\n###\nGET {{host}}/logo.png\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(crate::http_file::ENV_FILE),
+        format!("{{\"host\": \"http://127.0.0.1:{port}\", \"token\": \"super-secret-token\"}}"),
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 1;
+    app.send_http_request_under_caret();
+    assert!(
+        app.status.starts_with("Sending GET {{host}}/users"),
+        "the status carries the RAW line: {}",
+        app.status
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the HTTP response",
+        || {
+            app.drain_http_responses();
+            app.http_run.is_none()
+        },
+    );
+    let opened = app.editor.path.clone().expect("a response tab opened");
+    assert_eq!(opened.extension().and_then(|e| e.to_str()), Some("jsonc"));
+    let doc = app.editor.lines.join("\n");
+    assert!(
+        doc.contains("// GET {{host}}/users \u{2192} HTTP/1.1 200 OK"),
+        "{doc}"
+    );
+    assert!(doc.contains("\"users\": ["), "pretty-printed: {doc}");
+    assert!(
+        !doc.contains("super-secret-token"),
+        "the token never reaches the tab"
+    );
+    assert!(
+        seen.lock().unwrap()[0].contains("Bearer super-secret-token"),
+        "but the wire DID carry the substituted value"
+    );
+    let hits = app.command_history.search(
+        "http GET",
+        crate::command_history::HistoryScope::All,
+        "",
+        "",
+    );
+    assert_eq!(
+        hits[0].cmd, "http GET {{host}}/users",
+        "history keeps the raw line"
+    );
+    assert_eq!(hits[0].exit, Some(200));
+    assert!(!hits[0].cmd.contains("super-secret-token"));
+
+    // The PNG block renders through the image path.
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 4;
+    app.send_http_request_under_caret();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the PNG response",
+        || {
+            app.drain_http_responses();
+            app.http_run.is_none()
+        },
+    );
+    assert!(
+        app.editor.image.is_some(),
+        "a PNG response opens as an image, not bytes in a text tab: {:?}",
+        app.editor.path
+    );
+
+    // A second send while one is in flight is refused and clobbers
+    // nothing; a worker that died reports itself on the next drain.
+    let (dummy_tx, dummy_rx) = std::sync::mpsc::channel();
+    app.http_run = Some(dummy_rx);
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 0;
+    app.send_http_request_under_caret();
+    assert_eq!(app.status, "An HTTP request is already in flight");
+    drop(dummy_tx);
+    assert!(app.drain_http_responses());
+    assert!(app.status.contains("worker died"), "{}", app.status);
+    assert!(app.http_run.is_none());
+
+    // A transport failure must NOT leak a substituted secret into the
+    // status line: ureq's error Display opens with the resolved URL, so
+    // only its kind may be shown (#428 review). The port is bound then
+    // dropped, so the connection is refused at once.
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    std::fs::write(
+        tmp.path().join(crate::http_file::ENV_FILE),
+        format!(
+            "{{\"host\": \"http://127.0.0.1:{dead_port}\", \"token\": \"super-secret-token\"}}"
+        ),
+    )
+    .unwrap();
+    let secret_url = tmp.path().join("leak.http");
+    std::fs::write(&secret_url, "GET {{host}}/x?api_key={{token}}\n").unwrap();
+    app.editor.open_pinned(&secret_url).unwrap();
+    app.editor.cursor_row = 0;
+    app.send_http_request_under_caret();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the refused connection",
+        || {
+            app.drain_http_responses();
+            app.http_run.is_none()
+        },
+    );
+    assert!(
+        app.status.contains("failed"),
+        "a transport failure is reported: {}",
+        app.status
+    );
+    assert!(
+        !app.status.contains("super-secret-token"),
+        "the substituted URL never reaches the status line: {}",
+        app.status
+    );
+    let hits =
+        app.command_history
+            .search("api_key", crate::command_history::HistoryScope::All, "", "");
+    assert_eq!(hits[0].exit, None, "a failed run records no status code");
+    assert!(!hits[0].cmd.contains("super-secret-token"));
+    app.editor.open_pinned(&http).unwrap();
+
+    // A hole with no value refuses to send rather than leaking the hole.
+    app.editor.open_pinned(&http).unwrap();
+    std::fs::remove_file(tmp.path().join(crate::http_file::ENV_FILE)).unwrap();
+    app.editor.cursor_row = 0;
+    app.send_http_request_under_caret();
+    assert!(
+        app.status.contains("no value for {{host}}, {{token}}"),
+        "{}",
+        app.status
+    );
+    assert!(app.http_run.is_none(), "nothing was sent");
+}
