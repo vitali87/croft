@@ -27180,11 +27180,6 @@ impl App {
         });
     }
 
-    /// Refresh each pane's auto-label from its live foreground process. The
-    /// `tcgetpgrp` reads are cheap and stay on the loop; the `sysinfo` name
-    /// lookups (the slow part) run on a one-shot background thread, keyed by
-    /// shell pid so results land on the right pane even if panes moved. Returns
-    /// whether any label changed (for redraw).
     /// The workspace root a path belongs to, for a notification's title and
     /// deep link (#358): in a multi-root session an event from a pane in a
     /// secondary root must name that root, not the primary. The primary is
@@ -27194,6 +27189,11 @@ impl App {
             .unwrap_or_else(|| self.roots.primary())
     }
 
+    /// Refresh each pane's auto-label from its live foreground process. The
+    /// `tcgetpgrp` reads are cheap and stay on the loop; the `sysinfo` name
+    /// lookups (the slow part) run on a one-shot background thread, keyed by
+    /// shell pid so results land on the right pane even if panes moved. Returns
+    /// whether any label changed (for redraw).
     fn refresh_terminal_labels(&mut self) -> bool {
         let mut changed = false;
         // Apply whatever the last background lookup resolved.
