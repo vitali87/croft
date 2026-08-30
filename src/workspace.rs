@@ -242,7 +242,14 @@ where
 /// workspace names at least one folder.
 pub fn parse_workspace_file(path: &Path) -> Result<Vec<PathBuf>, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let stripped = strip_jsonc(&raw);
+    // `crate::tasks::strip_jsonc` walks CHARS. The copy that used to live
+    // here walked BYTES and rebuilt every multi-byte character as mojibake,
+    // so a workspace folder named "Caf\u{e9} Noir" arrived as "CafÃ© Noir"
+    // with no error anywhere: the JSON still parsed (#396).
+    //
+    // The two treat comments, trailing commas and string literals alike, so
+    // the swap changes what happens to non-ASCII input and nothing else.
+    let stripped = crate::tasks::strip_jsonc(&raw);
     let v: serde_json::Value =
         serde_json::from_str(&stripped).map_err(|e| format!("parse {}: {e}", path.display()))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
@@ -271,87 +278,6 @@ pub fn parse_workspace_file(path: &Path) -> Result<Vec<PathBuf>, String> {
         return Err(format!("{}: no folders", path.display()));
     }
     Ok(out)
-}
-
-/// Strip VS Code's JSONC extras so serde can parse: `//` and `/* */`
-/// comments outside strings, and trailing commas before `]`/`}` (#164
-/// review — `.code-workspace` files legitimately carry all three).
-fn strip_jsonc(src: &str) -> String {
-    let bytes = src.as_bytes();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    let mut in_str = false;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if in_str {
-            out.push(c);
-            if c == '\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
-                i += 2;
-                continue;
-            }
-            if c == '"' {
-                in_str = false;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            '"' => {
-                in_str = true;
-                out.push(c);
-                i += 1;
-            }
-            '/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            '/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-            }
-            ',' => {
-                // Trailing comma: swallow it when the next non-space,
-                // non-comment token closes the container.
-                let mut j = i + 1;
-                loop {
-                    while j < bytes.len() && (bytes[j] as char).is_whitespace() {
-                        j += 1;
-                    }
-                    if j + 1 < bytes.len() && bytes[j] == b'/' && bytes[j + 1] == b'/' {
-                        while j < bytes.len() && bytes[j] != b'\n' {
-                            j += 1;
-                        }
-                        continue;
-                    }
-                    if j + 1 < bytes.len() && bytes[j] == b'/' && bytes[j + 1] == b'*' {
-                        j += 2;
-                        while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
-                            j += 1;
-                        }
-                        j = (j + 2).min(bytes.len());
-                        continue;
-                    }
-                    break;
-                }
-                if j < bytes.len() && (bytes[j] == b']' || bytes[j] == b'}') {
-                    i += 1; // drop the comma; the closer re-processes
-                } else {
-                    out.push(c);
-                    i += 1;
-                }
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    out
 }
 
 /// Write the folder set as a `.code-workspace` (#163): paths relative to
@@ -602,6 +528,48 @@ mod tests {
             parse_workspace_file(&file).unwrap(),
             vec![alpha.canonicalize().unwrap()],
             "and round-trips back to the real directory"
+        );
+    }
+
+    /// A `.code-workspace` path carrying non-ASCII must survive the JSONC
+    /// strip (#396).
+    ///
+    /// The stripper that used to live in this module walked BYTES and treated
+    /// each as a char, so every multi-byte character was rebuilt as mojibake.
+    /// Nothing errored: the JSON still parsed and the folder simply arrived
+    /// under a mangled name.
+    #[test]
+    fn a_non_ascii_folder_path_survives_the_jsonc_strip() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory whose name needs more than one byte per character, in
+        // three scripts, since the corruption is per byte.
+        for name in [
+            "caf\u{e9}",
+            "\u{4e2d}\u{6587}",
+            "\u{444}\u{430}\u{439}\u{43b}",
+        ] {
+            std::fs::create_dir_all(tmp.path().join(name)).unwrap();
+        }
+        let ws = tmp.path().join("accents.code-workspace");
+        std::fs::write(
+            &ws,
+            "{\n  // a comment, so the stripper definitely runs\n  \"folders\": [\n                 { \"path\": \"caf\u{e9}\" },\n    { \"path\": \"\u{4e2d}\u{6587}\" },\n                 { \"path\": \"\u{444}\u{430}\u{439}\u{43b}\" },\n  ],\n}\n",
+        )
+        .unwrap();
+
+        let roots = parse_workspace_file(&ws).expect("a commented file with accents parses");
+        let names: Vec<String> = roots
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "caf\u{e9}",
+                "\u{4e2d}\u{6587}",
+                "\u{444}\u{430}\u{439}\u{43b}"
+            ],
+            "the folder names must arrive intact rather than as mojibake"
         );
     }
 

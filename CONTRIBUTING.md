@@ -88,7 +88,13 @@ so in a commit message on the branch:
 
 ```text
 doc-removal: src/path/to/file.rs::some_function_name
+doc-removal: src/path/to/file.rs::SomeType::method_name
 ```
+
+The key after the path is the one the gate's own error names: a bare name
+for a free item, or the enclosing `impl` header for a method (`Foo::new`,
+`Display for Foo::fmt`), so a declared removal of one `new` cannot excuse
+another.
 
 The file qualifier matters: an exemption keyed on the bare name would excuse
 every function of that name in every changed file, so a deliberate removal of
