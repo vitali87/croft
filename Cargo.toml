@@ -58,6 +58,13 @@ tree-sitter-bash = "0.25"
 # rustdoc / mdBook's engine; parser only, no HTML output needed.
 # 0.13.4 verified current on crates.io 2026-07-11.
 pulldown-cmark = { version = "0.13", default-features = false }
+# Display width of a char (CJK and most emoji take two cells) for the
+# rendered-log painter and its cell-to-column mapping (#404). Already in the
+# tree transitively via ratatui.
+unicode-width = "0.2"
+# Grapheme boundaries for the same map: ratatui paints by grapheme, so the
+# map must count the way it does. Already in the tree via ratatui.
+unicode-segmentation = "1"
 # NFC normalisation for `croft theme-import` ids: canonically equivalent
 # theme names must mint one id, not two (#407). No transitive weight.
 unicode-normalization = "0.1"

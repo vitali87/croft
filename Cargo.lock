@@ -665,6 +665,8 @@ dependencies = [
  "tui-input",
  "umya-spreadsheet",
  "unicode-normalization",
+ "unicode-segmentation",
+ "unicode-width",
  "ureq 2.12.1",
  "ureq 3.3.0",
  "url",
