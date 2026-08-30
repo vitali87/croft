@@ -1,8 +1,9 @@
 // The welcome panel used to bake `git log` output (`CROFT_RELEASE_COMMITS`)
 // and the repository remote (`CROFT_REPOSITORY_REMOTE`) into the binary at
 // build time. Both are gone: the panel now renders hand-curated release
-// highlights from `src/release_notes.rs` (compiled-in data, zero network,
-// never derived from a forge).
+// highlights from `src/release_notes/<version>.md`, baked in by
+// `bake_release_notes` below (compiled-in data, zero network, never derived
+// from a forge).
 //
 // What IS baked now is build provenance — the short git hash (`-dirty` when
 // the tree has uncommitted changes) and the UTC build time — for `--version`
@@ -26,7 +27,57 @@
 // so the package files that shape the binary (and flip `-dirty`) are
 // re-declared alongside. Outside a git tree nothing is emitted and cargo's
 // default behavior stands.
+/// Bake this version's release highlights into the binary.
+///
+/// One file per version (`src/release_notes/<version>.md`) rather than one
+/// shared file: the CONTENT of two versions' notes never conflicts, only the
+/// file did, and every open pull request had to rebase through it. Five
+/// rebases in one day, plus a hand-agreed version ladder between sessions,
+/// paid for this.
+///
+/// A missing file is a BUILD error rather than an empty panel, keeping the
+/// guarantee the single file gave: a binary always describes itself.
+fn bake_release_notes() {
+    let root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let dir = std::path::Path::new(&root)
+        .join("src")
+        .join("release_notes");
+    let path = dir.join(format!("{version}.md"));
+    // Watch the directory: adding the next version's file must rebuild, and
+    // editing this one must too.
+    println!("cargo:rerun-if-changed={}", dir.display());
+    // The SAME filter `release_notes::parse` applies, not merely "non-blank".
+    // A file holding only a `# 0.1.808` heading is non-blank and parses to
+    // zero highlights, which is an empty panel arriving past the guard that
+    // exists to prevent one.
+    let has_highlight = |text: &str| {
+        text.lines()
+            .map(str::trim)
+            .any(|l| !l.is_empty() && !l.starts_with('#'))
+    };
+    let notes = match std::fs::read_to_string(&path) {
+        Ok(text) if has_highlight(&text) => text,
+        Ok(_) => panic!(
+            "{} carries no highlights (blank, or nothing but headings). Write \
+             this version's highlights there: one per line, each prefixed \
+             `feature:` or `fix:`.",
+            path.display()
+        ),
+        Err(e) => panic!(
+            "{} could not be read ({e}). Every version needs a notes file, so \
+             the welcome panel always describes the binary it is in. Create it \
+             with one highlight per line, each prefixed `feature:` or `fix:`.",
+            path.display()
+        ),
+    };
+    let out =
+        std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("release_notes.md");
+    std::fs::write(&out, notes).expect("write release notes");
+}
+
 fn main() {
+    bake_release_notes();
     let root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     // git discovery walks UP from `-C`, so a crate unpacked inside some
     // unrelated repo (`cargo publish --dry-run` verifying under
