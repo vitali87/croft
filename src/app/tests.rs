@@ -36644,6 +36644,33 @@ fn the_agent_lane_ledger_attributes_writes_and_tracks_review_baselines() {
         "a fresh agent write re-queues the file"
     );
 
+    // A file DELETED after its agent goes idle still leaves the queue: the
+    // row would otherwise point at a file that is not there forever, since
+    // a deleted file generates no later write to clear it.
+    let later = tmp.path().join("later.rs");
+    std::fs::write(&later, "fn c() {}\n").unwrap();
+    let mut later_set = std::collections::BTreeSet::new();
+    later_set.insert(later.clone());
+    assert!(app.attribute_writes_to_working_agents(&later_set));
+    assert!(app.agent_ledger.is_unreviewed(&later));
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Idle,
+    }));
+    std::fs::remove_file(&later).unwrap();
+    assert!(
+        app.attribute_writes_to_working_agents(&later_set),
+        "a deletion is processed with no agent working"
+    );
+    assert!(
+        !app.agent_ledger.is_unreviewed(&later),
+        "the row leaves rather than stranding"
+    );
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+
     // A QUIET agent stops being attributed: only Working counts.
     app.terminals[0].set_agent(Some(crate::agents::AgentLane {
         name: String::from("claude"),

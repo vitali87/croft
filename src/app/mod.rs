@@ -27964,16 +27964,19 @@ impl App {
     }
 
     /// Record each changed file against every working agent, hashing its
-    /// current content. A file that cannot be read (deleted between the
-    /// event and here) is skipped rather than recorded at a stale hash.
+    /// current content. A file that cannot be read right now is skipped
+    /// rather than recorded at a stale hash.
+    ///
+    /// A DELETION is processed whether or not an agent is working: a file
+    /// can be removed after its agent goes idle, and the row would
+    /// otherwise sit in the queue forever pointing at a file that is not
+    /// there (its lane staying visible with it). Only attribution — adding
+    /// or updating a row — needs a working agent to attribute to.
     fn attribute_writes_to_working_agents(
         &mut self,
         changed: &std::collections::BTreeSet<PathBuf>,
     ) -> bool {
         let working = self.working_agents();
-        if working.is_empty() {
-            return false;
-        }
         let mut any = false;
         for path in changed {
             // Only workspace files: an agent editing its own config under
@@ -27984,9 +27987,13 @@ impl App {
                 continue;
             }
             match crate::agent_lane::read_baseline(path) {
-                crate::agent_lane::Baseline::Hash(hash) => {
+                // Attribution needs someone to attribute to; a quiet
+                // agent's pane is no reason to blame it for the user's
+                // own save.
+                crate::agent_lane::Baseline::Hash(hash) if !working.is_empty() => {
                     any |= self.agent_ledger.record_write(path, hash, &working);
                 }
+                crate::agent_lane::Baseline::Hash(_) => {}
                 // The agent deleted it: the row goes, rather than sitting in
                 // the queue forever pointing at a file that is not there.
                 crate::agent_lane::Baseline::Gone => {
