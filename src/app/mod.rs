@@ -18105,6 +18105,8 @@ impl App {
         self.active_test_root = root.clone();
         self.test_worker.set_root(root);
         self.testing.reset();
+        // The build this armed for is being dropped (#373).
+        self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
@@ -18254,9 +18256,9 @@ impl App {
                         self.dap_session = Some(session);
                         self.run_debug.feedback = Some(format!("Debugging test {name}"));
                         self.run_debug.feedback_is_error = false;
-                        self.status = format!(
+                        self.status = self.with_failure_note(format!(
                             "Debugging test {name} — F5 continue · F10 step over · Shift+F5 stop"
-                        );
+                        ));
                         self.reveal_debug_view();
                     }
                     Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
@@ -18331,6 +18333,8 @@ impl App {
         // Re-rooting the Explorer mid-build would otherwise launch the old
         // workspace's binary with the new workspace's cwd and breakpoints.
         if build_root != self.tree.root {
+            // No launch, so nothing will clean up after it (#373).
+            self.disarm_failure_breakpoint();
             self.status = format!(
                 "Test binary for {name} finished, but the workspace changed — debug it again from its workspace"
             );
@@ -37188,6 +37192,7 @@ impl App {
         // Drop any in-flight `cargo test --no-run`: the drain would refuse
         // its root-mismatched binary anyway, but the occupied slot kept
         // refusing NEW debug builds until the stale compile finished.
+        self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();

@@ -12,10 +12,11 @@
 //!   `~/.cargo/registry`, names a file the user cannot usefully break on —
 //!   and a breakpoint there fires on the way in, before the interesting
 //!   state exists. Those are rejected, not offered.
-//! * **The LAST location wins.** Runners print an outer frame after an
-//!   inner one (pytest's traceback ends at the assertion; libtest's panic
-//!   line follows the assertion's own output), so a parser that keeps the
-//!   first match stops at the wrong frame.
+//! * **Which location wins depends on the runner.** libtest prints
+//!   exactly one panic line per failure, before its message, so the FIRST
+//!   is the site — taking the last would let a test asserting on panic
+//!   TEXT hand us a location out of its own diff. pytest and jest nest
+//!   their frames outward-in, so for those the LAST is the assertion.
 
 use std::path::{Path, PathBuf};
 
@@ -141,13 +142,24 @@ fn parse_rust(line: &str) -> Option<FailureSite> {
     // parse as a location.
     let loc = loc.trim();
     let loc = loc.strip_suffix(':').unwrap_or(loc);
+    // Guard the WHOLE location before splitting. Checking only the file
+    // field afterwards let a quoted decoy through: `rsplitn` consumed the
+    // closing quote as the "column", leaving a quote-free file field that
+    // passed every test — while still carrying a colon no real path from
+    // this split ever has.
+    if loc.contains('"') || loc.contains('\'') {
+        return None;
+    }
     let mut parts = loc.rsplitn(3, ':');
     let last = parts.next()?;
     let mid = parts.next()?;
     let head = parts.next();
     match head {
-        // file:line:col
-        Some(file) => site_from(file, mid),
+        // file:line:col — the file field cannot itself hold a colon here,
+        // so one means the split landed inside something that is not a
+        // location at all.
+        Some(file) if !file.contains(':') => site_from(file, mid),
+        Some(_) => None,
         // file:line
         None => site_from(mid, last),
     }
@@ -237,14 +249,31 @@ pub fn is_failure_banner(line: &str, name: &str) -> bool {
     // test between underscore runs.
     let stripped = t.trim_matches(['_', '=', ' ']);
     if (t.starts_with('_') || t.starts_with('=')) && !stripped.is_empty() {
-        // pytest may print `TestClass::test_adds` or a bare function name.
-        let named = stripped.rsplit("::").next().unwrap_or(stripped);
+        // pytest prints `TestClass.test_adds` for class-based tests (a
+        // DOT), `TestClass::test_adds` in a node id, or a bare function
+        // name. Split on both so a `unittest.TestCase` subclass — entirely
+        // idiomatic — is not silently unsupported.
+        let named = stripped
+            .rsplit(['.', ':'])
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(stripped);
         return stripped == name || named == leaf;
     }
     // jest / vitest: `● suite › test name` or `FAIL src/a.test.ts > name`
     if let Some(rest) = t.strip_prefix('\u{25cf}') {
-        let named = rest.rsplit(['>', '\u{203a}']).next().unwrap_or(rest).trim();
+        // Split on jest's own separator only. Splitting on `>` too broke
+        // any test whose TITLE contains one (`handles a > b`), which is
+        // ordinary in a comparison suite.
+        let named = rest.rsplit('\u{203a}').next().unwrap_or(rest).trim();
         return named == name || named == leaf;
+    }
+    // jest/vitest also print `FAIL src/a.test.ts > name` and vitest's `x`.
+    for prefix in ["FAIL ", "\u{d7} "] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let named = rest.rsplit(['\u{203a}', '>']).next().unwrap_or(rest).trim();
+            return named == name || named == leaf;
+        }
     }
     false
 }
@@ -374,6 +403,31 @@ assertion `left == right` failed
         assert_eq!(failure_site(out), site("src/render.rs", 88));
     }
 
+    /// A decoy printed BEFORE the real panic must not win either. The
+    /// first-wins rule fixed the decoy-after case and opened this one:
+    /// any test that prints to stdout before failing (a logging test, a
+    /// snapshot test) can reach it.
+    #[test]
+    fn a_quoted_location_loses_from_either_side() {
+        // Decoy first, real panic after.
+        let out = "\
+running 1 test
+  saw: \"thread 'w' panicked at src/decoy.rs:1:1:\"
+thread 'tests::logs' panicked at src/render.rs:88:9:
+assertion failed";
+        assert_eq!(failure_site(out), site("src/render.rs", 88));
+
+        // Decoy only, with no real panic at all: nothing is offered.
+        let only = "  left: \"thread 'w' panicked at src/decoy.rs:5:1:\"";
+        assert_eq!(failure_site(only), None);
+
+        // And the original direction still holds.
+        let after = "\
+thread 'tests::formats' panicked at src/render.rs:88:9:
+  right: \"thread 'w' panicked at src/other.rs:2:2:\"";
+        assert_eq!(failure_site(after), site("src/render.rs", 88));
+    }
+
     /// Banners, not mentions: libtest reprints every failing name in its
     /// trailing summary, and a name that is a PREFIX of another test's
     /// must not match its block.
@@ -398,6 +452,28 @@ assertion `left == right` failed
         );
         // pytest and jest shapes.
         assert!(is_failure_banner("____ test_adds ____", "test_adds"));
+        // Class-based pytest prints a DOT, and is entirely idiomatic.
+        assert!(is_failure_banner(
+            "____ TestMath.test_adds ____",
+            "tests/test_a.py::TestMath::test_adds"
+        ));
+        assert!(is_failure_banner(
+            "____ TestMath.test_adds ____",
+            "test_adds"
+        ));
+        assert!(!is_failure_banner(
+            "____ TestMath.test_other ____",
+            "test_adds"
+        ));
+        // A vitest title containing `>` is ordinary in a comparison suite.
+        assert!(is_failure_banner(
+            "\u{25cf} sum \u{203a} handles a > b",
+            "handles a > b"
+        ));
+        assert!(is_failure_banner(
+            "FAIL src/sum.test.ts \u{203a} adds",
+            "adds"
+        ));
         assert!(is_failure_banner(
             "\u{25cf} suite \u{203a} test_adds",
             "test_adds"
