@@ -34,6 +34,11 @@ pub struct LaneFile {
     pub current_hash: u64,
     /// How many attributed writes have landed since the last review.
     pub writes_since_review: u32,
+    /// Monotonic sequence of the most recent attributed write, so the lane
+    /// can be ordered by RECENCY. Without it the ordering was by path,
+    /// which put the file an agent touched an hour ago above the one it
+    /// just wrote — the opposite of what a review queue is for.
+    pub last_write_seq: u64,
     /// Another agent was also working when this landed, so the attribution
     /// is ambiguous and is shown as such rather than guessed.
     pub shared: bool,
@@ -51,6 +56,9 @@ impl LaneFile {
 #[derive(Clone, Debug, Default)]
 pub struct AgentLedger {
     lanes: BTreeMap<String, BTreeMap<PathBuf, LaneFile>>,
+    /// Ticks once per recorded write, so every row can be ordered against
+    /// every other regardless of lane.
+    write_seq: u64,
 }
 
 /// Files above this are not hashed: the ledger runs on the frame loop
@@ -142,6 +150,8 @@ impl AgentLedger {
             return false;
         }
         let shared = working.len() > 1;
+        self.write_seq = self.write_seq.saturating_add(1);
+        let seq = self.write_seq;
         let mut changed = false;
         for agent in working {
             let lane = self.lanes.entry(agent.clone()).or_default();
@@ -155,6 +165,7 @@ impl AgentLedger {
                     if entry.current_hash != hash {
                         entry.current_hash = hash;
                         entry.writes_since_review = entry.writes_since_review.saturating_add(1);
+                        entry.last_write_seq = seq;
                         entry.shared |= shared;
                         changed = true;
                     }
@@ -167,6 +178,7 @@ impl AgentLedger {
                             reviewed_hash: None,
                             current_hash: hash,
                             writes_since_review: 1,
+                            last_write_seq: seq,
                             shared,
                         },
                     );
@@ -177,15 +189,27 @@ impl AgentLedger {
         changed
     }
 
-    /// The rows in one agent's lane: everything awaiting review first, then
-    /// the reviewed remainder, each group in path order. (There is no write
-    /// timestamp on a row, so this is not recency ordering.)
+    /// The rows in one agent's lane: everything awaiting review first, most
+    /// recently written first within that group, then the reviewed
+    /// remainder. Recency is what a review queue is ordered by — the file
+    /// the agent just touched is the one you want at the top.
     pub fn lane(&self, agent: &str) -> Vec<&LaneFile> {
         let Some(lane) = self.lanes.get(agent) else {
             return Vec::new();
         };
         let mut rows: Vec<&LaneFile> = lane.values().collect();
-        rows.sort_by(|a, b| (!a.unreviewed(), &a.path).cmp(&(!b.unreviewed(), &b.path)));
+        rows.sort_by(|a, b| {
+            (
+                !a.unreviewed(),
+                std::cmp::Reverse(a.last_write_seq),
+                &a.path,
+            )
+                .cmp(&(
+                    !b.unreviewed(),
+                    std::cmp::Reverse(b.last_write_seq),
+                    &b.path,
+                ))
+        });
         rows
     }
 
@@ -338,6 +362,7 @@ mod tests {
         assert!(!led.is_unreviewed(&p("/w/src/a.rs")));
         let rows = led.lane("claude");
         assert_eq!(rows[0].path, p("/w/src/b.rs"), "unreviewed sorts first");
+        assert!(rows[0].last_write_seq > 0);
         assert_eq!(rows[1].writes_since_review, 0);
 
         // A NEW write to the reviewed file re-queues it: the baseline is
@@ -438,6 +463,31 @@ mod tests {
         assert!(led.forget("claude"));
         assert!(led.agents().is_empty());
         assert!(!led.forget("claude"));
+    }
+
+    /// The queue is ordered by RECENCY, not by path: the file the agent
+    /// just wrote belongs at the top even when its name sorts last.
+    #[test]
+    fn the_lane_lists_the_most_recently_written_file_first() {
+        let mut led = AgentLedger::new();
+        let a = vec![String::from("claude")];
+        led.record_write(&p("/w/a.rs"), 1, &a);
+        led.record_write(&p("/w/z.rs"), 2, &a);
+        assert_eq!(
+            led.lane("claude")[0].path,
+            p("/w/z.rs"),
+            "z.rs was written last, so it heads the queue despite the name"
+        );
+
+        // A new write to the older file moves it back to the top.
+        led.record_write(&p("/w/a.rs"), 3, &a);
+        assert_eq!(led.lane("claude")[0].path, p("/w/a.rs"));
+
+        // Reviewed rows sink below every unreviewed one regardless of when
+        // they were written.
+        led.mark_reviewed("claude", &p("/w/a.rs"), 3);
+        assert_eq!(led.lane("claude")[0].path, p("/w/z.rs"));
+        assert_eq!(led.lane("claude")[1].path, p("/w/a.rs"));
     }
 
     /// A file that cannot be READ right now is not reviewed. Clearing it

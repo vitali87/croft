@@ -51,6 +51,12 @@ pub struct FsDrain {
     /// the ledger asks "what content changed", and a chmod is not a change
     /// a reviewer needs to see.
     pub changed_files: BTreeSet<PathBuf>,
+    /// The watcher reported a RESCAN: it overflowed its queue and events
+    /// were dropped, so `changed_files` is a lower bound rather than the
+    /// whole story (#345). A ledger that quietly showed a short list would
+    /// be telling the reviewer they had seen everything, which is the one
+    /// thing it must never do.
+    pub rescan_dropped_events: bool,
 }
 
 pub struct FsWatch {
@@ -181,14 +187,23 @@ impl FsWatch {
                 Err(_) => continue,
             };
             for ev in events {
+                if ev.event.need_rescan() {
+                    out.rescan_dropped_events = true;
+                }
                 let mutates_content = event_mutates_content(&ev.event.kind);
                 for path in &ev.event.paths {
                     if mutates_content && editor.matches_open_path(path) {
                         out.touched_open_file = true;
                     }
                     // The ledger wants files, not the directories whose
-                    // mtime moved because a file inside them changed.
-                    if mutates_content && !is_path_under_noise_dir(path) && !path.is_dir() {
+                    // mtime moved because a file inside them changed. A
+                    // REMOVED directory needs the event kind to tell it
+                    // apart: `is_dir()` is already false once it is gone.
+                    if mutates_content
+                        && !removes_a_directory(&ev.event.kind)
+                        && !is_path_under_noise_dir(path)
+                        && !path.is_dir()
+                    {
                         out.changed_files.insert(path.clone());
                     }
                     if let Some(dir) = affected_dir_for_event(path, &self.watch_root) {
@@ -579,6 +594,14 @@ impl Drop for FsWatch {
 // UI never joins; `T: Send + 'static` lets the watcher move across the boundary.
 pub(super) fn offload_drop<T: Send + 'static>(value: T) {
     std::thread::spawn(move || drop(value));
+}
+
+/// Whether the event is the removal of a DIRECTORY. After the removal the
+/// path no longer stats as one, so only the kind can say.
+fn removes_a_directory(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    use notify::event::RemoveKind;
+    matches!(kind, EventKind::Remove(RemoveKind::Folder))
 }
 
 fn event_mutates_content(kind: &notify::EventKind) -> bool {

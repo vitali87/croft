@@ -11245,6 +11245,7 @@ impl App {
             // them here would silently give a multi-root workspace an empty
             // review queue for every folder but the first (#345).
             drain.changed_files.extend(d.changed_files);
+            drain.rescan_dropped_events |= d.rescan_dropped_events;
         }
         if drain.dirs_changed {
             self.refresh_git_status_debounced();
@@ -11265,6 +11266,14 @@ impl App {
         // ACTIVE tab is hashed from the content the user is about to see.
         if !drain.changed_files.is_empty() {
             self.attribute_writes_to_working_agents(&drain.changed_files);
+        }
+        // A rescan means the watcher dropped events, so the queue this tick
+        // built is a lower bound. Say so once rather than let a short list
+        // read as a complete one (#345).
+        if drain.rescan_dropped_events && !self.working_agents().is_empty() {
+            self.status = String::from(
+                "File watcher overflowed: some agent changes may be missing from the review queue",
+            );
         }
         let polled = self.poll_filesystem_changes();
         drain.got_any || init_changed || polled
