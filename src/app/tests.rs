@@ -35269,6 +35269,7 @@ fn every_find_bar_title_fits_the_bar_it_is_painted_in() {
     // Written out rather than rebuilt from the code's own format strings on
     // purpose: sharing the construction with the code under test would make
     // any widening agree with itself and pass.
+    /// A title arm: the whole title it must paint, and how to reach it.
     type TitleCase = (&'static str, Box<dyn Fn(&mut EditorFind)>);
 
     let cases: Vec<TitleCase> = vec![
