@@ -54,6 +54,7 @@ The TERMINAL tab is your `$SHELL` on a real PTY, splittable into side-by-side pa
 * **Copy mode:** `Ctrl+Shift+Y` enters copy mode, where vi keys walk the scrollback and `v`/`V`/`Ctrl+V` select by character, line, or rectangular block before `y` copies.
 * **Command history:** `Ctrl+Shift+H` searches a durable command history — every command run under croft, with its directory, exit code, and duration, kept across restarts, filterable to the current directory or failures only, `Enter` typing the pick back at your prompt.
 * **Triggers:** iTerm2-style triggers from `triggers.json` watch the output stream and highlight matches in your colours, post status-bar notices, or capture matching lines into the CAPTURES tab where one click jumps back to the line.
+* **Agent lanes:** a pane whose foreground process is a coding agent (claude, codex, aider, gemini, or a row from `agents.json`) wears `◆ claude` in its name pill with a status glyph — `●` working, `◐` waiting for you, `○` idle — and the status bar shows `◆ 2 agents · 1 waiting` while any is seated; clicking it reveals the waiting pane
 * **Ask about a capture:** in CAPTURES, `n` on a row asks the resident Navigator about that line with the pane rows around it
 * **Broadcast:** `Cmd`/`Ctrl`+`K` `I` broadcasts your typing to every pane at once for multi-server work, behind a confirm popup and with red `⇶` pills marking the receiving panes.
 * **Inline images:** `imgcat` pictures render inline at their output row.

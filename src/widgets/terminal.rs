@@ -445,6 +445,13 @@ pub struct PtyTerminal {
     /// stays native; large ones stay capped so they can't saturate the
     /// ssh pipe and starve input.
     pty_pending_bytes: Arc<AtomicUsize>,
+    /// Epoch millis of the last PTY output byte, stamped by the reader (#344):
+    /// "no output for N seconds" is half of what tells an agent's waiting
+    /// from its working.
+    last_output_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// The coding agent seated in this pane, when the foreground process is
+    /// one (#344), carried between samples so a transition can be told.
+    agent: Option<crate::agents::AgentLane>,
     /// Tracks whether the inner program has enabled DECSET 2004 (bracketed
     /// paste). Sniffed off the byte stream; not all parsers expose it.
     bracketed_paste_enabled: Arc<AtomicBool>,
@@ -1566,6 +1573,16 @@ impl PtyTerminal {
         let pty_dirty_for_thread = pty_dirty.clone();
         let pty_pending_bytes = Arc::new(AtomicUsize::new(0));
         let pty_pending_bytes_for_thread = pty_pending_bytes.clone();
+        // Seeded with the spawn time, not zero: a pane that has not output
+        // yet is quiet since it STARTED, so a just-launched agent reads as
+        // working for its first seconds rather than as idle since 1970.
+        let last_output_ms = Arc::new(std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        ));
+        let last_output_ms_for_thread = last_output_ms.clone();
         let bracketed_paste_enabled = Arc::new(AtomicBool::new(false));
         let bracketed_paste_for_thread = bracketed_paste_enabled.clone();
         let (port_tx, port_rx) = std::sync::mpsc::channel::<crate::port_detect::PortHit>();
@@ -1863,6 +1880,13 @@ impl PtyTerminal {
                         }
                         drop(t);
                         pty_pending_bytes_for_thread.fetch_add(n, Ordering::Relaxed);
+                        last_output_ms_for_thread.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0),
+                            Ordering::Relaxed,
+                        );
                         pty_dirty_for_thread.store(true, Ordering::Release);
                     }
                     Err(_) => break,
@@ -1881,6 +1905,8 @@ impl PtyTerminal {
             term,
             pty_dirty,
             pty_pending_bytes,
+            last_output_ms,
+            agent: None,
             bracketed_paste_enabled,
             port_rx,
             master: pair.master,
@@ -2143,6 +2169,42 @@ impl PtyTerminal {
     /// Set the foreground-process label (from the off-loop refresh).
     pub fn set_auto_label(&mut self, label: String) {
         self.auto_label = label;
+    }
+
+    /// How long since the PTY last produced output; a pane that never has is
+    /// quiet since it was spawned.
+    pub fn quiet_for(&self) -> std::time::Duration {
+        let last = self.last_output_ms.load(Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        std::time::Duration::from_millis(now.saturating_sub(last))
+    }
+
+    /// The agent seated in this pane, if the last sample found one (#344).
+    pub fn agent(&self) -> Option<&crate::agents::AgentLane> {
+        self.agent.as_ref()
+    }
+
+    pub fn set_agent(&mut self, lane: Option<crate::agents::AgentLane>) {
+        self.agent = lane;
+    }
+
+    /// The last `n` non-empty VISIBLE rows, oldest first, for prompt
+    /// matching. Reads the viewport only: the whole scrollback is what
+    /// `grid_lines` walks, and a prompt is on screen or it is not there.
+    pub fn tail_rows(&self, n: usize) -> Vec<String> {
+        let text = self.visible_text();
+        let mut rows: Vec<String> = text
+            .lines()
+            .rev()
+            .filter(|l| !l.trim().is_empty())
+            .take(n)
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        rows.reverse();
+        rows
     }
 
     /// The user's manual pane name, when one was set via rename (what the

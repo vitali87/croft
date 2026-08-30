@@ -64,6 +64,9 @@ pub struct TestingPanel {
     /// Failed case still sits in the tree — the "run failed" marker keys on
     /// this, not on the (possibly stale) failed tally.
     run_reported_failed: bool,
+    /// A run just ended red; consumed once by the app (#358), so a failing
+    /// run notifies once, not once per test.
+    failed_run: bool,
     /// Latest cargo build-status line while busy (e.g. "Compiling ratatui"), so
     /// a long compile shows movement instead of a static "Discovering tests".
     progress: Option<String>,
@@ -97,6 +100,7 @@ impl TestingPanel {
             activity: Activity::Idle,
             last_run_ok: None,
             run_reported_failed: false,
+            failed_run: false,
             progress: None,
             refused: false,
             prerun: Vec::new(),
@@ -122,6 +126,7 @@ impl TestingPanel {
         self.activity = activity;
         self.last_run_ok = None;
         self.run_reported_failed = false;
+        self.failed_run = false;
         self.progress = None;
         self.scroll = 0;
     }
@@ -135,6 +140,7 @@ impl TestingPanel {
         self.activity = Activity::Idle;
         self.last_run_ok = None;
         self.run_reported_failed = false;
+        self.failed_run = false;
         self.progress = None;
         // The refusal latch and rollback snapshot belong to the old
         // workspace; carrying either across a re-root would surface a stale
@@ -156,6 +162,7 @@ impl TestingPanel {
         self.activity = Activity::Running;
         self.progress = None;
         self.run_reported_failed = false;
+        self.failed_run = false;
         // Snapshot the pre-run status (None = about to be inserted) so a
         // worker refusal can put the tree back exactly.
         let old = self.cases.iter().find(|c| c.name == name).map(|c| c.status);
@@ -174,6 +181,7 @@ impl TestingPanel {
         self.activity = Activity::Running;
         self.progress = None;
         self.run_reported_failed = false;
+        self.failed_run = false;
         // Snapshot each selected case's pre-run status for a refusal rollback.
         self.prerun = Vec::new();
         for c in &mut self.cases {
@@ -244,6 +252,22 @@ impl TestingPanel {
         if ok.is_some() {
             self.last_run_ok = ok;
         }
+        if ok == Some(false) {
+            self.failed_run = true;
+        }
+    }
+
+    /// Consume the failed-run latch (one notification per red run). Cleared
+    /// wherever `run_reported_failed` is, so a red that was never consumed
+    /// (a re-root, a new run) cannot fire against a different run's counts.
+    pub fn take_failed_run(&mut self) -> bool {
+        std::mem::take(&mut self.failed_run)
+    }
+
+    /// Whether the last run reported any case at all. False after a compile
+    /// error or a runner that died, when the tally is meaningless.
+    pub fn run_reported_failed(&self) -> bool {
+        self.run_reported_failed
     }
 
     /// The worker refused a queued request because no enabled runner claims
@@ -305,7 +329,7 @@ impl TestingPanel {
             .count()
     }
 
-    fn counts(&self) -> (usize, usize, usize) {
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
         let mut passed = 0;
         let mut failed = 0;
         let mut skipped = 0;
@@ -743,6 +767,29 @@ mod tests {
             status: TestStatus::NotRun,
         });
         assert_eq!(p.failed_count(), 0);
+    }
+
+    /// The failed-run latch (#358) fires once per red run and never for a
+    /// run that was superseded before the tick consumed it.
+    #[test]
+    fn the_failed_run_latch_fires_once_and_is_cleared_by_a_new_run() {
+        let mut p = TestingPanel::new();
+        assert!(!p.take_failed_run(), "nothing has run");
+        p.on_finished(Some(false));
+        assert!(p.take_failed_run(), "a red run latches");
+        assert!(!p.take_failed_run(), "and is consumed once");
+        p.on_finished(Some(true));
+        assert!(!p.take_failed_run(), "a green run does not latch");
+        p.on_finished(None);
+        assert!(!p.take_failed_run(), "discovery does not latch");
+        // A red run superseded before the tick drained it: a re-root or a
+        // new run clears it, the way the refusal latch is cleared.
+        p.on_finished(Some(false));
+        p.reset();
+        assert!(!p.take_failed_run(), "reset clears the latch");
+        p.on_finished(Some(false));
+        p.on_busy_started(Activity::Running);
+        assert!(!p.take_failed_run(), "a new run clears the latch");
     }
 
     #[test]

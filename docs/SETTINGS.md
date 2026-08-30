@@ -87,7 +87,7 @@ allowlist — appearance and editor/terminal behavior:
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `explorer_views`.
 
 Everything else — `disabled_extensions`, `mcp_consented`,
-`mcp_tool_fingerprints`, `host_accents`, and any future key not explicitly
+`mcp_tool_fingerprints`, `host_accents`, `notifications`, and any future key not explicitly
 allowlisted — is ignored from workspace layers with a visible warning.
 Extending the allowlist is a deliberate review decision, not a default.
 
@@ -119,3 +119,33 @@ set them.
 
 The mapped values sit **below** `.croft/config.json` in the chain, so a
 croft-native workspace file always wins over the VS Code one.
+
+## Notification sinks
+
+A `notifications` list forwards events croft already notices to somewhere
+you will see them away from the terminal (#358). Each entry names a sink
+and, optionally, which events it takes:
+
+```json
+{
+  "notifications": [
+    { "kind": "ntfy", "topic": "my-croft", "events": ["command_finished", "tests_failed"], "min_duration_secs": 30 },
+    { "kind": "webhook", "url": "https://hooks.example.org/croft", "headers": { "authorization": "Bearer …" } },
+    { "kind": "termux" },
+    { "kind": "command", "argv": ["/usr/bin/osascript", "-e", "display notification (system attribute \"CROFT_BODY\")"] }
+  ]
+}
+```
+
+Events are `command_finished` (a command in a pane you are not focused on,
+lasting at least `min_duration_secs`, default 10), `tests_failed` (once per
+red Test Explorer run), `osc9` (a terminal's own notification), and
+`agent_waiting` (reserved for #344). An empty `events` takes all of them.
+`ntfy` posts to `server` (default `https://ntfy.sh`) under `topic`; both `ntfy` and `webhook` endpoints must be `https`, or `http` only to localhost — a plain-http endpoint across a network is refused and named in the channel;
+`webhook` posts JSON `{event, title, body, workspace, host, link}` with your
+`headers`; `termux` runs `termux-notification`; `command` runs `argv` with
+the notification in `CROFT_TITLE`, `CROFT_BODY`, `CROFT_LINK`, and
+`CROFT_EVENT`. Delivery is off the render path on one worker with a bounded
+queue and one retry for transient failures; what finally fails appears in
+the **Notifications** OUTPUT channel, naming only a URL's host. The key is
+user-config only, and a webhook's headers belong in `config.local.json`.

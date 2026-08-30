@@ -971,6 +971,17 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
     for (key, command) in &report.keybindings {
         println!("  {key} -> {command}");
     }
+    if let Some(theme) = &report.theme {
+        println!(
+            "\nworkbench.colorTheme {:?} converts to croft theme {:?} (from {})",
+            theme.label,
+            theme.converted.id,
+            theme.path.display()
+        );
+        for note in &theme.converted.notes {
+            println!("  - {note}");
+        }
+    }
     if !report.unmapped_settings.is_empty() {
         println!(
             "\n{} setting{} croft has no equivalent for:",
@@ -993,6 +1004,43 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
     }
     for warning in &report.warnings {
         println!("  warning: {warning}");
+    }
+
+    // Extensions (#352): what VS Code has installed, plus what the current
+    // directory's workspace recommends, against croft's table. Read-only;
+    // installing a croft equivalent is a click in the Extensions panel.
+    let mut ids = crate::vscode_extensions::installed_via_code();
+    let listed = !ids.is_empty();
+    if let Ok(cwd) = std::env::current_dir() {
+        ids.extend(crate::vscode_extensions::workspace_recommendations(&cwd));
+    }
+    let compared = crate::vscode_extensions::compare(ids);
+    if !compared.is_empty() {
+        println!(
+            "\n{} VS Code extension{} ({}):",
+            compared.len(),
+            plural(compared.len()),
+            if listed {
+                "installed, plus this workspace's recommendations"
+            } else {
+                "this workspace's recommendations; `code` is not on PATH"
+            }
+        );
+        for row in &compared {
+            use crate::vscode_extensions::Status;
+            let what = match row.mapping {
+                Some(m) if m.status == Status::Builtin => {
+                    format!("built in ({}): {}", m.croft, m.note)
+                }
+                Some(m) if m.status == Status::Installable => {
+                    format!("installable ({}): {}", m.croft, m.note)
+                }
+                Some(m) => format!("no equivalent: {}", m.note),
+                None => String::from("no equivalent: not in croft's table"),
+            };
+            println!("  {} -> {what}", row.id);
+        }
+        println!("  Open the Extensions panel (Cmd+Shift+X) to add an installable one.");
     }
 
     if dry_run {
