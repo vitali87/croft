@@ -61,5 +61,5 @@ pub struct ReleaseNote {
 /// What shipped in the current release. Replace on every version bump.
 pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
     kind: NoteKind::Feature,
-    summary: "croft theme-import turns a VS Code colour theme (.json) into a croft theme: workbench chrome, the 16 terminal colours, and the code palette, with a note for every colour croft had to derive because the theme did not name it.",
+    summary: "The Extensions panel gains a FROM VS CODE group: the workspace's recommended extensions, and (via Extensions: Compare with VS Code) the ones you have installed, each with what croft has built in, can install, or lacks.",
 }];

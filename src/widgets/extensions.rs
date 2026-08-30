@@ -177,12 +177,22 @@ pub struct ExtensionItem {
     /// a hand-dropped user manifest). Set by the app, which owns catalog
     /// knowledge; drives the per-row trash button and the Delete handler.
     pub removable: bool,
+    /// A VS Code extension the workspace recommends or the user has installed
+    /// (#352), shown under FROM VS CODE with what croft has for it. `id` is
+    /// the marketplace id, not a croft extension.
+    pub vscode: bool,
+    /// For a FROM VS CODE row whose equivalent is a catalog entry: the croft
+    /// id to install when the user clicks Add. Everything else has none.
+    pub install: Option<String>,
 }
 
 impl ExtensionItem {
-    /// Section rank: BUILT-IN (0) before INSTALLED (1) before AVAILABLE (2).
+    /// Section rank: BUILT-IN (0) before INSTALLED (1) before AVAILABLE (2)
+    /// before FROM VS CODE (3).
     fn group_rank(&self) -> u8 {
-        if self.available {
+        if self.vscode {
+            3
+        } else if self.available {
             2
         } else if self.builtin {
             0
@@ -211,6 +221,8 @@ pub fn items_from_summaries(
             builtin: s.builtin,
             available: false,
             removable: false,
+            vscode: false,
+            install: None,
         })
         .collect()
 }
@@ -228,6 +240,45 @@ pub fn items_from_available(summaries: Vec<ExtensionSummary>) -> Vec<ExtensionIt
             builtin: false,
             available: true,
             removable: false,
+            vscode: false,
+            install: None,
+        })
+        .collect()
+}
+
+/// Project VS Code extensions onto FROM VS CODE rows: the marketplace id as
+/// the name, and what croft has for it as the blurb. An installable one
+/// carries the catalog id its Add installs and reports as `available` so the
+/// toggle path treats it as an add; the rest have no control at all.
+pub fn items_from_vscode(rows: &[crate::vscode_extensions::Comparison]) -> Vec<ExtensionItem> {
+    use crate::vscode_extensions::Status;
+    rows.iter()
+        .map(|row| {
+            let (description, install) = match row.mapping {
+                Some(m) if m.status == Status::Builtin => {
+                    (format!("built in: {} \u{2014} {}", m.croft, m.note), None)
+                }
+                Some(m) if m.status == Status::Installable => (
+                    format!("install {}: {}", m.croft, m.note),
+                    Some(m.croft.to_string()),
+                ),
+                Some(m) => (format!("no equivalent \u{2014} {}", m.note), None),
+                None => (
+                    String::from("no equivalent \u{2014} not in croft's table"),
+                    None,
+                ),
+            };
+            ExtensionItem {
+                id: row.id.clone(),
+                name: row.id.clone(),
+                description,
+                builtin: false,
+                enabled: false,
+                available: install.is_some(),
+                removable: false,
+                vscode: true,
+                install,
+            }
         })
         .collect()
 }
@@ -351,6 +402,23 @@ impl ExtensionsPanel {
         if self.scroll > self.selected {
             self.scroll = self.selected;
         }
+    }
+
+    /// The rows as last set, for callers that want to read the projection back.
+    pub fn items(&self) -> &[ExtensionItem] {
+        &self.items
+    }
+
+    /// The selected row itself.
+    pub fn selected_item(&self) -> Option<&ExtensionItem> {
+        let visible = self.visible_indices();
+        visible.get(self.selected).map(|&i| &self.items[i])
+    }
+
+    /// For a FROM VS CODE row with an installable equivalent, the croft
+    /// catalog id its Add installs; `None` for every other row.
+    pub fn selected_install_target(&self) -> Option<&str> {
+        self.selected_item().and_then(|it| it.install.as_deref())
     }
 
     pub fn selected_id(&self) -> Option<&str> {
@@ -637,7 +705,8 @@ impl Widget for &mut ExtensionsPanel {
                 let label = match item.group_rank() {
                     0 => "BUILT-IN",
                     1 => "INSTALLED",
-                    _ => "AVAILABLE",
+                    2 => "AVAILABLE",
+                    _ => "FROM VS CODE",
                 };
                 put(
                     buf,
@@ -711,9 +780,11 @@ impl Widget for &mut ExtensionsPanel {
                     .bg(row_bg.unwrap_or(Color::Reset))
                     .add_modifier(Modifier::BOLD);
                 put(buf, sw_x, y, right, "+Add", add_style);
-            } else {
+            } else if !item.vscode {
                 draw_switch(buf, sw_x, y, item.enabled, row_bg, &pal);
             }
+            // A FROM VS CODE row with nothing to install has no control: the
+            // blurb is the whole answer.
 
             // Removable (catalog) rows get a visible trash button just left of
             // the switch, so a mouse user has an uninstall control without the
@@ -777,6 +848,78 @@ mod tests {
         );
     }
 
+    /// FROM VS CODE rows (#352) sort after AVAILABLE under their own header;
+    /// only an installable one carries an "+Add" control, and it reports the
+    /// croft catalog id to install rather than its own (VS Code) id.
+    #[test]
+    fn from_vscode_rows_sort_last_and_only_installable_ones_offer_add() {
+        let mut panel = ExtensionsPanel::new();
+        let mut its = items();
+        its.extend(items_from_vscode(&[
+            crate::vscode_extensions::Comparison {
+                id: "rust-lang.rust-analyzer".into(),
+                mapping: Some(&crate::vscode_extensions::Mapping {
+                    vscode: "rust-lang.rust-analyzer",
+                    croft: "lsp-rust",
+                    status: crate::vscode_extensions::Status::Builtin,
+                    note: "rust-analyzer ships built in",
+                }),
+            },
+            crate::vscode_extensions::Comparison {
+                id: "acme.fetcher".into(),
+                mapping: Some(&crate::vscode_extensions::Mapping {
+                    vscode: "acme.fetcher",
+                    croft: "mcp-fetch",
+                    status: crate::vscode_extensions::Status::Installable,
+                    note: "the Web Fetch MCP server",
+                }),
+            },
+            crate::vscode_extensions::Comparison {
+                id: "nobody.nothing".into(),
+                mapping: None,
+            },
+        ]));
+        panel.set_items(its);
+        let (_buf, text) = render(&mut panel, 60, 30);
+        assert!(text.contains("FROM VS CODE"), "section header:\n{text}");
+        assert!(
+            text.contains("built in"),
+            "the builtin row says so:\n{text}"
+        );
+        assert!(
+            text.contains("no equivalent"),
+            "the unknown row says so:\n{text}"
+        );
+        assert_eq!(
+            text.matches("+Add").count(),
+            1,
+            "only the installable row offers Add:\n{text}"
+        );
+
+        let order = panel.visible_indices();
+        let tail: Vec<&str> = order[order.len() - 3..]
+            .iter()
+            .map(|&i| panel.items[i].id.as_str())
+            .collect();
+        assert_eq!(
+            tail,
+            ["rust-lang.rust-analyzer", "acme.fetcher", "nobody.nothing"]
+        );
+
+        for _ in 0..4 {
+            panel.move_down();
+        }
+        assert_eq!(panel.selected_id(), Some("acme.fetcher"));
+        assert_eq!(panel.selected_install_target(), Some("mcp-fetch"));
+        panel.move_up();
+        assert_eq!(panel.selected_id(), Some("rust-lang.rust-analyzer"));
+        assert_eq!(
+            panel.selected_install_target(),
+            None,
+            "a built-in row installs nothing"
+        );
+    }
+
     #[test]
     fn removable_row_shows_a_trash_button_and_only_its_zone_uninstalls() {
         let mut panel = ExtensionsPanel::new();
@@ -789,6 +932,8 @@ mod tests {
             enabled: true,
             available: false,
             removable: true,
+            vscode: false,
+            install: None,
         });
         panel.set_items(its);
         let (_buf, text) = render(&mut panel, 40, 24);
@@ -835,6 +980,8 @@ mod tests {
                 enabled: true,
                 available: false,
                 removable: false,
+                vscode: false,
+                install: None,
             },
             ExtensionItem {
                 id: "csv".into(),
@@ -844,6 +991,8 @@ mod tests {
                 enabled: false,
                 available: false,
                 removable: false,
+                vscode: false,
+                install: None,
             },
             ExtensionItem {
                 id: "vim".into(),
@@ -853,6 +1002,8 @@ mod tests {
                 enabled: true,
                 available: false,
                 removable: false,
+                vscode: false,
+                install: None,
             },
         ]
     }

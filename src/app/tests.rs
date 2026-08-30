@@ -35228,3 +35228,26 @@ fn a_log_that_paints_nothing_publishes_no_body_rect() {
          mouse path to hit-test against"
     );
 }
+
+/// #352: a workspace's `.vscode/extensions.json` recommendations appear in the
+/// Extensions panel under FROM VS CODE with what croft has for each.
+#[test]
+fn workspace_extension_recommendations_show_under_from_vscode() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode").join("extensions.json"),
+        r#"{ "recommendations": ["rust-lang.rust-analyzer", "nobody.nothing"] }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.refresh_extensions();
+    let ids: Vec<String> = app
+        .extensions
+        .items()
+        .iter()
+        .filter(|i| i.vscode)
+        .map(|i| i.id.clone())
+        .collect();
+    assert_eq!(ids, ["rust-lang.rust-analyzer", "nobody.nothing"]);
+}
