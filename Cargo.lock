@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "croft-software"
-version = "0.1.812"
+version = "0.1.810"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -616,6 +616,7 @@ dependencies = [
  "image",
  "libc",
  "lsp-types",
+ "memchr",
  "notify",
  "notify-debouncer-full",
  "plist",
