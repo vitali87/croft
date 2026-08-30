@@ -230,9 +230,10 @@ fn load_chain(path: &Path, depth: usize, out: &mut Vec<RawTheme>) -> Result<()> 
 
 /// Parse one theme document, tolerating VS Code's JSONC extras.
 fn parse_theme(raw: &str) -> Result<RawTheme> {
-    // `crate::tasks::strip_jsonc` walks CHARS. The `workspace.rs` one walks
-    // bytes and turns a non-ASCII theme name ("Caf\u{e9} Noir") into mojibake,
-    // which is exactly the sort of theme most likely to carry one.
+    // `crate::tasks::strip_jsonc` walks CHARS. The copy that used to live in
+    // `workspace.rs` walked bytes and turned a non-ASCII theme name
+    // ("Caf\u{e9} Noir") into mojibake (#396); it was deleted in favour of
+    // this one, which is why there is only ever one of these.
     let stripped = crate::tasks::strip_jsonc(raw);
     let value: serde_json::Value = serde_json::from_str(&stripped)?;
     // `tokenColors` is camelCase in the file; take it by hand rather than
@@ -1178,10 +1179,11 @@ mod tests {
         );
     }
 
-    /// Review finding: the byte-walking `strip_jsonc` in `workspace.rs`
-    /// turned every non-ASCII character into mojibake, so a theme called
-    /// "Caf\u{e9} Noir" imported under a mangled name. The chars-based
-    /// stripper in `tasks.rs` is the right one.
+    /// Review finding: the byte-walking `strip_jsonc` that used to live in
+    /// `workspace.rs` turned every non-ASCII character into mojibake, so a
+    /// theme called "Caf\u{e9} Noir" imported under a mangled name. It was
+    /// deleted for the chars-based stripper in `tasks.rs` (#396); this pins
+    /// that the theme path keeps using the right one.
     #[test]
     fn a_non_ascii_theme_name_survives_the_jsonc_strip() {
         let src = r##"{
