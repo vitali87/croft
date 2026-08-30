@@ -21690,9 +21690,9 @@ fn dark_blue_theme_terminal_button_keeps_navy_chip() {
     assert_eq!(buf[(add.x + 1, add.y)].bg, navy);
 }
 
-/// A long fixed note for the welcome-card tests: RELEASE_NOTES is replaced
-/// every version bump, so pinning against the live note would let a future
-/// one-line note quietly gut these tests. The distinctive final word is the
+/// A long fixed note for the welcome-card tests: the live notes are rewritten
+/// every version bump (`src/release_notes/<version>.md`), so pinning against
+/// them would let a future one-line note quietly gut these tests. The distinctive final word is the
 /// clip detector.
 fn long_test_note() -> Vec<crate::release_notes::ReleaseNote> {
     vec![crate::release_notes::ReleaseNote {

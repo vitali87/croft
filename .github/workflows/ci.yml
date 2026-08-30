@@ -65,8 +65,25 @@ jobs:
             echo "::error file=Cargo.toml::This PR changes shipped files but the version is still $old. Bump it (base: $old, head: $new) - two binaries must never share a version and differ only in commit hash."
             fail=1
           fi
-          if ! printf '%s\n' "$changed" | grep -qx 'src/release_notes.rs'; then
-            echo '::error file=src/release_notes.rs::This PR changes shipped files but src/release_notes.rs is untouched. REPLACE the "IN THIS RELEASE" highlights so the welcome panel describes this version.'
+          # One notes file per version (#399): the check is that THIS version's
+          # file exists and says something, not that a shared file was touched.
+          # Two PRs adding different versions' notes then never collide.
+          notes="src/release_notes/$new.md"
+          if ! git cat-file -e "HEAD:$notes" 2>/dev/null; then
+            echo "::error file=$notes::This PR changes shipped files but $notes does not exist. Write this version's highlights there, one per line, each prefixed 'feature:' or 'fix:', so the welcome panel describes the binary it is in."
+            fail=1
+          elif [ -z "$(git show "HEAD:$notes" | tr -d '[:space:]')" ]; then
+            echo "::error file=$notes::$notes is empty. Write this version's highlights there, one per line, each prefixed 'feature:' or 'fix:'."
+            fail=1
+          fi
+          # A shipped release describes itself and nothing else: editing an
+          # older version's notes rewrites what a binary already out there
+          # claims to be.
+          stale="$(printf '%s\n' "$changed" | grep -E '^src/release_notes/[0-9.]+\.md$' | grep -v "^$notes$" || true)"
+          if [ -n "$stale" ]; then
+            echo "Notes for other versions were modified:"
+            printf '  %s\n' $stale
+            echo "::error::A release's notes describe that release. Only $notes may change in this PR."
             fail=1
           fi
           exit $fail
