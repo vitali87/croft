@@ -36885,14 +36885,19 @@ fn debugging_a_test_breaks_at_its_last_failure_and_cleans_up_after() {
         Some(true),
         "the assertion's line carries a breakpoint the user never set"
     );
+    // The note rides on whichever launch message the user actually sees:
+    // setting it as the status here would be overwritten moments later.
     assert!(
-        app.status.contains("breaking where it failed"),
+        app.with_failure_note(String::from("Building"))
+            .contains("breaking at lib.rs:3 where it last failed"),
         "{}",
-        app.status
+        app.with_failure_note(String::from("Building"))
     );
 
-    // Disarming takes back exactly that one, leaving no empty entry.
+    // Disarming takes back exactly that one, leaving no empty entry, and
+    // drops the note with it.
     app.disarm_failure_breakpoint();
+    assert_eq!(app.with_failure_note(String::from("Building")), "Building");
     assert!(
         app.editor.breakpoints.is_empty(),
         "the temporary breakpoint does not outlive its session"
@@ -36938,4 +36943,74 @@ fn debugging_a_test_breaks_at_its_last_failure_and_cleans_up_after() {
         crate::widgets::command_palette::ALL_COMMANDS
             .contains(&crate::widgets::command_palette::Command::DebugTestAtCursor)
     );
+}
+
+/// #373: the site must be found in AUTHENTIC runner output, summary and
+/// all. libtest reprints every failing test's name in a trailing
+/// `failures:` block, so a scan anchored on "the last line mentioning the
+/// name" lands after every stdout block and finds nothing — the feature
+/// silently does nothing for the ecosystem it was written for. This is
+/// the regression test for that.
+#[test]
+fn the_failure_site_survives_a_whole_cargo_test_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "a\nb\nc\n").unwrap();
+    std::fs::write(tmp.path().join("src/other.rs"), "x\ny\nz\n").unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    crate::output::clear(crate::output::CHANNEL_TESTS);
+    for line in [
+        "   Compiling demo v0.1.0",
+        "    Finished test profile [unoptimized + debuginfo]",
+        "     Running unittests src/lib.rs",
+        "",
+        "running 2 tests",
+        "test tests::adds_two ... FAILED",
+        "test tests::adds ... FAILED",
+        "",
+        "failures:",
+        "",
+        "---- tests::adds_two stdout ----",
+        "thread 'tests::adds_two' panicked at src/other.rs:2:5:",
+        "assertion `left == right` failed",
+        "",
+        "---- tests::adds stdout ----",
+        "thread 'tests::adds' panicked at src/lib.rs:3:5:",
+        "assertion failed: false",
+        "note: run with `RUST_BACKTRACE=1` to display a backtrace",
+        "",
+        "failures:",
+        "    tests::adds",
+        "    tests::adds_two",
+        "",
+        "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured",
+    ] {
+        crate::output::push(
+            crate::output::CHANNEL_TESTS,
+            crate::output::OutputLevel::Info,
+            line,
+        );
+    }
+
+    // The trailing summary must not swallow the block, and each test must
+    // get ITS OWN assertion — not the other's.
+    let adds = app
+        .failure_site_of("tests::adds")
+        .expect("the site survives the summary that follows every block");
+    assert_eq!(
+        (adds.file.to_string_lossy().into_owned(), adds.line),
+        (String::from("src/lib.rs"), 3)
+    );
+    let two = app
+        .failure_site_of("tests::adds_two")
+        .expect("and so does the other test's");
+    assert_eq!(
+        (two.file.to_string_lossy().into_owned(), two.line),
+        (String::from("src/other.rs"), 2),
+        "a name that is a PREFIX of another must not borrow its block"
+    );
+
+    // And a test that did not fail has no block at all.
+    assert!(app.failure_site_of("tests::passes").is_none());
 }

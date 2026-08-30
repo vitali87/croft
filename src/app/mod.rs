@@ -2980,6 +2980,9 @@ pub struct App {
     /// that silently left breakpoints behind would be worse than one that
     /// set none.
     debug_temp_breakpoint: Option<(PathBuf, usize)>,
+    /// Human-readable note about that breakpoint, folded into whichever
+    /// launch message the user actually ends up seeing.
+    debug_temp_note: Option<String>,
     /// Per-agent ledger of files changed while an agent was working (#345),
     /// and the review baselines that decide which of them still need a
     /// look.
@@ -4477,6 +4480,7 @@ impl App {
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
             debug_temp_breakpoint: None,
+            debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
             problems_fix_started: None,
             http_run: None,
@@ -18269,10 +18273,14 @@ impl App {
                 self.start_test_binary_build(root, name, source);
             }
             Some(crate::testing::worker::Runner::Vitest | crate::testing::worker::Runner::Jest) => {
+                // No session will start, so the armed breakpoint has nothing
+                // to be cleaned up by (#373).
+                self.disarm_failure_breakpoint();
                 self.status =
                     String::from("Debugging JS tests is not wired yet — the play glyph runs them");
             }
             None => {
+                self.disarm_failure_breakpoint();
                 self.status = String::from("No test runner detected in this workspace");
             }
         }
@@ -18285,10 +18293,12 @@ impl App {
     /// it. The drain launches the debugger when the binary arrives.
     fn start_test_binary_build(&mut self, root: PathBuf, name: String, source: Option<PathBuf>) {
         if self.pending_test_debug.is_some() {
+            // The launch this armed for is not happening (#373).
+            self.disarm_failure_breakpoint();
             self.status = String::from("A test binary is already building");
             return;
         }
-        self.status = format!("Building test binary for {name}");
+        self.status = self.with_failure_note(format!("Building test binary for {name}"));
         let (tx, rx) = std::sync::mpsc::channel();
         {
             let name = name.clone();
@@ -18996,6 +19006,10 @@ impl App {
     /// silently whenever the user is looking at any other sidebar — which read
     /// as "F5 does nothing" on a remote with no debug adapter installed.
     fn debug_error(&mut self, msg: String) {
+        // A launch that never happened leaves no session to clean up after,
+        // so any breakpoint croft armed for it comes out here (#373) —
+        // otherwise it survives in the editor as if the user had set it.
+        self.disarm_failure_breakpoint();
         self.run_debug.feedback = Some(msg.clone());
         self.run_debug.feedback_is_error = true;
         self.status = msg;
@@ -19205,22 +19219,24 @@ impl App {
     /// starts at the runner's "failures:"-style banner for this test and
     /// ends at the next test's banner.
     fn failure_site_of(&self, name: &str) -> Option<crate::testing::failure_site::FailureSite> {
+        use crate::testing::failure_site::is_failure_banner;
         let lines = crate::output::snapshot(crate::output::CHANNEL_TESTS)?;
-        let leaf = name.rsplit("::").next().unwrap_or(name);
-        // Walk backwards to the most recent block naming this test, so a
-        // re-run's output wins over an earlier one in the same channel.
         let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
-        let start = texts
-            .iter()
-            .rposition(|t| t.contains(name) || t.contains(leaf))?;
-        // The block runs to the next line naming a DIFFERENT test, or to
-        // the end of the channel.
+        // Walk backwards to the most recent BANNER for this test, so a
+        // re-run's output wins over an earlier one in the same channel.
+        // Anchoring on the banner rather than on any mention is what makes
+        // this work against real output: libtest reprints every failing
+        // name in its trailing `failures:` summary, so "the last line
+        // mentioning the name" lands after every block and finds nothing.
+        let start = texts.iter().rposition(|t| is_failure_banner(t, name))?;
+        // The block runs to the next test's banner, or to the end.
         let end = texts[start + 1..]
             .iter()
             .position(|t| {
-                (t.starts_with("---- ") || t.starts_with("test "))
-                    && !t.contains(name)
-                    && !t.contains(leaf)
+                (t.trim_start().starts_with("---- ")
+                    || t.trim_start().starts_with('_')
+                    || t.trim_start().starts_with('\u{25cf}'))
+                    && !is_failure_banner(t, name)
             })
             .map(|i| start + 1 + i)
             .unwrap_or(texts.len());
@@ -19250,18 +19266,31 @@ impl App {
             return;
         }
         self.debug_temp_breakpoint = Some((file.clone(), line));
-        self.status = format!(
-            "Debugging {name}, breaking where it failed: {}:{line}",
+        // Recorded for the caller to append to whatever message it shows:
+        // setting `status` here would be overwritten moments later by the
+        // launch's own ("Building test binary…"), so the user would never
+        // learn a breakpoint had been set for them.
+        self.debug_temp_note = Some(format!(
+            "breaking at {}:{line} where it last failed",
             file.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default()
-        );
+        ));
+    }
+
+    /// Append the armed-breakpoint note to `msg`, if one was armed (#373).
+    fn with_failure_note(&self, msg: String) -> String {
+        match &self.debug_temp_note {
+            Some(note) => format!("{msg} — {note}"),
+            None => msg,
+        }
     }
 
     /// Remove the breakpoint [`Self::arm_failure_breakpoint`] set, if it is
     /// still ours. The user may have removed it themselves mid-session, in
     /// which case there is nothing to take back.
     fn disarm_failure_breakpoint(&mut self) {
+        self.debug_temp_note = None;
         let Some((file, line)) = self.debug_temp_breakpoint.take() else {
             return;
         };
