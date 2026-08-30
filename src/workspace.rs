@@ -247,10 +247,8 @@ pub fn parse_workspace_file(path: &Path) -> Result<Vec<PathBuf>, String> {
     // so a workspace folder named "Caf\u{e9} Noir" arrived as "CafÃ© Noir"
     // with no error anywhere: the JSON still parsed (#396).
     //
-    // The two agreed on all eleven JSONC shapes probed (line and block
-    // comments, trailing commas in objects and arrays, comment markers inside
-    // strings, escaped quotes, CRLF, empty input) and differed on exactly the
-    // three non-ASCII ones, so this is the same behaviour minus the defect.
+    // The two treat comments, trailing commas and string literals alike, so
+    // the swap changes what happens to non-ASCII input and nothing else.
     let stripped = crate::tasks::strip_jsonc(&raw);
     let v: serde_json::Value =
         serde_json::from_str(&stripped).map_err(|e| format!("parse {}: {e}", path.display()))?;
@@ -542,7 +540,7 @@ mod tests {
     /// under a mangled name.
     #[test]
     fn a_non_ascii_folder_path_survives_the_jsonc_strip() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
         // A directory whose name needs more than one byte per character, in
         // three scripts, since the corruption is per byte.
         for name in [
