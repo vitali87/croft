@@ -86,8 +86,14 @@ pub fn ask_prompt(
         .map(|row| mask(row))
         .collect::<Vec<_>>()
         .join("\n");
+    // The marker counts against the budget, so the excerpt never exceeds it.
+    const CUT: &str = "\n[excerpt cut]";
     if excerpt.chars().count() > ASK_CONTEXT_CHARS {
-        excerpt = excerpt.chars().take(ASK_CONTEXT_CHARS).collect::<String>() + "\n[excerpt cut]";
+        excerpt = excerpt
+            .chars()
+            .take(ASK_CONTEXT_CHARS - CUT.chars().count())
+            .collect::<String>()
+            + CUT;
     }
     (instruction, excerpt)
 }
@@ -335,7 +341,10 @@ mod tests {
         let long: Vec<String> = vec!["x".repeat(ASK_CONTEXT_CHARS * 2)];
         let (_, cut) = ask_prompt(&entry, &long, |t| t.to_string());
         assert!(cut.ends_with("[excerpt cut]"));
-        assert!(cut.chars().count() <= ASK_CONTEXT_CHARS + 20);
+        assert!(
+            cut.chars().count() <= ASK_CONTEXT_CHARS,
+            "the marker is inside the budget"
+        );
     }
 
     /// The ask leaves the process, so #360's masking applies to every part
