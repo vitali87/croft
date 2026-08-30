@@ -25607,8 +25607,6 @@ impl App {
         }
     }
 
-    /// Ctrl+Shift+H: open the durable command-history search over the
-    /// active pane's context (atuin's enhanced Ctrl+R, embedded).
     /// `.http`/`.rest` (#370): send the request under the caret. The env
     /// file's values are substituted before the send; a hole with no value
     /// refuses to send rather than leaking `{{name}}` to a server. The send
@@ -25796,6 +25794,8 @@ impl App {
         true
     }
 
+    /// Ctrl+Shift+H: open the durable command-history search over the
+    /// active pane's context (atuin's enhanced Ctrl+R, embedded).
     fn open_command_history(&mut self) {
         let mut pop = crate::widgets::history_popup::HistoryPopup::new();
         pop.cwd = self
