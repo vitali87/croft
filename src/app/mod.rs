@@ -14988,7 +14988,7 @@ impl App {
             }
             // Build the spans now that x positions are known: segment fg one
             // shade up from the transient's dim gray, │ dividers between, and
-            // a hover fill on the clickable segments (indices 1..=4) when the
+            // a hover fill on the clickable segments (indices 1..=5) when the
             // pointer rests on them — same affordance as the activity bar.
             // Ln/Col (index 0) is a readout, not a control, so it never
             // hovers. Hit rects recorded in the same pass.
@@ -27131,28 +27131,29 @@ impl App {
         });
     }
 
-    /// Seat, re-judge, or unseat the agent in each sampled pane (#344), from
-    /// the same `(shell_pid, process_name)` pairs the pill uses, and queue
-    /// the transitions. `quiet_after` is the working/quiet threshold
-    /// ([`crate::agents::QUIET_AFTER`]; tests pass zero). Returns whether any
-    /// pane's lane changed.
+    /// Seat, re-judge, or unseat the agent in EVERY pane (#344), from the
+    /// `(shell_pid, process_name)` samples the pill uses, and queue the
+    /// transitions. Driven over panes rather than over samples: a pane whose
+    /// foreground did not resolve this round (the agent exited and took the
+    /// shell with it, a pid `sysinfo` missed) has no sample, and that must
+    /// unseat it rather than leave the badge on forever. `quiet_after` is
+    /// the working/quiet threshold ([`crate::agents::QUIET_AFTER`]; tests
+    /// pass zero). Returns whether any pane's lane changed.
     pub(crate) fn apply_agent_samples(
         &mut self,
         samples: &[(i32, String)],
         quiet_after: std::time::Duration,
     ) -> bool {
+        let by_pid: std::collections::HashMap<i32, &str> = samples
+            .iter()
+            .map(|(pid, name)| (*pid, name.as_str()))
+            .collect();
         let mut changed = false;
-        for (shell_pid, name) in samples {
-            let Some(t) = self
-                .terminals
-                .iter_mut()
-                .find(|t| t.shell_pid() == Some(*shell_pid))
-            else {
-                continue;
-            };
-            let next = self
-                .agents
-                .classify(name)
+        for t in &mut self.terminals {
+            let next = t
+                .shell_pid()
+                .and_then(|pid| by_pid.get(&pid))
+                .and_then(|name| self.agents.classify(name))
                 .map(|kind| crate::agents::AgentLane {
                     name: kind.name.clone(),
                     status: crate::agents::judge(kind, t.quiet_for(), &t.tail_rows(6), quiet_after),
@@ -27205,7 +27206,10 @@ impl App {
         (seated, waiting)
     }
 
-    /// Focus the first waiting agent's pane, else the first seated one.
+    /// Focus the first waiting agent's pane, else the first seated one. Goes
+    /// through `set_bottom_panel_tab` like `captures_open_selected`, so a
+    /// click from the editor with the panel collapsed reveals the pane
+    /// rather than focusing something the user cannot see.
     fn focus_agent_pane(&mut self) {
         let pick = self
             .terminals
@@ -27217,7 +27221,7 @@ impl App {
             .or_else(|| self.terminals.iter().position(|t| t.agent().is_some()));
         if let Some(idx) = pick {
             self.active_terminal = idx;
-            self.focus_pane(Pane::Terminal);
+            self.set_bottom_panel_tab(BottomPanelTab::Terminal);
         }
     }
 
@@ -27258,6 +27262,11 @@ impl App {
                     _ => None,
                 })
                 .collect();
+            if targets.is_empty() {
+                // No pane has a foreground process to sample: any seated
+                // agent is gone, and only an empty sample says so.
+                changed |= self.apply_agent_samples(&[], crate::agents::QUIET_AFTER);
+            }
             if !targets.is_empty() {
                 let tx = self.label_tx.clone();
                 let inflight = self.label_inflight.clone();
@@ -35077,9 +35086,18 @@ impl App {
             self.status = String::from("Snippets reloaded");
         } else if path == crate::agents::agents_path() {
             self.agents = crate::agents::AgentTable::load(path);
+            let dropped = self.agents.dropped_patterns();
             self.status = format!(
-                "Agent lanes reloaded ({} agents known)",
-                self.agents.names().len()
+                "Agent lanes reloaded ({} agents known{})",
+                self.agents.names().len(),
+                if dropped > 0 {
+                    format!(
+                        ", {dropped} prompt pattern{} did not compile",
+                        if dropped == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                }
             );
         } else if path == crate::triggers::triggers_path() {
             self.triggers = load_trigger_set(self.secret_redaction);

@@ -110,6 +110,10 @@ struct AgentRow {
 #[derive(Debug, Clone, Default)]
 pub struct AgentTable {
     kinds: Vec<AgentKind>,
+    /// `agents.json` prompt patterns that did not compile and were dropped,
+    /// so the reload status can say so instead of an agent that silently
+    /// never reads as waiting.
+    dropped_patterns: usize,
 }
 
 fn kind(name: &str, process: &[&str], prompt: &[&str]) -> AgentKind {
@@ -124,45 +128,37 @@ impl AgentTable {
     /// The agents croft knows without any configuration.
     pub fn builtin() -> Self {
         // The prompt shapes are what each agent prints when it stops for the
-        // user: a permission question, a bare prompt line, a yes/no.
-        let common = [
-            "\\(y/n\\)",
-            "\\[Y/n\\]",
-            "\\[y/N\\]",
-            "\\?\\s*$",
-            "^\\s*[>❯›]\\s*$",
+        // user, anchored to the affordance rather than to a word: a bare
+        // `Allow` or a trailing `?` matched ordinary output ("Allowed
+        // origins: …", a rhetorical question in prose) and read as waiting.
+        let yes_no = ["\\(y/n\\)", "\\[Y/n\\]", "\\[y/N\\]"];
+        let claude = [
+            "Do you want to.*\\?",
+            "Esc to cancel",
+            "^\\s*\u{276f}\\s*\\d+\\.\\s",
+            "^\\s*[>\u{276f}]\\s*$",
         ];
+        let codex = [
+            "^\\s*Allow command",
+            "^\\s*[\u{276f}\u{203a}]\\s*\\d+\\.\\s",
+            "^\\s*[>\u{276f}\u{203a}]\\s*$",
+        ];
+        let aider = ["^\\s*[>\u{276f}]\\s*$", "\\(Y\\)es"];
+        let gemini = [
+            "^\\s*[>\u{276f}\u{203a}]\\s*$",
+            "^\\s*(Allow|Approve).*\\?\\s*$",
+        ];
+        fn with<'a>(own: &[&'a str], yes_no: &[&'a str]) -> Vec<&'a str> {
+            own.iter().chain(yes_no.iter()).copied().collect()
+        }
         Self {
             kinds: vec![
-                kind(
-                    "claude",
-                    &["claude"],
-                    &[
-                        "Do you want to",
-                        "Allow",
-                        "Esc to cancel",
-                        "^\\s*[>❯]\\s*$",
-                        "\\(y/n\\)",
-                    ],
-                ),
-                kind(
-                    "codex",
-                    &["codex"],
-                    &[
-                        "Allow",
-                        "approve",
-                        "\\[y/N\\]",
-                        "\\(y/n\\)",
-                        "^\\s*[>❯›]\\s*$",
-                    ],
-                ),
-                kind(
-                    "aider",
-                    &["aider"],
-                    &["^\\s*[>❯]\\s*$", "\\(Y\\)es", "\\[Y/n\\]", "\\?\\s*$"],
-                ),
-                kind("gemini", &["gemini"], &common),
+                kind("claude", &["claude"], &with(&claude, &yes_no)),
+                kind("codex", &["codex"], &with(&codex, &yes_no)),
+                kind("aider", &["aider"], &with(&aider, &yes_no)),
+                kind("gemini", &["gemini"], &with(&gemini, &yes_no)),
             ],
+            dropped_patterns: 0,
         }
     }
 
@@ -195,11 +191,13 @@ impl AgentTable {
                     .map(|p| p.trim().to_lowercase())
                     .collect()
             };
-            let prompt: Vec<Regex> = row
-                .prompt
-                .iter()
-                .filter_map(|p| Regex::new(p).ok())
-                .collect();
+            let mut prompt: Vec<Regex> = Vec::with_capacity(row.prompt.len());
+            for pat in &row.prompt {
+                match Regex::new(pat) {
+                    Ok(re) => prompt.push(re),
+                    Err(_) => table.dropped_patterns += 1,
+                }
+            }
             let k = AgentKind {
                 name: name.clone(),
                 process,
@@ -232,6 +230,11 @@ impl AgentTable {
 
     pub fn names(&self) -> Vec<&str> {
         self.kinds.iter().map(|k| k.name.as_str()).collect()
+    }
+
+    /// How many `agents.json` prompt patterns failed to compile.
+    pub fn dropped_patterns(&self) -> usize {
+        self.dropped_patterns
     }
 }
 
@@ -375,6 +378,14 @@ mod tests {
             "the row replaced the built-in prompts"
         );
         assert_eq!(t.names().len(), 5);
+        assert_eq!(t.dropped_patterns(), 0);
+        let bad = AgentTable::from_json(r#"[{ "name": "x", "prompt": ["(unclosed", "ok"] }]"#);
+        assert_eq!(
+            bad.dropped_patterns(),
+            1,
+            "a pattern that does not compile is counted"
+        );
+        assert_eq!(bad.classify("x").unwrap().prompt.len(), 1);
         // A broken file is the built-in table, not a failed start.
         assert_eq!(AgentTable::from_json("{ not json").names().len(), 4);
         assert_eq!(
@@ -406,9 +417,38 @@ mod tests {
             judge(claude, Duration::from_secs(10), &quiet, after),
             AgentStatus::Idle
         );
-        // A bare prompt line counts; a question ten rows up does not.
+        // A bare prompt line counts, and so does Claude Code's numbered
+        // permission menu; a question ten rows up does not.
         assert_eq!(
             judge(claude, after, &rows(&["> "]), after),
+            AgentStatus::Waiting
+        );
+        assert_eq!(
+            judge(
+                claude,
+                after,
+                &rows(&["Do you want to make this edit?", "\u{276f} 1. Yes"]),
+                after
+            ),
+            AgentStatus::Waiting
+        );
+        // Ordinary output that merely contains a question mark or the word
+        // "Allow" is not a prompt.
+        let gemini = t.classify("gemini").unwrap();
+        for (kind, row) in [
+            (claude, "Allowed origins: https://example.com"),
+            (claude, "  Do you want to know more"),
+            (gemini, "Does that make sense?"),
+            (claude, "if (x == 1) { return y; } // ?"),
+        ] {
+            assert_eq!(
+                judge(kind, after, &rows(&[row]), after),
+                AgentStatus::Idle,
+                "{row:?}"
+            );
+        }
+        assert_eq!(
+            judge(gemini, after, &rows(&["Allow this tool call?"]), after),
             AgentStatus::Waiting
         );
         let mut buried = vec!["Allow this? (y/n)".to_string()];

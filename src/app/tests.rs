@@ -35304,9 +35304,54 @@ fn an_agent_pane_is_badged_and_a_prompt_fires_waiting_once() {
     );
     assert!(app.status_agents_rect.width > 0, "and is clickable");
 
-    // The agent leaving the foreground unseats it.
+    // Clicking the chip from the editor with the panel collapsed reveals
+    // the pane, not just focuses it.
+    app.show_terminal = false;
+    app.focus_pane(Pane::Editor);
+    term.draw(|frame| app.render(frame)).unwrap();
+    let chip = app.status_agents_rect;
+    assert!(
+        chip.width > 0,
+        "the chip is painted while the panel is hidden"
+    );
+    app.handle_mouse(mouse(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        chip.x,
+        chip.y,
+    ));
+    assert!(app.show_terminal, "the click reveals the panel");
+    assert!(matches!(app.focus, Pane::Terminal), "and focuses the pane");
+
+    // The agent leaving the foreground unseats it: the shell reclaiming the
+    // pane is one way, and a pane that produced no sample at all (the agent
+    // took the shell with it, or the pid was missed) is the other.
     let gone = vec![(shell_pid, String::from("zsh"))];
     assert!(app.apply_agent_samples(&gone, zero));
     assert!(app.terminals[0].agent().is_none());
     assert_eq!(app.agent_counts(), (0, 0));
+    assert!(app.apply_agent_samples(&samples, zero), "re-seated");
+    assert!(app.apply_agent_samples(&[], zero), "no sample unseats");
+    assert!(app.terminals[0].agent().is_none());
+    assert!(
+        matches!(
+            app.agent_events.back(),
+            Some(crate::agents::AgentEvent::Gone { .. })
+        ),
+        "and says so: {:?}",
+        app.agent_events
+    );
+
+    // A pane that has not output yet is quiet since it spawned, not since
+    // 1970, so a just-launched agent reads as working.
+    let fresh = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
+    assert!(
+        fresh.quiet_for() < std::time::Duration::from_secs(5),
+        "quiet for {:?}",
+        fresh.quiet_for()
+    );
 }
