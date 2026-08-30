@@ -45,7 +45,11 @@ jobs:
         run: |
           set -euo pipefail
           base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
-          changed="$(git diff --name-only "$base" HEAD)"
+          # --no-renames: git collapses a rename to its destination alone, so
+          # `git mv 0.1.808.md 0.1.809.md` would look like "wrote this
+          # version's notes" while destroying the previous release's. Split
+          # into a delete plus an add, the stale guard below sees the delete.
+          changed="$(git diff --no-renames --name-only "$base" HEAD)"
           # What ships in the binary: sources, baked-in assets, the build
           # script, and the dependency set. src/app/tests.rs and tests/ are
           # compiled out of release builds.
@@ -71,8 +75,16 @@ jobs:
           # file exists and says something, not that a shared file was touched.
           # Two PRs adding different versions' notes then never collide.
           notes="src/release_notes/$new.md"
-          if ! git cat-file -e "HEAD:$notes" 2>/dev/null; then
-            echo "::error file=$notes::This PR changes shipped files but $notes does not exist. Write this version's highlights there, one per line, each prefixed 'feature:' or 'fix:', so the welcome panel describes the binary it is in."
+          # AUTHORSHIP, not merely existence. A file for this version can
+          # already be on main - left behind by a revert that dropped the
+          # code but not the notes - and a bump onto it would pass while the
+          # panel advertised a release the binary does not contain. This PR
+          # has to have written it.
+          if ! printf '%s\n' "$changed" | grep -qx "$notes"; then
+            echo "::error file=$notes::This PR changes shipped files but does not write $notes. Write this version's highlights there, one per line, each prefixed 'feature:' or 'fix:', so the welcome panel describes the binary it is in. A file left on main by an earlier revert does not count."
+            fail=1
+          elif ! git cat-file -e "HEAD:$notes" 2>/dev/null; then
+            echo "::error file=$notes::$notes was changed but does not exist at HEAD. This version's notes cannot be the file the PR deleted."
             fail=1
           elif [ -z "$(git show "HEAD:$notes" | tr -d '[:space:]')" ]; then
             echo "::error file=$notes::$notes is empty. Write this version's highlights there, one per line, each prefixed 'feature:' or 'fix:'."

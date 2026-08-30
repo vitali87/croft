@@ -46,11 +46,21 @@ fn bake_release_notes() {
     // Watch the directory: adding the next version's file must rebuild, and
     // editing this one must too.
     println!("cargo:rerun-if-changed={}", dir.display());
+    // The SAME filter `release_notes::parse` applies, not merely "non-blank".
+    // A file holding only a `# 0.1.808` heading is non-blank and parses to
+    // zero highlights, which is an empty panel arriving past the guard that
+    // exists to prevent one.
+    let has_highlight = |text: &str| {
+        text.lines()
+            .map(str::trim)
+            .any(|l| !l.is_empty() && !l.starts_with('#'))
+    };
     let notes = match std::fs::read_to_string(&path) {
-        Ok(text) if !text.trim().is_empty() => text,
+        Ok(text) if has_highlight(&text) => text,
         Ok(_) => panic!(
-            "{} is empty. Write this version's highlights there: one per line, \
-             each prefixed `feature:` or `fix:`.",
+            "{} carries no highlights (blank, or nothing but headings). Write \
+             this version's highlights there: one per line, each prefixed \
+             `feature:` or `fix:`.",
             path.display()
         ),
         Err(e) => panic!(

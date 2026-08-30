@@ -80,6 +80,10 @@ fn parse(md: &'static str) -> Vec<ReleaseNote> {
     md.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        // A markdown list is the obvious way to write a file of one-liners,
+        // and a leading bullet would otherwise make `- feature: x` an
+        // unrecognised prefix: a Fix whose summary still carries the dash.
+        .map(|l| l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")).unwrap_or(l).trim())
         .map(|line| match line.split_once(':') {
             Some((kind, rest)) if kind.eq_ignore_ascii_case("feature") => ReleaseNote {
                 kind: NoteKind::Feature,
@@ -115,6 +119,17 @@ mod tests {
         assert_eq!(notes[0].summary, "Something new.");
         assert_eq!(notes[1].kind, NoteKind::Fix);
         assert_eq!(notes[1].summary, "Something repaired.");
+    }
+
+    /// A markdown bullet is the obvious way to write a file of one-liners,
+    /// and it must not swallow the kind prefix.
+    #[test]
+    fn a_bullet_does_not_hide_the_kind_prefix() {
+        for line in ["- feature: One.", "* feature: One.", "feature: One."] {
+            let notes = parse(Box::leak(line.to_string().into_boxed_str()));
+            assert_eq!(notes[0].kind, NoteKind::Feature, "{line:?}");
+            assert_eq!(notes[0].summary, "One.", "{line:?}");
+        }
     }
 
     #[test]
