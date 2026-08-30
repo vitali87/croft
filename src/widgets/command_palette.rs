@@ -184,6 +184,7 @@ pub enum Command {
     /// Ask the resident navigator about the caret line or selection (opens
     /// the instruction box; the navigator may edit on the resulting turn).
     AskNavigator,
+    AskNavigatorAboutCapture,
     /// Hand the navigator the floor on the active file: a comment-only
     /// review turn, its say anchored as comment boxes.
     YieldToNavigator,
@@ -356,6 +357,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::SessionParticipants,
     Command::CollabCancelStream,
     Command::AskNavigator,
+    Command::AskNavigatorAboutCapture,
     Command::YieldToNavigator,
     Command::ToggleNavigator,
     Command::ClearNavigatorNotes,
@@ -522,6 +524,7 @@ impl Command {
             Command::SessionParticipants => "Session: Participants",
             Command::CollabCancelStream => "Collab: Cancel AI Stream",
             Command::AskNavigator => "Navigator: Ask About Line or Selection",
+            Command::AskNavigatorAboutCapture => "Captures: Ask Navigator About This Line",
             Command::YieldToNavigator => "Navigator: Yield the Turn",
             Command::ToggleNavigator => "Navigator: Activate or Deactivate",
             Command::ClearNavigatorNotes => "Navigator: Clear Comments",
@@ -690,6 +693,7 @@ impl Command {
             Command::SessionParticipants => "Cmd+K A",
             Command::CollabCancelStream => "Cmd+K X",
             Command::AskNavigator => "Cmd+K Q",
+            Command::AskNavigatorAboutCapture => "",
             Command::YieldToNavigator => "Cmd+K Y",
             Command::ToggleNavigator => "",
             Command::ClearNavigatorNotes => "",
@@ -855,6 +859,7 @@ impl Command {
             Command::SessionParticipants => "session_participants",
             Command::CollabCancelStream => "collab_cancel_stream",
             Command::AskNavigator => "navigator_ask",
+            Command::AskNavigatorAboutCapture => "captures_ask_navigator",
             Command::YieldToNavigator => "navigator_yield",
             Command::ToggleNavigator => "navigator_toggle",
             Command::ClearNavigatorNotes => "navigator_clear_notes",

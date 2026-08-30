@@ -1130,6 +1130,9 @@ enum MenuAction {
         start: usize,
         end: usize,
     },
+    /// CAPTURES row: ask the navigator about the selected captured line,
+    /// with the pane rows around it (#372).
+    AskNavigatorAboutCapture,
     /// Editor body: one level of the call hierarchy for the symbol at buffer
     /// `(row, col)` — callers when `incoming`, callees otherwise.
     ShowCallsAt {
@@ -1270,6 +1273,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::EditLogpointAt { .. } => Some("⇧⌥F9"),
         MenuAction::AskNavigatorAt { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorSelection { .. } => Some("⌘K Q"),
+        MenuAction::AskNavigatorAboutCapture => Some("n"),
         MenuAction::ShowCallsAt { incoming: true, .. } => Some("⌘K H"),
         MenuAction::ShowCallsAt {
             incoming: false, ..
@@ -25679,6 +25683,7 @@ impl App {
             KeyCode::Down => self.captures.move_selection(1),
             KeyCode::Esc => self.focus_pane(Pane::Editor),
             KeyCode::Enter => self.captures_open_selected(),
+            KeyCode::Char('n') => self.ask_navigator_about_capture(),
             KeyCode::Char('x') => self.captures.remove_selected(),
             KeyCode::Char('c') => {
                 self.captures.clear();
@@ -27867,29 +27872,134 @@ impl App {
         let Some(fr) = crate::file_ref::file_ref_at(&text, c) else {
             return false;
         };
-        let path = std::path::PathBuf::from(&fr.path);
-        let abs = if let Some(rest) = fr.path.strip_prefix("~/") {
-            match std::env::var_os("HOME") {
-                Some(h) => std::path::PathBuf::from(h).join(rest),
-                None => return false,
-            }
-        } else if path.is_absolute() {
-            path
-        } else {
-            let cwd = self
-                .terminal()
-                .pid()
-                .and_then(cwd_of_pid)
-                .filter(|p| p.is_dir())
-                .unwrap_or_else(|| self.workspace_root().to_path_buf());
-            let joined = cwd.join(&path);
-            if joined.is_file() {
-                joined
-            } else {
-                self.workspace_root().join(&path)
-            }
+        let Some(abs) = self.resolve_pane_path(self.active_terminal, &fr.path) else {
+            return false;
         };
         self.open_resolved_file_ref(&abs, fr.line, fr.column)
+    }
+
+    /// A path printed in pane `idx`, made absolute: `~` against $HOME, a
+    /// relative path against the pane shell's live cwd, then the workspace
+    /// root. Shared by the file-ref click and the captures ask.
+    fn resolve_pane_path(&self, idx: usize, raw: &str) -> Option<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(raw);
+        if let Some(rest) = raw.strip_prefix("~/") {
+            return std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(rest));
+        }
+        if path.is_absolute() {
+            return Some(path);
+        }
+        let cwd = self
+            .terminals
+            .get(idx)
+            .and_then(|t| t.pid())
+            .and_then(cwd_of_pid)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| self.workspace_root().to_path_buf());
+        let joined = cwd.join(&path);
+        Some(if joined.is_file() {
+            joined
+        } else {
+            self.workspace_root().join(&path)
+        })
+    }
+
+    /// CAPTURES: ask the resident Navigator about the selected captured line
+    /// (#372). The line, the trigger that caught it, and the pane rows around
+    /// it (redacted like any text that leaves a pane, #360) ride the ask. A
+    /// `path:line` in the line opens that file first so the reply lands as
+    /// a comment box at the referenced line; otherwise the ask is anchored
+    /// on the active file, and with no file at all it says so.
+    pub(crate) fn ask_navigator_about_capture(&mut self) {
+        let Some(entry) = self.captures.selected_entry().cloned() else {
+            self.status = String::from("No captured line is selected");
+            return;
+        };
+        let Some(host) = &self.pair_host else {
+            self.status =
+                String::from("Navigator is not active (run croft pair in this workspace)");
+            return;
+        };
+        if host.is_busy() {
+            self.status = format!("{} is mid-turn; wait for it to finish", host.name());
+            return;
+        }
+        let name = host.name().to_string();
+        let idx = entry
+            .shell_pid
+            .and_then(|pid| {
+                self.terminals
+                    .iter()
+                    .position(|t| t.shell_pid() == Some(pid))
+            })
+            .unwrap_or(self.active_terminal);
+        // The rows around the line, if it is still in the scrollback; the
+        // line alone otherwise.
+        let needle: String = entry.line.trim_end().chars().take(60).collect();
+        let context: Vec<String> = match self.terminals.get(idx) {
+            Some(t) => match t.find_captured_line(&needle) {
+                Some(line) => {
+                    let (lines, top) = t.grid_lines();
+                    let hit = usize::try_from(line - top).unwrap_or(0);
+                    crate::widgets::captures::context_window(
+                        &lines,
+                        hit,
+                        crate::widgets::captures::ASK_CONTEXT_ROWS,
+                    )
+                }
+                None => vec![entry.line.clone()],
+            },
+            None => vec![entry.line.clone()],
+        };
+        // Anchor: the file the line names, else the active file.
+        let referenced = crate::widgets::captures::first_file_ref(&entry.line)
+            .and_then(|fr| self.resolve_pane_path(idx, &fr.path).map(|abs| (abs, fr)))
+            .filter(|(abs, _)| abs.is_file());
+        let opened = match referenced {
+            Some((abs, fr)) => self.open_resolved_file_ref(&abs, fr.line, fr.column),
+            None => false,
+        };
+        let Some(file) = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&self.tree.root, p))
+        else {
+            self.status = String::from(
+                "Ask Navigator: the captured line names no workspace file and none is open",
+            );
+            return;
+        };
+        let row = self.editor.cursor_row;
+        let range = (row, row);
+        // Every part of the ask is masked here, the line and the trigger
+        // message included: a capture is stored raw (#360).
+        let triggers = self.triggers.clone();
+        let (instruction, selection) =
+            crate::widgets::captures::ask_prompt(&entry, &context, |t| {
+                crate::triggers::mask_text(t, &triggers, false)
+            });
+        let content = self.editor.lines.join("\n");
+        let Some(host) = &self.pair_host else {
+            // Unreachable today (nothing above touches the host), but a
+            // silent return would leave the jump's status reading as success.
+            self.status = String::from("Navigator is not active");
+            return;
+        };
+        match host.send_ask_turn(&file, range, &selection, &instruction, &content) {
+            Ok(()) => {
+                // Always name the anchor: when the line's own file did not
+                // open, the ask went to the active file and the user must
+                // see which.
+                self.status = format!(
+                    "Asked {name} about the captured line, anchored at {file}:{}{}",
+                    row + 1,
+                    if opened { "" } else { " (the active file)" }
+                );
+                self.pair_turn_origin = Some((file, row));
+            }
+            Err(e) => self.status = format!("Ask Navigator failed: {e}"),
+        }
     }
 
     /// Jump the editor to an absolute `path:line[:col]`, recording where the
@@ -29981,6 +30091,7 @@ impl App {
             Cmd::ColorTheme => self.open_theme_picker(),
             Cmd::SessionParticipants => self.open_participants_picker(),
             Cmd::CollabCancelStream => self.collab_cancel_stream(),
+            Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             Cmd::AskNavigator => {
                 let (range, selection) = match self.editor.selection_rows() {
                     Some(rows) => (rows, self.editor.selection_text()),
@@ -31626,6 +31737,35 @@ impl App {
         self.scroll_log_to_match(hit);
     }
 
+    /// Fold in the background index of an open rendered log (#394).
+    ///
+    /// Returns whether a repaint is due: the header's line count and the
+    /// scroll range moved. When the pass finishes, an open find bar has its
+    /// count re-run, since the count it shows was taken against a partial
+    /// index and flagged as such; a step the user makes next reaches the
+    /// tail on its own.
+    pub fn poll_log_index(&mut self) -> bool {
+        let Some(log) = self.editor.log.as_mut() else {
+            return false;
+        };
+        if !log.indexing() {
+            return false;
+        }
+        let changed = log.poll_index();
+        if log.indexing() {
+            return changed;
+        }
+        if let Some(state) = self.editor_find.as_ref()
+            && !state.query.is_empty()
+        {
+            let (count, truncated) = log.count_matches(&state.query, state.opts);
+            if let Some(state) = self.editor_find.as_mut() {
+                state.set_match_count(count, truncated);
+            }
+        }
+        true
+    }
+
     /// Enter / Shift+Enter over a rendered log.
     fn log_find_step(&mut self, forward: bool) {
         let Some(state) = self.editor_find.as_ref() else {
@@ -32797,6 +32937,23 @@ impl App {
                 // wins over the editor pane it sits beside.
                 if rect_contains(self.minimap_img_rect, m.column, m.row) {
                     self.open_minimap_menu(m.column, m.row);
+                    return;
+                }
+                // A CAPTURES row: the ask is offered whether or not a
+                // navigator is seated, and says so if none is (#372).
+                if self.bottom_panel_tab == BottomPanelTab::Captures
+                    && rect_contains(self.captures.last_area, m.column, m.row)
+                    && let Some(idx) = self.captures.row_at(m.column, m.row)
+                {
+                    self.captures.select_index(idx);
+                    self.context_menu = Some(ContextMenu::flat(
+                        (m.column, m.row),
+                        vec![(
+                            String::from("Ask Navigator About This Line"),
+                            MenuAction::AskNavigatorAboutCapture,
+                        )],
+                        self.tree.root.clone(),
+                    ));
                     return;
                 }
                 // Editor tab strip: right-click on a tab opens the
@@ -36605,6 +36762,7 @@ impl App {
                 let selection = self.editor.selection_text();
                 self.open_ask_navigator((start, end), selection);
             }
+            MenuAction::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             MenuAction::ShowCallsAt { row, col, incoming } => {
                 self.editor.cursor_row = row;
                 self.editor.cursor_col = col;
@@ -43015,6 +43173,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
         let search_changed = app.drain_search_results();
+        let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let ports_changed = app.drain_ports_and_poll();
@@ -43131,6 +43290,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || spinner_changed
             || ext_index_changed
             || search_changed
+            || log_index_changed
             || remote_changed
             || pulls_changed
             || ports_changed

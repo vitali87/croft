@@ -24607,6 +24607,24 @@ fn capture_triggers_collect_into_the_captures_panel_and_jump_to_the_line() {
         sel.contains("err-7 broke"),
         "jump must land the selection on the captured line, got {sel:?}"
     );
+
+    // `n` asks the Navigator about the line (#372); with none seated it
+    // says so rather than doing nothing, and the palette carries the same
+    // command.
+    app.ask_navigator_about_capture();
+    assert!(
+        app.status.to_lowercase().contains("not active"),
+        "{}",
+        app.status
+    );
+    assert!(
+        crate::widgets::command_palette::ALL_COMMANDS
+            .contains(&crate::widgets::command_palette::Command::AskNavigatorAboutCapture)
+    );
+    assert_eq!(
+        crate::widgets::command_palette::Command::AskNavigatorAboutCapture.id(),
+        "captures_ask_navigator"
+    );
 }
 
 #[test]
@@ -36109,5 +36127,84 @@ fn an_agent_pane_is_badged_and_a_prompt_fires_waiting_once() {
         fresh.quiet_for() < std::time::Duration::from_secs(5),
         "quiet for {:?}",
         fresh.quiet_for()
+    );
+}
+
+/// #394: a log past the head budget opens on a partial index, the header
+/// says so, and the main loop's `poll_log_index` grows it to the total and
+/// re-runs an open find's count once the pass is done.
+#[test]
+fn a_large_log_opens_before_its_index_is_complete_and_the_loop_finishes_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    use ratatui::widgets::Widget as _;
+    let p = tmp.path().join("huge.log");
+    let mut body = Vec::new();
+    body.extend_from_slice(b"\x1b[32mINFO\x1b[0m head\n");
+    let mut lines = 1usize;
+    while (body.len() as u64) < crate::log_view::HEAD_INDEX_BYTES + 1024 * 1024 {
+        body.extend_from_slice(format!("line{lines} some padding text\n").as_bytes());
+        lines += 1;
+    }
+    body.extend_from_slice(b"\x1b[31mERROR\x1b[0m disk full\n");
+    let total = lines + 1;
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    let log = app.editor.log.as_ref().expect("opens as a rendered log");
+    assert!(log.indexing(), "the tail is still being indexed after open");
+    assert!(log.len() < total, "the count is a lower bound for now");
+
+    let area = Rect::new(0, 0, 80, 12);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut *app.editor).render(area, &mut buf);
+    // The header sits on the row above the body the frame published; the
+    // editor's own border occupies row 0.
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let header: String = (body.x..body.x + body.width)
+        .map(|x| buf[(x, body.y - 1)].symbol().to_string())
+        .collect();
+    assert!(
+        header.contains("so far, indexing"),
+        "the header must not present a moving count as a total: {header:?}"
+    );
+
+    // A find typed while the pass runs: the ERROR line is past the index.
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "disk".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let state = app.editor_find.as_ref().unwrap();
+    assert!(
+        state.count_truncated(),
+        "a count taken against a partial index is flagged partial"
+    );
+
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the background log index",
+        || {
+            app.poll_log_index();
+            !app.editor.log.as_ref().unwrap().indexing()
+        },
+    );
+    assert_eq!(app.editor.log.as_ref().unwrap().len(), total);
+    (&mut *app.editor).render(area, &mut buf);
+    // The header sits on the row above the body the frame published; the
+    // editor's own border occupies row 0.
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let header: String = (body.x..body.x + body.width)
+        .map(|x| buf[(x, body.y - 1)].symbol().to_string())
+        .collect();
+    assert!(
+        header.contains(&format!("{total} lines ")) && !header.contains("indexing"),
+        "the finished header carries the total: {header:?}"
+    );
+    assert!(
+        !app.poll_log_index(),
+        "a finished index asks for no more repaints"
     );
 }
