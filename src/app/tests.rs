@@ -36774,6 +36774,32 @@ fn the_watcher_reports_rescans_and_keeps_directories_out_of_the_ledger() {
         "no rescan yet, so the queue is not a lower bound"
     );
 
+    // A removed FILE that IS in a lane leaves it the moment the removal is
+    // seen: a deleted file generates no later write, so a guard that
+    // excluded its event would strand the row in the queue forever.
+    let doomed = tmp.path().join("doomed.rs");
+    std::fs::write(&doomed, "fn gone() {}\n").unwrap();
+    let mut doomed_set = std::collections::BTreeSet::new();
+    doomed_set.insert(doomed.clone());
+    assert!(app.attribute_writes_to_working_agents(&doomed_set));
+    assert!(app.agent_ledger.is_unreviewed(&doomed));
+    std::fs::remove_file(&doomed).unwrap();
+    let (tx3, rx3) = mpsc::channel();
+    app.fs_watch.set_test_events(rx3);
+    // `Any` is what kqueue, the Windows watcher and the poll fallback emit
+    // for every removal, so this is the shape three of five backends send.
+    let removed = NotifyEvent::new(EventKind::Remove(RemoveKind::Any)).add_path(doomed.clone());
+    tx3.send(Ok(vec![DebouncedEvent::new(
+        removed,
+        std::time::Instant::now(),
+    )]))
+    .unwrap();
+    app.drain_fs_events();
+    assert!(
+        !app.agent_ledger.is_unreviewed(&doomed),
+        "the removed file's row leaves the queue rather than stranding"
+    );
+
     // Now a rescan: the watcher overflowed and dropped events.
     let (tx2, rx2) = mpsc::channel();
     app.fs_watch.set_test_events(rx2);

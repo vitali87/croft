@@ -274,6 +274,7 @@ impl AgentLedger {
         entry.reviewed_hash = Some(current);
         entry.current_hash = current;
         entry.writes_since_review = 0;
+        self.settle_if_empty();
         true
     }
 
@@ -345,7 +346,11 @@ impl AgentLedger {
 
     /// Drop an agent's lane entirely (it is gone and the user dismissed it).
     pub fn forget(&mut self, agent: &str) -> bool {
-        self.lanes.remove(agent).is_some()
+        let removed = self.lanes.remove(agent).is_some();
+        if removed {
+            self.settle_if_empty();
+        }
+        removed
     }
 
     /// Total unreviewed ROWS across every lane — the per-lane badges sum to
@@ -575,8 +580,32 @@ mod tests {
         led.mark_reviewed("claude", &p("/w/a.rs"), 1);
         assert!(led.may_be_incomplete());
 
+        // Emptying it through mark_reviewed ALONE must settle it too: the
+        // previous version of this test emptied the queue with
+        // mark_lane_reviewed, so it passed whether or not mark_reviewed
+        // cleared the flag.
+        led.mark_reviewed("claude", &p("/w/b.rs"), 2);
+        assert!(
+            !led.may_be_incomplete(),
+            "reviewing the last queued file one-by-one settles the doubt too"
+        );
+
+        // And a lane dropped wholesale settles it as well.
+        led.note_dropped_events();
+        led.record_write(&p("/w/c.rs"), 3, &a);
+        assert!(led.may_be_incomplete());
+        led.forget("claude");
+        assert!(
+            !led.may_be_incomplete(),
+            "a lane dropped with the queue empties it, doubt included"
+        );
+
+        // Re-arm for the whole-lane path below.
+        led.note_dropped_events();
+        led.record_write(&p("/w/d.rs"), 4, &a);
+
         // Emptying it settles the question: nothing is left to be wrong.
-        let (reviewed, _) = led.mark_lane_reviewed("claude", |_| Baseline::Hash(2));
+        let (reviewed, _) = led.mark_lane_reviewed("claude", |_| Baseline::Hash(4));
         assert_eq!(reviewed, 1);
         assert!(
             !led.may_be_incomplete(),
