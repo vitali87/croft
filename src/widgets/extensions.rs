@@ -380,7 +380,7 @@ impl ExtensionsPanel {
 
     /// Indices into `items` that pass the current filter, built-in group first
     /// (BUILT-IN before INSTALLED), preserving order within each group.
-    fn visible_indices(&self) -> Vec<usize> {
+    pub(crate) fn visible_indices(&self) -> Vec<usize> {
         let mut v: Vec<usize> = (0..self.items.len())
             .filter(|&i| self.matches(&self.items[i]))
             .collect();

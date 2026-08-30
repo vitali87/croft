@@ -614,21 +614,54 @@ pub fn workspace_recommendations(root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// How long `code --list-extensions` may take before it is given up on.
+/// Usually instant; a stale lock or a slow network share can wedge it.
+pub const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Extension ids VS Code reports installed, via `code --list-extensions`.
-/// Best effort: no `code` on PATH, or a failure, is an empty list. Runs a
-/// process, so callers invoke it on an explicit user action, not per frame.
+/// Best effort: no `code` on PATH, a failure, or no answer within
+/// [`LIST_TIMEOUT`] is an empty list. Runs a process, so callers invoke it
+/// on an explicit user action, not per frame; and it is bounded, because
+/// that action runs on the render thread and an unbounded `.output()` on a
+/// hung child would freeze croft with no way out (the `gui_path` probe has
+/// the same shape and the same scar).
 pub fn installed_via_code() -> Vec<String> {
-    let Ok(out) = std::process::Command::new("code")
-        .arg("--list-extensions")
+    let mut cmd = std::process::Command::new("code");
+    cmd.arg("--list-extensions");
+    installed_via(cmd, LIST_TIMEOUT)
+}
+
+/// [`installed_via_code`] over an explicit command and bound, for tests.
+pub fn installed_via(mut cmd: std::process::Command, timeout: std::time::Duration) -> Vec<String> {
+    let Ok(mut child) = cmd
         .stdin(std::process::Stdio::null())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
     else {
         return Vec::new();
     };
-    if !out.status.success() {
+    let Some(mut stdout) = child.stdout.take() else {
         return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        let _ = tx.send(buf);
+    });
+    let out = rx.recv_timeout(timeout).ok();
+    // Answered or wedged, it must not outlive the call holding a pipe open.
+    // The reap runs off-thread: a child in uninterruptible sleep cannot be
+    // killed, and a synchronous wait() would wedge the frame after all.
+    let _ = child.kill();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    let Some(out) = out else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out)
         .lines()
         .map(str::trim)
         .filter(|l| l.contains('.'))
@@ -772,6 +805,29 @@ mod tests {
                 "ms-python.python".to_string()
             ]
         );
+    }
+
+    /// The listing is bounded: a child that never answers is given up on
+    /// within the timeout, and a normal one is read in full.
+    #[test]
+    fn listing_installed_extensions_gives_up_on_a_hung_child() {
+        let mut fast = std::process::Command::new("/bin/sh");
+        fast.args(["-c", "printf 'a.b\\nnot-an-id\\nc.d\\n'"]);
+        assert_eq!(
+            installed_via(fast, std::time::Duration::from_secs(5)),
+            vec!["a.b".to_string(), "c.d".to_string()]
+        );
+        let mut hung = std::process::Command::new("/bin/sh");
+        hung.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+        assert!(installed_via(hung, std::time::Duration::from_millis(300)).is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "waited {:?} on a hung child",
+            started.elapsed()
+        );
+        let missing = std::process::Command::new("/definitely/not/here");
+        assert!(installed_via(missing, std::time::Duration::from_secs(1)).is_empty());
     }
 
     #[test]

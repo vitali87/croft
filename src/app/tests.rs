@@ -35250,4 +35250,22 @@ fn workspace_extension_recommendations_show_under_from_vscode() {
         .map(|i| i.id.clone())
         .collect();
     assert_eq!(ids, ["rust-lang.rust-analyzer", "nobody.nothing"]);
+
+    // Toggling a built-in row is an answer, not an install: the status names
+    // the extension and what croft has for it, and nothing is disabled.
+    let visible = app.extensions.visible_indices();
+    let pos = visible
+        .iter()
+        .position(|&i| app.extensions.items()[i].id == "rust-lang.rust-analyzer")
+        .expect("the row is visible");
+    app.extensions.select(pos);
+    let before = app.disabled_extensions.clone();
+    app.toggle_selected_extension();
+    assert!(
+        app.status
+            .starts_with("rust-lang.rust-analyzer: built in: lsp-rust"),
+        "the status restates the row: {}",
+        app.status
+    );
+    assert_eq!(app.disabled_extensions, before, "nothing was toggled");
 }
