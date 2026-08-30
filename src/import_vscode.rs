@@ -452,9 +452,10 @@ fn read_jsonc(path: &Path) -> Result<Option<Value>> {
     }
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    // `crate::tasks::strip_jsonc` walks CHARS. The `workspace.rs` one walks
-    // bytes and mangles any non-ASCII value (#396), which a settings file
-    // carries routinely in paths and snippet bodies.
+    // `crate::tasks::strip_jsonc` walks CHARS. The copy that used to live in
+    // `workspace.rs` walked bytes and mangled any non-ASCII value (#396),
+    // which a settings file carries routinely in paths and snippet bodies;
+    // it was deleted in favour of this one rather than repaired.
     let stripped = crate::tasks::strip_jsonc(&raw);
     if stripped.trim().is_empty() {
         return Ok(None);
