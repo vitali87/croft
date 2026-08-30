@@ -600,6 +600,19 @@ mod tests {
             "a lane dropped with the queue empties it, doubt included"
         );
 
+        // A file the agent DELETED empties the queue through forget_path,
+        // which is the fourth clearing path and the one no other test
+        // reaches (the whole-lane test removes rows inside
+        // mark_lane_reviewed's Gone arm, a different route).
+        led.note_dropped_events();
+        led.record_write(&p("/w/deleted.rs"), 9, &a);
+        assert!(led.may_be_incomplete());
+        assert!(led.forget_path(&p("/w/deleted.rs")));
+        assert!(
+            !led.may_be_incomplete(),
+            "a queue emptied by a deletion settles the doubt too"
+        );
+
         // Re-arm for the whole-lane path below.
         led.note_dropped_events();
         led.record_write(&p("/w/d.rs"), 4, &a);

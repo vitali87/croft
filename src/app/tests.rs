@@ -36734,7 +36734,6 @@ fn the_watcher_reports_rescans_and_keeps_directories_out_of_the_ledger() {
     std::fs::write(&file, "fn a() {}\n").unwrap();
     let doomed_dir = tmp.path().join("subdir");
     std::fs::create_dir(&doomed_dir).unwrap();
-    let doomed_file = tmp.path().join("removed.rs");
 
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.terminals[0].set_agent(Some(crate::agents::AgentLane {
@@ -36748,14 +36747,11 @@ fn the_watcher_reports_rescans_and_keeps_directories_out_of_the_ledger() {
     // A removed directory, a removed file, and an ordinary write.
     let mut dir_gone = NotifyEvent::new(EventKind::Remove(RemoveKind::Folder));
     dir_gone = dir_gone.add_path(doomed_dir.clone());
-    let mut file_gone = NotifyEvent::new(EventKind::Remove(RemoveKind::File));
-    file_gone = file_gone.add_path(doomed_file.clone());
     let mut written = NotifyEvent::new(EventKind::Modify(ModifyKind::Any));
     written = written.add_path(file.clone());
     let now = std::time::Instant::now();
     tx.send(Ok(vec![
         DebouncedEvent::new(dir_gone, now),
-        DebouncedEvent::new(file_gone, now),
         DebouncedEvent::new(written, now),
     ]))
     .unwrap();
