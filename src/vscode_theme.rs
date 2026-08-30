@@ -507,9 +507,11 @@ fn slug(s: &str) -> String {
     // + a combining acute) render identically and are the same theme to
     // anyone; only their bytes differ, by which editor last saved the file.
     // Without this they minted two ids and installed twice (#407). NFC is
-    // applied on both sides of the lowercase: lowercasing can itself
-    // decompose (`İ` becomes `i` + a combining dot), and a name already in
-    // NFC normalises to itself, so no existing single-form id changes.
+    // applied on both sides of the lowercase: lowercasing can expose a
+    // composition the uppercase spelling had no precomposed character for
+    // (`H` + U+0331 has none, so the first pass leaves it; its lowercase
+    // `h` + U+0331 composes to U+1E96 `ẖ`). A name already in NFC
+    // normalises to itself, so no existing single-form id changes.
     let lowered: String = s.nfc().collect::<String>().to_lowercase().nfc().collect();
     let slug = separators
         .replace_all(&lowered, "-")
@@ -1606,6 +1608,12 @@ mod tests {
         // Lowercasing İ (U+0130) yields i + U+0307; a name spelled that way
         // from the start must land on the same id.
         assert_eq!(slug("İstanbul"), slug("i\u{307}stanbul"));
+        // The trailing NFC is load-bearing: "H" + U+0331 has no precomposed
+        // uppercase, so the first pass leaves it, and its lowercase
+        // "h" + U+0331 composes to U+1E96. Without the second pass the two
+        // spellings mint two ids, the #407 bug surviving its own fix.
+        assert_eq!(slug("H\u{331}ana"), slug("\u{1e96}ana"));
+        assert_eq!(slug("H\u{331}ana"), "\u{1e96}ana");
         // A name already in NFC is unchanged by the normalisation, so every
         // existing single-form id survives.
         assert_eq!(slug("One Dark Pro"), "one-dark-pro");
