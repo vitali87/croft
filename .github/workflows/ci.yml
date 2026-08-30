@@ -27,9 +27,11 @@ jobs:
   release-hygiene:
     # Every merge that changes what ships must be a release in its own right
     # (#281): the version increments (two different binaries must never share
-    # a version and differ only in commit hash), and src/release_notes.rs is
-    # replaced so the welcome panel's "IN THIS RELEASE" card describes THIS
-    # version instead of silently carrying the previous release's story.
+    # a version and differ only in commit hash), and src/release_notes/<version>.md
+    # exists and says something, so the welcome panel's "IN THIS RELEASE" card
+    # describes THIS version instead of silently carrying the previous
+    # release's story. One file per version (#399) so two open PRs describing
+    # different changes never collide on the same file.
     # Docs / CI / test-only changes ship nothing and are exempt.
     name: version bump + release notes
     if: github.event_name == 'pull_request'

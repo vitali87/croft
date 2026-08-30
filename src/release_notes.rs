@@ -144,8 +144,28 @@ mod tests {
 
     /// The panel must show THIS version's notes, which is the guarantee the
     /// single shared file used to give.
+    ///
+    /// Non-emptiness alone cannot check that half: ANY version's file is
+    /// non-empty, so a build.rs that baked the wrong one would pass. The
+    /// current version's file is read here directly, through a path built
+    /// from `CARGO_PKG_VERSION` at compile time, and the baked text must
+    /// equal it. Measured: baking a fixed `0.1.999.md` instead leaves the
+    /// non-emptiness assertions green and fails this one.
     #[test]
     fn the_baked_notes_are_this_versions_and_are_not_empty() {
+        const FROM_SOURCE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/release_notes/",
+            env!("CARGO_PKG_VERSION"),
+            ".md"
+        ));
+        assert_eq!(
+            NOTES_MD,
+            FROM_SOURCE,
+            "the binary carries notes that are not v{}'s",
+            env!("CARGO_PKG_VERSION")
+        );
+
         let notes = release_notes();
         assert!(
             !notes.is_empty(),
