@@ -3,6 +3,9 @@
 //! `{{variables}}` from a `.http.env.json` beside the file — parsed, sent,
 //! and rendered as a response document the editor opens as an ordinary tab.
 //!
+//! One divergence from REST Client worth knowing: `ureq` replaces duplicate
+//! request headers, so two `Accept:` lines in a file send only the last.
+//!
 //! The split of responsibilities is deliberate: everything here is pure or
 //! blocking-IO-free except [`send`], which the app runs on a worker thread.
 //! Secrets never leave the substitution: history records the RAW request
@@ -53,6 +56,9 @@ pub fn is_http_file(path: &Path) -> bool {
 /// the first remaining line is `[METHOD] URL [HTTP/version]`, headers follow
 /// until a blank line, and everything after is the body.
 pub fn parse_requests(text: &str) -> Vec<HttpRequest> {
+    // A leading BOM (routine from Windows editors) must not defeat the
+    // method test on the first request line.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let lines: Vec<&str> = text.lines().collect();
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut start = 0usize;
@@ -94,14 +100,14 @@ fn parse_block(lines: &[&str], start: usize, end: usize) -> Option<HttpRequest> 
     let mut parts = lines[i].split_whitespace();
     let first = parts.next()?;
     // `GET https://…` or a bare URL (GET implied). A method is an all-caps
-    // token; anything else is the URL of a method-less request line.
-    let (method, url) = if first.len() <= 10
-        && !first.is_empty()
-        && first.chars().all(|c| c.is_ascii_uppercase())
-    {
-        (first.to_string(), parts.next()?.to_string())
-    } else {
-        (String::from("GET"), first.to_string())
+    // token WITH a URL after it; a lone all-caps token is treated as the
+    // URL, so a malformed line yields an honest send error rather than
+    // silently dropping the whole block from `request_at`.
+    let looks_like_method =
+        first.len() <= 10 && !first.is_empty() && first.chars().all(|c| c.is_ascii_uppercase());
+    let (method, url) = match parts.next() {
+        Some(second) if looks_like_method => (first.to_string(), second.to_string()),
+        _ => (String::from("GET"), first.to_string()),
     };
     i += 1;
     // Headers until the first blank line.
@@ -225,10 +231,17 @@ pub fn resolve(
     req: &HttpRequest,
     vars: &BTreeMap<String, String>,
 ) -> (ResolvedRequest, Vec<String>) {
-    let mut missing = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
     let mut sub = |s: &str| {
-        let (v, mut m) = substitute(s, vars);
-        missing.append(&mut m);
+        let (v, m) = substitute(s, vars);
+        for name in m {
+            // `Vec::dedup` removes only CONSECUTIVE duplicates; a name
+            // missing in both the URL and a later header must still be
+            // reported once.
+            if !missing.contains(&name) {
+                missing.push(name);
+            }
+        }
         v
     };
     let resolved = ResolvedRequest {
@@ -241,7 +254,6 @@ pub fn resolve(
             .collect(),
         body: req.body.as_deref().map(&mut sub),
     };
-    missing.dedup();
     (resolved, missing)
 }
 
@@ -312,7 +324,11 @@ pub fn send(req: &ResolvedRequest, timeout: Duration) -> Result<HttpResponse, St
         Ok(resp) => resp,
         // A status error still carries the whole response; show it.
         Err(ureq::Error::Status(_, resp)) => resp,
-        Err(ureq::Error::Transport(t)) => return Err(t.to_string()),
+        // The KIND only, never the Display: ureq's transport Display opens
+        // with the resolved URL, and a `?api_key={{token}}` request would
+        // print the substituted secret into the status line on exactly the
+        // failures (refused, DNS, timeout) a user reads it for.
+        Err(ureq::Error::Transport(t)) => return Err(t.kind().to_string()),
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let status = resp.status();
@@ -388,17 +404,29 @@ pub fn response_doc(raw_request_line: &str, resp: &HttpResponse) -> (&'static st
         "xml" => ("<!-- ", " -->"),
         _ => ("// ", ""),
     };
+    // A server header containing `-->` must not escape the XML comment
+    // prologue into the document body: the tab is a viewer of untrusted
+    // server output. (`//` comments are newline-delimited and ureq strips
+    // newlines from header values, so the other branch needs no escape.)
+    let esc = |s: &str| -> String {
+        if ext == "xml" {
+            s.replace("-->", "--&gt;")
+        } else {
+            s.to_string()
+        }
+    };
     let mut doc = String::new();
     let size = resp.body.len();
     doc.push_str(&format!(
-        "{open}{raw_request_line} \u{2192} HTTP/{} {} {} \u{00b7} {} ms \u{00b7} {size} B{close}\n",
+        "{open}{} \u{2192} HTTP/{} {} {} \u{00b7} {} ms \u{00b7} {size} B{close}\n",
+        esc(raw_request_line),
         resp.http_version.trim_start_matches("HTTP/"),
         resp.status,
-        resp.status_text,
+        esc(&resp.status_text),
         resp.elapsed_ms,
     ));
     for (k, v) in &resp.headers {
-        doc.push_str(&format!("{open}{k}: {v}{close}\n"));
+        doc.push_str(&format!("{open}{}: {}{close}\n", esc(k), esc(v)));
     }
     if resp.truncated {
         doc.push_str(&format!(
@@ -497,6 +525,8 @@ DELETE {{host}}/users/1\n";
         assert_eq!(s, "http://x.test/u/{{id}}");
         assert_eq!(missing, vec![String::from("id")]);
 
+        // SAFETY: the var name is unique to this test and nothing else in
+        // the tree reads it, so no concurrent reader races the mutation.
         unsafe { std::env::set_var("CROFT_HTTP_TEST_VAR", "7") };
         let (s, missing) = substitute("v={{$env.CROFT_HTTP_TEST_VAR}}", &vars);
         assert_eq!(s, "v=7");
@@ -511,6 +541,65 @@ DELETE {{host}}/users/1\n";
         assert!(missing.is_empty());
         assert_eq!(resolved.url, "http://x.test/users");
         assert_eq!(resolved.headers[0].1, "Bearer s3cret");
+    }
+
+    /// A malformed request line and a BOM'd file degrade honestly rather
+    /// than silently dropping a block (#428 review).
+    #[test]
+    fn malformed_lines_and_boms_degrade_honestly() {
+        // A lone all-caps token is a URL, not a method with no URL: the
+        // block survives, and the send fails with a real error later.
+        let reqs = parse_requests("GET\nAccept: x\n\n###\nGET http://ok/\n");
+        assert_eq!(reqs.len(), 2, "the malformed block is not dropped");
+        assert_eq!(reqs[0].url, "GET");
+        assert_eq!(request_at(&reqs, 1).unwrap().url, "GET");
+
+        // A leading BOM does not become part of the first URL.
+        let reqs = parse_requests("\u{feff}GET http://x/a\n");
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].url, "http://x/a");
+    }
+
+    /// A name missing in two places is reported once, even with another
+    /// missing name between the occurrences (`dedup` is consecutive-only).
+    #[test]
+    fn a_missing_name_is_reported_once_across_the_request() {
+        let req = HttpRequest {
+            method: String::from("GET"),
+            url: String::from("{{tok}}/{{host}}"),
+            headers: vec![(String::from("X-A"), String::from("{{tok}}"))],
+            body: None,
+            start: 0,
+            line: 0,
+            end: 1,
+        };
+        let (_, missing) = resolve(&req, &BTreeMap::new());
+        assert_eq!(missing, vec![String::from("tok"), String::from("host")]);
+    }
+
+    /// A server header carrying `-->` cannot escape the XML comment
+    /// prologue into the rendered document (#428 review).
+    #[test]
+    fn xml_prologue_survives_a_hostile_header_value() {
+        let resp = HttpResponse {
+            status: 200,
+            status_text: String::from("OK"),
+            http_version: String::from("HTTP/1.1"),
+            headers: vec![
+                (String::from("content-type"), String::from("text/xml")),
+                (String::from("x-evil"), String::from("a --> <boom/> <!--")),
+            ],
+            body: b"<a/>".to_vec(),
+            truncated: false,
+            elapsed_ms: 1,
+        };
+        let (ext, doc) = response_doc("GET x", &resp);
+        assert_eq!(ext, "xml");
+        assert!(
+            doc.contains("a --&gt; <boom/> <!-- -->"),
+            "the header stays inside its comment: {doc}"
+        );
+        assert!(!doc.contains("a --> <boom/>"), "no raw escape survives");
     }
 
     /// The env file is a flat JSON object; strings verbatim, numbers and
