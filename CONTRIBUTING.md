@@ -47,6 +47,69 @@ reason. Two specific traps:
 Re-fetch comments immediately before merging rather than trusting what you read
 earlier: bot replies land asynchronously while checks are still running.
 
+## Verifying the CHECKS actually ran
+
+A short, all-green `gh pr checks` is not evidence that CI ran, and a green
+merge gate is not evidence that anything is resolved. Every item below was hit
+for real on this repo in a single day, and they share one shape: **the thing
+that would have told you was absent rather than wrong.** A check that cannot
+fail in the case you need it for is not a check.
+
+**Require the head's full check set to EXIST, not merely to be green.** As CI
+gets faster this gets more dangerous, not less: a check-settled test that polls
+until nothing is pending passes instantly against an empty list, because the
+run has not been created yet. Count the jobs and require all of them for the
+SHA you are about to merge. "Nothing is failing" and "nothing has run" are the
+same reading.
+
+**A `CONFLICTING` pull request gets no workflow runs at all.** GitHub cannot
+compute the merge commit, so it never creates them. Four pushes over an hour
+produced zero runs while `gh pr checks` showed one row the whole time — a
+review bot's no-op — which reads exactly like a healthy PR early in its cycle.
+The tell is the pair:
+
+```bash
+gh pr view <n> --json mergeable          # CONFLICTING
+gh run list --branch <branch> --limit 3  # nothing for the head SHA
+```
+
+Either alone is ambiguous; together they are conclusive. This is worse than the
+empty-list case above, because a single green row survives a glance that an
+empty list would not.
+
+**An earlier read of the review threads expires.** The rule above about a bot
+whose check says pass while no review ran has a second direction, which is the
+one that nearly landed a major on #392: a bot that has been genuinely silent
+can start producing findings at any moment, and its check row looks identical
+before and after. That PR was eight-of-eight green with an approval in hand
+when a pre-merge re-fetch turned up five inline threads, one of them a command
+running in a directory other than the one the confirm popup named. Re-fetch
+`gh api repos/<repo>/pulls/<n>/comments` immediately before merging. An
+approval that predates your last push is stale for the same reason.
+
+**`mergeStateStatus: BLOCKED` names no reason, and the obvious endpoint lies.**
+Classic branch protection can report zero required checks and zero required
+approvals while a **ruleset** is what is actually enforcing. Rulesets live
+somewhere else entirely:
+
+```bash
+gh api repos/<repo>/rules/branches/main
+```
+
+On this repo that is where `required_review_thread_resolution` lives, which is
+why a PR with every check green and every finding fixed in code still refuses
+to merge until the threads themselves are resolved. Fixing the code does not
+resolve a thread, and a thread on a file your branch no longer owns cannot be
+resolved by any code change at all — reply saying where the point was addressed,
+then resolve it.
+
+**Re-read the version at merge time, in the same breath as the final checks.**
+The release gate compares your head against the merge base, so it passes as
+long as your branch is above main *at that point*. Two branches can both pass
+legitimately and only the second to merge conflicts. When several PRs are in
+flight the number you reserved when you branched is routinely stale by the time
+you merge; `git show origin/main:Cargo.toml` costs one command.
+
 ## Every shipped change is a release
 
 A PR that changes anything compiled into the binary (`src/`, `assets/`,
