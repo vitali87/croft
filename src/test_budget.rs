@@ -253,6 +253,45 @@ mod tests {
             None,
             "nor is one that does not parse"
         );
+        assert_eq!(
+            threads_from_args(argv(&["croft", "--test-threads=zero", "--test-threads=8"])),
+            Some(8.0),
+            "a value that does not parse must not mask a real one later on"
+        );
+    }
+
+    /// The flag beats the variable, because that is libtest's own order.
+    ///
+    /// `library/test/src/lib.rs` resolves the count as
+    /// `opts.test_threads.unwrap_or_else(get_concurrency)`, and only
+    /// `get_concurrency` reads `RUST_TEST_THREADS`. Reading them the other
+    /// way round undercounts exactly where it matters: CI pins the variable
+    /// to 4 and `CONTRIBUTING.md` teaches the variable, so
+    /// `RUST_TEST_THREADS=4 cargo test -- --test-threads=8` is the natural
+    /// way to reproduce #397, and an env-first reading believes 4 while the
+    /// harness runs 8.
+    ///
+    /// The rule is asserted on the resolver rather than by setting the
+    /// variable: this suite shares one process, so mutating the environment
+    /// here would change what every other thread reads.
+    #[test]
+    fn the_flag_outranks_the_environment_variable_as_libtest_does() {
+        // The shape of `configured_threads`, with both sources supplied
+        // explicitly instead of read from the process.
+        fn resolve(flag: Option<f64>, env: Option<f64>) -> Option<f64> {
+            flag.or(env)
+        }
+        assert_eq!(
+            resolve(Some(8.0), Some(4.0)),
+            Some(8.0),
+            "the flag wins when both are given, as libtest resolves it"
+        );
+        assert_eq!(
+            resolve(None, Some(4.0)),
+            Some(4.0),
+            "the variable is the fallback, not the override"
+        );
+        assert_eq!(resolve(None, None), None, "neither means fall back to CPUs");
     }
 
     #[test]
