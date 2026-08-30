@@ -35167,6 +35167,151 @@ fn dragging_past_a_short_lines_end_paints_what_it_copies() {
     );
 }
 
+/// #404: a double-width character occupies two cells, so every span after
+/// it must be painted, and every click after it hit-tested, by display
+/// width rather than by character count.
+///
+/// The painter advanced `x` by `chars().count()`, so after a CJK pair the
+/// next span landed two cells to the left of where the terminal had put
+/// the pair, overpainting its second half, and `log_cell_at` matched the
+/// drift by design. Fixed together so the two never disagree.
+#[test]
+fn double_width_characters_keep_log_columns_aligned() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use ratatui::widgets::Widget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("wide.log");
+    // "\u{4e2d}\u{6587}" is two characters and four cells; then a space and
+    // a coloured X, which must land on cell 5 (character column 3).
+    std::fs::write(
+        &p,
+        "\u{1b}[31m\u{4e2d}\u{6587}\u{1b}[0m \u{1b}[32mX\u{1b}[0m\n",
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some());
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let body = app.editor.log.as_ref().unwrap().last_body;
+
+    // Click the X and release on it: a one-character selection.
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        body.x + 5,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        body.x + 6,
+        body.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        body.x + 6,
+        body.y,
+    ));
+    let (text, _) = app.editor.log.as_ref().unwrap().selection_text();
+    assert_eq!(text, "X", "cell 5 is the X, two cells past the wide pair");
+
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    {
+        let area = app.editor.last_area;
+        (&mut app.editor).render(area, &mut buf);
+    }
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let row: Vec<&str> = (body.x..body.x + 7)
+        .map(|x| buf[(x, body.y)].symbol())
+        .collect();
+    assert_eq!(
+        buf[(body.x + 2, body.y)].symbol(),
+        "\u{6587}",
+        "the second wide character keeps its cells: {row:?}"
+    );
+    assert_eq!(
+        buf[(body.x + 5, body.y)].symbol(),
+        "X",
+        "the span after the pair starts where the terminal put it: {row:?}"
+    );
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    let painted: Vec<u16> = (body.x..body.x + body.width)
+        .filter(|x| buf[(*x, body.y)].style().bg == Some(selected_bg))
+        .collect();
+    assert_eq!(
+        painted,
+        vec![body.x + 5],
+        "the selection band sits on the X's cell, not on character column 3"
+    );
+}
+
+/// #404 review: a wide character whose first half lands on the body's last
+/// cell does not fit whole, and `set_stringn` drops it entirely. The
+/// selection band must not colour that cell, or the annotator paints where
+/// the painter deliberately put nothing, the same disagreement the cell map
+/// exists to close, at the boundary.
+#[test]
+fn a_wide_character_clipped_at_the_right_edge_gets_no_selection_band() {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 8,
+    };
+    // Learn the body width from a probe render, so the fixture puts the
+    // wide character exactly on the last cell whatever the chrome costs.
+    let probe = tmp.path().join("probe.log");
+    std::fs::write(&probe, "\u{1b}[31mx\u{1b}[0m\n").unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&probe).unwrap();
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut e).render(area, &mut buf);
+    let width = e.log.as_ref().unwrap().last_body.width as usize;
+    assert!(width > 2);
+
+    let p = tmp.path().join("edge.log");
+    let text = format!("{}\u{4e2d}", "x".repeat(width - 1));
+    std::fs::write(&p, format!("\u{1b}[31m{text}\u{1b}[0m\n")).unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&p).unwrap();
+    let chars = text.chars().count();
+    e.log.as_mut().unwrap().selection = Some(((0, 0), (0, chars)));
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut e).render(area, &mut buf);
+    let body = e.log.as_ref().unwrap().last_body;
+    let last = body.x + body.width - 1;
+    let selected_bg = crate::theme::Theme::BLACK.selection();
+    assert_eq!(
+        buf[(last, body.y)].symbol(),
+        " ",
+        "the painter drops a wide character that does not fit whole"
+    );
+    assert_ne!(
+        buf[(last, body.y)].style().bg,
+        Some(selected_bg),
+        "so the band must not colour the cell it left blank"
+    );
+    assert_eq!(
+        buf[(last - 1, body.y)].style().bg,
+        Some(selected_bg),
+        "while the character before it is selected as usual"
+    );
+}
+
 /// #257: a frame that paints no log body must publish no body rect.
 ///
 /// `render_log` returned early for a zero-sized area WITHOUT clearing
@@ -35519,5 +35664,66 @@ fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
         app.editor.active_search_match,
         Some((0, 0, 5)),
         "a query that matches again must paint its match, whole"
+    );
+}
+
+/// #414: a dropped `file://` URL naming a non-ASCII path must decode to that
+/// path, not to one char per byte.
+///
+/// The decoder pushed each `%xx` byte, and each literal byte, `as char`,
+/// which maps a byte to the Latin-1 code point of the same value, so every
+/// multi-byte UTF-8 sequence came out as mojibake and the drop opened a
+/// path that does not exist. The same defect class as #396, in the drop
+/// path.
+#[test]
+fn a_dropped_file_url_with_a_non_ascii_path_decodes_to_utf8() {
+    use std::path::PathBuf;
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/caf%C3%A9/%E4%B8%AD%E6%96%87.txt"),
+        Some(PathBuf::from("/tmp/caf\u{e9}/\u{4e2d}\u{6587}.txt")),
+        "percent-encoded UTF-8 reassembles into the characters it encodes"
+    );
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/caf\u{e9}"),
+        Some(PathBuf::from("/tmp/caf\u{e9}")),
+        "a literal non-ASCII character in the URL survives too"
+    );
+    // The ASCII cases the decoder always handled are unchanged.
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/a%20b"),
+        Some(PathBuf::from("/tmp/a b"))
+    );
+    assert_eq!(
+        super::normalise_dropped_token("'/tmp/x y'"),
+        Some(PathBuf::from("/tmp/x y"))
+    );
+    // `+` is not a space in a file URL (form encoding does not apply), and a
+    // `%` that is not an escape passes through literally, wherever it sits.
+    for (url, want) in [
+        ("file:///tmp/a+b", "/tmp/a+b"),
+        ("file:///tmp/a%zzb", "/tmp/a%zzb"),
+        ("file:///tmp/a%2", "/tmp/a%2"),
+        ("file:///tmp/a%", "/tmp/a%"),
+    ] {
+        assert_eq!(
+            super::normalise_dropped_token(url),
+            Some(PathBuf::from(want)),
+            "{url}"
+        );
+    }
+}
+
+/// A `file://` URL whose escapes do not form valid UTF-8 names no path this
+/// process can open. The decoder used to read each byte as Latin-1 and open
+/// the wrong path; a lossy decode would instead open a path with U+FFFD in
+/// it, which is just as wrong and passes every "is this a path" screen. The
+/// function's contract is to drop what is not a plausible path, so it does.
+#[test]
+fn a_dropped_file_url_with_invalid_utf8_is_dropped() {
+    assert_eq!(super::normalise_dropped_token("file:///tmp/%FF"), None);
+    assert_eq!(
+        super::normalise_dropped_token("file:///tmp/%C3"),
+        None,
+        "a truncated multi-byte lead is not a path either"
     );
 }
