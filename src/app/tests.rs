@@ -35228,3 +35228,211 @@ fn a_log_that_paints_nothing_publishes_no_body_rect() {
          mouse path to hit-test against"
     );
 }
+
+/// #257 follow-up: the find bar's title must FIT the bar.
+///
+/// The truncated-count arm shipped at 51 characters in a bar capped at 48
+/// and painted as "...in the part that could be searc". Nothing rendered the
+/// title, so nothing could catch it, and the replacement is protected only
+/// by arithmetic no one re-runs. This renders every arm at the real width.
+#[test]
+fn every_find_bar_title_fits_the_bar_it_is_painted_in() {
+    use crate::widgets::editor_find::{EditorFind, render_editor_find};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: 12,
+    };
+    let opts = crate::widgets::search::SearchOpts::default();
+
+    // Every arm of the title match, with the fragment that must survive
+    // whole. `match_index` matters as much as the count: the "N of M" arm is
+    // reached ONLY when it is Some, and `set_match_count` does not touch it,
+    // so the first version of this test never rendered that arm at all,
+    // while claiming in its name to cover every one. It is also the arm
+    // whose width grows with TWO runtime numbers, which makes it the most
+    // able to overrun the bar.
+    /// A title arm: the fragment that must survive, and how to reach it.
+    type TitleCase = (&'static str, Box<dyn Fn(&mut EditorFind)>);
+
+    let cases: Vec<TitleCase> = vec![
+        // The empty-query arm is the BARE title. Asserting it contains
+        // "Find" proved nothing: every arm does. It is identified by what it
+        // must NOT carry.
+        ("Find", Box::new(|s: &mut EditorFind| s.query.clear())),
+        (
+            "No results",
+            Box::new(|s: &mut EditorFind| s.set_match_count(0, false)),
+        ),
+        (
+            "no match in the part searched",
+            Box::new(|s: &mut EditorFind| s.set_match_count(0, true)),
+        ),
+        (
+            "1234 matches",
+            Box::new(|s: &mut EditorFind| s.set_match_count(1234, false)),
+        ),
+        (
+            "1234+ matches",
+            Box::new(|s: &mut EditorFind| s.set_match_count(1234, true)),
+        ),
+        (
+            "7 of 1234",
+            Box::new(|s: &mut EditorFind| {
+                s.set_match_count(1234, false);
+                s.match_index = Some(7);
+            }),
+        ),
+        (
+            "9876543 of 9876543+",
+            Box::new(|s: &mut EditorFind| {
+                // Both numbers as wide as they plausibly get on a log, since
+                // this arm's length grows with each independently.
+                s.set_match_count(9_876_543, true);
+                s.match_index = Some(9_876_543);
+            }),
+        ),
+    ];
+
+    for (fragment, prepare) in cases {
+        let mut state = EditorFind::new(String::from("needle"), opts);
+        prepare(&mut state);
+        let mut buf = Buffer::empty(area);
+        render_editor_find(&mut state, area, &mut buf, crate::theme::Theme::BLACK);
+
+        let rect = state.last_rect;
+        assert!(rect.width > 0, "the bar must have been painted");
+        let row: String = (rect.x..rect.x + rect.width)
+            .map(|x| buf[(x, rect.y)].symbol().to_string())
+            .collect();
+        assert!(
+            row.contains(fragment),
+            "the title was clipped: wanted {fragment:?} whole, painted {row:?}"
+        );
+        if fragment == "Find" {
+            // Every arm contains "Find", so containment alone cannot tell
+            // this arm from the others: a completely wrong bare title passed.
+            for other in ["of", "matches", "No results", "no match"] {
+                assert!(
+                    !row.contains(other),
+                    "the empty-query title must be bare, painted {row:?}"
+                );
+            }
+        }
+    }
+}
+
+/// #257 follow-up: the count and the highlight must agree at every step of
+/// a search over a budgeted log.
+///
+/// Rounds 3, 4 and 5 of #393 each found one instance of a single class: the
+/// bar's count and the painted highlight disagreeing. This walks the whole
+/// gesture sequence and asserts the exact state after each one: type, step
+/// forward into the out-of-reach branch (where round 3's defect lived),
+/// step back, retype into a query that matches nothing, delete back.
+///
+/// NO SEPARATE INVARIANT HELPER, deliberately. An earlier version carried a
+/// closure asserting `match_count == 0 => active_search_match.is_none()` at
+/// each checkpoint, which reads as the general property behind the three
+/// defects. It could not fail: `match_count == 0` holds at exactly one
+/// checkpoint, and there the concrete assertion already fixes the highlight
+/// to `None`, which is strictly stronger. Neutering the closure entirely
+/// left the test green. Extending it over a prefix walk did not help either,
+/// because the code has no per-length behaviour, so every state the walk
+/// visits is behaviourally identical to one already enumerated.
+///
+/// A dead assertion whose name announces a property is worse than no
+/// assertion: it makes a reader believe the class is covered. The concrete
+/// assertions ARE the property, made checkable one state at a time.
+///
+/// HALF A PAIR. These pin `count == 0` with nothing painted. The other
+/// direction, a count that survives while the highlight is thrown away, is
+/// pinned by `a_step_that_runs_out_of_reach_keeps_the_match_it_already_had`.
+#[test]
+fn the_count_and_the_highlight_agree_at_every_step_of_a_log_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("budgeted.log");
+    let mut body = String::from("\u{1b}[31mERROR\u{1b}[0m first and only\n");
+    let filler = "quiet line with nothing of interest ".repeat(4);
+    // Just past the budget: enough for the sweep to run out, no more.
+    for _ in 0..(crate::log_view::FIND_SCAN_BYTES / filler.len() + 200) {
+        body.push_str(&filler);
+        body.push('\n');
+    }
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some(), "the fixture opens rendered");
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "ERROR".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "typing lands on the only match"
+    );
+    assert!(
+        app.editor_find.as_ref().unwrap().match_count > 0,
+        "the match is counted"
+    );
+
+    // Step forward WHILE THE QUERY STILL MATCHES, so the step does something:
+    // the next match is past the budget, so this exercises the out-of-reach
+    // branch, which is where round 3's defect lived.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "a step that cannot reach further keeps the match it had"
+    );
+    assert!(
+        app.editor_find.as_ref().unwrap().count_truncated(),
+        "and the bar reports that the search did not cover the file"
+    );
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "stepping back over a single match returns to it"
+    );
+
+    // Only now retype into something unmatchable, so the transition from a
+    // painted match to none is itself a checkpoint.
+    for ch in "ZZQX".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor_find.as_ref().unwrap().match_count,
+        0,
+        "the new query matches nothing"
+    );
+    assert_eq!(
+        app.editor.active_search_match, None,
+        "so nothing may stay painted"
+    );
+
+    // And back: the highlight must return rather than staying cleared.
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match.map(|(r, _, _)| r),
+        Some(0),
+        "a query that matches again must paint its match"
+    );
+}
