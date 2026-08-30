@@ -15017,22 +15017,35 @@ impl App {
         // The review queue rides the same chip (#345): a file an agent
         // changed while you were looking elsewhere is the thing you most
         // need to be told about, and it outlives the agent's own pane.
-        let unreviewed = self.agent_ledger.total_unreviewed();
+        let unreviewed = self.agent_ledger.unreviewed_files();
         if seated > 0 || unreviewed > 0 {
-            seg_texts.push(format!(
-                " \u{25c6} {seated} agent{}{}{} ",
-                if seated == 1 { "" } else { "s" },
-                if waiting > 0 {
-                    format!(" \u{b7} {waiting} waiting")
-                } else {
-                    String::new()
-                },
-                if unreviewed > 0 {
-                    format!(" \u{b7} {unreviewed} to review")
-                } else {
-                    String::new()
-                }
-            ));
+            // With nothing seated the agent half would read "0 agents",
+            // which is not what the chip is reporting any more: the queue
+            // outlives the pane, so the chip becomes the queue's.
+            let agents_part = if seated > 0 {
+                format!(
+                    "{seated} agent{}{}",
+                    if seated == 1 { "" } else { "s" },
+                    if waiting > 0 {
+                        format!(" \u{b7} {waiting} waiting")
+                    } else {
+                        String::new()
+                    }
+                )
+            } else {
+                String::new()
+            };
+            let review_part = if unreviewed > 0 {
+                format!("{unreviewed} to review")
+            } else {
+                String::new()
+            };
+            let joined = match (agents_part.is_empty(), review_part.is_empty()) {
+                (false, false) => format!("{agents_part} \u{b7} {review_part}"),
+                (false, true) => agents_part,
+                _ => review_part,
+            };
+            seg_texts.push(format!(" \u{25c6} {joined} "));
         }
         let widths: Vec<u16> = seg_texts.iter().map(|s| s.chars().count() as u16).collect();
         let right_total: u16 = widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1);
@@ -27356,9 +27369,16 @@ impl App {
         while let Some(ev) = self.agent_events.pop_front() {
             // A gone agent with nothing left to review takes its lane with
             // it; one with a queue keeps it, since the files it changed
-            // still need looking at (#345).
+            // still need looking at (#345). The event is per PANE while the
+            // lane is per NAME, so a second pane still running the same
+            // agent — or an agent swap in one pane, which fires Gone then
+            // Seated — must not take the shared lane down with it.
             if let crate::agents::AgentEvent::Gone { agent, .. } = &ev
                 && self.agent_ledger.unreviewed_count(agent) == 0
+                && !self
+                    .terminals
+                    .iter()
+                    .any(|t| t.agent().is_some_and(|a| a.name == *agent))
             {
                 let agent = agent.clone();
                 self.agent_ledger.forget(&agent);
@@ -27425,10 +27445,18 @@ impl App {
             if self.roots.owning_root(path).is_none() {
                 continue;
             }
-            let Some(hash) = crate::agent_lane::hash_file(path) else {
-                continue;
-            };
-            any |= self.agent_ledger.record_write(path, hash, &working);
+            match crate::agent_lane::read_baseline(path) {
+                crate::agent_lane::Baseline::Hash(hash) => {
+                    any |= self.agent_ledger.record_write(path, hash, &working);
+                }
+                // The agent deleted it: the row goes, rather than sitting in
+                // the queue forever pointing at a file that is not there.
+                crate::agent_lane::Baseline::Gone => {
+                    any |= self.agent_ledger.forget_path(path);
+                }
+                // Unreadable this instant; the next write re-reports it.
+                crate::agent_lane::Baseline::Unreadable => {}
+            }
         }
         any
     }
@@ -27437,28 +27465,27 @@ impl App {
     /// DISK now becomes the baseline, so the row returns only on a later
     /// write.
     pub(crate) fn mark_agent_file_reviewed(&mut self, agent: &str, path: &Path) -> bool {
-        let Some(hash) = crate::agent_lane::hash_file(path) else {
-            // A vanished file has nothing left to review; clear it against
-            // whatever the ledger last saw so it cannot stick forever.
-            let current = self
-                .agent_ledger
-                .lane(agent)
-                .iter()
-                .find(|f| f.path == path)
-                .map(|f| f.current_hash);
-            return match current {
-                Some(h) => self.agent_ledger.mark_reviewed(agent, path, h),
-                None => false,
-            };
-        };
-        self.agent_ledger.mark_reviewed(agent, path, hash)
+        match crate::agent_lane::read_baseline(path) {
+            crate::agent_lane::Baseline::Hash(hash) => {
+                self.agent_ledger.mark_reviewed(agent, path, hash)
+            }
+            // Nothing left to review: drop the row rather than baselining a
+            // file that is not there.
+            crate::agent_lane::Baseline::Gone => self.agent_ledger.forget_path(path),
+            // Unreadable right now is NOT reviewed: say so instead of
+            // clearing content the user has not seen.
+            crate::agent_lane::Baseline::Unreadable => {
+                self.status = format!("Could not read {} to mark it reviewed", path.display());
+                false
+            }
+        }
     }
 
     /// Mark an agent's whole lane reviewed (#345).
     pub(crate) fn mark_agent_lane_reviewed(&mut self, agent: &str) -> usize {
         let cleared = self
             .agent_ledger
-            .mark_lane_reviewed(agent, crate::agent_lane::hash_file);
+            .mark_lane_reviewed(agent, crate::agent_lane::read_baseline);
         self.status = match cleared {
             0 => format!("{agent}: nothing waiting for review"),
             1 => format!("{agent}: 1 file marked reviewed"),
@@ -27480,9 +27507,15 @@ impl App {
                     .is_some_and(|a| a.status == crate::agents::AgentStatus::Waiting)
             })
             .or_else(|| self.terminals.iter().position(|t| t.agent().is_some()));
-        if let Some(idx) = pick {
-            self.active_terminal = idx;
-            self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+        match pick {
+            Some(idx) => {
+                self.active_terminal = idx;
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+            }
+            // The chip is showing a review queue whose agents have all gone:
+            // a click that silently did nothing was the worst of the three
+            // options (#345 review).
+            None => self.run_command(crate::widgets::command_palette::Command::ShowAgentLane),
         }
     }
 

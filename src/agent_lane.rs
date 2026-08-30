@@ -53,6 +53,13 @@ pub struct AgentLedger {
     lanes: BTreeMap<String, BTreeMap<PathBuf, LaneFile>>,
 }
 
+/// Files above this are not hashed: the ledger runs on the frame loop
+/// while an agent is working (exactly when writes are frequent), and a
+/// checked-in fixture or generated asset would otherwise be read whole on
+/// every touch. Such a file is recorded at a size-and-mtime stamp instead,
+/// which still changes when it changes.
+pub const MAX_HASH_BYTES: u64 = 4 * 1024 * 1024;
+
 /// A stable content hash. FNV-1a over the bytes: the ledger only ever asks
 /// "is this the same content I showed you", so a fast non-cryptographic
 /// hash is the right tool, and it keeps the baseline to 8 bytes per file
@@ -66,10 +73,57 @@ pub fn content_hash(bytes: &[u8]) -> u64 {
     h
 }
 
-/// The hash of `path`'s current content, or `None` when it cannot be read
-/// (deleted, or a directory).
-pub fn hash_file(path: &Path) -> Option<u64> {
-    std::fs::read(path).ok().map(|b| content_hash(&b))
+/// What reading a file for its baseline produced.
+///
+/// "Gone" and "unreadable" must never collapse: clearing a row because the
+/// file could not be read this instant marks content the user has NOT seen
+/// as reviewed, and the state is unrecoverable — a later write landing on
+/// the same hash is a no-op, so the unseen content stays clear forever.
+/// That is precisely the promise this module exists to keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Baseline {
+    /// The content hashed cleanly.
+    Hash(u64),
+    /// The path no longer exists: there is nothing left to review.
+    Gone,
+    /// It exists but could not be read (EMFILE under a build storm, a
+    /// transient lock, EACCES after the agent chmod'd it). The row must
+    /// stay in the queue.
+    Unreadable,
+}
+
+/// The hash of `path`'s current content, distinguishing a vanished file
+/// from one that merely could not be read right now.
+pub fn read_baseline(path: &Path) -> Baseline {
+    // One `metadata` call is cheaper than the read it guards, and it is
+    // also how a too-large file is stamped rather than slurped.
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Baseline::Gone,
+        Err(_) => return Baseline::Unreadable,
+    };
+    if meta.len() > MAX_HASH_BYTES {
+        return Baseline::Hash(stamp_hash(&meta));
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => Baseline::Hash(content_hash(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Baseline::Gone,
+        Err(_) => Baseline::Unreadable,
+    }
+}
+
+/// The stand-in hash for a file too large to read on the frame loop: its
+/// length and mtime. Weaker than content addressing — a same-size write in
+/// the same mtime granule is missed — but it is bounded, and the
+/// alternative is reading hundreds of megabytes during a draw.
+fn stamp_hash(meta: &std::fs::Metadata) -> u64 {
+    let mut bytes = meta.len().to_le_bytes().to_vec();
+    if let Ok(mtime) = meta.modified()
+        && let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH)
+    {
+        bytes.extend_from_slice(&d.as_nanos().to_le_bytes());
+    }
+    content_hash(&bytes)
 }
 
 impl AgentLedger {
@@ -95,14 +149,13 @@ impl AgentLedger {
                 Some(entry) => {
                     // A write that lands on content the user has already
                     // reviewed (an agent reverting its own change, say) is
-                    // still a write, but it does not resurrect the row.
+                    // still a write, but it does not resurrect the row —
+                    // and it is not evidence of ambiguity either, so the
+                    // `shared` promotion rides inside the same guard.
                     if entry.current_hash != hash {
                         entry.current_hash = hash;
                         entry.writes_since_review = entry.writes_since_review.saturating_add(1);
-                        changed = true;
-                    }
-                    if shared && !entry.shared {
-                        entry.shared = true;
+                        entry.shared |= shared;
                         changed = true;
                     }
                 }
@@ -124,14 +177,15 @@ impl AgentLedger {
         changed
     }
 
-    /// The rows in one agent's lane, most recently written first among
-    /// unreviewed ones, then the reviewed remainder.
+    /// The rows in one agent's lane: everything awaiting review first, then
+    /// the reviewed remainder, each group in path order. (There is no write
+    /// timestamp on a row, so this is not recency ordering.)
     pub fn lane(&self, agent: &str) -> Vec<&LaneFile> {
         let Some(lane) = self.lanes.get(agent) else {
             return Vec::new();
         };
         let mut rows: Vec<&LaneFile> = lane.values().collect();
-        rows.sort_by_key(|f| (!f.unreviewed(), f.path.clone()));
+        rows.sort_by(|a, b| (!a.unreviewed(), &a.path).cmp(&(!b.unreviewed(), &b.path)));
         rows
     }
 
@@ -177,28 +231,46 @@ impl AgentLedger {
 
     /// Mark every file in one lane reviewed, using `hash_of` to read each
     /// file's current content. Returns how many rows were cleared.
-    pub fn mark_lane_reviewed(
-        &mut self,
-        agent: &str,
-        hash_of: impl Fn(&Path) -> Option<u64>,
-    ) -> usize {
+    pub fn mark_lane_reviewed(&mut self, agent: &str, read: impl Fn(&Path) -> Baseline) -> usize {
         let Some(lane) = self.lanes.get_mut(agent) else {
             return 0;
         };
         let mut cleared = 0;
+        let mut gone: Vec<PathBuf> = Vec::new();
         for entry in lane.values_mut() {
             if !entry.unreviewed() {
                 continue;
             }
-            // A file that has vanished is cleared rather than left in the
-            // queue forever: there is nothing left to review.
-            let current = hash_of(&entry.path).unwrap_or(entry.current_hash);
-            entry.reviewed_hash = Some(current);
-            entry.current_hash = current;
-            entry.writes_since_review = 0;
+            match read(&entry.path) {
+                Baseline::Hash(current) => {
+                    entry.reviewed_hash = Some(current);
+                    entry.current_hash = current;
+                    entry.writes_since_review = 0;
+                    cleared += 1;
+                }
+                // Nothing left to review: the row goes rather than sitting
+                // in the queue forever pointing at a file that is not there.
+                Baseline::Gone => gone.push(entry.path.clone()),
+                // Unreadable RIGHT NOW is not reviewed: leave it queued and
+                // do not count it, so the status line's number is honest.
+                Baseline::Unreadable => {}
+            }
+        }
+        for path in &gone {
+            lane.remove(path);
             cleared += 1;
         }
         cleared
+    }
+
+    /// Drop `path` from every lane — the file is gone, so there is nothing
+    /// left for anyone to review.
+    pub fn forget_path(&mut self, path: &Path) -> bool {
+        let mut any = false;
+        for lane in self.lanes.values_mut() {
+            any |= lane.remove(path).is_some();
+        }
+        any
     }
 
     /// Drop an agent's lane entirely (it is gone and the user dismissed it).
@@ -206,13 +278,33 @@ impl AgentLedger {
         self.lanes.remove(agent).is_some()
     }
 
-    /// Total unreviewed rows across every lane — the sidebar section badge.
+    /// Total unreviewed ROWS across every lane (the per-lane badges sum to
+    /// this). Exposed for the sidebar section that will render those badges;
+    /// the single global chip uses [`Self::unreviewed_files`] instead.
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// Total unreviewed ROWS across every lane — the per-lane badges sum to
+    /// this, so a file two agents both touched counts twice, once in each
+    /// lane. For "how many files must the user look at", which is what a
+    /// single global badge means, use [`Self::unreviewed_files`].
     pub fn total_unreviewed(&self) -> usize {
         self.lanes
             .values()
             .flat_map(|lane| lane.values())
             .filter(|f| f.unreviewed())
             .count()
+    }
+
+    /// Distinct FILES awaiting review across every lane. A shared row is one
+    /// file to open, not two: a count that drops by two when the user
+    /// reviews one file is telling them something untrue.
+    pub fn unreviewed_files(&self) -> usize {
+        self.lanes
+            .values()
+            .flat_map(|lane| lane.values())
+            .filter(|f| f.unreviewed())
+            .map(|f| &f.path)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     }
 }
 
@@ -318,16 +410,20 @@ mod tests {
 
         // `a.rs` moved on disk since the agent's write (the user edited it);
         // `gone.rs` no longer exists.
-        let cleared =
-            led.mark_lane_reviewed(
-                "claude",
-                |path| {
-                    if path == p("/w/a.rs") { Some(42) } else { None }
-                },
-            );
+        let cleared = led.mark_lane_reviewed("claude", |path| {
+            if path == p("/w/a.rs") {
+                Baseline::Hash(42)
+            } else {
+                Baseline::Gone
+            }
+        });
         assert_eq!(cleared, 2);
         assert_eq!(led.unreviewed_count("claude"), 0);
         let rows = led.lane("claude");
+        assert!(
+            !rows.iter().any(|f| f.path == p("/w/gone.rs")),
+            "a vanished file leaves the lane rather than lingering reviewed"
+        );
         let a = rows.iter().find(|f| f.path == p("/w/a.rs")).unwrap();
         assert_eq!(
             a.reviewed_hash,
@@ -344,6 +440,58 @@ mod tests {
         assert!(!led.forget("claude"));
     }
 
+    /// A file that cannot be READ right now is not reviewed. Clearing it
+    /// would mark content the user never saw as seen, and unrecoverably: a
+    /// later write landing on the same hash is a no-op, so the row would
+    /// stay clear forever. This is the promise the module exists to keep.
+    #[test]
+    fn an_unreadable_file_stays_in_the_queue_rather_than_being_cleared() {
+        let mut led = AgentLedger::new();
+        led.record_write(&p("/w/locked.rs"), 100, &[String::from("claude")]);
+        assert_eq!(led.unreviewed_count("claude"), 1);
+
+        // The disk really holds different content; the read fails now.
+        let cleared = led.mark_lane_reviewed("claude", |_| Baseline::Unreadable);
+        assert_eq!(cleared, 0, "an unreadable file is not a cleared one");
+        assert_eq!(
+            led.unreviewed_count("claude"),
+            1,
+            "it stays queued: 'could not read' is not 'reviewed'"
+        );
+
+        // And it is still recoverable once the read succeeds.
+        assert_eq!(led.mark_lane_reviewed("claude", |_| Baseline::Hash(555)), 1);
+        assert_eq!(led.unreviewed_count("claude"), 0);
+    }
+
+    /// A file too large to read on the frame loop is stamped rather than
+    /// slurped, and a vanished file is distinguished from an unreadable one.
+    #[test]
+    fn baselines_bound_the_read_and_separate_gone_from_unreadable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let small = dir.path().join("small.rs");
+        std::fs::write(&small, b"hello").unwrap();
+        assert_eq!(
+            read_baseline(&small),
+            Baseline::Hash(content_hash(b"hello")),
+            "a small file is content-addressed"
+        );
+        assert_eq!(read_baseline(&dir.path().join("nope.rs")), Baseline::Gone);
+
+        let big = dir.path().join("big.bin");
+        std::fs::write(&big, vec![0u8; (MAX_HASH_BYTES + 1) as usize]).unwrap();
+        let stamped = read_baseline(&big);
+        assert!(matches!(stamped, Baseline::Hash(_)));
+        assert_ne!(
+            stamped,
+            Baseline::Hash(content_hash(&vec![0u8; (MAX_HASH_BYTES + 1) as usize])),
+            "past the cap the stamp stands in for the content, never reading it"
+        );
+        // The stamp still moves when the file does.
+        std::fs::write(&big, vec![1u8; (MAX_HASH_BYTES + 2) as usize]).unwrap();
+        assert_ne!(read_baseline(&big), stamped);
+    }
+
     /// The hash is content-addressed and stable, which is what makes a
     /// baseline comparison meaningful.
     #[test]
@@ -358,7 +506,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let f = dir.path().join("x.rs");
         std::fs::write(&f, b"hello").unwrap();
-        assert_eq!(hash_file(&f), Some(content_hash(b"hello")));
-        assert_eq!(hash_file(&dir.path().join("nope.rs")), None);
+        assert_eq!(read_baseline(&f), Baseline::Hash(content_hash(b"hello")));
+        assert_eq!(read_baseline(&dir.path().join("nope.rs")), Baseline::Gone);
     }
 }
