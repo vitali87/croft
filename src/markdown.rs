@@ -265,6 +265,39 @@ enum RedirectScan {
 
 /// One pass of [`has_write_redirect`] over a whole block; `quotes` says
 /// whether `'` and `"` open a string or are ordinary bytes.
+/// Whether `prev` ends a shell word, so a `#` immediately after it opens a
+/// comment rather than sitting mid-token.
+///
+/// Whitespace is the obvious case. The operators matter too, and getting
+/// this wrong the other way was a real over-flag: `echo a|#x > /tmp/y` was
+/// scored destructive because `|` is not whitespace, while every shell reads
+/// `#x > /tmp/y` there as a comment and writes nothing.
+///
+/// Every member was probed against `sh` with a positive control in the same
+/// run (the same line with the `#` removed, which does write):
+///
+/// | line | writes? |
+/// |---|---|
+/// | `echo a\|#x > out`, `echo a;#x > out`, `echo a &#x > out` | no |
+/// | `(#x > out)`, `echo a)#x > out` | no |
+/// | `echo a=#x > out`, `echo a-#x > out` | **yes** |
+///
+/// `=` and `-` are deliberately absent: they do not end a word, and
+/// admitting them would blank a redirect the shell really performs.
+///
+/// `<` and `>` are absent too, for a different reason. A `#` straight after
+/// a redirect operator is not a comment with clean semantics: `sh` answers
+/// `echo a >#x` and `cat <#x > out` with `Syntax error: end of file
+/// unexpected`, because the redirect is left with no target. Neither writes,
+/// but neither runs either, so there is no behaviour to match and nothing is
+/// gained by claiming one.
+///
+/// This list only ever grows on evidence, because every addition moves the
+/// matcher toward calling a destructive block calm.
+fn ends_a_word(prev: u8) -> bool {
+    prev.is_ascii_whitespace() || matches!(prev, b'|' | b';' | b'&' | b'(' | b')')
+}
+
 fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
     let b = code.as_bytes();
     let mut quote: Option<u8> = None;
@@ -301,7 +334,7 @@ fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
                 // was left open, and a `#` inside that string is text. And
                 // never immediately after a line continuation, where the
                 // joined word puts the `#` mid-token.
-                b'#' if quotes && prev.is_ascii_whitespace() => {
+                b'#' if quotes && ends_a_word(prev) => {
                     // A comment runs to the end of its line; the block goes on.
                     while i < b.len() && b[i] != b'\n' {
                         i += 1;
@@ -315,6 +348,22 @@ fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
                         while j < b.len() && b[j] == b'>' {
                             j += 1;
                         }
+                        // A descriptor dup is `>&N` or `>&-`, and the `&`
+                        // binds TIGHTLY: it is checked before whitespace is
+                        // skipped, and only a digit or `-` may follow it.
+                        //
+                        // Exempting every `&`-prefixed target was wrong in
+                        // the direction that matters. `>&` is bash and zsh's
+                        // synonym for `&>`, so `echo '' >& ~/.bashrc`
+                        // TRUNCATES the file, and it was classified calm.
+                        // Measured: an 18-byte file went to 1 byte under
+                        // bash, while the `echo a >&2` control left its file
+                        // untouched. dash refuses it ("Bad fd number"), but
+                        // croft's terminal is the user's shell, and on the
+                        // two shells most people have it writes.
+                        let dup = b.get(j) == Some(&b'&')
+                            && b.get(j + 1)
+                                .is_some_and(|n| n.is_ascii_digit() || *n == b'-');
                         while j < b.len() && b[j].is_ascii_whitespace() {
                             j += 1;
                         }
@@ -325,7 +374,7 @@ fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
                                     r.is_ascii_whitespace() || ";&|)".contains(r)
                                 })
                         });
-                        if !(target.starts_with('&') || dev_null) {
+                        if !(dup || dev_null) {
                             return RedirectScan::Found;
                         }
                     }
@@ -1244,6 +1293,14 @@ mod tests {
             // next physical line is mid-word and not a comment. `sh`, `bash`
             // and `zsh` all write the file for this one.
             "echo a\\\n#x > /tmp/y",
+            // `=` and `-` do NOT end a word, so these `#`s are mid-token and
+            // the redirect is real. `sh` writes the file for both.
+            // `>&` is bash and zsh's synonym for `&>`: this TRUNCATES the
+            // file. An 18-byte target went to 1 byte under bash.
+            "echo '' >& ~/.bashrc",
+            "cp id_rsa >& /tmp/out",
+            "echo a=#x > /tmp/y",
+            "echo a-#x > /tmp/y",
             "git push --force",
             "git reset --hard HEAD~3",
         ] {
@@ -1257,6 +1314,10 @@ mod tests {
             "echo hello",
             "python3 -m http.server",
             "cargo test 2>&1 | tail",
+            // The paired control: `&` followed by a DIGIT is a real
+            // descriptor dup and writes no file.
+            "echo a >&2",
+            "exec 2>&-",
             "make >/dev/null",
             "echo a -> b",
             "ls # see https://x -> y",
@@ -1269,6 +1330,13 @@ mod tests {
             // positive above so the continuation rule cannot be
             // over-applied: the two differ by exactly that space.
             "echo a \\\n#x > /tmp/y",
+            // A shell operator ends a word, so a `#` straight after one opens
+            // a comment and the `>` behind it never runs. Probed against `sh`
+            // with a control (the same line without the `#`) that does write.
+            "echo a|#x > /tmp/y",
+            "echo a;#x > /tmp/y",
+            "echo a &#x > /tmp/y",
+            "echo a)#x > /tmp/y",
             // A `>` genuinely inside a multi-line string writes nothing, and
             // `sh` agrees. Nothing pinned this direction before.
             "echo \"open\necho x > ~/.bashrc\nmore\"",

@@ -26281,8 +26281,14 @@ impl App {
         if let Some(idx) = self.terminals.iter().position(|t| {
             t.label() == block.pane_name
                 && t.foreground_is_shell()
+                // `is_some_and`, not `is_none_or`: an unreadable cwd is
+                // exactly the case this guard exists for. Reusing the pane
+                // when croft cannot tell where its shell sits would type
+                // this repo's block into the other repo's shell, which is
+                // the outcome the comment above forbids. The copy in
+                // `run_project_task` predates this and is left alone.
                 && t.kernel_shell_cwd()
-                    .is_none_or(|cwd| cwd.starts_with(&root))
+                    .is_some_and(|cwd| cwd.starts_with(&root))
         }) {
             self.active_terminal = idx;
             self.terminals[idx].write_input(bytes.as_bytes());
