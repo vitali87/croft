@@ -1120,6 +1120,12 @@ enum MenuAction {
     /// CAPTURES row: ask the navigator about the selected captured line,
     /// with the pane rows around it (#372).
     AskNavigatorAboutCapture,
+    /// PROBLEMS row: have the navigator fix this diagnostic as a streamed,
+    /// cancellable edit (#374).
+    FixProblemWithNavigator {
+        path: PathBuf,
+        item: crate::widgets::problems::ProblemItem,
+    },
     /// Editor body: one level of the call hierarchy for the symbol at buffer
     /// `(row, col)` — callers when `incoming`, callees otherwise.
     ShowCallsAt {
@@ -1261,6 +1267,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::AskNavigatorAt { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorSelection { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorAboutCapture => Some("n"),
+        MenuAction::FixProblemWithNavigator { .. } => None,
         MenuAction::ShowCallsAt { incoming: true, .. } => Some("⌘K H"),
         MenuAction::ShowCallsAt {
             incoming: false, ..
@@ -2953,6 +2960,10 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// When the running Fix with Navigator turn started (#374): the clock
+    /// its PROBLEMS-row spinner runs on, and the flag that keeps the main
+    /// loop repainting while it runs. `None` when no fix is streaming.
+    problems_fix_started: Option<std::time::Instant>,
     /// The presentation edits behind the open Change Color Presentation
     /// picker (#254), indexed by row id; cleared after a pick.
     pending_color_presentations: Vec<(String, Vec<crate::widgets::editor::TextSpanEdit>)>,
@@ -4433,6 +4444,7 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            problems_fix_started: None,
             pending_color_presentations: Vec::new(),
             pending_color_context: None,
             color_presentations_request: None,
@@ -10983,7 +10995,13 @@ impl App {
         self.code_action_request_id = None;
         let was_resolve = std::mem::take(&mut self.code_action_pending_resolve);
         if unsupported {
-            self.status = String::from("No quick fixes: no code-action server for this file");
+            // No code-action server, but a seated navigator can still take
+            // the diagnostic under the caret (#374).
+            if self.navigator_fix_candidate().is_some() {
+                self.open_code_action_picker(Vec::new());
+            } else {
+                self.status = String::from("No quick fixes: no code-action server for this file");
+            }
             return true;
         }
         // A resolve reply carries the one action the user already chose, now with
@@ -11002,16 +11020,24 @@ impl App {
                 self.resolve_and_apply_code_action(items.into_iter().next().unwrap());
             }
             Some(items) if !items.is_empty() => self.open_code_action_picker(items),
+            // Nothing from the server: the navigator entry alone, when a
+            // diagnostic sits under the caret (#374).
+            _ if self.navigator_fix_candidate().is_some() => {
+                self.open_code_action_picker(Vec::new());
+            }
             _ => self.status = String::from("No quick fixes available here"),
         }
         true
     }
 
     /// Present the available code actions in the shared list picker, tagging
-    /// each row with its index into `pending_code_actions`.
+    /// each row with its index into `pending_code_actions`. When a diagnostic
+    /// sits under the caret, one more row follows the server's: Fix with
+    /// Navigator (#374), at index `items.len()`, offered whether or not a
+    /// navigator is seated (the action says so if none is).
     fn open_code_action_picker(&mut self, items: Vec<crate::lsp::manager::CodeActionItem>) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
-        let rows = items
+        let mut rows: Vec<ListRow> = items
             .iter()
             .enumerate()
             .map(|(i, item)| ListRow {
@@ -11023,6 +11049,12 @@ impl App {
                 },
             })
             .collect();
+        if self.navigator_fix_candidate().is_some() {
+            rows.push(ListRow {
+                id: String::from("navigator"),
+                label: String::from("Fix with Navigator"),
+            });
+        }
         self.pending_code_actions = items;
         self.open_list_picker(
             ListPicker::new(ListPurpose::CodeAction, "Quick Fix", rows),
@@ -13401,6 +13433,10 @@ impl App {
         self.problems.theme = self.theme;
         self.problems.focused = self.focus == Pane::Terminal;
         self.problems.hover_pointer = self.pointer_cell;
+        self.problems.fix_glyph = match self.problems_fix_started {
+            Some(t) => update_spinner_frame(t.elapsed().as_millis()),
+            None => "",
+        };
         self.output.focus_gradient = gradient;
         self.output.theme = self.theme;
         self.output.focused = self.focus == Pane::Terminal;
@@ -21015,6 +21051,10 @@ impl App {
                     let file = self.pair_last_noted_file.take();
                     let prose = std::mem::take(&mut self.pair_commentary_buf);
                     let origin = self.pair_turn_origin.take();
+                    // Whatever the outcome, the fix turn is over: the row's
+                    // spinner stops, and the LSP's next publish decides
+                    // whether the row itself goes (#374).
+                    self.clear_problem_fix();
                     if !cancelled && !prose.trim().is_empty() {
                         // Anchor the turn's prose at its invocation point (or
                         // where it last commented). A file that is not live
@@ -21092,6 +21132,7 @@ impl App {
             self.navigator_notes.clear();
             self.pair_commentary_buf.clear();
             self.pair_turn_origin = None;
+            self.clear_problem_fix();
             // The turn counters die with the seat (see the unseat twin).
             self.pair_notes_this_turn = 0;
             self.pair_last_noted_file = None;
@@ -22072,6 +22113,17 @@ impl App {
             ListPurpose::CodeAction => {
                 if let Some(item) = self.pending_code_actions.get(index).cloned() {
                     self.apply_code_action(item);
+                } else if index == self.pending_code_actions.len()
+                    && let Some((path, item)) = self.navigator_fix_candidate()
+                {
+                    // The row past the server's actions (#374): the
+                    // server's titles ride along as hints.
+                    let hints = self
+                        .pending_code_actions
+                        .iter()
+                        .map(|a| a.title.clone())
+                        .collect();
+                    self.fix_problem_with_navigator(path, item, hints);
                 }
                 self.pending_code_actions.clear();
             }
@@ -27705,6 +27757,147 @@ impl App {
         }
     }
 
+    /// PROBLEMS: Fix with Navigator (#374). Opens the file at the diagnostic
+    /// and sends the navigator an ask turn built from the diagnostic
+    /// (message, source, position) with the server's quick fixes as
+    /// `hints`, anchored on the diagnostic's line. The navigator's edit
+    /// streams into the buffer under its caret exactly as any ask does, so
+    /// every safety property of that path holds: visible, cancellable with
+    /// `Cmd+K X` (which reverts the streamed text), never written to disk by
+    /// the navigator. The row wears a spinner until the turn ends, and the
+    /// server's next publish clears or updates it.
+    ///
+    /// With no navigator seated the action says so rather than doing
+    /// nothing; the menu model has no disabled state (#372's shape).
+    pub(crate) fn fix_problem_with_navigator(
+        &mut self,
+        path: PathBuf,
+        item: crate::widgets::problems::ProblemItem,
+        hints: Vec<String>,
+    ) {
+        let Some(host) = &self.pair_host else {
+            self.status =
+                String::from("Navigator is not active (run croft pair in this workspace)");
+            return;
+        };
+        if host.is_busy() {
+            self.status = format!("{} is mid-turn; wait for it to finish", host.name());
+            return;
+        }
+        let name = host.name().to_string();
+        // Land on the diagnostic first: the turn is anchored on the active
+        // file, and the navigator's caret parks where the user is looking.
+        let opened = if item.col_utf16 {
+            self.open_at_utf16(&path, item.line, item.col)
+        } else {
+            self.open_at(&path, item.line as usize, item.col as usize)
+        };
+        if let Err(e) = opened {
+            self.status = format!("Fix with Navigator: open failed: {e}");
+            return;
+        }
+        let Some(file) = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&self.tree.root, p))
+        else {
+            self.status = String::from("Fix with Navigator: the file is outside the workspace");
+            return;
+        };
+        let row = (item.line as usize).min(self.editor.lines.len().saturating_sub(1));
+        let selection = self.editor.lines.get(row).cloned().unwrap_or_default();
+        let instruction = crate::widgets::problems::fix_prompt(&item, &file, &hints);
+        let content = self.editor.lines.join("\n");
+        let Some(host) = &self.pair_host else {
+            // Unreachable today (the open above does not touch the seat),
+            // but a silent return would leave the jump's status as success.
+            self.status = String::from("Navigator is not active");
+            return;
+        };
+        match host.send_ask_turn(&file, (row, row), &selection, &instruction, &content) {
+            Ok(()) => {
+                let what: String = item
+                    .message
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
+                self.status = format!(
+                    "Asked {name} to fix {file}:{}: {what} (Cmd+K X cancels)",
+                    row + 1
+                );
+                self.pair_turn_origin = Some((file, row));
+                self.problems.fixing = Some((path, item.line));
+                self.problems_fix_started = Some(std::time::Instant::now());
+            }
+            Err(e) => self.status = format!("Fix with Navigator failed: {e}"),
+        }
+    }
+
+    /// The diagnostic under the caret in the active file, as a PROBLEMS
+    /// item, for the `Cmd+.` and palette entry points of Fix with Navigator
+    /// (#374). The first diagnostic covering the caret row wins; its source
+    /// is recovered from the per-server store, since the editor's overlay
+    /// does not carry it.
+    pub(crate) fn navigator_fix_candidate(
+        &self,
+    ) -> Option<(PathBuf, crate::widgets::problems::ProblemItem)> {
+        let path = self.editor.path.clone()?;
+        let row = self.editor.cursor_row as u32;
+        let d = self
+            .editor
+            .diagnostics_in_line_range(row, row)
+            .into_iter()
+            .next()?;
+        let source = self
+            .lsp_diagnostics
+            .get(&path)
+            .and_then(|by_server| {
+                by_server.iter().find_map(|(server, diags)| {
+                    diags
+                        .iter()
+                        .any(|x| {
+                            x.start_line == d.start_line
+                                && x.start_char == d.start_char
+                                && x.message == d.message
+                        })
+                        .then(|| server.clone())
+                })
+            })
+            .unwrap_or_default();
+        Some((
+            path,
+            crate::widgets::problems::ProblemItem {
+                line: d.start_line,
+                col: d.start_char,
+                col_utf16: true,
+                severity: d.severity,
+                message: d.message,
+                source,
+            },
+        ))
+    }
+
+    /// Stop the PROBLEMS-row spinner: the fix turn ended, was cancelled, or
+    /// the seat is gone (#374).
+    fn clear_problem_fix(&mut self) {
+        self.problems.fixing = None;
+        self.problems_fix_started = None;
+    }
+
+    /// Monotonic phase while a Fix with Navigator turn streams, so the loop
+    /// repaints its spinner; `0` otherwise, so it never wakes the renderer
+    /// idle (the same contract as the update spinner).
+    fn problems_fix_spinner_phase(&self) -> u128 {
+        match self.problems_fix_started {
+            Some(t) => t.elapsed().as_millis() / UPDATE_SPINNER_FRAME_MS,
+            None => 0,
+        }
+    }
+
     /// Jump the editor to an absolute `path:line[:col]`, recording where the
     /// user was so Back returns to it, exactly like go-to-definition. False
     /// when the file doesn't exist or won't open.
@@ -29795,6 +29988,10 @@ impl App {
             Cmd::SessionParticipants => self.open_participants_picker(),
             Cmd::CollabCancelStream => self.collab_cancel_stream(),
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
+            Cmd::FixProblemWithNavigator => match self.navigator_fix_candidate() {
+                Some((path, item)) => self.fix_problem_with_navigator(path, item, Vec::new()),
+                None => self.status = String::from("No diagnostic at the caret to fix"),
+            },
             Cmd::AskNavigator => {
                 let (range, selection) = match self.editor.selection_rows() {
                     Some(rows) => (rows, self.editor.selection_text()),
@@ -32611,6 +32808,24 @@ impl App {
                 // wins over the editor pane it sits beside.
                 if rect_contains(self.minimap_img_rect, m.column, m.row) {
                     self.open_minimap_menu(m.column, m.row);
+                    return;
+                }
+                // A PROBLEMS diagnostic row: Fix with Navigator (#374).
+                // Offered whether or not a navigator is seated, like the
+                // CAPTURES ask: the menu model has no disabled state, and a
+                // refusal that says why beats a greyed entry.
+                if self.bottom_panel_tab == BottomPanelTab::Problems
+                    && rect_contains(self.problems.last_area, m.column, m.row)
+                    && let Some((path, item)) = self.problems.diagnostic_at(m.row)
+                {
+                    self.context_menu = Some(ContextMenu::flat(
+                        (m.column, m.row),
+                        vec![(
+                            String::from("Fix with Navigator"),
+                            MenuAction::FixProblemWithNavigator { path, item },
+                        )],
+                        self.tree.root.clone(),
+                    ));
                     return;
                 }
                 // A CAPTURES row: the ask is offered whether or not a
@@ -36051,6 +36266,7 @@ impl App {
         self.navigator_notes.clear();
         self.pair_commentary_buf.clear();
         self.pair_turn_origin = None;
+        self.clear_problem_fix();
         self.editor.comment_focus = None;
         if self.pair_host_lock.take().is_some() {
             self.collab = None;
@@ -36437,6 +36653,9 @@ impl App {
                 self.open_ask_navigator((start, end), selection);
             }
             MenuAction::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
+            MenuAction::FixProblemWithNavigator { path, item } => {
+                self.fix_problem_with_navigator(path, item, Vec::new());
+            }
             MenuAction::ShowCallsAt { row, col, incoming } => {
                 self.editor.cursor_row = row;
                 self.editor.cursor_col = col;
@@ -42810,7 +43029,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let blink_visible = app.cursor_visible_phase();
         let blink_changed = blink_visible != last_blink_visible;
         // Either spinner advancing must wake a redraw; both stay 0 when idle.
-        let spinner_phase = app.update_spinner_phase() + app.mcp_spinner_phase();
+        let spinner_phase =
+            app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
         let search_changed = app.drain_search_results();

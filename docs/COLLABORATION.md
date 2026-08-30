@@ -76,7 +76,10 @@ it leaves, and riding its edits as they stream. Then, inside the editor:
 
 - **Ask it** about a line or a selection — right-click the gutter ("Ask Navigator"), right-click
   a selection ("Ask Navigator About Selection"), or press `Cmd+K Q`. From the CAPTURES panel, `n` on a
-  captured line asks about that line with the pane rows around it (#372). Its edits stream into the
+  captured line asks about that line with the pane rows around it (#372). From the PROBLEMS panel,
+  right-click a diagnostic → **Fix with Navigator** (also the last row of the `Cmd+.` Quick Fix
+  picker) sends it the diagnostic with the server's quick fixes as hints; the row wears a spinner
+  until the turn ends, and `Cmd+K X` cancels and reverts (#374). Its edits stream into the
   buffer **token by token**, the way a human types, with a named caret riding the stream.
 - **Yield it the turn** with `Cmd+K Y`: it reviews the active file *comment-only* — everything
   it says appears as **comment boxes** right in the file, unnumbered blocks between the lines
