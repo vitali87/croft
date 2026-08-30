@@ -5,15 +5,19 @@
 //! data, so the welcome panel needs zero network and never shells out to
 //! `git log` or a forge API — the list is an accurate property of the build.
 //!
-//! Update [`RELEASE_NOTES`] on every version bump so the panel always tells
-//! the truth about what the running binary ships (see the project memory
-//! "always populate release narratives after every build"). Newest / most
-//! notable highlight first; keep each summary to one short sentence.
+//! Write `src/release_notes/<version>.md` on every version bump so the panel
+//! always tells the truth about what the running binary ships. One highlight
+//! per line, each prefixed `feature:` or `fix:`; newest or most notable
+//! first, each summary one short sentence.
 //!
-//! REPLACE this list on every bump; do not append. The panel describes the
-//! single version it is baked into (`v{CARGO_PKG_VERSION}`), not a running
-//! changelog. Each patch bump is one change, so the list is usually one entry:
-//! what this bump fixed or added, and nothing carried over from prior versions.
+//! ONE FILE PER VERSION, and a version's file describes that version alone
+//! rather than accumulating a changelog. A missing file for the current
+//! version is a BUILD error, so a binary always describes itself.
+//!
+//! The layout exists because the single shared file was on every open pull
+//! request's rebase path (#399): two versions' notes never conflict in
+//! content, only in the file they shared, and contributors had to reserve
+//! version numbers by hand to keep the bumps from colliding.
 
 use ratatui::style::Color;
 
@@ -21,7 +25,7 @@ use ratatui::style::Color;
 /// the gutter glyph and tint the welcome panel paints beside the summary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoteKind {
-    // Which variants RELEASE_NOTES constructs depends on what this version
+    // Which variants a version's notes construct depends on what it
     // shipped; a fix-only release builds no `Feature` (and vice versa), so
     // either variant may go unconstructed in a given build. `icon()`/`color()`
     // reference both regardless; allow the unused one without tripping dead-code.
@@ -58,8 +62,135 @@ pub struct ReleaseNote {
     pub summary: &'static str,
 }
 
-/// What shipped in the current release. Replace on every version bump.
-pub const RELEASE_NOTES: &[ReleaseNote] = &[ReleaseNote {
-    kind: NoteKind::Feature,
-    summary: "Notification sinks: a `notifications` block in config.json forwards a long command finishing in an unwatched pane, a red test run, or a terminal notice to ntfy, a webhook, termux-notification, or a command of your own.",
-}];
+/// This version's highlights, as written in `src/release_notes/<version>.md`
+/// and baked in by `build.rs`.
+///
+/// One file per version rather than one shared file: two versions' notes
+/// never conflict in CONTENT, only in the file they shared, and that file was
+/// on every open pull request's rebase path (#399).
+const NOTES_MD: &str = include_str!(concat!(env!("OUT_DIR"), "/release_notes.md"));
+
+/// Parse the baked notes: one highlight per line, `feature:` or `fix:` first.
+///
+/// Blank lines and `#` comments are skipped so a notes file can carry a
+/// heading. A line with no recognised prefix is a `Fix`, which is the
+/// conservative reading: describing a fix as a feature oversells the release,
+/// and the opposite merely undersells it.
+fn parse(md: &'static str) -> Vec<ReleaseNote> {
+    md.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        // A markdown list is the obvious way to write a file of one-liners,
+        // and a leading bullet would otherwise make `- feature: x` an
+        // unrecognised prefix: a Fix whose summary still carries the dash.
+        .map(|l| l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")).unwrap_or(l).trim())
+        .map(|line| match line.split_once(':') {
+            Some((kind, rest)) if kind.eq_ignore_ascii_case("feature") => ReleaseNote {
+                kind: NoteKind::Feature,
+                summary: rest.trim_start(),
+            },
+            Some((kind, rest)) if kind.eq_ignore_ascii_case("fix") => ReleaseNote {
+                kind: NoteKind::Fix,
+                summary: rest.trim_start(),
+            },
+            _ => ReleaseNote {
+                kind: NoteKind::Fix,
+                summary: line,
+            },
+        })
+        .collect()
+}
+
+/// What shipped in the current release.
+pub fn release_notes() -> &'static [ReleaseNote] {
+    static NOTES: std::sync::OnceLock<Vec<ReleaseNote>> = std::sync::OnceLock::new();
+    NOTES.get_or_init(|| parse(NOTES_MD))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_kind_prefix_selects_the_glyph_and_the_rest_is_the_summary() {
+        let notes = parse("feature: Something new.\nfix: Something repaired.\n");
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].kind, NoteKind::Feature);
+        assert_eq!(notes[0].summary, "Something new.");
+        assert_eq!(notes[1].kind, NoteKind::Fix);
+        assert_eq!(notes[1].summary, "Something repaired.");
+    }
+
+    /// A markdown bullet is the obvious way to write a file of one-liners,
+    /// and it must not swallow the kind prefix.
+    #[test]
+    fn a_bullet_does_not_hide_the_kind_prefix() {
+        for line in ["- feature: One.", "* feature: One.", "feature: One."] {
+            let notes = parse(Box::leak(line.to_string().into_boxed_str()));
+            assert_eq!(notes[0].kind, NoteKind::Feature, "{line:?}");
+            assert_eq!(notes[0].summary, "One.", "{line:?}");
+        }
+    }
+
+    #[test]
+    fn headings_and_blank_lines_are_not_highlights() {
+        let notes = parse("# 0.1.808\n\nfeature: One.\n\n   \nfix: Two.\n");
+        assert_eq!(notes.len(), 2, "a notes file may carry a heading");
+    }
+
+    /// A summary containing a colon must not be cut at it: only a recognised
+    /// KIND prefix splits the line.
+    #[test]
+    fn a_colon_inside_the_summary_is_kept() {
+        let notes = parse("feature: croft plot: numbers in, a chart out.\n");
+        assert_eq!(notes[0].summary, "croft plot: numbers in, a chart out.");
+
+        // And a line with an unrecognised prefix keeps its whole text rather
+        // than losing everything before the colon.
+        let notes = parse("note: something worth saying.\n");
+        assert_eq!(notes[0].summary, "note: something worth saying.");
+        assert_eq!(
+            notes[0].kind,
+            NoteKind::Fix,
+            "an unrecognised prefix reads as a fix: overselling a release is \
+             the worse error"
+        );
+    }
+
+    /// The panel must show THIS version's notes, which is the guarantee the
+    /// single shared file used to give.
+    ///
+    /// Non-emptiness alone cannot check that half: ANY version's file is
+    /// non-empty, so a build.rs that baked the wrong one would pass. The
+    /// current version's file is read here directly, through a path built
+    /// from `CARGO_PKG_VERSION` at compile time, and the baked text must
+    /// equal it. Measured: baking a fixed `0.1.999.md` instead leaves the
+    /// non-emptiness assertions green and fails this one.
+    #[test]
+    fn the_baked_notes_are_this_versions_and_are_not_empty() {
+        const FROM_SOURCE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/release_notes/",
+            env!("CARGO_PKG_VERSION"),
+            ".md"
+        ));
+        assert_eq!(
+            NOTES_MD,
+            FROM_SOURCE,
+            "the binary carries notes that are not v{}'s",
+            env!("CARGO_PKG_VERSION")
+        );
+
+        let notes = release_notes();
+        assert!(
+            !notes.is_empty(),
+            "every version ships highlights; the build fails without them"
+        );
+        for n in notes {
+            assert!(
+                !n.summary.trim().is_empty(),
+                "a highlight with no text would paint an empty row"
+            );
+        }
+    }
+}
