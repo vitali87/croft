@@ -344,7 +344,17 @@ fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
                 b'>' => {
                     let prev = if i > 0 { b[i - 1] } else { b' ' };
                     if prev != b'-' && prev != b'=' {
-                        let mut j = i + 1;
+                        // Where the target search starts if this is a
+                        // single `>`. A dup is spelled with ONE: zsh parses
+                        // `>>&` as append-both-streams-to-file, so
+                        // `echo appended >>&2` APPENDS to a file named
+                        // `./2` (measured under `setopt NO_MULTIOS`, while
+                        // `>&2` on the same fixture left it alone). sh,
+                        // bash and dash reject the form outright, so this
+                        // is zsh-only and append rather than truncate, but
+                        // the direction is the dangerous one.
+                        let single = i + 1;
+                        let mut j = single;
                         while j < b.len() && b[j] == b'>' {
                             j += 1;
                         }
@@ -367,7 +377,7 @@ fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
                         // writes the file `./2x` (measured: a 17-byte file
                         // became 12 bytes reading "overwritten") while
                         // `>&2` followed by anything non-word is a real dup.
-                        let dup = b.get(j) == Some(&b'&') && {
+                        let dup = j == single && b.get(j) == Some(&b'&') && {
                             let mut k = j + 1;
                             if b.get(k) == Some(&b'-') {
                                 k += 1;
@@ -378,9 +388,13 @@ fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
                             }
                             // At least one digit or a `-`, then nothing that
                             // could continue the word.
-                            k > j + 1
-                                && b.get(k)
-                                    .is_none_or(|n| n.is_ascii_whitespace() || b";&|)".contains(n))
+                            // `ends_a_word` rather than a second spelling
+                            // of it a few lines away. The two lists differed
+                            // by `(`, which no shell distinguishes here
+                            // (`>&2(` is a parse error everywhere), but two
+                            // spellings of one idea invite a wrong
+                            // unification later.
+                            k > j + 1 && b.get(k).is_none_or(|n| ends_a_word(*n))
                         };
                         while j < b.len() && b[j].is_ascii_whitespace() {
                             j += 1;
@@ -1320,6 +1334,13 @@ mod tests {
             // The digits must run to a word boundary: `>&2x` writes `./2x`.
             "echo overwritten >&2x",
             "echo x >&12ab",
+            // Only a SINGLE `>` may precede a dup: zsh reads `>>&2` as
+            // append-both-streams to the file `./2`.
+            "echo appended >>&2",
+            // The two passes can only ADD a flag, never clear one: an
+            // unterminated quote makes pass 1 give up, and the quote-blind
+            // rescan then sees the `#` as text rather than a comment.
+            "echo \" # > /tmp/y",
             "echo a=#x > /tmp/y",
             "echo a-#x > /tmp/y",
             "git push --force",
