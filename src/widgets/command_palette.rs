@@ -185,6 +185,8 @@ pub enum Command {
     /// the instruction box; the navigator may edit on the resulting turn).
     AskNavigator,
     AskNavigatorAboutCapture,
+    /// Re-root the workspace onto the host the active pane is ssh'd into (#364).
+    OpenWorkspaceOnSshHost,
     /// Mark every file every agent changed as reviewed (#345).
     MarkAgentLaneReviewed,
     /// Summarise each agent's review queue (#345).
@@ -372,6 +374,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::CollabCancelStream,
     Command::AskNavigator,
     Command::AskNavigatorAboutCapture,
+    Command::OpenWorkspaceOnSshHost,
     Command::MarkAgentLaneReviewed,
     Command::ShowAgentLane,
     Command::MarkAgentFileReviewed,
@@ -545,6 +548,7 @@ impl Command {
             Command::CollabCancelStream => "Collab: Cancel AI Stream",
             Command::AskNavigator => "Navigator: Ask About Line or Selection",
             Command::AskNavigatorAboutCapture => "Captures: Ask Navigator About This Line",
+            Command::OpenWorkspaceOnSshHost => "Remote: Open Workspace on This Pane's Host",
             Command::MarkAgentLaneReviewed => "Agents: Mark Changed Files Reviewed",
             Command::ShowAgentLane => "Agents: Show Changed Files",
             Command::MarkAgentFileReviewed => "Agents: Mark This File Reviewed",
@@ -720,6 +724,7 @@ impl Command {
             Command::CollabCancelStream => "Cmd+K X",
             Command::AskNavigator => "Cmd+K Q",
             Command::AskNavigatorAboutCapture => "",
+            Command::OpenWorkspaceOnSshHost => "",
             Command::MarkAgentLaneReviewed => "",
             Command::ShowAgentLane => "",
             Command::MarkAgentFileReviewed => "",
@@ -892,6 +897,7 @@ impl Command {
             Command::CollabCancelStream => "collab_cancel_stream",
             Command::AskNavigator => "navigator_ask",
             Command::AskNavigatorAboutCapture => "captures_ask_navigator",
+            Command::OpenWorkspaceOnSshHost => "remote_open_workspace_on_ssh_host",
             Command::MarkAgentLaneReviewed => "agents_mark_reviewed",
             Command::ShowAgentLane => "agents_show_lane",
             Command::MarkAgentFileReviewed => "agents_mark_file_reviewed",
