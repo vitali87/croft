@@ -211,14 +211,23 @@ pub fn looks_delimited(bytes: &[u8]) -> Option<&'static str> {
 ///
 /// `None` means "no extension": the file opens as text, which is the
 /// issue's stated fallback and the right answer for a log or a diff.
-pub fn stdin_extension(bytes: &[u8], hint: Option<&str>) -> Option<String> {
+pub fn stdin_extension(bytes: &[u8], hint: Option<&str>) -> anyhow::Result<Option<String>> {
     if let Some(h) = hint {
-        return sanitize_extension(h);
+        // An unusable `--as` is refused rather than ignored. Falling back to
+        // the sniff would stage the bytes under a name the user did not ask
+        // for and report success, so the only signal that the flag was
+        // rejected would be the file opening in the wrong viewer.
+        let ext = sanitize_extension(h).ok_or_else(|| {
+            anyhow::anyhow!(
+                "croft view --as {h:?}: an extension must be a short run of letters and digits"
+            )
+        })?;
+        return Ok(Some(ext));
     }
     if let Some(m) = crate::magic::sniff(bytes) {
-        return Some(extension_for(m).to_string());
+        return Ok(Some(extension_for(m).to_string()));
     }
-    looks_delimited(bytes).map(str::to_string)
+    Ok(looks_delimited(bytes).map(str::to_string))
 }
 
 /// Stage piped bytes as a file the editor can route on.
@@ -226,14 +235,14 @@ pub fn stdin_extension(bytes: &[u8], hint: Option<&str>) -> Option<String> {
 /// Kept in croft's cache dir rather than `/tmp` so the file survives a
 /// tmpreaper mid-session and sits with the rest of croft's scratch state;
 /// named by pid and a counter so two pipes in the same pane cannot collide.
-pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> std::io::Result<PathBuf> {
+pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> anyhow::Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = cache_dir.join("view-stdin");
     std::fs::create_dir_all(&dir)?;
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let stem = format!("stdin-{}-{n}", std::process::id());
-    let name = match stdin_extension(bytes, hint) {
+    let name = match stdin_extension(bytes, hint)? {
         Some(ext) => format!("{stem}.{ext}"),
         None => stem,
     };
@@ -243,7 +252,11 @@ pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> std::i
 }
 
 /// `croft view <path>` / `croft view -`.
-pub fn run(target: &str, as_hint: Option<&str>, cache_dir: &Path) -> anyhow::Result<()> {
+pub fn run(
+    target: &std::ffi::OsStr,
+    as_hint: Option<&str>,
+    cache_dir: &Path,
+) -> anyhow::Result<()> {
     let socket = match std::env::var_os(SOCK_ENV).filter(|s| !s.is_empty()) {
         Some(s) => PathBuf::from(s),
         None => anyhow::bail!(
@@ -407,15 +420,40 @@ mod tests {
     fn the_hint_beats_the_sniff_which_beats_the_delimiter_guess() {
         let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR";
         // Sniff wins over nothing.
-        assert_eq!(stdin_extension(png, None).as_deref(), Some("png"));
+        assert_eq!(stdin_extension(png, None).unwrap().as_deref(), Some("png"));
         // An explicit hint wins over the sniff: the user knows more than we do.
-        assert_eq!(stdin_extension(png, Some("bin")).as_deref(), Some("bin"));
+        assert_eq!(
+            stdin_extension(png, Some("bin")).unwrap().as_deref(),
+            Some("bin")
+        );
         // Delimited text is the last resort.
-        assert_eq!(stdin_extension(b"a,b\n1,2\n", None).as_deref(), Some("csv"));
+        assert_eq!(
+            stdin_extension(b"a,b\n1,2\n", None).unwrap().as_deref(),
+            Some("csv")
+        );
         // And plain text gets no extension, so it opens as text.
         assert_eq!(
-            stdin_extension(b"just a log line\nand another\n", None),
+            stdin_extension(b"just a log line\nand another\n", None).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn an_unusable_as_flag_is_an_error_rather_than_a_silent_fallback() {
+        // Falling back to the sniff would stage the bytes under a name the
+        // user did not ask for and report success, so the only sign the flag
+        // was rejected would be the file opening in the wrong viewer.
+        let err = stdin_extension(b"a,b\n1,2\n", Some("../x")).unwrap_err();
+        assert!(
+            err.to_string().contains("--as"),
+            "the message must name the flag, got {err}"
+        );
+        // And the good case still resolves.
+        assert_eq!(
+            stdin_extension(b"anything", Some("json"))
+                .unwrap()
+                .as_deref(),
+            Some("json")
         );
     }
 

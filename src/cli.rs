@@ -267,7 +267,12 @@ pub enum CliCommand {
     /// Explorer click would.
     View {
         /// File to open, or `-` to read the content from stdin.
-        path: String,
+        ///
+        /// `OsString`, not `String`: a filename is bytes on Unix, and the
+        /// wire format goes to some trouble to carry those bytes intact.
+        /// Taking the argument as a `String` would have thrown them away at
+        /// the entry point, one call before the encoding that preserves them.
+        path: std::ffi::OsString,
         /// Extension to stage piped bytes under, for content that has no
         /// magic bytes to sniff (`--as csv`, `--as json`). Ignored unless
         /// the path is `-`.

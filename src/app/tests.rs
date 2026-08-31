@@ -37724,6 +37724,10 @@ fn a_view_request_for_a_directory_is_refused_with_a_reason_the_client_prints() {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    assert!(
+        client.is_finished(),
+        "no reply within two seconds; joining here would hang instead of failing"
+    );
     match client.join().unwrap() {
         crate::view_ipc::ViewReply::Err { message } => {
             assert!(

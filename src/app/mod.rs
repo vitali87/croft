@@ -28187,8 +28187,18 @@ impl App {
     /// here: a request is one path and the work is opening a tab, so a
     /// thread per client would buy nothing and cost the editor's `&mut self`.
     pub fn drain_view_requests(&mut self) -> bool {
+        // The drain is bounded by TIME rather than by a connection count.
+        // Each connection can sit in `read_request` until its own timeout,
+        // so a per-frame cap of N clients still bounds the frame at N times
+        // that timeout; a deadline bounds it at the deadline however many
+        // clients stall. Whatever is left is accepted on the next frame,
+        // which costs a stalled client latency and costs the user nothing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
         let mut changed = false;
         loop {
+            if std::time::Instant::now() >= deadline {
+                return changed;
+            }
             let Some((listener, _)) = self.view_listener.as_ref() else {
                 return changed;
             };
@@ -28197,7 +28207,10 @@ impl App {
                     // A client that connects and then stalls must not hold
                     // the frame loop: the read is bounded, and a request
                     // that misses the window is dropped rather than waited on.
-                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
+                    // A real client writes its one line immediately after
+                    // connecting, so this is a safety net for a wedged one
+                    // rather than a budget anybody legitimately spends.
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
                     let reply = match crate::view_ipc::read_request(&stream) {
                         Ok(req) => self.apply_view_request(&req.to_path()),
                         Err(e) => crate::view_ipc::ViewReply::Err {

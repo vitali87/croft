@@ -325,3 +325,80 @@ fn view_refuses_a_missing_file_without_bothering_the_socket() {
         "stderr must name the missing path, was: {stderr}"
     );
 }
+
+/// The wire carries a path as raw bytes so a filename that is not UTF-8
+/// survives. That is only true if the CLI takes the argument as an
+/// `OsString`: a `String` parameter throws the bytes away one call before
+/// the encoding that preserves them, which is where this started.
+#[cfg(unix)]
+#[test]
+fn view_transmits_a_non_utf8_filename_byte_for_byte() {
+    use std::ffi::OsStr;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let name = OsStr::from_bytes(b"od\xffd.txt");
+    let target = tmp.path().join(name);
+    std::fs::write(&target, b"x").unwrap();
+    assert!(
+        target.to_str().is_none(),
+        "fixture must be invalid UTF-8, or this test proves nothing"
+    );
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream.write_all(b"{\"status\":\"ok\"}\n").unwrap();
+        line
+    });
+
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .arg("view")
+        .arg(name)
+        .assert()
+        .success();
+
+    let request = server.join().unwrap();
+    let bytes: Vec<u8> = request
+        .trim()
+        .trim_start_matches("{\"path\":[")
+        .trim_end_matches("]}")
+        .split(',')
+        .map(|n| n.trim().parse::<u8>().expect("the wire is a byte array"))
+        .collect();
+    assert!(
+        bytes.contains(&0xff),
+        "the 0xff byte must reach the server intact, got {bytes:?}"
+    );
+    assert_eq!(std::path::PathBuf::from(OsStr::from_bytes(&bytes)), target);
+}
+
+/// An `--as` value that cannot become a filename is refused, not ignored:
+/// falling back to the sniff would stage the bytes under a name the user did
+/// not ask for and still report success.
+#[test]
+fn view_refuses_an_as_flag_that_cannot_be_a_file_extension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .write_stdin("a,b\n1,2\n")
+        .args(["view", "-", "--as", "../x"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("--as"),
+        "the message must name the flag, was: {stderr}"
+    );
+}
