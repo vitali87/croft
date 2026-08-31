@@ -41872,6 +41872,8 @@ fn pane_is_idle_at(
         && cwd_matches(t.kernel_shell_cwd().as_deref(), root, cwd_is_observable())
 }
 
+use crate::widgets::terminal::cwd_is_observable;
+
 /// The cwd half of [`pane_is_idle_at`], as a pure function so both arms are
 /// testable on any platform (#430).
 ///
@@ -41883,8 +41885,6 @@ fn pane_is_idle_at(
 /// closed guard would stack a new pane on every single run, so reuse falls
 /// back to the pane's identity, which is all croft had before the guard
 /// existed.
-use crate::widgets::terminal::cwd_is_observable;
-
 fn cwd_matches(cwd: Option<&Path>, root: &Path, observable: bool) -> bool {
     match cwd {
         Some(c) => c == root,
