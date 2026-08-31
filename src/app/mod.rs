@@ -3090,6 +3090,26 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// Review threads loaded onto a file, as `(the file, its threads)` (#366).
+    ///
+    /// A SEPARATE field from `editor.comment_boxes`, which the render loop
+    /// rebuilds from `navigator_notes` on every frame — assigning review
+    /// threads there directly meant they were wiped before the user saw
+    /// one, while the status line still reported having loaded them.
+    ///
+    /// Keyed by PATH because the merge runs on every frame: keyed only by
+    /// "whatever was loaded last", one file's objections would hang off the
+    /// next file's line numbers, against unrelated code. That is the harm
+    /// `threads_are_filtered_to_the_file_being_viewed` prevents on the
+    /// filter axis, and it re-enters through the lifetime axis if the boxes
+    /// outlive the buffer they describe.
+    ///
+    /// Holds `Thread`s rather than finished `CommentBox`es so the geometry
+    /// is derived against the LIVE buffer each frame. `box_line` clamps a
+    /// box past the end back into view; computed once at load, that clamp
+    /// goes stale the moment the user edits, and the box it was protecting
+    /// becomes invisible again.
+    review_boxes: Option<(PathBuf, Vec<crate::review_threads::Thread>)>,
     /// An open asciicast recording (#356): the writer, the file it appends
     /// to, and when it started. `None` when nothing is being recorded.
     recording: Option<(
@@ -4635,6 +4655,7 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            review_boxes: None,
             recording: None,
             recorded_size: (0, 0),
             symbol_tab: None,
@@ -14584,6 +14605,24 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Review threads (#366) join the navigator's rather than
+            // replacing them: both are comments on the same lines, and a
+            // reviewer reading a PR with a navigator session open wants
+            // both. Appended after, so a navigator note and a review
+            // comment on one line keep a stable order.
+            if let Some((path, threads)) = &self.review_boxes
+                && self.editor.path.as_deref() == Some(path.as_path())
+            {
+                let lines = self.editor.lines.len();
+                self.editor.comment_boxes.extend(threads.iter().map(|t| {
+                    crate::widgets::editor::CommentBox {
+                        id: t.id,
+                        line: t.box_line(lines),
+                        author: t.title_for(lines),
+                        body: t.body.clone(),
+                    }
+                }));
+            }
             // A focused box that vanished (ignored elsewhere, cleared, or
             // re-anchored away) releases the keyboard back to the buffer.
             if let Some(focus) = &self.editor.comment_focus
@@ -21886,6 +21925,22 @@ impl App {
         }
     }
 
+    /// Follow the open file to its new path so its review boxes survive a
+    /// rename or an explorer cut/paste (#366).
+    ///
+    /// Both guards — the render merge and the F4 walk — compare the stored
+    /// path against `editor.path`. A rename repoints the tab and would
+    /// otherwise leave the field naming a path nothing matches, so the boxes
+    /// vanish from the buffer the user is still editing and the field holds
+    /// unreachable garbage.
+    fn rename_review_boxes_path(&mut self, old: &Path, new: &Path) {
+        if let Some((p, _)) = &mut self.review_boxes
+            && p == old
+        {
+            *p = new.to_path_buf();
+        }
+    }
+
     /// Dismiss one comment box: drop the note from the pilot's state and
     /// from the local snapshot (the next poll would resurrect it otherwise
     /// only if the pilot still had it).
@@ -21895,6 +21950,19 @@ impl App {
         }
         for notes in self.navigator_notes.values_mut() {
             notes.retain(|(nid, ..)| *nid != id);
+        }
+        // Review boxes share this footer and this hit-test, so without
+        // retaining here the button would report "Comment ignored" and the
+        // box would return on the very next frame (#366).
+        //
+        // Matching on the id alone is safe because the two sources cannot
+        // collide in practice: a navigator note's id counts up from 1 (see
+        // `pair.rs`'s `take_note_id`, over `next_note_id`), while a review
+        // thread's is GitHub's own comment id, currently around 3.9e9. If
+        // notes ever gain a wider allocator, this needs a tag rather than a
+        // bare id.
+        if let Some((_, threads)) = &mut self.review_boxes {
+            threads.retain(|t| t.id != id);
         }
         if self
             .editor
@@ -21925,12 +21993,35 @@ impl App {
     /// The active file's next comment from the caret (by row, wrapping):
     /// (id, row).
     fn next_comment_from_caret(&self) -> Option<(u64, usize)> {
-        let file = self
+        // Built from the same two SOURCES the render merges, in the same
+        // order, rather than from `editor.comment_boxes` itself: that field
+        // is a render output, so reading it would make F4 depend on a frame
+        // having been drawn first, and the walk would find nothing before
+        // the first render. Review threads are included so F4 reaches them
+        // too (#366) — reading only the navigator's notes left review boxes
+        // on screen but unreachable by keyboard, reported as "No navigator
+        // comments in this file" while the user was looking at several.
+        let mut notes: Vec<(u64, usize, String)> = self
             .editor
             .path
             .as_ref()
-            .and_then(|p| collab_file_key(&self.tree.root, p))?;
-        let notes = self.navigator_notes.get(&file).filter(|n| !n.is_empty())?;
+            .and_then(|p| collab_file_key(&self.tree.root, p))
+            .and_then(|file| self.navigator_notes.get(&file))
+            .cloned()
+            .unwrap_or_default();
+        if let Some((path, threads)) = &self.review_boxes
+            && self.editor.path.as_deref() == Some(path.as_path())
+        {
+            let lines = self.editor.lines.len();
+            notes.extend(
+                threads
+                    .iter()
+                    .map(|t| (t.id, t.box_line(lines), t.body.clone())),
+            );
+        }
+        if notes.is_empty() {
+            return None;
+        }
         let here = self
             .editor
             .comment_focus
@@ -21938,7 +22029,7 @@ impl App {
             .and_then(|f| notes.iter().position(|(id, ..)| *id == f.id))
             .map(|i| (notes[i].1, i))
             .unwrap_or((self.editor.cursor_row, usize::MAX));
-        let idx = next_note_by_row(notes, here);
+        let idx = next_note_by_row(&notes, here);
         Some((notes[idx].0, notes[idx].1))
     }
 
@@ -23984,6 +24075,115 @@ impl App {
             }
             Err(e) => self.status = format!("Could not create {}: {e}", path.display()),
         }
+    }
+
+    /// Load this PR's review threads onto the open file as comment boxes
+    /// (#366).
+    ///
+    /// Only threads for THIS file. A review's comments span the whole PR,
+    /// and hanging another file's objections off this buffer's line numbers
+    /// would put them against unrelated code — the same failure as placing
+    /// an outdated thread silently, arriving through the other axis.
+    fn load_review_threads(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file from the PR first");
+            return;
+        };
+        // The root that OWNS the open file, not the primary. In a
+        // multi-root workspace the two differ, and using the primary runs
+        // `gh` in the wrong repository — which answers about a different
+        // PR entirely rather than failing.
+        let root = self.active_workspace_root();
+        // Relative to the REPOSITORY TOPLEVEL, not the workspace root. The
+        // API's `path` is repo-relative, and the two coincide only when the
+        // workspace root IS the toplevel — open croft on `repo/src` and
+        // every comparison fails silently, so a file with review comments
+        // reports having none. That is #139's rule; this is the same trap in
+        // a new place.
+        let Some(repo_root) = self.git_worker_for_root(&root).status().repo_root.clone() else {
+            self.status = String::from("This folder is not inside a git repository");
+            return;
+        };
+        let Ok(rel) = path.strip_prefix(&repo_root) else {
+            self.status = format!(
+                "{} is outside the repository, so it has no review comments",
+                path.display()
+            );
+            return;
+        };
+        // Forward slashes: the API always uses them, and on Windows a
+        // `to_string_lossy` here yields backslashes that match nothing.
+        let rel = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let out = std::process::Command::new("gh")
+            .args(["pr", "view", "--json", "number", "--jq", ".number"])
+            .current_dir(&root)
+            .output();
+        let number = match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => {
+                self.status = String::from("No PR for this branch — check it out first");
+                return;
+            }
+        };
+        let api = std::process::Command::new("gh")
+            .args([
+                "api",
+                &format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments"),
+                "--paginate",
+            ])
+            .current_dir(&root)
+            .output();
+        let json = match api {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            Ok(o) => {
+                // gh's own message names the problem — a missing scope, a
+                // rate limit — far better than anything invented here.
+                let err = String::from_utf8_lossy(&o.stderr);
+                self.status = format!(
+                    "Could not read the PR's comments: {}",
+                    err.trim().lines().next().unwrap_or("gh failed")
+                );
+                return;
+            }
+            Err(e) => {
+                self.status = format!("Could not run gh: {e}");
+                return;
+            }
+        };
+        let threads: Vec<crate::review_threads::Thread> =
+            crate::review_threads::parse_threads(&json)
+                .into_iter()
+                .filter(|t| t.path == rel)
+                .collect();
+        if threads.is_empty() {
+            self.status = format!("No review comments on {rel}");
+            return;
+        }
+        let outdated = threads
+            .iter()
+            .filter(|t| matches!(t.anchor, crate::review_threads::Anchor::Outdated(_)))
+            .count();
+        // Stored against the file they describe; the render derives each
+        // box's row and title from the buffer as it is at that moment.
+        // `path` is the binding taken at the top of this function, so the
+        // threads are keyed to the file the `gh` query was actually about
+        // rather than to whatever `editor.path` says afterwards. Today those
+        // cannot differ — the event loop is single-threaded and `gh` blocks
+        // it, so no keystroke is handled mid-call — but keying to the
+        // queried file is the property that matters, and it stops being
+        // free the moment this moves off the main thread.
+        self.review_boxes = Some((path, threads.clone()));
+        self.status = match outdated {
+            0 => format!("{} review comments on {rel}", threads.len()),
+            n => format!(
+                "{} review comments on {rel} \u{b7} {n} outdated, shown where they WERE",
+                threads.len()
+            ),
+        };
     }
 
     /// Append terminal output to the open recording, if there is one (#356).
@@ -32074,6 +32274,7 @@ impl App {
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
             Cmd::OpenAsSymbolTab => self.open_symbol_tab(),
+            Cmd::LoadReviewThreads => self.load_review_threads(),
             Cmd::ToggleSessionRecording => self.toggle_session_recording(),
             Cmd::FleetRun => {
                 self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
@@ -41258,6 +41459,7 @@ impl App {
                 Ok(p) => {
                     if matches!(mode, ExplorerClipMode::Cut) && self.editor.matches_open_path(src) {
                         self.editor.rename_open_path(src, &p);
+                        self.rename_review_boxes_path(src, &p);
                     }
                     placed.push(p);
                 }
@@ -41459,6 +41661,7 @@ impl App {
                             }
                         }
                         self.editor.rename_open_path(&old_path, &new_path);
+                        self.rename_review_boxes_path(&old_path, &new_path);
                         self.sync_open_file_poll_mtime();
                     }
                     Err(e) => {
