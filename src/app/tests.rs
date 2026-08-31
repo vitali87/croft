@@ -36595,6 +36595,151 @@ fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
     );
     assert!(app.http_run.is_none(), "nothing was sent");
 }
+/// #356: a recorded frame carries the VISIBLE screen, not the scrollback.
+///
+/// `grid_lines` starts at `topmost_line()`, which is negative scrollback —
+/// up to 5000 rows. Writing all of it after a clear scrolls the live screen
+/// straight off the top, so the cast shows the tail of the history rather
+/// than what the user was looking at, at roughly 400 KB per frame. A test
+/// that only counts event kinds cannot see either half of that.
+#[test]
+fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 40,
+        height: 6,
+    };
+    app.terminals[0].feed_bytes_for_test(b"\x1b[8;6;40t");
+
+    // Far more output than the screen holds, so most of it is scrollback.
+    let mut flood = String::new();
+    for i in 0..200 {
+        flood.push_str(&format!("line-{i}\r\n"));
+    }
+    app.terminals[0].feed_bytes_for_test(flood.as_bytes());
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+
+    let frame = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|ev| ev[1] == "o")
+        .and_then(|ev| ev[2].as_str().map(String::from))
+        .expect("an output event");
+
+    let rows = frame.split("\r\n").count();
+    assert!(
+        rows <= 64,
+        "the frame carries {rows} rows — that is scrollback, not a screen"
+    );
+    // And it is the RECENT end of the output, not the oldest.
+    assert!(
+        frame.contains("line-199") || frame.contains("line-19"),
+        "the frame must show what was last on screen: {:?}",
+        &frame[..frame.len().min(120)]
+    );
+    assert!(
+        !frame.contains("line-0\r\n"),
+        "the frame reaches back to the first line ever printed"
+    );
+}
+
+/// #356: a recording produces a file that is asciicast v2 all the way
+/// through, header and every event.
+///
+/// Asserted by PARSING the file rather than by matching strings: the format
+/// exists to be read by `asciinema play` and `agg`, and a cast that looks
+/// right but does not parse fails at the moment someone tries to share it.
+/// A terminal stream is full of quotes and escape bytes, so this is the
+/// failure mode that actually happens.
+#[test]
+fn a_recording_writes_a_parseable_asciicast() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 24,
+    };
+
+    // The PTY grid is sized from the pane's INNER rect, so the header must
+    // be too — `Borders::ALL` takes a cell on each side. Recording the outer
+    // size declares a terminal two columns wider than the content was
+    // wrapped for, and the player re-wraps every long line at the wrong
+    // column.
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 78,
+        height: 22,
+    };
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    assert!(app.recording.is_some(), "recording started: {}", app.status);
+
+    // Output carrying the characters that break a hand-rolled encoder.
+    app.record_terminal_output("\u{1b}[32m\"quoted\" \\ back\u{1b}[0m");
+    app.record_resize(132, 50);
+    app.record_terminal_output("after the resize");
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    assert!(app.recording.is_none(), "recording stopped: {}", app.status);
+
+    // Found by LISTING rather than by rebuilding the name. A test that
+    // recomputes the path asserts against its own copy of the naming rule,
+    // so it would keep passing if production's rule changed — the same
+    // stand-in problem as asserting against a helper you wrote yourself.
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+
+    let text = std::fs::read_to_string(&path).expect("the cast file exists");
+    let mut lines = text.lines();
+
+    let header: serde_json::Value =
+        serde_json::from_str(lines.next().expect("a header line")).expect("header is JSON");
+    assert_eq!(header["version"], 2);
+    assert_eq!(
+        header["width"], 78,
+        "the header must carry the GRID size, not the bordered pane's"
+    );
+    assert_eq!(header["height"], 22);
+
+    let mut kinds = Vec::new();
+    let mut last_time = -1.0f64;
+    for line in lines {
+        let ev: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("event is not JSON: {line:?} — {e}"));
+        let t = ev[0].as_f64().expect("a numeric timestamp");
+        assert!(
+            t >= last_time,
+            "time went backwards: {t} after {last_time} — a player would hang"
+        );
+        last_time = t;
+        kinds.push(ev[1].as_str().unwrap_or("?").to_string());
+    }
+    assert!(
+        kinds.iter().any(|k| k == "o") && kinds.iter().any(|k| k == "r"),
+        "both output and resize events must reach the file: {kinds:?}"
+    );
+}
+
 /// #369: the symbol's byte range slices exactly its source, including for
 /// the LAST symbol in a file.
 ///
