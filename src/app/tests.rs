@@ -36373,3 +36373,644 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
         "idle never wakes the renderer"
     );
 }
+/// #370: a `.http` file runs the request under the caret. The variables
+/// substitute from `.http.env.json` on the WIRE only: the status line,
+/// history entry, and response tab all carry the raw `{{name}}` form, so
+/// the token never leaves the env file. A JSON response opens pretty-printed
+/// as `.jsonc`; a PNG response opens through the image path.
+#[test]
+fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
+    use std::io::{Read as _, Write as _};
+    let tmp = tempfile::tempdir().unwrap();
+    // The cache-dir override is a process-wide global shared with the relay
+    // family: hold their lock and restore via RAII, exactly as
+    // `with_relay_home` does, so a panic cannot leak the redirect into
+    // later tests (#428 review).
+    struct RestoreCacheDir;
+    impl Drop for RestoreCacheDir {
+        fn drop(&mut self) {
+            *CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+        }
+    }
+    let _cache_lock = relay_test_lock().lock().unwrap();
+    let _restore = RestoreCacheDir;
+    *CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
+
+    // A 1x1 PNG via the image crate, so the decode on open genuinely works.
+    let png_bytes = {
+        let img: image::RgbaImage = image::ImageBuffer::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    };
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen2 = seen.clone();
+    let png_served = png_bytes.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let mut buf = vec![0u8; 8192];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let (body, ct): (Vec<u8>, &str) = if req.starts_with("GET /users") {
+                (
+                    b"{\"users\":[{\"id\":1,\"name\":\"ada\"}]}".to_vec(),
+                    "application/json",
+                )
+            } else {
+                (png_served.clone(), "image/png")
+            };
+            seen2.lock().unwrap().push(req);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(&body);
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    });
+
+    let http = tmp.path().join("api.http");
+    std::fs::write(
+        &http,
+        "GET {{host}}/users\nAuthorization: Bearer {{token}}\n\n###\nGET {{host}}/logo.png\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(crate::http_file::ENV_FILE),
+        format!("{{\"host\": \"http://127.0.0.1:{port}\", \"token\": \"super-secret-token\"}}"),
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 1;
+    app.send_http_request_under_caret();
+    assert!(
+        app.status.starts_with("Sending GET {{host}}/users"),
+        "the status carries the RAW line: {}",
+        app.status
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the HTTP response",
+        || {
+            app.drain_http_responses();
+            app.http_run.is_none()
+        },
+    );
+    let opened = app.editor.path.clone().expect("a response tab opened");
+    assert_eq!(opened.extension().and_then(|e| e.to_str()), Some("jsonc"));
+    let doc = app.editor.lines.join("\n");
+    assert!(
+        doc.contains("// GET {{host}}/users \u{2192} HTTP/1.1 200 OK"),
+        "{doc}"
+    );
+    assert!(doc.contains("\"users\": ["), "pretty-printed: {doc}");
+    assert!(
+        !doc.contains("super-secret-token"),
+        "the token never reaches the tab"
+    );
+    assert!(
+        seen.lock().unwrap()[0].contains("Bearer super-secret-token"),
+        "but the wire DID carry the substituted value"
+    );
+    let hits = app.command_history.search(
+        "http GET",
+        crate::command_history::HistoryScope::All,
+        "",
+        "",
+    );
+    assert_eq!(
+        hits[0].cmd, "http GET {{host}}/users",
+        "history keeps the raw line"
+    );
+    assert_eq!(hits[0].exit, Some(200));
+    assert!(!hits[0].cmd.contains("super-secret-token"));
+
+    // The PNG block renders through the image path.
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 4;
+    app.send_http_request_under_caret();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the PNG response",
+        || {
+            app.drain_http_responses();
+            app.http_run.is_none()
+        },
+    );
+    assert!(
+        app.editor.image.is_some(),
+        "a PNG response opens as an image, not bytes in a text tab: {:?}",
+        app.editor.path
+    );
+
+    // A second send while one is in flight is refused and clobbers
+    // nothing; a worker that died reports itself on the next drain.
+    let (dummy_tx, dummy_rx) = std::sync::mpsc::channel();
+    app.http_run = Some(dummy_rx);
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 0;
+    app.send_http_request_under_caret();
+    assert_eq!(app.status, "An HTTP request is already in flight");
+    drop(dummy_tx);
+    assert!(app.drain_http_responses());
+    assert!(app.status.contains("worker died"), "{}", app.status);
+    assert!(app.http_run.is_none());
+
+    // A transport failure must NOT leak a substituted secret into the
+    // status line: ureq's error Display opens with the resolved URL, so
+    // only its kind may be shown (#428 review). The port is bound then
+    // dropped, so the connection is refused at once.
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    std::fs::write(
+        tmp.path().join(crate::http_file::ENV_FILE),
+        format!(
+            "{{\"host\": \"http://127.0.0.1:{dead_port}\", \"token\": \"super-secret-token\"}}"
+        ),
+    )
+    .unwrap();
+    let secret_url = tmp.path().join("leak.http");
+    std::fs::write(&secret_url, "GET {{host}}/x?api_key={{token}}\n").unwrap();
+    app.editor.open_pinned(&secret_url).unwrap();
+    app.editor.cursor_row = 0;
+    app.send_http_request_under_caret();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the refused connection",
+        || {
+            app.drain_http_responses();
+            app.http_run.is_none()
+        },
+    );
+    assert!(
+        app.status.contains("failed"),
+        "a transport failure is reported: {}",
+        app.status
+    );
+    assert!(
+        !app.status.contains("super-secret-token"),
+        "the substituted URL never reaches the status line: {}",
+        app.status
+    );
+    let hits =
+        app.command_history
+            .search("api_key", crate::command_history::HistoryScope::All, "", "");
+    assert_eq!(hits[0].exit, None, "a failed run records no status code");
+    assert!(!hits[0].cmd.contains("super-secret-token"));
+    app.editor.open_pinned(&http).unwrap();
+
+    // A hole with no value refuses to send rather than leaking the hole.
+    app.editor.open_pinned(&http).unwrap();
+    std::fs::remove_file(tmp.path().join(crate::http_file::ENV_FILE)).unwrap();
+    app.editor.cursor_row = 0;
+    app.send_http_request_under_caret();
+    assert!(
+        app.status.contains("no value for {{host}}, {{token}}"),
+        "{}",
+        app.status
+    );
+    assert!(app.http_run.is_none(), "nothing was sent");
+}
+/// #345: the agent lane attributes workspace writes to whichever agents
+/// were WORKING when they landed, keeps a review baseline per file, and
+/// never blames an agent for the user's own saves.
+#[test]
+fn the_agent_lane_ledger_attributes_writes_and_tracks_review_baselines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let touched = tmp.path().join("touched.rs");
+    std::fs::write(&touched, "fn a() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // With no agent working, a write belongs to the user: no lane at all.
+    let mut changed = std::collections::BTreeSet::new();
+    changed.insert(touched.clone());
+    assert!(!app.attribute_writes_to_working_agents(&changed));
+    assert!(app.agent_ledger.agents().is_empty());
+
+    // Seat a WORKING agent in the pane, then replay the same write.
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+    assert_eq!(app.working_agents(), vec![String::from("claude")]);
+    assert!(app.attribute_writes_to_working_agents(&changed));
+    assert_eq!(app.agent_ledger.unreviewed_count("claude"), 1);
+    assert!(app.agent_ledger.is_unreviewed(&touched));
+
+    // A SECONDARY workspace root's files are attributed too: a multi-root
+    // session must not have an empty queue for every folder but the first.
+    let second = tempfile::tempdir().unwrap();
+    let in_second = second.path().join("lib.rs");
+    std::fs::write(&in_second, "fn b() {}\n").unwrap();
+    app.roots.add(second.path().to_path_buf());
+    let mut second_set = std::collections::BTreeSet::new();
+    second_set.insert(in_second.clone());
+    assert!(
+        app.attribute_writes_to_working_agents(&second_set),
+        "a write under a secondary root is still the agent's"
+    );
+    assert!(app.agent_ledger.is_unreviewed(&in_second));
+    app.mark_agent_file_reviewed("claude", &in_second);
+
+    // A file OUTSIDE the workspace is not this workspace's review queue.
+    let outside = tempfile::tempdir().unwrap();
+    let stray = outside.path().join("elsewhere.rs");
+    std::fs::write(&stray, "x\n").unwrap();
+    let mut outside_set = std::collections::BTreeSet::new();
+    outside_set.insert(stray.clone());
+    assert!(!app.attribute_writes_to_working_agents(&outside_set));
+    assert!(!app.agent_ledger.is_unreviewed(&stray));
+
+    // Reviewing baselines the content on disk NOW, so a later edit by the
+    // user does not resurrect the row but a later agent write does.
+    assert!(app.mark_agent_file_reviewed("claude", &touched));
+    assert_eq!(app.agent_ledger.unreviewed_count("claude"), 0);
+    std::fs::write(&touched, "fn a() { todo!() }\n").unwrap();
+    assert!(app.attribute_writes_to_working_agents(&changed));
+    assert_eq!(
+        app.agent_ledger.unreviewed_count("claude"),
+        1,
+        "a fresh agent write re-queues the file"
+    );
+
+    // A file DELETED after its agent goes idle still leaves the queue: the
+    // row would otherwise point at a file that is not there forever, since
+    // a deleted file generates no later write to clear it.
+    let later = tmp.path().join("later.rs");
+    std::fs::write(&later, "fn c() {}\n").unwrap();
+    let mut later_set = std::collections::BTreeSet::new();
+    later_set.insert(later.clone());
+    assert!(app.attribute_writes_to_working_agents(&later_set));
+    assert!(app.agent_ledger.is_unreviewed(&later));
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Idle,
+    }));
+    std::fs::remove_file(&later).unwrap();
+    assert!(
+        app.attribute_writes_to_working_agents(&later_set),
+        "a deletion is processed with no agent working"
+    );
+    assert!(
+        !app.agent_ledger.is_unreviewed(&later),
+        "the row leaves rather than stranding"
+    );
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+
+    // A QUIET agent stops being attributed: only Working counts.
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Idle,
+    }));
+    assert!(app.working_agents().is_empty());
+    std::fs::write(&touched, "fn a() { 1 }\n").unwrap();
+    assert!(!app.attribute_writes_to_working_agents(&changed));
+
+    // Mark-all clears the lane and says how much it cleared.
+    assert_eq!(app.mark_agent_lane_reviewed("claude"), 1);
+    assert!(
+        app.status.contains("1 file marked reviewed"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.agent_ledger.total_unreviewed(), 0);
+    assert_eq!(app.mark_agent_lane_reviewed("claude"), 0);
+    assert!(app.status.contains("nothing waiting"), "{}", app.status);
+
+    // The lane summary names each agent, its count, and any shared row.
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+    std::fs::write(&touched, "fn a() { 2 }\n").unwrap();
+    assert!(app.attribute_writes_to_working_agents(&changed));
+    app.run_command(crate::widgets::command_palette::Command::ShowAgentLane);
+    assert!(
+        app.status.contains("claude: 1 to review") && app.status.contains("touched.rs"),
+        "{}",
+        app.status
+    );
+
+    // "Mark this file reviewed" acts on the ACTIVE file, in every lane
+    // holding it, and refuses when there is nothing waiting.
+    app.editor.open_pinned(&touched).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::MarkAgentFileReviewed);
+    assert!(
+        app.status.contains("marked reviewed in 1 agent lane"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.agent_ledger.total_unreviewed(), 0);
+    app.run_command(crate::widgets::command_palette::Command::MarkAgentFileReviewed);
+    assert!(
+        app.status.contains("No agent change waiting"),
+        "{}",
+        app.status
+    );
+
+    // The palette commands are registered.
+    for (cmd, id) in [
+        (
+            crate::widgets::command_palette::Command::MarkAgentLaneReviewed,
+            "agents_mark_reviewed",
+        ),
+        (
+            crate::widgets::command_palette::Command::ShowAgentLane,
+            "agents_show_lane",
+        ),
+        (
+            crate::widgets::command_palette::Command::MarkAgentFileReviewed,
+            "agents_mark_file_reviewed",
+        ),
+    ] {
+        assert!(crate::widgets::command_palette::ALL_COMMANDS.contains(&cmd));
+        assert_eq!(cmd.id(), id);
+    }
+}
+
+/// #345: the watcher's three ledger-facing behaviours, driven through the
+/// real drain rather than asserted about by reading it.
+///
+/// A rescan means events were DROPPED, so the queue is a lower bound and
+/// the ledger must record that durably; a removed directory is not a file
+/// and must not enter a file-only ledger; and a removed FILE must still be
+/// reported, so the row can leave the queue.
+#[test]
+fn the_watcher_reports_rescans_and_keeps_directories_out_of_the_ledger() {
+    use notify::Event as NotifyEvent;
+    use notify::event::{EventKind, ModifyKind, RemoveKind};
+    use notify_debouncer_full::DebouncedEvent;
+    use std::sync::mpsc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("touched.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    let doomed_dir = tmp.path().join("subdir");
+    std::fs::create_dir(&doomed_dir).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+
+    let (tx, rx) = mpsc::channel();
+    app.fs_watch.set_test_events(rx);
+
+    // A removed directory, a removed file, and an ordinary write.
+    let mut dir_gone = NotifyEvent::new(EventKind::Remove(RemoveKind::Folder));
+    dir_gone = dir_gone.add_path(doomed_dir.clone());
+    let mut written = NotifyEvent::new(EventKind::Modify(ModifyKind::Any));
+    written = written.add_path(file.clone());
+    let now = std::time::Instant::now();
+    tx.send(Ok(vec![
+        DebouncedEvent::new(dir_gone, now),
+        DebouncedEvent::new(written, now),
+    ]))
+    .unwrap();
+    app.drain_fs_events();
+
+    assert!(
+        app.agent_ledger.is_unreviewed(&file),
+        "the written file is attributed to the working agent"
+    );
+    assert!(
+        !app.agent_ledger.is_unreviewed(&doomed_dir),
+        "a removed DIRECTORY must not enter a file-only ledger"
+    );
+    assert!(
+        !app.agent_ledger.may_be_incomplete(),
+        "no rescan yet, so the queue is not a lower bound"
+    );
+
+    // A removed FILE that IS in a lane leaves it the moment the removal is
+    // seen: a deleted file generates no later write, so a guard that
+    // excluded its event would strand the row in the queue forever.
+    let doomed = tmp.path().join("doomed.rs");
+    std::fs::write(&doomed, "fn gone() {}\n").unwrap();
+    let mut doomed_set = std::collections::BTreeSet::new();
+    doomed_set.insert(doomed.clone());
+    assert!(app.attribute_writes_to_working_agents(&doomed_set));
+    assert!(app.agent_ledger.is_unreviewed(&doomed));
+    std::fs::remove_file(&doomed).unwrap();
+    let (tx3, rx3) = mpsc::channel();
+    app.fs_watch.set_test_events(rx3);
+    // `Any` is what kqueue, the Windows watcher and the poll fallback emit
+    // for every removal, so this is the shape three of five backends send.
+    let removed = NotifyEvent::new(EventKind::Remove(RemoveKind::Any)).add_path(doomed.clone());
+    tx3.send(Ok(vec![DebouncedEvent::new(
+        removed,
+        std::time::Instant::now(),
+    )]))
+    .unwrap();
+    app.drain_fs_events();
+    assert!(
+        !app.agent_ledger.is_unreviewed(&doomed),
+        "the removed file's row leaves the queue rather than stranding"
+    );
+
+    // Now a rescan: the watcher overflowed and dropped events.
+    let (tx2, rx2) = mpsc::channel();
+    app.fs_watch.set_test_events(rx2);
+    let rescan = NotifyEvent::new(EventKind::Modify(ModifyKind::Any))
+        .add_path(file.clone())
+        .set_flag(notify::event::Flag::Rescan);
+    tx2.send(Ok(vec![DebouncedEvent::new(
+        rescan,
+        std::time::Instant::now(),
+    )]))
+    .unwrap();
+    app.drain_fs_events();
+    assert!(
+        app.agent_ledger.may_be_incomplete(),
+        "a rescan makes every count a lower bound, durably"
+    );
+
+    // And the doubt survives an unrelated status change, which is the
+    // point of holding it in the ledger rather than the status line.
+    app.status = String::from("something else entirely");
+    assert!(app.agent_ledger.may_be_incomplete());
+}
+
+/// #373: "Debug This Test" breaks where the test last failed, without the
+/// user setting a breakpoint — and takes that breakpoint back out when the
+/// session ends, so it never outlives the run that asked for it.
+#[test]
+fn debugging_a_test_breaks_at_its_last_failure_and_cleans_up_after() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    let src = tmp.path().join("src/lib.rs");
+    std::fs::write(&src, "fn a() {}\nfn b() {}\nassert!(false);\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // The runner's output for a failing test, as it reaches the channel.
+    crate::output::clear(crate::output::CHANNEL_TESTS);
+    for line in [
+        "---- tests::adds stdout ----",
+        "thread 'tests::adds' panicked at src/lib.rs:3:5:",
+        "assertion failed: false",
+    ] {
+        crate::output::push(
+            crate::output::CHANNEL_TESTS,
+            crate::output::OutputLevel::Info,
+            line,
+        );
+    }
+
+    let site = app
+        .failure_site_of("tests::adds")
+        .expect("the panic line names a place in the user's own code");
+    assert_eq!(site.line, 3);
+    assert_eq!(site.resolve(tmp.path()), Some((src.clone(), 3)));
+
+    // Arming sets the breakpoint and says where.
+    assert!(app.editor.breakpoints.is_empty());
+    app.arm_failure_breakpoint("tests::adds", tmp.path());
+    assert_eq!(
+        app.editor.breakpoints.get(&src).map(|l| l.contains(&3)),
+        Some(true),
+        "the assertion's line carries a breakpoint the user never set"
+    );
+    // The note rides on whichever launch message the user actually sees:
+    // setting it as the status here would be overwritten moments later.
+    assert!(
+        app.with_failure_note(String::from("Building"))
+            .contains("breaking at lib.rs:3 where it last failed"),
+        "{}",
+        app.with_failure_note(String::from("Building"))
+    );
+
+    // Disarming takes back exactly that one, leaving no empty entry, and
+    // drops the note with it.
+    app.disarm_failure_breakpoint();
+    assert_eq!(app.with_failure_note(String::from("Building")), "Building");
+    assert!(
+        app.editor.breakpoints.is_empty(),
+        "the temporary breakpoint does not outlive its session"
+    );
+
+    // A breakpoint the USER set at the same line is theirs: arming must not
+    // adopt it, and disarming must not delete their work.
+    app.editor
+        .breakpoints
+        .entry(src.clone())
+        .or_default()
+        .insert(3);
+    app.arm_failure_breakpoint("tests::adds", tmp.path());
+    app.disarm_failure_breakpoint();
+    assert_eq!(
+        app.editor.breakpoints.get(&src).map(|l| l.contains(&3)),
+        Some(true),
+        "the user's own breakpoint survives a debug session that shared its line"
+    );
+    app.editor.breakpoints.clear();
+
+    // A failure in a dependency names nothing actionable, so nothing is set.
+    crate::output::clear(crate::output::CHANNEL_TESTS);
+    for line in [
+        "---- tests::deps stdout ----",
+        "thread 'tests::deps' panicked at /Users/me/.cargo/registry/src/x-1.0/lib.rs:9:1:",
+    ] {
+        crate::output::push(
+            crate::output::CHANNEL_TESTS,
+            crate::output::OutputLevel::Info,
+            line,
+        );
+    }
+    assert!(app.failure_site_of("tests::deps").is_none());
+    app.arm_failure_breakpoint("tests::deps", tmp.path());
+    assert!(
+        app.editor.breakpoints.is_empty(),
+        "a location inside a dependency is not offered as a breakpoint"
+    );
+
+    // The palette carries the command that reaches all of this.
+    assert!(
+        crate::widgets::command_palette::ALL_COMMANDS
+            .contains(&crate::widgets::command_palette::Command::DebugTestAtCursor)
+    );
+}
+
+/// #373: the site must be found in AUTHENTIC runner output, summary and
+/// all. libtest reprints every failing test's name in a trailing
+/// `failures:` block, so a scan anchored on "the last line mentioning the
+/// name" lands after every stdout block and finds nothing — the feature
+/// silently does nothing for the ecosystem it was written for. This is
+/// the regression test for that.
+#[test]
+fn the_failure_site_survives_a_whole_cargo_test_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "a\nb\nc\n").unwrap();
+    std::fs::write(tmp.path().join("src/other.rs"), "x\ny\nz\n").unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    crate::output::clear(crate::output::CHANNEL_TESTS);
+    for line in [
+        "   Compiling demo v0.1.0",
+        "    Finished test profile [unoptimized + debuginfo]",
+        "     Running unittests src/lib.rs",
+        "",
+        "running 2 tests",
+        "test tests::adds_two ... FAILED",
+        "test tests::adds ... FAILED",
+        "",
+        "failures:",
+        "",
+        "---- tests::adds_two stdout ----",
+        "thread 'tests::adds_two' panicked at src/other.rs:2:5:",
+        "assertion `left == right` failed",
+        "",
+        "---- tests::adds stdout ----",
+        "thread 'tests::adds' panicked at src/lib.rs:3:5:",
+        "assertion failed: false",
+        "note: run with `RUST_BACKTRACE=1` to display a backtrace",
+        "",
+        "failures:",
+        "    tests::adds",
+        "    tests::adds_two",
+        "",
+        "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured",
+    ] {
+        crate::output::push(
+            crate::output::CHANNEL_TESTS,
+            crate::output::OutputLevel::Info,
+            line,
+        );
+    }
+
+    // The trailing summary must not swallow the block, and each test must
+    // get ITS OWN assertion — not the other's.
+    let adds = app
+        .failure_site_of("tests::adds")
+        .expect("the site survives the summary that follows every block");
+    assert_eq!(
+        (adds.file.to_string_lossy().into_owned(), adds.line),
+        (String::from("src/lib.rs"), 3)
+    );
+    let two = app
+        .failure_site_of("tests::adds_two")
+        .expect("and so does the other test's");
+    assert_eq!(
+        (two.file.to_string_lossy().into_owned(), two.line),
+        (String::from("src/other.rs"), 2),
+        "a name that is a PREFIX of another must not borrow its block"
+    );
+
+    // And a test that did not fail has no block at all.
+    assert!(app.failure_site_of("tests::passes").is_none());
+}

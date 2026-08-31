@@ -2973,10 +2973,28 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// A breakpoint croft set itself at the assertion the last run failed
+    /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
+    /// breakpoints: it is added to the launch set, rendered hollow-red like
+    /// any unverified one, and removed when the session ends — a debugger
+    /// that silently left breakpoints behind would be worse than one that
+    /// set none.
+    debug_temp_breakpoint: Option<(PathBuf, usize)>,
+    /// Human-readable note about that breakpoint, folded into whichever
+    /// launch message the user actually ends up seeing.
+    debug_temp_note: Option<String>,
+    /// Per-agent ledger of files changed while an agent was working (#345),
+    /// and the review baselines that decide which of them still need a
+    /// look.
+    pub agent_ledger: crate::agent_lane::AgentLedger,
     /// When the running Fix with Navigator turn started (#374): the clock
     /// its PROBLEMS-row spinner runs on, and the flag that keeps the main
     /// loop repainting while it runs. `None` when no fix is streaming.
     problems_fix_started: Option<std::time::Instant>,
+    /// The in-flight `.http` request's channel (#370). One at a time: the
+    /// worker owns the socket, the drain owns the tab, and a second send
+    /// while one runs is refused rather than queued.
+    http_run: Option<std::sync::mpsc::Receiver<HttpRunOutcome>>,
     /// The presentation edits behind the open Change Color Presentation
     /// picker (#254), indexed by row id; cleared after a pick.
     pending_color_presentations: Vec<(String, Vec<crate::widgets::editor::TextSpanEdit>)>,
@@ -4461,7 +4479,11 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            debug_temp_breakpoint: None,
+            debug_temp_note: None,
+            agent_ledger: crate::agent_lane::AgentLedger::new(),
             problems_fix_started: None,
+            http_run: None,
             pending_color_presentations: Vec::new(),
             pending_color_context: None,
             color_presentations_request: None,
@@ -11253,6 +11275,11 @@ impl App {
             drain.touched_open_file |= d.touched_open_file;
             drain.dirs_changed |= d.dirs_changed;
             drain.finder_relevant |= d.finder_relevant;
+            // A secondary root's writes are an agent's writes too: dropping
+            // them here would silently give a multi-root workspace an empty
+            // review queue for every folder but the first (#345).
+            drain.changed_files.extend(d.changed_files);
+            drain.rescan_dropped_events |= d.rescan_dropped_events;
         }
         if drain.dirs_changed {
             self.refresh_git_status_debounced();
@@ -11267,6 +11294,27 @@ impl App {
         // no-op and won't clobber selection or reload spuriously.
         if drain.got_any {
             self.reload_open_file_after_external_change();
+        }
+        // Attribute the writes to whichever agents were working when they
+        // landed (#345). Done after the reload so an agent's write to the
+        // ACTIVE tab is hashed from the content the user is about to see.
+        if !drain.changed_files.is_empty() {
+            self.attribute_writes_to_working_agents(&drain.changed_files);
+        }
+        // A rescan means the watcher dropped events, so the queue is a
+        // LOWER BOUND from here until it is emptied (#345). Recorded in the
+        // ledger rather than only announced: a status line the next
+        // keystroke clears would leave a partial queue looking complete.
+        // Unconditional on whether an agent is working right now — the
+        // dropped writes may have landed a moment ago, while the pane's
+        // sampled status has since flipped to idle.
+        if drain.rescan_dropped_events {
+            self.agent_ledger.note_dropped_events();
+            if !self.working_agents().is_empty() {
+                self.status = String::from(
+                    "File watcher overflowed: some agent changes may be missing from the review queue",
+                );
+            }
         }
         let polled = self.poll_filesystem_changes();
         drain.got_any || init_changed || polled
@@ -15016,16 +15064,47 @@ impl App {
         // `2 agents · 1 waiting` (#344), only while an agent is seated; a
         // click focuses the waiting pane.
         let (seated, waiting) = self.agent_counts();
-        if seated > 0 {
-            seg_texts.push(format!(
-                " \u{25c6} {seated} agent{}{} ",
-                if seated == 1 { "" } else { "s" },
-                if waiting > 0 {
-                    format!(" \u{b7} {waiting} waiting")
-                } else {
-                    String::new()
-                }
-            ));
+        // The review queue rides the same chip (#345): a file an agent
+        // changed while you were looking elsewhere is the thing you most
+        // need to be told about, and it outlives the agent's own pane.
+        let unreviewed = self.agent_ledger.unreviewed_files();
+        if seated > 0 || unreviewed > 0 {
+            // With nothing seated the agent half would read "0 agents",
+            // which is not what the chip is reporting any more: the queue
+            // outlives the pane, so the chip becomes the queue's.
+            let agents_part = if seated > 0 {
+                format!(
+                    "{seated} agent{}{}",
+                    if seated == 1 { "" } else { "s" },
+                    if waiting > 0 {
+                        format!(" \u{b7} {waiting} waiting")
+                    } else {
+                        String::new()
+                    }
+                )
+            } else {
+                String::new()
+            };
+            let review_part = if unreviewed > 0 {
+                // A "+" when the watcher dropped events: the count is a
+                // floor, and a bare number would read as a total.
+                format!(
+                    "{unreviewed}{} to review",
+                    if self.agent_ledger.may_be_incomplete() {
+                        "+"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                String::new()
+            };
+            let joined = match (agents_part.is_empty(), review_part.is_empty()) {
+                (false, false) => format!("{agents_part} \u{b7} {review_part}"),
+                (false, true) => agents_part,
+                _ => review_part,
+            };
+            seg_texts.push(format!(" \u{25c6} {joined} "));
         }
         let widths: Vec<u16> = seg_texts.iter().map(|s| s.chars().count() as u16).collect();
         let right_total: u16 = widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1);
@@ -18026,6 +18105,8 @@ impl App {
         self.active_test_root = root.clone();
         self.test_worker.set_root(root);
         self.testing.reset();
+        // The build this armed for is being dropped (#373).
+        self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
@@ -18138,6 +18219,13 @@ impl App {
             return;
         }
         let root = self.tree.root.clone();
+        // #373: if the last run of this test failed and named a place in
+        // the user's own code, break there — the whole point of "debug this
+        // test" is landing on the assertion without being asked to find it
+        // first. Set BEFORE the launch set is collected so it travels with
+        // the user's own breakpoints, and recorded so it can be taken back
+        // out when the session ends.
+        self.arm_failure_breakpoint(&name, &root);
         let breakpoints: BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> = self
             .editor
             .breakpoints
@@ -18168,9 +18256,9 @@ impl App {
                         self.dap_session = Some(session);
                         self.run_debug.feedback = Some(format!("Debugging test {name}"));
                         self.run_debug.feedback_is_error = false;
-                        self.status = format!(
+                        self.status = self.with_failure_note(format!(
                             "Debugging test {name} — F5 continue · F10 step over · Shift+F5 stop"
-                        );
+                        ));
                         self.reveal_debug_view();
                     }
                     Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
@@ -18187,10 +18275,14 @@ impl App {
                 self.start_test_binary_build(root, name, source);
             }
             Some(crate::testing::worker::Runner::Vitest | crate::testing::worker::Runner::Jest) => {
+                // No session will start, so the armed breakpoint has nothing
+                // to be cleaned up by (#373).
+                self.disarm_failure_breakpoint();
                 self.status =
                     String::from("Debugging JS tests is not wired yet — the play glyph runs them");
             }
             None => {
+                self.disarm_failure_breakpoint();
                 self.status = String::from("No test runner detected in this workspace");
             }
         }
@@ -18203,10 +18295,12 @@ impl App {
     /// it. The drain launches the debugger when the binary arrives.
     fn start_test_binary_build(&mut self, root: PathBuf, name: String, source: Option<PathBuf>) {
         if self.pending_test_debug.is_some() {
+            // The launch this armed for is not happening (#373).
+            self.disarm_failure_breakpoint();
             self.status = String::from("A test binary is already building");
             return;
         }
-        self.status = format!("Building test binary for {name}");
+        self.status = self.with_failure_note(format!("Building test binary for {name}"));
         let (tx, rx) = std::sync::mpsc::channel();
         {
             let name = name.clone();
@@ -18239,6 +18333,8 @@ impl App {
         // Re-rooting the Explorer mid-build would otherwise launch the old
         // workspace's binary with the new workspace's cwd and breakpoints.
         if build_root != self.tree.root {
+            // No launch, so nothing will clean up after it (#373).
+            self.disarm_failure_breakpoint();
             self.status = format!(
                 "Test binary for {name} finished, but the workspace changed — debug it again from its workspace"
             );
@@ -18256,6 +18352,10 @@ impl App {
     fn launch_lldb_test_debug(&mut self, binary: &Path, name: &str) {
         use std::collections::BTreeMap;
         if self.dap_session.is_some() {
+            // The build took minutes and the user started another session
+            // meanwhile: this launch is abandoned, so the breakpoint it
+            // armed has nothing to clean up after it (#373).
+            self.disarm_failure_breakpoint();
             self.status = String::from("A debug session is already running (Shift+F5 stops it)");
             return;
         }
@@ -18285,8 +18385,9 @@ impl App {
                 self.dap_session = Some(session);
                 self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
-                self.status =
-                    format!("Debugging test {name} via lldb-dap — F5 continue · Shift+F5 stop");
+                self.status = self.with_failure_note(format!(
+                    "Debugging test {name} via lldb-dap — F5 continue · Shift+F5 stop"
+                ));
                 self.reveal_debug_view();
             }
             Err(e) => self.debug_error(format!("Failed to start lldb-dap: {e}")),
@@ -18540,6 +18641,11 @@ impl App {
             Some(SessionPhase::Terminated) => {
                 self.editor.stop_line = None;
                 self.editor.unverified_breakpoints.clear();
+                // A session that ends on its own must take croft's own
+                // breakpoint with it, exactly as Shift+F5 does (#373):
+                // this is the path a passing test takes, so it is the
+                // common one, not the exceptional one.
+                self.disarm_failure_breakpoint();
                 self.reset_watch_runtime();
                 self.clear_inline_values();
                 // Reply to the adapter's own `terminated`/`exited` with the
@@ -18909,6 +19015,10 @@ impl App {
     /// silently whenever the user is looking at any other sidebar — which read
     /// as "F5 does nothing" on a remote with no debug adapter installed.
     fn debug_error(&mut self, msg: String) {
+        // A launch that never happened leaves no session to clean up after,
+        // so any breakpoint croft armed for it comes out here (#373) —
+        // otherwise it survives in the editor as if the user had set it.
+        self.disarm_failure_breakpoint();
         self.run_debug.feedback = Some(msg.clone());
         self.run_debug.feedback_is_error = true;
         self.status = msg;
@@ -19106,6 +19216,99 @@ impl App {
             return;
         }
         self.launch_resolved_config(rc);
+    }
+
+    /// Where the last run of `name` failed, if the runner named a place in
+    /// the user's own code (#373). Read back from the Test Runner output
+    /// channel, which already holds every line the run printed.
+    ///
+    /// Scoped to the failing test's own block: a run of the whole suite
+    /// prints many failures, and breaking on another test's assertion would
+    /// stop the debugger somewhere the user did not ask about. The block
+    /// starts at the runner's "failures:"-style banner for this test and
+    /// ends at the next test's banner.
+    fn failure_site_of(&self, name: &str) -> Option<crate::testing::failure_site::FailureSite> {
+        use crate::testing::failure_site::is_failure_banner;
+        let lines = crate::output::snapshot(crate::output::CHANNEL_TESTS)?;
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        // Walk backwards to the most recent BANNER for this test, so a
+        // re-run's output wins over an earlier one in the same channel.
+        // Anchoring on the banner rather than on any mention is what makes
+        // this work against real output: libtest reprints every failing
+        // name in its trailing `failures:` summary, so "the last line
+        // mentioning the name" lands after every block and finds nothing.
+        let start = texts.iter().rposition(|t| is_failure_banner(t, name))?;
+        // The block runs to the next test's banner, or to the end.
+        let end = texts[start + 1..]
+            .iter()
+            .position(|t| {
+                (t.trim_start().starts_with("---- ")
+                    || t.trim_start().starts_with('_')
+                    || t.trim_start().starts_with('\u{25cf}'))
+                    && !is_failure_banner(t, name)
+            })
+            .map(|i| start + 1 + i)
+            .unwrap_or(texts.len());
+        crate::testing::failure_site::failure_site(&texts[start..end].join("\n"))
+    }
+
+    /// Set a TEMPORARY breakpoint at the assertion the last run of `name`
+    /// failed on (#373), unless the user already has one there.
+    ///
+    /// Recorded in `debug_temp_breakpoint` so [`Self::disarm_failure_breakpoint`]
+    /// can take exactly this one back out: a breakpoint croft set and then
+    /// left behind would be indistinguishable from one the user set, and
+    /// would keep stopping them on a line they never chose.
+    fn arm_failure_breakpoint(&mut self, name: &str, root: &Path) {
+        self.disarm_failure_breakpoint();
+        let Some((file, line)) = self
+            .failure_site_of(name)
+            .and_then(|site| site.resolve(root))
+        else {
+            return;
+        };
+        let line = line as usize;
+        let lines = self.editor.breakpoints.entry(file.clone()).or_default();
+        // The user's own breakpoint there is left alone: it is theirs, it
+        // outlives the session, and removing it on stop would delete work.
+        if !lines.insert(line) {
+            return;
+        }
+        self.debug_temp_breakpoint = Some((file.clone(), line));
+        // Recorded for the caller to append to whatever message it shows:
+        // setting `status` here would be overwritten moments later by the
+        // launch's own ("Building test binary…"), so the user would never
+        // learn a breakpoint had been set for them.
+        self.debug_temp_note = Some(format!(
+            "breaking at {}:{line} where it last failed",
+            file.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+    }
+
+    /// Append the armed-breakpoint note to `msg`, if one was armed (#373).
+    fn with_failure_note(&self, msg: String) -> String {
+        match &self.debug_temp_note {
+            Some(note) => format!("{msg} — {note}"),
+            None => msg,
+        }
+    }
+
+    /// Remove the breakpoint [`Self::arm_failure_breakpoint`] set, if it is
+    /// still ours. The user may have removed it themselves mid-session, in
+    /// which case there is nothing to take back.
+    fn disarm_failure_breakpoint(&mut self) {
+        self.debug_temp_note = None;
+        let Some((file, line)) = self.debug_temp_breakpoint.take() else {
+            return;
+        };
+        if let Some(lines) = self.editor.breakpoints.get_mut(&file) {
+            lines.remove(&line);
+            if lines.is_empty() {
+                self.editor.breakpoints.remove(&file);
+            }
+        }
     }
 
     /// The editor's breakpoints in launch shape, shared by every session
@@ -19759,6 +19962,9 @@ impl App {
         ));
         self.editor.stop_line = None;
         self.editor.unverified_breakpoints.clear();
+        // The breakpoint croft set at the failing assertion goes with the
+        // session that asked for it (#373).
+        self.disarm_failure_breakpoint();
         self.clear_inline_values();
         self.status = String::from("Debug session stopped");
         // Clear the paused-state feedback ("Paused (breakpoint)") so the
@@ -24267,6 +24473,25 @@ impl App {
             self.open_editor_replace();
             return;
         }
+        // `.http`/`.rest` (#370): Cmd/Ctrl+Enter sends the request under
+        // the caret, REST Client's own chord. Checked BEFORE the runnable
+        // fence (#353), which claims the same chord: this arm is scoped to
+        // request files, so the two compose — a `.http` file sends, and
+        // every other file falls through to the fence path with its
+        // meaning intact.
+        if matches!(key.code, KeyCode::Enter)
+            && key
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL)
+            && self
+                .editor
+                .path
+                .as_deref()
+                .is_some_and(crate::http_file::is_http_file)
+        {
+            self.send_http_request_under_caret();
+            return;
+        }
         // Runnable docs (#353): Cmd+Enter runs the fence under the caret.
         if is_run_fence_key(key) && self.focus == Pane::Editor && self.run_fence_at_cursor() {
             return;
@@ -25776,6 +26001,193 @@ impl App {
             }
             Err(e) => self.status = format!("Open scrollback failed: {e}"),
         }
+    }
+
+    /// `.http`/`.rest` (#370): send the request under the caret. The env
+    /// file's values are substituted before the send; a hole with no value
+    /// refuses to send rather than leaking `{{name}}` to a server. The send
+    /// runs on a worker thread and [`Self::drain_http_responses`] opens the
+    /// response tab when it lands.
+    pub(crate) fn send_http_request_under_caret(&mut self) {
+        let Some((req, resolved, path)) = self.http_request_under_caret() else {
+            return;
+        };
+        if self.http_run.is_some() {
+            self.status = String::from("An HTTP request is already in flight");
+            return;
+        }
+        // History records the RAW line: what the user wrote, secrets still
+        // folded inside their {{names}}.
+        let raw_line = format!("{} {}", req.method, req.url);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let file = path.clone();
+        let line = raw_line.clone();
+        let spawned = std::thread::Builder::new()
+            .name(String::from("croft-http"))
+            .spawn(move || {
+                let result = crate::http_file::send(&resolved, crate::http_file::REQUEST_TIMEOUT);
+                let _ = tx.send(HttpRunOutcome {
+                    file,
+                    raw_line: line,
+                    result,
+                });
+            });
+        if spawned.is_err() {
+            self.status = String::from("HTTP: could not start the request worker");
+            return;
+        }
+        self.http_run = Some(rx);
+        self.status = format!("Sending {raw_line}");
+    }
+
+    /// `.http` (#370): put the request under the caret on the clipboard as
+    /// a curl command, variables substituted — the clipboard is the user's
+    /// own hand, unlike history and the response tab.
+    pub(crate) fn copy_http_request_as_curl(&mut self) {
+        let Some((_, resolved, _)) = self.http_request_under_caret() else {
+            return;
+        };
+        copy_to_clipboard(&crate::http_file::to_curl(&resolved));
+        self.status = String::from("curl command copied");
+    }
+
+    /// The parsed and variable-resolved request under the caret, or a
+    /// status naming why there is none (wrong file, no block, or a
+    /// `{{name}}` with no value in `.http.env.json` / the environment).
+    fn http_request_under_caret(
+        &mut self,
+    ) -> Option<(
+        crate::http_file::HttpRequest,
+        crate::http_file::ResolvedRequest,
+        PathBuf,
+    )> {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file open");
+            return None;
+        };
+        if !crate::http_file::is_http_file(&path) {
+            self.status = String::from("Not a .http/.rest file");
+            return None;
+        }
+        let text = self.editor.lines.join("\n");
+        let requests = crate::http_file::parse_requests(&text);
+        let Some(req) = crate::http_file::request_at(&requests, self.editor.cursor_row).cloned()
+        else {
+            self.status = String::from("No request under the caret");
+            return None;
+        };
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let vars = crate::http_file::load_env(&dir);
+        let (resolved, missing) = crate::http_file::resolve(&req, &vars);
+        if !missing.is_empty() {
+            let holes: Vec<String> = missing.iter().map(|m| format!("{{{{{m}}}}}")).collect();
+            self.status = format!(
+                "HTTP: no value for {} (add it to {} beside the file, or $env)",
+                holes.join(", "),
+                crate::http_file::ENV_FILE
+            );
+            return None;
+        }
+        Some((req, resolved, path))
+    }
+
+    /// Fold in a finished `.http` request (#370): record it in the durable
+    /// command history (raw line, status as the exit, elapsed as the
+    /// duration), materialise the response under the cache, and open it —
+    /// a text document with status/headers as comments, or the image
+    /// itself. Returns whether a repaint is due.
+    pub fn drain_http_responses(&mut self) -> bool {
+        let Some(rx) = self.http_run.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(o) => o,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.http_run = None;
+                self.status = String::from("HTTP: the request worker died");
+                return true;
+            }
+        };
+        self.http_run = None;
+        let cwd = outcome
+            .file
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        match outcome.result {
+            Err(e) => {
+                self.command_history
+                    .append(crate::command_history::HistoryEntry {
+                        cmd: format!("http {}", outcome.raw_line),
+                        cwd,
+                        host: String::new(),
+                        exit: None,
+                        dur_ms: 0,
+                        ts,
+                    });
+                self.status = format!("HTTP: {} failed: {e}", outcome.raw_line);
+            }
+            Ok(resp) => {
+                self.command_history
+                    .append(crate::command_history::HistoryEntry {
+                        cmd: format!("http {}", outcome.raw_line),
+                        cwd,
+                        host: String::new(),
+                        exit: Some(i32::from(resp.status)),
+                        dur_ms: resp.elapsed_ms,
+                        ts,
+                    });
+                let dir = croft_cache_dir().join("http");
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    self.status = format!("HTTP: cannot write the response: {e}");
+                    return true;
+                }
+                let slug: String = outcome
+                    .raw_line
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                    .collect::<String>()
+                    .trim_matches('-')
+                    .chars()
+                    .take(48)
+                    .collect();
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let (file, bytes): (PathBuf, Vec<u8>) =
+                    match crate::http_file::response_kind(&resp.content_type()) {
+                        crate::http_file::ResponseKind::Image(ext) => {
+                            (dir.join(format!("{slug}-{stamp}.{ext}")), resp.body.clone())
+                        }
+                        crate::http_file::ResponseKind::Text(_) => {
+                            let (ext, doc) =
+                                crate::http_file::response_doc(&outcome.raw_line, &resp);
+                            (dir.join(format!("{slug}-{stamp}.{ext}")), doc.into_bytes())
+                        }
+                    };
+                if let Err(e) = std::fs::write(&file, &bytes) {
+                    self.status = format!("HTTP: cannot write the response: {e}");
+                    return true;
+                }
+                match self.editor.open_pinned(&file) {
+                    Ok(()) => {
+                        self.focus_pane(Pane::Editor);
+                        self.status = format!(
+                            "{} \u{2192} {} {} \u{00b7} {} ms",
+                            outcome.raw_line, resp.status, resp.status_text, resp.elapsed_ms
+                        );
+                    }
+                    Err(e) => self.status = format!("HTTP: response open failed: {e}"),
+                }
+            }
+        }
+        true
     }
 
     /// Ctrl+Shift+H: open the durable command-history search over the
@@ -27632,6 +28044,22 @@ impl App {
     fn drain_agent_events(&mut self) -> bool {
         let mut said = false;
         while let Some(ev) = self.agent_events.pop_front() {
+            // A gone agent with nothing left to review takes its lane with
+            // it; one with a queue keeps it, since the files it changed
+            // still need looking at (#345). The event is per PANE while the
+            // lane is per NAME, so a second pane still running the same
+            // agent — or an agent swap in one pane, which fires Gone then
+            // Seated — must not take the shared lane down with it.
+            if let crate::agents::AgentEvent::Gone { agent, .. } = &ev
+                && self.agent_ledger.unreviewed_count(agent) == 0
+                && !self
+                    .terminals
+                    .iter()
+                    .any(|t| t.agent().is_some_and(|a| a.name == *agent))
+            {
+                let agent = agent.clone();
+                self.agent_ledger.forget(&agent);
+            }
             if let crate::agents::AgentEvent::Waiting { pane, agent } = ev {
                 self.status = format!("{agent} in {pane} is waiting for your input");
                 said = true;
@@ -27658,6 +28086,106 @@ impl App {
         (seated, waiting)
     }
 
+    /// The agents whose panes are producing output right now (#345). A
+    /// merely SEATED agent does not count: a quiet agent's pane is no
+    /// reason to blame it for the user's own save.
+    fn working_agents(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .terminals
+            .iter()
+            .filter_map(|t| t.agent())
+            .filter(|lane| lane.status == crate::agents::AgentStatus::Working)
+            .map(|lane| lane.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Record each changed file against every working agent, hashing its
+    /// current content. A file that cannot be read right now is skipped
+    /// rather than recorded at a stale hash.
+    ///
+    /// A DELETION is processed whether or not an agent is working: a file
+    /// can be removed after its agent goes idle, and the row would
+    /// otherwise sit in the queue forever pointing at a file that is not
+    /// there (its lane staying visible with it). Only attribution — adding
+    /// or updating a row — needs a working agent to attribute to.
+    fn attribute_writes_to_working_agents(
+        &mut self,
+        changed: &std::collections::BTreeSet<PathBuf>,
+    ) -> bool {
+        let working = self.working_agents();
+        let mut any = false;
+        for path in changed {
+            // Only workspace files: an agent editing its own config under
+            // $HOME is not part of this workspace's review queue. ANY root
+            // counts, not just the primary — a secondary folder's files are
+            // as much this session's work as the first folder's (#345).
+            if self.roots.owning_root(path).is_none() {
+                continue;
+            }
+            match crate::agent_lane::read_baseline(path) {
+                // Attribution needs someone to attribute to; a quiet
+                // agent's pane is no reason to blame it for the user's
+                // own save.
+                crate::agent_lane::Baseline::Hash(hash) if !working.is_empty() => {
+                    any |= self.agent_ledger.record_write(path, hash, &working);
+                }
+                crate::agent_lane::Baseline::Hash(_) => {}
+                // The agent deleted it: the row goes, rather than sitting in
+                // the queue forever pointing at a file that is not there.
+                crate::agent_lane::Baseline::Gone => {
+                    any |= self.agent_ledger.forget_path(path);
+                }
+                // Unreadable this instant; the next write re-reports it.
+                crate::agent_lane::Baseline::Unreadable => {}
+            }
+        }
+        any
+    }
+
+    /// Mark one file reviewed in one agent's lane (#345): the content on
+    /// DISK now becomes the baseline, so the row returns only on a later
+    /// write.
+    pub(crate) fn mark_agent_file_reviewed(&mut self, agent: &str, path: &Path) -> bool {
+        match crate::agent_lane::read_baseline(path) {
+            crate::agent_lane::Baseline::Hash(hash) => {
+                self.agent_ledger.mark_reviewed(agent, path, hash)
+            }
+            // Nothing left to review: drop the row rather than baselining a
+            // file that is not there.
+            crate::agent_lane::Baseline::Gone => self.agent_ledger.forget_path(path),
+            // Unreadable right now is NOT reviewed: say so instead of
+            // clearing content the user has not seen.
+            crate::agent_lane::Baseline::Unreadable => {
+                self.status = format!("Could not read {} to mark it reviewed", path.display());
+                false
+            }
+        }
+    }
+
+    /// Mark an agent's whole lane reviewed (#345).
+    pub(crate) fn mark_agent_lane_reviewed(&mut self, agent: &str) -> usize {
+        let (reviewed, dropped) = self
+            .agent_ledger
+            .mark_lane_reviewed(agent, crate::agent_lane::read_baseline);
+        // A file that vanished was not REVIEWED; saying so would tell the
+        // user they looked at something that is not there.
+        let gone = match dropped {
+            0 => String::new(),
+            1 => String::from(", 1 gone"),
+            n => format!(", {n} gone"),
+        };
+        self.status = match reviewed {
+            0 if dropped == 0 => format!("{agent}: nothing waiting for review"),
+            0 => format!("{agent}: nothing to review{gone}"),
+            1 => format!("{agent}: 1 file marked reviewed{gone}"),
+            n => format!("{agent}: {n} files marked reviewed{gone}"),
+        };
+        reviewed + dropped
+    }
+
     /// Focus the first waiting agent's pane, else the first seated one. Goes
     /// through `set_bottom_panel_tab` like `captures_open_selected`, so a
     /// click from the editor with the panel collapsed reveals the pane
@@ -27671,9 +28199,15 @@ impl App {
                     .is_some_and(|a| a.status == crate::agents::AgentStatus::Waiting)
             })
             .or_else(|| self.terminals.iter().position(|t| t.agent().is_some()));
-        if let Some(idx) = pick {
-            self.active_terminal = idx;
-            self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+        match pick {
+            Some(idx) => {
+                self.active_terminal = idx;
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+            }
+            // The chip is showing a review queue whose agents have all gone:
+            // a click that silently did nothing was the worst of the three
+            // options (#345 review).
+            None => self.run_command(crate::widgets::command_palette::Command::ShowAgentLane),
         }
     }
 
@@ -29706,7 +30240,7 @@ impl App {
     /// editor buffer; view / navigation commands defer to the same methods
     /// their dedicated chords use, so the palette can never drift from the
     /// keyboard surface.
-    fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
+    pub(crate) fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
         use crate::widgets::command_palette::Command as Cmd;
         use crate::widgets::editor::CaseTransform;
         match cmd {
@@ -30297,10 +30831,109 @@ impl App {
             Cmd::SessionParticipants => self.open_participants_picker(),
             Cmd::CollabCancelStream => self.collab_cancel_stream(),
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
+            Cmd::MarkAgentFileReviewed => {
+                match self.editor.path.clone() {
+                    None => self.status = String::from("No file open"),
+                    Some(path) if !self.agent_ledger.is_unreviewed(&path) => {
+                        self.status =
+                            String::from("No agent change waiting for review on this file");
+                    }
+                    Some(path) => {
+                        // Every lane holding it: a file two agents both
+                        // touched is reviewed once, for both.
+                        let agents: Vec<String> = self
+                            .agent_ledger
+                            .agents()
+                            .into_iter()
+                            .map(String::from)
+                            .collect();
+                        let mut n = 0;
+                        for agent in &agents {
+                            if self.mark_agent_file_reviewed(agent, &path) {
+                                n += 1;
+                            }
+                        }
+                        let name = path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        self.status = format!(
+                            "{name} marked reviewed in {n} agent lane{}",
+                            if n == 1 { "" } else { "s" }
+                        );
+                    }
+                }
+            }
+            Cmd::ShowAgentLane => {
+                let rows: Vec<String> = self
+                    .agent_ledger
+                    .agents()
+                    .into_iter()
+                    .map(|agent| {
+                        let n = self.agent_ledger.unreviewed_count(agent);
+                        let files: Vec<String> = self
+                            .agent_ledger
+                            .lane(agent)
+                            .into_iter()
+                            .filter(|f| f.unreviewed())
+                            .take(3)
+                            .map(|f| {
+                                let name = f
+                                    .path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                if f.shared {
+                                    format!("{name} (shared)")
+                                } else {
+                                    name
+                                }
+                            })
+                            .collect();
+                        format!("{agent}: {n} to review ({})", files.join(", "))
+                    })
+                    .collect();
+                self.status = if rows.is_empty() {
+                    String::from("No agent has changed anything yet")
+                } else if self.agent_ledger.may_be_incomplete() {
+                    format!(
+                        "{} \u{b7} at least: the file watcher overflowed",
+                        rows.join(" \u{b7} ")
+                    )
+                } else {
+                    rows.join(" \u{b7} ")
+                };
+            }
+            Cmd::MarkAgentLaneReviewed => {
+                let agents: Vec<String> = self
+                    .agent_ledger
+                    .agents()
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                match agents.len() {
+                    0 => self.status = String::from("No agent has changed anything yet"),
+                    _ => {
+                        let mut total = 0;
+                        for agent in &agents {
+                            total += self.mark_agent_lane_reviewed(agent);
+                        }
+                        // Each lane set its own status; the summary is the
+                        // one the user is left with.
+                        self.status = match total {
+                            0 => String::from("Nothing waiting for review"),
+                            1 => String::from("1 file marked reviewed"),
+                            n => format!("{n} files marked reviewed"),
+                        };
+                    }
+                }
+            }
             Cmd::FixProblemWithNavigator => match self.navigator_fix_candidate() {
                 Some((path, item)) => self.fix_problem_with_navigator(path, item, Vec::new()),
                 None => self.status = String::from("No diagnostic at the caret to fix"),
             },
+            Cmd::SendHttpRequest => self.send_http_request_under_caret(),
+            Cmd::CopyHttpRequestAsCurl => self.copy_http_request_as_curl(),
             Cmd::AskNavigator => {
                 let (range, selection) = match self.editor.selection_rows() {
                     Some(rows) => (rows, self.editor.selection_text()),
@@ -36564,6 +37197,7 @@ impl App {
         // Drop any in-flight `cargo test --no-run`: the drain would refuse
         // its root-mismatched binary anyway, but the occupied slot kept
         // refusing NEW debug builds until the stale compile finished.
+        self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
@@ -42259,6 +42893,15 @@ fn load_trigger_set(redact_secrets: bool) -> std::sync::Arc<crate::triggers::Tri
     })
 }
 
+/// What the `.http` worker hands back (#370): the file it ran from, the
+/// RAW request line (variables unresolved, so a secret can never land in a
+/// status line, history entry, or response tab through it), and the result.
+struct HttpRunOutcome {
+    file: PathBuf,
+    raw_line: String,
+    result: Result<crate::http_file::HttpResponse, String>,
+}
+
 fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
@@ -43419,6 +44062,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
+        let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
         app.sync_git_gutters();
@@ -43536,6 +44180,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || connect_changed
             || install_changed
             || update_changed
+            || http_changed
             || reveal_changed
             || lsp_changed
             || sig_help_changed
