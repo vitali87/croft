@@ -293,8 +293,17 @@ pub enum CliCommand {
     /// `~/.config/croft/extensions/`. No extension code is downloaded or run.
     /// The theme appears in the picker on croft's next launch.
     ThemeImport {
-        /// Path to the theme JSON (JSONC and `include` chains are handled).
-        file: PathBuf,
+        /// Path to the theme JSON (JSONC and `include` chains are handled),
+        /// or a marketplace reference: `publisher.name`, a marketplace item
+        /// URL, or `vscode:extension/publisher.name`. A marketplace import
+        /// downloads the `.vsix`, lifts out ONE theme JSON, and discards the
+        /// rest — no extension code is installed or run.
+        file: String,
+        /// Which theme to take, when the extension contributes several
+        /// (Catppuccin ships four). Matched against the label,
+        /// case-insensitively.
+        #[arg(long)]
+        theme: Option<String>,
         /// Theme id to use instead of one derived from the theme's name.
         #[arg(long)]
         id: Option<String>,
@@ -556,9 +565,12 @@ impl Cli {
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
             Some(CliCommand::ImportVscode { from, dry_run }) => import_vscode(from, dry_run),
-            Some(CliCommand::ThemeImport { file, id, dry_run }) => {
-                theme_import(&file, id.as_deref(), dry_run)
-            }
+            Some(CliCommand::ThemeImport {
+                file,
+                theme,
+                id,
+                dry_run,
+            }) => theme_import(&file, theme.as_deref(), id.as_deref(), dry_run),
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
             Some(CliCommand::InstallLauncher { path, user, yes }) => {
                 install_launcher(path, user, yes)
@@ -1100,8 +1112,30 @@ fn plural(n: usize) -> &'static str {
 /// The notes are printed rather than buried: a converted theme fills croft
 /// slots the source never named, and a user comparing it against VS Code
 /// deserves to know which colours were derived rather than designed.
-fn theme_import(file: &Path, id: Option<&str>, dry_run: bool) -> Result<()> {
-    let converted = crate::vscode_theme::convert_file(file, id)?;
+fn theme_import(
+    reference: &str,
+    theme: Option<&str>,
+    id: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    // A path that exists is a path; anything else is a marketplace
+    // reference. Checked in that order so a file literally named like an
+    // extension id still wins — the user pointing at a file they can see
+    // should never silently hit the network instead.
+    let local = Path::new(reference);
+    let (source, scratch) = if local.exists() {
+        (local.to_path_buf(), None)
+    } else {
+        let (path, dir) = fetch_marketplace_theme(reference, theme)?;
+        (path, Some(dir))
+    };
+    let converted = crate::vscode_theme::convert_file(&source, id);
+    // The archive and everything lifted from it go whether the conversion
+    // succeeded or not: nothing downloaded outlives this command.
+    if let Some(dir) = scratch {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let converted = converted?;
     if dry_run {
         print!("{}", converted.manifest);
         return Ok(());
@@ -1132,6 +1166,39 @@ fn theme_import(file: &Path, id: Option<&str>, dry_run: bool) -> Result<()> {
     }
     println!("\nPick it under the gear menu on croft's next launch.");
     Ok(())
+}
+
+/// Resolve a marketplace reference to a theme JSON on disk.
+///
+/// Returns the extracted file and the temporary directory holding it: the
+/// caller keeps that alive until the conversion has read the file, and
+/// dropping it takes the `.vsix` and everything lifted from it with it.
+/// Nothing from the archive outlives this function.
+fn fetch_marketplace_theme(reference: &str, wanted: Option<&str>) -> Result<(PathBuf, PathBuf)> {
+    use crate::marketplace;
+    let id = marketplace::parse_ref(reference)?;
+    // A private scratch under the cache dir rather than a dev-only temp
+    // crate: this is a production path, and the caller removes the whole
+    // directory when it is done with it.
+    let scratch = std::env::temp_dir().join(format!("croft-theme-import-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).with_context(|| format!("making {}", scratch.display()))?;
+    println!(
+        "Downloading {}.{} from the marketplace…",
+        id.publisher, id.name
+    );
+    let vsix = marketplace::download_vsix(&id, &scratch)?;
+    let pkg = marketplace::read_member(&vsix, "extension/package.json", &scratch)?;
+    let themes = marketplace::contributed_themes(&pkg)?;
+    let picked = marketplace::pick_theme(&themes, wanted)?;
+    println!("  taking \"{}\" ({})", picked.label, picked.path);
+    let member = format!("extension/{}", picked.path);
+    let text = marketplace::read_member(&vsix, &member, &scratch)?;
+    // Write it under a name the converter's own id-derivation can use, so a
+    // marketplace import and a file import of the same theme agree.
+    let out = scratch.join(format!("{}.json", picked.label));
+    std::fs::write(&out, text).with_context(|| format!("writing {}", out.display()))?;
+    Ok((out, scratch))
 }
 
 fn setup_ghostty(yes: bool) -> Result<()> {

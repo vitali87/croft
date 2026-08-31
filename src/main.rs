@@ -35,6 +35,7 @@ mod lsp;
 mod macros;
 mod magic;
 mod markdown;
+mod marketplace;
 mod mcp;
 mod media;
 mod merge;
