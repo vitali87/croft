@@ -1285,6 +1285,9 @@ enum MenuAction {
     /// Terminal pane right-click: maximize the pane at `idx` across the
     /// panel (or restore the even split when already maximized).
     ToggleMaximizeTerminal(usize),
+    /// Terminal pane right-click: collapse the pane at `idx` to a strip, or
+    /// expand it again (#313).
+    ToggleCollapseTerminal(usize),
     /// Terminal pane right-click: enter quick-select hint mode on the pane.
     TerminalQuickSelect,
     /// Terminal pane right-click: enter copy mode (keyboard selection with
@@ -1397,6 +1400,7 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::RenameTerminal(_) => Some("⌘K R"),
         MenuAction::ClearTerminal(_) => Some("⌘K K"),
         MenuAction::ToggleMaximizeTerminal(_) => Some("⌘K M"),
+        MenuAction::ToggleCollapseTerminal(_) => Some("⌘K ["),
         MenuAction::TerminalQuickSelect => Some("⌃⇧Space"),
         MenuAction::TerminalCopyMode => Some("⌃⇧Y"),
         MenuAction::TerminalCommandHistory => Some("⌃⇧H"),
@@ -2838,6 +2842,16 @@ pub struct App {
     /// lock-step with `terminals`. A press on one starts a drag-reorder;
     /// hidden or unlabeled panes hold an empty rect. Empty with one terminal.
     terminal_label_rects: Vec<Rect>,
+    /// Hit-test rectangles of the collapse (`‹`) buttons, in lock-step with
+    /// `terminals` (#313). A pane that is hidden, already collapsed, too
+    /// narrow for the glyph, or maximized holds an empty rect.
+    terminal_collapse_buttons: Vec<Rect>,
+    /// Hit-test rectangles of the one-column strips collapsed panes leave
+    /// behind, in lock-step with `terminals` (#313). Clicking anywhere down a
+    /// strip gives that pane its width back; expanded panes hold an empty
+    /// rect. The WHOLE strip is the target, not just the chevron: one column
+    /// is already a small thing to hit without also demanding the right row.
+    terminal_strip_rects: Vec<Rect>,
     /// Index of the terminal being drag-reordered (grabbed by its pane label
     /// or its maximize-rail row). The reorder is live: crossing another pane
     /// or rail row moves the terminal there immediately, and this follows it.
@@ -4418,6 +4432,8 @@ impl App {
             terminal_add_buttons: Vec::new(),
             terminal_profile_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
+            terminal_collapse_buttons: Vec::new(),
+            terminal_strip_rects: Vec::new(),
             terminal_max_buttons: Vec::new(),
             terminal_rail_rects: Vec::new(),
             terminal_rail_area: Rect::default(),
@@ -12754,6 +12770,10 @@ impl App {
         } else if self.active_terminal > idx {
             self.active_terminal -= 1;
         }
+        // Closing the only expanded pane would leave the row nothing but
+        // strips; the collapse gesture refuses that from its own side and
+        // this closes the other route to it.
+        self.ensure_a_terminal_pane_is_expanded();
         // A lone terminal has nothing to maximize against; the rail would be
         // empty, so the split view is the honest state.
         if self.terminals.len() <= 1 {
@@ -12786,6 +12806,124 @@ impl App {
         } else {
             self.status = String::from("Only one terminal open");
         }
+    }
+
+    /// Paint a collapsed pane's one-column strip (#313) and return its hit
+    /// rect: the expand chevron on the header row, then the pane's name set
+    /// vertically down the column.
+    ///
+    /// A strip rather than hiding the pane outright. A pane that vanishes is
+    /// indistinguishable from one that was closed, and croft already has
+    /// closing, with its own undo window; the strip keeps the pane counted,
+    /// named and clickable, which is what makes folding it obviously
+    /// reversible.
+    fn paint_terminal_collapsed_strip(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        idx: usize,
+    ) -> Rect {
+        if area.width == 0 || area.height == 0 {
+            return Rect::default();
+        }
+        let hovered = self.pointer_cell.is_some_and(|(px, py)| {
+            px >= area.x && px < area.x + area.width && py >= area.y && py < area.y + area.height
+        });
+        frame.render_widget(
+            ratatui::widgets::Block::default().style(Style::default().bg(self.theme.editor_bg())),
+            area,
+        );
+        let chevron = crate::widgets::header_pill::action_style(self.theme, hovered);
+        let name = crate::widgets::header_pill::action_style(self.theme, false);
+        let label = self.terminals[idx].label().to_string();
+        let buf = frame.buffer_mut();
+        buf.set_string(area.x, area.y, TERMINAL_EXPAND_GLYPH.to_string(), chevron);
+        // The name runs down the strip so a folded pane is still identifiable
+        // without unfolding it. Only single-width characters are placed: a CJK
+        // glyph or an emoji is two cells wide and would paint over the pane
+        // next door, which is one column away.
+        for (row, ch) in label
+            .chars()
+            .filter(|c| unicode_width::UnicodeWidthChar::width(*c) == Some(1))
+            .take(area.height.saturating_sub(1) as usize)
+            .enumerate()
+        {
+            buf.set_string(area.x, area.y + 1 + row as u16, ch.to_string(), name);
+        }
+        area
+    }
+
+    /// Collapse the pane at `idx` to a strip, or give a collapsed one its
+    /// width back (#313). The `‹` header button, the strip, the right-click
+    /// entry and the palette command all land here.
+    ///
+    /// Collapsing the LAST expanded pane is refused: folding every pane away
+    /// leaves a row of strips with nothing in it, and croft already has
+    /// Ctrl+Shift+J for putting the panel away entirely. The refusal says so
+    /// on the status line rather than swallowing the click, so the button
+    /// never reads as broken.
+    pub fn toggle_terminal_collapse(&mut self, idx: usize) {
+        let Some(pane) = self.terminals.get(idx) else {
+            return;
+        };
+        if pane.collapsed {
+            self.terminals[idx].collapsed = false;
+            self.active_terminal = idx;
+            self.focus_pane(Pane::Terminal);
+            let msg = format!("Expanded terminal {}", self.terminals[idx].label());
+            self.terminal_status(msg);
+            return;
+        }
+        if self.terminals.iter().filter(|t| !t.collapsed).count() <= 1 {
+            self.status = String::from("Cannot collapse the last expanded terminal");
+            return;
+        }
+        self.terminals[idx].collapsed = true;
+        // Focus cannot stay on a pane that is now one column wide: it shows no
+        // cursor, so the keystrokes would go somewhere the user cannot see
+        // them arrive. Hand it to the nearest pane still expanded.
+        if self.active_terminal == idx
+            && let Some(next) = self.terminals.iter().position(|t| !t.collapsed)
+        {
+            self.active_terminal = next;
+            self.sync_focus_flags();
+        }
+        let msg = format!("Collapsed terminal {}", self.terminals[idx].label());
+        self.terminal_status(msg);
+    }
+
+    /// Give every collapsed pane its width back (Cmd+K `]`): the issue's
+    /// "maximise the terminals back to the same equal-sized terminal
+    /// windows", which has to be one gesture rather than one per pane.
+    pub fn restore_all_terminal_panes(&mut self) {
+        let folded = self.terminals.iter().filter(|t| t.collapsed).count();
+        if folded == 0 {
+            self.status = String::from("No collapsed terminal panes");
+            return;
+        }
+        for t in self.terminals.iter_mut() {
+            t.collapsed = false;
+        }
+        self.status = format!(
+            "Restored {folded} terminal pane{}",
+            if folded == 1 { "" } else { "s" }
+        );
+    }
+
+    /// Keep at least one pane expanded after a pane leaves the row (#313).
+    ///
+    /// [`Self::toggle_terminal_collapse`] refuses to fold the last expanded
+    /// pane, but CLOSING reaches the same state from the other side: two
+    /// panes with one collapsed, close the expanded one, and the panel is a
+    /// single strip with nothing behind it. Expanding the pane that is now
+    /// active, rather than all of them, keeps the rest of the user's
+    /// folding intact.
+    fn ensure_a_terminal_pane_is_expanded(&mut self) {
+        if self.terminals.is_empty() || self.terminals.iter().any(|t| !t.collapsed) {
+            return;
+        }
+        let idx = self.active_terminal.min(self.terminals.len() - 1);
+        self.terminals[idx].collapsed = false;
     }
 
     /// Drop the rail's hit rects and its column. Both must go together: a
@@ -12951,6 +13089,10 @@ impl App {
         };
         let idx = parked.idx.min(self.terminals.len());
         self.terminals.insert(idx, parked.term);
+        // Reopening is a request to see the pane, so it comes back expanded
+        // whatever it was when it was closed: a restore that put a strip on
+        // screen would read as the reopen having failed.
+        self.terminals[idx].collapsed = false;
         self.active_terminal = idx;
         if !self.show_terminal {
             self.show_terminal = true;
@@ -14802,11 +14944,17 @@ impl App {
                             })
                             .collect()
                     } else {
-                        let constraints: Vec<Constraint> =
-                            (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect();
+                        // Collapsed panes (#313) keep a one-column strip and
+                        // the rest divide what is left. Read off the panes
+                        // rather than a list held here, so a reorder or a
+                        // close can never leave the flags naming the wrong
+                        // terminal.
+                        let collapsed: Vec<bool> = (0..n)
+                            .map(|i| self.terminals.get(i).is_some_and(|t| t.collapsed))
+                            .collect();
                         Layout::default()
                             .direction(Direction::Horizontal)
-                            .constraints(constraints)
+                            .constraints(terminal_pane_constraints(&collapsed))
                             .split(content)
                             .to_vec()
                     };
@@ -14819,7 +14967,16 @@ impl App {
                     // theme at all instead of showing the host's own bg.
                     let term_bg = self.theme.editor_bg();
                     for (i, t) in self.terminals.iter_mut().enumerate() {
-                        if cols[i].width == 0 {
+                        // A collapsed pane is not rendered, and that is what
+                        // keeps its shell intact: rendering is what resizes
+                        // the PTY, and reflowing a running shell into one
+                        // column would mangle everything already on its
+                        // screen. It keeps the geometry it had, so expanding
+                        // brings the pane back as it was rather than as a
+                        // column of broken wrapping. Its `last_area` is
+                        // cleared so a click on the strip cannot land in a
+                        // grid that is no longer painted there.
+                        if cols[i].width == 0 || (t.collapsed && !maximized) {
                             t.last_area = Rect::default();
                             t.redacted_on_screen = 0;
                         } else {
@@ -14837,6 +14994,8 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
+                    self.terminal_collapse_buttons.clear();
+                    self.terminal_strip_rects.clear();
                     for (i, col) in cols.iter().enumerate().take(self.terminals.len()) {
                         // Hidden panes still push placeholders so a button's
                         // position in each vec names its terminal index.
@@ -14846,8 +15005,25 @@ impl App {
                             self.terminal_close_buttons.push(Rect::default());
                             self.terminal_max_buttons.push(Rect::default());
                             self.terminal_label_rects.push(Rect::default());
+                            self.terminal_collapse_buttons.push(Rect::default());
+                            self.terminal_strip_rects.push(Rect::default());
                             continue;
                         }
+                        // A collapsed pane's whole chrome is its strip: no
+                        // header buttons fit in one column, and the only
+                        // gesture it offers is the way back out.
+                        if self.terminals[i].collapsed && !maximized {
+                            let strip = self.paint_terminal_collapsed_strip(frame, *col, i);
+                            self.terminal_add_buttons.push(Rect::default());
+                            self.terminal_profile_buttons.push(Rect::default());
+                            self.terminal_close_buttons.push(Rect::default());
+                            self.terminal_max_buttons.push(Rect::default());
+                            self.terminal_label_rects.push(Rect::default());
+                            self.terminal_collapse_buttons.push(Rect::default());
+                            self.terminal_strip_rects.push(strip);
+                            continue;
+                        }
+                        self.terminal_strip_rects.push(Rect::default());
                         let buttons = paint_terminal_pane_buttons(
                             frame,
                             *col,
@@ -14864,6 +15040,8 @@ impl App {
                             .push(buttons.close.unwrap_or_default());
                         self.terminal_max_buttons
                             .push(buttons.max.unwrap_or_default());
+                        self.terminal_collapse_buttons
+                            .push(buttons.collapse.unwrap_or_default());
                         // Auto/manual pane label at top-left, only with 2+ panes
                         // (a lone pane needs no name). Kept clear of the buttons.
                         // The painted pill doubles as the drag-reorder handle,
@@ -14971,6 +15149,8 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
+                    self.terminal_collapse_buttons.clear();
+                    self.terminal_strip_rects.clear();
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -14986,6 +15166,8 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
+                    self.terminal_collapse_buttons.clear();
+                    self.terminal_strip_rects.clear();
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -15001,6 +15183,8 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
+                    self.terminal_collapse_buttons.clear();
+                    self.terminal_strip_rects.clear();
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -15015,6 +15199,8 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
+                    self.terminal_collapse_buttons.clear();
+                    self.terminal_strip_rects.clear();
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -15029,6 +15215,8 @@ impl App {
             self.terminal_close_buttons.clear();
             self.terminal_max_buttons.clear();
             self.terminal_label_rects.clear();
+            self.terminal_collapse_buttons.clear();
+            self.terminal_strip_rects.clear();
             self.clear_terminal_rail();
             self.problems_tab_rect = Rect::default();
             self.output_tab_rect = Rect::default();
@@ -17153,6 +17341,32 @@ impl App {
                     self.show_terminal = true;
                 }
                 self.toggle_terminal_pane_maximize();
+                true
+            }
+            // Cmd+K [ / Cmd+K ]: fold the active terminal pane to a strip,
+            // and give every folded pane its width back (#313). VS Code binds
+            // its own fold / unfold pair to ⌘K ⌘[ and ⌘K ⌘], so the gesture
+            // keeps the keys it already has elsewhere.
+            //
+            // NOT ⌘K E, which the design proposal had picked as "even": that
+            // is croft's reveal-in-Explorer and the arm would never have been
+            // reached, since an earlier `e` arm in this same match wins.
+            // NOT ⌘K -, either: `-` is close, on the button and here.
+            //
+            // Cmd+K M (pane-maximize) is untouched: maximize and collapse are
+            // orthogonal and compose.
+            KeyCode::Char('[') if plain => {
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.toggle_terminal_collapse(self.active_terminal);
+                true
+            }
+            KeyCode::Char(']') if plain => {
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.restore_all_terminal_panes();
                 true
             }
             // Cmd+K D: dump the active terminal's scrollback into a scratch
@@ -31599,6 +31813,8 @@ impl App {
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
+            Cmd::CollapseTerminalPane => self.toggle_terminal_collapse(self.active_terminal),
+            Cmd::RestoreTerminalPanes => self.restore_all_terminal_panes(),
             Cmd::ToggleSecretRedaction => self.toggle_secret_redaction(),
             Cmd::RevealRedactedSecrets => self.reveal_redacted_secrets(),
             Cmd::SearchFromTerminal => self.search_from_last_terminal_command(),
@@ -35199,6 +35415,19 @@ impl App {
                             }),
                             action: MenuAction::ToggleMaximizeTerminal(idx),
                         });
+                        // Collapse is meaningless while maximize owns the
+                        // whole panel and the flags are ignored, so the entry
+                        // is not offered there.
+                        if !self.terminal_pane_maximized {
+                            items.push(MenuEntry::Item {
+                                label: String::from(if self.terminals[idx].collapsed {
+                                    "Expand Terminal"
+                                } else {
+                                    "Collapse Terminal"
+                                }),
+                                action: MenuAction::ToggleCollapseTerminal(idx),
+                            });
+                        }
                         items.push(MenuEntry::Item {
                             label: String::from(if self.broadcast_input {
                                 "Stop Broadcast Input"
@@ -35773,6 +36002,25 @@ impl App {
                     .position(|r| rect_contains(*r, m.column, m.row))
                 {
                     self.open_terminal_profile_picker(idx);
+                    return;
+                }
+                if let Some(idx) = self
+                    .terminal_collapse_buttons
+                    .iter()
+                    .position(|r| rect_contains(*r, m.column, m.row))
+                {
+                    self.toggle_terminal_collapse(idx);
+                    return;
+                }
+                // A strip is one column wide, so it is tested before the
+                // splitter and the pane body below: anything that claims the
+                // click first makes a folded pane impossible to unfold.
+                if let Some(idx) = self
+                    .terminal_strip_rects
+                    .iter()
+                    .position(|r| rect_contains(*r, m.column, m.row))
+                {
+                    self.toggle_terminal_collapse(idx);
                     return;
                 }
                 if let Some(idx) = self
@@ -39043,6 +39291,7 @@ impl App {
                 }
                 self.toggle_terminal_pane_maximize();
             }
+            MenuAction::ToggleCollapseTerminal(idx) => self.toggle_terminal_collapse(idx),
             MenuAction::NewTerminalWithProfile(shell) => {
                 let label = std::path::Path::new(&shell)
                     .file_name()
@@ -44219,15 +44468,67 @@ const TERMINAL_MAX_LABEL: &str = " \u{eb4c} ";
 /// Codicon screen-normal (Nerd Fonts `cod-screen_normal` = U+EB4D): restore
 /// the even split. Swapped in for the `⛶` while a pane is maximized.
 const TERMINAL_RESTORE_LABEL: &str = " \u{eb4d} ";
+/// Codicon chevron-left (Nerd Fonts `cod-chevron_left` = U+EAB5): fold this
+/// pane to a strip and hand its width to the panes still expanded (#313).
+///
+/// Its own button rather than a new meaning for `-`: `-` closes, and it goes
+/// on closing. A control that destroys on one build and folds on the next is
+/// the kind of change muscle memory finds out the hard way.
+const TERMINAL_COLLAPSE_LABEL: &str = " \u{eab5} ";
+/// Codicon chevron-right (U+EAB6), on the header row of a collapsed pane's
+/// strip: the way back out. It points the opposite way to the button that put
+/// the pane there, which is the whole of the affordance in one column.
+const TERMINAL_EXPAND_GLYPH: char = '\u{eab6}';
+/// A collapsed pane's entire width: one column, carrying the expand chevron
+/// and the pane's name set vertically.
+const TERMINAL_STRIP_W: u16 = 1;
 /// Codicon terminal (Nerd Fonts `cod-terminal` = U+EA85), leading each
 /// maximize-rail row the way VS Code's terminal tabs list does.
 /// Cells the pane's header buttons occupy, measured in from its right edge:
-/// `⛶`, `-`, `∨` and `+` at three each, plus the one blank column right of
-/// `+`. The name pill paints after the buttons and would win the shared cells,
-/// so it is clipped to the width left of this strip.
+/// `‹`, `⛶`, `-`, `∨` and `+` at three each, plus the one blank column right
+/// of `+`. The name pill paints after the buttons and would win the shared
+/// cells, so it is clipped to the width left of this strip.
 /// `a_long_pane_label_never_overpaints_the_maximize_button` pins it, so adding
-/// a fifth button fails a test rather than quietly erasing a glyph again.
-const TERMINAL_BUTTON_STRIP_W: u16 = 13;
+/// a SIXTH button fails a test rather than quietly erasing a glyph again -
+/// which is how the collapse button (#313) was caught needing this widened
+/// from 13 instead of silently sharing the pill's cells.
+const TERMINAL_BUTTON_STRIP_W: u16 = 16;
+/// Width constraints for the terminal row, given which panes are collapsed
+/// (#313).
+///
+/// A collapsed pane keeps a one-column strip; the panes still expanded divide
+/// everything left over. Split out as a pure function of the flags because
+/// the apportioning is the whole of the layout risk here, and this way it is
+/// asserted directly - a constraint vector measured against expected widths -
+/// rather than only through a rendered frame.
+///
+/// `Fill` rather than `Ratio` for the expanded panes: `Ratio(1, k)` is a
+/// share of the WHOLE row, so mixing it with the strips' `Length(1)` asks the
+/// solver for more columns than exist and it settles that overflow by shaving
+/// the panes. `Fill` divides what the strips leave, which is the arithmetic
+/// actually wanted.
+///
+/// With nothing collapsed every pane is `Fill(1)`, which apportions the row
+/// evenly - the same split as before the feature existed, so the common case
+/// pays nothing for it.
+///
+/// Every pane collapsed is unreachable through the UI ([`App::toggle_terminal_collapse`]
+/// and [`App::close_terminal_at`] both keep one expanded), but it is answered
+/// here rather than left to divide by zero.
+fn terminal_pane_constraints(collapsed: &[bool]) -> Vec<Constraint> {
+    let any_expanded = collapsed.iter().any(|c| !c);
+    collapsed
+        .iter()
+        .map(|&c| {
+            if c && any_expanded {
+                Constraint::Length(TERMINAL_STRIP_W)
+            } else {
+                Constraint::Fill(1)
+            }
+        })
+        .collect()
+}
+
 const TERMINAL_RAIL_ICON: char = '\u{ea85}';
 /// How many label characters a rail row shows. Fixed and deliberately tiny:
 /// the rail is a switcher, not a directory, so four letters identify a pane.
@@ -44517,11 +44818,16 @@ fn run_mcp_command_blocking(
     crate::mcp::McpOutcome { title, body }
 }
 
-/// Paint the `[+]` and (when more than one terminal is open) `[-]` buttons
-/// on the top border of the terminal pane and return their hit-test
-/// rectangles `(add, close)`. Either side is None when the pane is too
-/// narrow / short for the label, or — for close — when only one terminal
-/// is open and there's nothing to drop.
+/// Paint the terminal pane's header buttons on its top border and return
+/// their hit-test rectangles. Any of them is `None` when the pane is too
+/// narrow or short for the label to fit, and the three that act on ONE pane
+/// among several (`-`, `⛶`, `‹`) are absent when a lone terminal is open and
+/// there is nothing to drop, maximize against, or fold away from.
+///
+/// Right to left: `+`, `∨`, `-`, `⛶`, `‹`. The collapse button (#313) went on
+/// the far LEFT deliberately: every button already there keeps the exact
+/// column it had, so a user reaching for `-` by position still lands on `-`
+/// and not on a gesture that merely looks similar.
 fn paint_terminal_pane_buttons(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -44534,6 +44840,7 @@ fn paint_terminal_pane_buttons(
     let caret_w = TERMINAL_PROFILE_LABEL.chars().count() as u16;
     let close_w = TERMINAL_CLOSE_LABEL.chars().count() as u16;
     let max_w = TERMINAL_MAX_LABEL.chars().count() as u16;
+    let fold_w = TERMINAL_COLLAPSE_LABEL.chars().count() as u16;
     let mut out = TerminalPaneButtons::default();
     if area.height == 0 {
         return out;
@@ -44604,6 +44911,25 @@ fn paint_terminal_pane_buttons(
             height: 1,
         });
     }
+    // Collapse sits left of `⛶`, putting the two layout gestures beside each
+    // other and leaving the destructive `-` where it was. Maximize already
+    // owns the whole panel and ignores the collapse flags, so while it is on
+    // the button would be a control that does nothing: it is not painted.
+    if show_close_button
+        && !pane_maximized
+        && area.width >= add_w + caret_w + close_w + max_w + fold_w + 2
+    {
+        let x = area.x + area.width - add_w - caret_w - close_w - max_w - fold_w - 1;
+        frame
+            .buffer_mut()
+            .set_string(x, y, TERMINAL_COLLAPSE_LABEL, style_at(x, fold_w));
+        out.collapse = Some(Rect {
+            x,
+            y,
+            width: fold_w,
+            height: 1,
+        });
+    }
     out
 }
 
@@ -44615,6 +44941,7 @@ struct TerminalPaneButtons {
     profile: Option<Rect>,
     close: Option<Rect>,
     max: Option<Rect>,
+    collapse: Option<Rect>,
 }
 
 /// `app_cursor` is the pane's DECCKM state: cursor keys switch from the

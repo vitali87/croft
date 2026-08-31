@@ -499,9 +499,15 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `Cmd+K` `K` | Clear the active terminal's screen and scrollback (VS Code clears with `Cmd+K`) |
 | `Cmd+K` `M` | Maximize the active terminal across the panel; press again to restore the even split |
 | Click the `⛶` button (beside `-`) | Maximize that pane: it takes the panel's full width and the other terminals move to a rail down the right edge; the button becomes a restore glyph while maximized |
+| Click the `‹` button (left of `⛶`) | Collapse that pane to a one-column strip and hand its width to the panes still open. The pane keeps running: nothing is suspended, no output is lost, and `-` still closes |
+| Click a collapsed strip | Give that pane its width back. Anywhere down the strip works, not only the `›` chevron at the top |
+| `Cmd+K` `[` | Collapse the active terminal pane (VS Code folds with `Cmd+K` `[` too). Distinct from `Cmd+[`, which cycles to the previous pane. Collapsing the last expanded pane is refused: `Ctrl+Shift+j` is how you put the whole panel away |
+| `Cmd+K` `]` | Give every collapsed pane its width back, restoring the even split in one gesture |
 | Click a rail row | While maximized: hand that terminal the maximized pane (the highlight marks the active one), so you can shuffle between full-size terminals |
 | Wheel over the rail | Scroll the rail when there are more terminals than it has rows; switching panes always scrolls the new one back into view |
-| Right-click a terminal pane | Open the pane menu: **Rename Terminal**, **Clear**, **Quick Select**, **Copy Mode**, **Command History**, **Open Scrollback in Editor**, **Reopen Closed Terminal** (while one is in its undo window), **Maximize Terminal** (or **Restore Terminal Split**), **Broadcast Input** (and, while broadcasting, **Exclude from Broadcast**) |
+| Right-click a terminal pane | Open the pane menu: **Rename Terminal**, **Clear**, **Quick Select**, **Copy Mode**, **Command History**, **Open Scrollback in Editor**, **Reopen Closed Terminal** (while one is in its undo window), **Maximize Terminal** (or **Restore Terminal Split**), **Collapse Terminal** (or **Expand Terminal**), **Broadcast Input** (and, while broadcasting, **Exclude from Broadcast**) |
+
+Collapse and maximize are orthogonal and compose: entering maximize ignores the collapse flags rather than clearing them, and leaving it puts the strips back. Collapse is per-session and deliberately not saved with the pane layout, so a workspace never reopens with half its terminals folded away.
 
 With two or more panes open, each pane's header shows its live foreground process (`zsh`, `vim`, `node`…); a manual rename overrides that label.
 
