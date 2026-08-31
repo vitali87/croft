@@ -243,6 +243,14 @@ impl RewindBuffer {
         self.bytes
     }
 
+    /// Retained keyframes. Test-only: production reads keyframes through
+    /// [`Self::replay_from`], and an unconditional `pub fn` with no caller
+    /// would fail the build under `-D warnings` (which implies dead_code).
+    #[cfg(test)]
+    pub fn keyframe_count(&self) -> usize {
+        self.keyframes.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
@@ -580,6 +588,60 @@ mod tests {
             !b.push(4, b"x"),
             "a fourth keyframe was requested for three intervals of output"
         );
+    }
+
+    /// SEVERAL adjacent stale keyframes are all swept, not just the last.
+    ///
+    /// The trailing `if` in `drop_orphan_keyframes` removes one stale
+    /// keyframe; the `while` above it is what removes a RUN of them. Nothing
+    /// else in this module builds that state, so deleting the loop leaves
+    /// every other test green while orphans accumulate — measured: a brute
+    /// force over 16384 push/keyframe interleavings retains 7900 of them
+    /// without it.
+    ///
+    /// Several keyframes taken back to back with no frames between them is
+    /// the ordinary shape here: the reader asks for a keyframe when a write
+    /// crosses the interval, and a burst of large writes asks repeatedly
+    /// before the next frame lands.
+    #[test]
+    fn a_run_of_stale_keyframes_is_swept_not_just_the_newest() {
+        // 16 bytes of budget: each 8-byte frame evicts what came before it.
+        let mut b = RewindBuffer::new(16);
+        b.push(10, b"aaaaaaaa");
+        // Three keyframes back to back, all describing screens that only the
+        // first frame can reach.
+        b.push_keyframe(11, vec![String::from("s1")]);
+        b.push_keyframe(12, vec![String::from("s2")]);
+        b.push_keyframe(13, vec![String::from("s3")]);
+        b.push(20, b"bbbbbbbb");
+        b.push(30, b"cccccccc");
+
+        // PRESENCE half, so the count assertion cannot pass over an empty
+        // buffer: the surviving frames are the two most recent writes.
+        let (kf, frames) = b.replay_from(u64::MAX);
+        let data: Vec<&[u8]> = frames.iter().map(|f| f.data.as_slice()).collect();
+        assert_eq!(
+            data,
+            vec![b"bbbbbbbb".as_slice(), b"cccccccc".as_slice()],
+            "the two newest writes must survive in the 16-byte budget"
+        );
+        // Every keyframe predates the oldest surviving frame, so none is a
+        // valid start point and at most one may be retained.
+        assert!(
+            b.keyframe_count() <= 1,
+            "a run of stale keyframes was left behind: {} retained",
+            b.keyframe_count()
+        );
+        // And the one that may remain must not claim to describe a screen
+        // reachable from the surviving frames.
+        if let Some(k) = kf {
+            assert!(
+                k.seq + 1 >= frames[0].seq,
+                "retained keyframe seq {} is orphaned before frame seq {}",
+                k.seq,
+                frames[0].seq
+            );
+        }
     }
 
     /// A zero capacity records nothing rather than panicking.

@@ -1818,6 +1818,41 @@ impl PtyTerminal {
                         let mut t = term_for_thread.lock();
                         let (screen_wiped, hist_wiped) =
                             wipe_sniffer.scan(&buf[..n], t.mode().contains(TermMode::ALT_SCREEN));
+                        // Record the WHOLE read, before the OSC split below.
+                        // The loop advances the parser per segment and leaves
+                        // `done` at the LAST mark, so recording `buf[done..n]`
+                        // afterwards kept only the tail — with shell
+                        // integration on, marks arrive around every prompt and
+                        // command, so most of the session was parsed to the
+                        // screen and never recorded. That is the one thing
+                        // this buffer exists to prevent, and the pty test
+                        // covering it could not see the bug because its script
+                        // emitted no marks (fixed: the OSC variant alongside
+                        // it fails without this).
+                        //
+                        // Still recorded BEFORE the advance, so the buffer
+                        // holds the bytes that PRODUCED the state a keyframe
+                        // would capture. Takes only its own lock: the pane's
+                        // order is term -> clock -> line_times and `t` is held
+                        // here, so anything reaching back for `term` would
+                        // deadlock — `push` returns a keyframe request rather
+                        // than rendering one for exactly that reason.
+                        // Poisons independently of `term` (std Mutex vs
+                        // alacritty's FairMutex): a panic taken under this
+                        // lock disables recording for the pane's life, and the
+                        // `if let Ok` degrades to silence rather than
+                        // propagating. Acceptable for a cache, but not the
+                        // same failure mode as `term`'s.
+                        if let Ok(mut rb) = rewind_for_thread.lock() {
+                            let at = rewind_epoch.elapsed().as_millis() as u64;
+                            // The keyframe request is dropped for now: this is
+                            // the recording half, and nothing replays yet. The
+                            // overlay that does will honour it here, taking the
+                            // screen while it holds `t` rather than reaching
+                            // back for the lock. Until then the buffer replays
+                            // from the start, which is correct but unbounded.
+                            let _wants_keyframe = rb.push(at, &buf[..n]);
+                        }
                         let mut done = 0usize;
                         for (end, ev) in osc_events {
                             processor.advance(&mut *t, &buf[done..end]);
@@ -1921,29 +1956,6 @@ impl PtyTerminal {
                                     });
                                 }
                             }
-                        }
-                        // Recorded before the advance, so the buffer holds the
-                        // bytes that PRODUCED the state a keyframe would
-                        // capture. Takes only its own lock: the pane's order is
-                        // term -> clock -> line_times, and `t` is held here, so
-                        // anything reaching back for `term` would deadlock.
-                        // `push` returns a keyframe request rather than
-                        // rendering one for exactly that reason.
-                        // Poisons independently of `term` (std Mutex vs
-                        // alacritty's FairMutex): a panic taken under this
-                        // lock disables recording for the pane's life, and
-                        // the `if let Ok` below degrades to silence rather
-                        // than propagating. Acceptable for a cache, but it
-                        // is not the same failure mode as `term`'s.
-                        if let Ok(mut rb) = rewind_for_thread.lock() {
-                            let at = rewind_epoch.elapsed().as_millis() as u64;
-                            // The keyframe request is dropped for now: this is
-                            // the recording half, and nothing replays yet. The
-                            // overlay that does will honour it here, taking the
-                            // screen while it holds `t` rather than reaching
-                            // back for the lock. Until then the buffer replays
-                            // from the start, which is correct but unbounded.
-                            let _wants_keyframe = rb.push(at, &buf[done..n]);
                         }
                         processor.advance(&mut *t, &buf[done..n]);
                         // A destructive clear erases the content the pane's
@@ -5273,6 +5285,64 @@ mod tests {
             String::from_utf8_lossy(&seen).contains("REWIND_recorded"),
             "the reader thread parsed output without recording it: {} bytes held",
             rb.bytes()
+        );
+    }
+
+    /// Output arriving BEFORE an OSC 133 mark must be recorded too.
+    ///
+    /// The reader splits each read at OSC events and advances the parser per
+    /// segment, leaving `done` at the LAST mark in the chunk. Recording
+    /// `buf[done..n]` therefore keeps only the tail, and with shell
+    /// integration on — marks arriving around every prompt and command — that
+    /// silently discards most of the session, which is the one thing this
+    /// buffer exists to keep.
+    ///
+    /// `the_reader_thread_records_shell_output_for_rewind` cannot see this:
+    /// its script emits no marks, so `done` stays 0 and the tail happens to
+    /// BE the whole chunk. The fixture agrees with the implementation. This
+    /// test puts a mark between two needles so the two differ.
+    #[test]
+    fn output_before_an_osc_mark_is_recorded_not_just_the_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        // Both needles must be command OUTPUT ONLY. The shell ECHOES the
+        // input line before running it, and that echo arrives in one chunk
+        // with no mark before it — so a needle written literally in the
+        // command reaches the buffer via the echo whether or not the
+        // recording under test works, and the test passes vacuously. `$(..)`
+        // is unexpanded in the echo, so these two strings exist only in the
+        // command's output. (The sibling test above documents this; I used it
+        // as a template and dropped the property it exists to explain.)
+        term.write_input(
+            b"printf \"BEFORE_$(echo MARK)\\n\\033]133;C\\007AFTER_$(echo MARK)\\n\"\n",
+        );
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(2000),
+            "the shell to print both needles",
+            || {
+                let v = term.visible_text();
+                v.contains("BEFORE_MARK") && v.contains("AFTER_MARK")
+            },
+        );
+
+        let rb = term.rewind().lock().unwrap();
+        let (_, frames) = rb.replay_from(u64::MAX);
+        let seen: Vec<u8> = frames.iter().flat_map(|f| f.data.clone()).collect();
+        let text = String::from_utf8_lossy(&seen);
+        // The tail alone is the bug: AFTER_MARK present, BEFORE_MARK dropped.
+        // Asserting BOTH is what distinguishes the fix from the defect — the
+        // AFTER_MARK half is the paired presence assertion that keeps the
+        // BEFORE_MARK claim from passing over an empty buffer.
+        assert!(
+            text.contains("AFTER_MARK"),
+            "nothing was recorded at all: {} bytes held",
+            rb.bytes()
+        );
+        assert!(
+            text.contains("BEFORE_MARK"),
+            "output before the OSC mark was parsed but not recorded -- only \
+             the tail after the last mark survived: {:?}",
+            text
         );
     }
 
