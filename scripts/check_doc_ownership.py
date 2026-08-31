@@ -271,12 +271,17 @@ def is_doc(line):
 # because both multi-line constructs (an attribute spanning lines, a `/** */`
 # doc block) can only be recognised by reading downward: from below, `))]` and
 # `*/` are indistinguishable from code.
-# Lines a doc comment can never legally document. Deliberately a SHORT
-# allowlist of the shapes that have actually stranded prose rather than an
+# Lines a doc comment on this repo can never be MEANT for. Deliberately a
+# short allowlist of shapes that have actually stranded prose rather than an
 # attempt to enumerate everything: a false accusation here is worse than a
-# miss, because a gate that cries wolf stops being read. `use` is the one
-# observed in the wild (#436).
-NEVER_DOCUMENTED = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:use|extern\s+crate)\s")
+# miss, because a gate that cries wolf stops being read. A plain `use` is
+# the one observed in the wild (#436).
+#
+# `pub use` is excluded on purpose. Documenting a re-export is legitimate
+# Rust and rustdoc renders it, so flagging one would fail a correct PR —
+# and a private `use`, which cannot appear in the docs at all, is the only
+# form that has ever taken another item's prose here.
+NEVER_DOCUMENTED = re.compile(r"^\s*(?:use|extern\s+crate)\s")
 
 DOC, ATTR, SKIP, CODE = "doc", "attr", "skip", "code"
 

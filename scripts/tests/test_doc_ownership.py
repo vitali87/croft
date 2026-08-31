@@ -638,6 +638,25 @@ class HeadOnlyOrphanTests(unittest.TestCase):
             )
             self.assertEqual(repo.exit_code(), 0)
 
+    def test_a_documented_re_export_is_not_reported(self):
+        """`pub use` CAN legitimately carry a doc — rustdoc renders it — so
+        flagging one would fail a correct PR. A private `use` cannot appear
+        in the docs at all, which is why it is the only form treated as
+        unable to hold prose."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "fn existing() {}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "fn existing() {}\n\n"
+                "/// Re-exported for convenience.\n"
+                "pub use crate::x::Y;\n\n"
+                "/// Also re-exported.\n"
+                "pub(crate) use crate::x::Z;\n",
+            )
+            self.assertEqual(repo.exit_code(), 0)
+
     def test_a_use_that_documents_nothing_untouched_is_not_reported(self):
         """Only CHANGED files are swept, so a pre-existing orphan elsewhere
         does not fail an unrelated PR."""
