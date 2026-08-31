@@ -101,6 +101,12 @@ pub struct MdRunnable {
     /// A long-running block keeps running in its pane; croft just stops
     /// waiting to describe it. `None` means wait for the shell to say the
     /// command finished.
+    ///
+    /// `{timeout=0}` is honoured as written: the wait ends on the first
+    /// tick and the box says croft stopped waiting. Deliberately not
+    /// special-cased into "no timeout", because silently ignoring a value
+    /// the author wrote is worse than doing the odd thing they asked for,
+    /// and the box makes the outcome legible either way.
     pub capture_timeout: Option<u64>,
 }
 
@@ -263,21 +269,30 @@ pub fn replace_output_fence(text: &str, block_line: usize, output: &str) -> Opti
     // Wider than anything the capture contains AND at least as wide as the
     // block's own fence, in the block's own delimiter.
     let fence: String = std::iter::repeat_n(delim, longest.max(width - 1).max(2) + 1).collect();
+    // Match the document's own line ending. `split_inclusive('\n')` keeps
+    // the `\r`, so a CRLF file would otherwise get LF lines spliced into it
+    // and end up mixed - which git, diffs and editors all notice.
+    let nl = if lines.get(close).is_some_and(|l| l.ends_with("\r\n")) {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut out = String::with_capacity(text.len() + output.len() + 64);
     for l in &lines[..close + 1] {
         out.push_str(l);
     }
-    out.push('\n');
+    out.push_str(nl);
     out.push_str(OUTPUT_MARKER);
-    out.push('\n');
+    out.push_str(nl);
     out.push_str(&fence);
-    out.push_str("text\n");
+    out.push_str("text");
+    out.push_str(nl);
     for line in output.lines() {
         out.push_str(line);
-        out.push('\n');
+        out.push_str(nl);
     }
     out.push_str(&fence);
-    out.push('\n');
+    out.push_str(nl);
     for l in &lines[after..] {
         out.push_str(l);
     }
@@ -1785,6 +1800,27 @@ mod tests {
             !second.contains("FIRSTRUN"),
             "the previous capture was replaced, not kept: {second}"
         );
+    }
+
+    /// A CRLF document keeps its line endings (#354 review).
+    ///
+    /// `split_inclusive('\n')` keeps the `\r`, so writing bare LF would
+    /// splice mixed endings into a file that had none - which git, diffs
+    /// and editors all notice, and which the user did not ask for.
+    #[test]
+    fn a_crlf_document_gets_crlf_back() {
+        let doc = "```sh\r\necho hi\r\n```\r\n\r\nprose after\r\n";
+        let out = replace_output_fence(doc, 0, "hi\n").expect("the opener is a fence");
+        let inserted: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains(OUTPUT_MARKER) || l.contains("text") || *l == "hi")
+            .collect();
+        assert!(!inserted.is_empty(), "{out}");
+        assert!(
+            !out.split("\r\n").any(|seg| seg.contains('\n')),
+            "every line ending is CRLF, none bare: {out:?}"
+        );
+        assert!(out.contains("prose after"), "{out}");
     }
 
     /// A hand-written fence below the block is not croft's to replace: only

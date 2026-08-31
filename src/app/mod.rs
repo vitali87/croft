@@ -916,6 +916,34 @@ struct PendingCapture {
     started: std::time::Instant,
     timeout: Option<std::time::Duration>,
     persist: bool,
+    /// The most decorations the pane has carried since arming.
+    ///
+    /// The list is a sliding window, so a drop below this means marks were
+    /// collected and every index shifted. Comparing only against `seen`
+    /// catches a NET shrink and misses a shift: one eviction plus two new
+    /// commands leaves the length equal or larger while index `seen` names
+    /// a stranger.
+    ///
+    /// THIS DOES NOT CLOSE THE HOLE, and the comment says so because the
+    /// code cannot. Sampling catches an eviction only if the length dips
+    /// below the mark at an instant we happen to observe; an eviction and a
+    /// new command landing between two ticks never dip at all. Every
+    /// length-derived signal has that shape, because it samples a value
+    /// that can move twice between observations. It narrows the window; it
+    /// does not remove it, and the sound fix is a monotonic mark identity
+    /// assigned at creation and never renumbered by the collector, which
+    /// belongs in `terminal.rs` where `marks_snapshot` holds the records.
+    high_water: usize,
+    /// An eviction was seen, so `seen` no longer reliably names this
+    /// block's command. The box is still shown - it is cheap and the next
+    /// run corrects it - but the `{persist}` WRITE is refused, because a
+    /// stranger's output reaching the user's file is not self-correcting.
+    ///
+    /// Being precise about what this buys: it removes the cases it observes
+    /// and no others. `{persist}` on a positional index remains unsound
+    /// until the identity above exists, which is why the disk write is the
+    /// half that is gated and the box is not.
+    identity_lost: bool,
 }
 
 /// State of a background self-update observed by a remote-launched croft.
@@ -26872,6 +26900,8 @@ impl App {
             started: std::time::Instant::now(),
             timeout: block.capture_timeout,
             persist: block.persist,
+            high_water: seen,
+            identity_lost: false,
         });
     }
 
@@ -26927,7 +26957,7 @@ impl App {
             Option<PathBuf>,
             bool,
         )> = Vec::new();
-        self.pending_captures.retain(|c| {
+        self.pending_captures.retain_mut(|c| {
             let Some(term) = self.terminals.iter().find(|t| t.label() == c.pane_name) else {
                 // The pane is gone, so nothing will ever finish on it.
                 return false;
@@ -26941,9 +26971,12 @@ impl App {
             // list is exactly that eviction, so the capture is abandoned
             // rather than guessed at: no box is strictly better than the
             // wrong box, and far better than the wrong bytes on disk.
-            if decorations.len() < c.seen {
-                return false;
+            // A drop below the high-water mark is an eviction, whatever the
+            // length happens to be now.
+            if decorations.len() < c.high_water {
+                c.identity_lost = true;
             }
+            c.high_water = c.high_water.max(decorations.len());
             if let Some(d) = decorations.get(c.seen) {
                 settled.push((
                     c.pane_name.clone(),
@@ -26954,7 +26987,7 @@ impl App {
                         timed_out: false,
                     },
                     c.doc.clone(),
-                    c.persist,
+                    c.persist && !c.identity_lost,
                 ));
                 return false;
             }
@@ -26999,6 +27032,12 @@ impl App {
     /// result in. Called after a capture settles and when the preview is
     /// rebuilt, so a box appears without the user touching anything.
     fn publish_block_outputs(&mut self) {
+        // The common case by far: nothing has been run, so there is nothing
+        // to narrow and nothing to compare. Checked before the map is built
+        // rather than after, since this runs every tick.
+        if self.block_outputs.is_empty() && self.editor.md_outputs.is_empty() {
+            return;
+        }
         let prefix = self.block_pane_prefix();
         let narrowed: crate::markdown::BlockOutputs = self
             .block_outputs
