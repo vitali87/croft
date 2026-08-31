@@ -1101,6 +1101,29 @@ pub fn process_name(pid: i32) -> Option<String> {
         .filter(|n| !n.is_empty())
 }
 
+/// The argv of a running process, or `None` when the platform will not say.
+///
+/// Separate from [`process_name`] because the two answer different questions
+/// and cost differently: a name is what the label pill needs on every tick,
+/// while argv is only wanted when the name says the process is worth asking
+/// about (#364 wants it for `ssh` and nothing else).
+pub fn process_cmdline(pid: i32) -> Option<Vec<String>> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    if pid <= 0 {
+        return None;
+    }
+    let p = Pid::from(pid as usize);
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::Some(&[p]), true);
+    let cmd: Vec<String> = sys
+        .process(p)?
+        .cmd()
+        .iter()
+        .map(|s| s.to_string_lossy().to_string())
+        .collect();
+    (!cmd.is_empty()).then_some(cmd)
+}
+
 /// Live cwd of a running process by PID, or None when the platform doesn't
 /// expose one. Used by `split_terminal` so a new pane lands wherever the
 /// user has `cd`'d the active shell, and by [`PtyTerminal::local_shell_cwd`]
