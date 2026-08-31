@@ -271,6 +271,13 @@ def is_doc(line):
 # because both multi-line constructs (an attribute spanning lines, a `/** */`
 # doc block) can only be recognised by reading downward: from below, `))]` and
 # `*/` are indistinguishable from code.
+# Lines a doc comment can never legally document. Deliberately a SHORT
+# allowlist of the shapes that have actually stranded prose rather than an
+# attempt to enumerate everything: a false accusation here is worse than a
+# miss, because a gate that cries wolf stops being read. `use` is the one
+# observed in the wild (#436).
+NEVER_DOCUMENTED = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:use|extern\s+crate)\s")
+
 DOC, ATTR, SKIP, CODE = "doc", "attr", "skip", "code"
 
 
@@ -382,6 +389,63 @@ def documented(text):
     return state
 
 
+def orphaned_docs(text):
+    """Doc blocks in `text` that no item can be attached to.
+
+    The diff-based check above cannot see a capture whose VICTIM is new on
+    the branch: relative to the merge base that item does not exist, so it
+    cannot have lost a doc it never had (#427). Nor can it see one where
+    the capturing item is of a kind the `ITEM` regex does not model, such
+    as a `use` (#436).
+
+    Both are the same shape at HEAD, and it needs no base revision to see:
+    a `///` block that is not immediately followed by something a doc can
+    attach to. When an item is inserted between a doc and its subject, the
+    ORIGINAL doc lands on the newcomer and the newcomer's own doc — or, for
+    a `use`, nothing at all — is left with no item beneath it.
+
+    Deliberately narrow. Only a doc block followed by another DOC block, or
+    by a non-item line that ends the block's reach, is reported; a doc above
+    an `impl`, a `mod`, a macro invocation or any other legal-but-unmodelled
+    item is left alone, because reporting those would be the false accusation
+    that stops a gate being read. The check answers "is this prose stranded",
+    not "do I recognise what follows".
+    """
+    lines = text.splitlines()
+    kinds = classify(lines)
+    orphans = []
+    i = 0
+    while i < len(lines):
+        if kinds[i] != DOC:
+            i += 1
+            continue
+        start = i
+        while i < len(lines) and kinds[i] == DOC:
+            i += 1
+        # Attributes and blank lines sit legally between a doc and its item.
+        j = i
+        while j < len(lines) and kinds[j] in (ATTR, SKIP):
+            j += 1
+        if j >= len(lines):
+            # A doc block at end of file documents nothing.
+            orphans.append((start + 1, lines[start].strip(), "end of file"))
+            continue
+        if kinds[j] == DOC:
+            # Two doc blocks with no item between them: the first cannot
+            # reach an item, because the second one gets there first. This
+            # is what an insertion above a documented item leaves behind.
+            orphans.append((start + 1, lines[start].strip(), "another doc block"))
+            continue
+        if NEVER_DOCUMENTED.match(lines[j]):
+            # A line that syntactically cannot carry a doc comment. `use`
+            # is the one that has actually happened (#436) — an import
+            # dropped between a doc and its function takes prose that
+            # rustdoc then renders against the import, and neither the
+            # diff check nor `unused_doc_comments` says a word.
+            orphans.append((start + 1, lines[start].strip(), lines[j].strip()))
+    return orphans
+
+
 def main():
     base, head = sys.argv[1], sys.argv[2]
     declared = git("log", f"{base}..{head}", "--format=%B")
@@ -443,6 +507,17 @@ def main():
         for name, had_doc in before.items():
             if had_doc and name in after and not after[name] and (f, name) not in exempt:
                 losses.append((f, name, base))
+    # The head-only pass (#427, #436): a capture the diff cannot see because
+    # its victim is new on the branch, or because the capturing item is of a
+    # kind `ITEM` does not model. Runs on the same changed files, needs no
+    # base, and reports separately so the two failure shapes stay legible.
+    orphans = []
+    for f in changed:
+        text = git("show", f"{head}:{f}", allow_missing_path=True)
+        if not text:
+            continue
+        for line_no, first, follower in orphaned_docs(text):
+            orphans.append((f, line_no, first, follower))
     for f, name, at in losses:
         print(
             f"::error file={f}::`{name}` had a doc comment at {at[:12]} and has none now. "
@@ -450,8 +525,20 @@ def main():
             "(#314), which hands one item's prose to another with nothing failing. Restore it, "
             "or declare the removal with `doc-removal: " + f"{f}::{name}` in a commit message."
         )
-    if losses:
-        print(f"\n{len(losses)} item(s) lost documentation.", file=sys.stderr)
+    for f, line_no, first, follower in orphans:
+        print(
+            f"::error file={f},line={line_no}::this doc block documents nothing: "
+            f"the next thing after it is {follower!r}, which no doc comment can "
+            "attach to (#314/#427/#436). An item inserted above a documented one "
+            "takes that item's prose and strands its own, and neither the diff "
+            "check nor rustc reports it. Move the inserted item above the block, "
+            f"or give the block an item. First line: {first!r}"
+        )
+    if losses or orphans:
+        if losses:
+            print(f"\n{len(losses)} item(s) lost documentation.", file=sys.stderr)
+        if orphans:
+            print(f"{len(orphans)} doc block(s) document nothing.", file=sys.stderr)
         return 1
     print(f"No documentation lost across {len(changed)} changed Rust file(s).")
     return 0

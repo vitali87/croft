@@ -204,9 +204,6 @@ impl EventListener for VoidListener {
 /// the timestamps gutter (the "where did the deploy stall" signal).
 const STALL_GAP_MS: u64 = 60_000;
 
-/// One user note pinned to a span of terminal output (iTerm2's
-/// annotations), anchored like a mark so it rides the scrollback.
-#[derive(Clone, Debug)]
 /// The pane's monotonic scroll clock: lines the primary screen has
 /// scrolled since the pane spawned, read from a one-cell tracer selection's
 /// drift. Immune to the `history_size` saturation that froze selections in
@@ -222,6 +219,7 @@ const STALL_GAP_MS: u64 = 60_000;
 /// which keys arrival timestamps on it. Lock order everywhere:
 /// term → clock → line_times; the term lock is held across the whole
 /// sequence on both threads, and the inner two always nest in that order.
+#[derive(Clone, Debug)]
 struct ScrollClock {
     /// Monotonic reading, folded up to the last `tick`.
     base: i64,
@@ -420,6 +418,8 @@ fn stamp_chunk(
     }
 }
 
+/// One user note pinned to a span of terminal output (iTerm2's
+/// annotations), anchored like a mark so it rides the scrollback.
 struct PaneAnnotation {
     /// Grid line the span sat on when recorded, paired with the scroll
     /// clock reading at that instant. Translated with clock movement — NOT
