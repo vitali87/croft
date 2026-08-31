@@ -2737,6 +2737,14 @@ pub struct App {
     /// Drops awaiting reverse-pull from the user's local Mac via the
     /// drop-relay launched by the local croft parent. Polled each frame.
     pending_remote_pulls: Vec<PendingRemotePull>,
+    /// This croft's `croft view` listener (#362), and the socket path to
+    /// unlink when it goes away.
+    ///
+    /// `None` when the bind failed: a croft that cannot offer `croft view`
+    /// must still start, so the failure costs the feature and nothing else.
+    /// Panes then see no `CROFT_VIEW_SOCK` and the client says so plainly,
+    /// which is the same message a pane outside croft gets.
+    view_listener: Option<(std::os::unix::net::UnixListener, PathBuf)>,
     /// URL awaiting the user's local-browser confirmation (remote-
     /// launched croft only). When `Some`, a modal asks Y/A/N and all
     /// other keys are swallowed.
@@ -4346,6 +4354,7 @@ impl App {
             tree_drag: None,
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
+            view_listener: Self::bind_view_socket(),
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
@@ -27908,6 +27917,93 @@ impl App {
     /// Check the relay inbox for completed pulls and surface them in the
     /// explorer. Returns true if any pending pull resolved (success,
     /// failure, or timeout) so the main loop knows to redraw.
+    /// Bind this croft's `croft view` socket and publish it to panes.
+    ///
+    /// Keyed by pid so two crofts on one box never contend, and exported
+    /// through the process env so every pane spawned later inherits it
+    /// without each spawn site having to remember. Under `cfg(test)` the
+    /// bind is skipped: a test that stood up an App would otherwise leave a
+    /// live socket in the real cache dir and, worse, publish it into the env
+    /// of every OTHER test in the same process.
+    fn bind_view_socket() -> Option<(std::os::unix::net::UnixListener, PathBuf)> {
+        if cfg!(test) {
+            return None;
+        }
+        let dir = croft_cache_dir();
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = crate::view_ipc::socket_path(&dir, std::process::id());
+        sweep_dead_view_sockets(&dir);
+        let listener = prepare_view_listener(&path).ok()?;
+        unsafe { std::env::set_var(crate::view_ipc::SOCK_ENV, &path) };
+        Some((listener, path))
+    }
+
+    /// Accept whatever `croft view` clients have queued and open their files.
+    ///
+    /// Returns whether anything changed, so the frame loop redraws. Every
+    /// connection is answered before the next is accepted, which is right
+    /// here: a request is one path and the work is opening a tab, so a
+    /// thread per client would buy nothing and cost the editor's `&mut self`.
+    pub fn drain_view_requests(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let Some((listener, _)) = self.view_listener.as_ref() else {
+                return changed;
+            };
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // A client that connects and then stalls must not hold
+                    // the frame loop: the read is bounded, and a request
+                    // that misses the window is dropped rather than waited on.
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
+                    let reply = match crate::view_ipc::read_request(&stream) {
+                        Ok(req) => self.apply_view_request(&req.to_path()),
+                        Err(e) => crate::view_ipc::ViewReply::Err {
+                            message: format!("unreadable request: {e}"),
+                        },
+                    };
+                    changed |= matches!(reply, crate::view_ipc::ViewReply::Ok);
+                    let _ = crate::view_ipc::write_reply(&mut stream, &reply);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return changed,
+                Err(_) => return changed,
+            }
+        }
+    }
+
+    /// Open one requested path, answering with what the user should see.
+    ///
+    /// The path arrives absolute (the client resolved it against the pane's
+    /// own cwd, which croft only approximates), so the checks here are about
+    /// whether the file can be shown, not about where it is.
+    fn apply_view_request(&mut self, path: &Path) -> crate::view_ipc::ViewReply {
+        use crate::view_ipc::ViewReply;
+        if !path.exists() {
+            return ViewReply::Err {
+                message: format!("no such file: {}", path.display()),
+            };
+        }
+        if path.is_dir() {
+            return ViewReply::Err {
+                message: format!("{} is a directory", path.display()),
+            };
+        }
+        match self.editor.open_pinned(path) {
+            Ok(()) => {
+                // Same route as an Explorer click, focus included: the user
+                // asked for this from a prompt and expects to be looking at
+                // it, not to find it filed behind the pane they typed in.
+                self.focus_pane(Pane::Editor);
+                self.sync_open_file_poll_mtime();
+                self.status = format!("Opened {}", path.display());
+                ViewReply::Ok
+            }
+            Err(e) => ViewReply::Err {
+                message: format!("could not open {}: {e}", path.display()),
+            },
+        }
+    }
+
     pub fn drain_remote_pulls(&mut self) -> bool {
         if self.pending_remote_pulls.is_empty() {
             return false;
@@ -43662,7 +43758,65 @@ struct HttpRunOutcome {
     result: Result<crate::http_file::HttpResponse, String>,
 }
 
-fn croft_cache_dir() -> PathBuf {
+/// Bind the `croft view` socket and put it in the mode the frame loop needs.
+///
+/// Split out so the tests seat a listener through the SAME function rather
+/// than building one themselves. A test that set `set_nonblocking` itself
+/// would be asserting against its own setup: production could drop the call
+/// and the "the drain does not block" test would still pass, which is a
+/// check that cannot fail.
+fn prepare_view_listener(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    let listener = crate::session::bind_socket_0600(path)?;
+    // Polled from the frame loop, so a blocking accept would stall every
+    // redraw until somebody happened to run `croft view`.
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// Remove `view-<pid>.sock` files whose croft is gone (#362).
+///
+/// A Unix socket is not auto-unlinked, so every croft that dies leaves its
+/// file behind. An `impl Drop` would clean up the tidy exits and none of the
+/// others — a SIGKILL, an OOM kill, a panic in another thread — and those are
+/// exactly the cases that litter, so the sweep is the mechanism that has to
+/// exist and Drop would only duplicate its easy half.
+///
+/// Liveness is judged from the PID IN THE NAME rather than by connecting.
+/// A connect probe races a concurrent bind: the other croft can be between
+/// `bind_socket_0600`'s stale-file removal and its `bind`, where the probe
+/// reads "dead" correctly and the unlink then lands on the socket it creates
+/// a moment later. `kill(pid, 0)` has no such window. The cost is that a
+/// recycled PID keeps one dead file indefinitely, which is a stale byte
+/// rather than a stolen socket.
+fn sweep_dead_view_sockets(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = name
+            .strip_prefix("view-")
+            .and_then(|r| r.strip_suffix(".sock"))
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // Signal 0 checks existence and permission without delivering
+        // anything; ESRCH is the only answer that means "gone".
+        let gone = pid != me
+            && unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            let path = entry.path();
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("bind.lock"));
+        }
+    }
+}
+
+pub(crate) fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
         return dir;
@@ -44811,6 +44965,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
+        let view_changed = app.drain_view_requests();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
@@ -44934,6 +45089,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || log_index_changed
             || remote_changed
             || pulls_changed
+            || view_changed
             || ports_changed
             || session_presence_changed
             || session_typing_changed

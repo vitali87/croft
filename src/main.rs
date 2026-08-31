@@ -77,6 +77,7 @@ mod theme;
 mod triggers;
 mod update_check;
 mod update_watch;
+mod view_ipc;
 mod vim;
 mod voice;
 mod vscode_extensions;

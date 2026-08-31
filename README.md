@@ -82,6 +82,8 @@ croft attach                     # open the current folder as a persistent sessi
 croft attach ~/projects          # ...for a specific folder
 croft attach --solo ~/projects   # join a shared folder in your own viewport (live co-editing)
 croft ls                         # list running persistent sessions
+croft view report.pdf            # from any pane: open a file in the croft you are sitting in
+cat data.csv | croft view -      # ...or pipe it in
 croft theme-import theme.json    # use a VS Code colour theme in croft
 croft theme-import dracula-theme.theme-dracula   # ...or fetch one from the marketplace
 croft --help

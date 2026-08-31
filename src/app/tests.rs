@@ -37458,3 +37458,165 @@ fn an_unknowable_cwd_still_allows_reuse_but_a_wrong_one_does_not() {
         &real_root
     ));
 }
+
+/// Stand up a `croft view` listener on `app` without touching process env.
+///
+/// The real `bind_view_socket` also exports `CROFT_VIEW_SOCK`, which is
+/// process-global: setting it in one test would publish a socket into every
+/// other test running in the same process. This binds the same way and
+/// publishes nothing, so the server half is exercised and the neighbours are
+/// left alone.
+fn seat_view_listener(app: &mut App, dir: &std::path::Path) -> std::path::PathBuf {
+    let sock = dir.join("view-test.sock");
+    // Deliberately the production helper: seating a hand-built listener here
+    // would let `prepare_view_listener` lose its non-blocking mode without a
+    // single test noticing.
+    let listener = crate::app::prepare_view_listener(&sock).unwrap();
+    app.view_listener = Some((listener, sock.clone()));
+    sock
+}
+
+/// Send one request from a client thread and hand back its reply.
+fn view_from_a_pane(
+    sock: &std::path::Path,
+    path: &std::path::Path,
+) -> std::thread::JoinHandle<crate::view_ipc::ViewReply> {
+    let sock = sock.to_path_buf();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        crate::view_ipc::send(&sock, &crate::view_ipc::ViewRequest::new(&path)).unwrap()
+    })
+}
+
+/// Drain until the request lands: the client connects on another thread, so
+/// the first non-blocking accept can legitimately find nothing yet.
+fn drain_until_answered(app: &mut App) -> bool {
+    for _ in 0..200 {
+        if app.drain_view_requests() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+#[test]
+fn a_view_request_from_a_pane_opens_the_file_in_the_editor() {
+    // #362: the point of the whole channel. A shell prompt asks, and the file
+    // arrives as an editor tab exactly as an Explorer click would leave it.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("report.txt");
+    std::fs::write(&target, "hello from a pane").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let sock = seat_view_listener(&mut app, tmp.path());
+
+    let client = view_from_a_pane(&sock, &target);
+    assert!(drain_until_answered(&mut app), "the request never landed");
+    assert_eq!(client.join().unwrap(), crate::view_ipc::ViewReply::Ok);
+
+    let open = app.editor.editors[app.editor.active_index()].path.clone();
+    assert_eq!(
+        open.as_deref(),
+        Some(target.as_path()),
+        "the requested file must be the active tab"
+    );
+    assert!(
+        app.focus == Pane::Editor,
+        "the user asked to look at it, so focus follows"
+    );
+}
+
+#[test]
+fn a_view_request_for_a_directory_is_refused_with_a_reason_the_client_prints() {
+    // The server knows why; the client only relays. A silent refusal would
+    // exit the user's shell 0 having opened nothing.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("subdir");
+    std::fs::create_dir(&dir).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = seat_view_listener(&mut app, tmp.path());
+
+    let client = view_from_a_pane(&sock, &dir);
+    for _ in 0..200 {
+        app.drain_view_requests();
+        if client.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    match client.join().unwrap() {
+        crate::view_ipc::ViewReply::Err { message } => {
+            assert!(
+                message.contains("is a directory"),
+                "the reason must name what went wrong, got {message:?}"
+            );
+        }
+        other => panic!("a directory must not open as a file: {other:?}"),
+    }
+}
+
+#[test]
+fn draining_an_idle_listener_reports_no_change_and_does_not_block() {
+    // Polled from the frame loop: a blocking accept here would freeze every
+    // redraw until somebody happened to run `croft view`.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    seat_view_listener(&mut app, tmp.path());
+    // Asserted on the fd rather than only on elapsed time: if the mode is
+    // lost, `accept` blocks forever and a timing assertion is never reached,
+    // so the test would HANG instead of failing and read as a CI timeout
+    // rather than as this defect. Reading O_NONBLOCK turns that into a
+    // one-line failure that names the cause.
+    let flags = {
+        use std::os::unix::io::AsRawFd;
+        let (listener, _) = app.view_listener.as_ref().unwrap();
+        unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) }
+    };
+    assert!(
+        flags != -1 && flags & libc::O_NONBLOCK != 0,
+        "the frame loop polls this listener, so it must be non-blocking"
+    );
+    let started = std::time::Instant::now();
+    assert!(!app.drain_view_requests(), "nothing was sent");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "the drain blocked for {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn the_socket_sweep_removes_a_dead_crofts_file_and_spares_a_live_one() {
+    // Sockets are not auto-unlinked, so a crashed croft leaves its file for
+    // the next one to clear. Getting this wrong in the other direction would
+    // be worse than litter: deleting a LIVE croft's socket silently breaks
+    // `croft view` in every pane it owns.
+    let tmp = tempfile::tempdir().unwrap();
+    // A pid that has certainly exited: spawn, reap, and its number is free.
+    let dead = {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    };
+    let mine = std::process::id();
+    let dead_sock = tmp.path().join(format!("view-{dead}.sock"));
+    let live_sock = tmp.path().join(format!("view-{mine}.sock"));
+    let stranger = tmp.path().join("not-a-view-socket");
+    for p in [&dead_sock, &live_sock, &stranger] {
+        std::fs::write(p, b"").unwrap();
+    }
+
+    crate::app::sweep_dead_view_sockets(tmp.path());
+
+    assert!(!dead_sock.exists(), "a dead croft's socket must be cleared");
+    assert!(
+        live_sock.exists(),
+        "this process is alive, so its socket must survive the sweep"
+    );
+    assert!(
+        stranger.exists(),
+        "the sweep must only touch files it recognises by name"
+    );
+}

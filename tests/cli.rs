@@ -189,3 +189,63 @@ fn pair_off_and_reactivation_keep_the_recorded_backend() {
         }
     }
 }
+
+/// #362 acceptance criterion 3, against the real binary: outside croft the
+/// command exits 1 with a one-line explanation rather than trying to render.
+///
+/// `env_remove` rather than a bare run: this test suite is itself often
+/// launched from a croft pane, where `CROFT_VIEW_SOCK` is set and inherited,
+/// and the test would then quietly exercise the connected path instead.
+#[test]
+fn view_outside_croft_exits_one_with_an_explanation() {
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env_remove("CROFT_VIEW_SOCK")
+        .args(["view", "Cargo.toml"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft view needs a croft"),
+        "stderr must say why, was: {stderr}"
+    );
+    assert_eq!(
+        stderr.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "one line, not a backtrace: {stderr}"
+    );
+}
+
+/// An empty `CROFT_VIEW_SOCK` must read as absent, not as a socket at "".
+#[test]
+fn view_treats_an_empty_socket_variable_as_no_croft_at_all() {
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", "")
+        .args(["view", "Cargo.toml"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft view needs a croft"),
+        "stderr was: {stderr}"
+    );
+}
+
+/// A stale socket path (the croft that set it has exited) must name that
+/// situation rather than surfacing a raw connect error.
+#[test]
+fn view_against_a_vanished_croft_says_the_croft_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["view", "Cargo.toml"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("is gone"),
+        "stderr must name the situation, was: {stderr}"
+    );
+}
