@@ -190,6 +190,18 @@ pub fn read_line_by_deadline(
             Ok(n) => {
                 line.extend_from_slice(&chunk[..n]);
                 if let Some(pos) = line.iter().position(|b| *b == b'\n') {
+                    // Checked BEFORE accepting the line, not after. The cap
+                    // used to be tested on the next iteration, so a request
+                    // that carried its newline in the very chunk that crossed
+                    // the limit was accepted and deserialised: the bound held
+                    // for an unterminated flood and not for a terminated one,
+                    // which is the case an actual client sends.
+                    if pos as u64 > MAX_REQUEST_BYTES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "request exceeded the maximum length",
+                        ));
+                    }
                     line.truncate(pos);
                     break;
                 }

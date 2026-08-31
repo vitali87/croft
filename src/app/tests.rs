@@ -38667,3 +38667,49 @@ fn a_view_request_for_a_fifo_is_refused_rather_than_opened() {
          client prints, got {reply:?}"
     );
 }
+
+#[test]
+fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
+    // The cap was tested on the iteration AFTER the newline branch, so a
+    // request carrying its newline in the very chunk that crossed the limit
+    // was accepted and deserialised. The bound held for an unterminated flood
+    // and not for a terminated one - which is the shape a real client sends.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = seat_view_listener(&mut app, tmp.path());
+
+    let sock2 = sock.clone();
+    let flood = std::thread::spawn(move || {
+        let Ok(mut c) = std::os::unix::net::UnixStream::connect(&sock2) else {
+            return;
+        };
+        // Just past the cap, and TERMINATED, so the newline lands INSIDE the
+        // chunk that crosses the limit. The size matters: overshoot by more
+        // than one 4096-byte chunk and the accumulate-path check fires on an
+        // earlier read, before the newline arrives, which the old ordering
+        // also refused - a fixture that big cannot tell the two apart. This is
+        // the only window where the newline branch runs first.
+        let mut line = vec![b'x'; (crate::view_ipc::MAX_REQUEST_BYTES as usize) + 100];
+        line.push(b'\n');
+        let _ = std::io::Write::write_all(&mut c, &line);
+        let _ = std::io::Write::flush(&mut c);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let listener = app.view_listener.as_ref().unwrap();
+    let (stream, _) = listener.accept().expect("the flooder is waiting");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let (reply, opened) = app.answer_view_client(stream, deadline);
+    let _ = flood.join();
+
+    assert!(!opened, "an oversized request names nothing to open");
+    match reply {
+        crate::view_ipc::ViewReply::Err { message } => assert!(
+            message.contains("exceeded the maximum length"),
+            "the LENGTH cap must be what refuses this, not an incidental parse \
+             failure downstream of accepting it: {message}"
+        ),
+        other => panic!("an oversized request must not be accepted: {other:?}"),
+    }
+}
