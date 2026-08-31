@@ -1118,12 +1118,18 @@ fn theme_import(
     id: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
-    // A path that exists is a path; anything else is a marketplace
+    // A FILE that exists is a path; anything else is a marketplace
     // reference. Checked in that order so a file literally named like an
     // extension id still wins — the user pointing at a file they can see
     // should never silently hit the network instead.
+    //
+    // `is_file`, not `exists`: a DIRECTORY named like an extension id would
+    // otherwise be taken as the theme and fail deep inside the converter
+    // with a read error, rather than being passed to the marketplace where
+    // the user plainly meant it to go.
     let local = Path::new(reference);
-    let (source, scratch) = if local.exists() {
+    let (source, scratch) = if local.is_file() {
+        println!("Importing from {}", local.display());
         (local.to_path_buf(), None)
     } else {
         let (path, dir) = fetch_marketplace_theme(reference, theme)?;
@@ -1174,29 +1180,56 @@ fn theme_import(
 /// caller keeps that alive until the conversion has read the file, and
 /// dropping it takes the `.vsix` and everything lifted from it with it.
 /// Nothing from the archive outlives this function.
+/// A per-run value for the scratch directory's name. Not a secret and not a
+/// CSPRNG: it only has to be unpredictable enough that another user cannot
+/// pre-create the path, and `create_dir` failing on collision is what
+/// actually enforces exclusivity.
+fn scratch_nonce() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        ^ (&scratch_nonce as *const _ as u128)
+}
+
 fn fetch_marketplace_theme(reference: &str, wanted: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     use crate::marketplace;
     let id = marketplace::parse_ref(reference)?;
-    // A private scratch under the cache dir rather than a dev-only temp
-    // crate: this is a production path, and the caller removes the whole
-    // directory when it is done with it.
-    let scratch = std::env::temp_dir().join(format!("croft-theme-import-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir_all(&scratch).with_context(|| format!("making {}", scratch.display()))?;
+    // A private scratch in the temp dir rather than a dev-only temp crate:
+    // this is a production path, and the caller removes the whole directory
+    // when it is done with it.
+    //
+    // The name carries randomness, and the directory is created with
+    // `create_dir` so an existing path is an ERROR rather than something to
+    // delete. A PID-named directory is guessable in a shared /tmp, and the
+    // writes below (unlike `extract_member`, which refuses symlinked
+    // components) follow symlinks — so a planted link would have redirected
+    // them. Deleting whatever sat at the guessed name first, as this did,
+    // turned that into a way to destroy a directory of the attacker's
+    // choosing.
+    let scratch = std::env::temp_dir().join(format!(
+        "croft-theme-import-{}-{:x}",
+        std::process::id(),
+        scratch_nonce()
+    ));
+    std::fs::create_dir(&scratch).with_context(|| format!("making {}", scratch.display()))?;
     println!(
         "Downloading {}.{} from the marketplace…",
         id.publisher, id.name
     );
     let vsix = marketplace::download_vsix(&id, &scratch)?;
     let pkg = marketplace::read_member(&vsix, "extension/package.json", &scratch)?;
-    let themes = marketplace::contributed_themes(&pkg)?;
+    // The NLS bundle is optional — most extensions have none — so a missing
+    // or unreadable one leaves the labels as written rather than failing.
+    let nls = marketplace::read_member(&vsix, "extension/package.nls.json", &scratch).ok();
+    let themes = marketplace::contributed_themes(&pkg, nls.as_deref())?;
     let picked = marketplace::pick_theme(&themes, wanted)?;
     println!("  taking \"{}\" ({})", picked.label, picked.path);
     let member = format!("extension/{}", picked.path);
     let text = marketplace::read_member(&vsix, &member, &scratch)?;
     // Write it under a name the converter's own id-derivation can use, so a
     // marketplace import and a file import of the same theme agree.
-    let out = scratch.join(format!("{}.json", picked.label));
+    let out = scratch.join(format!("{}.json", marketplace::file_stem(&picked.label)));
     std::fs::write(&out, text).with_context(|| format!("writing {}", out.display()))?;
     Ok((out, scratch))
 }
