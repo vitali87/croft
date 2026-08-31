@@ -644,6 +644,49 @@ mod tests {
         }
     }
 
+    /// With NO surviving frames, keyframes still collapse to the newest.
+    ///
+    /// `drop_orphan_keyframes` has two arms, and the sibling test above only
+    /// covers the frames-present one. This is the `else` arm: when every
+    /// frame has aged out, the collapse loop there is the ONLY thing bounding
+    /// the keyframe deque, and deleting it leaves the whole rewind suite
+    /// green while keyframes grow without limit — each holding a full screen.
+    ///
+    /// Reachable in production, not just at capacity 0: any pane whose frames
+    /// have all aged out sits in this arm, which the module's own docs call
+    /// "after every frame has aged out".
+    #[test]
+    fn keyframes_collapse_to_the_newest_when_no_frames_survive() {
+        // Capacity 0: nothing is ever retained as a frame, so every call
+        // lands in the no-frames arm.
+        let mut b = RewindBuffer::new(0);
+        for i in 0..5u64 {
+            b.push(i, b"never retained");
+            b.push_keyframe(i, vec![format!("k{i}")]);
+        }
+
+        assert!(
+            b.is_empty(),
+            "precondition: no frames may survive, or this exercises the wrong arm"
+        );
+        assert_eq!(
+            b.keyframe_count(),
+            1,
+            "keyframes must collapse to the newest when no frame survives"
+        );
+        // PRESENCE half: pin WHICH keyframe survived. A count of 1 alone
+        // cannot tell "kept the newest" from "kept the oldest" — the two are
+        // indistinguishable by count, and only the newest is a valid start
+        // point for output arriving next.
+        let (kf, frames) = b.replay_from(u64::MAX);
+        assert!(frames.is_empty(), "no frames survive at capacity 0");
+        assert_eq!(
+            kf.map(|k| k.screen.clone()),
+            Some(vec![String::from("k4")]),
+            "the RETAINED keyframe must be the newest one"
+        );
+    }
+
     /// A zero capacity records nothing rather than panicking.
     #[test]
     fn a_zero_capacity_buffer_records_nothing() {
