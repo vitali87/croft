@@ -3,6 +3,7 @@ mod agents;
 mod ansi_text;
 mod app;
 mod archive;
+mod asciicast;
 mod build_matchers;
 mod cell_map;
 mod cli;
