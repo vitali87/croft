@@ -189,6 +189,10 @@ pub enum Command {
     OpenWorkspaceOnSshHost,
     /// Step the editor back through the branch's commits (#371).
     ScrubHistory,
+    /// Run one command across several ssh hosts and compare (#363).
+    FleetRun,
+    /// Open the symbol under the cursor as its own tab (#369).
+    OpenAsSymbolTab,
     /// Create a git worktree lane for an agent to work in (#348).
     NewWorktreeLane,
     /// Remove the current worktree lane, refusing when it is dirty (#348).
@@ -382,6 +386,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::AskNavigatorAboutCapture,
     Command::OpenWorkspaceOnSshHost,
     Command::ScrubHistory,
+    Command::FleetRun,
+    Command::OpenAsSymbolTab,
     Command::NewWorktreeLane,
     Command::CloseWorktreeLane,
     Command::MarkAgentLaneReviewed,
@@ -559,6 +565,8 @@ impl Command {
             Command::AskNavigatorAboutCapture => "Captures: Ask Navigator About This Line",
             Command::OpenWorkspaceOnSshHost => "Remote: Open Workspace on This Pane's Host",
             Command::ScrubHistory => "Source Control: Scrub History",
+            Command::FleetRun => "Terminal: Fleet Run",
+            Command::OpenAsSymbolTab => "Editor: Open Symbol as Its Own Tab",
             Command::NewWorktreeLane => "Agent: New Worktree Lane",
             Command::CloseWorktreeLane => "Agent: Close Worktree Lane",
             Command::MarkAgentLaneReviewed => "Agents: Mark Changed Files Reviewed",
@@ -738,6 +746,8 @@ impl Command {
             Command::AskNavigatorAboutCapture => "",
             Command::OpenWorkspaceOnSshHost => "",
             Command::ScrubHistory => "",
+            Command::FleetRun => "",
+            Command::OpenAsSymbolTab => "",
             Command::NewWorktreeLane => "",
             Command::CloseWorktreeLane => "",
             Command::MarkAgentLaneReviewed => "",
@@ -914,6 +924,8 @@ impl Command {
             Command::AskNavigatorAboutCapture => "captures_ask_navigator",
             Command::OpenWorkspaceOnSshHost => "remote_open_workspace_on_ssh_host",
             Command::ScrubHistory => "scm_scrub_history",
+            Command::FleetRun => "terminal_fleet_run",
+            Command::OpenAsSymbolTab => "editor_open_symbol_tab",
             Command::NewWorktreeLane => "agent_new_worktree_lane",
             Command::CloseWorktreeLane => "agent_close_worktree_lane",
             Command::MarkAgentLaneReviewed => "agents_mark_reviewed",

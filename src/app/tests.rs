@@ -36595,6 +36595,185 @@ fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
     );
     assert!(app.http_run.is_none(), "nothing was sent");
 }
+/// #369: the symbol's byte range slices exactly its source, including for
+/// the LAST symbol in a file.
+///
+/// The line-to-byte sum charges a `\n` between lines, and croft's offset
+/// model gives an N-line buffer no trailing newline — so charging one to the
+/// final line puts `end` a byte past the buffer. That panics anything that
+/// slices by the range, which is the whole point of the range, and makes an
+/// append at true EOF read as INSIDE the symbol rather than below it.
+#[test]
+fn a_symbol_range_slices_exactly_its_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    let text = "fn a() {\n    1\n}\nfn b() {\n    2\n}";
+    std::fs::write(&file, text).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+
+    // `fn b` occupies lines 3..5 (0-based), the last symbol in the file.
+    app.outline.set_symbols(
+        file.clone(),
+        vec![crate::lsp::manager::OutlineSymbol {
+            name: String::from("fn b"),
+            detail: None,
+            kind: crate::lsp::manager::OutlineKind::Function,
+            depth: 0,
+            line: 3,
+            character: 0,
+            range_start_line: 3,
+            range_end_line: 5,
+        }],
+    );
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+
+    let (_, _, range) = app.symbol_tab.clone().expect("a symbol tab opened");
+    assert!(
+        range.end <= text.len(),
+        "the range runs {} bytes past a {}-byte buffer",
+        range.end - text.len(),
+        text.len()
+    );
+    assert_eq!(
+        &text[range.start..range.end],
+        "fn b() {\n    2\n}",
+        "the range must slice exactly the symbol's source"
+    );
+}
+
+/// #369: an open symbol tab follows edits, and closes when its symbol goes.
+///
+/// The tab is a VIEW over a byte range rather than a copy, so an edit that
+/// never reaches it leaves the tab pointing at bytes that have moved —
+/// showing the wrong text under the right title, which is worse than showing
+/// nothing at all.
+#[test]
+fn a_symbol_tab_follows_edits_and_closes_when_its_symbol_goes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let anchored = tmp.path().join("a.rs");
+    app.symbol_tab = Some((
+        String::from("render"),
+        anchored.clone(),
+        crate::symbol_range::SymbolRange::new(100, 200),
+    ));
+
+    // An edit ABOVE slides the whole range.
+    app.follow_symbol_tab_edit(10, 0, 30);
+    assert_eq!(
+        app.symbol_tab.as_ref().map(|(_, _, r)| (r.start, r.end)),
+        Some((130, 230)),
+        "an insertion above must move the tab with its symbol"
+    );
+
+    // An edit INSIDE resizes rather than moving — the case that would slide
+    // the tab off its own function if it shifted.
+    app.follow_symbol_tab_edit(150, 0, 20);
+    assert_eq!(
+        app.symbol_tab.as_ref().map(|(_, _, r)| (r.start, r.end)),
+        Some((130, 250)),
+        "typing inside must grow the range, not move it"
+    );
+
+    // Deleting the symbol closes the tab and says so, rather than
+    // re-anchoring to whatever is now at those bytes.
+    app.follow_symbol_tab_edit(130, 120, 0);
+    assert!(app.symbol_tab.is_none(), "a deleted symbol closes its tab");
+    assert!(
+        app.status.contains("render") && app.status.contains("gone"),
+        "the user must be told which tab closed and why: {}",
+        app.status
+    );
+
+    // With no tab open, a further edit is a no-op rather than a panic.
+    app.follow_symbol_tab_edit(0, 5, 5);
+    assert!(app.symbol_tab.is_none());
+
+    // A tab carries its FILE, and an edit to another file must not move it.
+    // The range is a byte offset into one buffer, so offsets from elsewhere
+    // mean nothing — a collaborator typing in `b.rs` would otherwise shift a
+    // tab pointed at `a.rs`, or announce that its symbol had gone.
+    app.symbol_tab = Some((
+        String::from("render"),
+        anchored.clone(),
+        crate::symbol_range::SymbolRange::new(100, 200),
+    ));
+    let before = app.symbol_tab.clone();
+    app.apply_collab_spans(
+        tmp.path(),
+        "b.rs",
+        &[crate::collab::ResolvedSpan {
+            at: 0,
+            deleted: 0,
+            inserted: String::from("xxxxx"),
+        }],
+        1,
+    );
+    assert_eq!(
+        app.symbol_tab, before,
+        "an edit to another file must leave the tab exactly where it was"
+    );
+}
+
+/// #363: a fleet run does not block the event loop, and its results arrive
+/// through the channel like every other background answer.
+///
+/// The blocking version is the tempting one — `run_on_hosts` returns a
+/// `Vec`, so calling it inline reads naturally — and it freezes the editor
+/// for up to `FLEET_TIMEOUT` while the network answers. The user could not
+/// scroll, type, or cancel. This asserts the split: the command returns at
+/// once, and a later drain reports.
+#[test]
+fn a_fleet_run_reports_through_the_channel_rather_than_blocking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Nothing in flight: a drain finds nothing and says so, rather than
+    // blocking or inventing an empty result.
+    assert!(!app.drain_fleet_results(), "no run, nothing to report");
+
+    // Feed a result as the worker thread would.
+    let results = vec![
+        crate::fleet::HostResult {
+            host: String::from("a"),
+            output: String::from("5.15.0"),
+            exit: Some(0),
+        },
+        crate::fleet::HostResult {
+            host: String::from("b"),
+            output: String::from("5.15.0"),
+            exit: Some(0),
+        },
+        crate::fleet::HostResult {
+            host: String::from("odd"),
+            output: String::from("6.1.0"),
+            exit: Some(0),
+        },
+        crate::fleet::HostResult {
+            host: String::from("down"),
+            output: String::from("timed out"),
+            exit: None,
+        },
+    ];
+    app.fleet_running = true;
+    app.fleet_tx.send(results).unwrap();
+
+    assert!(app.drain_fleet_results(), "a delivered result must report");
+    assert!(!app.fleet_running, "the run is no longer in flight");
+    assert!(
+        app.status.contains("2 identical") && app.status.contains("1 differ"),
+        "the summary must reach the user: {}",
+        app.status
+    );
+    assert!(app.status.contains("1 failed"), "status: {}", app.status);
+
+    // And the channel is empty again, so a second drain is a no-op rather
+    // than replaying the same run.
+    assert!(!app.drain_fleet_results(), "results are consumed once");
+}
+
 /// #371: the scrubber's keys move through history, and anything else keeps
 /// its normal meaning.
 ///

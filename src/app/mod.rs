@@ -175,6 +175,14 @@ pub enum ActivityIcon {
 /// the first version so it cannot be slow on a large repo.
 const SCRUB_COMMIT_LIMIT: usize = 500;
 
+/// How long one host gets in a fleet run (#363).
+///
+/// A ceiling on the CONNECT and a wall-clock bound on the whole thing: the
+/// issue's criterion is that a host which times out shows red without
+/// delaying the others, and only the second bound delivers that for a host
+/// that connects and then hangs.
+const FLEET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 const ACTIVITY_BAR_WIDTH: u16 = 4;
 
 const ACTIVITY_ICON_HEIGHT: u16 = 2;
@@ -2866,6 +2874,15 @@ pub struct App {
     /// on the event loop (keeps input at 0ms). A full set, not individual hits,
     /// so the app can reconcile ports that stopped listening.
     port_poll_rx: std::sync::mpsc::Receiver<PortPoll>,
+    /// Results of a running fleet command (#363), delivered off the event
+    /// loop. A fleet run waits on the network for up to `FLEET_TIMEOUT`, and
+    /// blocking the loop for that would freeze the editor — the user could
+    /// not scroll, type, or cancel while their fleet answered.
+    fleet_rx: std::sync::mpsc::Receiver<Vec<crate::fleet::HostResult>>,
+    fleet_tx: std::sync::mpsc::Sender<Vec<crate::fleet::HostResult>>,
+    /// True while a run is in flight, so a second invocation says so rather
+    /// than starting a competing fleet against the same hosts.
+    fleet_running: bool,
     port_poll_tx: std::sync::mpsc::Sender<PortPoll>,
     /// True while a poll thread is in flight, so cadence ticks don't pile up
     /// overlapping `lsof` invocations.
@@ -3065,6 +3082,10 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// The symbol a symbol tab is showing (#369): its name and the byte
+    /// range it spans, which follows edits through
+    /// `SymbolRange::after_edit`. `None` when no symbol tab is open.
+    symbol_tab: Option<(String, PathBuf, crate::symbol_range::SymbolRange)>,
     /// The open history scrubber (#371), or `None` when the editor is
     /// showing the live buffer. `Some` at `Position::Working` is a real
     /// state: the scrubber is open and parked at the user's own edits.
@@ -4126,6 +4147,7 @@ impl App {
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
         let (search_results_tx, search_results_rx) = std::sync::mpsc::channel();
         let (port_poll_tx, port_poll_rx) = std::sync::mpsc::channel();
+        let (fleet_tx, fleet_rx) = std::sync::mpsc::channel();
         let (label_tx, label_rx) = std::sync::mpsc::channel();
         let search_root = root.clone();
         std::thread::spawn(move || {
@@ -4380,6 +4402,9 @@ impl App {
             port_toast: None,
             last_port_poll: std::time::Instant::now(),
             port_poll_rx,
+            fleet_rx,
+            fleet_tx,
+            fleet_running: false,
             port_poll_tx,
             port_poll_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_label_refresh: std::time::Instant::now(),
@@ -4584,6 +4609,7 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            symbol_tab: None,
             scrubber: None,
             debug_temp_breakpoint: None,
             debug_temp_note: None,
@@ -20966,7 +20992,17 @@ impl App {
                     Err(e) => self.status = format!("Extract failed: {e}"),
                 }
             }
-            InputPurpose::NewWorktreeLane => self.create_worktree_lane(&value),
+            InputPurpose::NewWorktreeLane => {
+                self.close_input_prompt();
+                self.create_worktree_lane(&value);
+            }
+            InputPurpose::FleetCommand => {
+                // Closed FIRST, like every sibling arm. Leaving it open hides
+                // the status line the run writes, so the user cannot see the
+                // answer they just asked for.
+                self.close_input_prompt();
+                self.run_fleet_command(&value);
+            }
             InputPurpose::HexFind => {
                 self.close_input_prompt();
                 match crate::hex::HexView::parse_find_query(&value) {
@@ -22473,6 +22509,23 @@ impl App {
             ed.collab_synced_seq = ed.edit_seq;
             ed.collab_doc_gen = doc_gen;
         };
+        // A symbol tab is a view over a byte range, so a remote edit moves it
+        // too (#369). Outside the closure because the tab belongs to the app
+        // rather than to one editor.
+        // Only when the tab is anchored to THIS file. The range is a byte
+        // offset into one buffer, so an edit to any other file would shift,
+        // resize or close it against offsets that mean nothing there — a
+        // collaborator typing in `other.rs` would move a tab pointed at
+        // `main.rs`, or announce that its symbol is gone.
+        if self
+            .symbol_tab
+            .as_ref()
+            .is_some_and(|(_, p, _)| p.as_path() == path)
+        {
+            for span in spans {
+                self.follow_symbol_tab_edit(span.at, span.deleted, span.inserted.len());
+            }
+        }
         for ed in self.editor.editors.iter_mut() {
             if ed.path.as_deref() == Some(path.as_path()) {
                 apply(ed);
@@ -23701,6 +23754,198 @@ impl App {
         self.scrubber = Some(crate::scrubber::Scrubber::new(commits));
         self.status =
             format!("Scrubbing {n} commits — arrows step, Home returns to your working tree");
+    }
+
+    /// Follow an edit with the open symbol tab's range (#369).
+    ///
+    /// A symbol tab is a VIEW over a byte range rather than a copy, so an
+    /// edit that is not reported here leaves the tab pointing at bytes that
+    /// have moved — showing the wrong text under the right title, which is
+    /// worse than showing nothing.
+    ///
+    /// **Wired only to the collab span path today**, which is the one place
+    /// an edit already arrives as `(at, deleted, inserted)`. Local typing,
+    /// backspace, paste, undo and formatting all mutate the buffer through
+    /// line/column APIs that do not report a byte span, so a tab opened
+    /// while those run would go stale — which is why the tab VIEW is not
+    /// built yet and this ships as the tracking layer alone. Giving the
+    /// editor a byte-span edit signal is the next piece of #369, and doing
+    /// it before there is a view to break is deliberate: the alternative is
+    /// a tab that is right for remote edits and silently wrong for the
+    /// user's own.
+    ///
+    /// A symbol the edit removed or straddled CLOSES the tab with a notice,
+    /// rather than re-anchoring to half a function glued to whatever
+    /// followed it.
+    pub(crate) fn follow_symbol_tab_edit(&mut self, at: usize, removed: usize, inserted: usize) {
+        let Some((name, path, range)) = self.symbol_tab.take() else {
+            return;
+        };
+        match range.after_edit(at, removed, inserted) {
+            crate::symbol_range::RangeAfterEdit::At(moved) => {
+                self.symbol_tab = Some((name, path, moved));
+            }
+            crate::symbol_range::RangeAfterEdit::Gone => {
+                self.status = format!("Closed the {name} tab: that symbol is gone");
+            }
+        }
+    }
+
+    /// Open the symbol under the cursor as its own tab (#369).
+    ///
+    /// The INNERMOST enclosing symbol, so opening from inside a method shows
+    /// the method rather than its `impl` — the enclosing block is almost
+    /// never what was meant.
+    fn open_symbol_tab(&mut self) {
+        let line = self.editor.cursor_row as u32;
+        let symbols = self.outline.symbols();
+        let Some(sym) = crate::symbol_range::enclosing_symbol(symbols, line) else {
+            self.status = if symbols.is_empty() {
+                String::from("No symbols for this file yet")
+            } else {
+                String::from("The cursor is not inside a symbol")
+            };
+            return;
+        };
+        let name = sym.name.clone();
+        let (first, last) = (sym.range_start_line as usize, sym.range_end_line as usize);
+        // Converted to BYTES once, here. `SymbolRange` tracks bytes because
+        // that is what an edit reports, and holding lines as well would be
+        // two representations that can disagree the moment one is updated
+        // and the other is not.
+        let start: usize = self
+            .editor
+            .lines
+            .iter()
+            .take(first)
+            .map(|l| l.len() + 1)
+            .sum();
+        let mut len: usize = self
+            .editor
+            .lines
+            .iter()
+            .skip(first)
+            .take(last + 1 - first)
+            .map(|l| l.len() + 1)
+            .sum();
+        // The `+ 1` is a SEPARATOR between lines, not a terminator: croft's
+        // offset model gives an N-line buffer no trailing newline. Charging
+        // one to the final line puts `end` a byte past the buffer, which
+        // panics anything that slices by the range — and makes an append at
+        // true EOF read as INSIDE the symbol rather than below it.
+        if last + 1 >= self.editor.lines.len() {
+            len = len.saturating_sub(1);
+        }
+        let range = crate::symbol_range::SymbolRange::new(start, start + len);
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Save this buffer before opening a symbol from it");
+            return;
+        };
+        self.symbol_tab = Some((name.clone(), path, range));
+        self.status = format!("{name}: {} bytes", range.len());
+    }
+
+    /// Run `command` on every configured ssh host and report what differs
+    /// (#363).
+    ///
+    /// In PARALLEL, one thread per host, because the whole point is
+    /// comparing a fleet: run serially, ten hosts at a two-second timeout
+    /// each is twenty seconds of staring, and a single unreachable host
+    /// would hold up every other result behind it.
+    fn run_fleet_command(&mut self, command: &str) {
+        let command = command.trim();
+        if command.is_empty() {
+            self.status = String::from("Fleet run needs a command");
+            return;
+        }
+        let known: Vec<String> = crate::remote::discover_ssh_targets()
+            .into_iter()
+            .map(|t| t.alias)
+            .collect();
+        if known.is_empty() {
+            self.status = String::from("No hosts in ~/.ssh/config to run on");
+            return;
+        }
+        // The fleet must be NAMED. Defaulting to every configured host means
+        // running arbitrary text on every remote the user ever set up — and
+        // a confirmation saying "run on 5 hosts?" asks them to approve a list
+        // they cannot see, which is not consent. `*` is how to say "all of
+        // them" deliberately.
+        let Some((picked, command)) = crate::fleet::parse_request(command, &known) else {
+            self.status = format!(
+                "Fleet run needs 'hosts: command' — e.g. '{}: uptime', or '*: uptime' for all {}",
+                known[0],
+                known.len()
+            );
+            return;
+        };
+        let hosts: Vec<String> = picked.into_iter().cloned().collect();
+        if self.fleet_running {
+            self.status = String::from("A fleet run is already in flight");
+            return;
+        }
+        crate::output::push(
+            crate::output::CHANNEL_FLEET,
+            crate::output::OutputLevel::Info,
+            &format!("$ {command}   on {}", hosts.join(", ")),
+        );
+        // Off the event loop: the run waits on the network for up to
+        // FLEET_TIMEOUT, and blocking the loop for that would freeze the
+        // editor — the user could not scroll, type, or cancel while their
+        // fleet answered. Results arrive through `fleet_rx` and are drained
+        // on a later tick, the same shape the port poll and label lookup use.
+        let host_count = hosts.len();
+        let tx = self.fleet_tx.clone();
+        let command = command.to_string();
+        self.fleet_running = true;
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::fleet::run_on_hosts(&hosts, &command, FLEET_TIMEOUT));
+        });
+        self.status = format!("Fleet: running on {host_count} hosts…");
+    }
+
+    /// Report a finished fleet run, if one arrived (#363).
+    ///
+    /// Drained on the tick like the other background results. Returns
+    /// whether anything landed, so the caller can redraw only when there is
+    /// something new.
+    fn drain_fleet_results(&mut self) -> bool {
+        // Every queued run, not just the newest. Each message is ONE run's
+        // results, unlike the label channel this idiom comes from where each
+        // message is a complete snapshot — taking `.last()` there is right
+        // and here would drop a whole run's output with no trace of it.
+        let batches: Vec<Vec<crate::fleet::HostResult>> = self.fleet_rx.try_iter().collect();
+        if batches.is_empty() {
+            return false;
+        }
+        self.fleet_running = false;
+        for results in batches {
+            let reference = crate::fleet::reference_output(&results).map(String::from);
+            for r in &results {
+                let mark = match (r.ok(), Some(r.output.as_str()) == reference.as_deref()) {
+                    (false, _) => "FAILED",
+                    (true, true) => "same",
+                    (true, false) => "DIFFERS",
+                };
+                crate::output::push(
+                    crate::output::CHANNEL_FLEET,
+                    if r.ok() {
+                        crate::output::OutputLevel::Info
+                    } else {
+                        crate::output::OutputLevel::Error
+                    },
+                    &format!("{}  [{mark}]  {}", r.host, r.output.replace('\n', " ")),
+                );
+            }
+            let summary = crate::fleet::summarise(&results, reference.as_deref());
+            crate::output::push(
+                crate::output::CHANNEL_FLEET,
+                crate::output::OutputLevel::Info,
+                &summary.line(),
+            );
+            self.status = format!("Fleet: {}", summary.line());
+        }
+        true
     }
 
     /// Create a worktree lane and add it as a workspace root (#348).
@@ -31519,6 +31764,14 @@ impl App {
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
+            Cmd::OpenAsSymbolTab => self.open_symbol_tab(),
+            Cmd::FleetRun => {
+                self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
+                    crate::widgets::input_prompt::InputPurpose::FleetCommand,
+                    String::from("Fleet run"),
+                    String::from("hosts: command   (or  *: command  for every host)"),
+                ))
+            }
             Cmd::NewWorktreeLane => {
                 self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
                     crate::widgets::input_prompt::InputPurpose::NewWorktreeLane,
@@ -44838,7 +45091,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // Every tick, not only when a capture settles: this is what notices
         // the editor has moved to another document (#354 review).
         app.publish_block_outputs();
-        let labels_changed = app.refresh_terminal_labels() | app.drain_agent_events();
+        let labels_changed =
+            app.refresh_terminal_labels() | app.drain_agent_events() | app.drain_fleet_results();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
         let connect_changed = app.poll_connect_dialog();
