@@ -10,10 +10,11 @@
 //!
 //! # What this does NOT do
 //!
-//! No extension code is fetched or run. This reads a JSON file the user
-//! already has. Downloading a `.vsix` from the marketplace is deliberately
-//! out of scope here (still open on #350): it is a network + archive path
-//! with its own trust questions, and it is not needed to convert a theme.
+//! No extension code is run. This module reads a JSON file; fetching one
+//! from the marketplace lives in [`crate::marketplace`], which downloads
+//! the `.vsix`, lifts out exactly one theme JSON, and discards the rest —
+//! nothing is installed into an extensions directory and nothing in the
+//! archive is executed.
 //!
 //! # Fidelity
 //!
