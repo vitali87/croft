@@ -702,6 +702,28 @@ pub struct HintSpan {
     pub typed: usize,
 }
 
+/// Source of [`StoredMark::id`], shared by every pane.
+///
+/// Process-wide rather than per-pane so an id is unambiguous wherever it
+/// travels; `u64` so it cannot realistically wrap (at one mark per
+/// microsecond it lasts half a million years), which matters because the
+/// whole value of the id is that a stale one never matches a live command.
+static NEXT_MARK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Take the next mark id.
+///
+/// `Relaxed` is sufficient and is not a shortcut. Uniqueness needs no
+/// ordering at all — `fetch_add` on a single atomic is totally ordered on
+/// itself, so no two callers can take the same value. And the id's
+/// PUBLICATION is ordered by something else entirely: it reaches a reader
+/// only inside a `StoredMark` behind the `marks` mutex, whose unlock/lock
+/// pair supplies the happens-before. There is no second variable whose
+/// visibility this atomic would have to fence, which is the only thing a
+/// stronger ordering would buy. Do not "upgrade" it to `SeqCst`.
+fn next_mark_id() -> u64 {
+    NEXT_MARK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One OSC 133 mark at its recording-time anchor, keyed on the scroll
 /// clock like annotations and images (current position =
 /// `line_rec - (clock_now - clock_rec)`), NOT on `history_size`, whose
@@ -709,6 +731,20 @@ pub struct HintSpan {
 /// on a scrollback wipe inverted the math outright. Marks past the
 /// scrollback floor are GC'd in `marks_snapshot`.
 struct StoredMark {
+    /// Monotonic identity, assigned once when the mark is recorded and never
+    /// renumbered (#440).
+    ///
+    /// Positions are not identity here. Three paths remove marks —
+    /// `marks_snapshot` GCs those past the scrollback floor, the reader drops
+    /// the oldest at `MARKS_MAX`, and a destructive screen wipe clears the
+    /// list outright — and the first two shift every index below them down.
+    /// A caller holding "index 3" is holding a slot, not a command, and after
+    /// an eviction that slot silently names a different one. An id turns that into "command
+    /// 41": if 41 is gone the caller learns it is gone instead of reading 42.
+    ///
+    /// The counter is never reset, including by the wipe, so an id is not
+    /// reused after a pane is cleared either.
+    id: u64,
     kind: crate::shell_integration::OscEvent,
     line_rec: i32,
     clock_rec: i64,
@@ -753,12 +789,56 @@ pub const FINISHED_OUTPUT_CAP_LINES: usize = 5000;
 /// (`CommandStart` line up to but excluding the `CommandEnd` line).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandDecoration {
+    /// Identity of the command, stable across eviction (#440).
+    ///
+    /// Taken from the `CommandStart` mark, because that is the mark every
+    /// finished command has exactly one of — the prompt marks before it are
+    /// optional in the pairing below, so keying on one of those would leave
+    /// some decorations without an id.
+    ///
+    /// **Only the identity is stable; the presentation fields are not.** The
+    /// id, `exit` and the output span come from the `CommandStart`/`CommandEnd`
+    /// pair, so they hold for as long as the decoration exists at all. But
+    /// `line` and `input` come from the PROMPT marks, which sit on earlier
+    /// grid rows and so cross the scrollback floor FIRST: the GC in
+    /// `marks_snapshot` retains per mark, not per command, so a command can
+    /// outlive its own prompt. When that happens `line` falls back to
+    /// `output_start` and `input` becomes `None`, while the id keeps naming
+    /// the same command throughout.
+    ///
+    /// So a consumer keyed on the id gets a durable answer to "which
+    /// command", and a best-effort answer to "where on screen was it typed".
+    /// That is the right split for the callers there are — the gutter wants
+    /// a row and can use the fallback, and a re-run wants the text and must
+    /// handle its absence — but it is a real limit, not an oversight, and
+    /// worth knowing before keying anything else on the pair.
+    pub id: u64,
     pub line: i32,
     pub exit: Option<i32>,
     pub duration: Option<std::time::Duration>,
     pub input: Option<(i32, usize)>,
     pub output_start: i32,
     pub output_end: i32,
+}
+
+/// One mark as a caller sees it: its identity, its CURRENT grid line, and
+/// the fields the pairing needs.
+///
+/// A struct rather than the tuple this used to be. The tuple had reached four
+/// positional fields and adding the id would have made five, at which point
+/// `m.3` at a call site says nothing about what it holds — and the whole
+/// change here is about not confusing a position with an identity.
+#[derive(Clone, Debug)]
+pub struct MarkView {
+    /// Stable identity from [`StoredMark::id`] (#440).
+    pub id: u64,
+    pub kind: crate::shell_integration::OscEvent,
+    /// Current grid line; negative means scrollback.
+    pub line: i32,
+    /// Cursor column when the mark landed.
+    pub col: usize,
+    /// For `CommandEnd`: how long the command ran.
+    pub dur: Option<std::time::Duration>,
 }
 
 /// Pair the mark stream (oldest first, each with its current grid line and,
@@ -768,36 +848,33 @@ pub struct CommandDecoration {
 /// with no pending `CommandStart` is dropped — that's how a second
 /// integration layer's duplicate marks (Ghostty's hooks chained behind
 /// croft's) stay out of the record.
-pub fn pair_decorations(
-    marks: &[(
-        crate::shell_integration::OscEvent,
-        i32,
-        usize,
-        Option<std::time::Duration>,
-    )],
-) -> Vec<CommandDecoration> {
+pub fn pair_decorations(marks: &[MarkView]) -> Vec<CommandDecoration> {
     use crate::shell_integration::OscEvent as E;
     let mut out = Vec::new();
     let mut prompt: Option<i32> = None;
     let mut input: Option<(i32, usize)> = None;
-    let mut started: Option<i32> = None;
-    for (kind, line, col, dur) in marks {
-        match kind {
+    // The id of the `CommandStart` currently open, carried alongside its
+    // line so the decoration is keyed on the mark that actually defines the
+    // command rather than on whichever prompt mark happened to precede it.
+    let mut started: Option<(u64, i32)> = None;
+    for m in marks {
+        match &m.kind {
             E::PromptStart => {
-                prompt = Some(*line);
+                prompt = Some(m.line);
                 input = None;
             }
-            E::PromptEnd => input = Some((*line, *col)),
-            E::CommandStart => started = Some(*line),
+            E::PromptEnd => input = Some((m.line, m.col)),
+            E::CommandStart => started = Some((m.id, m.line)),
             E::CommandEnd(exit) => {
-                if let Some(output_start) = started.take() {
+                if let Some((id, output_start)) = started.take() {
                     out.push(CommandDecoration {
+                        id,
                         line: prompt.unwrap_or(output_start),
                         exit: *exit,
-                        duration: *dur,
+                        duration: m.dur,
                         input,
                         output_start,
-                        output_end: *line,
+                        output_end: m.line,
                     });
                 }
             }
@@ -1796,6 +1873,7 @@ impl PtyTerminal {
                                         ms.drain(..drop_n);
                                     }
                                     ms.push(StoredMark {
+                                        id: next_mark_id(),
                                         kind,
                                         line_rec,
                                         clock_rec,
@@ -1993,20 +2071,13 @@ impl PtyTerminal {
     pub fn command_marks(&self) -> Vec<(crate::shell_integration::OscEvent, i32)> {
         self.marks_snapshot()
             .into_iter()
-            .map(|(kind, line, _, _)| (kind, line))
+            .map(|m| (m.kind, m.line))
             .collect()
     }
 
     /// The marks with current grid lines and, for `CommandEnd`, the measured
     /// command duration. GC + drift adjustment as in [`Self::command_marks`].
-    fn marks_snapshot(
-        &self,
-    ) -> Vec<(
-        crate::shell_integration::OscEvent,
-        i32,
-        usize,
-        Option<std::time::Duration>,
-    )> {
+    fn marks_snapshot(&self) -> Vec<MarkView> {
         let mut term = self.term.lock();
         let now = self.clock.lock().unwrap().tick(&mut term);
         let floor = term.grid().topmost_line().0;
@@ -2015,13 +2086,12 @@ impl PtyTerminal {
         marks.retain(|m| m.line_rec - (now - m.clock_rec) as i32 >= floor);
         marks
             .iter()
-            .map(|m| {
-                (
-                    m.kind.clone(),
-                    m.line_rec - (now - m.clock_rec) as i32,
-                    m.col_rec,
-                    m.dur,
-                )
+            .map(|m| MarkView {
+                id: m.id,
+                kind: m.kind.clone(),
+                line: m.line_rec - (now - m.clock_rec) as i32,
+                col: m.col_rec,
+                dur: m.dur,
             })
             .collect()
     }
@@ -2882,6 +2952,7 @@ impl PtyTerminal {
         let clock_rec = self.clock.lock().unwrap().tick(&mut term);
         drop(term);
         self.marks.lock().unwrap().push(StoredMark {
+            id: next_mark_id(),
             kind,
             line_rec,
             clock_rec,
@@ -6172,6 +6243,31 @@ mod tests {
         }
     }
 
+    /// Build a mark stream from the old `(kind, line, col, dur)` shape,
+    /// numbering ids by position. The fixtures below care about pairing, not
+    /// identity, so an id per row keeps them readable while still exercising
+    /// the id path.
+    fn views(
+        marks: &[(
+            crate::shell_integration::OscEvent,
+            i32,
+            usize,
+            Option<std::time::Duration>,
+        )],
+    ) -> Vec<MarkView> {
+        marks
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, line, col, dur))| MarkView {
+                id: i as u64 + 1,
+                kind: kind.clone(),
+                line: *line,
+                col: *col,
+                dur: *dur,
+            })
+            .collect()
+    }
+
     #[test]
     fn pair_decorations_matches_prompts_with_exits() {
         use crate::shell_integration::OscEvent as E;
@@ -6192,9 +6288,13 @@ mod tests {
             (E::PromptStart, -2, 0, None),
         ];
         assert_eq!(
-            pair_decorations(&marks),
+            pair_decorations(&views(&marks)),
             vec![
                 CommandDecoration {
+                    // The `CommandStart` mark is the third row of the
+                    // fixture, and the id comes from that mark, not from the
+                    // prompt before it.
+                    id: 3,
                     line: -10,
                     exit: Some(0),
                     duration: Some(ms(2400)),
@@ -6203,6 +6303,7 @@ mod tests {
                     output_end: -7,
                 },
                 CommandDecoration {
+                    id: 7,
                     line: -7,
                     exit: Some(3),
                     duration: Some(ms(150)),
@@ -6220,10 +6321,10 @@ mod tests {
             (E::CommandEnd(Some(0)), -4, 0, Some(ms(90))),
             (E::CommandEnd(Some(0)), -4, 0, None),
         ];
-        assert_eq!(pair_decorations(&dup).len(), 1);
+        assert_eq!(pair_decorations(&views(&dup)).len(), 1);
         // A command still running (no CommandEnd yet) has no record.
         let running = [(E::PromptStart, 0, 0, None), (E::CommandStart, 0, 0, None)];
-        assert!(pair_decorations(&running).is_empty());
+        assert!(pair_decorations(&views(&running)).is_empty());
     }
 
     #[test]
@@ -7705,6 +7806,194 @@ mod tests {
         );
     }
 
+    /// A decoration's id names the same command for as long as that command
+    /// exists, and a positional index does not (#440).
+    ///
+    /// Asserted as a CONTRAST, because that is the actual claim: the same
+    /// eviction is shown moving the index while leaving the id alone. An
+    /// assertion that only checked "id 7 is still 7" would pass against a
+    /// collector that renumbered from zero, since nothing would have moved.
+    ///
+    /// Driven through `pair_decorations` rather than a live pane: both
+    /// eviction paths (the scrollback GC in `marks_snapshot`, the `MARKS_MAX`
+    /// drain in the reader thread) end in the same observable state — a
+    /// prefix of the mark stream is gone — and constructing that state
+    /// directly tests the property at the level it actually holds, instead of
+    /// depending on how a PTY happens to schedule its scrollback.
+    #[test]
+    fn a_decoration_id_outlives_the_eviction_that_moves_its_index() {
+        use crate::shell_integration::OscEvent as E;
+        let cycle = |line: i32| {
+            [
+                (E::PromptStart, line, 0, None),
+                (E::PromptEnd, line, 2, None),
+                (E::CommandStart, line + 1, 0, None),
+                (E::CommandEnd(Some(0)), line + 2, 0, None),
+            ]
+        };
+        let mut marks = Vec::new();
+        for (n, line) in [-12, -8, -4].iter().enumerate() {
+            marks.extend(cycle(*line));
+            assert_eq!(marks.len(), (n + 1) * 4, "staging: four marks per cycle");
+        }
+        let views = views(&marks);
+
+        let before = pair_decorations(&views);
+        assert_eq!(before.len(), 3, "staging: three finished commands");
+        assert!(
+            before[0].id < before[1].id && before[1].id < before[2].id,
+            "ids ascend with command order: {:?}",
+            before.iter().map(|d| d.id).collect::<Vec<_>>()
+        );
+
+        // Evict the oldest command: its four marks leave the front of the
+        // stream, exactly as the scrollback GC and the MARKS_MAX drain both
+        // leave it. Ids are NOT reassigned, because they belong to the marks.
+        let after = pair_decorations(&views[4..]);
+        assert_eq!(after.len(), 2, "staging: one command was evicted");
+
+        // The index has moved. The command that was last is still last here,
+        // so the telling case is the MIDDLE one: it was at index 1 and is now
+        // at index 0, which is what silently hands a caller the wrong command.
+        assert_eq!(
+            before[1].id, after[0].id,
+            "the survivor moved down one slot"
+        );
+        assert_ne!(
+            before[1].id, before[0].id,
+            "staging: the slots must hold different commands"
+        );
+        assert_ne!(
+            after[0].id,
+            before.first().map(|d| d.id).unwrap(),
+            "index 0 now names a different command than it did"
+        );
+
+        // The id still names the SAME command: same span, same exit.
+        let found = after
+            .iter()
+            .find(|d| d.id == before[2].id)
+            .expect("a surviving command keeps its id");
+        assert_eq!(
+            (found.exit, found.output_start, found.output_end),
+            (before[2].exit, before[2].output_start, before[2].output_end),
+            "the id must name the same command, not merely some decoration"
+        );
+
+        // And an evicted id reads as gone rather than as its neighbour, which
+        // is the whole difference from a positional index.
+        assert!(
+            after.iter().all(|d| d.id != before[0].id),
+            "an evicted command's id must never be reused by a survivor"
+        );
+    }
+
+    /// A command outlives its own prompt marks, and the id says so (#440).
+    ///
+    /// The GC retains per MARK, not per command, and the prompt marks sit on
+    /// earlier rows than the command's own — so the floor takes them first.
+    /// The interesting case is therefore not the clean boundary the test
+    /// above cuts, but this one: the same command, still identified, with its
+    /// presentation fields degraded. Pinning it here so the limit documented
+    /// on `CommandDecoration::id` cannot quietly stop being true.
+    #[test]
+    fn a_command_can_outlive_its_prompt_marks() {
+        use crate::shell_integration::OscEvent as E;
+        let marks = [
+            (E::PromptStart, -10, 0, None),
+            (E::PromptEnd, -10, 5, None),
+            (E::CommandStart, -9, 0, None),
+            (E::CommandEnd(Some(0)), -7, 0, None),
+        ];
+        let views = views(&marks);
+        let whole = pair_decorations(&views);
+        assert_eq!(whole.len(), 1, "staging: one finished command");
+
+        // The floor rises past the prompt row but not past the command's.
+        let survivors: Vec<MarkView> = views.iter().filter(|m| m.line >= -9).cloned().collect();
+        assert_eq!(survivors.len(), 2, "staging: only the prompt marks evict");
+        let after = pair_decorations(&survivors);
+        assert_eq!(after.len(), 1, "the command itself survives");
+
+        // Identity and the output span are untouched.
+        assert_eq!(after[0].id, whole[0].id, "the id names the same command");
+        assert_eq!(
+            (after[0].exit, after[0].output_start, after[0].output_end),
+            (whole[0].exit, whole[0].output_start, whole[0].output_end),
+            "the fields taken from CommandStart/CommandEnd do not drift"
+        );
+
+        // The presentation fields DO degrade, exactly as documented.
+        assert_eq!(
+            whole[0].input,
+            Some((-10, 5)),
+            "staging: the typed-text position existed before the eviction"
+        );
+        assert_eq!(
+            after[0].input, None,
+            "the typed-text position goes with the prompt mark"
+        );
+        assert_eq!(whole[0].line, -10, "staging: the row was the prompt's");
+        assert_eq!(
+            after[0].line, after[0].output_start,
+            "the row falls back to the command's own line"
+        );
+    }
+
+    /// Ids are unique across panes, and a wipe does not restart them (#440).
+    ///
+    /// The counter is process-wide precisely so an id means one thing
+    /// wherever it travels; a per-pane counter would hand two panes the same
+    /// id and a wipe would hand the same pane its old ids back. Both are the
+    /// kind of thing that looks fine until a consumer keys on the id, so both
+    /// are pinned rather than left to the comment.
+    #[test]
+    fn ids_are_unique_across_panes_and_survive_a_wipe() {
+        use crate::shell_integration::OscEvent;
+        let run = |t: &PtyTerminal| {
+            feed_pty(t, b"\r\n$ ");
+            t.push_mark_for_test(OscEvent::PromptStart, 0);
+            t.push_mark_for_test(OscEvent::PromptEnd, 2);
+            feed_pty(t, b"cmd\r\nout\r\n");
+            t.push_mark_for_test(OscEvent::CommandStart, 0);
+            t.push_mark_for_test(OscEvent::CommandEnd(Some(0)), 0);
+        };
+
+        let (_a, mut a) = quiet_pty();
+        let (_b, b) = quiet_pty();
+        run(&a);
+        run(&b);
+        run(&a);
+        let mut ids: Vec<u64> = a
+            .command_decorations()
+            .iter()
+            .chain(b.command_decorations().iter())
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(ids.len(), 3, "staging: three commands across two panes");
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "ids must not collide between panes");
+
+        // A wipe clears the pane's marks; the counter is not reset, so the
+        // next command must not be handed an id the wipe just freed.
+        let highest = *ids.last().unwrap();
+        a.clear_screen_and_scrollback();
+        assert!(
+            a.command_decorations().is_empty(),
+            "staging: the wipe must actually clear the marks"
+        );
+        run(&a);
+        let after = a.command_decorations();
+        assert_eq!(after.len(), 1, "staging: one command since the wipe");
+        assert!(
+            after[0].id > highest,
+            "an id must not be reused after a wipe: {} came after {highest}",
+            after[0].id
+        );
+    }
+
     /// A prompt mark recorded after the scrollback saturated must ride the
     /// ring rotation like its content: under the history-size model the
     /// delta froze, so the mark (and its decoration dot) drifted off its
@@ -7729,7 +8018,7 @@ mod tests {
                 .unwrap() as i32
         };
         assert_eq!(
-            t.marks_snapshot()[0].1,
+            t.marks_snapshot()[0].line,
             find(&mut t),
             "the mark starts on its prompt row"
         );
@@ -7739,7 +8028,7 @@ mod tests {
         }
         feed_pty(&t, more.as_bytes());
         assert_eq!(
-            t.marks_snapshot()[0].1,
+            t.marks_snapshot()[0].line,
             find(&mut t),
             "the mark must follow its prompt through ring rotation"
         );
