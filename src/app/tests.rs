@@ -36783,8 +36783,14 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
         "the frame carries {rows} rows — that is scrollback, not a screen"
     );
     // And it is the RECENT end of the output, not the oldest.
+    // `line-199` alone. The `|| contains("line-19")` this replaces was both
+    // redundant and weakening: "line-199" already contains "line-19", so the
+    // disjunct could only ever ADD acceptance - of a frame showing an old
+    // scrollback slice around line-19 through line-24, which is precisely the
+    // regression the assertion exists to reject. An OR whose second arm is a
+    // substring of its first can only make a check weaker.
     assert!(
-        frame.contains("line-199") || frame.contains("line-19"),
+        frame.contains("line-199"),
         "the frame must show what was last on screen: {:?}",
         &frame[..frame.len().min(120)]
     );
