@@ -36691,6 +36691,351 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
     );
 }
 
+/// #366: review boxes survive a render, which rebuilds the navigator's.
+///
+/// `render` reassigns `editor.comment_boxes` from `navigator_notes` every
+/// frame, so review threads written straight into that field were wiped
+/// before the user saw one — while the status line still reported having
+/// loaded them. The boxes therefore live in their own field and are merged
+/// in, and this asserts the merge rather than the assignment.
+#[test]
+fn review_boxes_survive_the_render_that_rebuilds_navigator_notes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+
+    app.review_boxes = Some((
+        file.clone(),
+        vec![crate::review_threads::Thread {
+            id: 77,
+            author: String::from("ada"),
+            body: String::from("this moved"),
+            path: String::from("a.rs"),
+            anchor: crate::review_threads::Anchor::Outdated(1),
+            resolved: false,
+        }],
+    ));
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert!(
+        app.editor.comment_boxes.iter().any(|b| b.id == 77),
+        "the render wiped the review box: {:?}",
+        app.editor
+            .comment_boxes
+            .iter()
+            .map(|b| b.id)
+            .collect::<Vec<_>>()
+    );
+
+    // A second frame must not duplicate it — the merge appends each time,
+    // so it has to append to a freshly rebuilt list rather than accumulate.
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        app.editor
+            .comment_boxes
+            .iter()
+            .filter(|b| b.id == 77)
+            .count(),
+        1,
+        "the box was duplicated across frames"
+    );
+}
+
+/// #366: another file's review comments do not follow the user to this one.
+///
+/// The boxes are merged into `editor.comment_boxes` on every frame. Keyed
+/// only by "whatever was loaded last", `a.rs`'s objections would hang off
+/// `b.rs`'s line numbers, against unrelated code — the same harm
+/// `threads_are_filtered_to_the_file_being_viewed` prevents on the filter
+/// axis, re-entering through the lifetime axis. So the field carries the
+/// path it was loaded for and the merge checks it.
+#[test]
+fn review_boxes_do_not_follow_the_user_to_another_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    std::fs::write(&b, "alpha\nbeta\ngamma\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.review_boxes = Some((
+        a.clone(),
+        vec![crate::review_threads::Thread {
+            id: 77,
+            author: String::from("ada"),
+            body: String::from("objection"),
+            path: String::from("a.rs"),
+            anchor: crate::review_threads::Anchor::At(1),
+            resolved: false,
+        }],
+    ));
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.editor.comment_boxes.iter().any(|b| b.id == 77),
+        "the box should be on the file it was loaded for"
+    );
+
+    // Switch files: the boxes belong to a.rs and must not appear here.
+    app.editor.open(&b).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        !app.editor.comment_boxes.iter().any(|bx| bx.id == 77),
+        "a.rs's review comments followed the user to b.rs: {:?}",
+        app.editor
+            .comment_boxes
+            .iter()
+            .map(|bx| (bx.id, bx.line))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// #366: box geometry tracks the live buffer, not the buffer at load time.
+///
+/// `box_line` clamps so a box past the end stays visible. Computed once at
+/// load, that clamp is stale the instant the user edits: delete most of the
+/// file and the boxes keep rows that no longer exist, which is exactly the
+/// invisibility clamping exists to prevent. So the field keeps `Thread`s and
+/// the geometry is derived per frame.
+#[test]
+fn review_box_geometry_follows_the_buffer_when_it_shrinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.review_boxes = Some((
+        file.clone(),
+        vec![crate::review_threads::Thread {
+            id: 88,
+            author: String::from("ada"),
+            body: String::from("late"),
+            path: String::from("a.rs"),
+            anchor: crate::review_threads::Anchor::At(9),
+            resolved: false,
+        }],
+    ));
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let before = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|b| b.id == 88)
+        .map(|b| b.line);
+    assert_eq!(before, Some(9), "the box should sit on its own line first");
+
+    // The user deletes most of the file; line 9 no longer exists.
+    app.editor.lines.truncate(3);
+    term.draw(|f| app.render(f)).unwrap();
+    let after = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|b| b.id == 88)
+        .map(|b| b.line);
+    assert_eq!(
+        after,
+        Some(2),
+        "the box kept a row past the end of the shrunken buffer"
+    );
+}
+
+/// #366: Ignore actually dismisses a review box.
+///
+/// Every box renders a live `\u{2715} Ignore` footer, and the hit-test is
+/// driven off `comment_boxes` indices with no notion of a box's origin. If
+/// `ignore_comment_box` only knows about navigator notes, it reports
+/// "Comment ignored" and the box returns on the next frame — a dismiss that
+/// claims success and visibly does nothing.
+#[test]
+fn ignoring_a_review_box_actually_dismisses_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.review_boxes = Some((
+        file.clone(),
+        vec![crate::review_threads::Thread {
+            id: 99,
+            author: String::from("ada"),
+            body: String::from("dismiss me"),
+            path: String::from("a.rs"),
+            anchor: crate::review_threads::Anchor::At(0),
+            resolved: false,
+        }],
+    ));
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(app.editor.comment_boxes.iter().any(|b| b.id == 99));
+
+    app.ignore_comment_box(99);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        !app.editor.comment_boxes.iter().any(|b| b.id == 99),
+        "the ignored review box came back on the next frame"
+    );
+}
+
+/// #366: F4 reaches review boxes, not only navigator notes.
+///
+/// The boxes render on a shared surface with a shared hit-test, so a
+/// keyboard walk that reads `navigator_notes` alone leaves them visible but
+/// unreachable — and reports "No navigator comments in this file" while
+/// several are on screen.
+#[test]
+fn the_comment_walk_reaches_review_boxes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.review_boxes = Some((
+        file.clone(),
+        vec![crate::review_threads::Thread {
+            id: 55,
+            author: String::from("ada"),
+            body: String::from("reachable?"),
+            path: String::from("a.rs"),
+            anchor: crate::review_threads::Anchor::At(2),
+            resolved: false,
+        }],
+    ));
+
+    // Deliberately NO render first: `comment_boxes` is a render output, so
+    // a walk that read it would depend on a frame having been drawn and
+    // would find nothing on an F4 pressed before the first one.
+    app.editor.cursor_row = 0;
+    assert_eq!(
+        app.next_comment_from_caret().map(|(id, _)| id),
+        Some(55),
+        "F4 skipped the review box entirely"
+    );
+}
+
+/// #366: a navigator note and a review comment on ONE line keep a stable
+/// order, and the review box carries its own text.
+///
+/// The merge appends review boxes after the navigator's, which is the order
+/// the render comment promises. Asserting on ids alone would pass under a
+/// merge that mangled every other field, so this pins the whole tuple:
+/// a swap of the two sources, a wrong line, or a body taken from the wrong
+/// thread all fail here.
+#[test]
+fn a_navigator_note_and_a_review_comment_on_one_line_keep_a_stable_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+    app.navigator_notes
+        .insert("a.rs".into(), vec![(1, 1, "the navigator's note".into())]);
+    app.review_boxes = Some((
+        file.clone(),
+        vec![crate::review_threads::Thread {
+            id: 4_000_000_001,
+            author: String::from("ada"),
+            body: String::from("the reviewer's objection"),
+            path: String::from("a.rs"),
+            // Same row as the navigator's note.
+            anchor: crate::review_threads::Anchor::At(1),
+            resolved: false,
+        }],
+    ));
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let got: Vec<(u64, usize, String)> = app
+        .editor
+        .comment_boxes
+        .iter()
+        .map(|b| (b.id, b.line, b.body.clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, 1, String::from("the navigator's note")),
+            (4_000_000_001, 1, String::from("the reviewer's objection")),
+        ],
+        "the navigator's note must come first and each box keep its own text"
+    );
+}
+
+/// #366: review boxes follow the open file through a rename.
+///
+/// Both guards compare the stored path against `editor.path`, so a rename
+/// that repoints the tab without repointing the field makes the boxes
+/// vanish from the buffer the user is still editing.
+#[test]
+fn review_boxes_follow_the_open_file_through_a_rename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = tmp.path().join("a.rs");
+    let new = tmp.path().join("renamed.rs");
+    std::fs::write(&old, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&old).unwrap();
+    app.review_boxes = Some((
+        old.clone(),
+        vec![crate::review_threads::Thread {
+            id: 66,
+            author: String::from("ada"),
+            body: String::from("still mine"),
+            path: String::from("a.rs"),
+            anchor: crate::review_threads::Anchor::At(1),
+            resolved: false,
+        }],
+    ));
+
+    // Driven through the real rename prompt rather than by calling the
+    // helpers directly: hand-calling them tests the helper's logic while
+    // leaving the WIRING untested, so deleting the call from the rename
+    // handler would keep passing.
+    app.prompt = Some(super::Prompt {
+        label: String::from("Rename a.rs"),
+        buffer: String::from("renamed.rs"),
+        kind: super::PromptKind::Rename(old.clone()),
+        target_dir: tmp.path().to_path_buf(),
+        error: None,
+    });
+    app.commit_prompt();
+    assert!(
+        app.prompt.is_none(),
+        "the rename prompt should have committed"
+    );
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(new.as_path()),
+        "the tab should have followed the rename"
+    );
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.editor.comment_boxes.iter().any(|b| b.id == 66),
+        "the rename orphaned the review boxes: {:?}",
+        app.editor
+            .comment_boxes
+            .iter()
+            .map(|b| b.id)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// #356: a recording produces a file that is asciicast v2 all the way
 /// through, header and every event.
 ///
