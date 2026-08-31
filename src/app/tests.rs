@@ -1657,6 +1657,40 @@ fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
     assert!(app.tab_tooltip.is_none(), "and the tab tooltip with it");
 }
 
+/// #357: output a pane prints is recorded for rewind, and the cap holds.
+///
+/// Driven through the pane rather than by calling `RewindBuffer` directly:
+/// the buffer's own tests already cover its logic, and what is unproven is
+/// the WIRING — that the path which parses output also records it. A test
+/// that constructed a buffer itself would pass with the pane recording
+/// nothing at all.
+#[test]
+fn terminal_output_is_recorded_into_the_rewind_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    let before = app.terminals[0].rewind().lock().unwrap().bytes();
+    app.terminals[0].feed_bytes_for_test(b"hello from the past\r\n");
+    let rb = app.terminals[0].rewind().lock().unwrap();
+    assert!(
+        rb.bytes() > before,
+        "the pane parsed output without recording it: {} bytes",
+        rb.bytes()
+    );
+    // The bytes are replayable, not merely counted.
+    let (_, frames) = rb.replay_from(u64::MAX);
+    let seen: Vec<u8> = frames.iter().flat_map(|f| f.data.clone()).collect();
+    assert!(
+        String::from_utf8_lossy(&seen).contains("hello from the past"),
+        "the recorded bytes do not contain the output: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        rb.span_ms().is_some(),
+        "a recorded buffer must span a range"
+    );
+}
+
 #[test]
 fn a_terminal_miss_does_not_blame_a_view_it_never_searched() {
     // The refusal was scoped to the editor lookup, but the STATUS derived from

@@ -659,6 +659,10 @@ pub struct PtyTerminal {
     /// `inline=1`, the imgcat protocol), anchored like marks. Capped at
     /// [`IMAGES_MAX`]; the app overlays the newest visible one.
     images: Arc<std::sync::Mutex<Vec<StoredImage>>>,
+    /// The last few minutes of this pane's output, for Session: Rewind
+    /// (#357). Written by the reader thread as chunks arrive; bounded by
+    /// bytes, so a `yes`-style flood evicts rather than grows.
+    rewind: Arc<std::sync::Mutex<crate::rewind::RewindBuffer>>,
     /// Test-only capture of every byte written toward the child's stdin.
     #[cfg(test)]
     written_for_test: Arc<std::sync::Mutex<Vec<u8>>>,
@@ -1718,6 +1722,10 @@ impl PtyTerminal {
         let marks_for_thread = marks.clone();
         let images = Arc::new(std::sync::Mutex::new(Vec::<StoredImage>::new()));
         let images_for_thread = images.clone();
+        let rewind = Arc::new(std::sync::Mutex::new(crate::rewind::RewindBuffer::new(
+            crate::rewind::DEFAULT_CAPACITY_BYTES,
+        )));
+        let rewind_for_thread = rewind.clone();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel::<FinishedCommand>();
         let osc7_cwd = Arc::new(std::sync::Mutex::new(Option::<std::path::PathBuf>::None));
         let osc7_for_thread = osc7_cwd.clone();
@@ -1906,6 +1914,26 @@ impl PtyTerminal {
                                 }
                             }
                         }
+                        // Recorded before the advance, so the buffer holds the
+                        // bytes that PRODUCED the state a keyframe would
+                        // capture. Takes only its own lock: the pane's order is
+                        // term -> clock -> line_times, and `t` is held here, so
+                        // anything reaching back for `term` would deadlock.
+                        // `push` returns a keyframe request rather than
+                        // rendering one for exactly that reason.
+                        if let Ok(mut rb) = rewind_for_thread.lock() {
+                            let at = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            // The keyframe request is dropped for now: this is
+                            // the recording half, and nothing replays yet. The
+                            // overlay that does will honour it here, taking the
+                            // screen while it holds `t` rather than reaching
+                            // back for the lock. Until then the buffer replays
+                            // from the start, which is correct but unbounded.
+                            let _wants_keyframe = rb.push(at, &buf[done..n]);
+                        }
                         processor.advance(&mut *t, &buf[done..n]);
                         // A destructive clear erases the content the pane's
                         // captured images anchored to: ED 2 the live screen
@@ -2083,6 +2111,7 @@ impl PtyTerminal {
             watch_rx,
             palette: crate::theme::VSCODE_ANSI,
             images,
+            rewind,
             #[cfg(test)]
             written_for_test: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
@@ -2934,11 +2963,32 @@ impl PtyTerminal {
         p.advance(&mut *term, &bytes);
     }
 
+    /// The pane's rewind buffer (#357), for the scrubber to replay from.
+    ///
+    /// Handed out as the shared handle rather than a copy: the buffer is
+    /// megabytes by design, and the reader thread is writing to it while the
+    /// overlay reads, so a snapshot would be both expensive and immediately
+    /// stale.
+    pub fn rewind(&self) -> &Arc<std::sync::Mutex<crate::rewind::RewindBuffer>> {
+        &self.rewind
+    }
+
     /// Test-only: parse `bytes` straight into this pane's grid, as if the
     /// child had printed them — app-level tests drive alt-screen repaint
     /// scenarios deterministically through this.
     #[cfg(test)]
     pub fn feed_bytes_for_test(&self, bytes: &[u8]) {
+        // Records into the rewind buffer first, exactly as the reader thread
+        // does (#357). A test helper that skipped this would let a test of
+        // the recording pass while the real path recorded nothing — it would
+        // be standing in for the wiring rather than driving it.
+        if let Ok(mut rb) = self.rewind.lock() {
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            rb.push(at, bytes);
+        }
         let mut p = Processor::<StdSyncHandler>::new();
         let mut term = self.term.lock();
         p.advance(&mut *term, bytes);
