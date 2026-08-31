@@ -663,15 +663,6 @@ pub struct PtyTerminal {
     /// (#357). Written by the reader thread as chunks arrive; bounded by
     /// bytes, so a `yes`-style flood evicts rather than grows.
     rewind: Arc<std::sync::Mutex<crate::rewind::RewindBuffer>>,
-    /// The monotonic zero for [`Self::rewind`]'s timestamps, so they cannot
-    /// go backwards under a clock correction.
-    ///
-    /// Test-only: the reader thread owns its own copy of the same `Instant`
-    /// (it is `Copy`, taken before the closure captures it), so on the live
-    /// path this field has no reader. It exists so `feed_bytes_for_test`
-    /// stamps frames on the same timeline the reader would.
-    #[cfg(test)]
-    rewind_epoch: std::time::Instant,
     /// Test-only capture of every byte written toward the child's stdin.
     #[cfg(test)]
     written_for_test: Arc<std::sync::Mutex<Vec<u8>>>,
@@ -2133,8 +2124,6 @@ impl PtyTerminal {
             images,
             rewind,
             #[cfg(test)]
-            rewind_epoch,
-            #[cfg(test)]
             written_for_test: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
@@ -3000,14 +2989,13 @@ impl PtyTerminal {
     /// scenarios deterministically through this.
     #[cfg(test)]
     pub fn feed_bytes_for_test(&self, bytes: &[u8]) {
-        // Records into the rewind buffer first, exactly as the reader thread
-        // does (#357). A test helper that skipped this would let a test of
-        // the recording pass while the real path recorded nothing — it would
-        // be standing in for the wiring rather than driving it.
-        if let Ok(mut rb) = self.rewind.lock() {
-            let at = self.rewind_epoch.elapsed().as_millis() as u64;
-            rb.push(at, bytes);
-        }
+        // Deliberately does NOT record into the rewind buffer, though the
+        // reader thread does (#357). Recording here too would be a SECOND
+        // implementation of that wiring, and a test driving this helper
+        // would then pass with the reader thread recording nothing at all —
+        // measured: deleting the reader's `rb.push` left the app-level test
+        // green. The recording is proven through a real pty instead, by
+        // `the_reader_thread_records_shell_output_for_rewind`.
         let mut p = Processor::<StdSyncHandler>::new();
         let mut term = self.term.lock();
         p.advance(&mut *term, bytes);
