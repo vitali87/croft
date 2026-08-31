@@ -933,6 +933,8 @@ struct PendingCapture {
     /// does not remove it, and the sound fix is a monotonic mark identity
     /// assigned at creation and never renumbered by the collector, which
     /// belongs in `terminal.rs` where `marks_snapshot` holds the records.
+    /// That is #440; once it exists, this field and `identity_lost` both
+    /// go away and the disk write stops needing a gate at all.
     high_water: usize,
     /// An eviction was seen, so `seen` no longer reliably names this
     /// block's command. The box is still shown - it is cheap and the next
