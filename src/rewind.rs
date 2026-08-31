@@ -77,6 +77,13 @@ pub struct Frame {
     /// frame rather than reporting an inverted range, but the ordering is
     /// still the caller's to keep.
     pub at_ms: u64,
+    /// Position in the buffer's own recording order.
+    ///
+    /// `at_ms` cannot order records on its own: it comes from a millisecond
+    /// clock, and a burst of output produces many records sharing a value.
+    /// The sweep below has to know whether a frame recorded AFTER a keyframe
+    /// was evicted, which a tie makes unanswerable. This counter is total.
+    seq: u64,
     pub data: Vec<u8>,
 }
 
@@ -84,6 +91,8 @@ pub struct Frame {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Keyframe {
     pub at_ms: u64,
+    /// Position in the recording order, from the same counter as [`Frame`].
+    seq: u64,
     /// The rendered screen at `at_ms`, one entry per row.
     pub screen: Vec<String>,
 }
@@ -98,6 +107,9 @@ pub struct RewindBuffer {
     capacity: usize,
     /// Bytes seen since the last keyframe, driving the next snapshot.
     since_keyframe: usize,
+    /// Hands out [`Frame::seq`] / [`Keyframe::seq`]. Shared by both so the
+    /// two interleave in one order rather than two.
+    next_seq: u64,
 }
 
 impl RewindBuffer {
@@ -108,6 +120,7 @@ impl RewindBuffer {
             bytes: 0,
             capacity,
             since_keyframe: 0,
+            next_seq: 0,
         }
     }
 
@@ -126,8 +139,10 @@ impl RewindBuffer {
             data
         };
         self.bytes += data.len();
+        let seq = self.take_seq();
         self.frames.push_back(Frame {
             at_ms,
+            seq,
             data: data.to_vec(),
         });
         self.evict();
@@ -147,8 +162,15 @@ impl RewindBuffer {
 
     /// Store a screen snapshot the caller rendered after [`push`] asked for one.
     pub fn push_keyframe(&mut self, at_ms: u64, screen: Vec<String>) {
-        self.keyframes.push_back(Keyframe { at_ms, screen });
+        let seq = self.take_seq();
+        self.keyframes.push_back(Keyframe { at_ms, seq, screen });
         self.drop_orphan_keyframes();
+    }
+
+    fn take_seq(&mut self) -> u64 {
+        let s = self.next_seq;
+        self.next_seq += 1;
+        s
     }
 
     /// Drop the oldest frames until the total payload fits the cap.
@@ -183,7 +205,7 @@ impl RewindBuffer {
     /// hole after it. Having no keyframe is honest — [`replay_from`] then
     /// replays from a blank screen, which is slower and correct.
     fn drop_orphan_keyframes(&mut self) {
-        let Some(oldest) = self.frames.front().map(|f| f.at_ms) else {
+        let Some(oldest_seq) = self.frames.front().map(|f| f.seq) else {
             // No frames at all. This is NOT the orphan case: a keyframe
             // taken before any output — or after every frame has aged out —
             // is a valid start point for everything that arrives next, and
@@ -195,11 +217,23 @@ impl RewindBuffer {
             }
             return;
         };
-        while self.keyframes.len() > 1 && self.keyframes[1].at_ms <= oldest {
+        // Keyed on the SEQUENCE, not the timestamp. A keyframe is a valid
+        // start point exactly when every frame recorded after it survives —
+        // that is, when nothing between it and the oldest surviving frame was
+        // evicted. `at_ms` cannot answer that: it cannot tell a keyframe that
+        // predates the frames because output was EVICTED from one that
+        // predates them because output had not yet ARRIVED, and a burst of
+        // same-millisecond records makes even the ordering ambiguous. The
+        // counter is total and increments once per record, so the frame
+        // immediately after a keyframe has exactly `seq + 1`.
+        while self.keyframes.len() > 1 && self.keyframes[1].seq < oldest_seq {
             self.keyframes.pop_front();
         }
-        // The survivor is only usable if it does not predate the frames.
-        if self.keyframes.front().is_some_and(|k| k.at_ms < oldest) {
+        if self
+            .keyframes
+            .front()
+            .is_some_and(|k| k.seq + 1 < oldest_seq)
+        {
             self.keyframes.pop_front();
         }
     }
@@ -431,6 +465,54 @@ mod tests {
              {oldest}: the output between them was evicted",
             kf.map(|k| k.at_ms)
         );
+
+        // POSITIVE CONTROL. The assertion above short-circuits on `None`, so
+        // it is satisfied by a buffer that simply never offers a keyframe at
+        // all — it proves no BAD start point is returned, not that a good one
+        // still is. Without this half, a sweep that discarded every keyframe
+        // would pass, which is exactly the regression that reached review.
+        let mut b = RewindBuffer::new(1 << 20);
+        b.push_keyframe(10, vec![String::from("valid")]);
+        b.push(20, b"x");
+        b.push(30, b"y");
+        let (kf, _) = b.replay_from(30);
+        assert_eq!(
+            kf.map(|k| k.at_ms),
+            Some(10),
+            "an unorphaned keyframe must still be offered as a start point"
+        );
+    }
+
+    /// Eviction inside ONE millisecond still invalidates the keyframe.
+    ///
+    /// A timestamp cannot see this: the evicted frame, the survivors and the
+    /// keyframe all share `at_ms`, so any `<` comparison says the keyframe is
+    /// fine while output that followed it has gone. The records carry a
+    /// sequence number for exactly this case — bursts of output routinely
+    /// land within one millisecond, so this is the common shape, not a
+    /// contrived one.
+    #[test]
+    fn eviction_within_one_millisecond_still_invalidates_the_keyframe() {
+        let mut b = RewindBuffer::new(15);
+        b.push_keyframe(5, vec![String::from("before any output")]);
+        b.push(5, b"aaaaa");
+        b.push(5, b"bbbbb");
+        b.push(5, b"ccccc");
+        // Evicts "aaaaa", which followed the keyframe and is not in it.
+        b.push(5, b"ddddd");
+
+        let (kf, frames) = b.replay_from(5);
+        let data: Vec<&[u8]> = frames.iter().map(|f| f.data.as_slice()).collect();
+        assert!(
+            !data.contains(&b"aaaaa".as_slice()),
+            "precondition: aaaaa must have been evicted, or this proves nothing"
+        );
+        assert!(
+            kf.is_none(),
+            "the keyframe was kept although output recorded after it was \
+             evicted: replaying it plus {data:?} shows a screen that never \
+             existed"
+        );
     }
 
     /// Timestamps that go backwards are not silently swallowed.
@@ -474,11 +556,16 @@ mod tests {
             "three intervals in one write must ask for a keyframe"
         );
         // The surplus carries: two intervals' worth is still outstanding, so
-        // a small write pushes past the next boundary rather than restarting
-        // the count from zero.
+        // two more requests are owed before the count restarts.
         assert!(
             b.push(2, b"x"),
             "the remainder from the big write was discarded"
+        );
+        assert!(b.push(3, b"x"), "the second owed keyframe was discarded");
+        // Negative control: three intervals owe exactly three, not more.
+        assert!(
+            !b.push(4, b"x"),
+            "a fourth keyframe was requested for three intervals of output"
         );
     }
 
