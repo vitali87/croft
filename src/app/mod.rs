@@ -11303,7 +11303,11 @@ impl App {
                         for _ in 0..prefix_len {
                             self.editor.backspace();
                         }
-                        self.editor.insert_str(&t);
+                        // An accepted completion is the SERVER's text, not
+                        // the user's: they picked it from a list rather than
+                        // writing it (#349).
+                        self.editor
+                            .insert_str_as(&t, crate::provenance::Seat::Generated);
                     }
                 }
                 true
