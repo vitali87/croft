@@ -238,8 +238,18 @@ pub fn stdin_extension(bytes: &[u8], hint: Option<&str>) -> anyhow::Result<Optio
 pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> anyhow::Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    // Owner-only, both of them. Whatever came down the pipe was chosen by
+    // the user, not by croft, and `vault read … | croft view -` or a piped
+    // `.env` is exactly the case this command invites; the default mode
+    // would leave it world-readable in a predictable path under the cache
+    // dir. Possession of the account is already the trust boundary for
+    // every other croft socket and staging path, and this joins them.
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let dir = cache_dir.join("view-stdin");
-    std::fs::create_dir_all(&dir)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let stem = format!("stdin-{}-{n}", std::process::id());
     let name = match stdin_extension(bytes, hint)? {
@@ -247,7 +257,15 @@ pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> anyhow
         None => stem,
     };
     let path = dir.join(name);
-    std::fs::write(&path, bytes)?;
+    // `create_new` rather than `write`: the name carries this process's pid
+    // and a counter, so an existing file means another process got there
+    // first, and truncating whatever it holds is not this command's business.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    std::io::Write::write_all(&mut f, bytes)?;
     Ok(path)
 }
 
@@ -467,6 +485,24 @@ mod tests {
             "the editor routes on extension, so staging without one lands in text"
         );
         assert_eq!(std::fs::read(&p).unwrap(), b"a,b\n1,2\n");
+    }
+
+    #[test]
+    fn staged_stdin_is_readable_only_by_its_owner() {
+        // Piped content is chosen by the user, and `vault read … | croft view -`
+        // is exactly what this command invites. A default-mode file would sit
+        // world-readable at a predictable path under the cache dir.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = stage_stdin(tmp.path(), b"hunter2", Some("txt")).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "staged stdin was mode {mode:o}");
+        let dir_mode = std::fs::metadata(p.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "the staging dir was mode {dir_mode:o}");
     }
 
     #[test]
