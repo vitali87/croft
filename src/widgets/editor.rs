@@ -2287,6 +2287,15 @@ thread_local! {
 pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
+    /// Which seat wrote each line (#349), for the gutter overlay and the
+    /// inline blame annotation.
+    ///
+    /// Only edits croft can attribute are recorded — a line it did not watch
+    /// being written stays unknown rather than inheriting from its
+    /// neighbour, because a provenance overlay that is right most of the
+    /// time gets read as fact and the line it gets wrong is the one someone
+    /// is arguing about.
+    pub provenance: crate::provenance::Provenance,
     /// Debugger breakpoints, keyed by file path, as 1-based line numbers.
     /// Rendered as red dots in the gutter and pushed to the DAP adapter on
     /// launch. Keyed by path (not just the active file) so switching the buffer
@@ -2791,6 +2800,7 @@ impl Editor {
         Self {
             path: None,
             lines: Vec::new(),
+            provenance: crate::provenance::Provenance::new(),
             breakpoints: std::collections::HashMap::new(),
             stop_line: None,
             unverified_breakpoints: std::collections::HashMap::new(),
@@ -3985,6 +3995,10 @@ impl Editor {
             LineEnding::Lf
         };
         self.lines = split_into_lines(&text);
+        // The map described the text that was just replaced (#349). Clearing
+        // is the safe direction: an unknown line is correct, a line credited
+        // to whoever wrote the file's PREVIOUS contents is not.
+        self.provenance = crate::provenance::Provenance::new();
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
@@ -5686,6 +5700,10 @@ impl Editor {
             LineEnding::Lf
         };
         self.lines = split_into_lines(&text);
+        // The map described the text that was just replaced (#349). Clearing
+        // is the safe direction: an unknown line is correct, a line credited
+        // to whoever wrote the file's PREVIOUS contents is not.
+        self.provenance = crate::provenance::Provenance::new();
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
@@ -5730,11 +5748,33 @@ impl Editor {
     }
 
     pub fn insert_str(&mut self, s: &str) {
+        self.insert_str_as(s, crate::provenance::Seat::Me);
+    }
+
+    /// [`Self::insert_str`], attributing the inserted lines to `seat` (#349).
+    ///
+    /// The seat is a parameter rather than editor state because the same
+    /// buffer takes text from several of them — the person typing, the
+    /// navigator's accepted stream, an agent's write — and which one is
+    /// making THIS edit is known only at the call site.
+    pub fn insert_str_as(&mut self, s: &str, seat: crate::provenance::Seat) {
         self.pin_on_edit();
         self.push_undo(EditKind::Paste);
-        if self.selection.is_some() {
-            self.delete_selection_inner();
+        // A selection is deleted FIRST, and the map has to learn about that
+        // deletion separately: without this, the lines below a multi-line
+        // selection keep their old indices while the buffer's lines shift up,
+        // so a surviving line paints as whoever wrote a different one. That
+        // is the module's one forbidden outcome, reachable by an ordinary
+        // select-and-type.
+        if let Some(sel) = self.selection {
+            let ((sr, _), (er, _)) = sel.normalised();
+            if self.delete_selection_inner() {
+                // The selected span collapses to a single line.
+                self.provenance.splice(sr, er.saturating_sub(sr) + 1, 1);
+            }
         }
+        let start_line = self.cursor_row;
+        let before = self.lines.len();
         for c in s.chars() {
             if c == '\n' {
                 self.insert_newline_raw();
@@ -5742,6 +5782,22 @@ impl Editor {
                 self.insert_char_raw(c);
             }
         }
+        // The line the insertion started on is rewritten too, so it counts as
+        // written by this seat — hence the `+ 1`. But clamp to the lines that
+        // actually EXIST: inserting into an empty buffer pushes the first
+        // line, so the count moves 0 -> 1 and a naive `added + 1` claims two
+        // lines when there is one. Attributing a line that is not there is
+        // precisely what the module's invariant forbids, so the clamp is the
+        // invariant rather than defensiveness.
+        let added = self.lines.len().saturating_sub(before);
+        let end = (start_line + added + 1).min(self.lines.len());
+        self.provenance
+            .splice(start_line, 1, end.saturating_sub(start_line));
+        self.provenance.record(start_line..end, seat);
+        // "No key is ever past the end" as a structural guarantee rather than
+        // an argument about arithmetic: cheap, and it holds across every path
+        // into this function at once instead of one proof per path.
+        self.provenance.truncate(self.lines.len());
         self.recompute_highlights();
     }
 
@@ -5801,7 +5857,8 @@ impl Editor {
         } else {
             parsed.text.replace('\n', &format!("\n{indent}"))
         };
-        self.insert_str(&inserted);
+        // A snippet body is text the user chose, not text they wrote (#349).
+        self.insert_str_as(&inserted, crate::provenance::Seat::Generated);
 
         let mut abs: std::collections::VecDeque<(usize, usize, usize)> = parsed
             .stops
@@ -7408,6 +7465,14 @@ impl Editor {
     /// the caret into the restored buffer and refreshing highlights.
     fn restore_snapshot(&mut self, snap: Snapshot) {
         self.lines = snap.lines;
+        // Undo/redo swaps the whole buffer, and `Snapshot` does not carry the
+        // map, so the attributions describe text that is no longer here.
+        // Cleared rather than kept: #349 lists surviving an undo cycle as a
+        // criterion, and carrying a stale map would falsify it silently
+        // instead of leaving the lines honestly unknown. Restoring it
+        // properly means putting `provenance` in `Snapshot`, which is the
+        // later layer of that issue.
+        self.provenance = crate::provenance::Provenance::new();
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
@@ -14060,6 +14125,206 @@ mod tests {
             off.lines,
             vec!["a,b".to_string(), "1,2".to_string()],
             "disabled CSV viewer opens the raw rows as text lines"
+        );
+    }
+
+    /// A whole-buffer swap leaves no attribution behind (#349).
+    ///
+    /// Undo/redo and a reload both replace `lines` outright, and the map
+    /// described the text that was replaced. Keeping it would credit lines to
+    /// whoever wrote the buffer's PREVIOUS contents — the invariant's worst
+    /// form, because nothing about the resulting overlay looks wrong.
+    #[test]
+    fn a_whole_buffer_swap_forgets_the_old_attributions() {
+        let mut ed = Editor::new();
+        ed.lines = vec![String::from("a"), String::from("b")];
+        ed.cursor_row = 0;
+        ed.cursor_col = 0;
+        ed.insert_str_as("x\ny", crate::provenance::Seat::Navigator);
+        assert!(
+            ed.provenance.attributed() > 0,
+            "staging: something is attributed before the swap"
+        );
+
+        ed.undo();
+        assert_eq!(
+            ed.provenance.attributed(),
+            0,
+            "undo left a map describing text that is gone: {:?}",
+            ed.provenance
+        );
+
+        // A reload is the same shape: `load_text` replaces the buffer, so
+        // whatever the map said described the file's previous contents.
+        let mut re = Editor::new();
+        re.lines = vec![String::from("old")];
+        re.cursor_row = 0;
+        re.cursor_col = 0;
+        re.insert_str_as("mine", crate::provenance::Seat::Me);
+        assert!(re.provenance.attributed() > 0, "staging: attributed");
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("other.txt");
+        std::fs::write(&f, "entirely different\ntext\n").unwrap();
+        re.open(&f).unwrap();
+        assert_eq!(
+            re.provenance.attributed(),
+            0,
+            "a reload kept attributions for text it replaced: {:?}",
+            re.provenance
+        );
+    }
+
+    /// Splitting a line attributes BOTH halves to the seat that split it,
+    /// and that is deliberate (#349).
+    ///
+    /// It looks wrong on first read — the tail is someone else's text — but
+    /// the line they wrote no longer exists. Neither half is a line they
+    /// wrote, so crediting them would be the wrong answer in the other
+    /// direction. Pinned with this note so the next reader finds the
+    /// reasoning rather than filing it as a bug.
+    #[test]
+    fn splitting_a_line_gives_both_halves_to_the_splitting_seat() {
+        let mut ed = Editor::new();
+        ed.lines = vec![String::from("hello world")];
+        ed.provenance
+            .record(0..1, crate::provenance::Seat::Peer(String::from("ada")));
+        ed.cursor_row = 0;
+        ed.cursor_col = 5;
+        ed.insert_str_as("\n", crate::provenance::Seat::Me);
+
+        assert_eq!(
+            ed.lines,
+            vec![String::from("hello"), String::from(" world")]
+        );
+        assert_eq!(ed.provenance.seat(0), Some(&crate::provenance::Seat::Me));
+        assert_eq!(
+            ed.provenance.seat(1),
+            Some(&crate::provenance::Seat::Me),
+            "the tail is a NEW line, not ada's old one"
+        );
+    }
+
+    /// Inserted text is attributed to the seat that inserted it, and
+    /// nothing else in the buffer is (#349).
+    ///
+    /// Asserted as a contrast: an untouched line beside the written ones,
+    /// because "the new lines are attributed" passes just as well against an
+    /// implementation that attributes the whole buffer to whoever edited
+    /// last — which is precisely the wrong answer this feature exists to
+    /// avoid giving.
+    #[test]
+    fn inserted_text_carries_the_seat_that_wrote_it() {
+        let mut ed = Editor::new();
+        ed.lines = vec![String::from("existing"), String::from("tail")];
+        ed.cursor_row = 1;
+        ed.cursor_col = 0;
+
+        ed.insert_str_as("one\ntwo", crate::provenance::Seat::Navigator);
+
+        assert_eq!(
+            ed.provenance.seat(1),
+            Some(&crate::provenance::Seat::Navigator),
+            "the first inserted line is the navigator's"
+        );
+        assert_eq!(
+            ed.provenance.seat(2),
+            Some(&crate::provenance::Seat::Navigator),
+            "and so is the second"
+        );
+        // The line that was already there is NOT attributed: croft did not
+        // watch it being written.
+        assert_eq!(
+            ed.provenance.seat(0),
+            None,
+            "a pre-existing line must not inherit the editing seat"
+        );
+
+        // An insert into an EMPTY buffer: `insert_char_raw` pushes the first
+        // line, so the line count moves 0 -> 1 and the recorded range covers
+        // exactly the line that now exists. Worth pinning because reasoning
+        // about it from the arithmetic alone gets it wrong — `added` looks
+        // like 0 until you notice the push.
+        let mut empty = Editor::new();
+        empty.insert_str_as("hello", crate::provenance::Seat::Me);
+        assert_eq!(empty.lines.len(), 1, "staging: the buffer has one line");
+        assert_eq!(
+            empty.provenance.seat(0),
+            Some(&crate::provenance::Seat::Me),
+            "the only line must be attributed"
+        );
+        assert_eq!(
+            empty.provenance.attributed(),
+            1,
+            "and nothing beyond it: {:?}",
+            empty.provenance
+        );
+
+        // Replacing a MULTI-LINE selection. `delete_selection_inner` runs
+        // before the line-count snapshot, so `added` measures only the
+        // insertion — but the lines the selection removed must lose their
+        // attribution rather than carry it onto the replacement, which is
+        // the invariant in its most tempting-to-break form.
+        let mut sel = Editor::new();
+        sel.lines = vec![
+            String::from("keep"),
+            String::from("gone one"),
+            String::from("gone two"),
+            String::from("tail"),
+        ];
+        // FOUR DISTINCT SEATS, deliberately. With one seat on every line a
+        // misattribution is invisible — the wrong seat and the right one are
+        // the same value — so the assertions below would pass against the
+        // very bug they exist to catch. Only the count would fail.
+        sel.provenance.record(0..1, crate::provenance::Seat::Me);
+        sel.provenance
+            .record(1..2, crate::provenance::Seat::Navigator);
+        sel.provenance
+            .record(2..3, crate::provenance::Seat::Agent(String::from("pane 2")));
+        sel.provenance
+            .record(3..4, crate::provenance::Seat::Peer(String::from("ada")));
+        sel.cursor_row = 1;
+        sel.cursor_col = 0;
+        sel.selection = Some(EditorSelection {
+            anchor: (1, 0),
+            head: (2, 8),
+        });
+        sel.insert_str_as("replaced", crate::provenance::Seat::Generated);
+
+        assert_eq!(
+            sel.provenance.seat(0),
+            Some(&crate::provenance::Seat::Me),
+            "the line above the selection keeps its own seat"
+        );
+        assert_eq!(
+            sel.provenance.seat(1),
+            Some(&crate::provenance::Seat::Generated),
+            "the replacement belongs to the seat that made it"
+        );
+        // The surviving `tail` was ada's. Before the fix it painted as the
+        // AGENT — the seat of a line the selection destroyed — which is the
+        // bug in the form that matters, and the form a same-seat fixture
+        // cannot see.
+        assert_eq!(
+            sel.provenance.seat(2),
+            Some(&crate::provenance::Seat::Peer(String::from("ada"))),
+            "the surviving line kept its own seat, not a destroyed line's"
+        );
+        assert_eq!(
+            sel.provenance.attributed(),
+            sel.lines.len(),
+            "one seat per line, none past the end: {:?}",
+            sel.provenance
+        );
+
+        // A second seat writing elsewhere does not repaint the first's work.
+        ed.cursor_row = 0;
+        ed.cursor_col = 0;
+        ed.insert_str_as("mine", crate::provenance::Seat::Me);
+        assert_eq!(ed.provenance.seat(0), Some(&crate::provenance::Seat::Me));
+        assert_eq!(
+            ed.provenance.seat(2),
+            Some(&crate::provenance::Seat::Navigator),
+            "the navigator's lines kept their seat through another edit"
         );
     }
 
