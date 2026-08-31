@@ -501,7 +501,8 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | Click the `⛶` button (beside `-`) | Maximize that pane: it takes the panel's full width and the other terminals move to a rail down the right edge; the button becomes a restore glyph while maximized |
 | Click the `‹` button (left of `⛶`) | Collapse that pane to a one-column strip and hand its width to the panes still open. The pane keeps running: nothing is suspended, no output is lost, and `-` still closes |
 | Click a collapsed strip | Give that pane its width back. Anywhere down the strip works, not only the `›` chevron at the top |
-| `Cmd+K` `[` | Collapse the active terminal pane (VS Code folds with `Cmd+K` `[` too). Distinct from `Cmd+[`, which cycles to the previous pane. Collapsing the last expanded pane is refused: `Ctrl+Shift+j` is how you put the whole panel away |
+| Right-click a collapsed strip | Open the pane menu on the folded pane, where **Expand Terminal** is the other way back |
+| `Cmd+K` `[` | Collapse the active terminal pane (VS Code folds with `Cmd+K` `[` too). Distinct from `Cmd+[`, which cycles to the previous pane. Collapsing the last expanded pane is refused: `Ctrl+J` is how you put the whole panel away |
 | `Cmd+K` `]` | Give every collapsed pane its width back, restoring the even split in one gesture |
 | Click a rail row | While maximized: hand that terminal the maximized pane (the highlight marks the active one), so you can shuffle between full-size terminals |
 | Wheel over the rail | Scroll the rail when there are more terminals than it has rows; switching panes always scrolls the new one back into view |

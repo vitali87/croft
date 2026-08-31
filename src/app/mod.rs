@@ -12859,7 +12859,8 @@ impl App {
     ///
     /// Collapsing the LAST expanded pane is refused: folding every pane away
     /// leaves a row of strips with nothing in it, and croft already has
-    /// Ctrl+Shift+J for putting the panel away entirely. The refusal says so
+    /// Ctrl+J for putting the panel away entirely (Ctrl+Shift+J is the
+    /// opposite gesture, growing it over the editor). The refusal says so
     /// on the status line rather than swallowing the click, so the button
     /// never reads as broken.
     pub fn toggle_terminal_collapse(&mut self, idx: usize) {
@@ -12905,6 +12906,23 @@ impl App {
         }
         let msg = format!("Collapsed terminal {}", self.terminals[idx].label());
         self.terminal_status(msg);
+    }
+
+    /// Fold the active pane, unless maximize owns the panel (#313).
+    ///
+    /// The `‹` button is not painted while maximized and the right-click entry
+    /// is suppressed there, but the chord and the palette command reached
+    /// `toggle_terminal_collapse` directly and so had no such guard. Because
+    /// collapsing reassigns `active_terminal` and the maximize branch hands
+    /// the panel to whatever that is, the effect was to swap the maximized
+    /// pane for a neighbour while the status line announced a collapse that
+    /// was invisible until you left maximize.
+    pub fn collapse_active_terminal_pane(&mut self) {
+        if self.terminal_pane_maximized {
+            self.status = String::from("Collapse is unavailable while a pane is maximized");
+            return;
+        }
+        self.toggle_terminal_collapse(self.active_terminal);
     }
 
     /// Give every collapsed pane its width back (Cmd+K `]`): the issue's
@@ -13073,7 +13091,16 @@ impl App {
             }
         } else {
             for (term, rect) in self.terminals.iter_mut().zip(slot_rects) {
-                term.last_area = rect;
+                // A folded pane is not painted in whatever slot the drag left
+                // it in, so it must not inherit that slot's geometry (#313):
+                // the rest of the drained mouse burst hit-tests these rects,
+                // and a live rect over an unpainted pane resolves clicks to a
+                // pane that is not there.
+                term.last_area = if term.collapsed {
+                    Rect::default()
+                } else {
+                    rect
+                };
             }
         }
         self.terminal_session_dirty = true;
@@ -13348,23 +13375,49 @@ impl App {
         }
     }
 
-    /// Cycle the active terminal forward by one slot, wrapping at the end.
+    /// Cycle the active terminal forward to the next pane the user can
+    /// actually see, wrapping at the end.
+    ///
+    /// Collapsed panes are stepped over (#313). A folded pane is one column
+    /// wide and is never rendered, so it paints no cursor and no focus
+    /// border: cycling onto one would send every keystroke into a pane the
+    /// user cannot see receiving them. `toggle_terminal_collapse` defends
+    /// that same invariant on its own path; this is the other way in, and it
+    /// predated the flag.
     pub fn cycle_terminal(&mut self) {
-        if self.terminals.len() <= 1 {
-            return;
-        }
-        self.active_terminal = (self.active_terminal + 1) % self.terminals.len();
-        self.sync_focus_flags();
+        self.step_active_terminal(true);
     }
 
-    /// Cycle the active terminal backward by one slot, wrapping at the
-    /// front. Mirror of `cycle_terminal` for the Cmd+[ binding.
+    /// Cycle the active terminal backward, wrapping at the front. Mirror of
+    /// `cycle_terminal` for the Cmd+[ binding, folded panes skipped alike.
     pub fn cycle_terminal_back(&mut self) {
+        self.step_active_terminal(false);
+    }
+
+    /// Walk `active_terminal` one visible pane in either direction.
+    ///
+    /// The loop is bounded by the pane count and at least one pane is always
+    /// expanded (`toggle_terminal_collapse` refuses to fold the last one and
+    /// `ensure_a_terminal_pane_is_expanded` closes the other route), so it
+    /// always terminates on a pane that is painted. If that invariant were
+    /// ever broken the walk falls through without moving, which is inert
+    /// rather than a hang.
+    fn step_active_terminal(&mut self, forward: bool) {
         let n = self.terminals.len();
         if n <= 1 {
             return;
         }
-        self.active_terminal = (self.active_terminal + n - 1) % n;
+        for step in 1..=n {
+            let cand = if forward {
+                (self.active_terminal + step) % n
+            } else {
+                (self.active_terminal + n - (step % n)) % n
+            };
+            if !self.terminals[cand].collapsed {
+                self.active_terminal = cand;
+                break;
+            }
+        }
         self.sync_focus_flags();
     }
 
@@ -17374,7 +17427,7 @@ impl App {
                 if !self.show_terminal {
                     self.show_terminal = true;
                 }
-                self.toggle_terminal_collapse(self.active_terminal);
+                self.collapse_active_terminal_pane();
                 true
             }
             KeyCode::Char(']') if plain => {
@@ -31828,7 +31881,7 @@ impl App {
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
-            Cmd::CollapseTerminalPane => self.toggle_terminal_collapse(self.active_terminal),
+            Cmd::CollapseTerminalPane => self.collapse_active_terminal_pane(),
             Cmd::RestoreTerminalPanes => self.restore_all_terminal_panes(),
             Cmd::ToggleSecretRedaction => self.toggle_secret_redaction(),
             Cmd::RevealRedactedSecrets => self.reveal_redacted_secrets(),
@@ -35380,6 +35433,16 @@ impl App {
                 // Terminal pane right-click: the `…`-overflow equivalent. Rename
                 // and Clear (the gaps vs VS Code's toolbar); split/close already
                 // have buttons and chords.
+                // A folded pane clears its `last_area`, so `terminal_at_pos`
+                // can never name one and the menu's "Expand Terminal" branch
+                // was unreachable while KEYBINDINGS.md advertised it (#313).
+                // Fall back to the strips so a folded pane has a second
+                // gesture rather than left-click alone.
+                let terminal_hit = terminal_hit.or_else(|| {
+                    self.terminal_strip_rects
+                        .iter()
+                        .position(|r| rect_contains(*r, m.column, m.row))
+                });
                 if self.bottom_panel_tab == BottomPanelTab::Terminal
                     && let Some(idx) = terminal_hit
                 {

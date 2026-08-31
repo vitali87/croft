@@ -38532,3 +38532,128 @@ fn a_long_pane_name_never_paints_past_the_end_of_its_strip() {
         );
     }
 }
+
+// --- #313 fallback-review findings: red-first ------------------------------
+
+#[test]
+fn cycling_terminals_never_lands_on_a_collapsed_pane() {
+    // Cmd+] / Cmd+[ walk `active_terminal` by raw modular arithmetic, which
+    // predates the collapse flag. `toggle_terminal_collapse` documents the
+    // invariant "focus must not sit on a pane the user cannot see" and
+    // defends it on its own path only; cycling is the other way in.
+    //
+    // The FIXTURE has to be able to tell the two apart: four panes with index
+    // 1 folded, cycling from 0. Broken lands on 1 (folded, no cursor painted);
+    // correct skips to 2. A three-pane fixture would not discriminate.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(4);
+    app.toggle_terminal_collapse(1);
+    app.active_terminal = 0;
+    app.cycle_terminal();
+    assert_eq!(
+        app.active_terminal, 2,
+        "forward cycling steps over the strip"
+    );
+    assert!(!app.terminals[app.active_terminal].collapsed);
+
+    app.cycle_terminal_back();
+    assert_eq!(app.active_terminal, 0, "and so does backward cycling");
+    assert!(!app.terminals[app.active_terminal].collapsed);
+
+    // Presence half: with nothing folded the cycle still moves one slot, so
+    // this cannot pass by the cycle being broken outright.
+    app.restore_all_terminal_panes();
+    app.active_terminal = 0;
+    app.cycle_terminal();
+    assert_eq!(app.active_terminal, 1, "an unfolded row still steps by one");
+}
+
+#[test]
+fn collapse_is_inert_while_a_pane_is_maximized() {
+    // The `‹` button is not painted while maximized and the menu entry is
+    // suppressed, but the chord and the palette command called through
+    // unconditionally. `toggle_terminal_collapse` reassigns `active_terminal`,
+    // and the maximize branch hands the panel to whatever that is - so the
+    // pane being watched was silently swapped for a neighbour.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.active_terminal = 1;
+    app.toggle_terminal_pane_maximize();
+    assert!(app.terminal_pane_maximized, "precondition");
+
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('['), KeyModifiers::NONE)));
+    assert_eq!(
+        app.active_terminal, 1,
+        "the maximized pane must not be swapped out from under the user"
+    );
+    assert!(
+        !app.terminals.iter().any(|t| t.collapsed),
+        "and nothing folds while maximize owns the panel"
+    );
+}
+
+#[test]
+fn right_clicking_a_collapsed_strip_offers_to_expand_it() {
+    // `terminal_at_pos` hit-tests `last_area`, which a collapsed pane clears,
+    // so the right-click never resolved to a folded pane: the menu's
+    // "Expand Terminal" branch was unreachable while KEYBINDINGS.md advertised
+    // it, and a strip had exactly one gesture.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("a strip right-click opens the pane menu");
+    let labels: Vec<String> = menu
+        .items
+        .iter()
+        .filter_map(|e| match e {
+            MenuEntry::Item { label, .. } => Some(label.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "Expand Terminal"),
+        "the folded pane offers the way back out: {labels:?}"
+    );
+}
+
+#[test]
+fn a_reorder_never_hands_a_collapsed_pane_a_live_hit_rect() {
+    // `move_terminal` re-seats `last_area` in SLOT order, because the rect is a
+    // slot's geometry living on the terminal object. Before collapse existed
+    // every visible slot had a real rect, so that was self-consistent. Now a
+    // folded pane dragged into an expanded slot inherits a full-size rect it is
+    // not painted in, and clicks over it resolve to a pane that is not there.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+
+    app.move_terminal(0, 2);
+    let folded = app
+        .terminals
+        .iter()
+        .position(|t| t.collapsed)
+        .expect("the folded pane survived the reorder");
+    assert_eq!(
+        app.terminals[folded].last_area,
+        Rect::default(),
+        "a folded pane must not inherit an expanded slot's hit rect"
+    );
+    // Presence half: the panes that ARE painted keep real rects, so this
+    // cannot pass by the re-seat having been removed altogether.
+    assert!(
+        app.terminals
+            .iter()
+            .filter(|t| !t.collapsed)
+            .any(|t| t.last_area.width > 0),
+        "expanded panes still carry their slot geometry"
+    );
+}
