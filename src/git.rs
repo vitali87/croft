@@ -1001,6 +1001,50 @@ pub fn commit_graph(root: &Path, limit: usize) -> Vec<GraphCommit> {
     )
 }
 
+/// The current branch's first-parent history, newest first (#371).
+///
+/// NOT [`commit_graph`], which logs `--branches --tags HEAD` to draw the
+/// repo-wide graph: with any other branch present that list interleaves
+/// commits the current branch does not contain, and topological order can
+/// put one of them at index 0. A scrubber built on it steps back from the
+/// working tree onto a commit that is not HEAD and may not even be an
+/// ancestor of it.
+///
+/// `--first-parent` because a scrubber walks the branch as a line. A merge's
+/// second parent is a different line of development, and stepping into one
+/// would take the user somewhere they cannot step back out of in a straight
+/// line.
+///
+/// Empty on any failure — no repo, no commits, no git — so the caller shows
+/// an empty state rather than an error, matching `commit_graph`.
+pub fn branch_history(root: &Path, limit: usize) -> Vec<GraphCommit> {
+    let Some(path_str) = root.to_str() else {
+        return Vec::new();
+    };
+    let output = Command::new("git")
+        .args([
+            "-C",
+            path_str,
+            "log",
+            "--first-parent",
+            "HEAD",
+            &format!("-n{limit}"),
+            "--format=%H\x1f%h\x1f%P\x1f%D\x1f%s\x1f%an\x1f%ct",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    parse_commit_graph(&String::from_utf8_lossy(&output.stdout), now)
+}
+
 /// Parse the `%H\x1f%h\x1f%P\x1f%D\x1f%s\x1f%an\x1f%ct` lines emitted by
 /// [`commit_graph`], computing each commit's age relative to `now`.
 pub fn parse_commit_graph(out: &str, now: i64) -> Vec<GraphCommit> {
@@ -2673,6 +2717,67 @@ mod tests {
         assert_eq!(
             notes.additions, 3,
             "untracked line counts must join the porcelain path against the TOPLEVEL"
+        );
+    }
+
+    /// The scrubber's history is the CURRENT BRANCH, and index 0 is HEAD.
+    ///
+    /// `commit_graph` logs `--branches --tags HEAD` because it draws the
+    /// repo-wide graph. Feeding a scrubber from it means that with any other
+    /// branch present, index 0 is whatever topological order put first —
+    /// demonstrated here with a sibling branch carrying a future committer
+    /// date, which sorts ahead of HEAD. Stepping back from the working tree
+    /// then lands on a commit the current branch does not contain (#371).
+    #[test]
+    fn branch_history_is_the_current_branch_with_head_first() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+
+        let git = |args: &[&str]| {
+            let _ = Command::new("git").args(["-C"]).arg(p).args(args).status();
+        };
+        // A sibling branch whose commit dates FUTURE, so any date- or
+        // topo-ordered listing across all branches puts it first.
+        git(&["checkout", "-q", "-b", "sibling"]);
+        std::fs::write(p.join("sibling.txt"), "s").unwrap();
+        git(&["add", "-A"]);
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["commit", "-q", "-m", "sibling-future"])
+            .env("GIT_COMMITTER_DATE", "2038-01-01T00:00:00")
+            .env("GIT_AUTHOR_DATE", "2038-01-01T00:00:00")
+            .status();
+        // Back to the original branch.
+        git(&["checkout", "-q", "-"]);
+
+        let head = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        let hist = branch_history(p, 50);
+        assert!(!hist.is_empty(), "the branch has commits");
+        assert_eq!(
+            hist[0].hash, head,
+            "index 0 must be HEAD, not whatever sorted first across branches"
+        );
+        assert!(
+            hist.iter().all(|c| c.summary != "sibling-future"),
+            "a sibling branch's commit leaked into the branch history: {:?}",
+            hist.iter().map(|c| &c.summary).collect::<Vec<_>>()
+        );
+
+        // The positive control: the graph DOES include it, so the assertion
+        // above is about the ref set rather than about the repo being empty.
+        let graph = commit_graph(p, 50);
+        assert!(
+            graph.iter().any(|c| c.summary == "sibling-future"),
+            "control: commit_graph should see every branch"
         );
     }
 

@@ -166,6 +166,15 @@ pub enum ActivityIcon {
     Settings,
 }
 
+/// How many commits the history scrubber loads up front (#371).
+///
+/// A ceiling rather than the whole history: the issue's own criterion is
+/// that scrubbing 200 commits stays interactive, and a repo with 50,000 of
+/// them should not pay for all of them to answer a question about the last
+/// few hundred. Lazy loading around the cursor is the follow-up; this bounds
+/// the first version so it cannot be slow on a large repo.
+const SCRUB_COMMIT_LIMIT: usize = 500;
+
 const ACTIVITY_BAR_WIDTH: u16 = 4;
 
 const ACTIVITY_ICON_HEIGHT: u16 = 2;
@@ -3056,6 +3065,10 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// The open history scrubber (#371), or `None` when the editor is
+    /// showing the live buffer. `Some` at `Position::Working` is a real
+    /// state: the scrubber is open and parked at the user's own edits.
+    scrubber: Option<crate::scrubber::Scrubber>,
     /// A breakpoint croft set itself at the assertion the last run failed
     /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
     /// breakpoints: it is added to the launch set, rendered hollow-red like
@@ -4571,6 +4584,7 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            scrubber: None,
             debug_temp_breakpoint: None,
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
@@ -17259,6 +17273,22 @@ impl App {
             }
             return Ok(());
         }
+        // History scrubber (#371): arrows step, Home returns to the working
+        // tree, Esc closes.
+        //
+        // BELOW every modal guard above, deliberately. The scrubber is a view
+        // of the editor, not a mode over the window, so a palette, prompt or
+        // picker opened while scrubbing keeps its own arrows. Placing it here
+        // gets that by construction — each of those guards returns
+        // unconditionally, so a key only reaches this line when none of them
+        // wanted it. The alternative, a list of "overlays that take
+        // precedence", silently rots the next time someone adds a modal.
+        if self.scrubber.is_some()
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && self.handle_scrubber_key(key.code)
+        {
+            return Ok(());
+        }
         if self.scm_menu.open && matches!(key.code, KeyCode::Esc) {
             self.scm_menu.close();
             return Ok(());
@@ -23630,6 +23660,62 @@ impl App {
             // adding it to ~/.ssh/config is the action available.
             Err(why) => self.status = why,
         }
+    }
+
+    /// Open the history scrubber over the current branch (#371).
+    ///
+    /// Parks at the WORKING TREE rather than at HEAD, so opening the
+    /// scrubber changes nothing about what the user is looking at — the
+    /// first step is theirs to take. That also makes the gesture free to
+    /// try: a user who opens it by accident is exactly where they were.
+    fn scrub_history(&mut self) {
+        // `branch_history`, NOT `commit_graph`: the latter logs
+        // `--branches --tags HEAD` to draw the repo-wide graph, so with any
+        // other branch present index 0 is whatever topological order put
+        // first rather than HEAD, and stepping back from the working tree
+        // lands on a commit the current branch may not even contain.
+        let commits = crate::git::branch_history(self.workspace_root(), SCRUB_COMMIT_LIMIT);
+        if commits.is_empty() {
+            self.status = String::from("No commits to scrub through");
+            return;
+        }
+        let n = commits.len();
+        self.scrubber = Some(crate::scrubber::Scrubber::new(commits));
+        self.status =
+            format!("Scrubbing {n} commits — arrows step, Home returns to your working tree");
+    }
+
+    /// One scrubber keystroke. Returns whether it was consumed (#371).
+    ///
+    /// Returning `false` for anything else matters: the scrubber is a view,
+    /// not a mode that swallows the keyboard, so a key it does not use keeps
+    /// its normal meaning rather than being silently eaten.
+    fn handle_scrubber_key(&mut self, code: KeyCode) -> bool {
+        let Some(scrub) = self.scrubber.as_mut() else {
+            return false;
+        };
+        match code {
+            KeyCode::Left => scrub.older(),
+            KeyCode::Right => scrub.newer(),
+            KeyCode::Home => scrub.home(),
+            KeyCode::Esc => {
+                // Closing returns to the live buffer by construction: the
+                // scrubber never replaced it, so there is nothing to put
+                // back and no path where unsaved edits could be lost.
+                self.scrubber = None;
+                self.status = String::from("Left the history scrubber");
+                return true;
+            }
+            _ => return false,
+        }
+        // git's own short hash, not a byte slice of the full one: that
+        // slice is safe only while the string is ASCII hex, and the width
+        // git abbreviates to is per-repo rather than always seven.
+        self.status = match self.scrubber.as_ref().and_then(|s| s.commit()) {
+            Some(c) => format!("At {} — {}", c.short_hash, c.summary),
+            None => String::from("At your working tree"),
+        };
+        true
     }
 
     pub fn poll_connect_dialog(&mut self) -> bool {
@@ -31336,6 +31422,7 @@ impl App {
             Cmd::CollabCancelStream => self.collab_cancel_stream(),
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
+            Cmd::ScrubHistory => self.scrub_history(),
             Cmd::MarkAgentFileReviewed => {
                 match self.editor.path.clone() {
                     None => self.status = String::from("No file open"),
