@@ -249,3 +249,79 @@ fn view_against_a_vanished_croft_says_the_croft_is_gone() {
         "stderr must name the situation, was: {stderr}"
     );
 }
+
+/// #362 end to end against the REAL binary: `croft view <file>` connects to
+/// the socket named by the environment, sends the resolved path, and exits 0
+/// on an ok reply.
+///
+/// The unit tests drive the client and server halves in one process, where
+/// they can agree with each other. This stands up a socket the binary knows
+/// nothing about and makes the shipped `croft view` talk to it.
+#[test]
+fn view_sends_the_resolved_path_to_the_socket_and_exits_zero() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let target = tmp.path().join("report.txt");
+    std::fs::write(&target, b"hello").unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream.write_all(b"{\"status\":\"ok\"}\n").unwrap();
+        line
+    });
+
+    // Run from a DIFFERENT directory with a RELATIVE argument: the client is
+    // the side that resolves, and running from the file's own directory
+    // would pass even if it did not.
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["view", "report.txt"])
+        .assert()
+        .success();
+
+    // The wire carries the path as raw bytes (a filename is bytes, not
+    // UTF-8), so decode rather than substring-match: asserting on the text
+    // form would pass only for paths that happen to be valid UTF-8, which is
+    // the case the byte encoding exists to stop relying on.
+    let request = server.join().unwrap();
+    let bytes: Vec<u8> = request
+        .trim()
+        .trim_start_matches("{\"path\":[")
+        .trim_end_matches("]}")
+        .split(',')
+        .map(|n| n.trim().parse::<u8>().expect("the wire is a byte array"))
+        .collect();
+    assert_eq!(
+        std::path::PathBuf::from(String::from_utf8(bytes).unwrap()),
+        target,
+        "the server must receive the path resolved against the client's cwd"
+    );
+}
+
+/// A file that does not exist is refused by the client, before any croft is
+/// asked to open it: the message can then name the path as the user typed it,
+/// resolved against the cwd they typed it in.
+#[test]
+fn view_refuses_a_missing_file_without_bothering_the_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["view", "nope.pdf"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("no such file") && stderr.contains("nope.pdf"),
+        "stderr must name the missing path, was: {stderr}"
+    );
+}
