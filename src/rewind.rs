@@ -315,9 +315,22 @@ mod tests {
     #[test]
     fn a_write_larger_than_the_budget_keeps_its_tail() {
         let mut b = RewindBuffer::new(16);
-        b.push(1, &[b'x'; 100]);
+        // DISTINGUISHABLE payload: every byte differs, so the assertion can
+        // tell the tail from the head. A uniform `[b'x'; 100]` would pass
+        // just as happily against a slice taken from the wrong end.
+        let big: Vec<u8> = (0u8..100).collect();
+        b.push(1, &big);
         assert_eq!(b.bytes(), 16, "a huge write must be clamped to the budget");
         assert!(!b.is_empty(), "it must not vanish entirely");
+
+        let (_, frames) = b.replay_from(u64::MAX);
+        let kept: Vec<u8> = frames.iter().flat_map(|f| f.data.clone()).collect();
+        assert_eq!(
+            kept,
+            (84u8..100).collect::<Vec<u8>>(),
+            "the LAST 16 bytes must survive, not the first: a replay shows \
+             what the command most recently printed"
+        );
     }
 
     /// Eviction is oldest-first, so the buffer keeps the RECENT past.
