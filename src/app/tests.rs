@@ -2650,6 +2650,13 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     // link is in the pane; only its row moves, and hard-coding
     // `area.y + 1` made the test a race against shell startup rather than a
     // check of the swallow guard it is named for.
+    //
+    // Searching trades a false negative for a weaker claim, which is the
+    // right trade HERE and not everywhere: this assertion only proves the
+    // built-in has something to act on, and the click coordinates are
+    // computed separately below. If it ever grows into a position-sensitive
+    // check, the search has to narrow with it - "the link is somewhere in
+    // the pane" would then pass for a row no click could reach.
     let area = app.terminals[0].last_area;
     let (col, row) = (area.y..area.y + area.height)
         .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
