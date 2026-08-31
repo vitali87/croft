@@ -130,16 +130,29 @@ fn anchor_of(v: &serde_json::Value) -> Anchor {
 
 impl Thread {
     /// The box's title row: who, and whether it can be trusted to be here.
-    pub fn title(&self) -> String {
+    ///
+    /// Takes the buffer's length because a clamped thread has to say where
+    /// it really was.
+    ///
+    /// Two outdated threads at lines 5000 and 6000 of a 100-line file both
+    /// clamp onto the last line, and stacked boxes give no hint that their
+    /// anchors were 900 lines apart. Naming the original line is the only
+    /// thing that distinguishes them.
+    pub fn title_for(&self, buffer_lines: usize) -> String {
         let mut t = self.author.clone();
         if self.resolved {
             t.push_str(" \u{b7} resolved");
         }
-        if matches!(self.anchor, Anchor::Outdated(_)) {
+        if let Anchor::Outdated(line) = self.anchor {
             // Named in the title rather than only in a colour, because a
             // reviewer skimming boxes reads titles and a colour is exactly
             // what a screenshot or a colour-blind reader loses.
             t.push_str(" \u{b7} outdated");
+            if line >= buffer_lines {
+                // Clamped: say where it was, or two threads from far apart
+                // stack on the last line indistinguishably.
+                t.push_str(&format!(", was line {}", line + 1));
+            }
         }
         if matches!(self.anchor, Anchor::FileLevel) {
             t.push_str(" \u{b7} on the file");
@@ -187,19 +200,22 @@ mod tests {
         // Current: `line` wins over `original_line`, and converts to 0-based.
         assert_eq!(threads[0].anchor, Anchor::At(41));
         assert!(
-            !threads[0].title().contains("outdated"),
+            !threads[0].title_for(usize::MAX).contains("outdated"),
             "a current thread must not be labelled outdated: {}",
-            threads[0].title()
+            threads[0].title_for(usize::MAX)
         );
 
         // Outdated: placed from `original_line`, and SAID so.
         assert_eq!(threads[1].anchor, Anchor::Outdated(6));
         assert!(
-            threads[1].title().contains("outdated"),
+            threads[1].title_for(usize::MAX).contains("outdated"),
             "an outdated thread must say so in its title: {}",
-            threads[1].title()
+            threads[1].title_for(usize::MAX)
         );
-        assert!(threads[1].title().contains("bob"), "and name its author");
+        assert!(
+            threads[1].title_for(usize::MAX).contains("bob"),
+            "and name its author"
+        );
     }
 
     /// A REAL payload from the REST endpoint, trimmed but not reshaped.
@@ -234,7 +250,7 @@ mod tests {
             Anchor::Outdated(20),
             "a null `line` with `original_line` is the outdated case"
         );
-        assert!(t.title().contains("outdated"));
+        assert!(t.title_for(usize::MAX).contains("outdated"));
         assert!(
             !t.resolved,
             "the REST endpoint carries no resolution state, and unresolved \
@@ -260,7 +276,49 @@ mod tests {
         assert_eq!(threads.len(), 1, "an unplaceable thread must not vanish");
         assert_eq!(threads[0].anchor, Anchor::FileLevel);
         assert_eq!(threads[0].box_line(100), 0);
-        assert!(threads[0].title().contains("on the file"));
+        assert!(threads[0].title_for(usize::MAX).contains("on the file"));
+    }
+
+    /// A clamped thread names the line it was really on.
+    ///
+    /// Two outdated threads from far apart both land on the last line, and
+    /// stacked boxes otherwise give no hint their anchors differed at all.
+    #[test]
+    fn a_clamped_thread_says_where_it_was() {
+        let far = Thread {
+            id: 1,
+            author: String::from("ada"),
+            body: String::new(),
+            path: String::from("a.rs"),
+            anchor: Anchor::Outdated(5000),
+            resolved: false,
+        };
+        let near = Thread {
+            anchor: Anchor::Outdated(6000),
+            ..far.clone()
+        };
+        // Both clamp onto the same row of a 100-line file...
+        assert_eq!(far.box_line(100), near.box_line(100));
+        // ...so the title is the only thing telling them apart.
+        assert!(
+            far.title_for(100).contains("was line 5001"),
+            "{}",
+            far.title_for(100)
+        );
+        assert!(
+            near.title_for(100).contains("was line 6001"),
+            "{}",
+            near.title_for(100)
+        );
+        assert_ne!(far.title_for(100), near.title_for(100));
+
+        // In a buffer long enough to hold it, the box IS where it says, so
+        // repeating the line would be noise.
+        assert!(
+            !far.title_for(9000).contains("was line"),
+            "{}",
+            far.title_for(9000)
+        );
     }
 
     /// A line past the end of a shrunken file is clamped into view.
@@ -344,9 +402,9 @@ mod tests {
         let t = &parse_threads(json)[0];
         assert!(t.resolved);
         assert!(
-            t.title().contains("resolved"),
+            t.title_for(usize::MAX).contains("resolved"),
             "what was already dealt with is part of reading a review: {}",
-            t.title()
+            t.title_for(usize::MAX)
         );
     }
 }

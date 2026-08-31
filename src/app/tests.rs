@@ -36657,6 +36657,56 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
     );
 }
 
+/// #366: review boxes survive a render, which rebuilds the navigator's.
+///
+/// `render` reassigns `editor.comment_boxes` from `navigator_notes` every
+/// frame, so review threads written straight into that field were wiped
+/// before the user saw one — while the status line still reported having
+/// loaded them. The boxes therefore live in their own field and are merged
+/// in, and this asserts the merge rather than the assignment.
+#[test]
+fn review_boxes_survive_the_render_that_rebuilds_navigator_notes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+
+    app.review_boxes = vec![crate::widgets::editor::CommentBox {
+        id: 77,
+        line: 1,
+        author: String::from("ada \u{b7} outdated"),
+        body: String::from("this moved"),
+    }];
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert!(
+        app.editor.comment_boxes.iter().any(|b| b.id == 77),
+        "the render wiped the review box: {:?}",
+        app.editor
+            .comment_boxes
+            .iter()
+            .map(|b| b.id)
+            .collect::<Vec<_>>()
+    );
+
+    // A second frame must not duplicate it — the merge appends each time,
+    // so it has to append to a freshly rebuilt list rather than accumulate.
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        app.editor
+            .comment_boxes
+            .iter()
+            .filter(|b| b.id == 77)
+            .count(),
+        1,
+        "the box was duplicated across frames"
+    );
+}
+
 /// #356: a recording produces a file that is asciicast v2 all the way
 /// through, header and every event.
 ///

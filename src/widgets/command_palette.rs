@@ -193,9 +193,9 @@ pub enum Command {
     FleetRun,
     /// Open the symbol under the cursor as its own tab (#369).
     OpenAsSymbolTab,
-    /// Start or stop recording the active terminal as an asciicast (#356).
     /// Load this PR's review threads as comment boxes (#366).
     LoadReviewThreads,
+    /// Start or stop recording the active terminal as an asciicast (#356).
     ToggleSessionRecording,
     /// Create a git worktree lane for an agent to work in (#348).
     NewWorktreeLane,

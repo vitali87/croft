@@ -3082,6 +3082,13 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// Review threads loaded onto the open file as comment boxes (#366).
+    ///
+    /// A SEPARATE field from `editor.comment_boxes`, which the render loop
+    /// rebuilds from `navigator_notes` on every frame — assigning review
+    /// threads there directly meant they were wiped before the user saw
+    /// one, while the status line still reported having loaded them.
+    review_boxes: Vec<crate::widgets::editor::CommentBox>,
     /// An open asciicast recording (#356): the writer, the file it appends
     /// to, and when it started. `None` when nothing is being recorded.
     recording: Option<(
@@ -4621,6 +4628,7 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            review_boxes: Vec::new(),
             recording: None,
             recorded_size: (0, 0),
             symbol_tab: None,
@@ -14570,6 +14578,14 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Review threads (#366) join the navigator's rather than
+            // replacing them: both are comments on the same lines, and a
+            // reviewer reading a PR with a navigator session open wants
+            // both. Appended after, so a navigator note and a review
+            // comment on one line keep a stable order.
+            self.editor
+                .comment_boxes
+                .extend(self.review_boxes.iter().cloned());
             // A focused box that vanished (ignored elsewhere, cleared, or
             // re-anchored away) releases the keyboard back to the buffer.
             if let Some(focus) = &self.editor.comment_focus
@@ -23984,14 +24000,18 @@ impl App {
             self.status = String::from("Open a file from the PR first");
             return;
         };
-        let root = self.workspace_root().to_path_buf();
+        // The root that OWNS the open file, not the primary. In a
+        // multi-root workspace the two differ, and using the primary runs
+        // `gh` in the wrong repository — which answers about a different
+        // PR entirely rather than failing.
+        let root = self.active_workspace_root();
         // Relative to the REPOSITORY TOPLEVEL, not the workspace root. The
         // API's `path` is repo-relative, and the two coincide only when the
         // workspace root IS the toplevel — open croft on `repo/src` and
         // every comparison fails silently, so a file with review comments
         // reports having none. That is #139's rule; this is the same trap in
         // a new place.
-        let Some(repo_root) = self.git.status().repo_root.clone() else {
+        let Some(repo_root) = self.git_worker_for_root(&root).status().repo_root.clone() else {
             self.status = String::from("This folder is not inside a git repository");
             return;
         };
@@ -24059,12 +24079,12 @@ impl App {
             .iter()
             .filter(|t| matches!(t.anchor, crate::review_threads::Anchor::Outdated(_)))
             .count();
-        self.editor.comment_boxes = threads
+        self.review_boxes = threads
             .iter()
             .map(|t| crate::widgets::editor::CommentBox {
                 id: t.id,
                 line: t.box_line(lines),
-                author: t.title(),
+                author: t.title_for(lines),
                 body: t.body.clone(),
             })
             .collect();
