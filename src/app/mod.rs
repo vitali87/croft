@@ -23573,6 +23573,63 @@ impl App {
         }
     }
 
+    /// Re-root the workspace onto the host the active pane is ssh'd into
+    /// (#364).
+    ///
+    /// Reads the pane's foreground argv rather than its scrollback: what the
+    /// user typed may have scrolled away, been edited, or never been typed at
+    /// all (a shell function, a `Host` alias resolved by ssh itself), while
+    /// argv is what is actually running.
+    ///
+    /// The foreground PROCESS GROUP LEADER is what identifies the session,
+    /// and it is right for the case that matters: `ssh box` typed at a
+    /// prompt is its own group leader. A PIPELINE is the limit — `ssh box |
+    /// tee log` makes the whole pipeline one group whose leader is not
+    /// necessarily the ssh, so the command reports "not an SSH session"
+    /// rather than guessing. Measured rather than assumed: on zsh the leader
+    /// resolves to the LAST stage. Refusing is the right failure here, since
+    /// the alternative is walking the process tree to find an ssh somewhere
+    /// under the pane and offering to re-root onto a host the user piped
+    /// output from rather than one they are working on.
+    ///
+    /// Explicit rather than automatic, deliberately. The issue proposes a
+    /// status-bar prompt offering this on detection, which needs a per-host
+    /// opt-out, a memory of hosts that refused provisioning, and a decision
+    /// about how often to nag — none of which should be invented alongside
+    /// the detection itself. A command the user reaches for does the same
+    /// work and cannot interrupt anyone.
+    fn open_workspace_on_ssh_host(&mut self) {
+        let Some(term) = self.terminals.get(self.active_terminal) else {
+            self.status = String::from("No terminal pane is open");
+            return;
+        };
+        let Some(fg) = term.foreground_pid() else {
+            self.status = String::from("This pane is not running anything");
+            return;
+        };
+        let Some(cmd) = crate::widgets::terminal::process_cmdline(fg) else {
+            self.status = String::from("Could not read what this pane is running");
+            return;
+        };
+        let argv: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let targets = crate::remote::discover_ssh_targets();
+        match crate::remote::ssh_reroot_decision(&argv, &targets) {
+            Ok(host) => {
+                let alias = host.alias.clone();
+                // No path: the remote flow opens the login directory, which
+                // is where the ssh session started. Carrying the pane's
+                // remote cwd across would need the shell's OSC 7 report from
+                // the far side, and croft only trusts those against a local
+                // cwd it can verify.
+                self.request_remote_launch(alias, None);
+            }
+            // The message distinguishes "not ssh" from "ssh to a box croft
+            // has no config entry for": the second names the host, because
+            // adding it to ~/.ssh/config is the action available.
+            Err(why) => self.status = why,
+        }
+    }
+
     pub fn poll_connect_dialog(&mut self) -> bool {
         let Some(auth) = self.connect_auth.as_mut() else {
             return false;
@@ -31266,6 +31323,7 @@ impl App {
             Cmd::SessionParticipants => self.open_participants_picker(),
             Cmd::CollabCancelStream => self.collab_cancel_stream(),
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
+            Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::MarkAgentFileReviewed => {
                 match self.editor.path.clone() {
                     None => self.status = String::from("No file open"),
