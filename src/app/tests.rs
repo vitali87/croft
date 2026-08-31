@@ -38394,16 +38394,30 @@ fn folding_the_focused_pane_moves_focus_somewhere_visible() {
     app.active_terminal = 1;
     app.toggle_terminal_collapse(1);
     assert!(app.terminals[1].collapsed);
-    // The SPECIFIC pane, not merely "not the folded one": focus goes to the
-    // first pane still expanded, and naming it is what tells a deliberate
-    // hand-off from focus landing somewhere by accident.
-    assert_eq!(
-        app.active_terminal, 0,
-        "focus goes to the first pane still expanded"
-    );
+    // The SPECIFIC pane, not merely "not the folded one": naming it is what
+    // tells a deliberate hand-off from focus landing somewhere by accident.
+    // Pane 1's neighbours are equidistant, so this pins the left tie-break.
+    assert_eq!(app.active_terminal, 0, "ties go to the pane on the left");
     assert!(
         !app.terminals[app.active_terminal].collapsed,
         "and that pane is actually on screen"
+    );
+}
+
+#[test]
+fn folding_a_pane_hands_focus_to_its_neighbour_not_to_the_front_of_the_row() {
+    // The case above cannot tell "nearest" from "first": pane 1 of three is
+    // one step from both its neighbours, so the two rules agree there. Four
+    // panes with the LAST one folded separates them - nearest says 2, first
+    // says 0 - which is the whole of the difference between handing focus to
+    // a neighbour and throwing the user back across the panel.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(4);
+    app.active_terminal = 3;
+    app.toggle_terminal_collapse(3);
+    assert!(app.terminals[3].collapsed);
+    assert_eq!(
+        app.active_terminal, 2,
+        "focus goes to the neighbour, not to the first expanded pane"
     );
 }
 

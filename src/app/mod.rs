@@ -12881,9 +12881,24 @@ impl App {
         self.terminals[idx].collapsed = true;
         // Focus cannot stay on a pane that is now one column wide: it shows no
         // cursor, so the keystrokes would go somewhere the user cannot see
-        // them arrive. Hand it to the nearest pane still expanded.
+        // them arrive. Hand it to the NEAREST pane still expanded, ties going
+        // left, the way closing a pane hands focus to a neighbour rather than
+        // to the front of the row: folding the fourth of four panes should not
+        // throw the user back to the first.
+        //
+        // `position` was here first and returns the FIRST expanded pane, which
+        // is a different thing that happens to agree whenever the folded pane
+        // is near the left edge. The comment above already said "nearest", so
+        // the code was contradicting its own doc rather than merely being
+        // simpler than it.
         if self.active_terminal == idx
-            && let Some(next) = self.terminals.iter().position(|t| !t.collapsed)
+            && let Some(next) = self
+                .terminals
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| !t.collapsed)
+                .min_by_key(|(candidate, _)| candidate.abs_diff(idx))
+                .map(|(candidate, _)| candidate)
         {
             self.active_terminal = next;
             self.sync_focus_flags();
