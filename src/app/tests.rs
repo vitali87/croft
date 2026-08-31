@@ -1523,8 +1523,21 @@ fn cell_carrying(pane: &crate::widgets::terminal::PtyTerminal, needle: &str) -> 
     (area.y..area.y + area.height)
         .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
         .find(|&(c, r)| {
-            pane.line_text_at(c, r)
-                .is_some_and(|(text, _)| text.contains(needle))
+            // The cell must be ON the needle, not merely on a ROW containing
+            // it. `line_text_at` hands back the whole row plus the char index
+            // under the cell, and every column maps to an index (blanks
+            // included), so a `text.contains` test succeeds at the row's FIRST
+            // inner column whatever the needle's position. These fixtures print
+            // at column 0, which hid it; a row like `bash-5.2$ some_token`
+            // would have matched and clicked the `b`.
+            //
+            // A click lands on a cell, not a row, so the span is the claim.
+            pane.line_text_at(c, r).is_some_and(|(text, idx)| {
+                text.find(needle).is_some_and(|byte_start| {
+                    let start = text[..byte_start].chars().count();
+                    (start..start + needle.chars().count()).contains(&idx)
+                })
+            })
         })
 }
 
@@ -2475,8 +2488,14 @@ fn an_unmatched_modified_click_does_not_arm_the_tracker() {
     // which is the only condition it exists to cover. The negative assertion
     // at the end is satisfied by a click that lands on blank and selects
     // nothing, whether or not the tracker armed.
-    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
-    app.terminals[0].feed_bytes_for_test(b"hello_world_token some other text\r\n");
+    // ONE call, not two. `feed_bytes_for_test` holds the term mutex for a
+    // single `advance`, and the PTY reader locks the same mutex per chunk, so
+    // a reader blocked on the first call takes the lock at the handoff -
+    // exactly BETWEEN the two feeds - and the prompt prefixes the payload row,
+    // which is the state the decoy exists to prevent. Concatenated, the pair
+    // is atomic against the reader.
+    app.terminals[0]
+        .feed_bytes_for_test(b"a prompt got here first\r\nhello_world_token some other text\r\n");
     term.draw(|f| app.render(f)).unwrap();
     let (col, row) = cell_carrying(&app.terminals[0], "hello_world_token")
         .expect("the pane must show THIS test's token, or there is no word to mis-select");
@@ -2513,6 +2532,27 @@ fn an_unmatched_modified_click_does_not_arm_the_tracker() {
         "a plain click after an unmatched ctrl+click must not select a WORD: \
          the ctrl+click must not have armed the double-click tracker, but \
          selection was {selected:?}"
+    );
+
+    // The POSITIVE half, over the same cell. Without it, "the tracker stayed
+    // unarmed" and "word selection could never have happened here" are the
+    // same green: a click landing somewhere unselectable satisfies the
+    // negative whatever the tracker did.
+    //
+    // ONE more click, not two. The plain click above DID arm the tracker -
+    // that is the behaviour being contrasted with the ctrl+click, which must
+    // not - so this one pairs with it (`is_double` allows a one-column drift)
+    // and selects the word. A second click would then start a FRESH
+    // single-cell selection and wipe it, which is what the first draft of this
+    // control did and why it failed.
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.terminal()
+            .selection_text()
+            .contains("hello_world_token"),
+        "a PLAIN click pairing with the plain click above must select the \
+         word: the tracker arms on plain clicks and refuses only modified \
+         ones, and without this the negative above proves nothing"
     );
 }
 
@@ -2557,8 +2597,7 @@ fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal(
     // arrived, so the click has a real word to wrongly select.
     // A line of output IN FRONT of the token, so the ordering that used to
     // break these tests is the one this test always runs (#397).
-    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
-    app.terminals[0].feed_bytes_for_test(b"hello_world_token\r\n");
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\nhello_world_token\r\n");
     term.draw(|f| app.render(f)).unwrap();
     // SEARCHED, not assumed. This test already carried a positive control, so
     // a displaced token failed it outright rather than passing vacuously - the
@@ -2577,9 +2616,17 @@ fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal(
     let (text, idx) = app.terminals[0]
         .line_text_at(col, row)
         .expect("the click must resolve to a terminal grid cell, not the border");
+    // `idx < text.len()` was a tautology - `idx` is a char index into a row
+    // that by then certainly contains the token - so this asserted the row and
+    // called it the cell. The span is the claim a click makes.
+    let start = text
+        .find("hello_world_token")
+        .map(|b| text[..b].chars().count())
+        .expect("the row must carry the token");
     assert!(
-        text.contains("hello_world_token") && idx < text.len(),
-        "the click must land ON the token: got {text:?} at {idx}"
+        (start..start + "hello_world_token".chars().count()).contains(&idx),
+        "the click must land ON the token, not merely on its row: \
+         got {text:?} at char {idx}, token at {start}"
     );
 
     let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
@@ -2780,8 +2827,7 @@ fn a_prefix_click_defers_to_the_builtin_for_a_file_reference_too() {
     // rather than `terminal_url_click`. The audit that found the others was
     // scoped to "tests that feed an OSC 8 link", which excludes a bare file
     // reference BY CONSTRUCTION - so the scope, not the code, is what hid it.
-    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
-    app.terminals[0].feed_bytes_for_test(b"target_file.rs:1:1\r\n");
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\ntarget_file.rs:1:1\r\n");
     term.draw(|f| app.render(f)).unwrap();
 
     let (col, row) = cell_carrying(&app.terminals[0], "target_file.rs:1:1")
@@ -2856,8 +2902,13 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
     // Trailing newline parks the cursor on the NEXT row: without it any late
     // shell output writes onto the link's own row.
-    app.terminals[0]
-        .feed_bytes_for_test(b"\x1b]8;;mailto:x@example.com\x1b\\link\x1b]8;;\x1b\\\r\n");
+    // A decoy link ahead of the real one, so the exact-status assertion below
+    // has a red state. Without it, reverting that assertion to `contains`
+    // leaves the suite green - the tightening was unpinned here even though
+    // its twin in this PR was pinned.
+    app.terminals[0].feed_bytes_for_test(
+        b"\x1b]8;;mailto:decoy@example.com\x1b\\decoy\x1b]8;;\x1b\\\r\n\x1b]8;;mailto:x@example.com\x1b\\link\x1b]8;;\x1b\\\r\n",
+    );
     let (col, row) = (area.y..area.y + area.height)
         .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
         .find(|&(c, r)| {
