@@ -186,22 +186,75 @@ fn split_id(candidate: &str, gallery: Gallery) -> Result<ExtensionId> {
     })
 }
 
-/// A theme label reduced to a safe FILE STEM.
+/// A scratch directory that removes itself.
+///
+/// The import has many failure points after the directory exists — the
+/// download, the gzip sniff, two member reads, the manifest parse, the theme
+/// choice, the include walk — and every early return from any of them used
+/// to leave the `.vsix` and everything unpacked from it behind in the temp
+/// directory. Ownership belongs to a value whose `Drop` runs on the error
+/// path as readily as the success one, rather than to a line at the bottom
+/// of a function that an error never reaches.
+pub struct Scratch {
+    path: PathBuf,
+}
+
+impl Scratch {
+    /// Create a fresh scratch directory, owner-only where the platform can
+    /// express that.
+    ///
+    /// `create_dir` (not `create_dir_all`) so an existing path is an error
+    /// rather than something to adopt or delete, and mode `0o700` so the
+    /// inherited umask cannot leave it group- or world-writable: the writes
+    /// into it follow symlinks, so a permissive umask would let a local user
+    /// plant one between the create and the write.
+    pub fn new(path: PathBuf) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .with_context(|| format!("making {}", path.display()))?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(&path).with_context(|| format!("making {}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    /// The directory itself.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // Nothing useful to do with a failure here, and it must not mask the
+        // error that is usually already on its way out.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A theme label reduced to a safe file stem.
 ///
 /// The label is free-form text from inside the archive — the one field on
 /// `ContributedTheme` that no charset rule has touched, unlike the publisher
-/// and name, which `split_id` restricts. Interpolating it into a path is a
+/// and name, which `split_id` restricts. Building a path out of one is a
 /// write-anywhere primitive: `"../../x"` climbs out of the scratch directory,
 /// and `Path::join` with an ABSOLUTE label discards the base entirely, so the
-/// write lands exactly where the label says. `extract_member` guards the
-/// archive read; this guards the write that follows it, which would otherwise
-/// walk straight past that guard.
+/// write lands exactly where the label says.
+///
+/// No caller here needs it any more: `extract_theme_chain` writes every
+/// member at its own archive-relative path, so the label never reaches the
+/// filesystem at all and the hazard is gone by construction rather than by
+/// sanitising. It stays, with its tests, because the property is the kind
+/// that gets rediscovered the hard way — the next caller to name a file after
+/// a theme should find this instead of writing it again.
 ///
 /// Same class as `split_id`'s: keep `[A-Za-z0-9_-]`, and let everything else
-/// become a separator. That leaves a stem recognisably derived from the label
-/// (so a marketplace import and a file import of the same theme still agree on
-/// an id) while containing no separator, no `.` and no `..`. A label with
-/// nothing to keep falls back to a constant rather than an empty name.
+/// become a separator.
+#[allow(dead_code)]
 pub fn file_stem(label: &str) -> String {
     let mapped: String = label
         .chars()
@@ -400,6 +453,101 @@ fn check_host(url: &str) -> Result<()> {
         bail!("refusing to fetch from {host} — not a marketplace host");
     }
     Ok(())
+}
+
+/// How many `include` hops a theme may take inside the archive.
+///
+/// Matches the converter's own `MAX_INCLUDE_DEPTH`: this walk exists to put
+/// the files where the converter will look for them, so refusing a chain it
+/// would accept — or accepting one it would refuse — is the wrong shape.
+const MAX_CHAIN: usize = 8;
+
+/// Extract the chosen theme AND every file its `include` chain names,
+/// keeping each at its own archive-relative path. Returns the path of the
+/// theme itself.
+///
+/// The naive version wrote the one member out under a flat name at the
+/// scratch root, which silently broke every theme that extends another. That
+/// is not a rare shape: of the eight themes VS Code itself ships, four use
+/// `include`, and `dark_modern` → `dark_plus` → `dark_vs` is two hops deep.
+/// The converter resolves an include RELATIVE TO THE INCLUDING FILE, so the
+/// layout is load-bearing and flattening it destroys exactly the information
+/// the resolution needs.
+///
+/// Traversal is refused here as well as in the converter. The converter's
+/// check is what protects a theme the user already has; this one protects
+/// the extraction itself, which runs first and writes files.
+pub fn extract_theme_chain(vsix: &Path, theme_path: &str, scratch: &Path) -> Result<PathBuf> {
+    let mut pending = vec![theme_path.trim_start_matches("./").to_string()];
+    let mut seen: Vec<String> = Vec::new();
+    let mut entry: Option<PathBuf> = None;
+    while let Some(rel) = pending.pop() {
+        // A cycle would otherwise spin until the depth cap; naming it is a
+        // better error than "chain too deep".
+        if seen.contains(&rel) {
+            continue;
+        }
+        if seen.len() >= MAX_CHAIN {
+            bail!("include chain longer than {MAX_CHAIN} files (a cycle?)");
+        }
+        let text = read_member(vsix, &format!("extension/{rel}"), scratch)
+            .with_context(|| format!("reading the theme member {rel}"))?;
+        let dest = contained_scratch_path(scratch, &rel)?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("making {}", parent.display()))?;
+        }
+        std::fs::write(&dest, &text).with_context(|| format!("writing {}", dest.display()))?;
+        if entry.is_none() {
+            entry = Some(dest);
+        }
+        seen.push(rel.clone());
+        if let Some(inc) = include_of(&text) {
+            // Resolved against the INCLUDING file's directory, exactly as the
+            // converter will resolve it.
+            let base = Path::new(&rel).parent().unwrap_or(Path::new(""));
+            let joined = base.join(inc.trim_start_matches("./"));
+            let next = joined.to_string_lossy().replace('\\', "/");
+            pending.push(next);
+        }
+    }
+    entry.ok_or_else(|| anyhow::anyhow!("no theme file extracted"))
+}
+
+/// The `include` field of a theme document, if it names one.
+///
+/// Comments and trailing commas are stripped first, through the same
+/// `strip_jsonc` the converter uses: a theme carrying them is ordinary, and a
+/// stricter parse here would skip includes on files the converter then goes
+/// on to read successfully.
+fn include_of(text: &str) -> Option<String> {
+    let stripped = crate::tasks::strip_jsonc(text);
+    let v: serde_json::Value = serde_json::from_str(&stripped).ok()?;
+    v.get("include")?.as_str().map(str::to_string)
+}
+
+/// Join `rel` under `scratch`, refusing anything that would land outside it.
+///
+/// The path comes from inside the archive, so it gets the same treatment as
+/// any other attacker-supplied path: no absolute paths, no `..`, no escaping
+/// the directory this import owns.
+fn contained_scratch_path(scratch: &Path, rel: &str) -> Result<PathBuf> {
+    let candidate = Path::new(rel);
+    if candidate.is_absolute() {
+        bail!("theme path {rel} is absolute");
+    }
+    let mut out = scratch.to_path_buf();
+    for comp in candidate.components() {
+        match comp {
+            std::path::Component::Normal(c) => out.push(c),
+            std::path::Component::CurDir => {}
+            _ => bail!("theme path {rel} escapes the import directory"),
+        }
+    }
+    if !out.starts_with(scratch) {
+        bail!("theme path {rel} escapes the import directory");
+    }
+    Ok(out)
 }
 
 /// The agent every request here goes through: one timeout, and redirects
@@ -676,6 +824,169 @@ mod tests {
         assert_eq!(
             host_of("https://evil.test@open-vsx.org/x").as_deref(),
             Some("open-vsx.org")
+        );
+    }
+
+    /// Build a `.vsix` holding the given `(member, contents)` pairs.
+    fn make_vsix(path: &Path, members: &[(&str, &str)]) {
+        use std::io::Write as _;
+        let f = std::fs::File::create(path).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in members {
+            z.start_file(*name, opts).unwrap();
+            z.write_all(body.as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+    }
+
+    /// A theme that extends another must arrive with its whole chain, laid
+    /// out the way the archive had it.
+    ///
+    /// This is not an exotic shape: of the eight themes VS Code itself ships,
+    /// four use `include`, and `dark_modern` → `dark_plus` → `dark_vs` is two
+    /// hops. Writing the chosen member out under a flat name at the scratch
+    /// root — which is what this did first — resolves nothing, because the
+    /// converter looks for an include RELATIVE TO THE INCLUDING FILE.
+    #[test]
+    fn a_theme_arrives_with_its_whole_include_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let vsix = dir.path().join("x.vsix");
+        make_vsix(
+            &vsix,
+            &[
+                (
+                    "extension/themes/dark_modern.json",
+                    r##"{"include": "./dark_plus.json", "colors": {"editor.background": "#111111"}}"##,
+                ),
+                (
+                    // A comment, to prove the include is found through JSONC
+                    // rather than a strict parse.
+                    "extension/themes/dark_plus.json",
+                    "{\n  // extends the base\n  \"include\": \"./dark_vs.json\"\n}",
+                ),
+                (
+                    "extension/themes/dark_vs.json",
+                    r##"{"name": "Dark Base", "colors": {"editor.foreground": "#eeeeee"}}"##,
+                ),
+                // A member NOT in the chain must not be extracted.
+                ("extension/themes/unrelated.json", r#"{"name": "Nope"}"#),
+            ],
+        );
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+
+        let entry = extract_theme_chain(&vsix, "./themes/dark_modern.json", &scratch).unwrap();
+
+        // The entry keeps its archive-relative position, not a flat name.
+        assert!(
+            entry.ends_with("themes/dark_modern.json"),
+            "entry at {}",
+            entry.display()
+        );
+        // Every file in the chain is present, at the layout the includes need.
+        for name in ["dark_modern.json", "dark_plus.json", "dark_vs.json"] {
+            assert!(
+                scratch.join("themes").join(name).is_file(),
+                "{name} missing from the extracted chain"
+            );
+        }
+        // And only the chain: an unrelated theme in the same archive stays in
+        // it, because this lifts one theme rather than unpacking the package.
+        assert!(
+            !scratch.join("themes/unrelated.json").exists(),
+            "a member outside the chain was extracted"
+        );
+        // The converter can now actually follow it.
+        let converted = crate::vscode_theme::convert_file(&entry, None).unwrap();
+        assert!(
+            converted.manifest.contains("Dark Base"),
+            "the base theme's name did not survive the chain: {}",
+            converted.manifest
+        );
+    }
+
+    /// A chain that points outside the archive, or loops, is refused.
+    #[test]
+    fn a_hostile_include_chain_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("s");
+
+        // Traversal in the include: the extraction refuses before the
+        // converter ever sees it.
+        let vsix = dir.path().join("t.vsix");
+        make_vsix(
+            &vsix,
+            &[(
+                "extension/themes/a.json",
+                r#"{"include": "../../../../etc/passwd"}"#,
+            )],
+        );
+        std::fs::create_dir_all(&scratch).unwrap();
+        let err = extract_theme_chain(&vsix, "themes/a.json", &scratch).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("escapes") || format!("{err:#}").contains("reading"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !dir.path().join("etc").exists() && !scratch.join("../etc").exists(),
+            "traversal wrote outside the scratch directory"
+        );
+
+        // A cycle terminates rather than spinning to the depth cap.
+        let cyc = dir.path().join("c.vsix");
+        make_vsix(
+            &cyc,
+            &[
+                ("extension/a.json", r#"{"include": "./b.json"}"#),
+                ("extension/b.json", r#"{"include": "./a.json"}"#),
+            ],
+        );
+        let s2 = dir.path().join("s2");
+        std::fs::create_dir_all(&s2).unwrap();
+        // Both files extract, the cycle is noticed, and it returns rather
+        // than looping.
+        let entry = extract_theme_chain(&cyc, "a.json", &s2).unwrap();
+        assert!(entry.ends_with("a.json"));
+        assert!(
+            s2.join("b.json").is_file(),
+            "the cycle's other half is there"
+        );
+    }
+
+    /// The scratch directory removes itself, on the failure path too.
+    #[test]
+    fn the_scratch_directory_cleans_up_after_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch");
+        {
+            let scratch = Scratch::new(path.clone()).unwrap();
+            std::fs::write(scratch.path().join("leftover.bin"), b"x").unwrap();
+            assert!(path.is_dir(), "staging: the directory exists while held");
+
+            // A second create on the same path is an ERROR, not an adoption:
+            // that is what makes a planted directory fail loudly instead of
+            // being deleted or written into.
+            assert!(
+                Scratch::new(path.clone()).is_err(),
+                "an existing path must not be adopted"
+            );
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "the scratch dir must not be group- or world-accessible: {mode:o}"
+                );
+            }
+        }
+        assert!(
+            !path.exists(),
+            "the scratch directory outlived its guard, contents and all"
         );
     }
 

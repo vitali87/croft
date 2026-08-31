@@ -1128,20 +1128,18 @@ fn theme_import(
     // with a read error, rather than being passed to the marketplace where
     // the user plainly meant it to go.
     let local = Path::new(reference);
-    let (source, scratch) = if local.is_file() {
+    let (source, _scratch) = if local.is_file() {
         println!("Importing from {}", local.display());
         (local.to_path_buf(), None)
     } else {
         let (path, dir) = fetch_marketplace_theme(reference, theme)?;
         (path, Some(dir))
     };
-    let converted = crate::vscode_theme::convert_file(&source, id);
-    // The archive and everything lifted from it go whether the conversion
-    // succeeded or not: nothing downloaded outlives this command.
-    if let Some(dir) = scratch {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    let converted = converted?;
+    // `_scratch` is held until this function returns, so the archive and
+    // everything lifted from it survive the conversion and go immediately
+    // after it — on the error path as well, since the guard drops either
+    // way. Nothing downloaded outlives this command.
+    let converted = crate::vscode_theme::convert_file(&source, id)?;
     if dry_run {
         print!("{}", converted.manifest);
         return Ok(());
@@ -1192,46 +1190,40 @@ fn scratch_nonce() -> u128 {
         ^ (&scratch_nonce as *const _ as u128)
 }
 
-fn fetch_marketplace_theme(reference: &str, wanted: Option<&str>) -> Result<(PathBuf, PathBuf)> {
+fn fetch_marketplace_theme(
+    reference: &str,
+    wanted: Option<&str>,
+) -> Result<(PathBuf, crate::marketplace::Scratch)> {
     use crate::marketplace;
     let id = marketplace::parse_ref(reference)?;
     // A private scratch in the temp dir rather than a dev-only temp crate:
-    // this is a production path, and the caller removes the whole directory
-    // when it is done with it.
+    // this is a production path. `Scratch` owns it and removes it on drop,
+    // so every failure below cleans up as reliably as success does.
     //
-    // The name carries randomness, and the directory is created with
-    // `create_dir` so an existing path is an ERROR rather than something to
-    // delete. A PID-named directory is guessable in a shared /tmp, and the
-    // writes below (unlike `extract_member`, which refuses symlinked
-    // components) follow symlinks — so a planted link would have redirected
-    // them. Deleting whatever sat at the guessed name first, as this did,
-    // turned that into a way to destroy a directory of the attacker's
-    // choosing.
-    let scratch = std::env::temp_dir().join(format!(
+    // The name carries randomness, the directory is created with `create_dir`
+    // so an existing path is an ERROR rather than something to delete, and it
+    // is mode 0o700 so a permissive umask cannot leave it writable by another
+    // local user — the writes here follow symlinks, unlike `extract_member`.
+    let scratch = marketplace::Scratch::new(std::env::temp_dir().join(format!(
         "croft-theme-import-{}-{:x}",
         std::process::id(),
         scratch_nonce()
-    ));
-    std::fs::create_dir(&scratch).with_context(|| format!("making {}", scratch.display()))?;
+    )))?;
+    let dir = scratch.path();
     println!(
         "Downloading {}.{} from the marketplace…",
         id.publisher, id.name
     );
-    let vsix = marketplace::download_vsix(&id, &scratch)?;
-    let pkg = marketplace::read_member(&vsix, "extension/package.json", &scratch)?;
+    let vsix = marketplace::download_vsix(&id, dir)?;
+    let pkg = marketplace::read_member(&vsix, "extension/package.json", dir)?;
     // The NLS bundle is optional — most extensions have none — so a missing
     // or unreadable one leaves the labels as written rather than failing.
-    let nls = marketplace::read_member(&vsix, "extension/package.nls.json", &scratch).ok();
+    let nls = marketplace::read_member(&vsix, "extension/package.nls.json", dir).ok();
     let themes = marketplace::contributed_themes(&pkg, nls.as_deref())?;
     let picked = marketplace::pick_theme(&themes, wanted)?;
     println!("  taking \"{}\" ({})", picked.label, picked.path);
-    let member = format!("extension/{}", picked.path);
-    let text = marketplace::read_member(&vsix, &member, &scratch)?;
-    // Write it under a name the converter's own id-derivation can use, so a
-    // marketplace import and a file import of the same theme agree.
-    let out = scratch.join(format!("{}.json", marketplace::file_stem(&picked.label)));
-    std::fs::write(&out, text).with_context(|| format!("writing {}", out.display()))?;
-    Ok((out, scratch))
+    let entry = marketplace::extract_theme_chain(&vsix, &picked.path, dir)?;
+    Ok((entry, scratch))
 }
 
 fn setup_ghostty(yes: bool) -> Result<()> {
