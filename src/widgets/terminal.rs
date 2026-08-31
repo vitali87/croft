@@ -737,9 +737,9 @@ struct StoredMark {
     /// Positions are not identity here. Three paths remove marks —
     /// `marks_snapshot` GCs those past the scrollback floor, the reader drops
     /// the oldest at `MARKS_MAX`, and a destructive screen wipe clears the
-    /// list outright — and the first two shift every index below them down. A caller holding
-    /// "index 3" is holding a slot, not a command, and after an eviction that
-    /// slot silently names a different one. An id turns that into "command
+    /// list outright — and the first two shift every index below them down.
+    /// A caller holding "index 3" is holding a slot, not a command, and after
+    /// an eviction that slot silently names a different one. An id turns that into "command
     /// 41": if 41 is gone the caller learns it is gone instead of reading 42.
     ///
     /// The counter is never reset, including by the wipe, so an id is not
