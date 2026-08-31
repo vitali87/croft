@@ -47,6 +47,8 @@ pub const CHANNEL_DAP: &str = "Debug Adapter";
 pub const CHANNEL_GIT: &str = "Git";
 pub const CHANNEL_PROVISION: &str = "Server Provisioning";
 pub const CHANNEL_TESTS: &str = "Test Runner";
+/// Fleet run results, one line per host plus the summary (#363).
+pub const CHANNEL_FLEET: &str = "Fleet";
 /// Notification-sink delivery failures (#358).
 pub const CHANNEL_NOTIFICATIONS: &str = "Notifications";
 

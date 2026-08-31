@@ -36595,6 +36595,63 @@ fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
     );
     assert!(app.http_run.is_none(), "nothing was sent");
 }
+/// #363: a fleet run does not block the event loop, and its results arrive
+/// through the channel like every other background answer.
+///
+/// The blocking version is the tempting one — `run_on_hosts` returns a
+/// `Vec`, so calling it inline reads naturally — and it freezes the editor
+/// for up to `FLEET_TIMEOUT` while the network answers. The user could not
+/// scroll, type, or cancel. This asserts the split: the command returns at
+/// once, and a later drain reports.
+#[test]
+fn a_fleet_run_reports_through_the_channel_rather_than_blocking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Nothing in flight: a drain finds nothing and says so, rather than
+    // blocking or inventing an empty result.
+    assert!(!app.drain_fleet_results(), "no run, nothing to report");
+
+    // Feed a result as the worker thread would.
+    let results = vec![
+        crate::fleet::HostResult {
+            host: String::from("a"),
+            output: String::from("5.15.0"),
+            exit: Some(0),
+        },
+        crate::fleet::HostResult {
+            host: String::from("b"),
+            output: String::from("5.15.0"),
+            exit: Some(0),
+        },
+        crate::fleet::HostResult {
+            host: String::from("odd"),
+            output: String::from("6.1.0"),
+            exit: Some(0),
+        },
+        crate::fleet::HostResult {
+            host: String::from("down"),
+            output: String::from("timed out"),
+            exit: None,
+        },
+    ];
+    app.fleet_running = true;
+    app.fleet_tx.send(results).unwrap();
+
+    assert!(app.drain_fleet_results(), "a delivered result must report");
+    assert!(!app.fleet_running, "the run is no longer in flight");
+    assert!(
+        app.status.contains("2 identical") && app.status.contains("1 differ"),
+        "the summary must reach the user: {}",
+        app.status
+    );
+    assert!(app.status.contains("1 failed"), "status: {}", app.status);
+
+    // And the channel is empty again, so a second drain is a no-op rather
+    // than replaying the same run.
+    assert!(!app.drain_fleet_results(), "results are consumed once");
+}
+
 /// #371: the scrubber's keys move through history, and anything else keeps
 /// its normal meaning.
 ///
