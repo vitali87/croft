@@ -465,7 +465,19 @@ impl Cli {
                 crate::collab_agent::run(&socket, name.unwrap_or_else(|| "claude".into()))
             }
             Some(CliCommand::View { path, as_ext }) => {
-                crate::view_ipc::run(&path, as_ext.as_deref(), &crate::app::croft_cache_dir())
+                // Printed and exited here rather than returned: an `Err` out
+                // of `run` reaches anyhow's `Debug`, which appends a full
+                // Rust backtrace whenever RUST_BACKTRACE is set, and it is
+                // set in this repo's CI, where the one-line-of-stderr test
+                // measured 42. Someone running `croft view` at a prompt
+                // should get a sentence about their file, not croft's stack.
+                if let Err(e) =
+                    crate::view_ipc::run(&path, as_ext.as_deref(), &crate::app::croft_cache_dir())
+                {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                Ok(())
             }
             Some(CliCommand::Pair {
                 workspace,

@@ -180,8 +180,8 @@ pub fn sanitize_extension(raw: &str) -> Option<String> {
 ///
 /// Needed because CSV has no magic bytes: `cat data.csv | croft view -` is
 /// in the issue's acceptance criteria, and by content a CSV is just text.
-/// The test is deliberately strict — every one of the first lines must
-/// carry the SAME non-zero count of the delimiter — because the cost of a
+/// The test is deliberately strict (every one of the first lines must
+/// carry the SAME non-zero count of the delimiter) because the cost of a
 /// false positive (prose opening in a grid) is worse than the cost of a
 /// false negative (a `--as csv` away).
 pub fn looks_delimited(bytes: &[u8]) -> Option<&'static str> {
@@ -505,7 +505,7 @@ mod tests {
             // Read the request BEFORE hanging up. Dropping straight after
             // accept makes the kind depend on whether the client's write
             // landed first: EPIPE if not, EOF if so. Reading first pins the
-            // case this test is about — croft took the request and died.
+            // case this test is about: croft took the request and died.
             let _ = read_request(&stream);
             drop(stream);
         });

@@ -28159,9 +28159,6 @@ impl App {
         }
     }
 
-    /// Check the relay inbox for completed pulls and surface them in the
-    /// explorer. Returns true if any pending pull resolved (success,
-    /// failure, or timeout) so the main loop knows to redraw.
     /// Bind this croft's `croft view` socket and publish it to panes.
     ///
     /// Keyed by pid so two crofts on one box never contend, and exported
@@ -28249,6 +28246,9 @@ impl App {
         }
     }
 
+    /// Check the relay inbox for completed pulls and surface them in the
+    /// explorer. Returns true if any pending pull resolved (success,
+    /// failure, or timeout) so the main loop knows to redraw.
     pub fn drain_remote_pulls(&mut self) -> bool {
         if self.pending_remote_pulls.is_empty() {
             return false;
@@ -44030,7 +44030,7 @@ fn prepare_view_listener(path: &Path) -> std::io::Result<std::os::unix::net::Uni
 ///
 /// A Unix socket is not auto-unlinked, so every croft that dies leaves its
 /// file behind. An `impl Drop` would clean up the tidy exits and none of the
-/// others — a SIGKILL, an OOM kill, a panic in another thread — and those are
+/// others (a SIGKILL, an OOM kill, a panic in another thread), and those are
 /// exactly the cases that litter, so the sweep is the mechanism that has to
 /// exist and Drop would only duplicate its easy half.
 ///
