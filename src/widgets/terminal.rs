@@ -663,6 +663,15 @@ pub struct PtyTerminal {
     /// (#357). Written by the reader thread as chunks arrive; bounded by
     /// bytes, so a `yes`-style flood evicts rather than grows.
     rewind: Arc<std::sync::Mutex<crate::rewind::RewindBuffer>>,
+    /// The monotonic zero for [`Self::rewind`]'s timestamps, so they cannot
+    /// go backwards under a clock correction.
+    ///
+    /// Test-only: the reader thread owns its own copy of the same `Instant`
+    /// (it is `Copy`, taken before the closure captures it), so on the live
+    /// path this field has no reader. It exists so `feed_bytes_for_test`
+    /// stamps frames on the same timeline the reader would.
+    #[cfg(test)]
+    rewind_epoch: std::time::Instant,
     /// Test-only capture of every byte written toward the child's stdin.
     #[cfg(test)]
     written_for_test: Arc<std::sync::Mutex<Vec<u8>>>,
@@ -1726,6 +1735,14 @@ impl PtyTerminal {
             crate::rewind::DEFAULT_CAPACITY_BYTES,
         )));
         let rewind_for_thread = rewind.clone();
+        // MONOTONIC, not the wall clock. Every read the buffer offers —
+        // `span_ms`, `replay_from`, the orphan-keyframe sweep — assumes the
+        // frames are ordered by `at_ms`, and `SystemTime` can step backwards
+        // across an NTP correction or a manual set. A frame recorded during
+        // such a step lands before its predecessors and becomes unreachable
+        // through the only read API there is, which is a silent loss rather
+        // than a visible fault. `Instant` cannot go backwards.
+        let rewind_epoch = std::time::Instant::now();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel::<FinishedCommand>();
         let osc7_cwd = Arc::new(std::sync::Mutex::new(Option::<std::path::PathBuf>::None));
         let osc7_for_thread = osc7_cwd.clone();
@@ -1921,11 +1938,14 @@ impl PtyTerminal {
                         // anything reaching back for `term` would deadlock.
                         // `push` returns a keyframe request rather than
                         // rendering one for exactly that reason.
+                        // Poisons independently of `term` (std Mutex vs
+                        // alacritty's FairMutex): a panic taken under this
+                        // lock disables recording for the pane's life, and
+                        // the `if let Ok` below degrades to silence rather
+                        // than propagating. Acceptable for a cache, but it
+                        // is not the same failure mode as `term`'s.
                         if let Ok(mut rb) = rewind_for_thread.lock() {
-                            let at = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0);
+                            let at = rewind_epoch.elapsed().as_millis() as u64;
                             // The keyframe request is dropped for now: this is
                             // the recording half, and nothing replays yet. The
                             // overlay that does will honour it here, taking the
@@ -2112,6 +2132,8 @@ impl PtyTerminal {
             palette: crate::theme::VSCODE_ANSI,
             images,
             rewind,
+            #[cfg(test)]
+            rewind_epoch,
             #[cfg(test)]
             written_for_test: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
@@ -2983,10 +3005,7 @@ impl PtyTerminal {
         // the recording pass while the real path recorded nothing — it would
         // be standing in for the wiring rather than driving it.
         if let Ok(mut rb) = self.rewind.lock() {
-            let at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+            let at = self.rewind_epoch.elapsed().as_millis() as u64;
             rb.push(at, bytes);
         }
         let mut p = Processor::<StdSyncHandler>::new();
@@ -5235,6 +5254,37 @@ mod tests {
         assert!(
             term.take_dirty(),
             "write_input must mark the terminal dirty"
+        );
+    }
+
+    /// #357: the REAL reader thread records output into the rewind buffer.
+    ///
+    /// The app-level test drives `feed_bytes_for_test`, a `#[cfg(test)]`
+    /// sibling hand-edited to mirror the reader. That proves the buffer works
+    /// but not that the production path uses it — deleting the reader's
+    /// `rb.push` leaves it green, which was measured, not assumed. This
+    /// spawns a real shell and reads what the reader thread actually stored.
+    #[test]
+    fn the_reader_thread_records_shell_output_for_rewind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        // The needle only ever appears as command OUTPUT, so matching it in
+        // the buffer proves the recorded bytes came through the pty rather
+        // than from the echoed input line.
+        term.write_input(b"echo REWIND_$(echo recorded)\n");
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(2000),
+            "the shell to print the needle",
+            || term.visible_text().contains("REWIND_recorded"),
+        );
+
+        let rb = term.rewind().lock().unwrap();
+        let (_, frames) = rb.replay_from(u64::MAX);
+        let seen: Vec<u8> = frames.iter().flat_map(|f| f.data.clone()).collect();
+        assert!(
+            String::from_utf8_lossy(&seen).contains("REWIND_recorded"),
+            "the reader thread parsed output without recording it: {} bytes held",
+            rb.bytes()
         );
     }
 

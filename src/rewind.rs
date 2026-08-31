@@ -48,7 +48,12 @@
 use std::collections::VecDeque;
 
 /// A default that holds a busy session's last few minutes without being felt.
-/// Overridable per the issue's "default 10 minutes or 64 MB, configurable".
+///
+/// PER PANE, and not yet configurable: #357 asks for a setting and this ships
+/// the constant, so ten busy panes is a 640 MB ceiling with no way to lower
+/// it. Tolerable only because the buffer grows to what is actually printed —
+/// an idle pane costs nothing, and a closed one is reaped with its pane — but
+/// the prefs key is owed before the scrubber ships, not after.
 pub const DEFAULT_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 
 /// How often a keyframe is taken, in bytes of output between snapshots.
@@ -62,8 +67,15 @@ pub const KEYFRAME_INTERVAL_BYTES: usize = 256 * 1024;
 /// One chunk of terminal output, as it arrived.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
-    /// Milliseconds since the buffer started, so a scrub position maps to a
-    /// frame without consulting a wall clock that may have stepped.
+    /// Milliseconds since the buffer started, from a MONOTONIC source.
+    ///
+    /// The pane passes `Instant::elapsed()` rather than a wall clock for a
+    /// reason that binds any other caller too: every read here — `span_ms`,
+    /// `replay_from`, the orphan-keyframe sweep — compares these values, so a
+    /// clock that steps backwards puts a frame before its predecessors and
+    /// out of the range a scrubber would ask for. `span_ms` covers such a
+    /// frame rather than reporting an inverted range, but the ordering is
+    /// still the caller's to keep.
     pub at_ms: u64,
     pub data: Vec<u8>,
 }
@@ -119,9 +131,15 @@ impl RewindBuffer {
             data: data.to_vec(),
         });
         self.evict();
+        // Counts RETAINED bytes: a write truncated to the budget, or one
+        // evicted moments later, contributes what the buffer actually holds.
         self.since_keyframe += data.len();
         if self.since_keyframe >= KEYFRAME_INTERVAL_BYTES {
-            self.since_keyframe = 0;
+            // Reduced, not zeroed. A single write spanning several intervals
+            // would otherwise ask once and discard the surplus, so the next
+            // keyframe would come a full interval after a write that had
+            // already earned three.
+            self.since_keyframe -= KEYFRAME_INTERVAL_BYTES;
             return true;
         }
         false
@@ -150,22 +168,38 @@ impl RewindBuffer {
         self.drop_orphan_keyframes();
     }
 
-    /// Discard keyframes older than the oldest surviving frame.
+    /// Discard keyframes that can no longer start an exact replay.
     ///
-    /// A keyframe whose following frames have been evicted cannot be replayed
-    /// forward to anything, and keeping it would let [`replay_from`] pick a
-    /// start point with a gap after it — silently rendering a screen that
-    /// never existed. One keyframe at or before the oldest frame is kept,
-    /// because that is the one a scrub to the very start replays from.
+    /// A keyframe is a valid start point only if every frame between it and
+    /// the target still survives. Once eviction removes output that followed
+    /// a keyframe, replaying from it and applying what remains renders a
+    /// screen that never existed — the frames that bridged the gap are gone.
+    ///
+    /// So a keyframe strictly OLDER than the oldest surviving frame is
+    /// dropped, including the last one. An earlier version kept the final
+    /// keyframe unconditionally, on the theory that a scrub to the very
+    /// start needs something to replay from; that was wrong in the way that
+    /// matters, because the thing it kept was precisely a start point with a
+    /// hole after it. Having no keyframe is honest — [`replay_from`] then
+    /// replays from a blank screen, which is slower and correct.
     fn drop_orphan_keyframes(&mut self) {
         let Some(oldest) = self.frames.front().map(|f| f.at_ms) else {
-            // No frames: only the newest keyframe can still be meaningful.
+            // No frames at all. This is NOT the orphan case: a keyframe
+            // taken before any output — or after every frame has aged out —
+            // is a valid start point for everything that arrives next, and
+            // clearing here would drop the screen a fresh pane replays from.
+            // Only the newest is worth keeping; the older ones describe
+            // screens no surviving frame can reach.
             while self.keyframes.len() > 1 {
                 self.keyframes.pop_front();
             }
             return;
         };
         while self.keyframes.len() > 1 && self.keyframes[1].at_ms <= oldest {
+            self.keyframes.pop_front();
+        }
+        // The survivor is only usable if it does not predate the frames.
+        if self.keyframes.front().is_some_and(|k| k.at_ms < oldest) {
             self.keyframes.pop_front();
         }
     }
@@ -180,8 +214,16 @@ impl RewindBuffer {
     }
 
     /// The span the buffer can rewind over, as `(oldest, newest)` in ms.
+    ///
+    /// Taken as min/max rather than front/back. The pane feeds a monotonic
+    /// clock so the two agree there, but `push` is public: a caller using a
+    /// wall clock that stepped backwards would otherwise get an INVERTED
+    /// span, and a scrubber sizing its timeline from `end - start` on that
+    /// would underflow rather than show a short range.
     pub fn span_ms(&self) -> Option<(u64, u64)> {
-        Some((self.frames.front()?.at_ms, self.frames.back()?.at_ms))
+        let lo = self.frames.iter().map(|f| f.at_ms).min()?;
+        let hi = self.frames.iter().map(|f| f.at_ms).max()?;
+        Some((lo, hi))
     }
 
     /// The replay needed to show the screen at `at_ms`: the newest keyframe at
@@ -360,6 +402,83 @@ mod tests {
             b.keyframes.len() <= 2,
             "stale keyframes accumulated: {:?}",
             b.keyframes.iter().map(|k| k.at_ms).collect::<Vec<_>>()
+        );
+    }
+
+    /// Replay never starts from a keyframe with evicted output after it.
+    ///
+    /// The sweep used to keep the LAST keyframe unconditionally, so a lone
+    /// stale one survived however far it sat before the oldest frame. A
+    /// backward scrub then replayed that keyframe plus the frames after the
+    /// gap, silently rendering a screen that never existed — the precise
+    /// failure the sweep exists to prevent, reachable through the public API
+    /// alone. Asserted at a MIDDLE target: checking only the newest one
+    /// picks the newest keyframe and never sees the gap.
+    #[test]
+    fn replay_never_starts_from_a_keyframe_with_evicted_frames_after_it() {
+        let mut b = RewindBuffer::new(10);
+        b.push_keyframe(1, vec![String::from("t=1")]);
+        b.push(2, b"aaaaa");
+        b.push(3, b"bbbbb");
+        // Evicts the frame at 2, so the keyframe at 1 now has a hole after it.
+        b.push(4, b"ccccc");
+
+        let oldest = b.span_ms().expect("frames remain").0;
+        let (kf, _) = b.replay_from(4);
+        assert!(
+            kf.is_none_or(|k| k.at_ms >= oldest),
+            "replay starts at keyframe {:?} but the oldest surviving frame is \
+             {oldest}: the output between them was evicted",
+            kf.map(|k| k.at_ms)
+        );
+    }
+
+    /// Timestamps that go backwards are not silently swallowed.
+    ///
+    /// Every read assumes `frames` is ordered by `at_ms`. The pane now feeds
+    /// a monotonic clock so this cannot arise there, but `push` is public and
+    /// a caller with a wall clock would otherwise lose output with no signal:
+    /// the frame lands before its predecessors and falls outside both
+    /// `span_ms` and every `replay_from` window.
+    #[test]
+    fn a_backwards_timestamp_is_clamped_rather_than_hidden() {
+        let mut b = RewindBuffer::new(1 << 20);
+        b.push(1000, b"first");
+        b.push(500, b"clock stepped back");
+        b.push(1100, b"after");
+
+        let (_, frames) = b.replay_from(u64::MAX);
+        let seen: Vec<&[u8]> = frames.iter().map(|f| f.data.as_slice()).collect();
+        assert!(
+            seen.contains(&b"clock stepped back".as_slice()),
+            "output recorded across a backward step became unreachable: {seen:?}"
+        );
+        // The span must COVER every frame, not merely be non-inverted: taken
+        // positionally it reports (1000, 1100) while a frame sits at 500,
+        // and a scrubber sizing its timeline from that cannot address it.
+        let (start, end) = b.span_ms().expect("frames remain");
+        assert_eq!(
+            (start, end),
+            (500, 1100),
+            "the span must cover the earliest and latest frame, not the first \
+             and last recorded"
+        );
+    }
+
+    /// A write spanning several keyframe intervals does not lose the surplus.
+    #[test]
+    fn a_multi_interval_write_keeps_its_remainder() {
+        let mut b = RewindBuffer::new(1 << 30);
+        assert!(
+            b.push(1, &[b'x'; KEYFRAME_INTERVAL_BYTES * 3]),
+            "three intervals in one write must ask for a keyframe"
+        );
+        // The surplus carries: two intervals' worth is still outstanding, so
+        // a small write pushes past the next boundary rather than restarting
+        // the count from zero.
+        assert!(
+            b.push(2, b"x"),
+            "the remainder from the big write was discarded"
         );
     }
 
