@@ -3082,6 +3082,10 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// The symbol a symbol tab is showing (#369): its name and the byte
+    /// range it spans, which follows edits through
+    /// `SymbolRange::after_edit`. `None` when no symbol tab is open.
+    symbol_tab: Option<(String, PathBuf, crate::symbol_range::SymbolRange)>,
     /// The open history scrubber (#371), or `None` when the editor is
     /// showing the live buffer. `Some` at `Position::Working` is a real
     /// state: the scrubber is open and parked at the user's own edits.
@@ -4605,6 +4609,7 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            symbol_tab: None,
             scrubber: None,
             debug_temp_breakpoint: None,
             debug_temp_note: None,
@@ -22487,6 +22492,23 @@ impl App {
             ed.collab_synced_seq = ed.edit_seq;
             ed.collab_doc_gen = doc_gen;
         };
+        // A symbol tab is a view over a byte range, so a remote edit moves it
+        // too (#369). Outside the closure because the tab belongs to the app
+        // rather than to one editor.
+        // Only when the tab is anchored to THIS file. The range is a byte
+        // offset into one buffer, so an edit to any other file would shift,
+        // resize or close it against offsets that mean nothing there — a
+        // collaborator typing in `other.rs` would move a tab pointed at
+        // `main.rs`, or announce that its symbol is gone.
+        if self
+            .symbol_tab
+            .as_ref()
+            .is_some_and(|(_, p, _)| p.as_path() == path)
+        {
+            for span in spans {
+                self.follow_symbol_tab_edit(span.at, span.deleted, span.inserted.len());
+            }
+        }
         for ed in self.editor.editors.iter_mut() {
             if ed.path.as_deref() == Some(path.as_path()) {
                 apply(ed);
@@ -23715,6 +23737,95 @@ impl App {
         self.scrubber = Some(crate::scrubber::Scrubber::new(commits));
         self.status =
             format!("Scrubbing {n} commits — arrows step, Home returns to your working tree");
+    }
+
+    /// Follow an edit with the open symbol tab's range (#369).
+    ///
+    /// A symbol tab is a VIEW over a byte range rather than a copy, so an
+    /// edit that is not reported here leaves the tab pointing at bytes that
+    /// have moved — showing the wrong text under the right title, which is
+    /// worse than showing nothing.
+    ///
+    /// **Wired only to the collab span path today**, which is the one place
+    /// an edit already arrives as `(at, deleted, inserted)`. Local typing,
+    /// backspace, paste, undo and formatting all mutate the buffer through
+    /// line/column APIs that do not report a byte span, so a tab opened
+    /// while those run would go stale — which is why the tab VIEW is not
+    /// built yet and this ships as the tracking layer alone. Giving the
+    /// editor a byte-span edit signal is the next piece of #369, and doing
+    /// it before there is a view to break is deliberate: the alternative is
+    /// a tab that is right for remote edits and silently wrong for the
+    /// user's own.
+    ///
+    /// A symbol the edit removed or straddled CLOSES the tab with a notice,
+    /// rather than re-anchoring to half a function glued to whatever
+    /// followed it.
+    pub(crate) fn follow_symbol_tab_edit(&mut self, at: usize, removed: usize, inserted: usize) {
+        let Some((name, path, range)) = self.symbol_tab.take() else {
+            return;
+        };
+        match range.after_edit(at, removed, inserted) {
+            crate::symbol_range::RangeAfterEdit::At(moved) => {
+                self.symbol_tab = Some((name, path, moved));
+            }
+            crate::symbol_range::RangeAfterEdit::Gone => {
+                self.status = format!("Closed the {name} tab: that symbol is gone");
+            }
+        }
+    }
+
+    /// Open the symbol under the cursor as its own tab (#369).
+    ///
+    /// The INNERMOST enclosing symbol, so opening from inside a method shows
+    /// the method rather than its `impl` — the enclosing block is almost
+    /// never what was meant.
+    fn open_symbol_tab(&mut self) {
+        let line = self.editor.cursor_row as u32;
+        let symbols = self.outline.symbols();
+        let Some(sym) = crate::symbol_range::enclosing_symbol(symbols, line) else {
+            self.status = if symbols.is_empty() {
+                String::from("No symbols for this file yet")
+            } else {
+                String::from("The cursor is not inside a symbol")
+            };
+            return;
+        };
+        let name = sym.name.clone();
+        let (first, last) = (sym.range_start_line as usize, sym.range_end_line as usize);
+        // Converted to BYTES once, here. `SymbolRange` tracks bytes because
+        // that is what an edit reports, and holding lines as well would be
+        // two representations that can disagree the moment one is updated
+        // and the other is not.
+        let start: usize = self
+            .editor
+            .lines
+            .iter()
+            .take(first)
+            .map(|l| l.len() + 1)
+            .sum();
+        let mut len: usize = self
+            .editor
+            .lines
+            .iter()
+            .skip(first)
+            .take(last + 1 - first)
+            .map(|l| l.len() + 1)
+            .sum();
+        // The `+ 1` is a SEPARATOR between lines, not a terminator: croft's
+        // offset model gives an N-line buffer no trailing newline. Charging
+        // one to the final line puts `end` a byte past the buffer, which
+        // panics anything that slices by the range — and makes an append at
+        // true EOF read as INSIDE the symbol rather than below it.
+        if last + 1 >= self.editor.lines.len() {
+            len = len.saturating_sub(1);
+        }
+        let range = crate::symbol_range::SymbolRange::new(start, start + len);
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Save this buffer before opening a symbol from it");
+            return;
+        };
+        self.symbol_tab = Some((name.clone(), path, range));
+        self.status = format!("{name}: {} bytes", range.len());
     }
 
     /// Run `command` on every configured ssh host and report what differs
@@ -31636,6 +31747,7 @@ impl App {
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
+            Cmd::OpenAsSymbolTab => self.open_symbol_tab(),
             Cmd::FleetRun => {
                 self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
                     crate::widgets::input_prompt::InputPurpose::FleetCommand,
