@@ -11708,7 +11708,12 @@ impl App {
                 height: box_rect.height.saturating_sub(2),
             };
             let theme = self.theme;
-            crate::gradient::paint_card_wave(frame.buffer_mut(), wave_area, |c| theme.ui(c));
+            crate::gradient::paint_card_wave(
+                frame.buffer_mut(),
+                wave_area,
+                theme.is_light(),
+                |c| theme.ui(c),
+            );
         }
     }
 

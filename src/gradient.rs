@@ -152,6 +152,26 @@ const WAVE_COLUMN_STEP: u16 = 3;
 /// real clearance and lets the ramp read as an emergence.
 const WAVE_START: f32 = 0.68;
 
+/// Light-theme ink for the field, chosen to stay on ONE side of
+/// `Theme::ui`'s luma-128 branch.
+///
+/// That branch is the whole problem, and it took a measurement to see it.
+/// `light_fallback` scales a colour of luma >= 128 DOWN to luma 80 (dark
+/// ink on white) and blends anything below it 12% toward near-white (a
+/// faint tint). The brand gradient straddles the boundary - `GRAD_BL` is
+/// luma 112 and `GRAD_TR` is 150 - so the ramp crossed it partway across
+/// the card: two curves vanished into the page while the third appeared
+/// abruptly as a hard fragment at higher contrast than the note text it is
+/// meant to sit behind.
+///
+/// A first attempt at "light-tuned colours" straddled it too (luma 111 and
+/// 160) and measured no better, which is why these are picked against the
+/// branch rather than by eye. Both endpoints sit below 128, and luma is
+/// linear in RGB so every interpolated step between them does too - the
+/// field fades rather than fragmenting.
+const WAVE_LIGHT_NEAR: (u8, u8, u8) = (0x8a, 0x6a, 0x52);
+const WAVE_LIGHT_FAR: (u8, u8, u8) = (0x6e, 0x76, 0x82);
+
 /// Paint the ambient dotted wave into the right of a card's interior (#312).
 ///
 /// TO THE RIGHT OF THE TEXT, not merely into blank cells. A per-cell blank
@@ -164,7 +184,12 @@ const WAVE_START: f32 = 0.68;
 /// The card's text is therefore always intact, which is the contract: a
 /// release with a lot to say pushes the field out of view rather than being
 /// decorated over.
-pub fn paint_card_wave(buf: &mut Buffer, inner: Rect, theme_ui: impl Fn(Color) -> Color) {
+pub fn paint_card_wave(
+    buf: &mut Buffer,
+    inner: Rect,
+    light: bool,
+    mut theme_ui: impl FnMut(Color) -> Color,
+) {
     if inner.width < 24 || inner.height < 3 {
         return;
     }
@@ -221,8 +246,22 @@ pub fn paint_card_wave(buf: &mut Buffer, inner: Rect, theme_ui: impl Fn(Color) -
             if cell.symbol() != " " {
                 continue;
             }
-            let tint = lerp_rgb(GRAD_BL, GRAD_TR, if curve == 0 { 0.85 } else { 0.10 });
-            let faded = lerp_rgb(GRAD_BL, tint, 0.25 + 0.75 * ramp);
+            let (base, tint) = if light {
+                (
+                    WAVE_LIGHT_FAR,
+                    lerp_rgb(
+                        WAVE_LIGHT_FAR,
+                        WAVE_LIGHT_NEAR,
+                        if curve == 0 { 0.85 } else { 0.10 },
+                    ),
+                )
+            } else {
+                (
+                    GRAD_BL,
+                    lerp_rgb(GRAD_BL, GRAD_TR, if curve == 0 { 0.85 } else { 0.10 }),
+                )
+            };
+            let faded = lerp_rgb(base, tint, 0.25 + 0.75 * ramp);
             cell.set_symbol("\u{b7}");
             // set_style REPLACES rather than patches: a cell reset by an
             // earlier paint can carry modifiers, and a dot inheriting BOLD
@@ -283,7 +322,7 @@ mod wave_tests {
             "and a second line that also has spaces",
             Style::default(),
         );
-        paint_card_wave(&mut buf, area(w, h), |c| c);
+        paint_card_wave(&mut buf, area(w, h), false, |c| c);
 
         for (row, text) in [(2u16, note), (3, "and a second line that also has spaces")] {
             let end = text.chars().count() as u16;
@@ -305,7 +344,7 @@ mod wave_tests {
     fn the_wave_paints_into_the_blank_right_of_a_card() {
         let (w, h) = (76u16, 8u16);
         let mut buf = blank(w, h);
-        paint_card_wave(&mut buf, area(w, h), |c| c);
+        paint_card_wave(&mut buf, area(w, h), false, |c| c);
         let dots = dots_at(&buf, w, h);
         assert!(!dots.is_empty(), "the field is drawn on an empty card");
         let start = (w as f32 * WAVE_START) as u16;
@@ -321,7 +360,7 @@ mod wave_tests {
     fn the_field_is_sparse_enough_to_read_as_dots() {
         let (w, h) = (76u16, 8u16);
         let mut buf = blank(w, h);
-        paint_card_wave(&mut buf, area(w, h), |c| c);
+        paint_card_wave(&mut buf, area(w, h), false, |c| c);
         for y in 0..h {
             let mut run = 0u16;
             for x in 0..w {
@@ -338,12 +377,59 @@ mod wave_tests {
         }
     }
 
+    /// `Theme::ui`'s light branch: at or above this, a colour is scaled to
+    /// dark ink; below it, blended toward the page. Crossing it mid-ramp is
+    /// what produced the fragment.
+    const LUMA_BRANCH: f32 = 128.0;
+
+    fn luma((r, g, b): (u8, u8, u8)) -> f32 {
+        0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32
+    }
+
+    /// Every colour the light field hands the theme must sit on ONE side of
+    /// `light_fallback`'s luma-128 branch.
+    ///
+    /// This asserts the MECHANISM rather than a contrast number, and that
+    /// distinction is the point. My first version of this test guessed
+    /// luminance bounds, and the dark palette passed them - so it could not
+    /// have caught the defect it was named for, which I found only by
+    /// running the mutation. The branch is what actually decides whether
+    /// the field fades or fragments, so the branch is what the test names.
+    ///
+    /// Every earlier test passes `|c| c` as the theme closure, which means
+    /// none of them executes this path at all: the code with the bug was
+    /// the code the tests could not reach.
+    #[test]
+    fn the_light_palette_stays_on_one_side_of_the_luma_branch() {
+        let (w, h) = (76u16, 8u16);
+        let mut buf = blank(w, h);
+        let seen = std::cell::RefCell::new(Vec::<f32>::new());
+        paint_card_wave(&mut buf, area(w, h), true, |c| {
+            if let Color::Rgb(r, g, b) = c {
+                seen.borrow_mut().push(luma((r, g, b)));
+            }
+            c
+        });
+        let seen = seen.into_inner();
+        assert!(
+            !seen.is_empty(),
+            "the light path must actually run, or this test says nothing"
+        );
+        let lo = seen.iter().cloned().fold(f32::MAX, f32::min);
+        let hi = seen.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            hi < LUMA_BRANCH || lo >= LUMA_BRANCH,
+            "the ramp straddles the branch at {LUMA_BRANCH}: luma {lo} to {hi}, \
+             so some dots become dark ink and others vanish into the page"
+        );
+    }
+
     /// A card too small to carry a field gets none rather than a stripe.
     #[test]
     fn a_narrow_card_gets_no_wave() {
         let mut buf = blank(20, 8);
         let before = buf.clone();
-        paint_card_wave(&mut buf, area(20, 8), |c| c);
+        paint_card_wave(&mut buf, area(20, 8), false, |c| c);
         assert_eq!(buf, before);
     }
 }
