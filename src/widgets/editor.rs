@@ -167,7 +167,10 @@ fn render_image_placeholder(
 /// log matches what a terminal pane would show under the same theme. The low
 /// 16 stay symbolic until here precisely so a theme switch recolours without
 /// reparsing the file.
-fn ansi_color_to_tui(c: crate::ansi_text::AnsiColor, theme: crate::theme::Theme) -> Color {
+pub(crate) fn ansi_color_to_tui(
+    c: crate::ansi_text::AnsiColor,
+    theme: crate::theme::Theme,
+) -> Color {
     use crate::ansi_text::AnsiColor;
     match c {
         AnsiColor::Indexed(i) => {
@@ -2697,6 +2700,10 @@ pub struct Editor {
     /// Rendered Markdown preview (Cmd/Ctrl+Shift+V) replacing the source view
     /// while set; rebuilt lazily when `built_seq` falls behind `edit_seq`.
     pub markdown_preview: Option<crate::markdown::MarkdownPreview>,
+    /// Captured runs to show under their fences in the preview (#354).
+    /// Owned by the app and copied in before a rebuild, because the editor
+    /// has no view of which panes ran what.
+    pub md_outputs: crate::markdown::BlockOutputs,
     pub image: Option<ImageView>,
     /// A reload's request that `open_pdf` come up on this page instead of
     /// page 1, so the reader's place survives an external rebuild in ONE
@@ -2890,6 +2897,7 @@ impl Editor {
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
             active_search_match: None,
             markdown_preview: None,
+            md_outputs: crate::markdown::BlockOutputs::new(),
             image: None,
             pdf_restore_page: None,
             sheet: None,
@@ -4910,27 +4918,41 @@ impl Editor {
                 self.markdown_preview = None;
             }
         } else if self.markdown_preview.is_some() {
-            // The image-aware builder (#196 review): the plain one left
-            // md.images pointing at anchors into the REPLACED lines, and
-            // the wrap-key recompute then sliced with stale first_line
-            // values - an out-of-range panic on a theme switch.
-            let text = self.lines.join("\n");
-            let base = self
-                .path
-                .as_ref()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (lines, images, runnables) = crate::markdown::render_markdown_full(
-                &text,
-                self.theme,
-                &mut self.registry,
-                base.as_deref(),
-            );
-            if let Some(md) = self.markdown_preview.as_mut() {
-                md.lines = lines;
-                md.images = images;
-                md.runnables = runnables;
-                md.built_seq = self.edit_seq;
-            }
+            self.rebuild_markdown_preview();
+        }
+    }
+
+    /// Rebuild an open Markdown preview from the current buffer, theme and
+    /// captured outputs. No-op when no preview is open.
+    ///
+    /// Extracted so a settled capture (#354) and a theme change share one
+    /// implementation: the theme path had a hard-won detail the other would
+    /// otherwise have had to rediscover.
+    pub fn rebuild_markdown_preview(&mut self) {
+        if self.markdown_preview.is_none() {
+            return;
+        }
+        // The image-aware builder (#196 review): the plain one left
+        // md.images pointing at anchors into the REPLACED lines, and
+        // the wrap-key recompute then sliced with stale first_line
+        // values - an out-of-range panic on a theme switch.
+        let text = self.lines.join("\n");
+        let base = self
+            .path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let (lines, images, runnables) = crate::markdown::render_markdown_full(
+            &text,
+            self.theme,
+            &mut self.registry,
+            base.as_deref(),
+            self.md_outputs.clone(),
+        );
+        if let Some(md) = self.markdown_preview.as_mut() {
+            md.lines = lines;
+            md.images = images;
+            md.runnables = runnables;
+            md.built_seq = self.edit_seq;
         }
     }
 
@@ -5357,6 +5379,7 @@ impl Editor {
             self.theme,
             &mut self.registry,
             base.as_deref(),
+            self.md_outputs.clone(),
         );
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
@@ -11621,6 +11644,7 @@ impl Editor {
                 self.theme,
                 &mut self.registry,
                 base.as_deref(),
+                self.md_outputs.clone(),
             );
             if let Some(md) = self.markdown_preview.as_mut() {
                 md.lines = lines;

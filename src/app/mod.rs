@@ -890,6 +890,62 @@ struct PendingRunBlock {
     code: String,
     /// Turns the popup red: the block looks destructive or said `{confirm}`.
     destructive: bool,
+    /// The document this block came from, for `{persist}`'s write-back.
+    doc: Option<PathBuf>,
+    /// The fence opener's SOURCE line, which keys the captured output.
+    block_line: usize,
+    /// `{persist}`: write the capture back into the document.
+    persist: bool,
+    /// `{timeout=N}`: stop CAPTURING after N seconds. Never stops the
+    /// process; the block keeps running in its pane.
+    capture_timeout: Option<std::time::Duration>,
+}
+
+/// A block whose output croft is waiting for (#354).
+///
+/// Armed when the block is typed into its pane and settled by
+/// [`App::settle_block_captures`] when the shell reports the command
+/// finished. `seen` is the pane's decoration count at arming time: the
+/// capture is the FIRST decoration to appear after that, which is what ties
+/// the output to this run rather than to whatever the pane did before.
+struct PendingCapture {
+    pane_name: String,
+    doc: Option<PathBuf>,
+    block_line: usize,
+    seen: usize,
+    started: std::time::Instant,
+    timeout: Option<std::time::Duration>,
+    persist: bool,
+    /// The most decorations the pane has carried since arming.
+    ///
+    /// The list is a sliding window, so a drop below this means marks were
+    /// collected and every index shifted. Comparing only against `seen`
+    /// catches a NET shrink and misses a shift: one eviction plus two new
+    /// commands leaves the length equal or larger while index `seen` names
+    /// a stranger.
+    ///
+    /// THIS DOES NOT CLOSE THE HOLE, and the comment says so because the
+    /// code cannot. Sampling catches an eviction only if the length dips
+    /// below the mark at an instant we happen to observe; an eviction and a
+    /// new command landing between two ticks never dip at all. Every
+    /// length-derived signal has that shape, because it samples a value
+    /// that can move twice between observations. It narrows the window; it
+    /// does not remove it, and the sound fix is a monotonic mark identity
+    /// assigned at creation and never renumbered by the collector, which
+    /// belongs in `terminal.rs` where `marks_snapshot` holds the records.
+    /// That is #440; once it exists, this field and `identity_lost` both
+    /// go away and the disk write stops needing a gate at all.
+    high_water: usize,
+    /// An eviction was seen, so `seen` no longer reliably names this
+    /// block's command. The box is still shown - it is cheap and the next
+    /// run corrects it - but the `{persist}` WRITE is refused, because a
+    /// stranger's output reaching the user's file is not self-correcting.
+    ///
+    /// Being precise about what this buys: it removes the cases it observes
+    /// and no others. `{persist}` on a positional index remains unsound
+    /// until the identity above exists, which is why the disk write is the
+    /// half that is gated and the box is not.
+    identity_lost: bool,
 }
 
 /// State of a background self-update observed by a remote-launched croft.
@@ -3165,6 +3221,13 @@ pub struct App {
     /// A runnable fence waiting on the confirm popup (#353): destructive-
     /// looking blocks and `{confirm}` fences ask before they type.
     pending_run_block: Option<PendingRunBlock>,
+    /// Blocks whose output croft is still waiting for (#354).
+    pending_captures: Vec<PendingCapture>,
+    /// Captured output per fence, keyed by the pane name (which already
+    /// encodes the document's path under the workspace) and the fence
+    /// opener's source line. In memory for the session unless the fence
+    /// said `{persist}`.
+    block_outputs: std::collections::HashMap<(String, usize), crate::markdown::BlockOutput>,
     /// Paint the terminal panes' right-edge arrival-time gutter ("Terminal:
     /// Toggle Timestamps"). Session-scoped, off by default.
     pub show_terminal_timestamps: bool,
@@ -4389,6 +4452,8 @@ impl App {
             broadcast_input: false,
             pending_broadcast_enable: false,
             pending_run_block: None,
+            pending_captures: Vec::new(),
+            block_outputs: std::collections::HashMap::new(),
             show_terminal_timestamps: false,
             notifier: crate::notifications::Notifier::new(&loaded_prefs.notifications),
             host_accents: compile_host_accents(&loaded_prefs.host_accents),
@@ -26707,6 +26772,10 @@ impl App {
             command: fence_command(block.interpreter, &block.code),
             code: block.code.clone(),
             destructive: block.destructive,
+            doc: doc.clone(),
+            block_line: block.lines.0,
+            persist: block.persist,
+            capture_timeout: block.capture_timeout.map(std::time::Duration::from_secs),
         }
     }
 
@@ -26741,6 +26810,7 @@ impl App {
             self.theme,
             &mut crate::highlight::LangRegistry::new(),
             None,
+            crate::markdown::BlockOutputs::new(),
         );
         let row = self.editor.cursor_row;
         let Some((idx, block)) = runnables
@@ -26773,11 +26843,15 @@ impl App {
             .cwd
             .canonicalize()
             .unwrap_or_else(|_| block.cwd.clone());
+        // `pane_is_idle_at` is main's shared predicate (#430): one
+        // definition for tasks and for runnable blocks, so a correction to
+        // the cwd rule cannot land on one and miss the other.
         if let Some(idx) = self
             .terminals
             .iter()
             .position(|t| pane_is_idle_at(t, &block.pane_name, &root))
         {
+            self.arm_block_capture(&block, idx);
             self.active_terminal = idx;
             self.terminals[idx].write_input(bytes.as_bytes());
             self.show_terminal = true;
@@ -26790,6 +26864,17 @@ impl App {
                 term.set_manual_name(Some(block.pane_name.clone()));
                 term.write_input(bytes.as_bytes());
                 self.insert_terminal(term);
+                // A fresh pane has no decorations yet, so the capture arms
+                // at zero and the block's own command is the first to
+                // finish. Armed AFTER the insert, since that is what puts
+                // the pane in `self.terminals` for the settle to find.
+                if let Some(idx) = self
+                    .terminals
+                    .iter()
+                    .position(|t| t.label() == block.pane_name)
+                {
+                    self.arm_block_capture(&block, idx);
+                }
                 self.status = format!("Running {}", block.pane_name);
             }
             Err(e) => {
@@ -26807,6 +26892,206 @@ impl App {
     fn cancel_pending_run_block(&mut self) {
         self.pending_run_block = None;
         self.status = String::from("Block not run");
+    }
+
+    /// Start waiting for `block`'s output on pane `idx` (#354).
+    ///
+    /// The pane's CURRENT decoration count is recorded, so the capture is
+    /// the first command to finish after this moment rather than whatever
+    /// the pane happened to run before. Re-running a block replaces its
+    /// pending capture: the newest run is the one the preview describes.
+    fn arm_block_capture(&mut self, block: &PendingRunBlock, idx: usize) {
+        let seen = self.terminals[idx].command_decorations().len();
+        self.pending_captures
+            .retain(|c| c.pane_name != block.pane_name || c.block_line != block.block_line);
+        self.pending_captures.push(PendingCapture {
+            pane_name: block.pane_name.clone(),
+            doc: block.doc.clone(),
+            block_line: block.block_line,
+            seen,
+            started: std::time::Instant::now(),
+            timeout: block.capture_timeout,
+            persist: block.persist,
+            high_water: seen,
+            identity_lost: false,
+        });
+    }
+
+    /// Write a capture into the document as an output fence (#354).
+    ///
+    /// The fence goes immediately after the block's closer, marked with an
+    /// HTML comment so a later run can find and REPLACE it rather than
+    /// stacking a new one each time. Exactly one output fence per block, and
+    /// no other fence is touched: the search starts at the block's closer
+    /// and stops at the first line that is not part of the marked pair.
+    ///
+    /// This writes to the user's file from a preview action, so it is
+    /// deliberately narrow. It refuses rather than guesses when the document
+    /// on disk no longer looks like the one the block came from, since the
+    /// block's line numbers are only meaningful against the text that
+    /// produced them.
+    fn persist_block_output(
+        &mut self,
+        path: &Path,
+        block_line: usize,
+        out: &crate::markdown::BlockOutput,
+    ) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            self.status = format!("Could not read {} to persist the output", path.display());
+            return;
+        };
+        let Some(updated) = crate::markdown::replace_output_fence(&text, block_line, &out.text)
+        else {
+            self.status =
+                String::from("The document changed since the block ran; output not saved");
+            return;
+        };
+        if std::fs::write(path, &updated).is_err() {
+            self.status = format!("Could not write the captured output to {}", path.display());
+        }
+    }
+
+    /// Settle any capture whose command has finished, or whose
+    /// `{timeout=N}` has elapsed. Returns true when something changed, so
+    /// the caller knows to repaint.
+    ///
+    /// Deliberately its own pass rather than a branch inside
+    /// `drain_terminal_bells`: that function is about notifying, this one
+    /// is about recording, and they answer to different pane states.
+    fn settle_block_captures(&mut self) -> bool {
+        if self.pending_captures.is_empty() {
+            return false;
+        }
+        let mut settled: Vec<(
+            String,
+            usize,
+            crate::markdown::BlockOutput,
+            Option<PathBuf>,
+            bool,
+        )> = Vec::new();
+        self.pending_captures.retain_mut(|c| {
+            let Some(term) = self.terminals.iter().find(|t| t.label() == c.pane_name) else {
+                // The pane is gone, so nothing will ever finish on it.
+                return false;
+            };
+            let decorations = term.command_decorations();
+            // `command_decorations` is a SLIDING WINDOW: marks past the
+            // scrollback floor are collected, which shifts every index down.
+            // A block whose own output evicts older marks would otherwise
+            // settle on an unrelated later command - and under `{persist}`
+            // write that stranger's output to the user's file. A shrunken
+            // list is exactly that eviction, so the capture is abandoned
+            // rather than guessed at: no box is strictly better than the
+            // wrong box, and far better than the wrong bytes on disk.
+            // A drop below the high-water mark is an eviction, whatever the
+            // length happens to be now.
+            if decorations.len() < c.high_water {
+                c.identity_lost = true;
+            }
+            c.high_water = c.high_water.max(decorations.len());
+            if let Some(d) = decorations.get(c.seen) {
+                settled.push((
+                    c.pane_name.clone(),
+                    c.block_line,
+                    crate::markdown::BlockOutput {
+                        text: term.command_output_text(d),
+                        exit: d.exit,
+                        timed_out: false,
+                    },
+                    c.doc.clone(),
+                    c.persist && !c.identity_lost,
+                ));
+                return false;
+            }
+            // The TIMEOUT stops the capture, never the process: the block
+            // keeps running in its pane and the box says the wait gave up.
+            if c.timeout.is_some_and(|t| c.started.elapsed() >= t) {
+                settled.push((
+                    c.pane_name.clone(),
+                    c.block_line,
+                    crate::markdown::BlockOutput {
+                        text: String::new(),
+                        exit: None,
+                        timed_out: true,
+                    },
+                    c.doc.clone(),
+                    c.persist,
+                ));
+                return false;
+            }
+            true
+        });
+        if settled.is_empty() {
+            return false;
+        }
+        for (pane, line, out, doc, persist) in settled {
+            if persist
+                && !out.timed_out
+                && let Some(path) = doc.as_ref()
+            {
+                self.persist_block_output(path, line, &out);
+            }
+            self.block_outputs.insert((pane, line), out);
+        }
+        self.publish_block_outputs();
+        true
+    }
+
+    /// Hand the editor the captures for the document it is showing (#354).
+    ///
+    /// The editor has no view of which pane ran what, so the app narrows
+    /// `block_outputs` to the current document's pane prefix and copies the
+    /// result in. Called after a capture settles and when the preview is
+    /// rebuilt, so a box appears without the user touching anything.
+    fn publish_block_outputs(&mut self) {
+        // The common case by far: nothing has been run, so there is nothing
+        // to narrow and nothing to compare. Checked before the map is built
+        // rather than after, since this runs every tick.
+        if self.block_outputs.is_empty() && self.editor.md_outputs.is_empty() {
+            return;
+        }
+        let prefix = self.block_pane_prefix();
+        let narrowed: crate::markdown::BlockOutputs = self
+            .block_outputs
+            .iter()
+            .filter(|((pane, _), _)| pane.starts_with(&prefix))
+            .map(|((_, line), out)| (*line, out.clone()))
+            .collect();
+        // Idempotent, so the tick can call it unconditionally and a
+        // DOCUMENT SWITCH is picked up without every switch path having to
+        // remember to. Keying only by source line meant `B.md`'s line-12
+        // fence rendered `A.md`'s capture until something else rebuilt the
+        // preview; narrowing by pane prefix fixes that only if it actually
+        // re-runs, which is what this comparison buys.
+        if narrowed == self.editor.md_outputs {
+            return;
+        }
+        self.editor.md_outputs = narrowed;
+        if self.editor.markdown_preview.is_some() {
+            self.editor.rebuild_markdown_preview();
+        }
+    }
+
+    /// The pane-name prefix for the document the editor is showing: the
+    /// same `<file>:` the run path builds its pane names from, so a capture
+    /// from another document cannot appear under this one's fences.
+    fn block_pane_prefix(&self) -> String {
+        let root = self.active_workspace_root();
+        let file = self
+            .editor
+            .path
+            .as_ref()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .map(|rel| rel.display().to_string())
+                    .unwrap_or_else(|_| {
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| String::from("doc"))
+                    })
+            })
+            .unwrap_or_else(|| String::from("doc"));
+        format!("{file}:")
     }
 
     /// Extend a live preview drag and finish it on release. Returns true
@@ -44126,6 +44411,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let session_typing_changed = app.poll_session_typing();
         let collab_changed = app.poll_collab();
         let bells_changed = app.drain_terminal_bells();
+        // A block whose command has finished gets its output box (#354).
+        let captures_changed = app.settle_block_captures();
+        // Every tick, not only when a capture settles: this is what notices
+        // the editor has moved to another document (#354 review).
+        app.publish_block_outputs();
         let labels_changed = app.refresh_terminal_labels() | app.drain_agent_events();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
@@ -44244,6 +44534,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || session_typing_changed
             || collab_changed
             || bells_changed
+            || captures_changed
             || labels_changed
             || auto_save_changed
             || ws_symbols_changed
