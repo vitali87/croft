@@ -23972,6 +23972,111 @@ impl App {
         }
     }
 
+    /// Load this PR's review threads onto the open file as comment boxes
+    /// (#366).
+    ///
+    /// Only threads for THIS file. A review's comments span the whole PR,
+    /// and hanging another file's objections off this buffer's line numbers
+    /// would put them against unrelated code — the same failure as placing
+    /// an outdated thread silently, arriving through the other axis.
+    fn load_review_threads(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file from the PR first");
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        // Relative to the REPOSITORY TOPLEVEL, not the workspace root. The
+        // API's `path` is repo-relative, and the two coincide only when the
+        // workspace root IS the toplevel — open croft on `repo/src` and
+        // every comparison fails silently, so a file with review comments
+        // reports having none. That is #139's rule; this is the same trap in
+        // a new place.
+        let Some(repo_root) = self.git.status().repo_root.clone() else {
+            self.status = String::from("This folder is not inside a git repository");
+            return;
+        };
+        let Ok(rel) = path.strip_prefix(&repo_root) else {
+            self.status = format!(
+                "{} is outside the repository, so it has no review comments",
+                path.display()
+            );
+            return;
+        };
+        // Forward slashes: the API always uses them, and on Windows a
+        // `to_string_lossy` here yields backslashes that match nothing.
+        let rel = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let out = std::process::Command::new("gh")
+            .args(["pr", "view", "--json", "number", "--jq", ".number"])
+            .current_dir(&root)
+            .output();
+        let number = match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => {
+                self.status = String::from("No PR for this branch — check it out first");
+                return;
+            }
+        };
+        let api = std::process::Command::new("gh")
+            .args([
+                "api",
+                &format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments"),
+                "--paginate",
+            ])
+            .current_dir(&root)
+            .output();
+        let json = match api {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            Ok(o) => {
+                // gh's own message names the problem — a missing scope, a
+                // rate limit — far better than anything invented here.
+                let err = String::from_utf8_lossy(&o.stderr);
+                self.status = format!(
+                    "Could not read the PR's comments: {}",
+                    err.trim().lines().next().unwrap_or("gh failed")
+                );
+                return;
+            }
+            Err(e) => {
+                self.status = format!("Could not run gh: {e}");
+                return;
+            }
+        };
+        let threads: Vec<crate::review_threads::Thread> =
+            crate::review_threads::parse_threads(&json)
+                .into_iter()
+                .filter(|t| t.path == rel)
+                .collect();
+        if threads.is_empty() {
+            self.status = format!("No review comments on {rel}");
+            return;
+        }
+        let lines = self.editor.lines.len();
+        let outdated = threads
+            .iter()
+            .filter(|t| matches!(t.anchor, crate::review_threads::Anchor::Outdated(_)))
+            .count();
+        self.editor.comment_boxes = threads
+            .iter()
+            .map(|t| crate::widgets::editor::CommentBox {
+                id: t.id,
+                line: t.box_line(lines),
+                author: t.title(),
+                body: t.body.clone(),
+            })
+            .collect();
+        self.status = match outdated {
+            0 => format!("{} review comments on {rel}", threads.len()),
+            n => format!(
+                "{} review comments on {rel} \u{b7} {n} outdated, shown where they WERE",
+                threads.len()
+            ),
+        };
+    }
+
     /// Append terminal output to the open recording, if there is one (#356).
     ///
     /// Times are measured from the recording's start rather than from the
@@ -31917,6 +32022,7 @@ impl App {
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
             Cmd::OpenAsSymbolTab => self.open_symbol_tab(),
+            Cmd::LoadReviewThreads => self.load_review_threads(),
             Cmd::ToggleSessionRecording => self.toggle_session_recording(),
             Cmd::FleetRun => {
                 self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
