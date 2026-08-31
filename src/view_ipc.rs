@@ -207,18 +207,6 @@ pub fn read_line_by_deadline(
     String::from_utf8(line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// Read one request from an accepted connection, bounded by `deadline`.
-///
-/// The socket's read timeout does NOT bound this on its own, which is why the
-/// work is delegated to [`read_line_by_deadline`] rather than done with a
-/// `BufReader`: `SO_RCVTIMEO` applies per `recv` while a line read loops, so a
-/// client writing one byte inside every window resets the timeout forever and
-/// holds the caller. The drain runs on the frame loop, so that freezes the
-/// whole editor, and same-uid is not a defence: any process in any pane (a
-/// build script, a piped installer) can do it by accident.
-///
-/// The byte cap and the deadline are separate bounds: the cap stops one
-/// enormous line, the deadline stops a slow one. Neither substitutes.
 pub fn read_request(
     stream: &std::os::unix::net::UnixStream,
     deadline: std::time::Instant,
