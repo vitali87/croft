@@ -159,6 +159,15 @@ files agrees it worked. `git status` is clean, the diff against main is what
 you expect, the suite passes. GitHub keeps computing a conflict against a
 merge that looks done, and the branch reads as inexplicably `DIRTY`.
 
+**The trigger is "DIRTY at a tree I have just verified is right"**, not "I
+suspect my merge failed" — because you will not suspect that. The natural
+response to an unexplained `DIRTY` is to resolve the conflict again, which
+produces another single-parent commit and the identical result. And the
+evidence does not survive: redoing the merge on top makes the broken commit
+two-parent, so `git log -1 --format=%p` on it prints two afterwards and
+nothing in the tree records that anything was wrong. It is diagnosable only
+in the moment.
+
 Only the parent list tells you, so ask about the parents:
 
 ```bash
