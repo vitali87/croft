@@ -267,10 +267,6 @@ def is_doc(line):
     return s.startswith("///") and not s.startswith("////")
 
 
-# What a line is, for the backward scan. Computed in one FORWARD pass,
-# because both multi-line constructs (an attribute spanning lines, a `/** */`
-# doc block) can only be recognised by reading downward: from below, `))]` and
-# `*/` are indistinguishable from code.
 # Lines a doc comment on this repo can never be MEANT for. Deliberately a
 # short allowlist of shapes that have actually stranded prose rather than an
 # attempt to enumerate everything: a false accusation here is worse than a
@@ -286,6 +282,11 @@ def is_doc(line):
 # hold prose.
 NEVER_DOCUMENTED = re.compile(r"^\s*(?:use|extern\s+crate)\s")
 
+
+# What a line is, for the backward scan. Computed in one FORWARD pass,
+# because both multi-line constructs (an attribute spanning lines, a `/** */`
+# doc block) can only be recognised by reading downward: from below, `))]` and
+# `*/` are indistinguishable from code.
 DOC, ATTR, SKIP, CODE = "doc", "attr", "skip", "code"
 
 
@@ -559,7 +560,9 @@ def main():
         if orphans:
             print(f"{len(orphans)} doc block(s) document nothing.", file=sys.stderr)
         return 1
-    print(f"No documentation lost across {len(changed)} changed Rust file(s).")
+    print(
+        f"No documentation lost or stranded across {len(changed)} changed Rust file(s)."
+    )
     return 0
 
 

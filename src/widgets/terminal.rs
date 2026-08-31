@@ -420,6 +420,12 @@ fn stamp_chunk(
 
 /// One user note pinned to a span of terminal output (iTerm2's
 /// annotations), anchored like a mark so it rides the scrollback.
+///
+/// This doc had drifted onto `ScrollClock`, 200 lines up, when a `#[derive]`
+/// was inserted beneath it. The derive originated here and is left where it
+/// has effectively lived: neither struct uses `Clone` or `Debug` today (the
+/// `clock.clone()` in the reader is `Arc::clone`), so moving it back would
+/// only relocate dead code.
 struct PaneAnnotation {
     /// Grid line the span sat on when recorded, paired with the scroll
     /// clock reading at that instant. Translated with clock movement — NOT
