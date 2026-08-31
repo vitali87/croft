@@ -1753,16 +1753,24 @@ fn a_terminal_link_binding_is_not_refused_for_an_editor_side_reason() {
     // A non-web OSC 8 link in the terminal: resolves via `hyperlink_at_screen`,
     // then `open_detected_url` refuses the scheme INERTLY. A web URL would
     // reach `open_url` and launch a real browser.
+    // The prompt of the real shell in this pane races the fed bytes, so the
+    // line it lands on is not fixed (#397). This puts a line in front of the
+    // link deliberately, making the order that used to break this test the
+    // one it always runs, and the cell is then searched for rather than
+    // assumed.
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
     app.terminals[0].feed_bytes_for_test(b"\x1b]8;;mailto:t@example.com\x1b\\link\x1b]8;;\x1b\\");
     term.draw(|f| app.render(f)).unwrap();
     let area = app.terminals[0].last_area;
-    let (col, row) = (area.x + 2, area.y + 1);
-    assert_eq!(
-        app.terminals[0].hyperlink_at_screen(col, row).as_deref(),
-        Some("mailto:t@example.com"),
-        "precondition: the click must land on the terminal link, or a refusal \
-         proves nothing about which branch refused it"
-    );
+    let (col, row) = (area.y..area.y + area.height)
+        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
+        .find(|&(c, r)| {
+            app.terminals[0].hyperlink_at_screen(c, r).as_deref() == Some("mailto:t@example.com")
+        })
+        .expect(
+            "precondition: the click must land on the terminal link, or a refusal \
+             proves nothing about which branch refused it",
+        );
 
     app.focus_pane(Pane::Terminal);
     let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
@@ -2125,23 +2133,35 @@ fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one()
     // inertly. A printed https URL would reach `open_url`, which is
     // `Command::new("open")` with no test guard — the suite would launch a
     // real browser on every run (#307's spawning class).
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
     app.terminals[0]
         .feed_bytes_for_test(b"\x1b]8;;mailto:zero@example.com\x1b\\zero-link\x1b]8;;\x1b\\\r\n");
     app.active_terminal = 1;
     term.draw(|f| app.render(f)).unwrap();
 
-    // Click directly on the URL — in pane 0, the pane that is NOT active.
-    // The pane's first row is its border, so the printed line lands on the
-    // next one. Assert the cell really holds the URL first: clicking an
-    // empty cell also yields "No link there", which would pass this test
-    // for entirely the wrong reason.
+    // Click directly on the URL, in pane 0, the pane that is NOT active.
+    //
+    // The cell is SEARCHED FOR rather than computed as "first row after the
+    // border". Pane 0 runs a real shell, so its prompt races the fed bytes:
+    // when the prompt lands first the printed line is pushed down a row and
+    // the assumed cell holds nothing, which is a flake under full-suite load
+    // and passes every time in isolation (#397). The `a prompt got here
+    // first` line above makes that order permanent instead of occasional, so
+    // this test now exercises the case that used to break it.
+    //
+    // Searching costs nothing here: the claim is "clicking the link in pane 0
+    // resolves against pane 0", and any cell carrying that link is a fair
+    // place to click. The precondition survives, because a pane with no such
+    // cell fails below rather than clicking somewhere arbitrary.
     let area = app.terminals[0].last_area;
-    let (col, row) = (area.x + 2, area.y + 1);
-    assert_eq!(
-        app.terminals[0].hyperlink_at_screen(col, row).as_deref(),
-        Some("mailto:zero@example.com"),
-        "the click must land on the OSC 8 link, or a refusal proves nothing"
-    );
+    let (col, row) = (area.y..area.y + area.height)
+        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
+        .find(|&(c, r)| {
+            app.terminals[0].hyperlink_at_screen(c, r).as_deref() == Some("mailto:zero@example.com")
+        })
+        .expect(
+            "pane 0 must carry the OSC 8 link somewhere in its area, or a refusal proves nothing",
+        );
     let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
     ev.modifiers = KeyModifiers::CONTROL;
     app.handle_mouse(ev);
@@ -2769,18 +2789,20 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
         area.width > 4 && area.height > 2,
         "terminal must be laid out"
     );
-    // `area.y` is the BORDER row: `cell_at` hit-tests `last_inner`, so a click
-    // there resolves to no grid cell and the whole test would be vacuous.
-    let (col, row) = (area.x + 2, area.y + 1);
-
     // A real OSC 8 hyperlink with a non-web scheme: the built-in finds it via
     // `hyperlink_at_screen`, and `open_detected_url` then refuses it inertly.
+    // The leading line forces the shell-prompt race (#397) to resolve the way
+    // that used to break this test, so the cell is searched for instead of
+    // computed from the border row.
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
     app.terminals[0].feed_bytes_for_test(b"\x1b]8;;mailto:x@example.com\x1b\\link\x1b]8;;\x1b\\");
-    assert!(
-        app.terminals[0].hyperlink_at_screen(col, row).is_some(),
-        "the cell must carry an OSC 8 link, or the built-in has nothing to act \
-         on and this test cannot distinguish the two branches"
-    );
+    let (col, row) = (area.y..area.y + area.height)
+        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
+        .find(|&(c, r)| app.terminals[0].hyperlink_at_screen(c, r).is_some())
+        .expect(
+            "the cell must carry an OSC 8 link, or the built-in has nothing to act \
+             on and this test cannot distinguish the two branches",
+        );
 
     app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
     assert!(
