@@ -31,6 +31,17 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// kilobytes; a hundred megabytes means the URL is not what it claimed.
 pub const MAX_VSIX_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Largest member this will read into memory as text.
+///
+/// The shared archive reader's own `MEMBER_CAP` is 100 MB, which is right
+/// for a user opening an archive they chose to look at and far too generous
+/// for a file downloaded from the internet and parsed as JSON. The two files
+/// read here are a `package.json` and a theme — the largest theme on the
+/// marketplace is a few hundred kilobytes — so a member past this is not a
+/// theme, whatever it claims, and it would otherwise be read into a `String`
+/// entire before anything looked at it.
+pub const MAX_MEMBER_BYTES: u64 = 8 * 1024 * 1024;
+
 /// A marketplace extension's identity: `publisher.name`, as the gallery
 /// keys everything on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,6 +217,14 @@ pub fn pick_theme<'a>(
 pub fn download_vsix(id: &ExtensionId, dir: &Path) -> Result<PathBuf> {
     use std::io::Read;
     let url = id.vsix_url();
+    // Redirects are followed, as every other downloader in this tree does
+    // (`lsp::install`, `dap::install`), and the gallery answers this URL
+    // directly today. What bounds the risk is not the hop count but what
+    // happens to the bytes: they are size-capped, written to a scratch
+    // directory, read for exactly two members through the shared archive
+    // reader, converted to a manifest, and deleted. Nothing downloaded is
+    // installed as an extension or executed, so a redirect landing
+    // somewhere unexpected yields a failed parse rather than code running.
     let resp = ureq::AgentBuilder::new()
         .timeout(FETCH_TIMEOUT)
         .redirects(4)
@@ -261,6 +280,14 @@ pub fn read_member(vsix: &Path, member: &str, scratch: &Path) -> Result<String> 
     let extracted =
         crate::archive::extract_member(vsix, crate::archive::ArchiveKind::Zip, member, scratch)
             .with_context(|| format!("extracting {member}"))?;
+    // Check the size on disk BEFORE reading: `read_to_string` on a member
+    // the shared cap allowed (100 MB) would allocate all of it first.
+    let len = std::fs::metadata(&extracted)
+        .with_context(|| format!("sizing {member}"))?
+        .len();
+    if len > MAX_MEMBER_BYTES {
+        bail!("{member} is {len} bytes — that is not a theme file");
+    }
     std::fs::read_to_string(&extracted).with_context(|| format!("reading {member}"))
 }
 
