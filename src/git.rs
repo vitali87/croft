@@ -1001,6 +1001,232 @@ pub fn commit_graph(root: &Path, limit: usize) -> Vec<GraphCommit> {
     )
 }
 
+/// A worktree lane: a branch and the sibling directory it lives in (#348).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeLane {
+    /// Absolute path of the worktree, a SIBLING of the repo.
+    pub path: PathBuf,
+    /// The branch created for the lane.
+    pub branch: String,
+}
+
+impl WorktreeLane {
+    /// Plan a lane for `name` beside `repo`, or `None` when the name has
+    /// nothing usable in it.
+    ///
+    /// Refused rather than defaulted: a name of `"..."` would otherwise
+    /// become the branch `agent/` and the directory `croft-`, and a branch
+    /// named after nothing is worse than being told to pick a name.
+    ///
+    /// The slug is what makes both halves safe at once. git refuses a ref
+    /// containing `..`, whitespace, or any of `~^:?*[\`, and a directory
+    /// name carrying those is a different kind of trouble — so one pass
+    /// reducing to `[a-z0-9-]` covers the ref grammar and the filesystem
+    /// together, rather than sanitising twice with two chances to disagree.
+    pub fn plan(repo: &Path, name: &str) -> Option<Self> {
+        let slug = lane_slug(name)?;
+        // A SIBLING, never a child. A worktree inside its own repo is a
+        // working tree git then tries to track, and the Explorer would show
+        // the lane nested in the root it was cut from.
+        let parent = repo.parent()?;
+        let base = repo.file_name()?.to_string_lossy();
+        Some(Self {
+            path: parent.join(format!("{base}-{slug}")),
+            branch: format!("agent/{slug}"),
+        })
+    }
+}
+
+/// Reduce `name` to `[a-z0-9-]`, or `None` when nothing survives.
+fn lane_slug(name: &str) -> Option<String> {
+    let mapped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Collapse runs so `a  b` is `a-b` rather than `a--b`, and trim so the
+    // branch never starts or ends on the separator — git refuses a ref
+    // component ending in `.`, and a trailing `-` merely looks broken.
+    let mut out = String::new();
+    for part in mapped.split('-').filter(|p| !p.is_empty()) {
+        if !out.is_empty() {
+            out.push('-');
+        }
+        out.push_str(part);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    // Capped, because the slug becomes a DIRECTORY name as well as a branch:
+    // git accepts a ref of any length, but a filesystem component past ~255
+    // bytes fails at `mkdir` with "File name too long" — measured — and the
+    // user would see that instead of anything about lanes. 60 is far more
+    // than a lane name needs. Trimmed again because the cut can land on the
+    // separator.
+    let capped: String = out.chars().take(60).collect();
+    let capped = capped.trim_matches('-');
+    (!capped.is_empty()).then(|| capped.to_string())
+}
+
+/// Why `lane` must not be removed, or `None` when it is safe to remove.
+///
+/// `git worktree remove` DISCARDS a dirty tree, so this is the one check in
+/// the lane flow where being wrong destroys work rather than annoying
+/// someone. It answers with a reason rather than a bool so the caller can
+/// tell the user what to do about it.
+///
+/// A tree git cannot report on is treated as unsafe: an unreadable status is
+/// not evidence of cleanliness, and refusing costs a user one manual
+/// `git worktree remove` while guessing costs them their work.
+pub fn lane_removal_block(lane: &Path) -> Option<String> {
+    let Some(path_str) = lane.to_str() else {
+        return Some(format!("{} is not a readable path", lane.display()));
+    };
+    let output = Command::new("git")
+        .args(["-C", path_str, "status", "--porcelain", "--ignored"])
+        .output();
+    let Ok(output) = output else {
+        return Some(String::from(
+            "could not run git to check for uncommitted work",
+        ));
+    };
+    if !output.status.success() {
+        return Some(format!("{path_str} does not look like a git worktree"));
+    }
+    let dirty = String::from_utf8_lossy(&output.stdout);
+    let mut changed = 0usize;
+    let mut ignored = 0usize;
+    for line in dirty.lines().filter(|l| !l.trim().is_empty()) {
+        // `!!` is an IGNORED entry, which `--ignored` adds and plain
+        // `--porcelain` omits entirely. Counted separately because the two
+        // want different words, but both must refuse: `git worktree remove`
+        // deletes ignored files without a murmur, and an agent lane is
+        // exactly where an uncommitted `.env`, a local database, or an
+        // expensive `node_modules` lives. Measured — a `.env` in a lane was
+        // destroyed while plain `--porcelain` reported the tree clean.
+        if line.starts_with("!!") {
+            ignored += 1;
+        } else {
+            changed += 1;
+        }
+    }
+    match (changed, ignored) {
+        (0, 0) => None,
+        (0, n) => Some(format!(
+            "this lane has {n} ignored file{} (build output, local config) that removal would \
+             delete — clear them by hand first",
+            if n == 1 { "" } else { "s" }
+        )),
+        (1, _) => Some(String::from(
+            "this lane has 1 file with uncommitted changes — commit or discard it first",
+        )),
+        (n, _) => Some(format!(
+            "this lane has {n} files with uncommitted changes — commit or discard them first"
+        )),
+    }
+}
+
+/// Run a MUTATING git command, returning git's own error text.
+///
+/// Separate from the read-only `run_git` above, which goes out of its way to
+/// avoid taking `.git/index.lock` because `status` and `diff` opportunistically
+/// rewrite the index. A worktree add or remove genuinely changes the repo and
+/// must take the lock like any other write.
+fn run_git_mut(dir: &Path, args: &[&str]) -> Result<(), String> {
+    let Some(dir) = dir.to_str() else {
+        return Err(String::from("path is not valid UTF-8"));
+    };
+    let output = Command::new("git")
+        .args(["-C", dir])
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // git's own message, which names the actual problem — a branch that
+    // exists, a path in use, a repo with no commits — far better than any
+    // sentence this could invent.
+    let err = String::from_utf8_lossy(&output.stderr);
+    Err(err
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("git failed")
+        .to_string())
+}
+
+/// Add `lane` as a worktree of `repo` on a new branch.
+pub fn add_worktree_lane(repo: &Path, lane: &WorktreeLane) -> Result<(), String> {
+    let Some(path) = lane.path.to_str() else {
+        return Err(String::from("lane path is not valid UTF-8"));
+    };
+    run_git_mut(repo, &["worktree", "add", "-b", &lane.branch, path])
+}
+
+/// Remove `lane`'s worktree.
+///
+/// No `--force`: the caller has already asked [`lane_removal_block`], and a
+/// force here would defeat that check by making the refusal advisory. If git
+/// refuses anyway, the reason reaches the user rather than being overridden.
+pub fn remove_worktree_lane(lane: &Path) -> Result<(), String> {
+    let Some(path) = lane.to_str() else {
+        return Err(String::from("lane path is not valid UTF-8"));
+    };
+    // Run from the lane itself: git resolves the main worktree from there,
+    // so the caller does not have to remember which repo it was cut from.
+    run_git_mut(lane, &["worktree", "remove", path])
+}
+
+/// The current branch's first-parent history, newest first (#371).
+///
+/// NOT [`commit_graph`], which logs `--branches --tags HEAD` to draw the
+/// repo-wide graph: with any other branch present that list interleaves
+/// commits the current branch does not contain, and topological order can
+/// put one of them at index 0. A scrubber built on it steps back from the
+/// working tree onto a commit that is not HEAD and may not even be an
+/// ancestor of it.
+///
+/// `--first-parent` because a scrubber walks the branch as a line. A merge's
+/// second parent is a different line of development, and stepping into one
+/// would take the user somewhere they cannot step back out of in a straight
+/// line.
+///
+/// Empty on any failure — no repo, no commits, no git — so the caller shows
+/// an empty state rather than an error, matching `commit_graph`.
+pub fn branch_history(root: &Path, limit: usize) -> Vec<GraphCommit> {
+    let Some(path_str) = root.to_str() else {
+        return Vec::new();
+    };
+    let output = Command::new("git")
+        .args([
+            "-C",
+            path_str,
+            "log",
+            "--first-parent",
+            "HEAD",
+            &format!("-n{limit}"),
+            "--format=%H\x1f%h\x1f%P\x1f%D\x1f%s\x1f%an\x1f%ct",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    parse_commit_graph(&String::from_utf8_lossy(&output.stdout), now)
+}
+
 /// Parse the `%H\x1f%h\x1f%P\x1f%D\x1f%s\x1f%an\x1f%ct` lines emitted by
 /// [`commit_graph`], computing each commit's age relative to `now`.
 pub fn parse_commit_graph(out: &str, now: i64) -> Vec<GraphCommit> {
@@ -2674,6 +2900,325 @@ mod tests {
             notes.additions, 3,
             "untracked line counts must join the porcelain path against the TOPLEVEL"
         );
+    }
+
+    /// The scrubber's history is the CURRENT BRANCH, and index 0 is HEAD.
+    ///
+    /// `commit_graph` logs `--branches --tags HEAD` because it draws the
+    /// repo-wide graph. Feeding a scrubber from it means that with any other
+    /// branch present, index 0 is whatever topological order put first —
+    /// demonstrated here with a sibling branch carrying a future committer
+    /// date, which sorts ahead of HEAD. Stepping back from the working tree
+    /// then lands on a commit the current branch does not contain (#371).
+    /// A lane's branch name and directory come from one slug, and both are
+    /// safe to hand to git and to the filesystem (#348).
+    #[test]
+    fn a_lane_name_becomes_a_safe_branch_and_directory() {
+        let plan = |name: &str| WorktreeLane::plan(Path::new("/repos/croft"), name);
+
+        let p = plan("fix the parser").expect("an ordinary name");
+        assert_eq!(p.branch, "agent/fix-the-parser");
+        assert_eq!(p.path, PathBuf::from("/repos/croft-fix-the-parser"));
+
+        // The directory is a SIBLING of the repo, never inside it: a
+        // worktree nested in its own repo is a working tree git will then
+        // try to track, and the Explorer would show the lane inside the
+        // root it was cut from.
+        assert!(
+            !p.path.starts_with("/repos/croft/"),
+            "a lane must not nest inside its own repo: {}",
+            p.path.display()
+        );
+
+        // Shapes git refuses in a ref name, or the shell would mangle:
+        // every one collapses to the separator rather than reaching git.
+        for name in [
+            "a..b", "a b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b",
+        ] {
+            let p = plan(name).unwrap_or_else(|| panic!("{name} should still plan"));
+            assert!(
+                !p.branch.contains("..")
+                    && !p.branch.contains(' ')
+                    && !p.branch.contains(['~', '^', ':', '?', '*', '[', '\\']),
+                "{name} produced an unsafe branch: {}",
+                p.branch
+            );
+        }
+
+        // A very long name is capped: the slug becomes a directory name as
+        // well as a branch, and a component past ~255 bytes fails at
+        // `mkdir` with "File name too long" — the user would see that
+        // instead of anything about lanes.
+        let long = plan(&"parser".repeat(50)).expect("a long name still plans");
+        let dir = long
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        assert!(dir.len() < 100, "directory name is {} bytes", dir.len());
+        assert!(!long.branch.ends_with('-'), "branch: {}", long.branch);
+
+        // A name with nothing usable in it is REFUSED rather than silently
+        // becoming `agent/` — a branch named after nothing is worse than
+        // being told to pick a name.
+        for empty in ["", "   ", "///", "..."] {
+            assert!(plan(empty).is_none(), "{empty:?} must not yield a lane");
+        }
+    }
+
+    /// A lane with uncommitted work refuses to be removed, and says so.
+    ///
+    /// This is the safety rule the issue names, and it is the one place
+    /// where being wrong destroys work rather than merely annoying someone:
+    /// `git worktree remove` on a dirty tree discards it.
+    #[test]
+    fn a_dirty_lane_refuses_removal_and_a_clean_one_allows_it() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        // Inside the TempDir's own parent would collide with a leftover from
+        // an earlier run; a second TempDir gives this test a private
+        // directory that is still a sibling of the repo.
+        let side = TempDir::new().unwrap();
+        let lane = side.path().join("lane-clean");
+
+        let git = |args: &[&str]| {
+            let _ = Command::new("git").args(["-C"]).arg(p).args(args).status();
+        };
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "lane",
+            lane.to_str().unwrap(),
+        ]);
+        assert!(lane.is_dir(), "staging: the worktree exists");
+
+        // Clean: removal is allowed.
+        assert_eq!(lane_removal_block(&lane), None, "a clean lane may go");
+
+        // Dirty: refused, and the reason names the tree.
+        std::fs::write(lane.join("scratch.txt"), "unsaved").unwrap();
+        let why = lane_removal_block(&lane).expect("a dirty lane must be refused");
+        assert!(
+            why.contains("uncommitted"),
+            "the refusal must say why: {why}"
+        );
+
+        // IGNORED files refuse too. Plain `--porcelain` omits them, so the
+        // check reported this tree clean while `git worktree remove`
+        // destroyed a `.env` — measured. An agent lane is exactly where an
+        // uncommitted local config or an expensive `node_modules` lives.
+        // The dirty file from above goes first, so this case starts clean
+        // and the only thing the check can be reacting to is the ignored one.
+        std::fs::remove_file(lane.join("scratch.txt")).unwrap();
+        std::fs::write(lane.join(".gitignore"), "*.local\n").unwrap();
+        let lane_git0 = |args: &[&str]| {
+            let _ = Command::new("git")
+                .args(["-C"])
+                .arg(&lane)
+                .args(args)
+                .status();
+        };
+        lane_git0(&["add", "-A"]);
+        lane_git0(&["commit", "-q", "-m", "ignore"]);
+        std::fs::write(lane.join("secrets.local"), "TOKEN=1").unwrap();
+        assert!(
+            plain_status_is_clean(&lane),
+            "control: plain --porcelain sees nothing, which is the trap"
+        );
+        let why = lane_removal_block(&lane).expect("ignored files must refuse");
+        assert!(
+            why.contains("ignored"),
+            "the refusal must name what it is protecting: {why}"
+        );
+        std::fs::remove_file(lane.join("secrets.local")).unwrap();
+
+        // Committing it makes the lane clean again.
+        let lane_git = |args: &[&str]| {
+            let _ = Command::new("git")
+                .args(["-C"])
+                .arg(&lane)
+                .args(args)
+                .status();
+        };
+        lane_git(&["add", "-A"]);
+        lane_git(&["commit", "-q", "-m", "keep"]);
+        assert_eq!(
+            lane_removal_block(&lane),
+            None,
+            "a committed lane is clean again"
+        );
+
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["worktree", "remove", "--force", lane.to_str().unwrap()])
+            .status();
+
+        // A path git CANNOT report on is refused, not assumed clean. This is
+        // the branch where being wrong destroys work: `git worktree remove`
+        // discards a dirty tree, so an unreadable status must fail closed.
+        // Without this case the whole not-a-worktree arm could be replaced
+        // by `return None` and every other assertion here would still pass.
+        let outside = TempDir::new().unwrap();
+        let why = lane_removal_block(outside.path())
+            .expect("a directory that is not a worktree must be refused");
+        assert!(
+            why.contains("worktree") || why.contains("could not run"),
+            "the refusal must say what went wrong: {why}"
+        );
+
+        // And a path that does not exist at all.
+        let gone = outside.path().join("no-such-lane");
+        assert!(
+            lane_removal_block(&gone).is_some(),
+            "a missing path must be refused rather than reported clean"
+        );
+    }
+
+    /// The scrubber's history is the CURRENT BRANCH, and index 0 is HEAD.
+    ///
+    /// `commit_graph` logs `--branches --tags HEAD` because it draws the
+    /// repo-wide graph. Feeding a scrubber from it means that with any other
+    /// branch present, index 0 is whatever topological order put first —
+    /// demonstrated here with a sibling branch carrying a future committer
+    /// date, which sorts ahead of HEAD. Stepping back from the working tree
+    /// then lands on a commit the current branch does not contain (#371).
+    #[test]
+    fn branch_history_is_the_current_branch_with_head_first() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+
+        let git = |args: &[&str]| {
+            let _ = Command::new("git").args(["-C"]).arg(p).args(args).status();
+        };
+        // A sibling branch whose commit dates FUTURE, so any date- or
+        // topo-ordered listing across all branches puts it first.
+        git(&["checkout", "-q", "-b", "sibling"]);
+        std::fs::write(p.join("sibling.txt"), "s").unwrap();
+        git(&["add", "-A"]);
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["commit", "-q", "-m", "sibling-future"])
+            .env("GIT_COMMITTER_DATE", "2038-01-01T00:00:00")
+            .env("GIT_AUTHOR_DATE", "2038-01-01T00:00:00")
+            .status();
+        // Back to the original branch.
+        git(&["checkout", "-q", "-"]);
+
+        let head = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        let hist = branch_history(p, 50);
+        assert!(!hist.is_empty(), "the branch has commits");
+        assert_eq!(
+            hist[0].hash, head,
+            "index 0 must be HEAD, not whatever sorted first across branches"
+        );
+        assert!(
+            hist.iter().all(|c| c.summary != "sibling-future"),
+            "a sibling branch's commit leaked into the branch history: {:?}",
+            hist.iter().map(|c| &c.summary).collect::<Vec<_>>()
+        );
+
+        // The positive control: the graph DOES include it, so the assertion
+        // above is about the ref set rather than about the repo being empty.
+        let graph = commit_graph(p, 50);
+        assert!(
+            graph.iter().any(|c| c.summary == "sibling-future"),
+            "control: commit_graph should see every branch"
+        );
+    }
+
+    /// What plain `--porcelain` (no `--ignored`) reports, as the positive
+    /// control for the ignored-file case: it must see NOTHING there, or the
+    /// assertion that `lane_removal_block` catches it proves nothing.
+    fn plain_status_is_clean(lane: &Path) -> bool {
+        let out = Command::new("git")
+            .args(["-C"])
+            .arg(lane)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    }
+
+    /// A lane round-trips through the real git commands (#348).
+    ///
+    /// Driven through `add_worktree_lane` / `remove_worktree_lane` rather
+    /// than asserting on the strings they would build: the argument order
+    /// and the working directory each command runs in are the parts that go
+    /// wrong, and only running them can show that.
+    #[test]
+    fn a_lane_is_created_and_removed_through_git() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+
+        let lane = WorktreeLane::plan(p, "parser work").expect("planned");
+        assert!(lane.path.starts_with(p.parent().unwrap()), "a sibling");
+
+        add_worktree_lane(p, &lane).expect("git worktree add should succeed");
+        assert!(lane.path.is_dir(), "the lane directory exists");
+
+        // The branch really was created, and the lane is on it.
+        let out = Command::new("git")
+            .args(["-C"])
+            .arg(&lane.path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            lane.branch,
+            "the lane must be on its own branch"
+        );
+
+        // A second lane of the same name is refused by git rather than
+        // silently reusing the branch.
+        assert!(
+            add_worktree_lane(p, &lane).is_err(),
+            "a duplicate lane must fail rather than adopt the existing one"
+        );
+
+        // A LOCKED worktree reports a clean status — `lane_removal_block`
+        // asks "is there uncommitted work", which is a different question
+        // from "will git remove this" — and git then refuses. Pinned
+        // because it is why the caller runs git BEFORE dropping the
+        // workspace folder: the other order leaves the lane gone from the
+        // workspace and the directory still on disk.
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["worktree", "lock", lane.path.to_str().unwrap()])
+            .status();
+        assert_eq!(
+            lane_removal_block(&lane.path),
+            None,
+            "a locked-but-clean lane has no uncommitted work"
+        );
+        assert!(
+            remove_worktree_lane(&lane.path).is_err(),
+            "git must refuse a locked worktree, and the caller must hear it"
+        );
+        assert!(lane.path.is_dir(), "the refusal left the lane in place");
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["worktree", "unlock", lane.path.to_str().unwrap()])
+            .status();
+
+        remove_worktree_lane(&lane.path).expect("a clean lane removes");
+        assert!(!lane.path.exists(), "the lane directory is gone");
     }
 
     #[test]

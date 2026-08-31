@@ -187,6 +187,12 @@ pub enum Command {
     AskNavigatorAboutCapture,
     /// Re-root the workspace onto the host the active pane is ssh'd into (#364).
     OpenWorkspaceOnSshHost,
+    /// Step the editor back through the branch's commits (#371).
+    ScrubHistory,
+    /// Create a git worktree lane for an agent to work in (#348).
+    NewWorktreeLane,
+    /// Remove the current worktree lane, refusing when it is dirty (#348).
+    CloseWorktreeLane,
     /// Mark every file every agent changed as reviewed (#345).
     MarkAgentLaneReviewed,
     /// Summarise each agent's review queue (#345).
@@ -375,6 +381,9 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::AskNavigator,
     Command::AskNavigatorAboutCapture,
     Command::OpenWorkspaceOnSshHost,
+    Command::ScrubHistory,
+    Command::NewWorktreeLane,
+    Command::CloseWorktreeLane,
     Command::MarkAgentLaneReviewed,
     Command::ShowAgentLane,
     Command::MarkAgentFileReviewed,
@@ -549,6 +558,9 @@ impl Command {
             Command::AskNavigator => "Navigator: Ask About Line or Selection",
             Command::AskNavigatorAboutCapture => "Captures: Ask Navigator About This Line",
             Command::OpenWorkspaceOnSshHost => "Remote: Open Workspace on This Pane's Host",
+            Command::ScrubHistory => "Source Control: Scrub History",
+            Command::NewWorktreeLane => "Agent: New Worktree Lane",
+            Command::CloseWorktreeLane => "Agent: Close Worktree Lane",
             Command::MarkAgentLaneReviewed => "Agents: Mark Changed Files Reviewed",
             Command::ShowAgentLane => "Agents: Show Changed Files",
             Command::MarkAgentFileReviewed => "Agents: Mark This File Reviewed",
@@ -725,6 +737,9 @@ impl Command {
             Command::AskNavigator => "Cmd+K Q",
             Command::AskNavigatorAboutCapture => "",
             Command::OpenWorkspaceOnSshHost => "",
+            Command::ScrubHistory => "",
+            Command::NewWorktreeLane => "",
+            Command::CloseWorktreeLane => "",
             Command::MarkAgentLaneReviewed => "",
             Command::ShowAgentLane => "",
             Command::MarkAgentFileReviewed => "",
@@ -898,6 +913,9 @@ impl Command {
             Command::AskNavigator => "navigator_ask",
             Command::AskNavigatorAboutCapture => "captures_ask_navigator",
             Command::OpenWorkspaceOnSshHost => "remote_open_workspace_on_ssh_host",
+            Command::ScrubHistory => "scm_scrub_history",
+            Command::NewWorktreeLane => "agent_new_worktree_lane",
+            Command::CloseWorktreeLane => "agent_close_worktree_lane",
             Command::MarkAgentLaneReviewed => "agents_mark_reviewed",
             Command::ShowAgentLane => "agents_show_lane",
             Command::MarkAgentFileReviewed => "agents_mark_file_reviewed",

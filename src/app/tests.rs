@@ -2643,12 +2643,25 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     app.active_terminal = 1;
     term.draw(|f| app.render(f)).unwrap();
 
+    // FIND the link's cell rather than assuming which row it landed on
+    // (#397). Pane 0 has a real shell, and its prompt arrives from the
+    // reader thread whenever the OS gets round to it - before the injected
+    // bytes on a loaded machine, after them on a quiet one. Either way the
+    // link is in the pane; only its row moves, and hard-coding
+    // `area.y + 1` made the test a race against shell startup rather than a
+    // check of the swallow guard it is named for.
+    //
+    // Searching trades a false negative for a weaker claim, which is the
+    // right trade HERE and not everywhere: this assertion only proves the
+    // built-in has something to act on, and the click coordinates are
+    // computed separately below. If it ever grows into a position-sensitive
+    // check, the search has to narrow with it - "the link is somewhere in
+    // the pane" would then pass for a row no click could reach.
     let area = app.terminals[0].last_area;
-    let (col, row) = (area.x + 2, area.y + 1);
-    assert!(
-        app.terminals[0].hyperlink_at_screen(col, row).is_some(),
-        "pane 0 must carry the link, or the built-in has nothing to act on"
-    );
+    let (col, row) = (area.y..area.y + area.height)
+        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
+        .find(|&(c, r)| app.terminals[0].hyperlink_at_screen(c, r).is_some())
+        .expect("pane 0 must carry the link somewhere, or the built-in has nothing to act on");
     assert_eq!(
         app.active_terminal, 1,
         "pane 1 must be ACTIVE while the click lands in pane 0, or the \
@@ -36582,6 +36595,67 @@ fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
     );
     assert!(app.http_run.is_none(), "nothing was sent");
 }
+/// #371: the scrubber's keys move through history, and anything else keeps
+/// its normal meaning.
+///
+/// The consumed/not-consumed split is the point. A scrubber that swallowed
+/// every key would be a mode, and the user would lose their editor to a
+/// gesture they meant as a glance.
+#[test]
+fn the_scrubber_consumes_its_own_keys_and_no_others() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let fake = |h: &str, sum: &str| crate::git::GraphCommit {
+        hash: String::from(h),
+        short_hash: String::from(&h[..7]),
+        parents: Vec::new(),
+        refs: Vec::new(),
+        summary: String::from(sum),
+        author: String::from("t"),
+        age_secs: 0,
+    };
+    app.scrubber = Some(crate::scrubber::Scrubber::new(vec![
+        fake("aaaaaaa1", "newest"),
+        fake("bbbbbbb2", "older"),
+    ]));
+
+    // Left steps back and lands on HEAD, not past it.
+    assert!(app.handle_scrubber_key(KeyCode::Left));
+    assert_eq!(
+        app.scrubber.as_ref().unwrap().position(),
+        crate::scrubber::Position::At(0)
+    );
+    assert!(app.status.contains("aaaaaaa"), "status: {}", app.status);
+    assert!(
+        app.status.contains("newest"),
+        "the summary helps: {}",
+        app.status
+    );
+
+    // Home returns to the working tree from anywhere.
+    assert!(app.handle_scrubber_key(KeyCode::Left));
+    assert!(app.handle_scrubber_key(KeyCode::Home));
+    assert_eq!(
+        app.scrubber.as_ref().unwrap().position(),
+        crate::scrubber::Position::Working
+    );
+
+    // A key the scrubber does not use is NOT consumed, so it still means
+    // whatever it meant before.
+    assert!(
+        !app.handle_scrubber_key(KeyCode::Char('x')),
+        "an unrelated key must pass through"
+    );
+    assert!(app.scrubber.is_some(), "and must not close the scrubber");
+
+    // Esc closes, and the live buffer is simply what is there — the
+    // scrubber never replaced it, so closing cannot lose unsaved work.
+    assert!(app.handle_scrubber_key(KeyCode::Esc));
+    assert!(app.scrubber.is_none());
+    // With no scrubber open, its keys are not consumed either.
+    assert!(!app.handle_scrubber_key(KeyCode::Left));
+}
+
 /// #345: the Explorer's unreviewed dots track the ledger, on every path
 /// that changes it.
 ///

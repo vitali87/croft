@@ -28,6 +28,9 @@ pub enum InputPurpose {
     ArchiveExtract {
         member: String,
     },
+    /// Name a new worktree lane (#348): the typed value becomes the branch
+    /// `agent/<slug>` and a sibling directory beside the repo.
+    NewWorktreeLane,
     /// Find in a hex tab (#172): the typed value is hex byte pairs
     /// ("de ad be ef") or, when it does not parse as hex, literal ASCII.
     /// Submitting stores the query on the view and jumps to the first
