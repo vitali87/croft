@@ -24,7 +24,7 @@
 //! approximation refreshed on a timer. The client holds the truth, so it
 //! resolves before sending and the server only ever sees absolute paths.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -101,11 +101,18 @@ pub fn resolve(cwd: &Path, arg: &Path) -> PathBuf {
     }
 }
 
-/// Send one request and wait for the reply.
+/// Send one request and wait for the reply, both bounded by a deadline.
 ///
-/// Both timeouts are set because a croft wedged mid-frame would otherwise
-/// hang the user's shell forever, and a shell that never returns is a worse
-/// failure than a view that does not open.
+/// A croft wedged mid-frame must not hang the user's shell forever: a shell
+/// that never returns is a worse failure than a view that does not open.
+///
+/// The socket timeouts alone did not deliver that, and the doc here used to
+/// claim they did. `SO_RCVTIMEO` applies per `recv` while `read_line` loops
+/// over `fill_buf`, so a croft dribbling a byte inside every window held the
+/// shell indefinitely — verbatim the defect fixed on the SERVER half, left
+/// standing on the client half of the same module. Exposure was low (the only
+/// writer is croft itself, sending one `write_all`) but the asymmetry inside
+/// one file is the point: the fix belonged to the read, not to the caller.
 pub fn send(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
     use std::os::unix::net::UnixStream;
     let mut stream = UnixStream::connect(socket)?;
@@ -116,8 +123,10 @@ pub fn send(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
     line.push('\n');
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
-    let mut reply = String::new();
-    BufReader::new(&stream).read_line(&mut reply)?;
+    let reply = read_line_by_deadline(
+        &stream,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )?;
     if reply.trim().is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -128,7 +137,15 @@ pub fn send(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// Read one request from an accepted connection.
+/// The most `croft view -` will take from a pipe.
+///
+/// Uncapped, `some_command | croft view -` with a runaway producer buffered
+/// the whole stream in RAM and then wrote a 0600 copy of it into the cache
+/// dir - and the editor refuses anything past its own `MAX_FILE_BYTES`
+/// afterwards, so those bytes were pure cost. The request is capped for
+/// exactly this reasoning; the payload was not.
+pub const MAX_STAGED_STDIN_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The most a single request may be. A path plus JSON framing; anything past
 /// this is not a `croft view` invocation, and reading it unbounded would grow
 /// the UI thread's buffer on a client's say-so.
@@ -145,20 +162,27 @@ pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 /// is not a defence: any process in any pane (a build script, a piped
 /// installer) can do it by accident.
 ///
-/// `Read::take` caps the bytes; the caller's deadline caps the time.
-pub fn read_request(
+/// The byte cap and the deadline are separate bounds: the cap stops one
+/// enormous line, the deadline stops a slow one. Neither substitutes.
+/// Read one newline-framed line, re-arming the socket timeout from `deadline`
+/// on every `recv`.
+///
+/// The re-arming is the whole mechanism. `SO_RCVTIMEO` is per `recv` and this
+/// loops, so a timeout armed once outside is reset by every byte arriving
+/// inside its window: a peer dribbling under the budget is answered by each
+/// read and never trips it. Capping bytes does not substitute, because the
+/// cost is per read rather than per byte.
+///
+/// A per-`recv` timeout is not fatal here — it is one window closing, and
+/// whether that ends the read is the DEADLINE's decision rather than the
+/// errno's. Returning it directly refused the peer promptly but reported
+/// `EAGAIN`, which is also what a socket left non-blocking reports, so two
+/// unrelated defects produced identical text.
+pub fn read_line_by_deadline(
     stream: &std::os::unix::net::UnixStream,
     deadline: std::time::Instant,
-) -> std::io::Result<ViewRequest> {
+) -> std::io::Result<String> {
     use std::io::Read;
-    // The timeout is RE-ARMED from the deadline on every read, which is the
-    // whole point. `SO_RCVTIMEO` applies per `recv`, so a timeout armed once
-    // outside the loop is reset by every byte that arrives inside its window:
-    // a client dribbling under the budget is answered by each `recv` and never
-    // trips it. Measured on the first attempt at this fix, a 5ms dribble held
-    // a 20ms drain for 147ms; the theoretical worst case is the byte cap times
-    // the timeout. Capping BYTES does not help, because the cost is per read
-    // rather than per byte.
     let mut line: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -166,7 +190,7 @@ pub fn read_request(
         if left.is_zero() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "request did not arrive within the frame budget",
+                "did not arrive within the frame budget",
             ));
         }
         stream.set_read_timeout(Some(left))?;
@@ -185,11 +209,22 @@ pub fn read_request(
                     ));
                 }
             }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
             Err(e) => return Err(e),
         }
     }
-    let text = std::str::from_utf8(&line)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    String::from_utf8(line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+pub fn read_request(
+    stream: &std::os::unix::net::UnixStream,
+    deadline: std::time::Instant,
+) -> std::io::Result<ViewRequest> {
+    let text = read_line_by_deadline(stream, deadline)?;
     serde_json::from_str(text.trim())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
@@ -376,7 +411,17 @@ pub fn run(
     let path = if target == "-" {
         use std::io::Read;
         let mut buf = Vec::new();
-        std::io::stdin().read_to_end(&mut buf)?;
+        // Capped: an uncapped `read_to_end` let a runaway producer buffer the
+        // whole stream in RAM and then write a 0600 copy of it into the cache
+        // dir, which the editor refuses past its own limit anyway.
+        let read =
+            std::io::Read::take(std::io::stdin(), MAX_STAGED_STDIN_BYTES).read_to_end(&mut buf)?;
+        if read as u64 == MAX_STAGED_STDIN_BYTES {
+            anyhow::bail!(
+                "more than {MAX_STAGED_STDIN_BYTES} bytes arrived on stdin; \
+                 write it to a file and view that instead"
+            );
+        }
         if buf.is_empty() {
             anyhow::bail!("croft view -: nothing arrived on stdin");
         }

@@ -2745,14 +2745,21 @@ pub struct App {
     /// Drops awaiting reverse-pull from the user's local Mac via the
     /// drop-relay launched by the local croft parent. Polled each frame.
     pending_remote_pulls: Vec<PendingRemotePull>,
-    /// This croft's `croft view` listener (#362), and the socket path to
-    /// unlink when it goes away.
+    /// This croft's `croft view` listener (#362).
     ///
     /// `None` when the bind failed: a croft that cannot offer `croft view`
     /// must still start, so the failure costs the feature and nothing else.
     /// Panes then see no `CROFT_VIEW_SOCK` and the client says so plainly,
     /// which is the same message a pane outside croft gets.
-    view_listener: Option<(std::os::unix::net::UnixListener, PathBuf)>,
+    ///
+    /// No path is kept alongside it. The doc used to promise "the socket path
+    /// to unlink when it goes away" and nothing unlinked it: there is no
+    /// `Drop for App`, both readers discarded the second element, and the
+    /// launch-time sweep is what actually reclaims a dead croft's socket -
+    /// deliberately, since an unclean exit leaves no `Drop` to run either.
+    /// A field carrying a promise the code does not keep is worse than no
+    /// field.
+    view_listener: Option<std::os::unix::net::UnixListener>,
     /// URL awaiting the user's local-browser confirmation (remote-
     /// launched croft only). When `Some`, a modal asks Y/A/N and all
     /// other keys are swallowed.
@@ -12833,16 +12840,20 @@ impl App {
         // larger than any legal reply - which is why it is set rather than
         // tested. `read_request` re-arms its own read timeout from the
         // deadline on every recv, so none is set here.
-        let left = deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .max(std::time::Duration::from_millis(1));
-        let _ = stream.set_write_timeout(Some(left));
         let reply = match crate::view_ipc::read_request(&stream, deadline) {
             Ok(req) => self.apply_view_request(&req.to_path()),
             Err(e) => crate::view_ipc::ViewReply::Err {
                 message: format!("unreadable request: {e}"),
             },
         };
+        // Armed AFTER the read, from what the read left: computing it before
+        // gives a client that spent the whole budget reading a fresh window to
+        // spend writing, so one client could cost the frame loop twice the
+        // documented 20ms.
+        let left = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(std::time::Duration::from_millis(1));
+        let _ = stream.set_write_timeout(Some(left));
         let opened = matches!(reply, crate::view_ipc::ViewReply::Ok);
         let _ = crate::view_ipc::write_reply(&mut stream, &reply);
         (reply, opened)
@@ -28587,7 +28598,7 @@ impl App {
     /// bind is skipped: a test that stood up an App would otherwise leave a
     /// live socket in the real cache dir and, worse, publish it into the env
     /// of every OTHER test in the same process.
-    fn bind_view_socket() -> Option<(std::os::unix::net::UnixListener, PathBuf)> {
+    fn bind_view_socket() -> Option<std::os::unix::net::UnixListener> {
         if cfg!(test) {
             return None;
         }
@@ -28612,8 +28623,8 @@ impl App {
         // the MCP index refresh and the FS watcher all running, which is
         // exactly the condition `src/gui_path.rs` and `src/session.rs` both
         // document when they place their own `set_var` calls at startup.
-        let _ = crate::view_ipc::SOCK_PATH.set(path.clone());
-        Some((listener, path))
+        let _ = crate::view_ipc::SOCK_PATH.set(path);
+        Some(listener)
     }
 
     /// Accept whatever `croft view` clients have queued and open their files.
@@ -28644,7 +28655,7 @@ impl App {
             if std::time::Instant::now() >= deadline {
                 return changed;
             }
-            let Some((listener, _)) = self.view_listener.as_ref() else {
+            let Some(listener) = self.view_listener.as_ref() else {
                 return changed;
             };
             match listener.accept() {
@@ -28666,14 +28677,37 @@ impl App {
     /// whether the file can be shown, not about where it is.
     fn apply_view_request(&mut self, path: &Path) -> crate::view_ipc::ViewReply {
         use crate::view_ipc::ViewReply;
-        if !path.exists() {
-            return ViewReply::Err {
-                message: format!("no such file: {}", path.display()),
-            };
-        }
-        if path.is_dir() {
+        // A REGULAR file, not merely something that exists and is not a
+        // directory. `File::open` on a FIFO blocks until a writer appears, so
+        // `mkfifo /tmp/f && croft view /tmp/f` from any pane froze the whole
+        // editor permanently; `/dev/zero` took the same route and read until
+        // the machine ran out of memory. Neither is reachable through the
+        // Explorer without a deliberate human gesture, and this is reachable
+        // by any process in any pane.
+        //
+        // The 20ms drain deadline does not cover it: that bounds the READ of
+        // the request, and this is the step after. Bounding one stage of a
+        // pipeline says nothing about the next.
+        //
+        // `metadata` follows symlinks, so a symlink to a real file still
+        // opens; one stat answers all three questions the old `exists` +
+        // `is_dir` pair asked in two.
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                return ViewReply::Err {
+                    message: format!("no such file: {} ({e})", path.display()),
+                };
+            }
+        };
+        if meta.is_dir() {
             return ViewReply::Err {
                 message: format!("{} is a directory", path.display()),
+            };
+        }
+        if !meta.is_file() {
+            return ViewReply::Err {
+                message: format!("{} is not a regular file", path.display()),
             };
         }
         match self.editor.open_pinned(path) {

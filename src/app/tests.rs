@@ -38141,7 +38141,7 @@ fn seat_view_listener(app: &mut App, dir: &std::path::Path) -> std::path::PathBu
     // would let `prepare_view_listener` lose its non-blocking mode without a
     // single test noticing.
     let listener = crate::app::prepare_view_listener(&sock).unwrap();
-    app.view_listener = Some((listener, sock.clone()));
+    app.view_listener = Some(listener);
     sock
 }
 
@@ -38243,7 +38243,7 @@ fn draining_an_idle_listener_reports_no_change_and_does_not_block() {
     // one-line failure that names the cause.
     let flags = {
         use std::os::unix::io::AsRawFd;
-        let (listener, _) = app.view_listener.as_ref().unwrap();
+        let listener = app.view_listener.as_ref().unwrap();
         unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) }
     };
     assert!(
@@ -38356,17 +38356,18 @@ fn a_pane_command_omits_the_view_socket_when_none_is_bound() {
 }
 
 #[test]
-fn a_client_that_never_sends_a_newline_cannot_wedge_the_frame_loop() {
+fn a_client_that_never_sends_a_newline_is_refused_by_the_deadline() {
     // The socket's read timeout does NOT bound `read_request` on its own:
-    // SO_RCVTIMEO applies per `recv`, while `read_line` loops over `fill_buf`
-    // until it sees a newline. A client writing a byte at a time and never a
-    // newline resets the timeout on every read. The drain runs on the frame
-    // loop, so that freezes the whole editor, and same-uid is no defence: a
-    // build script or a piped installer can do it by accident.
+    // SO_RCVTIMEO applies per `recv`, while the read loops until it sees a
+    // newline. A client writing inside every window re-arms it forever, and
+    // the drain runs on the frame loop, so that freezes the editor.
     //
-    // Bounded in BYTES here rather than only in time, because a byte cap is
-    // what makes the read terminate at all; the deadline below is the
-    // observable that would have caught the hang.
+    // Asserted on the REPLY, not on elapsed time. The wall-clock version of
+    // this test was load-sensitive to the point of being a flake in waiting:
+    // measured, the fixed path took 20-90ms and the broken path 147-495ms, so
+    // the two bands nearly touch and any threshold between them is a coin
+    // toss on a busy machine. The deadline path produces a message no other
+    // path produces, which is load-independent and says WHICH bound fired.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let sock = seat_view_listener(&mut app, tmp.path());
@@ -38376,22 +38377,12 @@ fn a_client_that_never_sends_a_newline_cannot_wedge_the_frame_loop() {
         let Ok(mut c) = std::os::unix::net::UnixStream::connect(&sock2) else {
             return;
         };
-        // DRIBBLE, continuously. Writing once and going quiet does not
-        // reproduce the defect: the per-read timeout fires and the drain moves
-        // on, so a fixture shaped that way passes against the unbounded read
-        // too and proves nothing. The hang needs a client that keeps RESETTING
-        // the timeout, which is one byte arriving inside every window, and it
-        // is why bounding bytes alone does not help - this whole stream is a
-        // few dozen bytes.
+        // Continuously, and INSIDE the budget. Writing once and going quiet
+        // does not reproduce the defect: the per-read timeout fires and the
+        // drain moves on, so a fixture shaped that way passes against the
+        // unbounded read too. The hang needs a client that keeps re-arming.
         let _ = std::io::Write::write_all(&mut c, br#"{"path":[47"#);
         let _ = std::io::Write::flush(&mut c);
-        // 5ms, deliberately UNDER the drain's whole 20ms budget. The round-1
-        // fix computed the timeout once and handed it to a `read_line` that
-        // does one `recv` per call, so a client answering inside each window
-        // re-arms it forever: 65536 bytes x the timeout is a 21-minute freeze,
-        // and the byte cap does not touch it. The earlier 20ms interval was
-        // LONGER than the budget, so it tripped the timeout and passed against
-        // the broken code - a fixture that could not reach the defect.
         for _ in 0..240 {
             std::thread::sleep(std::time::Duration::from_millis(5));
             if std::io::Write::write_all(&mut c, b",47").is_err() {
@@ -38400,32 +38391,27 @@ fn a_client_that_never_sends_a_newline_cannot_wedge_the_frame_loop() {
             let _ = std::io::Write::flush(&mut c);
         }
     });
-
-    // Let the connect land before draining, or the drain finds nothing and
-    // the test passes without ever exercising the read.
     std::thread::sleep(std::time::Duration::from_millis(50));
-    let started = std::time::Instant::now();
-    let _ = app.drain_view_requests();
-    let elapsed = started.elapsed();
+
+    let listener = app.view_listener.as_ref().unwrap();
+    let (stream, _) = listener.accept().expect("the dribbler is waiting");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    let (reply, opened) = app.answer_view_client(stream, deadline);
     let _ = dribbler.join();
 
-    // 300ms sits BETWEEN the two behaviours, which is what makes this an
-    // observable rather than a formality. Deadline-bounded, the drain returns
-    // in tens of milliseconds; with a flat per-read timeout the client resets
-    // it on every byte and the drain runs for the whole ~1.2s dribble. An
-    // earlier version of this assertion used 1500ms - above BOTH - and passed
-    // against the unbounded read, proving nothing.
-    // 80ms sits BETWEEN the two behaviours, which is what makes this measure
-    // anything. Deadline re-armed per recv, the drain returns at roughly its
-    // own 20ms budget; armed once outside the loop it ran 147ms against a 5ms
-    // dribble (measured, not estimated). Two earlier versions of this
-    // assertion used 1500ms and then 300ms - both ABOVE the broken behaviour -
-    // and passed straight through a real overrun.
     assert!(
-        elapsed < std::time::Duration::from_millis(80),
-        "a client that never terminates its line must not hold the frame loop: \
-         the drain took {elapsed:?}"
+        !opened,
+        "nothing was ever named, so nothing can have opened"
     );
+    match reply {
+        crate::view_ipc::ViewReply::Err { message } => assert!(
+            message.contains("did not arrive within the frame budget"),
+            "the DEADLINE must be what refuses this client. Any other error \
+             means some incidental bound fired instead and the deadline is \
+             still unenforced: {message}"
+        ),
+        other => panic!("a request with no newline cannot succeed: {other:?}"),
+    }
 }
 
 #[test]
@@ -38472,7 +38458,7 @@ fn a_non_blocking_accepted_stream_is_still_answered() {
     // not been written yet.
     std::thread::sleep(std::time::Duration::from_millis(30));
 
-    let (listener, _) = app.view_listener.as_ref().unwrap();
+    let listener = app.view_listener.as_ref().unwrap();
     let (stream, _) = listener.accept().expect("a client is waiting");
     // The state macOS hands production, forced here so Linux exercises it too.
     stream.set_nonblocking(true).unwrap();
@@ -38566,7 +38552,26 @@ fn the_view_socket_is_bound_before_the_first_pane_is_spawned() {
     let ctor = src
         .find("pub fn new(root: PathBuf)")
         .expect("App::new must exist for this guard to mean anything");
-    let body = &src[ctor..];
+    // Bounded to App::new's own body. Slicing to the end of the file let two
+    // plausible edits satisfy the guard while inverting the runtime order:
+    // extracting the pane spawn into a helper defined BELOW App::new (the
+    // marker's offset then jumps past the bind's), or a doc comment naming
+    // `Self::bind_view_socket()` somewhere above a later spawn.
+    let end = src[ctor..]
+        .find("\n    pub fn ")
+        .map(|i| ctor + i)
+        .unwrap_or(src.len());
+    let body = &src[ctor..end];
+    // And each marker must be unique in the file, so a second occurrence
+    // cannot silently be the one measured.
+    for marker in ["Self::bind_view_socket()", "PtyTerminal::new(&root)"] {
+        assert_eq!(
+            src.matches(marker).count(),
+            1,
+            "{marker} must appear exactly once, or this guard measures whichever \
+             copy comes first rather than the one that runs"
+        );
+    }
     let bind = body
         .find("Self::bind_view_socket()")
         .expect("App::new must bind the view socket");
@@ -38579,5 +38584,50 @@ fn the_view_socket_is_bound_before_the_first_pane_is_spawned() {
          portable-pty snapshots the environment when a pane's CommandBuilder \
          is built, so a pane constructed first never learns the socket and \
          `croft view` fails in it while working in every pane opened later"
+    );
+}
+
+#[test]
+fn a_view_request_for_a_fifo_is_refused_rather_than_opened() {
+    // `apply_view_request` refused only directories, so a FIFO passed the
+    // check and reached `Editor::open`, whose `File::open` BLOCKS until a
+    // writer appears. `mkfifo /tmp/f && croft view /tmp/f` from any pane froze
+    // the whole editor permanently, recoverable only by SIGKILL, and
+    // `/dev/zero` took the same route and read until OOM.
+    //
+    // The 20ms drain deadline does not help: it bounds the READ of the
+    // request, and this is the step after it. Bounding one stage of a pipeline
+    // says nothing about the next.
+    //
+    // Run on a thread with a join deadline: against the old behaviour this
+    // hangs forever, and a hang reads as a CI timeout rather than as this
+    // defect.
+    let tmp = tempfile::tempdir().unwrap();
+    let fifo = tmp.path().join("pipe");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "precondition: the fixture must actually create a FIFO"
+    );
+    assert!(
+        fifo.exists(),
+        "and `exists()` must say yes, as it did in production"
+    );
+
+    let root = tmp.path().to_path_buf();
+    let target = fifo.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut app = App::new(root).unwrap();
+        let _ = tx.send(app.apply_view_request(&target));
+    });
+    let reply = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("opening a FIFO must not block the frame loop forever");
+    assert!(
+        matches!(reply, crate::view_ipc::ViewReply::Err { .. }),
+        "a FIFO is not a regular file and must be refused with a reason the \
+         client prints, got {reply:?}"
     );
 }
