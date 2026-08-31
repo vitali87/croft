@@ -20949,6 +20949,7 @@ impl App {
                     Err(e) => self.status = format!("Extract failed: {e}"),
                 }
             }
+            InputPurpose::NewWorktreeLane => self.create_worktree_lane(&value),
             InputPurpose::HexFind => {
                 self.close_input_prompt();
                 match crate::hex::HexView::parse_find_query(&value) {
@@ -23683,6 +23684,84 @@ impl App {
         self.scrubber = Some(crate::scrubber::Scrubber::new(commits));
         self.status =
             format!("Scrubbing {n} commits — arrows step, Home returns to your working tree");
+    }
+
+    /// Create a worktree lane and add it as a workspace root (#348).
+    ///
+    /// The worktree is a SIBLING of the repo, never a child: a worktree
+    /// nested inside its own repo is a working tree git then tries to track,
+    /// and the Explorer would show the lane inside the root it was cut from.
+    fn create_worktree_lane(&mut self, name: &str) {
+        let repo = self.workspace_root().to_path_buf();
+        let Some(lane) = crate::git::WorktreeLane::plan(&repo, name) else {
+            // Refused rather than defaulted: a name with nothing usable in
+            // it would otherwise become the branch `agent/`.
+            self.status = format!("{name:?} has no letters or digits to name a lane after");
+            return;
+        };
+        if lane.path.exists() {
+            self.status = format!("{} already exists — pick another name", lane.path.display());
+            return;
+        }
+        match crate::git::add_worktree_lane(&repo, &lane) {
+            Ok(()) => {
+                self.add_workspace_folder(lane.path.clone());
+                self.status = format!("Lane {} on branch {}", lane.path.display(), lane.branch);
+            }
+            Err(why) => self.status = format!("Could not create the lane: {why}"),
+        }
+    }
+
+    /// Remove the active root's worktree lane, refusing when it is dirty
+    /// (#348).
+    ///
+    /// The refusal is the point. `git worktree remove` DISCARDS uncommitted
+    /// work, so this is the one place in the lane flow where being wrong
+    /// destroys something rather than annoying someone — and the check fails
+    /// closed, treating a tree git cannot report on as unsafe.
+    fn close_worktree_lane(&mut self) {
+        // The ACTIVE root, not the primary. `workspace_root()` is
+        // `roots.primary()`, and a lane is appended by `add_workspace_folder`
+        // so it is never index 0 — this targeted the user's main repo every
+        // time. Today git's own "is a main working tree" refusal masks that,
+        // but the guard is git's rather than ours: launch croft INSIDE a lane
+        // (the workflow this feature creates) and the primary becomes a
+        // removable worktree, so the directory is deleted, the folder cannot
+        // be dropped, and the status reports success.
+        let lane = self.active_scm_root.clone();
+        if lane == self.roots.primary() {
+            self.status =
+                String::from("The primary folder is not a lane — open a file in the lane first");
+            return;
+        }
+        if let Some(why) = crate::git::lane_removal_block(&lane) {
+            self.status = format!("Keeping the lane: {why}");
+            return;
+        }
+        // git FIRST, then the folder. `lane_removal_block` answers "is there
+        // uncommitted work", which is not the same question as "will git
+        // remove this" — a LOCKED worktree reports a clean status and is
+        // then refused, measured. Dropping the folder first would leave the
+        // user with the lane gone from their workspace and the directory
+        // still on disk, which is the worst of both.
+        match crate::git::remove_worktree_lane(&lane) {
+            Ok(()) => {
+                self.remove_workspace_folder(lane.clone());
+                // `remove_workspace_folder` refuses the primary and says so
+                // in the status; only claim success when the folder really
+                // left, or a refusal there would be overwritten by a message
+                // saying the whole thing worked.
+                if self.roots.iter().any(|r| r == lane) {
+                    self.status = format!(
+                        "Removed {} on disk, but it is still in this workspace",
+                        lane.display()
+                    );
+                } else {
+                    self.status = format!("Removed lane {}", lane.display());
+                }
+            }
+            Err(why) => self.status = format!("Keeping the lane: {why}"),
+        }
     }
 
     /// One scrubber keystroke. Returns whether it was consumed (#371).
@@ -31423,6 +31502,14 @@ impl App {
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
+            Cmd::NewWorktreeLane => {
+                self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
+                    crate::widgets::input_prompt::InputPurpose::NewWorktreeLane,
+                    String::from("New worktree lane"),
+                    String::from("what the agent will work on"),
+                ))
+            }
+            Cmd::CloseWorktreeLane => self.close_worktree_lane(),
             Cmd::MarkAgentFileReviewed => {
                 match self.editor.path.clone() {
                     None => self.status = String::from("No file open"),
