@@ -130,6 +130,16 @@ impl RewindBuffer {
         if self.capacity == 0 {
             return false;
         }
+        // An empty write records nothing. `bytes` sums payload lengths and
+        // `evict` runs while `bytes > capacity`, so a zero-length frame adds
+        // an entry while adding nothing to the figure that would evict it —
+        // repeated empty pushes would grow `frames` without bound, in the one
+        // structure here whose purpose is to stay bounded. The reader cannot
+        // emit one today (`Ok(0)` ends its loop), but this is public and the
+        // replay half will add callers.
+        if data.is_empty() {
+            return false;
+        }
         // One frame bigger than the whole budget is truncated to the budget
         // rather than dropped: the replay then shows a shortened write, which
         // is explicable, instead of a hole that looks like lost output.
@@ -737,6 +747,38 @@ mod tests {
             kf2.map(|k| k.screen.clone()),
             Some(vec![String::from("pre4")]),
             "the newest pre-output keyframe must be the one retained"
+        );
+    }
+
+    /// Empty writes must not accumulate frames the cap can never evict.
+    ///
+    /// `bytes` sums payload lengths, and `evict` runs `while bytes > capacity`
+    /// — so a zero-length write adds a `Frame` while adding nothing to the
+    /// figure that triggers eviction. Repeated empty pushes therefore grew
+    /// `frames` without bound, in a buffer whose entire purpose is to be
+    /// bounded. The reader cannot emit one today (`Ok(0) => break` ends the
+    /// loop), but `push` is public and the replay half will add callers.
+    #[test]
+    fn empty_writes_do_not_accumulate_unevictable_frames() {
+        let mut b = RewindBuffer::new(1 << 20);
+        for _ in 0..10_000 {
+            b.push(1, b"");
+        }
+        assert!(
+            b.is_empty(),
+            "empty writes must record nothing at all, not unevictable frames"
+        );
+        assert_eq!(b.bytes(), 0);
+
+        // PRESENCE half: a real write still records, so the guard rejects
+        // only the empty case rather than everything.
+        b.push(2, b"real");
+        let (_, frames) = b.replay_from(u64::MAX);
+        let kept: Vec<&[u8]> = frames.iter().map(|f| f.data.as_slice()).collect();
+        assert_eq!(
+            kept,
+            vec![b"real".as_slice()],
+            "a non-empty write must still be recorded"
         );
     }
 
