@@ -27,6 +27,25 @@ const MAX_SCALE: u32 = 8;
 /// since every one of them was observed failing at 1x.
 const MIN_SCALE: u32 = 2;
 
+/// Recalibration for the #422 rule change, applied once here rather than at
+/// seventeen call sites.
+///
+/// The old scale tracked machine SIZE, so on any box with four or more cores
+/// it read at least 4 and a `base` was effectively `base * 4`. Measuring
+/// PRESSURE instead correctly reads 2 on a quiet machine — which would have
+/// halved every budget in the suite, and the module's own note warned that
+/// every one of these waits was observed failing at 1x. Doubling the base
+/// holds the wall clock where it was calibrated while the scale goes back to
+/// meaning what it says.
+///
+/// Deliberately central. Doubling seventeen literals by hand invites missing
+/// one, and a missed one is a flake that looks like the change under test —
+/// the exact failure this module exists to remove. It also keeps `base` the
+/// number a test author reasons about ("a shell printing a line costs about
+/// a second") rather than a number pre-multiplied for a rule they would have
+/// to know about.
+const BASE_CALIBRATION: u32 = 2;
+
 /// One-minute load average, where the platform reports one.
 fn load_average() -> Option<f64> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -56,8 +75,11 @@ pub fn load_scale() -> u32 {
             .map(|n| n.get())
             .unwrap_or(1) as f64;
         let threads = configured_threads().unwrap_or(cpus);
-        let oversubscribed = load_average().map(|l| l / cpus).unwrap_or(1.0);
-        scale_from(threads, oversubscribed)
+        // The RAW load average, not a ratio: `scale_from` divides once, by
+        // the same `cpus`, after summing. Dividing here too was the unit
+        // error (#422).
+        let load = load_average().unwrap_or(0.0);
+        scale_from(threads, load, cpus)
     })
 }
 
@@ -122,15 +144,33 @@ fn threads_from_args<I: IntoIterator<Item = String>>(args: I) -> Option<f64> {
 /// The rule itself, split out so it can be tested without a machine in a
 /// particular state.
 ///
-/// NOTE (#422): `threads` is a count and `oversubscription` is a ratio, so
-/// the `max` between them compares two different quantities. Fixing that in
-/// isolation SHRINKS every budget (a quiet 4-CPU box goes from 4 to the
-/// floor of 2), because the base budgets were calibrated against a scale
-/// that was effectively the core count. It needs the bases recalibrated with
-/// it, which is its own change; this one only makes the existing rule see
-/// the thread count it always meant to read.
-fn scale_from(threads: f64, oversubscription: f64) -> u32 {
-    let raw = threads.max(oversubscription).ceil();
+/// **Runnable work per CPU** (#422). The old rule was `max(threads, load /
+/// cpus)`, which compared a COUNT against a RATIO: on a 64-core box running
+/// 64 threads with no contention at all it returned the cap of 8, while a
+/// genuinely crushed 4-core box returned 4. The scale was tracking machine
+/// size rather than pressure, which is the one thing it exists to measure.
+///
+/// The two signals ADD rather than compete. The suite's own threads and
+/// whatever else owns the machine are contending for the same cores, so the
+/// runnable count is their sum, and dividing by `cpus` turns it into the
+/// factor by which everything is slower than it would be alone. Both inputs
+/// keep the property that made the old `max` attractive — each is blind
+/// where the other sees, and summing preserves that without pretending a
+/// count and a ratio are the same kind of number.
+///
+/// This deliberately reads LOWER than the old rule on a quiet machine (a
+/// quiet 4-CPU box: 4 before, 2 now), which is why the bases moved with it
+/// in the same change. See [`await_spawned`] for the ceiling that had to be
+/// preserved: #397's measured flake — a 4-CPU box at `--test-threads=8`
+/// under six spinning hogs — needed 8 seconds where the base was 4, and
+/// with doubled bases it still gets them.
+fn scale_from(threads: f64, load: f64, cpus: f64) -> u32 {
+    if !(threads.is_finite() && load.is_finite() && cpus.is_finite()) || cpus < 1.0 {
+        return MIN_SCALE;
+    }
+    // `load` is already the machine-wide runnable average, threads is this
+    // suite's own contribution; the sum is what is competing for `cpus`.
+    let raw = ((threads + load) / cpus).ceil();
     if !raw.is_finite() {
         return MIN_SCALE;
     }
@@ -141,7 +181,7 @@ fn scale_from(threads: f64, oversubscription: f64) -> u32 {
 /// timeout to something else (a `recv_timeout`, a probe's own deadline) rather
 /// than polling.
 pub fn spawn_budget(base: Duration) -> Duration {
-    base * load_scale()
+    base * BASE_CALIBRATION * load_scale()
 }
 
 /// Poll `ready` until it answers true, within a load-scaled `base` budget.
@@ -154,7 +194,7 @@ pub fn spawn_budget(base: Duration) -> Duration {
 #[track_caller]
 pub fn await_spawned(base: Duration, what: &str, mut ready: impl FnMut() -> bool) {
     let scale = load_scale();
-    let budget = base * scale;
+    let budget = base * BASE_CALIBRATION * scale;
     let started = Instant::now();
     while started.elapsed() < budget {
         if ready() {
@@ -179,42 +219,99 @@ mod tests {
     #[test]
     fn the_scale_is_clamped_at_both_ends() {
         assert_eq!(
-            scale_from(1.0, 0.0),
+            scale_from(1.0, 0.0, 4.0),
             MIN_SCALE,
             "a quiet machine still gets the floor"
         );
         assert_eq!(
-            scale_from(64.0, 1.0),
+            scale_from(64.0, 0.0, 4.0),
             MAX_SCALE,
-            "a huge thread count is capped"
+            "far more threads than cores is capped"
         );
         assert_eq!(
-            scale_from(1.0, 999.0),
+            scale_from(1.0, 999.0, 4.0),
             MAX_SCALE,
             "a crushed machine is capped too"
         );
+        for (t, l, c) in [
+            (f64::NAN, f64::NAN, 4.0),
+            (4.0, f64::INFINITY, 4.0),
+            (4.0, 1.0, 0.0),
+            (4.0, 1.0, f64::NAN),
+        ] {
+            assert_eq!(
+                scale_from(t, l, c),
+                MIN_SCALE,
+                "a nonsense reading falls back: {t} {l} {c}"
+            );
+        }
+    }
+
+    /// #422: the scale measures PRESSURE, not machine size.
+    ///
+    /// The old rule took `max(threads, load / cpus)` — a count against a
+    /// ratio — so it read the core count on any machine big enough, and a
+    /// 64-core box idling at one thread per core got the same maximum
+    /// stretch as a genuinely crushed one.
+    #[test]
+    fn a_big_quiet_machine_is_not_a_loaded_one() {
         assert_eq!(
-            scale_from(f64::NAN, f64::NAN),
+            scale_from(64.0, 1.0, 64.0),
             MIN_SCALE,
-            "a nonsense reading falls back"
+            "64 threads on 64 cores with nothing else running is not \
+             contention: the old rule returned the CAP here"
+        );
+        assert_eq!(
+            scale_from(8.0, 0.5, 8.0),
+            MIN_SCALE,
+            "nor is a quiet developer machine at its default thread count"
+        );
+        assert!(
+            scale_from(4.0, 14.0, 4.0) > MIN_SCALE,
+            "while a 4-core box under a genuine 3.5x oversubscription is"
         );
     }
 
-    // Each signal is blind where the other sees, so the rule takes whichever
-    // is worse rather than averaging them away.
+    /// Each signal is blind where the other sees, so both count — and they
+    /// ADD, because the suite's threads and everything else on the machine
+    /// contend for the same cores.
     #[test]
-    fn either_signal_alone_can_raise_the_scale() {
-        assert_eq!(
-            scale_from(4.0, 1.0),
-            4,
+    fn both_signals_contribute_to_the_pressure() {
+        let quiet = scale_from(4.0, 0.0, 4.0);
+        assert!(
+            scale_from(12.0, 0.0, 4.0) > quiet,
             "the suite's own parallelism counts"
         );
-        assert_eq!(
-            scale_from(1.0, 4.0),
-            4,
+        assert!(
+            scale_from(4.0, 12.0, 4.0) > quiet,
             "so does load from outside the suite"
         );
-        assert_eq!(scale_from(4.0, 6.0), 6, "the worse of the two wins");
+        assert!(
+            scale_from(12.0, 12.0, 4.0) >= scale_from(12.0, 0.0, 4.0),
+            "and together they are worse than either alone"
+        );
+    }
+
+    /// #397's measured flake, which is the ceiling this rule may not lower:
+    /// a 4-CPU box at `--test-threads=8` under six spinning hogs needed a
+    /// wait budgeted at 4s to have 8s.
+    ///
+    /// The old rule reached 8 there by reading the thread count directly.
+    /// This one reads 4 — (8 + 6) / 4 — so the bases doubled in the same
+    /// change to hold the same wall clock. That trade is the whole point of
+    /// doing both together, and this test is what stops the scale half
+    /// being changed again without the base half.
+    #[test]
+    fn the_397_flake_still_gets_its_eight_seconds() {
+        let scale = scale_from(8.0, 6.0, 4.0);
+        assert_eq!(scale, 4, "runnable work per CPU: (8 + 6) / 4");
+        // Through the real formula, not a hand-doubled literal: the base a
+        // test author writes is 1s, and the module supplies the calibration.
+        let base = std::time::Duration::from_secs(1);
+        assert!(
+            base * BASE_CALIBRATION * scale >= std::time::Duration::from_secs(8),
+            "the 1s base a caller writes still clears the 8s that flake needed"
+        );
     }
 
     /// `--test-threads` and `RUST_TEST_THREADS` are the same instruction to
@@ -297,7 +394,11 @@ mod tests {
     #[test]
     fn a_budget_scales_by_exactly_the_scale() {
         let base = Duration::from_millis(500);
-        assert_eq!(spawn_budget(base), base * load_scale());
+        assert_eq!(
+            spawn_budget(base),
+            base * BASE_CALIBRATION * load_scale(),
+            "the calibration factor rides with the scale (#422)"
+        );
     }
 
     // The helper must not become a way to pass by waiting: a condition that
