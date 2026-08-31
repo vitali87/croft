@@ -215,26 +215,24 @@ pub fn file_stem(label: &str) -> String {
         .collect();
     let trimmed = mapped.trim_matches('-');
     if trimmed.is_empty() {
+        return String::from("theme");
+    }
+    // Nothing bounds a label's length, and the stem becomes a real filename:
+    // past ~255 bytes the write fails with ENAMETOOLONG. That fails closed
+    // rather than dangerously, but it fails on the theme's NAME, which is a
+    // baffling place for an import to stop. 64 is far more than any real
+    // theme name needs. Trimmed again because the cut can land on a `-`.
+    let capped: String = trimmed.chars().take(64).collect();
+    let capped = capped.trim_matches('-');
+    // The cut can leave nothing but separators behind, which would put the
+    // empty name back that the guard above just ruled out.
+    if capped.is_empty() {
         String::from("theme")
     } else {
-        trimmed.to_string()
+        capped.to_string()
     }
 }
 
-/// One theme a `.vsix` contributes, as its `package.json` declares it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContributedTheme {
-    /// The label a user would recognise ("One Dark Pro").
-    pub label: String,
-    /// Archive-relative path to the theme JSON.
-    pub path: String,
-}
-
-/// The themes a `package.json` contributes, in declaration order.
-///
-/// Only `contributes.themes` is read. Every other field — `main`,
-/// `activationEvents`, `scripts` — is ignored by construction, because the
-/// archive is never installed and nothing in it is executed.
 /// Resolve VS Code's `%key%` localisation placeholders against an NLS
 /// bundle.
 ///
@@ -256,6 +254,20 @@ fn resolve_nls(value: &str, nls: Option<&serde_json::Value>) -> String {
         .to_string()
 }
 
+/// One theme a `.vsix` contributes, as its `package.json` declares it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContributedTheme {
+    /// The label a user would recognise ("One Dark Pro").
+    pub label: String,
+    /// Archive-relative path to the theme JSON.
+    pub path: String,
+}
+
+/// The themes a `package.json` contributes, in declaration order.
+///
+/// Only `contributes.themes` is read. Every other field — `main`,
+/// `activationEvents`, `scripts` — is ignored by construction, because the
+/// archive is never installed and nothing in it is executed.
 pub fn contributed_themes(
     package_json: &str,
     nls_json: Option<&str>,
@@ -603,6 +615,26 @@ mod tests {
         // A label with nothing to keep still yields a usable name.
         assert_eq!(file_stem("///"), "theme");
         assert_eq!(file_stem(""), "theme");
+
+        // Nothing bounds a label's length, and the stem becomes a filename:
+        // past ~255 bytes the write fails with ENAMETOOLONG, stopping the
+        // import on the theme's NAME. Every stem stays a usable filename.
+        for label in [
+            "x".repeat(4096),
+            format!("{}{}", "a".repeat(70), "/".repeat(70)),
+            // A cut landing in a run of separators must not empty the stem.
+            format!("{}{}", "-".repeat(64), "real"),
+            "é".repeat(300),
+        ] {
+            let stem = file_stem(&label);
+            assert!(
+                !stem.is_empty(),
+                "empty stem for a {}-char label",
+                label.len()
+            );
+            assert!(stem.len() <= 64, "stem of {} bytes: {stem:?}", stem.len());
+            assert!(!stem.starts_with('-') && !stem.ends_with('-'), "{stem:?}");
+        }
         // And an ordinary label survives recognisably, so a marketplace
         // import and a file import of the same theme still agree on an id.
         assert_eq!(file_stem("Nord"), "Nord");
