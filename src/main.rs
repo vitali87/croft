@@ -15,6 +15,7 @@ mod config_sync;
 mod dap;
 mod docx;
 mod file_ref;
+mod fleet;
 mod ghostty;
 mod git;
 mod gradient;
