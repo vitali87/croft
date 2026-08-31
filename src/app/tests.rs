@@ -2643,12 +2643,18 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     app.active_terminal = 1;
     term.draw(|f| app.render(f)).unwrap();
 
+    // FIND the link's cell rather than assuming which row it landed on
+    // (#397). Pane 0 has a real shell, and its prompt arrives from the
+    // reader thread whenever the OS gets round to it - before the injected
+    // bytes on a loaded machine, after them on a quiet one. Either way the
+    // link is in the pane; only its row moves, and hard-coding
+    // `area.y + 1` made the test a race against shell startup rather than a
+    // check of the swallow guard it is named for.
     let area = app.terminals[0].last_area;
-    let (col, row) = (area.x + 2, area.y + 1);
-    assert!(
-        app.terminals[0].hyperlink_at_screen(col, row).is_some(),
-        "pane 0 must carry the link, or the built-in has nothing to act on"
-    );
+    let (col, row) = (area.y..area.y + area.height)
+        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
+        .find(|&(c, r)| app.terminals[0].hyperlink_at_screen(c, r).is_some())
+        .expect("pane 0 must carry the link somewhere, or the built-in has nothing to act on");
     assert_eq!(
         app.active_terminal, 1,
         "pane 1 must be ACTIVE while the click lands in pane 0, or the \
