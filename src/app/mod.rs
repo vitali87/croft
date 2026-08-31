@@ -22896,18 +22896,19 @@ impl App {
         // (same rule `format_cd_command` pins for the cd seed).
         let command = format!("\x05\x15{}\r", task.command);
         self.last_task = Some(task.clone());
-        // Reuse only a pane whose shell still lives under the current
-        // workspace: after a re-root the old pane's label still matches,
-        // and running the new project's build there builds the old one.
-        // An unknown cwd (android, remote) keeps today's reuse.
+        // Reuse only a pane whose shell is standing exactly where this
+        // task will run: after a re-root the old pane's label still
+        // matches, and running the new project's build there builds the
+        // old one. Shares `pane_is_idle_at` with the runnable-fence path
+        // (#430) — this guard existed twice and only one copy was fixed,
+        // which is precisely how the two defects survived a green suite.
         let active = self.active_workspace_root();
         let root = active.canonicalize().unwrap_or(active);
-        if let Some(idx) = self.terminals.iter().position(|t| {
-            t.label() == pane_name
-                && t.foreground_is_shell()
-                && t.kernel_shell_cwd()
-                    .is_none_or(|cwd| cwd.starts_with(&root))
-        }) {
+        if let Some(idx) = self
+            .terminals
+            .iter()
+            .position(|t| pane_is_idle_at(t, &pane_name, &root))
+        {
             self.active_terminal = idx;
             self.terminals[idx].write_input(command.as_bytes());
             self.show_terminal = true;
@@ -26747,30 +26748,19 @@ impl App {
         // Ctrl-E + Ctrl-U first, as tasks do: an idle shell's line editor
         // may hold a half-typed command.
         let bytes = format!("\x05\x15{}", block.command);
-        // Same guard as `run_project_task`: `README.md:1` is a likely name
-        // across two repos opened in sequence, and a pane whose shell still
-        // sits in the other repo must not receive this one's block.
+        // Same guard as `run_project_task`, and the SAME predicate rather
+        // than a second copy: `README.md:1` is a likely name across two
+        // repos opened in sequence, and a pane whose shell still sits in
+        // the other repo must not receive this one's block (#430).
         let root = block
             .cwd
             .canonicalize()
             .unwrap_or_else(|_| block.cwd.clone());
-        if let Some(idx) = self.terminals.iter().position(|t| {
-            t.label() == block.pane_name
-                && t.foreground_is_shell()
-                // `is_some_and`, not `is_none_or`: an unreadable cwd is
-                // exactly the case this guard exists for. Reusing the pane
-                // when croft cannot tell where its shell sits would type
-                // this repo's block into the other repo's shell, which is
-                // the outcome the comment above forbids. The copy in
-                // `run_project_task` predates this and is left alone.
-                // EXACTLY the block's directory, not merely under it.
-                // `starts_with` accepted any descendant, so a pane whose
-                // shell had cd'd into a subdirectory was reused and the
-                // block ran there while the confirm popup showed
-                // `block.cwd`. A pane is only this block's pane if its
-                // shell is standing where the block says it will run.
-                && t.kernel_shell_cwd().is_some_and(|cwd| cwd == root)
-        }) {
+        if let Some(idx) = self
+            .terminals
+            .iter()
+            .position(|t| pane_is_idle_at(t, &block.pane_name, &root))
+        {
             self.active_terminal = idx;
             self.terminals[idx].write_input(bytes.as_bytes());
             self.show_terminal = true;
@@ -41837,6 +41827,35 @@ fn relative_clipboard_text(path: &Path, root: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+/// Whether `t` is the idle pane named `pane_name` whose shell is standing
+/// exactly at `root` — the one predicate behind every "reuse a pane rather
+/// than stack a new one" decision (#430).
+///
+/// Shared deliberately. This guard existed as two copies, and when #392
+/// fixed the runnable-fence copy the task copy kept both defects: a
+/// `starts_with` that accepted any DESCENDANT, so a shell that had `cd`'d
+/// into a subdirectory was reused and the command ran there; and an
+/// `is_none_or` that opened the guard when the cwd could not be read at
+/// all, which is the exact case the guard exists for. One predicate means
+/// a future correction cannot land on one caller and miss the other.
+///
+/// The comparison is exact on purpose. Both sides are resolved paths — the
+/// kernel reports the shell's cwd fully resolved, and `canonicalize()`
+/// resolves symlinks and never emits a trailing separator — so equality
+/// holds wherever reuse is genuinely wanted, including through a
+/// `/tmp` -> `/private/tmp` symlink. When it does not hold, the caller
+/// opens a fresh pane at the right directory, so the worst case is a spare
+/// pane rather than a command run somewhere the user was not told about.
+fn pane_is_idle_at(
+    t: &crate::widgets::terminal::PtyTerminal,
+    pane_name: &str,
+    root: &Path,
+) -> bool {
+    t.label() == pane_name
+        && t.foreground_is_shell()
+        && t.kernel_shell_cwd().is_some_and(|cwd| cwd == root)
 }
 
 fn copy_to_clipboard(text: &str) -> bool {

@@ -37014,3 +37014,96 @@ fn the_failure_site_survives_a_whole_cargo_test_run() {
     // And a test that did not fail has no block at all.
     assert!(app.failure_site_of("tests::passes").is_none());
 }
+
+/// #430: a task must not be typed into a pane whose shell has walked away
+/// from the task's directory.
+///
+/// Both defects lived in `run_project_task`'s copy of a guard that #392
+/// fixed only on the runnable-fence side: `starts_with` accepted any
+/// DESCENDANT, so a shell that had `cd`'d into a subdirectory was reused
+/// and the task ran there. The two callers now share `pane_is_idle_at`,
+/// so a correction cannot land on one and miss the other.
+#[test]
+fn a_task_pane_whose_shell_left_the_directory_is_not_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let chord = key(
+        KeyCode::Char('B'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    app.handle_key(chord).unwrap();
+
+    // Wait for the pane's shell to reach its prompt, as the reuse path
+    // requires an idle pane.
+    let root = tmp.path().canonicalize().unwrap();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the task pane's shell",
+        || {
+            let t = &app.terminals[app.active_terminal];
+            t.foreground_is_shell() && t.kernel_shell_cwd() == Some(root.clone())
+        },
+    );
+    let idx = app.active_terminal;
+    let label = app.terminals[idx].label().to_string();
+    // The control: standing in the task's own directory, the pane IS this
+    // task's pane.
+    assert!(
+        pane_is_idle_at(&app.terminals[idx], &label, &root),
+        "precondition: an idle pane at the task's own directory is reusable"
+    );
+
+    // Now walk the shell into a subdirectory, as a user reading a log or
+    // poking at a subcrate would.
+    app.terminals[idx].write_input(b"cd sub\r");
+    let sub = root.join("sub");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the shell to enter the subdirectory",
+        || app.terminals[idx].kernel_shell_cwd() == Some(sub.clone()),
+    );
+
+    assert!(
+        !pane_is_idle_at(&app.terminals[idx], &label, &root),
+        "a shell that has left the task's directory is not the task's pane: \
+         `starts_with` accepted any descendant and ran the task in `sub`"
+    );
+
+    // And the whole path agrees: rerunning opens a fresh pane at the right
+    // directory rather than typing into the one that walked away.
+    let before = app.terminals.len();
+    app.handle_key(chord).unwrap();
+    assert_eq!(
+        app.terminals.len(),
+        before + 1,
+        "the task gets a pane standing where it will actually run"
+    );
+}
+
+/// #430: an UNREADABLE cwd must close the guard, not open it. `is_none_or`
+/// did the opposite in exactly the case the guard exists for — croft cannot
+/// tell where the shell is, so it reused the pane anyway.
+#[test]
+fn a_pane_with_no_readable_cwd_is_not_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A pane with no shell pid reports no cwd, which is what an android or
+    // remote pane looks like to `kernel_shell_cwd`.
+    let t = &app.terminals[0];
+    if t.kernel_shell_cwd().is_none() {
+        assert!(
+            !pane_is_idle_at(t, t.label(), &root),
+            "an unreadable cwd closes the guard rather than opening it"
+        );
+    }
+    // A label mismatch is refused regardless of cwd, which is the other
+    // half of the predicate.
+    assert!(!pane_is_idle_at(
+        &app.terminals[0],
+        "Task: nonexistent",
+        &root
+    ));
+}
