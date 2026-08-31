@@ -156,7 +156,7 @@ impl Thread {
         if let Anchor::At(line) | Anchor::Outdated(line) = self.anchor
             && line >= buffer_lines
         {
-            t.push_str(&format!(", was line {}", line + 1));
+            t.push_str(&format!(" \u{b7} was line {}", line + 1));
         }
         if matches!(self.anchor, Anchor::FileLevel) {
             t.push_str(" \u{b7} on the file");
@@ -323,6 +323,40 @@ mod tests {
             "{}",
             far.title_for(9000)
         );
+    }
+
+    /// A CURRENT anchor that is clamped also says where it was.
+    ///
+    /// Not only an outdated one: the buffer is whatever the user has edited
+    /// it to since the threads were loaded, so any line can end up past the
+    /// end. Without this the box silently stacks on the last line with a
+    /// bare author name, which is the same indistinguishable pile the
+    /// outdated case already avoids.
+    #[test]
+    fn a_clamped_current_thread_also_says_where_it_was() {
+        let t = Thread {
+            id: 1,
+            author: String::from("ada"),
+            body: String::from("b"),
+            path: String::from("a.rs"),
+            anchor: Anchor::At(9),
+            resolved: false,
+        };
+        // Buffer shrank to 3 lines: the anchor is past the end.
+        let title = t.title_for(3);
+        assert!(
+            title.contains("was line 10"),
+            "a clamped current anchor must name its line: {title:?}"
+        );
+        assert!(
+            !title.contains("outdated"),
+            "it is clamped, not outdated: {title:?}"
+        );
+        // The separator keeps the title readable rather than leaving a bare
+        // comma where the `outdated` clause used to be.
+        assert_eq!(title, "ada \u{b7} was line 10", "malformed title");
+        // Still inside the buffer: no clamp, so nothing to say.
+        assert_eq!(t.title_for(100), "ada");
     }
 
     /// A line past the end of a shrunken file is clamped into view.

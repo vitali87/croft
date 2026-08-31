@@ -36891,6 +36891,99 @@ fn the_comment_walk_reaches_review_boxes() {
     );
 }
 
+/// #366: a navigator note and a review comment on ONE line keep a stable
+/// order, and the review box carries its own text.
+///
+/// The merge appends review boxes after the navigator's, which is the order
+/// the render comment promises. Asserting on ids alone would pass under a
+/// merge that mangled every other field, so this pins the whole tuple:
+/// a swap of the two sources, a wrong line, or a body taken from the wrong
+/// thread all fail here.
+#[test]
+fn a_navigator_note_and_a_review_comment_on_one_line_keep_a_stable_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+    app.navigator_notes
+        .insert("a.rs".into(), vec![(1, 1, "the navigator's note".into())]);
+    app.review_boxes = Some((
+        file.clone(),
+        vec![crate::review_threads::Thread {
+            id: 4_000_000_001,
+            author: String::from("ada"),
+            body: String::from("the reviewer's objection"),
+            path: String::from("a.rs"),
+            // Same row as the navigator's note.
+            anchor: crate::review_threads::Anchor::At(1),
+            resolved: false,
+        }],
+    ));
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    let got: Vec<(u64, usize, String)> = app
+        .editor
+        .comment_boxes
+        .iter()
+        .map(|b| (b.id, b.line, b.body.clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, 1, String::from("the navigator's note")),
+            (4_000_000_001, 1, String::from("the reviewer's objection")),
+        ],
+        "the navigator's note must come first and each box keep its own text"
+    );
+}
+
+/// #366: review boxes follow the open file through a rename.
+///
+/// Both guards compare the stored path against `editor.path`, so a rename
+/// that repoints the tab without repointing the field makes the boxes
+/// vanish from the buffer the user is still editing.
+#[test]
+fn review_boxes_follow_the_open_file_through_a_rename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = tmp.path().join("a.rs");
+    let new = tmp.path().join("renamed.rs");
+    std::fs::write(&old, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&old).unwrap();
+    app.review_boxes = Some((
+        old.clone(),
+        vec![crate::review_threads::Thread {
+            id: 66,
+            author: String::from("ada"),
+            body: String::from("still mine"),
+            path: String::from("a.rs"),
+            anchor: crate::review_threads::Anchor::At(1),
+            resolved: false,
+        }],
+    ));
+
+    std::fs::rename(&old, &new).unwrap();
+    app.editor.rename_open_path(&old, &new);
+    app.rename_review_boxes_path(&old, &new);
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.editor.comment_boxes.iter().any(|b| b.id == 66),
+        "the rename orphaned the review boxes: {:?}",
+        app.editor
+            .comment_boxes
+            .iter()
+            .map(|b| b.id)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// #356: a recording produces a file that is asciicast v2 all the way
 /// through, header and every event.
 ///

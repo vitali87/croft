@@ -21914,6 +21914,22 @@ impl App {
     /// Dismiss one comment box: drop the note from the pilot's state and
     /// from the local snapshot (the next poll would resurrect it otherwise
     /// only if the pilot still had it).
+    /// Follow the open file to its new path so its review boxes survive a
+    /// rename or an explorer cut/paste (#366).
+    ///
+    /// Both guards — the render merge and the F4 walk — compare the stored
+    /// path against `editor.path`. A rename repoints the tab and would
+    /// otherwise leave the field naming a path nothing matches, so the boxes
+    /// vanish from the buffer the user is still editing and the field holds
+    /// unreachable garbage.
+    fn rename_review_boxes_path(&mut self, old: &Path, new: &Path) {
+        if let Some((p, _)) = &mut self.review_boxes
+            && p == old
+        {
+            *p = new.to_path_buf();
+        }
+    }
+
     fn ignore_comment_box(&mut self, id: u64) {
         if let Some(host) = &self.pair_host {
             host.remove_note(id);
@@ -21924,6 +21940,12 @@ impl App {
         // Review boxes share this footer and this hit-test, so without
         // retaining here the button would report "Comment ignored" and the
         // box would return on the very next frame (#366).
+        //
+        // Matching on the id alone is safe because the two sources cannot
+        // collide in practice: a navigator note's id counts up from 0 (see
+        // `session_host`'s `next_id`), while a review thread's is GitHub's
+        // own comment id, currently around 3.9e9. If notes ever gain a
+        // wider allocator, this needs a tag rather than a bare id.
         if let Some((_, threads)) = &mut self.review_boxes {
             threads.retain(|t| t.id != id);
         }
@@ -24132,9 +24154,11 @@ impl App {
             .count();
         // Stored against the file they describe; the render derives each
         // box's row and title from the buffer as it is at that moment.
-        if let Some(path) = self.editor.path.clone() {
-            self.review_boxes = Some((path, threads.clone()));
-        }
+        // `path` is the binding taken at the top of this function, so the
+        // threads are keyed to the file the `gh` query was actually about —
+        // re-reading `editor.path` here could key them to a different file
+        // if the user switched tabs while the subprocess ran.
+        self.review_boxes = Some((path, threads.clone()));
         self.status = match outdated {
             0 => format!("{} review comments on {rel}", threads.len()),
             n => format!(
@@ -41274,6 +41298,7 @@ impl App {
                 Ok(p) => {
                     if matches!(mode, ExplorerClipMode::Cut) && self.editor.matches_open_path(src) {
                         self.editor.rename_open_path(src, &p);
+                        self.rename_review_boxes_path(src, &p);
                     }
                     placed.push(p);
                 }
@@ -41475,6 +41500,7 @@ impl App {
                             }
                         }
                         self.editor.rename_open_path(&old_path, &new_path);
+                        self.rename_review_boxes_path(&old_path, &new_path);
                         self.sync_open_file_poll_mtime();
                     }
                     Err(e) => {
