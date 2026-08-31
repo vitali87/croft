@@ -946,6 +946,35 @@ struct PendingCapture {
     persist: bool,
 }
 
+/// Canonicalise `path` even when it no longer exists.
+///
+/// `std::fs::canonicalize` stats the final component, so it fails on a path
+/// that has been deleted — and a deletion event carries exactly such a path.
+/// Resolving the deepest ancestor that still exists and re-attaching the tail
+/// gives the same answer for a live path and a usable one for a dead path,
+/// which is what lets a removal clear the row it created (#345).
+///
+/// `None` when nothing on the way to the filesystem root resolves, and also
+/// for a path with no file name to strip — a bare root, or one ending in
+/// `..` — which cannot be climbed any further.
+fn canonicalize_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = path.to_path_buf();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&probe) {
+            let mut out = canon;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return Some(out);
+        }
+        // `file_name` is None for a root or `..`; either way there is
+        // nothing further to climb.
+        tail.push(probe.file_name()?.to_os_string());
+        probe = probe.parent()?.to_path_buf();
+    }
+}
+
 /// State of a background self-update observed by a remote-launched croft.
 /// `Idle` is the steady state; `InProgress` paints an "Updating" hint in
 /// the status bar; `Ready` arms the re-exec into the freshly-shipped binary.
@@ -11361,8 +11390,12 @@ impl App {
         // Attribute the writes to whichever agents were working when they
         // landed (#345). Done after the reload so an agent's write to the
         // ACTIVE tab is hashed from the content the user is about to see.
-        if !drain.changed_files.is_empty() {
-            self.attribute_writes_to_working_agents(&drain.changed_files);
+        if !drain.changed_files.is_empty()
+            && self.attribute_writes_to_working_agents(&drain.changed_files)
+        {
+            // Only when the ledger actually moved: the Explorer's dots must
+            // match it, and a decoration that lags is worse than none.
+            self.sync_agent_lane_decorations();
         }
         // A rescan means the watcher dropped events, so the queue is a
         // LOWER BOUND from here until it is emptied (#345). Recorded in the
@@ -15130,7 +15163,12 @@ impl App {
         // The review queue rides the same chip (#345): a file an agent
         // changed while you were looking elsewhere is the thing you most
         // need to be told about, and it outlives the agent's own pane.
-        let unreviewed = self.agent_ledger.unreviewed_files();
+        // The set the Explorer is drawing, not a fresh count off the ledger:
+        // this is the per-frame render path, and `unreviewed_files` clones
+        // every path to build a set it then throws away. Reading the cache
+        // also makes the chip and the dots the SAME number by construction
+        // rather than by two code paths agreeing.
+        let unreviewed = self.tree.agent_touched.len();
         if seated > 0 || unreviewed > 0 {
             // With nothing seated the agent half would read "0 agents",
             // which is not what the chip is reporting any more: the queue
@@ -28341,6 +28379,10 @@ impl App {
                     .any(|t| t.agent().is_some_and(|a| a.name == *agent))
             {
                 let agent = agent.clone();
+                // No decoration sync needed here, and deliberately so: the
+                // guard above only lets this run when the lane has NOTHING
+                // unreviewed, so it removes no row the Explorer is drawing
+                // a dot for (#345).
                 self.agent_ledger.forget(&agent);
             }
             if let crate::agents::AgentEvent::Waiting { pane, agent } = ev {
@@ -28400,14 +28442,29 @@ impl App {
     ) -> bool {
         let working = self.working_agents();
         let mut any = false;
+        // Resolved once: the roots cannot change inside this loop, and on a
+        // symlinked root the direct check never hits, so leaving it inside
+        // would pay `files x roots` canonicalisations on every drain.
+        let root_canons = self.root_canons();
         for path in changed {
             // Only workspace files: an agent editing its own config under
             // $HOME is not part of this workspace's review queue. ANY root
             // counts, not just the primary — a secondary folder's files are
             // as much this session's work as the first folder's (#345).
-            if self.roots.owning_root(path).is_none() {
+            // Compare in the same spelling on both sides. The watcher reports
+            // the realpath, while a root is stored as the user gave it — so on
+            // macOS a workspace under /var arrives as /private/var and matches
+            // no root. Every agent write was silently dropped and the queue
+            // stayed empty with nothing failing. Any root reached through a
+            // symlink has the same shape, which is ordinary on Linux too.
+            //
+            // The path is recorded in the form the ROOT uses, so the ledger's
+            // keys match what the Explorer's rows are keyed on and a later
+            // "mark reviewed" finds the row instead of adding a second.
+            let Some(under_root) = self.path_under_roots(&root_canons, path) else {
                 continue;
-            }
+            };
+            let path = &under_root;
             match crate::agent_lane::read_baseline(path) {
                 // Attribution needs someone to attribute to; a quiet
                 // agent's pane is no reason to blame it for the user's
@@ -28428,10 +28485,110 @@ impl App {
         any
     }
 
+    /// `path` expressed under whichever workspace root owns it, or `None`
+    /// when no root does.
+    ///
+    /// Tries the path as given first — the common case, costing nothing —
+    /// then compares canonicalised, which is what a file watcher's realpath
+    /// needs to match a root the user spelled with a symlink in it. The
+    /// returned path is rooted the way the ROOT is spelled, so everything
+    /// keyed on it agrees with the Explorer's rows.
+    ///
+    /// A DELETED path still resolves. `canonicalize` stats the final
+    /// component and fails with `ENOENT` on a path that is gone — which is
+    /// exactly what a deletion event carries, so resolving the whole path
+    /// would make the ledger's `forget_path` arm unreachable and strand rows
+    /// on files that no longer exist. The walk therefore resolves the
+    /// deepest ancestor that DOES exist and re-attaches the tail: a deleted
+    /// file's parent directory is almost always still there, and when it is
+    /// not the walk keeps climbing.
+    ///
+    /// Longest prefix wins, mirroring `WorkspaceRoots::owning_root`: with
+    /// nested roots the deeper one owns the path, and picking the first
+    /// match instead would make the ledger's key depend on the order the
+    /// user added folders.
+    /// The roots are resolved by the CALLER so a loop over many changed
+    /// paths can hoist the canonicalisation, which depends only on the root
+    /// set and cannot change between iterations. Not a cache — there is
+    /// nothing to invalidate, because the value does not outlive the loop
+    /// that computes it.
+    fn path_under_roots(&self, root_canons: &[(PathBuf, PathBuf)], path: &Path) -> Option<PathBuf> {
+        // The direct check FIRST, and that ordering is load-bearing rather
+        // than merely quick. If an intermediate directory is itself a
+        // symlink pointing outside the workspace, resolving the whole path
+        // would land the result outside the root; hitting on the spelled
+        // path here means the walk below never sees that case.
+        if self.roots.owning_root(path).is_some() {
+            return Some(path.to_path_buf());
+        }
+        let canon = canonicalize_existing_ancestor(path)?;
+        root_canons
+            .iter()
+            .cloned()
+            .filter_map(|(spelled, canon_root)| {
+                let rel = canon.strip_prefix(&canon_root).ok()?;
+                Some((canon_root.components().count(), spelled.join(rel)))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, joined)| joined)
+    }
+
+    /// Each root as `(spelling, canonical)`.
+    ///
+    /// Recomputed per call rather than cached on `App`: the set is one or
+    /// two entries in practice, and this runs only when a path failed the
+    /// direct check — i.e. on a symlinked root, where it is the price of the
+    /// feature working at all. A cache here would need invalidating from
+    /// every root mutation, which is more ways to be wrong than it saves.
+    fn root_canons(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.roots
+            .iter()
+            .map(|r| {
+                (
+                    r.to_path_buf(),
+                    std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()),
+                )
+            })
+            .collect()
+    }
+
+    /// Called from every place the ledger's CONTENT changes, rather than on
+    /// a schedule: a decoration that lags the thing it describes is worse
+    /// than none, because "no dot" is exactly what a reviewed file looks
+    /// like, so a stale one says the user reviewed something they did not.
+    ///
+    /// Every site that mutates the ledger's content calls this, and here is
+    /// why that is all of them. `record_write`
+    /// and `forget_path` both run under the fs-watch drain, behind
+    /// `attribute_writes_to_working_agents`'s return; `mark_reviewed` under
+    /// `mark_agent_file_reviewed`; `mark_lane_reviewed` under
+    /// `mark_agent_lane_reviewed`; `forget_path` again from
+    /// `remove_workspace_folder`. Of the ledger's other `&mut self`
+    /// methods, `note_dropped_events` and `settle_if_empty` move only the
+    /// incomplete flag and cannot change the set, and `forget` is reachable
+    /// only behind a guard that requires the lane to be empty already.
+    fn sync_agent_lane_decorations(&mut self) {
+        let paths = self.agent_ledger.unreviewed_paths();
+        // Skip the Arc swap when both sides are empty, which is the common
+        // shape early in a session and after a review clears the queue.
+        if paths.is_empty() && self.tree.agent_touched.is_empty() {
+            return;
+        }
+        self.tree.agent_touched = std::sync::Arc::new(paths);
+    }
+
     /// Mark one file reviewed in one agent's lane (#345): the content on
     /// DISK now becomes the baseline, so the row returns only on a later
     /// write.
     pub(crate) fn mark_agent_file_reviewed(&mut self, agent: &str, path: &Path) -> bool {
+        let changed = self.mark_agent_file_reviewed_inner(agent, path);
+        if changed {
+            self.sync_agent_lane_decorations();
+        }
+        changed
+    }
+
+    fn mark_agent_file_reviewed_inner(&mut self, agent: &str, path: &Path) -> bool {
         match crate::agent_lane::read_baseline(path) {
             crate::agent_lane::Baseline::Hash(hash) => {
                 self.agent_ledger.mark_reviewed(agent, path, hash)
@@ -28466,6 +28623,9 @@ impl App {
             1 => format!("{agent}: 1 file marked reviewed{gone}"),
             n => format!("{agent}: {n} files marked reviewed{gone}"),
         };
+        if reviewed + dropped > 0 {
+            self.sync_agent_lane_decorations();
+        }
         reviewed + dropped
     }
 
@@ -37220,6 +37380,19 @@ impl App {
             return;
         }
         self.tree.remove_root(&path);
+        // The removed folder's review queue goes with it (#345). Its rows
+        // leave the tree, so no stale DOT renders — but the status chip
+        // counts the same set, and a count that outlives the folder it
+        // describes sends the user looking for rows that are not there.
+        for gone in self
+            .agent_ledger
+            .unreviewed_paths()
+            .into_iter()
+            .filter(|p| p.starts_with(&path))
+        {
+            self.agent_ledger.forget_path(&gone);
+        }
+        self.sync_agent_lane_decorations();
         self.git_extra.retain(|(r, _)| r != &path);
         self.git_head_oids.remove(&path);
         if self.active_scm_root == path {
@@ -37441,6 +37614,11 @@ impl App {
         self.tree.set_root(new_root.clone());
         self.tree_clipboard = None;
         self.compare_anchor = None;
+        // The agent review queue belongs to the workspace that was left
+        // (#345). `set_root` has just cleared the Explorer's copy; this
+        // clears the ledger it is drawn from, so the two cannot come back
+        // apart the moment an agent writes under the new root.
+        self.agent_ledger = crate::agent_lane::AgentLedger::new();
         self.fs_watch.rebind(&new_root, &self.tree);
         // A re-root collapses the workspace to one folder: the secondary
         // watchers go with their roots (#147).
