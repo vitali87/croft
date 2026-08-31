@@ -38335,6 +38335,42 @@ fn a_pane_command_carries_the_view_socket_when_one_is_bound() {
 }
 
 #[test]
+fn a_pane_command_clears_an_inherited_view_socket_when_none_is_bound() {
+    // A croft launched FROM a croft pane inherits the outer croft's
+    // `CROFT_VIEW_SOCK` through `CommandBuilder::new`, which seeds itself from
+    // `std::env::vars_os()`. If the inner croft's own bind fails, adding
+    // nothing is not the same as clearing: its panes keep the PARENT's socket,
+    // and `croft view report.pdf` opens the file in the wrong window and exits
+    // 0. The field doc promises the opposite ("panes then see no
+    // CROFT_VIEW_SOCK and the client says so plainly").
+    //
+    // Asserted through `iter_full_env_as_str`, which is what the CHILD
+    // receives. The sibling test below reads `iter_extra_env_as_str`, which
+    // filters out every inherited entry and is therefore structurally blind to
+    // this: it can only ever prove nothing was ADDED.
+    let mut cmd = portable_pty::CommandBuilder::new("/bin/sh");
+    cmd.env(crate::view_ipc::SOCK_ENV, "/tmp/outer-croft.sock");
+    crate::widgets::terminal::apply_pane_env(&mut cmd, None);
+    let carried: Vec<(String, String)> = cmd
+        .iter_full_env_as_str()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert!(
+        !carried.iter().any(|(k, _)| k == crate::view_ipc::SOCK_ENV),
+        "an inherited socket must be CLEARED, not merely not-added, or a \
+         nested croft routes `croft view` to its parent: {carried:?}"
+    );
+    // Presence half over the same view: the terminal identity still reaches
+    // the child, so this cannot pass by the whole env having been dropped.
+    assert!(
+        carried
+            .iter()
+            .any(|(k, v)| k == "TERM" && v == "xterm-256color"),
+        "TERM must still reach the child: {carried:?}"
+    );
+}
+
+#[test]
 fn a_pane_command_omits_the_view_socket_when_none_is_bound() {
     // A croft that failed to bind must not hand its panes a stale or empty
     // path: `croft view` then says the socket is unset, which is true and
@@ -38527,7 +38563,7 @@ fn the_sweep_removes_staged_stdin_old_enough_that_nothing_can_be_showing_it() {
 // drain returned in 13ms because the reply is bounded by MAX_REQUEST_BYTES
 // (~16KB of path) while Linux's default unix-socket buffer is an order of
 // magnitude larger, so `write_all` never blocks here whatever the timeout is.
-// The fix (`set_write_timeout` in `drain_view_requests`) is correct on macOS,
+// The fix (`set_write_timeout` in `answer_view_client`) is correct on macOS,
 // whose buffers are small enough to hit it and which is croft's primary
 // platform - but a test that passes identically with and without it is not
 // evidence, and keeping one would misrepresent this as covered.

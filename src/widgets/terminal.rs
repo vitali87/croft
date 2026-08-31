@@ -1308,8 +1308,17 @@ pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::path::Path>) {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    if let Some(path) = view_sock {
-        cmd.env(crate::view_ipc::SOCK_ENV, path);
+    match view_sock {
+        Some(path) => cmd.env(crate::view_ipc::SOCK_ENV, path),
+        // CLEARED, not merely not-added. `CommandBuilder::new` seeds itself
+        // from `std::env::vars_os()`, so a croft launched from a croft pane
+        // inherits the OUTER croft's socket. If this croft's own bind failed,
+        // leaving that inherited value in place points its panes at the
+        // parent: `croft view report.pdf` opens the file in the wrong window
+        // and exits 0, which is worse than the honest refusal the field doc
+        // promises ("panes then see no CROFT_VIEW_SOCK and the client says so
+        // plainly").
+        None => cmd.env_remove(crate::view_ipc::SOCK_ENV),
     }
 }
 

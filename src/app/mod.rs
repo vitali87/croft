@@ -12834,8 +12834,13 @@ impl App {
         // while Linux CI stays green.
         let _ = stream.set_nonblocking(false);
         // `read_request` re-arms its own read timeout from the deadline on
-        // every recv, so none is set here; the WRITE bound is armed below,
-        // after the read, from whatever the read left.
+        // every recv, so none is set here. The WRITE bound is armed below,
+        // after the read, from whatever the read left — and it exists because
+        // the reply embeds the client-supplied path, so a client that sends a
+        // valid long request and never reads can block `write_all` on a full
+        // socket buffer. Not reproducible on Linux, whose default unix-socket
+        // buffer is far larger than any legal reply, which is why it is set
+        // rather than tested.
         let reply = match crate::view_ipc::read_request(&stream, deadline) {
             Ok(req) => self.apply_view_request(&req.to_path()),
             Err(e) => crate::view_ipc::ViewReply::Err {
@@ -28697,8 +28702,18 @@ impl App {
         // pipeline says nothing about the next.
         //
         // `metadata` follows symlinks, so a symlink to a real file still
-        // opens; one stat answers all three questions the old `exists` +
-        // `is_dir` pair asked in two.
+        // opens (and a symlink to a FIFO is refused on the target's kind);
+        // one stat answers all three questions the old `exists` + `is_dir`
+        // pair asked in two.
+        //
+        // This bounds the file's KIND, not the time. `metadata` is itself a
+        // blocking syscall on a client-supplied path, so `croft view` naming
+        // something on a hung NFS mount still parks the frame loop here,
+        // before the type check runs. A real bound needs the stat off this
+        // thread. There is also a TOCTOU window between this and the open,
+        // which is same-uid and so inside the trust boundary the module
+        // already argues from - noted so a later reader does not mistake the
+        // check for airtight.
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {

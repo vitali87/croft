@@ -126,6 +126,7 @@ pub fn send(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
     let reply = read_line_by_deadline(
         &stream,
         std::time::Instant::now() + std::time::Duration::from_secs(5),
+        "croft did not reply within 5s",
     )?;
     if reply.trim().is_empty() {
         return Err(std::io::Error::new(
@@ -168,6 +169,7 @@ pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 pub fn read_line_by_deadline(
     stream: &std::os::unix::net::UnixStream,
     deadline: std::time::Instant,
+    whose: &str,
 ) -> std::io::Result<String> {
     use std::io::Read;
     let mut line: Vec<u8> = Vec::new();
@@ -175,10 +177,12 @@ pub fn read_line_by_deadline(
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "did not arrive within the frame budget",
-            ));
+            // The wording is the CALLER's, because the two callers bound
+            // different things. The server has a frame budget; a `croft view`
+            // client has no frames at all, and printing "did not arrive within
+            // the frame budget" at a shell prompt names a budget that process
+            // does not have.
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, whose));
         }
         stream.set_read_timeout(Some(left))?;
         match (&*stream).read(&mut chunk) {
@@ -211,7 +215,11 @@ pub fn read_request(
     stream: &std::os::unix::net::UnixStream,
     deadline: std::time::Instant,
 ) -> std::io::Result<ViewRequest> {
-    let text = read_line_by_deadline(stream, deadline)?;
+    let text = read_line_by_deadline(
+        stream,
+        deadline,
+        "the request did not arrive within the frame budget",
+    )?;
     serde_json::from_str(text.trim())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
