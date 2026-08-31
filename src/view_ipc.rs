@@ -32,6 +32,17 @@ use serde::{Deserialize, Serialize};
 /// Env var naming the host croft's socket, exported into every pane.
 pub const SOCK_ENV: &str = "CROFT_VIEW_SOCK";
 
+/// The bound socket's path, published to every pane spawned after the bind.
+///
+/// A `OnceLock` rather than the process environment (#362). portable-pty
+/// snapshots `std::env::vars_os()` when a pane's `CommandBuilder` is built and
+/// then clears the child's environment before applying only that snapshot, so
+/// a `set_var` after `App::new` constructed the first pane never reached that
+/// pane's shell. Read at SPAWN time instead, there is no ordering to get
+/// wrong: a pane built before the bind simply carries no socket, and every
+/// pane built after carries the right one.
+pub static SOCK_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// One request, one JSON line.
 ///
 /// The path travels as raw BYTES rather than a `String` because a filename
@@ -118,9 +129,26 @@ pub fn send(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
 }
 
 /// Read one request from an accepted connection.
+/// The most a single request may be. A path plus JSON framing; anything past
+/// this is not a `croft view` invocation, and reading it unbounded would grow
+/// the UI thread's buffer on a client's say-so.
+pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+
+/// Read one newline-framed request, bounded in bytes.
+///
+/// The socket's read timeout does NOT bound this on its own: `SO_RCVTIMEO`
+/// applies per `recv`, while `read_line` loops over `fill_buf` until it sees a
+/// newline. A client writing one byte every 40ms and never a newline resets
+/// the timeout on every read and holds the caller indefinitely, and a client
+/// writing one very long line grows the buffer without limit. Since the drain
+/// runs on the frame loop, either one freezes the whole editor, and same-uid
+/// is not a defence: any process in any pane (a build script, a piped
+/// installer) can do it by accident.
+///
+/// `Read::take` caps the bytes; the caller's deadline caps the time.
 pub fn read_request(stream: &std::os::unix::net::UnixStream) -> std::io::Result<ViewRequest> {
     let mut line = String::new();
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(std::io::Read::take(stream, MAX_REQUEST_BYTES));
     reader.read_line(&mut line)?;
     serde_json::from_str(line.trim())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -256,17 +284,40 @@ pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> anyhow
         Some(ext) => format!("{stem}.{ext}"),
         None => stem,
     };
-    let path = dir.join(name);
-    // `create_new` rather than `write`: the name carries this process's pid
-    // and a counter, so an existing file means another process got there
-    // first, and truncating whatever it holds is not this command's business.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?;
-    std::io::Write::write_all(&mut f, bytes)?;
-    Ok(path)
+    // `create_new` rather than `write`, so this never truncates a file it did
+    // not make. But the name carries THIS process's pid and a per-process
+    // counter that restarts at 0, and nothing used to remove the staging
+    // directory - so once a croft drew a recycled pid it collided with a
+    // months-old file and `croft view -` failed with "File exists" forever.
+    // The collision is with the dead, not with a live competitor, so the right
+    // answer is to step past it rather than to refuse.
+    let mut attempt = 0;
+    loop {
+        let suffixed = if attempt == 0 {
+            name.clone()
+        } else {
+            match name.rsplit_once('.') {
+                Some((stem, ext)) => format!("{stem}-{attempt}.{ext}"),
+                None => format!("{name}-{attempt}"),
+            }
+        };
+        let path = dir.join(&suffixed);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                std::io::Write::write_all(&mut f, bytes)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 64 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// `croft view <path>` / `croft view -`.

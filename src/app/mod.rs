@@ -4149,6 +4149,11 @@ impl App {
         let (deps_tx, deps_rx) = std::sync::mpsc::channel();
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         let editor = EditorTabs::new();
+        // Bound before the first pane, so that pane's shell carries the
+        // socket like every later one. `spawn_with_preamble` reads
+        // `view_ipc::SOCK_PATH` at spawn time, so this ordering is what
+        // decides whether the startup pane can use `croft view` at all (#362).
+        let view_listener = Self::bind_view_socket();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
         // Background git worker: every `git status` / `git status
@@ -4388,7 +4393,7 @@ impl App {
             tree_drag: None,
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
-            view_listener: Self::bind_view_socket(),
+            view_listener,
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
@@ -28345,7 +28350,23 @@ impl App {
         let path = crate::view_ipc::socket_path(&dir, std::process::id());
         sweep_dead_view_sockets(&dir);
         let listener = prepare_view_listener(&path).ok()?;
-        unsafe { std::env::set_var(crate::view_ipc::SOCK_ENV, &path) };
+        // Published through a `OnceLock` read at SPAWN time rather than
+        // `std::env::set_var` (#362). Two things were wrong with the env:
+        //
+        // portable-pty snapshots `std::env::vars_os()` inside
+        // `CommandBuilder::new` and then clears the child's environment before
+        // applying only that snapshot, so a variable set after a pane was
+        // constructed never reached its shell. This call happens while
+        // `App::new` runs, which is AFTER the first pane exists, so `croft
+        // view` was broken in the startup pane and working everywhere else.
+        //
+        // And `set_var` is unsafe in edition 2024 because a concurrent
+        // `getenv` in another thread is a data race. By this point croft has
+        // the highlight prewarm, the DAP reaper, a PTY reader, the git worker,
+        // the MCP index refresh and the FS watcher all running, which is
+        // exactly the condition `src/gui_path.rs` and `src/session.rs` both
+        // document when they place their own `set_var` calls at startup.
+        let _ = crate::view_ipc::SOCK_PATH.set(path.clone());
         Some((listener, path))
     }
 
@@ -28357,11 +28378,20 @@ impl App {
     /// thread per client would buy nothing and cost the editor's `&mut self`.
     pub fn drain_view_requests(&mut self) -> bool {
         // The drain is bounded by TIME rather than by a connection count.
-        // Each connection can sit in `read_request` until its own timeout,
-        // so a per-frame cap of N clients still bounds the frame at N times
-        // that timeout; a deadline bounds it at the deadline however many
+        // A per-frame cap of N clients still bounds the frame at N times the
+        // per-read timeout; a deadline bounds it at the deadline however many
         // clients stall. Whatever is left is accepted on the next frame,
         // which costs a stalled client latency and costs the user nothing.
+        //
+        // The per-stream timeout below is taken from what REMAINS of this
+        // deadline, which is the half that actually bounds a stalled client.
+        // `SO_RCVTIMEO` applies per `recv`, and `read_line` loops until it
+        // sees a newline, so a flat 50ms is reset on every byte that arrives:
+        // a client dribbling one byte every 40ms and never a newline holds
+        // the frame loop for as long as it likes. Bounding the BYTES does not
+        // fix that either - 50 bytes trickled over a second is under any cap
+        // and still costs the second. Only a deadline the client cannot push
+        // forward does.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
         let mut changed = false;
         loop {
@@ -28379,7 +28409,25 @@ impl App {
                     // A real client writes its one line immediately after
                     // connecting, so this is a safety net for a wedged one
                     // rather than a budget anybody legitimately spends.
-                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+                    // An accepted socket's flags are not portably inherited:
+                    // Linux's accept(2) says the new socket does NOT inherit
+                    // O_NONBLOCK and that portable programs must set flags
+                    // explicitly, while BSD (so macOS, croft's primary
+                    // platform) does inherit them. Inherited, the read timeout
+                    // below is inert - a non-blocking recv returns EAGAIN
+                    // before any timeout applies - and every `croft view`
+                    // would come back "unreadable request: Resource
+                    // temporarily unavailable" while Linux CI stayed green.
+                    let _ = stream.set_nonblocking(false);
+                    // Never zero: a zero timeout means "block forever" to
+                    // `SO_RCVTIMEO`, which is the exact opposite of the
+                    // intent, so a spent deadline gets the smallest real
+                    // timeout instead and the connection is dropped on the
+                    // next pass through the loop.
+                    let left = deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .max(std::time::Duration::from_millis(1));
+                    let _ = stream.set_read_timeout(Some(left));
                     let reply = match crate::view_ipc::read_request(&stream) {
                         Ok(req) => self.apply_view_request(&req.to_path()),
                         Err(e) => crate::view_ipc::ViewReply::Err {
@@ -44224,7 +44272,7 @@ fn prepare_view_listener(path: &Path) -> std::io::Result<std::os::unix::net::Uni
 /// a moment later. `kill(pid, 0)` has no such window. The cost is that a
 /// recycled PID keeps one dead file indefinitely, which is a stale byte
 /// rather than a stolen socket.
-fn sweep_dead_view_sockets(dir: &Path) {
+pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -44248,6 +44296,45 @@ fn sweep_dead_view_sockets(dir: &Path) {
             let path = entry.path();
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(path.with_extension("bind.lock"));
+        }
+    }
+    sweep_staged_stdin(dir);
+}
+
+/// Drop staged stdin left behind by crofts that are gone (#362).
+///
+/// `croft view -` writes what was piped to it into `view-stdin/`, and the
+/// module's own rationale names `vault read … | croft view -`: every such pipe
+/// left a permanent 0600 copy on disk that the user was never told about, and
+/// the name carries a pid, so a recycled pid used to collide with a
+/// months-old file forever. Pruning on the same launch-time sweep as the
+/// sockets bounds both.
+///
+/// A file whose pid is still alive is spared, including this croft's own: a
+/// pane may be looking at it right now.
+fn sweep_staged_stdin(dir: &Path) {
+    let staged = dir.join("view-stdin");
+    let Ok(entries) = std::fs::read_dir(&staged) else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // `stdin-{pid}-{n}` with an optional extension and an optional
+        // collision suffix: the pid is the second dash-separated field.
+        let Some(pid) = name
+            .strip_prefix("stdin-")
+            .and_then(|r| r.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let gone = pid != me
+            && unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }

@@ -1280,6 +1280,35 @@ pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
     manual.unwrap_or(auto)
 }
 
+/// Croft's own environment for a pane's shell: the terminal identity every
+/// pane needs, plus the `croft view` socket when one is bound (#362).
+///
+/// `view_sock` is passed IN rather than read from a global here, so this is a
+/// pure function a test can assert against without touching process-wide
+/// state; the spawn funnel supplies it from [`crate::view_ipc::SOCK_PATH`].
+///
+/// The socket travels this way rather than through the process environment
+/// because it cannot travel that way at all. portable-pty snapshots
+/// `std::env::vars_os()` inside `CommandBuilder::new` and then `env_clear()`s
+/// before applying only that snapshot, so a `set_var` performed after a pane
+/// was constructed never reaches its shell. The listener is bound while
+/// `App::new` runs, which is after the FIRST pane exists, so publishing by
+/// environment left `croft view` broken in the one pane most users type in
+/// and working in every pane opened later: breakage that reads as
+/// intermittent rather than as a bug.
+///
+/// A `OnceLock` read at spawn time has no ordering hazard to get wrong, and
+/// no `unsafe` either: `std::env::set_var` is unsafe in edition 2024 precisely
+/// because croft has threads running by then, which is the condition
+/// `src/gui_path.rs` and `src/session.rs` both document for their own calls.
+pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::path::Path>) {
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    if let Some(path) = view_sock {
+        cmd.env(crate::view_ipc::SOCK_ENV, path);
+    }
+}
+
 impl PtyTerminal {
     pub fn new(cwd: &std::path::Path) -> Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
@@ -1633,8 +1662,10 @@ impl PtyTerminal {
             })
             .context("openpty")?;
 
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
+        apply_pane_env(
+            &mut cmd,
+            crate::view_ipc::SOCK_PATH.get().map(|p| p.as_path()),
+        );
         let child = pair.slave.spawn_command(cmd).context("spawn child")?;
         let shell_pid = child.process_id().map(|p| p as i32);
         drop(pair.slave);
