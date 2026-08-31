@@ -1134,6 +1134,18 @@ pub fn cwd_of_pid(_pid: u32) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Whether this platform can report a process's cwd AT ALL.
+///
+/// The distinction matters wherever a guard reads `cwd_of_pid`: on Android
+/// — a separate `target_os` from `linux`, so it binds the stub above — the
+/// answer is a permanent `None` rather than a per-pane one. A guard that
+/// treats "cannot observe" as "observed something wrong" does not become
+/// stricter there, it becomes unsatisfiable, and whatever it guards is
+/// lost entirely for those users (#430).
+pub const fn cwd_is_observable() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
 /// A saved transcript rendered as bytes safe to feed a fresh parser.
 ///
 /// Control characters are stripped rather than escaped: a transcript comes off

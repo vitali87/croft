@@ -37085,48 +37085,38 @@ fn a_task_pane_whose_shell_left_the_directory_is_not_reused() {
 /// #430: "moved away" and "unknowable" are different, and only the first
 /// is a reason to refuse.
 ///
-/// `kernel_shell_cwd` returns `None` for every pane on Android, for a
-/// remote pane's ssh process, and for a dead shell — not because the shell
-/// wandered off but because croft cannot ask. Refusing those would stack a
-/// new pane on EVERY task run for those users. The defect this fixes was
-/// never that `None` was tolerated; it was that `Some(subdirectory)` was.
+/// Tested through the pure `cwd_matches` rather than through a live pane,
+/// so BOTH arms execute on every platform. The previous version of this
+/// test wrapped its headline assertion in `if kernel_shell_cwd().is_none()`
+/// — false on macOS and Linux, so the assertion never ran anywhere the
+/// suite runs, and reverting the fix would have left it green.
 #[test]
 fn an_unknowable_cwd_still_allows_reuse_but_a_wrong_one_does_not() {
+    let root = Path::new("/w/a");
+
+    // Read and equal: this command's pane.
+    assert!(cwd_matches(Some(Path::new("/w/a")), root, true));
+    // Read and different: the shell wandered off. A DESCENDANT is the
+    // #430 defect specifically — `starts_with` accepted it.
+    assert!(!cwd_matches(Some(Path::new("/w/a/sub")), root, true));
+    assert!(!cwd_matches(Some(Path::new("/w/b")), root, true));
+    // Unreadable where the platform CAN read one: the failure the guard
+    // exists for, so it stays closed.
+    assert!(!cwd_matches(None, root, true));
+    // Unreadable because the platform can never read one (Android): a
+    // closed guard would stack a new pane on every single run.
+    assert!(cwd_matches(None, root, false));
+    // And a platform that cannot observe still refuses a cwd it somehow
+    // did read and that differs — the capability is not a blanket pass.
+    assert!(!cwd_matches(Some(Path::new("/w/a/sub")), root, false));
+
+    // The label half of the predicate, on a real pane.
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let real_root = tmp.path().canonicalize().unwrap();
     let app = App::new(tmp.path().to_path_buf()).unwrap();
-    let t = &app.terminals[0];
-    let label = t.label().to_string();
-
-    // Whatever this platform reports, the predicate must follow the rule:
-    // readable-and-equal reuses, readable-and-different refuses, and
-    // unreadable falls back to the pane's identity.
-    match t.kernel_shell_cwd() {
-        None => assert_eq!(
-            pane_is_idle_at(t, &label, &root),
-            t.foreground_is_shell(),
-            "an unreadable cwd falls back to the pane's identity rather \
-             than stacking a new pane on every run"
-        ),
-        Some(cwd) => {
-            assert_eq!(
-                pane_is_idle_at(t, &label, &cwd),
-                t.foreground_is_shell(),
-                "a shell standing exactly where the command will run is \
-                 that command's pane"
-            );
-            assert!(
-                !pane_is_idle_at(t, &label, &cwd.join("nowhere")),
-                "and a shell standing anywhere else is not"
-            );
-        }
-    }
-
-    // A label mismatch is refused regardless of cwd, the other half of
-    // the predicate.
     assert!(!pane_is_idle_at(
         &app.terminals[0],
         "Task: nonexistent",
-        &root
+        &real_root
     ));
 }

@@ -41830,8 +41830,9 @@ fn relative_clipboard_text(path: &Path, root: &Path) -> String {
 }
 
 /// Whether `t` is the idle pane named `pane_name` whose shell is standing
-/// exactly at `root` — the one predicate behind every "reuse a pane rather
-/// than stack a new one" decision (#430).
+/// at `root` — or whose directory croft cannot read at all. The one
+/// predicate behind every "reuse a pane rather than stack a new one"
+/// decision (#430).
 ///
 /// Shared deliberately. This guard existed as two copies, and when #392
 /// fixed the runnable-fence copy the task copy kept both defects: a
@@ -41849,16 +41850,18 @@ fn relative_clipboard_text(path: &Path, root: &Path) -> String {
 /// opens a fresh pane at the right directory, so the worst case is a spare
 /// pane rather than a command run somewhere the user was not told about.
 ///
-/// **"Moved away" and "unknowable" are different, and only the first is a
-/// reason to refuse.** `kernel_shell_cwd` returns `None` for every pane on
-/// Android, for a remote pane's ssh process, and for a dead shell — not
-/// because the shell wandered off, but because croft cannot ask. Refusing
-/// those would stack a new pane on EVERY task run for those users, which
-/// is why the original comment said an unknown cwd keeps today's reuse.
-/// The defect was never that `None` was tolerated; it was that `Some(sub)`
-/// was. So a readable cwd must match exactly, and an unreadable one falls
-/// back to the pane's identity — which is all croft had to go on before
-/// this guard existed at all.
+/// When `canonicalize()` itself fails — a root deleted or renamed under a
+/// live session — `unwrap_or` leaves an unresolved path and the comparison
+/// cannot match, which costs a spare pane and never a misdirected command.
+///
+/// The cwd decision itself lives in [`cwd_matches`], which distinguishes a
+/// shell that moved from a platform that cannot say where it is.
+///
+/// A DEAD shell never reaches that decision: `foreground_is_shell` is
+/// checked first and answers false for one (#155), so the unreadable arm
+/// only ever sees panes croft cannot ask about. Relaxing that check would
+/// make identity-fallback start reusing corpses, so the two belong
+/// together.
 fn pane_is_idle_at(
     t: &crate::widgets::terminal::PtyTerminal,
     pane_name: &str,
@@ -41866,10 +41869,27 @@ fn pane_is_idle_at(
 ) -> bool {
     t.label() == pane_name
         && t.foreground_is_shell()
-        && match t.kernel_shell_cwd() {
-            Some(cwd) => cwd == root,
-            None => true,
-        }
+        && cwd_matches(t.kernel_shell_cwd().as_deref(), root, cwd_is_observable())
+}
+
+/// The cwd half of [`pane_is_idle_at`], as a pure function so both arms are
+/// testable on any platform (#430).
+///
+/// Three cases, not two. A cwd croft READ and that differs is a shell that
+/// wandered off — refuse. A cwd croft read and that matches is this
+/// command's pane — reuse. A cwd croft could not read splits on whether
+/// the platform can read one at all: where it can, `None` is the failure
+/// the guard exists for and stays closed; where it cannot (Android), a
+/// closed guard would stack a new pane on every single run, so reuse falls
+/// back to the pane's identity, which is all croft had before the guard
+/// existed.
+use crate::widgets::terminal::cwd_is_observable;
+
+fn cwd_matches(cwd: Option<&Path>, root: &Path, observable: bool) -> bool {
+    match cwd {
+        Some(c) => c == root,
+        None => !observable,
+    }
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
