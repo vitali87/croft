@@ -10,10 +10,14 @@
 //! right number is therefore not knowable from inside a single test, which is
 //! why raising individual caps has already been tried twice on one of them.
 //!
-//! So the budget stops being a guess and becomes `base x scale`, where `base`
-//! is what the operation costs on a quiet machine (the number a test author
-//! can actually reason about) and `scale` is measured from the load the suite
-//! is running under.
+//! So the budget stops being a guess and becomes
+//! `base x BASE_CALIBRATION x scale`, where `base` is what the operation
+//! costs on a quiet machine (the number a test author can actually reason
+//! about), `scale` is measured from the load the suite is running under, and
+//! the calibration is the one constant that keeps the wall clock where it was
+//! when these budgets were derived (#422). The widest any budget stretches is
+//! `BASE_CALIBRATION x MAX_SCALE`, deliberately unchanged at 8x, because a
+//! broken test must still fail in a time a developer will wait.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -21,7 +25,13 @@ use std::time::{Duration, Instant};
 /// Widest a budget may stretch. A failing test must still fail: past this the
 /// wait is no longer distinguishing "loaded" from "broken", and every extra
 /// second is paid by the developer whose change genuinely broke the thing.
-const MAX_SCALE: u32 = 8;
+///
+/// Halved with the #422 rule change, so the CEILING is unchanged. The total
+/// stretch is `BASE_CALIBRATION * MAX_SCALE`, and leaving this at 8 while
+/// introducing a x2 calibration would have doubled the worst case with it —
+/// a broken test on a 10s base going from 80s to 160s, which is exactly the
+/// cost this constant exists to bound. 2 x 4 is the 8 it always was.
+const MAX_SCALE: u32 = 4;
 
 /// Narrowest it may shrink. Never below the budgets these tests already had,
 /// since every one of them was observed failing at 1x.
@@ -62,8 +72,8 @@ fn load_average() -> Option<f64> {
 
 /// How much slack this machine needs, resolved once per test binary.
 ///
-/// Two signals, and the maximum of them, because each is blind where the
-/// other sees. The suite's own thread count is known before anything runs
+/// Two signals, and their SUM, because each is blind where the other sees
+/// and both contend for the same cores (#422). The suite's own thread count is known before anything runs
 /// and covers the self-inflicted case (dozens of test shells at once), where
 /// a load average would still be reading the quiet minute before the suite
 /// started. The load average covers what no test can know: a second cargo
@@ -168,8 +178,22 @@ fn scale_from(threads: f64, load: f64, cpus: f64) -> u32 {
     if !(threads.is_finite() && load.is_finite() && cpus.is_finite()) || cpus < 1.0 {
         return MIN_SCALE;
     }
-    // `load` is already the machine-wide runnable average, threads is this
-    // suite's own contribution; the sum is what is competing for `cpus`.
+    // `load` is the machine-wide runnable average, `threads` this suite's own
+    // contribution; the sum is what is competing for `cpus`.
+    //
+    // Those overlap once the suite has been running a minute — its own
+    // threads then appear in the load average too, so the sum counts them
+    // twice. Deliberately left alone. The overlap is bounded (it can only
+    // raise the quotient by `threads / cpus`, one clamp step in practice)
+    // and it errs toward MORE slack, which is the safe direction for a
+    // deadline; subtracting an estimate of our own load would be a guess
+    // about a number we cannot observe, and a wrong one shortens budgets.
+    // `load_scale` memoises in a `OnceLock`, so in practice the reading is
+    // taken at the first wait — early, while the average still describes
+    // the machine the suite arrived on.
+    // Belt and braces: the guard above already rules out every input that
+    // could make this non-finite, so this branch is unreachable today. Kept
+    // because the guard is the thing most likely to be relaxed later.
     let raw = ((threads + load) / cpus).ceil();
     if !raw.is_finite() {
         return MIN_SCALE;
@@ -203,7 +227,8 @@ pub fn await_spawned(base: Duration, what: &str, mut ready: impl FnMut() -> bool
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!(
-        "timed out after {budget:?} ({base:?} x{scale} for load) waiting for {what}; \
+        "timed out after {budget:?} ({base:?} x{BASE_CALIBRATION} calibration \
+         x{scale} for load) waiting for {what}; \
          if this is a real failure it would also fail at 1x, so re-run the full suite \
          on the unmodified merge base under the same load before suspecting your diff"
     );
@@ -286,9 +311,32 @@ mod tests {
             scale_from(4.0, 12.0, 4.0) > quiet,
             "so does load from outside the suite"
         );
+        // Strict, on inputs where summing genuinely separates from `max`:
+        // (4 + 4) / 4 = 2 against max(4, 4) / 4 = 1. A `>=` here would pass
+        // even if the sum were replaced by the old maximum.
         assert!(
-            scale_from(12.0, 12.0, 4.0) >= scale_from(12.0, 0.0, 4.0),
-            "and together they are worse than either alone"
+            scale_from(6.0, 6.0, 4.0) > scale_from(6.0, 0.0, 4.0),
+            "together they are worse than either alone"
+        );
+    }
+
+    /// The total stretch is what a broken test pays, and it must not have
+    /// grown. `BASE_CALIBRATION * MAX_SCALE` was 1 x 8 before #422 and is
+    /// 2 x 4 after — the same 8. Pinned because the two constants are only
+    /// safe as a PAIR: raising either alone doubles what a developer waits
+    /// to be told their change broke something, which is the cost
+    /// `MAX_SCALE` exists to bound.
+    #[test]
+    fn the_worst_case_stretch_is_unchanged() {
+        assert_eq!(
+            BASE_CALIBRATION * MAX_SCALE,
+            8,
+            "a broken test on a 10s base still fails in 80s, not 160s"
+        );
+        assert_eq!(
+            BASE_CALIBRATION * MIN_SCALE,
+            4,
+            "and a quiet machine waits 4x, down from the old 8x"
         );
     }
 
@@ -304,7 +352,7 @@ mod tests {
     #[test]
     fn the_397_flake_still_gets_its_eight_seconds() {
         let scale = scale_from(8.0, 6.0, 4.0);
-        assert_eq!(scale, 4, "runnable work per CPU: (8 + 6) / 4");
+        assert_eq!(scale, 4, "runnable work per CPU: ceil((8 + 6) / 4)");
         // Through the real formula, not a hand-doubled literal: the base a
         // test author writes is 1s, and the module supplies the calibration.
         let base = std::time::Duration::from_secs(1);
