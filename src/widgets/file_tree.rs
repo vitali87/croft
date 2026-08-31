@@ -38,6 +38,18 @@ pub struct FileTree {
     /// in the set — or under a dir in the set — render their name in the
     /// theme's dimmed foreground, VS Code's ignored-resource decoration.
     pub ignored: Arc<HashSet<PathBuf>>,
+    /// Workspace files an agent changed and the user has not reviewed
+    /// (#345), absolute. Rows in this set take a TRAILING dot in the theme's
+    /// yellow; it clears when the file is marked reviewed.
+    ///
+    /// One colour, not one per agent: `AgentLane` carries no colour today,
+    /// and inventing one here would put the mapping in the wrong place.
+    ///
+    /// Membership is EXACT, unlike `ignored`, which covers a directory's
+    /// descendants. A directory is not something an agent wrote and not
+    /// something "mark reviewed" can clear, so a dot on one would be a mark
+    /// no gesture removes. Fed from `AgentLedger` on the app's sync.
+    pub agent_touched: Arc<HashSet<PathBuf>>,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -72,6 +84,11 @@ pub struct FileTree {
     pub header_views_btn: Rect,
 }
 
+/// The unreviewed-file marker (#345). A middle dot rather than a filled
+/// circle: it must read as a small annotation beside a filename, not compete
+/// with the file-type icon at the start of the row.
+const AGENT_DOT: char = '\u{b7}';
+
 impl FileTree {
     pub fn new(root: PathBuf) -> Self {
         let mut tree = Self {
@@ -89,6 +106,7 @@ impl FileTree {
             focus_gradient: false,
             theme: crate::theme::Theme::default(),
             ignored: Arc::default(),
+            agent_touched: Arc::default(),
             last_inner: Rect::default(),
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
@@ -127,6 +145,13 @@ impl FileTree {
         // The old workspace's ignore set is meaningless under the new root;
         // the git worker re-queries after its SetRoot and repopulates.
         self.ignored = Arc::default();
+        // Same for the agent review queue (#345), and it matters more: these
+        // are ABSOLUTE paths, and the documented use of Make Root is
+        // re-rooting into a CHILD, where the new tree's paths are the very
+        // ones still in the set. Left behind, every stale dot re-renders on
+        // the new tree, describing a lane the user has walked away from —
+        // the exact staleness this decoration exists to avoid.
+        self.agent_touched = Arc::default();
         self.load_children(0);
     }
 
@@ -232,6 +257,13 @@ impl FileTree {
                 None => return false,
             }
         }
+    }
+
+    /// Whether `path` is a file an agent changed that is still unreviewed.
+    ///
+    /// Exact membership, deliberately: see [`Self::agent_touched`].
+    pub fn is_agent_touched(&self, path: &Path) -> bool {
+        !self.agent_touched.is_empty() && self.agent_touched.contains(path)
     }
 
     /// Map a screen y coordinate to a node index, if any. Screen rows map
@@ -1498,6 +1530,17 @@ impl Widget for &mut FileTree {
                     Style::default().fg(name_fg),
                     self.theme,
                 );
+                // The agent-lane dot (#345), AFTER the name rather than
+                // before it: a leading marker would shift every name in the
+                // tree by a column as writes land, so the eye loses the
+                // alignment it reads the tree by. Trailing, it appears and
+                // clears without moving anything.
+                if self.is_agent_touched(&node.path) {
+                    spans.push(Span::styled(
+                        format!(" {AGENT_DOT}"),
+                        Style::default().fg(self.theme.ui(Color::Yellow)),
+                    ));
+                }
             }
 
             let line = Line::from(spans);
@@ -1893,6 +1936,76 @@ mod tests {
         );
     }
 
+    /// The dot actually reaches the screen, on the right row, and clears
+    /// when the file is reviewed (#345).
+    ///
+    /// Separate from the predicate test above on purpose: a predicate that
+    /// answers correctly while nothing draws it is the same to a user as a
+    /// feature that was never built, and the render is where every wiring
+    /// mistake between the two would live.
+    #[test]
+    fn the_lane_dot_is_painted_on_the_row_and_clears_when_reviewed() {
+        let (_tmp, mut tree) = fixture();
+        let root = tree.root.clone();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+
+        let row_containing = |buf: &Buffer, needle: &str| -> Option<String> {
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .find(|line| line.contains(needle))
+        };
+
+        // Nothing touched: no dot anywhere, which is the control that makes
+        // the positive assertion below mean something.
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let clean = row_containing(&buf, "main.rs").expect("main.rs is on screen");
+        assert!(
+            !clean.contains(AGENT_DOT),
+            "a dot with nothing unreviewed: {clean:?}"
+        );
+
+        // One unreviewed file: its row takes the dot and its neighbour
+        // does not.
+        tree.agent_touched =
+            std::sync::Arc::new(std::collections::HashSet::from([root.join("main.rs")]));
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let marked = row_containing(&buf, "main.rs").expect("main.rs is on screen");
+        assert!(
+            marked.contains(AGENT_DOT),
+            "the unreviewed file took no dot: {marked:?}"
+        );
+        let other = row_containing(&buf, "README.md").expect("README.md is on screen");
+        assert!(
+            !other.contains(AGENT_DOT),
+            "an untouched file took a dot: {other:?}"
+        );
+
+        // Reviewed: the dot goes, and the row is otherwise what it was.
+        tree.agent_touched = std::sync::Arc::new(std::collections::HashSet::new());
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let cleared = row_containing(&buf, "main.rs").expect("main.rs is on screen");
+        assert!(
+            !cleared.contains(AGENT_DOT),
+            "the dot outlived the review: {cleared:?}"
+        );
+        assert_eq!(
+            cleared, clean,
+            "clearing the dot must leave the row exactly as it was"
+        );
+    }
+
     #[test]
     fn collapse_all_closes_nested_folders_but_keeps_the_root_expanded() {
         let tmp = TempDir::new().unwrap();
@@ -2113,6 +2226,36 @@ mod tests {
             tree.nodes.iter().any(|n| n.path.ends_with("dummy2.txt")),
             "Explorer must show disk reality, including gitignored files"
         );
+    }
+
+    /// An unreviewed file carries the agent-lane dot, and only that file
+    /// does (#345).
+    ///
+    /// The dot is a decoration on the FILE the agent wrote, not on the
+    /// directories above it. A directory is not something an agent changed
+    /// and not something a review can clear, so marking the tree all the way
+    /// to the root would put a mark on rows that no gesture can ever remove —
+    /// which is why this is a set membership test rather than a prefix walk
+    /// like `is_ignored`.
+    #[test]
+    fn only_the_unreviewed_files_themselves_take_the_lane_dot() {
+        let (_tmp, mut tree) = fixture();
+        let root = tree.root.clone();
+        tree.agent_touched =
+            std::sync::Arc::new(std::collections::HashSet::from([root.join("src/main.rs")]));
+        assert!(tree.is_agent_touched(&root.join("src/main.rs")));
+        // Not the directories on the way to it: a directory cannot be
+        // reviewed, so a mark there would never clear.
+        assert!(
+            !tree.is_agent_touched(&root.join("src")),
+            "a parent directory must not inherit the dot"
+        );
+        assert!(!tree.is_agent_touched(&root));
+        // Nor a sibling the agent did not touch.
+        assert!(!tree.is_agent_touched(&root.join("src/other.rs")));
+        // An empty set is the common case and must be cheap and quiet.
+        tree.agent_touched = std::sync::Arc::new(std::collections::HashSet::new());
+        assert!(!tree.is_agent_touched(&root.join("src/main.rs")));
     }
 
     #[test]

@@ -36582,6 +36582,270 @@ fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
     );
     assert!(app.http_run.is_none(), "nothing was sent");
 }
+/// #345: the Explorer's unreviewed dots track the ledger, on every path
+/// that changes it.
+///
+/// The predicate and the painting are tested in `file_tree`; this is the
+/// wiring between them, which is where a decoration feature actually breaks.
+/// A dot that lags the ledger is worse than no dot at all, because "no dot"
+/// is precisely what a reviewed file looks like — so a stale one tells the
+/// user they have reviewed something they have not.
+///
+/// **The drain is driven for real, not stood in for.** An earlier version of
+/// this test called `attribute_writes_to_working_agents` and then
+/// `sync_agent_lane_decorations` by hand, which tests the helper and not the
+/// wiring: deleting the drain's own sync left every assertion passing. Since
+/// the drain is the path that fires on every agent write, that was the one
+/// call site the feature cannot afford to have untested.
+#[test]
+fn the_explorer_dots_follow_the_agent_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let touched = tmp.path().join("touched.rs");
+    std::fs::write(&touched, "fn a() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        app.tree.agent_touched.is_empty(),
+        "staging: nothing decorated before an agent writes"
+    );
+
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+
+    // Let the watcher establish itself first, as the other fs-watch tests
+    // do: a write racing the initial registration is simply not delivered,
+    // which would make this test flaky rather than wrong.
+    for _ in 0..20 {
+        let _ = app.drain_fs_events();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Through the real drain: write the file, let the watcher deliver it,
+    // and call the function the event loop calls. No explicit sync here —
+    // that is the property under test.
+    std::fs::write(&touched, "fn a() { todo!() }\n").unwrap();
+    let mut waited = 0;
+    while !app.tree.agent_touched.contains(&touched) && waited < 4000 {
+        app.drain_fs_events();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        waited += 20;
+    }
+    assert!(
+        app.tree.agent_touched.contains(&touched),
+        "the drain must light the row it attributed, without a nudge \
+         (waited {waited}ms; ledger has {} unreviewed)",
+        app.agent_ledger.unreviewed_files()
+    );
+    assert!(app.tree.is_agent_touched(&touched));
+    // The chip counts the set the tree draws. Asserted HERE, where both
+    // sides are 1: after the lane is cleared below they are both 0, and an
+    // equality that only ever compares 0 to 0 cannot fail.
+    assert_eq!(
+        app.agent_ledger.unreviewed_files(),
+        app.tree.agent_touched.len(),
+        "the badge and the dots must be the same number"
+    );
+
+    // Reviewing goes through the public entry point, which syncs itself.
+    assert!(app.mark_agent_file_reviewed("claude", &touched));
+    assert!(
+        !app.tree.agent_touched.contains(&touched),
+        "marking reviewed must clear the dot without a further nudge"
+    );
+
+    // Mark-the-whole-lane reviewed is the other syncing entry point.
+    let mut changed = std::collections::BTreeSet::new();
+    changed.insert(touched.clone());
+    std::fs::write(&touched, "fn a() { 1 }\n").unwrap();
+    assert!(app.attribute_writes_to_working_agents(&changed));
+    app.sync_agent_lane_decorations();
+    assert!(
+        app.tree.agent_touched.contains(&touched),
+        "staging: lit again"
+    );
+    app.mark_agent_lane_reviewed("claude");
+    assert!(
+        app.tree.agent_touched.is_empty(),
+        "marking the lane reviewed must clear every dot"
+    );
+}
+
+/// #345: a write reported through a symlinked root is still attributed.
+///
+/// Found by driving the real fs-watch drain rather than calling the
+/// attribution helper directly. The watcher reports a file's REALPATH while
+/// a root is stored as the user spelled it, so a workspace reached through a
+/// symlink — `/var` on macOS, which is `/private/var`, and any symlinked
+/// checkout on Linux — matched no root and every agent write was dropped.
+/// The queue stayed empty and nothing failed, which is why a test that
+/// substituted for the drain could not see it.
+#[test]
+#[cfg(unix)]
+fn a_write_under_a_symlinked_root_is_still_the_agents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    // The workspace is opened through the LINK; the file is written and
+    // reported through the real path, as a watcher would.
+    let via_link = link.join("f.rs");
+    std::fs::write(&via_link, "fn a() {}\n").unwrap();
+    let mut app = App::new(link.clone()).unwrap();
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+
+    let mut changed = std::collections::BTreeSet::new();
+    changed.insert(real.join("f.rs"));
+    assert!(
+        app.attribute_writes_to_working_agents(&changed),
+        "a realpath write under a symlinked root must still be attributed"
+    );
+
+    // And it is keyed the way the ROOT is spelled, so the Explorer's rows —
+    // which come from the tree, not the watcher — find it.
+    app.sync_agent_lane_decorations();
+    assert!(
+        app.tree.agent_touched.contains(&via_link),
+        "the ledger keyed the row under the realpath, so no tree row matches \
+         it: {:?}",
+        app.tree.agent_touched
+    );
+
+    // And a DELETION clears it. `canonicalize` stats the final component, so
+    // resolving the whole path fails on a file that is gone — which would
+    // make the ledger's forget-path arm unreachable and strand the row on a
+    // file that no longer exists, with no later write able to clear it. That
+    // is strictly worse than the original bug, which dropped writes and
+    // deletions alike and so at least stayed self-consistent.
+    std::fs::remove_file(&via_link).unwrap();
+    assert!(
+        app.attribute_writes_to_working_agents(&changed),
+        "a deletion reported by realpath must reach the ledger too"
+    );
+    app.sync_agent_lane_decorations();
+    assert!(
+        app.tree.agent_touched.is_empty(),
+        "the row outlived the file it described: {:?}",
+        app.tree.agent_touched
+    );
+
+    // The parent going too, which makes the walk climb more than one level.
+    // A tail-reattachment bug hides here rather than in the single-level
+    // case: the key the delete resolves to must still be the key the write
+    // created, or `forget_path` finds nothing to forget.
+    let sub = link.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let nested = sub.join("g.rs");
+    std::fs::write(&nested, "fn g() {}\n").unwrap();
+    let mut deep = std::collections::BTreeSet::new();
+    deep.insert(real.join("sub/g.rs"));
+    assert!(app.attribute_writes_to_working_agents(&deep));
+    app.sync_agent_lane_decorations();
+    assert!(
+        app.tree.agent_touched.contains(&nested),
+        "staging: the nested file is queued"
+    );
+
+    std::fs::remove_dir_all(&sub).unwrap();
+    assert!(
+        app.attribute_writes_to_working_agents(&deep),
+        "a deletion whose PARENT is gone must still resolve"
+    );
+    app.sync_agent_lane_decorations();
+    assert!(
+        app.tree.agent_touched.is_empty(),
+        "the row outlived its whole directory: {:?}",
+        app.tree.agent_touched
+    );
+}
+
+/// #345: removing a workspace folder takes its review queue with it.
+///
+/// The rows leave the tree on their own, so no stale dot renders — but the
+/// status chip counts the same set, and a count that outlives the folder it
+/// describes sends the user hunting for rows that are not there.
+#[test]
+fn removing_a_folder_drops_its_rows_from_the_review_queue() {
+    let primary = tempfile::tempdir().unwrap();
+    let secondary = tempfile::tempdir().unwrap();
+    let in_second = secondary.path().join("s.rs");
+    std::fs::write(&in_second, "fn s() {}\n").unwrap();
+    let mut app = App::new(primary.path().to_path_buf()).unwrap();
+    app.roots.add(secondary.path().to_path_buf());
+
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+    let mut changed = std::collections::BTreeSet::new();
+    changed.insert(in_second.clone());
+    assert!(app.attribute_writes_to_working_agents(&changed));
+    app.sync_agent_lane_decorations();
+    assert_eq!(
+        app.tree.agent_touched.len(),
+        1,
+        "staging: the secondary root's file is queued"
+    );
+
+    app.remove_workspace_folder(secondary.path().to_path_buf());
+    assert!(
+        app.tree.agent_touched.is_empty(),
+        "the removed folder's rows outlived it: {:?}",
+        app.tree.agent_touched
+    );
+    assert_eq!(app.agent_ledger.unreviewed_files(), 0);
+}
+
+/// #345: a re-root leaves no dots from the workspace the user left.
+///
+/// The paths in the set are ABSOLUTE, and Make Root's documented use is
+/// re-rooting into a CHILD — where the new tree's paths are exactly the ones
+/// still in the set. Left behind, every stale dot re-renders on the new tree
+/// describing a lane that is gone, which is the precise staleness this
+/// decoration exists to avoid.
+#[test]
+fn a_re_root_drops_the_previous_workspaces_review_queue() {
+    let tmp = tempfile::tempdir().unwrap();
+    let child = tmp.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let inside = child.join("in_child.rs");
+    std::fs::write(&inside, "fn a() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.terminals[0].set_agent(Some(crate::agents::AgentLane {
+        name: String::from("claude"),
+        status: crate::agents::AgentStatus::Working,
+    }));
+    let mut changed = std::collections::BTreeSet::new();
+    changed.insert(inside.clone());
+    assert!(app.attribute_writes_to_working_agents(&changed));
+    app.sync_agent_lane_decorations();
+    assert!(
+        app.tree.agent_touched.contains(&inside),
+        "staging: the file is decorated before the re-root"
+    );
+
+    // Re-root INTO the child: the file's absolute path is unchanged and it
+    // is still on screen, so a surviving set would re-decorate it.
+    app.change_workspace_root(child.clone());
+    assert!(
+        app.tree.agent_touched.is_empty(),
+        "the Explorer kept the old workspace's dots: {:?}",
+        app.tree.agent_touched
+    );
+    assert_eq!(
+        app.agent_ledger.unreviewed_files(),
+        0,
+        "the ledger kept the old workspace's queue"
+    );
+    assert!(!app.tree.is_agent_touched(&inside));
+}
+
 /// #345: the agent lane attributes workspace writes to whichever agents
 /// were WORKING when they landed, keeps a review baseline per file, and
 /// never blames an agent for the user's own saves.

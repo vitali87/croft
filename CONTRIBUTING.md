@@ -152,6 +152,32 @@ why a PR with every check green and every finding fixed in code still refuses
 to merge until the threads themselves are resolved. Fixing the code does not resolve a thread: reply saying where the point was
 addressed, then resolve it.
 
+**A merge commit can have the right tree and the wrong parents.** If a merge
+is committed before it is completed, the tree carries main's *changes* while
+the commit does not carry main's *history* — and every check that looks at
+files agrees it worked. `git status` is clean, the diff against main is what
+you expect, the suite passes. GitHub keeps computing a conflict against a
+merge that looks done, and the branch reads as inexplicably `DIRTY`.
+
+**The trigger is "DIRTY at a tree I have just verified is right"**, not "I
+suspect my merge failed" — because you will not suspect that. The natural
+response to an unexplained `DIRTY` is to resolve the conflict again, which
+produces another single-parent commit and the identical result. And the
+evidence does not survive: redoing the merge on top makes the broken commit
+two-parent, so `git log -1 --format=%p` on it prints two afterwards and
+nothing in the tree records that anything was wrong. It is diagnosable only
+in the moment.
+
+Only the parent list tells you, so ask about the parents:
+
+```bash
+git merge-base --is-ancestor origin/main HEAD && echo ok || echo "main is NOT merged"
+git log -1 --format=%p            # a merge has two parents; one means it is not one
+```
+
+Run it in the same breath as the version re-read below — both answer "is this
+branch really current with main", and neither is visible in a diff.
+
 **Your version was valid when you branched and is stale by the time you merge.**
 The release gate compares your head against the merge base, so it passes as
 long as your branch is above main *at that point*. Two branches can both pass
