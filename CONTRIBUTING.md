@@ -5,8 +5,9 @@ Thanks for hacking on croft. Build, run, and platform setup live in the
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). This guide covers the day to day
 developer workflow concerns that do not belong in any of those.
 
-Everything in this guide applies to AI agents too, including the two sections
-below on coordinating work and on verifying that a review happened. Agents often
+Everything in this guide applies to AI agents too, including the three
+sections below on coordinating work, on verifying that a review happened, and
+on verifying that the checks actually ran. Agents often
 also keep a `CLAUDE.md` at the root for their own preferences, but it is
 deliberately untracked and clone-local: a fresh checkout will not have one, and
 nothing here depends on it.
@@ -46,6 +47,118 @@ reason. Two specific traps:
 
 Re-fetch comments immediately before merging rather than trusting what you read
 earlier: bot replies land asynchronously while checks are still running.
+
+## Verifying the CHECKS actually ran
+
+A short, all-green `gh pr checks` is not evidence that CI ran, and a green
+merge gate is not evidence that anything is resolved. Every item below was hit
+for real on this repo in a single day, and they share one shape: **the thing
+that would have told you was absent rather than wrong.** A check that cannot
+fail in the case you need it for is not a check.
+
+Where this section and an untracked `/CLAUDE.md` disagree, **this file wins**:
+`/CLAUDE.md` is gitignored, so a fresh clone never sees it and it drifts
+per-machine.
+
+**An all-green check list can mean CI never started.** As CI
+gets faster this gets more dangerous, not less: a check-settled test that polls
+until nothing is pending passes instantly against an empty list, because the
+run has not been created yet. Count the jobs and require all of them for the
+SHA you are about to merge. "Nothing is failing" and "nothing has run" are the
+same reading.
+
+```bash
+head=$(gh pr view <n> --json headRefOid --jq .headRefOid)
+gh run list --commit "$head" --json databaseId --jq 'length'   # 0 = nothing ran
+```
+
+Count **runs**, not checks. A check is not a run: a rate-limited review bot
+posts a status context without any workflow behind it, so on this repo PR #335
+returns `1` from `gh pr checks --json name --jq 'length'` while having zero
+runs for its head. The reader who most needs this item — the one whose CI never
+started — is exactly the one that count misleads.
+
+**A `CONFLICTING` pull request gets no workflow runs at all.** GitHub cannot
+compute the merge commit, so it never creates them. Four pushes over an hour
+produced zero runs while `gh pr checks` showed one row the whole time — a
+review bot's no-op — which reads exactly like a healthy PR early in its cycle.
+The tell is the pair:
+
+```bash
+head=$(gh pr view <n> --json headRefOid --jq .headRefOid)
+gh pr view <n> --json mergeable    # CONFLICTING
+gh run list --commit "$head"       # empty: no run exists for this commit
+```
+
+`--commit`, not `--branch`: a branch filter happily returns an older run and
+answers a question you did not ask.
+
+Either alone is ambiguous; together they are conclusive. This is worse than the
+empty-list case above, because a single green row survives a glance that an
+empty list would not.
+
+**A job that never got a runner reports `pending`, exactly like one that is
+running.** `gh run view <id> --json jobs` is the right command, but read
+`status`, not `completedAt`. That field is Go's zero `time.Time`
+(`0001-01-01T00:00:00Z`) for every job that has not finished, `in_progress` and
+`queued` alike, so it separates finished from unfinished — which is not the
+question. `startedAt` is populated on queued jobs too. What distinguishes them
+is a job still `queued` while its siblings in the same run have moved to
+`in_progress` or `completed`.
+
+**Threads can appear after everything is green, and an earlier read of them
+expires.** The rule above about a bot whose check says pass while no review ran
+has a second direction, and it nearly landed a major on #392: a bot that has
+been genuinely silent can start producing findings at any moment, and its check
+row looks identical before and after. That PR was eight-of-eight green — where
+one of the eight was the review bot's own `pass`, annotated "Review rate
+limited" — when a pre-merge re-fetch turned up five inline threads, one of them
+a command running in a directory other than the one its confirm popup named.
+
+Read them with the GraphQL `reviewThreads` query rather than
+`pulls/<n>/comments`: the REST payload carries no resolution state at all, and
+resolution is what the ruleset below gates on.
+
+```bash
+gh api graphql -F owner=OWNER -F repo=REPO -F number=N -f query='
+query($owner:String!, $repo:String!, $number:Int!, $after:String) {
+  repository(owner:$owner, name:$repo) { pullRequest(number:$number) {
+    reviewThreads(first:100, after:$after) {
+      pageInfo { hasNextPage endCursor }
+      nodes { isResolved isOutdated path }
+    } } } }'
+```
+
+Variables, not literals spliced into the query: `number:N` is not an `Int!` and
+the call fails outright, which is at least loud. **Page it.** `first:` is a cap,
+not a promise, and a PR with more threads than the page size returns a short
+list — this section's own failure mode wearing a page size. Follow `endCursor`
+while `hasNextPage` is true.
+
+`isOutdated` earns its place beside `isResolved`: a thread on a file your branch
+no longer owns appears there, and no code change will ever resolve it.
+
+**`mergeStateStatus: BLOCKED` names no reason, and the obvious endpoint lies.**
+Classic branch protection can report zero required checks and zero required
+approvals while a **ruleset** is what is actually enforcing. Rulesets live
+somewhere else entirely:
+
+```bash
+gh api repos/<repo>/rules/branches/main
+```
+
+On this repo that is where `required_review_thread_resolution` lives, which is
+why a PR with every check green and every finding fixed in code still refuses
+to merge until the threads themselves are resolved. Fixing the code does not resolve a thread: reply saying where the point was
+addressed, then resolve it.
+
+**Your version was valid when you branched and is stale by the time you merge.**
+The release gate compares your head against the merge base, so it passes as
+long as your branch is above main *at that point*. Two branches can both pass
+legitimately and only the second to merge conflicts. Re-read
+`git show origin/main:Cargo.toml` in the same breath as the final
+`gh pr checks`, which is one command.
+
 
 ## Every shipped change is a release
 
