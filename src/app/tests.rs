@@ -38332,6 +38332,10 @@ fn reopening_a_closed_pane_brings_it_back_expanded() {
     app.toggle_terminal_collapse(2);
     assert!(app.close_terminal_at(2));
     app.undo_close_terminal();
+    // The count first. Without it a reopen that did nothing at all leaves two
+    // uncollapsed panes and satisfies the flag check while proving the pane
+    // never came back: the predicate is fine, the set it ranges over is wrong.
+    assert_eq!(app.terminals.len(), 3, "the pane must actually be back");
     assert!(
         !app.terminals.iter().any(|t| t.collapsed),
         "a reopen that put a strip on screen would read as having failed"
@@ -38368,9 +38372,17 @@ fn cmd_k_e_still_reveals_in_the_explorer() {
     let (_tmp, mut app, _term) = app_with_terminal_panes(2);
     app.toggle_terminal_collapse(1);
     assert!(app.handle_cmd_k_chord(key(KeyCode::Char('e'), KeyModifiers::NONE)));
+    // BOTH halves, in this test. "Did not collapse" alone passes against a
+    // build where `e` reaches nothing at all, while the test's NAME goes on
+    // claiming it revealed. With no file open the reveal arm says so, and
+    // that is the presence half over the same state.
+    assert_eq!(
+        app.status, "Reveal in Explorer View: no active file",
+        "Cmd+K E must still reach reveal-in-Explorer"
+    );
     assert!(
         app.terminals[1].collapsed,
-        "Cmd+K E must not have been quietly taken over by collapse"
+        "and must not have been quietly taken over by collapse"
     );
 }
 
@@ -38382,10 +38394,16 @@ fn folding_the_focused_pane_moves_focus_somewhere_visible() {
     app.active_terminal = 1;
     app.toggle_terminal_collapse(1);
     assert!(app.terminals[1].collapsed);
-    assert_ne!(app.active_terminal, 1, "focus must leave the folded pane");
+    // The SPECIFIC pane, not merely "not the folded one": focus goes to the
+    // first pane still expanded, and naming it is what tells a deliberate
+    // hand-off from focus landing somewhere by accident.
+    assert_eq!(
+        app.active_terminal, 0,
+        "focus goes to the first pane still expanded"
+    );
     assert!(
         !app.terminals[app.active_terminal].collapsed,
-        "and must land on a pane that is actually on screen"
+        "and that pane is actually on screen"
     );
 }
 
@@ -38447,4 +38465,56 @@ fn a_collapsed_strip_carries_the_pane_name_down_its_column() {
         column.contains("build"),
         "the pane's name runs down the strip: {column:?}"
     );
+}
+
+#[test]
+fn a_long_pane_name_never_paints_past_the_end_of_its_strip() {
+    // A PROPERTY, not a case: this never states which row the name should end
+    // on, only that nothing lands outside the strip. A case written to a
+    // boundary already reasoned through would confirm the painting code's
+    // arithmetic rather than probe it, since the same reasoning produced both.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let height = app.terminal_strip_rects[1].height;
+    assert!(
+        height > 2,
+        "the strip must be tall enough for a name to overrun"
+    );
+
+    // Omega is one cell wide and appears nowhere else in the chrome, so any
+    // sighting of it outside the strip is the name having escaped.
+    const MARK: &str = "\u{3a9}";
+    for len in 1..=(height as usize + 2) {
+        app.terminals[1].set_manual_name(Some(MARK.repeat(len)));
+        term.draw(|f| app.render(f)).unwrap();
+        let strip = app.terminal_strip_rects[1];
+        assert_eq!(strip.width, 1, "still one column at name length {len}");
+        // Containment, counted over the WHOLE screen rather than probed at
+        // the row below the strip: that probe reads `None` whenever the panel
+        // reaches the last screen row, and an assertion the buffer's edge can
+        // satisfy is not an assertion. Comparing totals cannot go vacuous, and
+        // it states no arithmetic about which row is last.
+        let buf = term.backend().buffer();
+        let mark_at = |x: u16, y: u16| {
+            buf.cell(ratatui::layout::Position::new(x, y))
+                .is_some_and(|c| c.symbol() == MARK)
+        };
+        let area = buf.area();
+        let on_screen = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| mark_at(x, y))
+            .count();
+        let in_strip = (strip.y..strip.y + strip.height)
+            .filter(|&y| mark_at(strip.x, y))
+            .count();
+        assert!(
+            in_strip > 0,
+            "the name must actually be painted at length {len}, or nothing is being tested"
+        );
+        assert_eq!(
+            on_screen, in_strip,
+            "a {len}-character name painted outside its own strip"
+        );
+    }
 }
