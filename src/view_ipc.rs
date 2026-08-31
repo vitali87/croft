@@ -151,19 +151,6 @@ pub const MAX_STAGED_STDIN_BYTES: u64 = 64 * 1024 * 1024;
 /// the UI thread's buffer on a client's say-so.
 pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
-/// Read one newline-framed request, bounded in bytes.
-///
-/// The socket's read timeout does NOT bound this on its own: `SO_RCVTIMEO`
-/// applies per `recv`, while `read_line` loops over `fill_buf` until it sees a
-/// newline. A client writing one byte every 40ms and never a newline resets
-/// the timeout on every read and holds the caller indefinitely, and a client
-/// writing one very long line grows the buffer without limit. Since the drain
-/// runs on the frame loop, either one freezes the whole editor, and same-uid
-/// is not a defence: any process in any pane (a build script, a piped
-/// installer) can do it by accident.
-///
-/// The byte cap and the deadline are separate bounds: the cap stops one
-/// enormous line, the deadline stops a slow one. Neither substitutes.
 /// Read one newline-framed line, re-arming the socket timeout from `deadline`
 /// on every `recv`.
 ///
@@ -220,6 +207,18 @@ pub fn read_line_by_deadline(
     String::from_utf8(line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// Read one request from an accepted connection, bounded by `deadline`.
+///
+/// The socket's read timeout does NOT bound this on its own, which is why the
+/// work is delegated to [`read_line_by_deadline`] rather than done with a
+/// `BufReader`: `SO_RCVTIMEO` applies per `recv` while a line read loops, so a
+/// client writing one byte inside every window resets the timeout forever and
+/// holds the caller. The drain runs on the frame loop, so that freezes the
+/// whole editor, and same-uid is not a defence: any process in any pane (a
+/// build script, a piped installer) can do it by accident.
+///
+/// The byte cap and the deadline are separate bounds: the cap stops one
+/// enormous line, the deadline stops a slow one. Neither substitutes.
 pub fn read_request(
     stream: &std::os::unix::net::UnixStream,
     deadline: std::time::Instant,
@@ -414,9 +413,13 @@ pub fn run(
         // Capped: an uncapped `read_to_end` let a runaway producer buffer the
         // whole stream in RAM and then write a 0600 copy of it into the cache
         // dir, which the editor refuses past its own limit anyway.
-        let read =
-            std::io::Read::take(std::io::stdin(), MAX_STAGED_STDIN_BYTES).read_to_end(&mut buf)?;
-        if read as u64 == MAX_STAGED_STDIN_BYTES {
+        // `+ 1` so a payload of EXACTLY the cap is accepted rather than
+        // refused with a message claiming more than the cap arrived. `take(N)`
+        // stops at N, so `== N` cannot tell a legal N-byte payload from a
+        // truncated larger one; reading one byte more can.
+        let read = std::io::Read::take(std::io::stdin(), MAX_STAGED_STDIN_BYTES + 1)
+            .read_to_end(&mut buf)?;
+        if read as u64 > MAX_STAGED_STDIN_BYTES {
             anyhow::bail!(
                 "more than {MAX_STAGED_STDIN_BYTES} bytes arrived on stdin; \
                  write it to a file and view that instead"

@@ -12833,13 +12833,9 @@ impl App {
         // comes back "unreadable request: Resource temporarily unavailable"
         // while Linux CI stays green.
         let _ = stream.set_nonblocking(false);
-        // The WRITE side needs a bound too: the reply embeds the
-        // client-supplied path, so a client that sends a valid long request
-        // and never reads can block `write_all` on a full socket buffer. Not
-        // reproducible on Linux, whose default unix-socket buffer is far
-        // larger than any legal reply - which is why it is set rather than
-        // tested. `read_request` re-arms its own read timeout from the
-        // deadline on every recv, so none is set here.
+        // `read_request` re-arms its own read timeout from the deadline on
+        // every recv, so none is set here; the WRITE bound is armed below,
+        // after the read, from whatever the read left.
         let reply = match crate::view_ipc::read_request(&stream, deadline) {
             Ok(req) => self.apply_view_request(&req.to_path()),
             Err(e) => crate::view_ipc::ViewReply::Err {
@@ -28655,6 +28651,17 @@ impl App {
             if std::time::Instant::now() >= deadline {
                 return changed;
             }
+            // Do not accept what we cannot serve. `read_line_by_deadline`
+            // checks its budget BEFORE the first read, so a well-behaved
+            // client accepted at deadline-minus-epsilon is refused without a
+            // single read attempt, and the client does not retry. Deferring it
+            // to the next frame costs that client one frame and costs the user
+            // nothing, which is the same trade the deadline itself makes.
+            if deadline.saturating_duration_since(std::time::Instant::now())
+                < std::time::Duration::from_millis(3)
+            {
+                return changed;
+            }
             let Some(listener) = self.view_listener.as_ref() else {
                 return changed;
             };
@@ -28695,8 +28702,11 @@ impl App {
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
+                // Not necessarily absence: EACCES and ELOOP land here too,
+                // and the old text claimed "no such file" over an errno that
+                // said otherwise.
                 return ViewReply::Err {
-                    message: format!("no such file: {} ({e})", path.display()),
+                    message: format!("cannot read {}: {e}", path.display()),
                 };
             }
         };
