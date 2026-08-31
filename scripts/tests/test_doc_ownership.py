@@ -638,6 +638,36 @@ class HeadOnlyOrphanTests(unittest.TestCase):
             )
             self.assertEqual(repo.exit_code(), 0)
 
+    def test_a_doc_block_at_end_of_file_is_reported(self):
+        """The third shape the pass reports, and the one with no test until
+        now: a doc block with no item after it at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "fn existing() {}\n")
+            repo.branch("feat")
+            repo.commit("a.rs", "fn existing() {}\n\n/// Documents nothing at all.\n")
+            self.assertEqual(repo.exit_code(), 1)
+
+    def test_a_capture_by_a_documented_newcomer_is_a_known_miss(self):
+        """The residue #427 keeps. When the inserted item carries its OWN
+        doc, nothing is stranded — the original prose has silently moved and
+        both items look documented — so this pass cannot see it. Pinned as a
+        deliberate limitation rather than left for someone to discover: if a
+        future change makes this exit 1, that is an improvement and this test
+        should be inverted, not deleted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "fn existing() {}\n")
+            repo.branch("feat")
+            repo.commit("a.rs", "fn existing() {}\n\n/// Documents alpha.\nfn alpha() {}\n")
+            repo.commit(
+                "a.rs",
+                "fn existing() {}\n\n/// Documents alpha.\n"
+                "/// ...but now sits above the newcomer.\n"
+                "struct Inserted;\n\nfn alpha() {}\n",
+            )
+            self.assertEqual(repo.exit_code(), 0)
+
     def test_a_documented_re_export_is_not_reported(self):
         """`pub use` CAN legitimately carry a doc — rustdoc renders it — so
         flagging one would fail a correct PR. A private `use` cannot appear

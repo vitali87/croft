@@ -277,10 +277,13 @@ def is_doc(line):
 # miss, because a gate that cries wolf stops being read. A plain `use` is
 # the one observed in the wild (#436).
 #
-# `pub use` is excluded on purpose. Documenting a re-export is legitimate
-# Rust and rustdoc renders it, so flagging one would fail a correct PR —
-# and a private `use`, which cannot appear in the docs at all, is the only
-# form that has ever taken another item's prose here.
+# Any VISIBILITY-QUALIFIED `use` is excluded, not just `pub use`.
+# Documenting a re-export is legitimate Rust and rustdoc renders a `pub use`,
+# so flagging one would fail a correct PR; `pub(crate) use` does not reach
+# an external reader either, but a doc above one is a deliberate note rather
+# than stranded prose. A bare private `use` is the only form that has ever
+# taken another item's doc here, and the only one this treats as unable to
+# hold prose.
 NEVER_DOCUMENTED = re.compile(r"^\s*(?:use|extern\s+crate)\s")
 
 DOC, ATTR, SKIP, CODE = "doc", "attr", "skip", "code"
@@ -415,6 +418,17 @@ def orphaned_docs(text):
     item is left alone, because reporting those would be the false accusation
     that stops a gate being read. The check answers "is this prose stranded",
     not "do I recognise what follows".
+
+    KNOWN LIMITATION, and the reason #427 is only partly closed: this sees a
+    capture solely through the doc it STRANDS. When the inserted item carries
+    its own doc, nothing is stranded — the original prose has silently moved
+    to the newcomer and both items look documented — and when the inserted
+    item is a `mod`, an `impl` or a macro invocation, the doc above it is
+    legal, so that case is deliberately unreportable here. All three remain
+    invisible to a merge-base comparison too when the victim is new on the
+    branch, which is what #427 filed. Catching them needs the commit-walk
+    that issue also proposed, or a semantic check of whether prose describes
+    the item beneath it; neither is in scope for this pass.
     """
     lines = text.splitlines()
     kinds = classify(lines)
