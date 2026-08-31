@@ -38,7 +38,7 @@ const MAX_SCALE: u32 = 4;
 const MIN_SCALE: u32 = 2;
 
 /// Recalibration for the #422 rule change, applied once here rather than at
-/// seventeen call sites.
+/// sixteen call sites.
 ///
 /// The old scale tracked machine SIZE, so on any box with four or more cores
 /// it read at least 4 and a `base` was effectively `base * 4`. Measuring
@@ -48,7 +48,7 @@ const MIN_SCALE: u32 = 2;
 /// holds the wall clock where it was calibrated while the scale goes back to
 /// meaning what it says.
 ///
-/// Deliberately central. Doubling seventeen literals by hand invites missing
+/// Deliberately central. Doubling sixteen literals by hand invites missing
 /// one, and a missed one is a flake that looks like the change under test —
 /// the exact failure this module exists to remove. It also keeps `base` the
 /// number a test author reasons about ("a shell printing a line costs about
@@ -73,8 +73,9 @@ fn load_average() -> Option<f64> {
 /// How much slack this machine needs, resolved once per test binary.
 ///
 /// Two signals, and their SUM, because each is blind where the other sees
-/// and both contend for the same cores (#422). The suite's own thread count is known before anything runs
-/// and covers the self-inflicted case (dozens of test shells at once), where
+/// and both contend for the same cores (#422). The suite's own thread count
+/// is known before anything runs and covers the self-inflicted case (dozens
+/// of test shells at once), where
 /// a load average would still be reading the quiet minute before the suite
 /// started. The load average covers what no test can know: a second cargo
 /// build, another suite, whatever else owns the machine.
@@ -191,10 +192,10 @@ fn scale_from(threads: f64, load: f64, cpus: f64) -> u32 {
     // `load_scale` memoises in a `OnceLock`, so in practice the reading is
     // taken at the first wait — early, while the average still describes
     // the machine the suite arrived on.
+    let raw = ((threads + load) / cpus).ceil();
     // Belt and braces: the guard above already rules out every input that
     // could make this non-finite, so this branch is unreachable today. Kept
     // because the guard is the thing most likely to be relaxed later.
-    let raw = ((threads + load) / cpus).ceil();
     if !raw.is_finite() {
         return MIN_SCALE;
     }
@@ -338,6 +339,14 @@ mod tests {
             4,
             "and a quiet machine waits 4x, down from the old 8x"
         );
+        // The property `MAX_SCALE`'s doc actually promises, asserted on the
+        // OUTPUT rather than on the factors: a third multiplier entering the
+        // expression would leave the constants above untouched.
+        let base = Duration::from_secs(1);
+        assert!(
+            spawn_budget(base) <= base * 8,
+            "no budget may exceed the 8x ceiling, however it is composed"
+        );
     }
 
     /// #397's measured flake, which is the ceiling this rule may not lower:
@@ -353,6 +362,17 @@ mod tests {
     fn the_397_flake_still_gets_its_eight_seconds() {
         let scale = scale_from(8.0, 6.0, 4.0);
         assert_eq!(scale, 4, "runnable work per CPU: ceil((8 + 6) / 4)");
+        // That value is also MAX_SCALE, so the assertion above passes via
+        // the CLAMP whether or not the formula is right — it survives
+        // reverting the sum to the old `max` rule, and survives dropping
+        // the division. This companion sits clear of both clamps, so it
+        // asserts the formula itself: ceil((6 + 2) / 4) = 2, where the old
+        // max(6, 0.5) gave 6.
+        assert_eq!(
+            scale_from(6.0, 2.0, 4.0),
+            MIN_SCALE,
+            "away from the clamps, the rule is the sum over cpus"
+        );
         // Through the real formula, not a hand-doubled literal: the base a
         // test author writes is 1s, and the module supplies the calibration.
         let base = std::time::Duration::from_secs(1);
