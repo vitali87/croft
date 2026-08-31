@@ -36966,9 +36966,27 @@ fn review_boxes_follow_the_open_file_through_a_rename() {
         }],
     ));
 
-    std::fs::rename(&old, &new).unwrap();
-    app.editor.rename_open_path(&old, &new);
-    app.rename_review_boxes_path(&old, &new);
+    // Driven through the real rename prompt rather than by calling the
+    // helpers directly: hand-calling them tests the helper's logic while
+    // leaving the WIRING untested, so deleting the call from the rename
+    // handler would keep passing.
+    app.prompt = Some(super::Prompt {
+        label: String::from("Rename a.rs"),
+        buffer: String::from("renamed.rs"),
+        kind: super::PromptKind::Rename(old.clone()),
+        target_dir: tmp.path().to_path_buf(),
+        error: None,
+    });
+    app.commit_prompt();
+    assert!(
+        app.prompt.is_none(),
+        "the rename prompt should have committed"
+    );
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(new.as_path()),
+        "the tab should have followed the rename"
+    );
 
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();

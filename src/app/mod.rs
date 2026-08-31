@@ -21911,9 +21911,6 @@ impl App {
         }
     }
 
-    /// Dismiss one comment box: drop the note from the pilot's state and
-    /// from the local snapshot (the next poll would resurrect it otherwise
-    /// only if the pilot still had it).
     /// Follow the open file to its new path so its review boxes survive a
     /// rename or an explorer cut/paste (#366).
     ///
@@ -21930,6 +21927,9 @@ impl App {
         }
     }
 
+    /// Dismiss one comment box: drop the note from the pilot's state and
+    /// from the local snapshot (the next poll would resurrect it otherwise
+    /// only if the pilot still had it).
     fn ignore_comment_box(&mut self, id: u64) {
         if let Some(host) = &self.pair_host {
             host.remove_note(id);
@@ -21942,10 +21942,11 @@ impl App {
         // box would return on the very next frame (#366).
         //
         // Matching on the id alone is safe because the two sources cannot
-        // collide in practice: a navigator note's id counts up from 0 (see
-        // `session_host`'s `next_id`), while a review thread's is GitHub's
-        // own comment id, currently around 3.9e9. If notes ever gain a
-        // wider allocator, this needs a tag rather than a bare id.
+        // collide in practice: a navigator note's id counts up from 1 (see
+        // `pair.rs`'s `take_note_id`, over `next_note_id`), while a review
+        // thread's is GitHub's own comment id, currently around 3.9e9. If
+        // notes ever gain a wider allocator, this needs a tag rather than a
+        // bare id.
         if let Some((_, threads)) = &mut self.review_boxes {
             threads.retain(|t| t.id != id);
         }
@@ -24155,9 +24156,12 @@ impl App {
         // Stored against the file they describe; the render derives each
         // box's row and title from the buffer as it is at that moment.
         // `path` is the binding taken at the top of this function, so the
-        // threads are keyed to the file the `gh` query was actually about —
-        // re-reading `editor.path` here could key them to a different file
-        // if the user switched tabs while the subprocess ran.
+        // threads are keyed to the file the `gh` query was actually about
+        // rather than to whatever `editor.path` says afterwards. Today those
+        // cannot differ — the event loop is single-threaded and `gh` blocks
+        // it, so no keystroke is handled mid-call — but keying to the
+        // queried file is the property that matters, and it stops being
+        // free the moment this moves off the main thread.
         self.review_boxes = Some((path, threads.clone()));
         self.status = match outdated {
             0 => format!("{} review comments on {rel}", threads.len()),
