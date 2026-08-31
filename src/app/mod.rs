@@ -3082,6 +3082,18 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
+    /// An open asciicast recording (#356): the writer, the file it appends
+    /// to, and when it started. `None` when nothing is being recorded.
+    recording: Option<(
+        crate::asciicast::Recorder,
+        std::fs::File,
+        std::time::Instant,
+    )>,
+    /// The terminal size the open recording last wrote (#356). A resize is
+    /// an `r` event, and a player that never receives one keeps rendering
+    /// the header's size — so a session resized mid-recording plays back
+    /// with every later frame wrapped at the wrong width.
+    recorded_size: (u16, u16),
     /// The symbol a symbol tab is showing (#369): its name and the byte
     /// range it spans, which follows edits through
     /// `SymbolRange::after_edit`. `None` when no symbol tab is open.
@@ -4609,6 +4621,8 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
+            recording: None,
+            recorded_size: (0, 0),
             symbol_tab: None,
             scrubber: None,
             debug_temp_breakpoint: None,
@@ -13197,9 +13211,83 @@ impl App {
     /// (not `||`) so every terminal's flag is consumed even after the first
     /// dirty one is found.
     pub fn drain_terminals_dirty(&mut self) -> bool {
-        self.terminals
+        let dirty = self
+            .terminals
             .iter()
-            .fold(false, |acc, t| acc | t.take_dirty())
+            .fold(false, |acc, t| acc | t.take_dirty());
+        // A recording captures the SCREEN, not the byte stream (#356). The
+        // PTY bytes are consumed by the grid before the app sees them, so
+        // there is no text stream left to tee — and a cast of screens is
+        // what a player replays anyway. Sampled here because this fires
+        // exactly when something changed, so an idle session records
+        // nothing rather than a frame per tick.
+        if dirty && self.recording.is_some() {
+            self.record_active_screen();
+        }
+        dirty
+    }
+
+    /// Write a resize event to the open recording (#356).
+    fn record_resize(&mut self, cols: u16, rows: u16) {
+        use std::io::Write as _;
+        let Some((rec, file, started)) = self.recording.as_mut() else {
+            return;
+        };
+        let line = rec.line(&crate::asciicast::Event::Resize {
+            at: started.elapsed().as_secs_f64(),
+            cols,
+            rows,
+        });
+        if writeln!(file, "{line}").is_err() {
+            self.recording = None;
+            self.status = String::from("Recording stopped: could not write to the cast file");
+        }
+    }
+
+    /// Write the active terminal's current screen to the open recording.
+    ///
+    /// Clear-and-redraw rather than a delta: `\u{1b}[H\u{1b}[2J` then the
+    /// rows. A delta would need the previous screen and a diff that agrees
+    /// with the terminal's own scroll behaviour, and a cast that drifts a
+    /// row from reality is the kind of bug nobody notices until the demo is
+    /// published.
+    ///
+    /// **The recording is monochrome, and the cursor is not restored.**
+    /// `grid_lines` returns plain `String`s — the cell attributes are in the
+    /// grid but not in that view — so a cast records the TEXT of a session
+    /// and not its colour. That is a real limit rather than an oversight:
+    /// carrying attributes means re-emitting SGR per run of cells, which is
+    /// the byte stream this deliberately does not tap. Named here so nobody
+    /// files it as a bug and so the follow-on knows what it costs.
+    fn record_active_screen(&mut self) {
+        // Read everything the frame needs from the pane in ONE borrow, then
+        // write. The two writes below both take `&mut self`, so interleaving
+        // them with pane reads would need the pane borrowed twice around
+        // them — which compiles but reads as an accident rather than as a
+        // decision.
+        let Some((size, lines)) = self.terminals.get(self.active_terminal).map(|t| {
+            let (mut all, top) = t.grid_lines();
+            // The VISIBLE screen only. `grid_lines` starts at
+            // `topmost_line()`, which is negative scrollback — up to
+            // 5000 rows. Writing all of it after a clear scrolls the
+            // live screen straight off the top, so the cast shows the
+            // tail of the history rather than what the user was looking
+            // at, at ~400 KB per frame.
+            let visible = all.split_off((-top).max(0) as usize);
+            ((t.last_inner.width, t.last_inner.height), visible)
+        }) else {
+            return;
+        };
+        // The resize goes FIRST, so a player has the new geometry before the
+        // frame drawn at it — the other order renders one frame wrapped at
+        // the old width.
+        if size != self.recorded_size && size.0 > 0 && size.1 > 0 {
+            self.recorded_size = size;
+            self.record_resize(size.0, size.1);
+        }
+        let mut frame = String::from("\u{1b}[H\u{1b}[2J");
+        frame.push_str(&lines.join("\r\n"));
+        self.record_terminal_output(&frame);
     }
 
     /// Like `drain_terminals_dirty` but does not clear the underlying flags.
@@ -23845,6 +23933,87 @@ impl App {
         self.status = format!("{name}: {} bytes", range.len());
     }
 
+    /// Start or stop recording the active terminal as an asciicast (#356).
+    ///
+    /// Toggling rather than two commands, because a recording is a mode with
+    /// exactly one visible state: a user who cannot remember whether they
+    /// started one reaches for the same entry either way, and gets told
+    /// which happened.
+    fn toggle_session_recording(&mut self) {
+        use std::io::Write as _;
+        if let Some((_, _, started)) = self.recording.take() {
+            let secs = started.elapsed().as_secs_f64();
+            self.status = format!("Stopped recording after {secs:.1}s");
+            return;
+        }
+        let Some(term) = self.terminals.get(self.active_terminal) else {
+            self.status = String::from("No terminal pane to record");
+            return;
+        };
+        // `last_inner`, not `last_area`. The PTY grid is sized from the
+        // pane's INNER rect — `Borders::ALL` takes a cell on each side — so
+        // recording the outer size declares a terminal two columns wider and
+        // two rows taller than the content was wrapped for. The player then
+        // wraps every long line at the wrong column.
+        let (cols, rows) = (term.last_inner.width, term.last_inner.height);
+        if cols == 0 || rows == 0 {
+            // A zero-sized header makes a cast every player refuses, and the
+            // error names the file rather than the moment it was started.
+            self.status = String::from("The terminal has no size yet — try once it has drawn");
+            return;
+        }
+        // A per-recording name, not a per-process one: two recordings in
+        // one session would otherwise write the same file, and the second
+        // would silently destroy the first — which the user only discovers
+        // when they go to share the earlier one.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = self
+            .workspace_root()
+            .join(format!("croft-{}-{stamp}.cast", std::process::id()));
+        let rec = crate::asciicast::Recorder::new(cols, rows);
+        let header = rec.header(Some("croft session"));
+        match std::fs::File::create(&path) {
+            Ok(mut f) => {
+                if let Err(e) = writeln!(f, "{header}") {
+                    self.status = format!("Could not write {}: {e}", path.display());
+                    return;
+                }
+                self.recorded_size = (cols, rows);
+                self.recording = Some((rec, f, std::time::Instant::now()));
+                self.status = format!("\u{25cf} REC to {}", path.display());
+            }
+            Err(e) => self.status = format!("Could not create {}: {e}", path.display()),
+        }
+    }
+
+    /// Append terminal output to the open recording, if there is one (#356).
+    ///
+    /// Times are measured from the recording's start rather than from the
+    /// process's, because a cast's first event should be at ~0 — a player
+    /// given a first timestamp of 4000 seconds sits on a blank screen for
+    /// over an hour before anything happens.
+    pub(crate) fn record_terminal_output(&mut self, data: &str) {
+        use std::io::Write as _;
+        let Some((rec, file, started)) = self.recording.as_mut() else {
+            return;
+        };
+        let line = rec.line(&crate::asciicast::Event::Output {
+            at: started.elapsed().as_secs_f64(),
+            data: data.to_string(),
+        });
+        // A write failure STOPS the recording rather than being ignored: a
+        // half-written cast that keeps growing is worse than one that ends,
+        // and the user needs to know the file they are about to share is
+        // truncated.
+        if writeln!(file, "{line}").is_err() {
+            self.recording = None;
+            self.status = String::from("Recording stopped: could not write to the cast file");
+        }
+    }
+
     /// Run `command` on every configured ssh host and report what differs
     /// (#363).
     ///
@@ -31765,6 +31934,7 @@ impl App {
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
             Cmd::OpenAsSymbolTab => self.open_symbol_tab(),
+            Cmd::ToggleSessionRecording => self.toggle_session_recording(),
             Cmd::FleetRun => {
                 self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
                     crate::widgets::input_prompt::InputPurpose::FleetCommand,
