@@ -143,16 +143,20 @@ impl Thread {
         if self.resolved {
             t.push_str(" \u{b7} resolved");
         }
-        if let Anchor::Outdated(line) = self.anchor {
+        if matches!(self.anchor, Anchor::Outdated(_)) {
             // Named in the title rather than only in a colour, because a
             // reviewer skimming boxes reads titles and a colour is exactly
             // what a screenshot or a colour-blind reader loses.
             t.push_str(" \u{b7} outdated");
-            if line >= buffer_lines {
-                // Clamped: say where it was, or two threads from far apart
-                // stack on the last line indistinguishably.
-                t.push_str(&format!(", was line {}", line + 1));
-            }
+        }
+        // Clamped: say where it was, or two threads from far apart stack on
+        // the last line indistinguishably. Applies to a CURRENT anchor too,
+        // not just an outdated one: the buffer is whatever the user has
+        // edited it to since loading, so any line can end up past the end.
+        if let Anchor::At(line) | Anchor::Outdated(line) = self.anchor
+            && line >= buffer_lines
+        {
+            t.push_str(&format!(", was line {}", line + 1));
         }
         if matches!(self.anchor, Anchor::FileLevel) {
             t.push_str(" \u{b7} on the file");

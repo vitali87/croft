@@ -3082,13 +3082,26 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
-    /// Review threads loaded onto the open file as comment boxes (#366).
+    /// Review threads loaded onto a file, as `(the file, its threads)` (#366).
     ///
     /// A SEPARATE field from `editor.comment_boxes`, which the render loop
     /// rebuilds from `navigator_notes` on every frame — assigning review
     /// threads there directly meant they were wiped before the user saw
     /// one, while the status line still reported having loaded them.
-    review_boxes: Vec<crate::widgets::editor::CommentBox>,
+    ///
+    /// Keyed by PATH because the merge runs on every frame: keyed only by
+    /// "whatever was loaded last", one file's objections would hang off the
+    /// next file's line numbers, against unrelated code. That is the harm
+    /// `threads_are_filtered_to_the_file_being_viewed` prevents on the
+    /// filter axis, and it re-enters through the lifetime axis if the boxes
+    /// outlive the buffer they describe.
+    ///
+    /// Holds `Thread`s rather than finished `CommentBox`es so the geometry
+    /// is derived against the LIVE buffer each frame. `box_line` clamps a
+    /// box past the end back into view; computed once at load, that clamp
+    /// goes stale the moment the user edits, and the box it was protecting
+    /// becomes invisible again.
+    review_boxes: Option<(PathBuf, Vec<crate::review_threads::Thread>)>,
     /// An open asciicast recording (#356): the writer, the file it appends
     /// to, and when it started. `None` when nothing is being recorded.
     recording: Option<(
@@ -4628,7 +4641,7 @@ impl App {
             code_action_request_id: None,
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
-            review_boxes: Vec::new(),
+            review_boxes: None,
             recording: None,
             recorded_size: (0, 0),
             symbol_tab: None,
@@ -14583,9 +14596,19 @@ impl App {
             // reviewer reading a PR with a navigator session open wants
             // both. Appended after, so a navigator note and a review
             // comment on one line keep a stable order.
-            self.editor
-                .comment_boxes
-                .extend(self.review_boxes.iter().cloned());
+            if let Some((path, threads)) = &self.review_boxes
+                && self.editor.path.as_deref() == Some(path.as_path())
+            {
+                let lines = self.editor.lines.len();
+                self.editor.comment_boxes.extend(threads.iter().map(|t| {
+                    crate::widgets::editor::CommentBox {
+                        id: t.id,
+                        line: t.box_line(lines),
+                        author: t.title_for(lines),
+                        body: t.body.clone(),
+                    }
+                }));
+            }
             // A focused box that vanished (ignored elsewhere, cleared, or
             // re-anchored away) releases the keyboard back to the buffer.
             if let Some(focus) = &self.editor.comment_focus
@@ -21898,6 +21921,12 @@ impl App {
         for notes in self.navigator_notes.values_mut() {
             notes.retain(|(nid, ..)| *nid != id);
         }
+        // Review boxes share this footer and this hit-test, so without
+        // retaining here the button would report "Comment ignored" and the
+        // box would return on the very next frame (#366).
+        if let Some((_, threads)) = &mut self.review_boxes {
+            threads.retain(|t| t.id != id);
+        }
         if self
             .editor
             .comment_focus
@@ -21927,12 +21956,35 @@ impl App {
     /// The active file's next comment from the caret (by row, wrapping):
     /// (id, row).
     fn next_comment_from_caret(&self) -> Option<(u64, usize)> {
-        let file = self
+        // Built from the same two SOURCES the render merges, in the same
+        // order, rather than from `editor.comment_boxes` itself: that field
+        // is a render output, so reading it would make F4 depend on a frame
+        // having been drawn first, and the walk would find nothing before
+        // the first render. Review threads are included so F4 reaches them
+        // too (#366) — reading only the navigator's notes left review boxes
+        // on screen but unreachable by keyboard, reported as "No navigator
+        // comments in this file" while the user was looking at several.
+        let mut notes: Vec<(u64, usize, String)> = self
             .editor
             .path
             .as_ref()
-            .and_then(|p| collab_file_key(&self.tree.root, p))?;
-        let notes = self.navigator_notes.get(&file).filter(|n| !n.is_empty())?;
+            .and_then(|p| collab_file_key(&self.tree.root, p))
+            .and_then(|file| self.navigator_notes.get(&file))
+            .cloned()
+            .unwrap_or_default();
+        if let Some((path, threads)) = &self.review_boxes
+            && self.editor.path.as_deref() == Some(path.as_path())
+        {
+            let lines = self.editor.lines.len();
+            notes.extend(
+                threads
+                    .iter()
+                    .map(|t| (t.id, t.box_line(lines), t.body.clone())),
+            );
+        }
+        if notes.is_empty() {
+            return None;
+        }
         let here = self
             .editor
             .comment_focus
@@ -21940,7 +21992,7 @@ impl App {
             .and_then(|f| notes.iter().position(|(id, ..)| *id == f.id))
             .map(|i| (notes[i].1, i))
             .unwrap_or((self.editor.cursor_row, usize::MAX));
-        let idx = next_note_by_row(notes, here);
+        let idx = next_note_by_row(&notes, here);
         Some((notes[idx].0, notes[idx].1))
     }
 
@@ -24074,20 +24126,15 @@ impl App {
             self.status = format!("No review comments on {rel}");
             return;
         }
-        let lines = self.editor.lines.len();
         let outdated = threads
             .iter()
             .filter(|t| matches!(t.anchor, crate::review_threads::Anchor::Outdated(_)))
             .count();
-        self.review_boxes = threads
-            .iter()
-            .map(|t| crate::widgets::editor::CommentBox {
-                id: t.id,
-                line: t.box_line(lines),
-                author: t.title_for(lines),
-                body: t.body.clone(),
-            })
-            .collect();
+        // Stored against the file they describe; the render derives each
+        // box's row and title from the buffer as it is at that moment.
+        if let Some(path) = self.editor.path.clone() {
+            self.review_boxes = Some((path, threads.clone()));
+        }
         self.status = match outdated {
             0 => format!("{} review comments on {rel}", threads.len()),
             n => format!(
