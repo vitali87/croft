@@ -38750,3 +38750,69 @@ fn restore_all_is_inert_while_a_pane_is_maximized() {
         "restore must not silently clear folding the user cannot see"
     );
 }
+
+#[test]
+fn jumping_to_a_captured_line_reveals_the_folded_pane_that_holds_it() {
+    // Round 2 moved the "focus never rests on a folded pane" invariant into
+    // `sync_focus_flags`. That closed three routes and broke a fourth class:
+    // callers which deliberately TARGET a pane by index and then focus it.
+    // `sync_focus_flags` sees the target folded and walks focus away, so the
+    // caller's chosen pane is silently swapped for a neighbour - here the
+    // capture is applied to a pane the user cannot see while focus lands
+    // somewhere unrelated. `run_project_task` and `run_block_in_pane` have the
+    // same shape and write a COMMAND into the invisible pane.
+    //
+    // The invariant is right; what was missing is that reaching for a pane by
+    // index is a request to SEE it, which is the rationale `undo_close_terminal`
+    // already applies when it force-expands a reopened pane.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    let pid = app.terminals[1]
+        .shell_pid()
+        .expect("a real shell to key on");
+    app.terminals[1].feed_bytes_for_test(b"a captured line worth jumping to\r\n");
+    app.toggle_terminal_collapse(1);
+    assert!(
+        app.terminals[1].collapsed,
+        "precondition: the target is folded"
+    );
+    assert_ne!(app.active_terminal, 1, "precondition: focus left it");
+
+    app.captures.push(crate::widgets::captures::CapturedLine {
+        pane: String::from("build"),
+        shell_pid: Some(pid),
+        message: String::from("captured"),
+        line: String::from("a captured line worth jumping to"),
+    });
+    app.captures_open_selected();
+
+    assert_eq!(
+        app.active_terminal, 1,
+        "the jump must land on the pane that HOLDS the captured line"
+    );
+    assert!(
+        !app.terminals[1].collapsed,
+        "and that pane must be visible: applying a selection to a folded pane \
+         shows the user nothing"
+    );
+}
+
+#[test]
+fn the_expand_entry_advertises_no_chord_it_cannot_perform() {
+    // `Cmd+K [` acts on `active_terminal`, which the focus invariant keeps off
+    // folded panes, so the chord can only ever COLLAPSE. The menu label
+    // alternates, so a folded pane's menu read `Expand Terminal   ⌘K [` -
+    // advertising a shortcut that does the opposite of the label beside it.
+    // Contrast `ToggleMaximizeTerminal`, which carries `⌘K M` honestly because
+    // that chord genuinely toggles both ways.
+    assert_eq!(
+        shortcut_for(&MenuAction::ToggleCollapseTerminal(0)),
+        None,
+        "a one-way chord must not be advertised beside a two-way label"
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::ToggleMaximizeTerminal(0)),
+        Some("⌘K M"),
+        "and the genuinely two-way sibling keeps its hint, so this is not just \
+         the hint lookup being broken"
+    );
+}

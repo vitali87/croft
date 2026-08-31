@@ -1400,7 +1400,14 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::RenameTerminal(_) => Some("⌘K R"),
         MenuAction::ClearTerminal(_) => Some("⌘K K"),
         MenuAction::ToggleMaximizeTerminal(_) => Some("⌘K M"),
-        MenuAction::ToggleCollapseTerminal(_) => Some("⌘K ["),
+        // No hint. The label alternates "Collapse Terminal" / "Expand
+        // Terminal", but `Cmd+K [` only ever COLLAPSES: it acts on
+        // `active_terminal`, which the focus invariant guarantees is never a
+        // folded pane, so the expand branch is unreachable from the chord. Its
+        // sibling `ToggleMaximizeTerminal` can carry `⌘K M` honestly because
+        // that chord really does toggle both ways. Advertising a shortcut
+        // beside a label it cannot perform is worse than showing none.
+        MenuAction::ToggleCollapseTerminal(_) => None,
         MenuAction::TerminalQuickSelect => Some("⌃⇧Space"),
         MenuAction::TerminalCopyMode => Some("⌃⇧Y"),
         MenuAction::TerminalCommandHistory => Some("⌃⇧H"),
@@ -12887,28 +12894,11 @@ impl App {
         self.terminals[idx].collapsed = true;
         // Focus cannot stay on a pane that is now one column wide: it shows no
         // cursor, so the keystrokes would go somewhere the user cannot see
-        // them arrive. Hand it to the NEAREST pane still expanded, ties going
-        // left, the way closing a pane hands focus to a neighbour rather than
-        // to the front of the row: folding the fourth of four panes should not
-        // throw the user back to the first.
-        //
-        // `position` was here first and returns the FIRST expanded pane, which
-        // is a different thing that happens to agree whenever the folded pane
-        // is near the left edge. The comment above already said "nearest", so
-        // the code was contradicting its own doc rather than merely being
-        // simpler than it.
-        if self.active_terminal == idx
-            && let Some(next) = self
-                .terminals
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| !t.collapsed)
-                .min_by_key(|(candidate, _)| candidate.abs_diff(idx))
-                .map(|(candidate, _)| candidate)
-        {
-            self.active_terminal = next;
-            self.sync_focus_flags();
-        }
+        // them arrive. `sync_focus_flags` owns that rule for every path, this
+        // one included - a second copy of the nearest-expanded walk here would
+        // be dead weight AND a tie-break that can drift out of step with the
+        // one that matters.
+        self.sync_focus_flags();
         let msg = format!("Collapsed terminal {}", self.terminals[idx].label());
         self.terminal_status(msg);
     }
@@ -12928,6 +12918,26 @@ impl App {
             return;
         }
         self.toggle_terminal_collapse(self.active_terminal);
+    }
+
+    /// Make the pane at `idx` the active one AND visible (#313).
+    ///
+    /// For callers that deliberately TARGET a pane by index - jump to a
+    /// captured line, run a task in its own pane, run a fenced block, focus an
+    /// agent's pane - rather than for a gesture that merely moves focus.
+    ///
+    /// The distinction is load-bearing. `sync_focus_flags` walks focus OFF a
+    /// folded pane, which is right for a drifting gesture and wrong here: it
+    /// silently redirected these callers to a neighbour, so a task command was
+    /// written into a pane that is never rendered while the status line
+    /// reported it running. Reaching for a pane by index is a request to see
+    /// it, which is the rationale `undo_close_terminal` already applies when
+    /// it force-expands a reopened pane.
+    fn reveal_terminal_pane(&mut self, idx: usize) {
+        if let Some(t) = self.terminals.get_mut(idx) {
+            t.collapsed = false;
+        }
+        self.active_terminal = idx;
     }
 
     /// Give every collapsed pane its width back (Cmd+K `]`): the issue's
@@ -13873,15 +13883,28 @@ impl App {
         // focus border: the user would be typing into a pane they cannot see
         // receiving it.
         //
-        // Enforced HERE rather than at each gesture, because this function
-        // already claims below to cover "every gesture that can move
-        // `active_terminal` in one place", and the first attempt at this
-        // invariant did not. It guarded `cycle_terminal` alone, which left
-        // closing the pane beside a folded one, the maximize rail, and a
-        // right-click on a strip - the last of which that same round OPENED,
-        // since making a strip right-clickable also made it focusable. A fix
-        // at the call site closes the path you were looking at; a fix at the
-        // invariant closes the ones you were not.
+        // Enforced HERE rather than at each gesture. The first attempt guarded
+        // `cycle_terminal` alone, which left closing the pane beside a folded
+        // one, the maximize rail, and a right-click on a strip - the last of
+        // which that same round OPENED, since making a strip right-clickable
+        // also made it focusable. A fix at the call site closes the path you
+        // were looking at; a fix at the invariant closes the ones you were not.
+        //
+        // Two things this function does NOT do, contrary to an earlier
+        // version of this comment. It is not called per frame - there are
+        // eleven call sites, none in a render path - and it is not on every
+        // path that moves `active_terminal`: `activate_terminal_pane` and
+        // `move_terminal` both assign without calling it. Those two are safe
+        // for reasons of their own (the first takes its index from
+        // `terminal_at_pos`, which cannot name a folded pane because its
+        // `last_area` is cleared; the second keeps the active pane pointed at
+        // its own terminal), so the invariant's totality rests on those
+        // reasons rather than on this being a universal funnel. A change to
+        // what feeds `terminal_at_pos` would break it silently.
+        //
+        // And this is the rule for focus that DRIFTS. A caller deliberately
+        // choosing a pane by index wants it made visible instead, which is
+        // `reveal_terminal_pane`.
         //
         // Skipped while a pane is maximized: the flags are deliberately
         // ignored there and the active pane is painted full width whatever it
@@ -23607,7 +23630,11 @@ impl App {
             .iter()
             .position(|t| pane_is_idle_at(t, &pane_name, &root))
         {
-            self.active_terminal = idx;
+            // Reused panes may be folded (#313): the release notes name the
+            // build pane as the thing you would fold, and a task written into
+            // a pane that is never rendered runs invisibly under a status line
+            // saying it started.
+            self.reveal_terminal_pane(idx);
             self.terminals[idx].write_input(command.as_bytes());
             self.show_terminal = true;
             self.focus_pane(Pane::Terminal);
@@ -27579,7 +27606,7 @@ impl App {
                     .position(|t| t.shell_pid() == Some(pid))
             })
             .unwrap_or(self.active_terminal);
-        self.active_terminal = idx;
+        self.reveal_terminal_pane(idx);
         self.set_bottom_panel_tab(BottomPanelTab::Terminal);
         self.focus_pane(Pane::Terminal);
         let needle: String = entry.line.trim_end().chars().take(60).collect();
@@ -28041,7 +28068,7 @@ impl App {
             .position(|t| pane_is_idle_at(t, &block.pane_name, &root))
         {
             self.arm_block_capture(&block, idx);
-            self.active_terminal = idx;
+            self.reveal_terminal_pane(idx);
             self.terminals[idx].write_input(bytes.as_bytes());
             self.show_terminal = true;
             self.focus_pane(Pane::Terminal);
@@ -29814,7 +29841,7 @@ impl App {
             .or_else(|| self.terminals.iter().position(|t| t.agent().is_some()));
         match pick {
             Some(idx) => {
-                self.active_terminal = idx;
+                self.reveal_terminal_pane(idx);
                 self.set_bottom_panel_tab(BottomPanelTab::Terminal);
             }
             // The chip is showing a review queue whose agents have all gone:
