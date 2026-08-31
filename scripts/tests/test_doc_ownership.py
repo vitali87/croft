@@ -562,3 +562,139 @@ class GitShapes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HeadOnlyOrphanTests(unittest.TestCase):
+    """The head-only pass: captures the DIFF cannot see (#427, #436).
+
+    The diff check reports an item that HAD a doc and HAS none. Two real
+    captures are invisible to it: one whose victim is new on the branch (so
+    it had no doc at the merge base to lose, #427), and one whose capturing
+    item is of a kind `ITEM` does not model, such as a `use` (#436). Both
+    leave the same fingerprint at HEAD — a doc block with no item under it —
+    which needs no base revision to see.
+    """
+
+    def test_a_use_between_a_doc_and_its_fn_is_caught(self):
+        """#436, reduced. This exact shape shipped and the gate passed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "fn existing() {}\n")
+            repo.branch("feat")
+            # The victim is added by the BRANCH, so the diff check has
+            # nothing at the base to compare it against.
+            repo.commit(
+                "a.rs",
+                "fn existing() {}\n\n/// Documents beta.\nuse std::fmt;\n\nfn beta() {}\n",
+            )
+            self.assertEqual(repo.exit_code(), 1)
+
+    def test_a_capture_whose_victim_is_new_on_the_branch_is_caught(self):
+        """#427: both items added by the branch, so the merge-base
+        comparison sees no loss however many commits it spans."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "fn existing() {}\n")
+            repo.branch("feat")
+            repo.commit("a.rs", "fn existing() {}\n\n/// Documents beta.\nfn beta() {}\n")
+            # A later commit inserts a documented item above it, taking the
+            # first doc and stranding its own.
+            # Two `///` lines in a row are ONE block, which is legal; a
+            # real insertion leaves a blank line between the stranded doc
+            # and the newcomer's own, which is what rustfmt produces.
+            repo.commit(
+                "a.rs",
+                "fn existing() {}\n\n/// Documents beta.\n\n"
+                "/// Documents gamma.\nfn gamma() {}\n\nfn beta() {}\n",
+            )
+            self.assertEqual(repo.exit_code(), 1)
+
+    def test_ordinary_docs_are_not_reported(self):
+        """The control. A gate that cries wolf stops being read, so the
+        shapes a real file is full of must stay silent: attributes and
+        blank lines between a doc and its item, a `//` note under a doc,
+        and a doc above an item kind the regex does not model."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "fn existing() {}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "fn existing() {}\n\n"
+                # An attribute between doc and item.
+                "/// Documented, with an attribute under the doc.\n"
+                "#[derive(Clone, Debug)]\n"
+                "struct A;\n\n"
+                # A plain comment under a doc: does NOT break attachment.
+                "/// Documented, with an implementation note.\n"
+                "// not a doc comment\n"
+                "fn b() {}\n\n"
+                # A doc above an item kind `ITEM` does not model.
+                "/// Documented, above an impl.\n"
+                "impl A {}\n\n"
+                # A doc above a module.
+                "/// Documented, above a mod.\n"
+                "mod inner {}\n",
+            )
+            self.assertEqual(repo.exit_code(), 0)
+
+    def test_a_doc_block_at_end_of_file_is_reported(self):
+        """The third shape the pass reports, and the one with no test until
+        now: a doc block with no item after it at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "fn existing() {}\n")
+            repo.branch("feat")
+            repo.commit("a.rs", "fn existing() {}\n\n/// Documents nothing at all.\n")
+            self.assertEqual(repo.exit_code(), 1)
+
+    def test_a_capture_by_a_documented_newcomer_is_a_known_miss(self):
+        """The residue #427 keeps. When the inserted item carries its OWN
+        doc, nothing is stranded — the original prose has silently moved and
+        both items look documented — so this pass cannot see it. Pinned as a
+        deliberate limitation rather than left for someone to discover: if a
+        future change makes this exit 1, that is an improvement and this test
+        should be inverted, not deleted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "fn existing() {}\n")
+            repo.branch("feat")
+            repo.commit("a.rs", "fn existing() {}\n\n/// Documents alpha.\nfn alpha() {}\n")
+            repo.commit(
+                "a.rs",
+                "fn existing() {}\n\n/// Documents alpha.\n"
+                "/// ...but now sits above the newcomer.\n"
+                "struct Inserted;\n\nfn alpha() {}\n",
+            )
+            self.assertEqual(repo.exit_code(), 0)
+
+    def test_a_documented_re_export_is_not_reported(self):
+        """`pub use` CAN legitimately carry a doc — rustdoc renders it — so
+        flagging one would fail a correct PR. A private `use` cannot appear
+        in the docs at all, which is why it is the only form treated as
+        unable to hold prose."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "fn existing() {}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "fn existing() {}\n\n"
+                "/// Re-exported for convenience.\n"
+                "pub use crate::x::Y;\n\n"
+                "/// Also re-exported.\n"
+                "pub(crate) use crate::x::Z;\n",
+            )
+            self.assertEqual(repo.exit_code(), 0)
+
+    def test_a_use_that_documents_nothing_untouched_is_not_reported(self):
+        """Only CHANGED files are swept, so a pre-existing orphan elsewhere
+        does not fail an unrelated PR."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "/// Stranded.\nuse std::fmt;\n\nfn a() {}\n")
+            repo.commit("b.rs", "fn b() {}\n")
+            repo.branch("feat")
+            repo.commit("b.rs", "fn b() {}\n\nfn c() {}\n")
+            self.assertEqual(repo.exit_code(), 0)
+
