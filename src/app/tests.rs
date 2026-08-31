@@ -38657,3 +38657,96 @@ fn a_reorder_never_hands_a_collapsed_pane_a_live_hit_rect() {
         "expanded panes still carry their slot geometry"
     );
 }
+
+#[test]
+fn closing_the_pane_beside_a_folded_one_never_leaves_focus_on_it() {
+    // Round 1 fixed ONE route onto a folded pane (cycling) at the call site
+    // rather than at `sync_focus_flags`, which documents itself as the single
+    // place every gesture moving `active_terminal` funnels through.
+    //
+    // Here: fold the ACTIVE pane 1, which hands focus left to 0, then close 0.
+    // `close_terminal_at` leaves `active_terminal` at 0, which is now the
+    // folded pane. `ensure_a_terminal_pane_is_expanded` does not catch it - it
+    // enforces "SOME pane is expanded", not "the ACTIVE pane is".
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.active_terminal = 1;
+    app.toggle_terminal_collapse(1);
+    assert_eq!(app.active_terminal, 0, "precondition: focus went left");
+    assert!(app.close_terminal_at(0), "close the pane holding focus");
+    assert!(
+        !app.terminals[app.active_terminal].collapsed,
+        "closing a neighbour must not leave focus on a strip"
+    );
+}
+
+#[test]
+fn dismissing_a_strips_menu_never_leaves_focus_on_the_strip() {
+    // This route was OPENED by round 1's own fix: making a strip
+    // right-clickable also made it focusable, because the same line that
+    // resolves the pane also focuses it. A folded pane paints no cursor and no
+    // focus border, so the user then types into a pane they cannot see.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    assert!(
+        app.context_menu.is_some(),
+        "precondition: the strip right-click opened the pane menu"
+    );
+    app.context_menu = None; // the user presses Esc
+    assert!(
+        !app.terminals[app.active_terminal].collapsed,
+        "dismissing a strip's menu must not leave focus on the strip"
+    );
+}
+
+#[test]
+fn leaving_maximize_never_lands_focus_on_a_folded_pane() {
+    // The rail lists every pane, folded ones included, and a rail click sets
+    // `active_terminal` with no collapse check. While maximized that is
+    // harmless - the flags are ignored and the pane is painted full width -
+    // but leaving maximize drops focus onto a one-column strip.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    app.active_terminal = 0;
+    app.toggle_terminal_pane_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Hand the maximized pane to the folded terminal the way the rail does.
+    app.active_terminal = 2;
+    app.toggle_terminal_pane_maximize();
+    assert!(
+        !app.terminal_pane_maximized,
+        "precondition: back to the split"
+    );
+    assert!(
+        !app.terminals[app.active_terminal].collapsed,
+        "leaving maximize must not leave focus on a strip"
+    );
+}
+
+#[test]
+fn restore_all_is_inert_while_a_pane_is_maximized() {
+    // The mirror of `collapse_is_inert_while_a_pane_is_maximized`. Collapse
+    // got the maximize guard in round 1 and restore did not, so Cmd+K ]
+    // cleared every flag and announced it, for a change invisible until the
+    // user left maximize - the same silent-state-change shape, reversed.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    app.active_terminal = 0;
+    app.toggle_terminal_pane_maximize();
+    assert!(app.terminal_pane_maximized, "precondition");
+
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char(']'), KeyModifiers::NONE)));
+    assert!(
+        app.terminals[2].collapsed,
+        "restore must not silently clear folding the user cannot see"
+    );
+}

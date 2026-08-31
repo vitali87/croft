@@ -12799,6 +12799,11 @@ impl App {
     pub fn toggle_terminal_pane_maximize(&mut self) {
         if self.terminal_pane_maximized {
             self.terminal_pane_maximized = false;
+            // The rail lists folded panes too, so the pane that held the
+            // maximized view may be a strip once the split comes back. The
+            // invariant lives in `sync_focus_flags` and this is the gesture
+            // that re-enters its scope.
+            self.sync_focus_flags();
             self.terminal_status(String::from("Restored terminal split"));
         } else if self.terminals.len() > 1 {
             self.terminal_pane_maximized = true;
@@ -12929,6 +12934,15 @@ impl App {
     /// "maximise the terminals back to the same equal-sized terminal
     /// windows", which has to be one gesture rather than one per pane.
     pub fn restore_all_terminal_panes(&mut self) {
+        // The mirror of the guard on `collapse_active_terminal_pane`. Without
+        // it, Cmd+K ] while maximized cleared every flag and announced it, for
+        // a change the user cannot see until they leave maximize: the same
+        // silent-state-change this pair already refuses in the other
+        // direction.
+        if self.terminal_pane_maximized {
+            self.status = String::from("Restore is unavailable while a pane is maximized");
+            return;
+        }
         let folded = self.terminals.iter().filter(|t| t.collapsed).count();
         if folded == 0 {
             self.status = String::from("No collapsed terminal panes");
@@ -13854,6 +13868,40 @@ impl App {
     }
 
     fn sync_focus_flags(&mut self) {
+        // Focus must never rest on a COLLAPSED pane (#313). A folded pane is
+        // one column wide and is never rendered, so it paints no cursor and no
+        // focus border: the user would be typing into a pane they cannot see
+        // receiving it.
+        //
+        // Enforced HERE rather than at each gesture, because this function
+        // already claims below to cover "every gesture that can move
+        // `active_terminal` in one place", and the first attempt at this
+        // invariant did not. It guarded `cycle_terminal` alone, which left
+        // closing the pane beside a folded one, the maximize rail, and a
+        // right-click on a strip - the last of which that same round OPENED,
+        // since making a strip right-clickable also made it focusable. A fix
+        // at the call site closes the path you were looking at; a fix at the
+        // invariant closes the ones you were not.
+        //
+        // Skipped while a pane is maximized: the flags are deliberately
+        // ignored there and the active pane is painted full width whatever it
+        // holds, so moving focus would fight the user's own selection. Leaving
+        // maximize calls back through here, which is where it is repaired.
+        if !self.terminal_pane_maximized
+            && self
+                .terminals
+                .get(self.active_terminal)
+                .is_some_and(|t| t.collapsed)
+            && let Some(next) = self
+                .terminals
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| !t.collapsed)
+                .min_by_key(|(candidate, _)| candidate.abs_diff(self.active_terminal))
+                .map(|(candidate, _)| candidate)
+        {
+            self.active_terminal = next;
+        }
         // Quick-select is bound to the pane it opened on; this per-frame
         // invariant covers every gesture that can move `active_terminal`
         // (clicks, chords, pane closes shifting indices) in one place, so
