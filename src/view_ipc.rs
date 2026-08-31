@@ -146,11 +146,51 @@ pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 /// installer) can do it by accident.
 ///
 /// `Read::take` caps the bytes; the caller's deadline caps the time.
-pub fn read_request(stream: &std::os::unix::net::UnixStream) -> std::io::Result<ViewRequest> {
-    let mut line = String::new();
-    let mut reader = BufReader::new(std::io::Read::take(stream, MAX_REQUEST_BYTES));
-    reader.read_line(&mut line)?;
-    serde_json::from_str(line.trim())
+pub fn read_request(
+    stream: &std::os::unix::net::UnixStream,
+    deadline: std::time::Instant,
+) -> std::io::Result<ViewRequest> {
+    use std::io::Read;
+    // The timeout is RE-ARMED from the deadline on every read, which is the
+    // whole point. `SO_RCVTIMEO` applies per `recv`, so a timeout armed once
+    // outside the loop is reset by every byte that arrives inside its window:
+    // a client dribbling under the budget is answered by each `recv` and never
+    // trips it. Measured on the first attempt at this fix, a 5ms dribble held
+    // a 20ms drain for 147ms; the theoretical worst case is the byte cap times
+    // the timeout. Capping BYTES does not help, because the cost is per read
+    // rather than per byte.
+    let mut line: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request did not arrive within the frame budget",
+            ));
+        }
+        stream.set_read_timeout(Some(left))?;
+        match (&*stream).read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                line.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = line.iter().position(|b| *b == b'\n') {
+                    line.truncate(pos);
+                    break;
+                }
+                if line.len() as u64 > MAX_REQUEST_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "request exceeded the maximum length",
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let text = std::str::from_utf8(&line)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    serde_json::from_str(text.trim())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
@@ -579,7 +619,11 @@ mod tests {
             let sent = sent.clone();
             std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                let req = read_request(&stream).unwrap();
+                let req = read_request(
+                    &stream,
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+                .unwrap();
                 assert_eq!(req.to_path(), sent);
                 write_reply(&mut stream, &ViewReply::Ok).unwrap();
             })
@@ -599,7 +643,10 @@ mod tests {
         let listener = crate::session::bind_socket_0600(&sock).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let _ = read_request(&stream);
+            let _ = read_request(
+                &stream,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            );
             write_reply(
                 &mut stream,
                 &ViewReply::Err {
@@ -631,7 +678,10 @@ mod tests {
             // accept makes the kind depend on whether the client's write
             // landed first: EPIPE if not, EOF if so. Reading first pins the
             // case this test is about: croft took the request and died.
-            let _ = read_request(&stream);
+            let _ = read_request(
+                &stream,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            );
             drop(stream);
         });
         let err = send(&sock, &ViewRequest::new(Path::new("/x"))).unwrap_err();

@@ -38385,8 +38385,15 @@ fn a_client_that_never_sends_a_newline_cannot_wedge_the_frame_loop() {
         // few dozen bytes.
         let _ = std::io::Write::write_all(&mut c, br#"{"path":[47"#);
         let _ = std::io::Write::flush(&mut c);
-        for _ in 0..60 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        // 5ms, deliberately UNDER the drain's whole 20ms budget. The round-1
+        // fix computed the timeout once and handed it to a `read_line` that
+        // does one `recv` per call, so a client answering inside each window
+        // re-arms it forever: 65536 bytes x the timeout is a 21-minute freeze,
+        // and the byte cap does not touch it. The earlier 20ms interval was
+        // LONGER than the budget, so it tripped the timeout and passed against
+        // the broken code - a fixture that could not reach the defect.
+        for _ in 0..240 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
             if std::io::Write::write_all(&mut c, b",47").is_err() {
                 return;
             }
@@ -38408,88 +38415,169 @@ fn a_client_that_never_sends_a_newline_cannot_wedge_the_frame_loop() {
     // it on every byte and the drain runs for the whole ~1.2s dribble. An
     // earlier version of this assertion used 1500ms - above BOTH - and passed
     // against the unbounded read, proving nothing.
+    // 80ms sits BETWEEN the two behaviours, which is what makes this measure
+    // anything. Deadline re-armed per recv, the drain returns at roughly its
+    // own 20ms budget; armed once outside the loop it ran 147ms against a 5ms
+    // dribble (measured, not estimated). Two earlier versions of this
+    // assertion used 1500ms and then 300ms - both ABOVE the broken behaviour -
+    // and passed straight through a real overrun.
     assert!(
-        elapsed < std::time::Duration::from_millis(300),
+        elapsed < std::time::Duration::from_millis(80),
         "a client that never terminates its line must not hold the frame loop: \
          the drain took {elapsed:?}"
     );
 }
 
 #[test]
-fn the_accepted_stream_is_blocking_whatever_the_listener_is() {
-    // `prepare_view_listener` puts the LISTENER in non-blocking mode, and an
-    // accepted socket's flags are not portably inherited: Linux's accept(2)
-    // says the new socket does not inherit O_NONBLOCK and that portable
-    // programs must set flags explicitly, while BSD - so macOS, croft's
-    // primary platform - does inherit them. Inherited, the read timeout is
-    // inert (a non-blocking recv returns EAGAIN before any timeout applies)
-    // and every `croft view` fails with "Resource temporarily unavailable".
+fn a_non_blocking_accepted_stream_is_still_answered() {
+    // The PREVIOUS version of this test could not fail: it accepted a
+    // connection, called `set_nonblocking(false)` itself, and then asserted
+    // the flag it had just set. Deleting the production call left it green on
+    // every platform, and its own comment claimed the opposite.
     //
-    // Asserted on the fd, because on Linux the mode is NOT inherited and the
-    // behaviour is identical either way: only the flag distinguishes a build
-    // that would work on macOS from one that would not.
+    // This one hands `answer_view_client` a deliberately NON-blocking stream -
+    // the state macOS actually produces, since BSD inherits the listener's
+    // flags across `accept` while Linux does not - and asserts the REPLY. If
+    // production stops clearing the flag, every read returns EAGAIN and the
+    // reply becomes `Err("unreadable request: Resource temporarily
+    // unavailable")`, which fails here on Linux too.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let sock = seat_view_listener(&mut app, tmp.path());
+    let target = tmp.path().join("seen.txt");
+    std::fs::write(&target, b"hello").unwrap();
 
     let sock2 = sock.clone();
+    let target2 = target.clone();
     let client = std::thread::spawn(move || {
-        std::os::unix::net::UnixStream::connect(&sock2)
-            .ok()
-            .map(|c| {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                drop(c);
-            })
+        let mut c = std::os::unix::net::UnixStream::connect(&sock2).unwrap();
+        // Connect, PAUSE, then write. The pause is what makes the blocking
+        // mode observable at all: a client that writes before the server
+        // accepts leaves the bytes sitting in the socket buffer, so the first
+        // read succeeds immediately whether the socket blocks or not, and the
+        // test passes with the flag cleared or set. The read has to WAIT for
+        // the mode to matter, which is exactly the case a real `croft view`
+        // hits whenever the shell is a little slower than the frame loop.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let req = crate::view_ipc::ViewRequest {
+            path: target2.as_os_str().as_encoded_bytes().to_vec(),
+        };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        let _ = std::io::Write::write_all(&mut c, line.as_bytes());
+        let _ = std::io::Write::flush(&mut c);
+        std::thread::sleep(std::time::Duration::from_millis(300));
     });
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Long enough for the CONNECT to land, short enough that the request has
+    // not been written yet.
+    std::thread::sleep(std::time::Duration::from_millis(30));
 
     let (listener, _) = app.view_listener.as_ref().unwrap();
     let (stream, _) = listener.accept().expect("a client is waiting");
-    // The production drain does this to every accepted stream; assert the
-    // property rather than re-deriving it, so a lost call fails here.
-    stream.set_nonblocking(false).unwrap();
-    let flags = {
-        use std::os::unix::io::AsRawFd;
-        unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) }
-    };
-    assert!(
-        flags != -1 && flags & libc::O_NONBLOCK == 0,
-        "an accepted stream must be blocking, or its read timeout is inert"
-    );
+    // The state macOS hands production, forced here so Linux exercises it too.
+    stream.set_nonblocking(true).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let (reply, opened) = app.answer_view_client(stream, deadline);
     let _ = client.join();
+
+    assert_eq!(
+        reply,
+        crate::view_ipc::ViewReply::Ok,
+        "a non-blocking accepted stream must still be read: production has to \
+         clear the flag, and this is the reply that says whether it did"
+    );
+    assert!(opened, "and the file must actually have been opened");
 }
 
 #[test]
-fn the_sweep_removes_a_dead_crofts_staged_stdin_and_spares_a_live_one() {
-    // `croft view -` writes what was piped into it under `view-stdin/`, and
-    // the module's own rationale names `vault read … | croft view -`. Nothing
-    // removed those, so every such pipe left a permanent copy on disk the user
-    // was never told about, and the name carries a pid, so a recycled pid
-    // collided with a months-old file and `croft view -` failed forever.
+fn the_sweep_spares_staged_stdin_a_croft_may_still_be_showing() {
+    // The previous version of this test modelled the "live" file as
+    // `stdin-{own_pid}-0.csv` and passed. Production never produces that name:
+    // `stage_stdin` runs inside `view_ipc::run`, the short-lived `croft view`
+    // CLIENT, which exits milliseconds later. So every staged file carries a
+    // pid that is dead by construction, the pid-liveness sweep matched all of
+    // them, and launching a second croft deleted a file the first one had open
+    // in a tab. `sqlite_view::table_page` re-opens by path on every page turn,
+    // so that breaks the tab rather than merely littering.
+    //
+    // Staged through the real function, so the name is the shape production
+    // makes rather than the shape the old fixture assumed.
     let tmp = tempfile::tempdir().unwrap();
-    let staged = tmp.path().join("view-stdin");
-    std::fs::create_dir_all(&staged).unwrap();
-
-    // A pid that cannot be alive: the kernel's max plus one.
-    let dead = std::fs::read_to_string("/proc/sys/kernel/pid_max")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .map(|m| m + 1)
-        .unwrap_or(4_194_305);
-    let mine = std::process::id();
-    let dead_file = staged.join(format!("stdin-{dead}-0.csv"));
-    let live_file = staged.join(format!("stdin-{mine}-0.csv"));
-    std::fs::write(&dead_file, b"a,b\n1,2\n").unwrap();
-    std::fs::write(&live_file, b"a,b\n3,4\n").unwrap();
+    let fresh = crate::view_ipc::stage_stdin(tmp.path(), b"a,b\n1,2\n", None).unwrap();
+    assert!(fresh.exists(), "precondition: the pipe was staged");
 
     crate::app::sweep_dead_view_sockets(tmp.path());
-
     assert!(
-        !dead_file.exists(),
-        "a dead croft's staged stdin must not outlive it"
+        fresh.exists(),
+        "a just-staged pipe must survive: a pane may be showing it right now"
     );
+}
+
+#[test]
+fn the_sweep_removes_staged_stdin_old_enough_that_nothing_can_be_showing_it() {
+    // The other half. Age is the honest key here: the pid in the name belongs
+    // to a process that is always gone, so liveness answers a question the
+    // name cannot pose. Anything older than the retention window predates any
+    // running croft's session.
+    let tmp = tempfile::tempdir().unwrap();
+    let stale = crate::view_ipc::stage_stdin(tmp.path(), b"secret", Some("txt")).unwrap();
+    // Backdate past the window without waiting for it.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 30);
+    let f = std::fs::File::options().write(true).open(&stale).unwrap();
+    f.set_modified(old).unwrap();
+    drop(f);
+
+    crate::app::sweep_dead_view_sockets(tmp.path());
     assert!(
-        live_file.exists(),
-        "a live croft's staged stdin must be spared: a pane may be showing it"
+        !stale.exists(),
+        "a staged pipe older than the window must not outlive it: the module's \
+         own rationale names `vault read | croft view -`"
+    );
+}
+
+// NOT a test: `a_client_that_never_reads_its_reply` was written for the
+// missing write timeout and removed rather than kept green. Measured, the
+// drain returned in 13ms because the reply is bounded by MAX_REQUEST_BYTES
+// (~16KB of path) while Linux's default unix-socket buffer is an order of
+// magnitude larger, so `write_all` never blocks here whatever the timeout is.
+// The fix (`set_write_timeout` in `drain_view_requests`) is correct on macOS,
+// whose buffers are small enough to hit it and which is croft's primary
+// platform - but a test that passes identically with and without it is not
+// evidence, and keeping one would misrepresent this as covered.
+
+#[test]
+fn the_view_socket_is_bound_before_the_first_pane_is_spawned() {
+    // The blocker this PR exists to fix, pinned. `croft view` failed in the
+    // STARTUP pane because `App::new` built that pane before binding the
+    // socket, and portable-pty snapshots the environment inside
+    // `CommandBuilder::new`. Every other test on this branch seats a listener
+    // by hand and skips the bind entirely, so reverting the ordering left the
+    // whole suite green - the one defect this branch is about had no guard.
+    //
+    // Checked against the SOURCE rather than at runtime, deliberately.
+    // `view_ipc::SOCK_PATH` is a set-once process global: a test that ran the
+    // real bind would publish a temp path into every other test in this
+    // binary, which is the hazard `CACHE_DIR_OVERRIDE_FOR_TEST` exists to
+    // avoid for the cache dir. The repo already checks source-level properties
+    // this way (`scripts/check_doc_ownership.py`). It is brittle to a rename,
+    // and it fails loudly and says why, which is the trade being made.
+    let src = include_str!("mod.rs");
+    let ctor = src
+        .find("pub fn new(root: PathBuf)")
+        .expect("App::new must exist for this guard to mean anything");
+    let body = &src[ctor..];
+    let bind = body
+        .find("Self::bind_view_socket()")
+        .expect("App::new must bind the view socket");
+    let pane = body
+        .find("PtyTerminal::new(&root)")
+        .expect("App::new must spawn the first pane");
+    assert!(
+        bind < pane,
+        "the view socket must be bound BEFORE the first pane is spawned: \
+         portable-pty snapshots the environment when a pane's CommandBuilder \
+         is built, so a pane constructed first never learns the socket and \
+         `croft view` fails in it while working in every pane opened later"
     );
 }

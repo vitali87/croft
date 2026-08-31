@@ -12802,6 +12802,52 @@ impl App {
         }
     }
 
+    /// Serve one accepted `croft view` client: bound the socket, read the
+    /// request, apply it, and answer. Returns the reply and whether anything
+    /// was opened (so the caller can redraw).
+    ///
+    /// Split out of the accept loop so a test can hand it a stream and observe
+    /// the REPLY. The previous test for the blocking-mode fix accepted a
+    /// connection, called `set_nonblocking(false)` itself, and then asserted
+    /// the flag it had just set - it could not fail on any platform, which is
+    /// the false-green shape this repo's own guidance names. Given this seam a
+    /// test can hand in a deliberately NON-blocking stream and assert the
+    /// reply is `Ok`, which fails everywhere if the call below is dropped.
+    fn answer_view_client(
+        &mut self,
+        mut stream: std::os::unix::net::UnixStream,
+        deadline: std::time::Instant,
+    ) -> (crate::view_ipc::ViewReply, bool) {
+        // An accepted socket's flags are not portably inherited: Linux's
+        // accept(2) says the new socket does NOT inherit O_NONBLOCK and that
+        // portable programs must set flags explicitly, while BSD (so macOS,
+        // croft's primary platform) does inherit them. Inherited, every read
+        // returns EAGAIN before any timeout applies and every `croft view`
+        // comes back "unreadable request: Resource temporarily unavailable"
+        // while Linux CI stays green.
+        let _ = stream.set_nonblocking(false);
+        // The WRITE side needs a bound too: the reply embeds the
+        // client-supplied path, so a client that sends a valid long request
+        // and never reads can block `write_all` on a full socket buffer. Not
+        // reproducible on Linux, whose default unix-socket buffer is far
+        // larger than any legal reply - which is why it is set rather than
+        // tested. `read_request` re-arms its own read timeout from the
+        // deadline on every recv, so none is set here.
+        let left = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(std::time::Duration::from_millis(1));
+        let _ = stream.set_write_timeout(Some(left));
+        let reply = match crate::view_ipc::read_request(&stream, deadline) {
+            Ok(req) => self.apply_view_request(&req.to_path()),
+            Err(e) => crate::view_ipc::ViewReply::Err {
+                message: format!("unreadable request: {e}"),
+            },
+        };
+        let opened = matches!(reply, crate::view_ipc::ViewReply::Ok);
+        let _ = crate::view_ipc::write_reply(&mut stream, &reply);
+        (reply, opened)
+    }
+
     /// Drop the rail's hit rects and its column. Both must go together: a
     /// stale area would keep swallowing the wheel after the rail left screen.
     fn clear_terminal_rail(&mut self) {
@@ -28602,40 +28648,10 @@ impl App {
                 return changed;
             };
             match listener.accept() {
-                Ok((mut stream, _)) => {
-                    // A client that connects and then stalls must not hold
-                    // the frame loop: the read is bounded, and a request
-                    // that misses the window is dropped rather than waited on.
-                    // A real client writes its one line immediately after
-                    // connecting, so this is a safety net for a wedged one
-                    // rather than a budget anybody legitimately spends.
-                    // An accepted socket's flags are not portably inherited:
-                    // Linux's accept(2) says the new socket does NOT inherit
-                    // O_NONBLOCK and that portable programs must set flags
-                    // explicitly, while BSD (so macOS, croft's primary
-                    // platform) does inherit them. Inherited, the read timeout
-                    // below is inert - a non-blocking recv returns EAGAIN
-                    // before any timeout applies - and every `croft view`
-                    // would come back "unreadable request: Resource
-                    // temporarily unavailable" while Linux CI stayed green.
-                    let _ = stream.set_nonblocking(false);
-                    // Never zero: a zero timeout means "block forever" to
-                    // `SO_RCVTIMEO`, which is the exact opposite of the
-                    // intent, so a spent deadline gets the smallest real
-                    // timeout instead and the connection is dropped on the
-                    // next pass through the loop.
-                    let left = deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .max(std::time::Duration::from_millis(1));
-                    let _ = stream.set_read_timeout(Some(left));
-                    let reply = match crate::view_ipc::read_request(&stream) {
-                        Ok(req) => self.apply_view_request(&req.to_path()),
-                        Err(e) => crate::view_ipc::ViewReply::Err {
-                            message: format!("unreadable request: {e}"),
-                        },
-                    };
-                    changed |= matches!(reply, crate::view_ipc::ViewReply::Ok);
-                    let _ = crate::view_ipc::write_reply(&mut stream, &reply);
+                Ok((stream, _)) => {
+                    let (reply, opened) = self.answer_view_client(stream, deadline);
+                    changed |= opened;
+                    let _ = reply;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return changed,
                 Err(_) => return changed,
@@ -44504,39 +44520,42 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
     sweep_staged_stdin(dir);
 }
 
-/// Drop staged stdin left behind by crofts that are gone (#362).
+/// Drop staged stdin old enough that no running croft can be showing it (#362).
 ///
-/// `croft view -` writes what was piped to it into `view-stdin/`, and the
-/// module's own rationale names `vault read … | croft view -`: every such pipe
-/// left a permanent 0600 copy on disk that the user was never told about, and
-/// the name carries a pid, so a recycled pid used to collide with a
-/// months-old file forever. Pruning on the same launch-time sweep as the
-/// sockets bounds both.
+/// Keyed on AGE, not on pid liveness, and the distinction is the whole of this
+/// function. `stage_stdin` runs inside [`crate::view_ipc::run`] — the
+/// short-lived `croft view` CLIENT process, which exits milliseconds later —
+/// so the pid baked into every staged name belongs to something that is always
+/// already dead. A liveness check therefore matched EVERY staged file,
+/// including one a running croft had open in a tab, and launching a second
+/// croft deleted it. That is not litter: `sqlite_view::table_page` re-opens the
+/// file by path on every page turn, so the tab breaks on the next page.
 ///
-/// A file whose pid is still alive is spared, including this croft's own: a
-/// pane may be looking at it right now.
+/// The retention window is generous because the cost of keeping a file too
+/// long is disk and the cost of dropping one too early is a broken tab. It
+/// still bounds the pile: the module's own rationale names
+/// `vault read … | croft view -`, and without any sweep every such pipe left a
+/// permanent copy on disk the user was never told about.
+const STAGED_STDIN_RETENTION: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24);
+
 fn sweep_staged_stdin(dir: &Path) {
     let staged = dir.join("view-stdin");
     let Ok(entries) = std::fs::read_dir(&staged) else {
         return;
     };
-    let me = std::process::id();
     for entry in entries.flatten() {
+        // Only croft's own staging names, so a file dropped in this directory
+        // by anything else is left alone rather than deleted on a guess.
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        // `stdin-{pid}-{n}` with an optional extension and an optional
-        // collision suffix: the pid is the second dash-separated field.
-        let Some(pid) = name
-            .strip_prefix("stdin-")
-            .and_then(|r| r.split('-').next())
-            .and_then(|p| p.parse::<u32>().ok())
-        else {
+        if !name.to_str().is_some_and(|n| n.starts_with("stdin-")) {
             continue;
-        };
-        let gone = pid != me
-            && unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if gone {
+        }
+        let too_old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+            .is_ok_and(|age| age > STAGED_STDIN_RETENTION);
+        if too_old {
             let _ = std::fs::remove_file(entry.path());
         }
     }
