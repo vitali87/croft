@@ -38700,7 +38700,18 @@ fn dismissing_a_strips_menu_never_leaves_focus_on_the_strip() {
         app.context_menu.is_some(),
         "precondition: the strip right-click opened the pane menu"
     );
-    app.context_menu = None; // the user presses Esc
+    // Dismiss through the PRODUCTION path. Assigning `context_menu = None`
+    // under a comment saying "the user presses Esc" made this test assert
+    // focus after the RIGHT-CLICK, not after dismissal: the right-click branch
+    // calls `focus_pane`, which runs the invariant, so the assertion below was
+    // already satisfied before the line pretending to dismiss anything ran. It
+    // passed, and it could not have failed for the reason it is named for.
+    app.handle_menu_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(
+        app.context_menu.is_none(),
+        "Esc must actually close the menu, or the dismissal path is not what \
+         this test exercised"
+    );
     assert!(
         !app.terminals[app.active_terminal].collapsed,
         "dismissing a strip's menu must not leave focus on the strip"
