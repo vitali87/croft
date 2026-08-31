@@ -58,6 +58,7 @@ mod release_notes;
 mod remote;
 mod remote_bulk;
 mod remote_connect;
+mod scrubber;
 mod session;
 mod session_host;
 mod session_state;
