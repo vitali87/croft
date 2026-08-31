@@ -2680,7 +2680,10 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     let area = app.terminals[0].last_area;
     let (col, row) = (area.y..area.y + area.height)
         .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
-        .find(|&(c, r)| app.terminals[0].hyperlink_at_screen(c, r).is_some())
+        .find(|&(c, r)| {
+            app.terminals[0].hyperlink_at_screen(c, r).as_deref()
+                == Some("mailto:split@example.com")
+        })
         .expect("pane 0 must carry the link somewhere, or the built-in has nothing to act on");
     assert_eq!(
         app.active_terminal, 1,
@@ -2798,10 +2801,12 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     app.terminals[0].feed_bytes_for_test(b"\x1b]8;;mailto:x@example.com\x1b\\link\x1b]8;;\x1b\\");
     let (col, row) = (area.y..area.y + area.height)
         .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
-        .find(|&(c, r)| app.terminals[0].hyperlink_at_screen(c, r).is_some())
+        .find(|&(c, r)| {
+            app.terminals[0].hyperlink_at_screen(c, r).as_deref() == Some("mailto:x@example.com")
+        })
         .expect(
-            "the cell must carry an OSC 8 link, or the built-in has nothing to act \
-             on and this test cannot distinguish the two branches",
+            "the cell must carry THIS test's OSC 8 link, or the built-in has nothing \
+             to act on and this test cannot distinguish the two branches",
         );
 
     app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
