@@ -130,24 +130,40 @@ pub fn paint_gradient_box(buf: &mut Buffer, rect: Rect) {
     }
 }
 
-/// Rows of dotted contour lines drawn into a card's interior (#312).
+/// Dotted contour lines drawn into a card's interior (#312).
 ///
 /// Three curves, phase-shifted, so the field reads as a landscape rather
-/// than as one repeated ripple.
+/// than one repeated ripple.
 const WAVE_CURVES: usize = 3;
+
+/// Only every Nth column carries a dot.
+///
+/// Sampling one row per column put adjacent columns on the same row often
+/// enough that the curves merged into solid dashes of eight to eleven
+/// cells - a smear rather than the sparse dotted field the reference shows,
+/// and dense enough that three curves read as one mass.
+const WAVE_COLUMN_STEP: u16 = 3;
+
+/// Where the field starts, as a fraction of the card's width.
+///
+/// The midpoint was too far left: it put the leading edge exactly where the
+/// longest note lines end, which is what made the field collide with the
+/// gaps between words in the first place. Starting later gives the text
+/// real clearance and lets the ramp read as an emergence.
+const WAVE_START: f32 = 0.68;
 
 /// Paint the ambient dotted wave into the right of a card's interior (#312).
 ///
-/// Only ever writes to cells that are still BLANK, so the card's text always
-/// wins: the wave is atmosphere behind the content, and a release note that
-/// grows to fill the card simply pushes it out of view rather than being
-/// painted over. That is also why it is painted last by the caller, when
-/// what the text occupies is already known.
+/// TO THE RIGHT OF THE TEXT, not merely into blank cells. A per-cell blank
+/// test is not enough: the spaces BETWEEN WORDS of a release note are blank
+/// cells, so a dot lands between "release" and "notes" and the note reads
+/// as though it has been speckled. Each row's last occupied column is found
+/// first and nothing is painted at or left of it, so the field can only
+/// ever sit past the end of that row's text.
 ///
-/// The curves fade left to right, from nothing at the midpoint to full
-/// strength at the card's right edge, so the field never competes with the
-/// note text that starts on the left. Teal and orange are the brand
-/// gradient's own corners rather than new colours.
+/// The card's text is therefore always intact, which is the contract: a
+/// release with a lot to say pushes the field out of view rather than being
+/// decorated over.
 pub fn paint_card_wave(buf: &mut Buffer, inner: Rect, theme_ui: impl Fn(Color) -> Color) {
     if inner.width < 24 || inner.height < 3 {
         return;
@@ -155,42 +171,64 @@ pub fn paint_card_wave(buf: &mut Buffer, inner: Rect, theme_ui: impl Fn(Color) -
     let buf_area = buf.area;
     let w = inner.width as f32;
     let h = inner.height as f32;
-    // The left half stays clear for the text; the wave lives in the right.
-    let start = inner.width / 2;
-    for col in start..inner.width {
+    let start = ((w * WAVE_START) as u16).min(inner.width.saturating_sub(1));
+    // Per row, the column after that row's last painted cell. A dot must
+    // clear it, which is what keeps the field out of the gaps in a note.
+    let text_end: Vec<u16> = (0..inner.height)
+        .map(|row| {
+            let y = inner.y + row;
+            if y < buf_area.y || y >= buf_area.y + buf_area.height {
+                return inner.width;
+            }
+            (0..inner.width)
+                .rev()
+                .find(|&col| {
+                    let x = inner.x + col;
+                    x >= buf_area.x
+                        && x < buf_area.x + buf_area.width
+                        && buf[(x, y)].symbol() != " "
+                })
+                .map_or(0, |c| c + 1)
+        })
+        .collect();
+    for col in (start..inner.width).step_by(WAVE_COLUMN_STEP as usize) {
         let x = inner.x + col;
         if x < buf_area.x || x >= buf_area.x + buf_area.width {
             continue;
         }
-        // 0 at the midpoint, 1 at the right edge: the field emerges rather
-        // than starting abruptly.
         let ramp = (col - start) as f32 / (inner.width - start).max(1) as f32;
         let phase = col as f32 / w;
-        for curve in 0..WAVE_CURVES {
+        // Back to front, so where two curves land on the same cell the NEAR
+        // one wins. Painting front to back let a receding curve overwrite
+        // the one that should sit in front of it.
+        for curve in (0..WAVE_CURVES).rev() {
             let c = curve as f32;
-            // Each curve peaks at a different place and sits at a different
-            // height, which is what makes the three read as one landscape.
             let peak = (phase * 6.0 + c * 0.9).sin() * 0.5 + 0.5;
             let level = h * (0.30 + 0.22 * c) + peak * h * 0.42;
             let row = level.round();
             if !(0.0..h).contains(&row) {
                 continue;
             }
-            let y = inner.y + row as u16;
+            let row_idx = row as u16;
+            let y = inner.y + row_idx;
             if y < buf_area.y || y >= buf_area.y + buf_area.height {
                 continue;
             }
+            if col < text_end[row_idx as usize] {
+                continue;
+            }
             let cell = &mut buf[(x, y)];
-            // Blank only: the text was painted first and keeps its cells.
             if cell.symbol() != " " {
                 continue;
             }
-            // The near curve carries the orange the wordmark uses; the ones
-            // behind it recede into teal.
             let tint = lerp_rgb(GRAD_BL, GRAD_TR, if curve == 0 { 0.85 } else { 0.10 });
             let faded = lerp_rgb(GRAD_BL, tint, 0.25 + 0.75 * ramp);
             cell.set_symbol("\u{b7}");
-            cell.set_style(Style::default().fg(theme_ui(rgb_color(faded))));
+            // set_style REPLACES rather than patches: a cell reset by an
+            // earlier paint can carry modifiers, and a dot inheriting BOLD
+            // or REVERSED from whatever was there is not the same colour
+            // the palette chose.
+            cell.set_style(Style::reset().fg(theme_ui(rgb_color(faded))));
         }
     }
 }
@@ -208,64 +246,104 @@ mod wave_tests {
         })
     }
 
-    /// The wave is atmosphere: a cell the card already painted keeps what it
-    /// has (#312). This is the whole contract, because the alternative is a
-    /// decorative field eating a release note.
-    #[test]
-    fn the_wave_never_overwrites_a_painted_cell() {
-        let area = Rect {
+    fn area(w: u16, h: u16) -> Rect {
+        Rect {
             x: 0,
             y: 0,
-            width: 60,
-            height: 8,
-        };
-        let mut buf = blank(60, 8);
-        // Fill every cell with text, as a card whose notes reach the edges.
-        for y in 0..8 {
-            buf.set_string(0, y, "x".repeat(60), Style::default());
+            width: w,
+            height: h,
         }
-        let before = buf.clone();
-        paint_card_wave(&mut buf, area, |c| c);
-        assert_eq!(buf, before, "a full card is left exactly as it was painted");
     }
 
-    /// And it does paint SOMETHING when there is room, or the test above
-    /// would pass against a function that does nothing at all.
+    fn dots_at(buf: &Buffer, w: u16, h: u16) -> Vec<(u16, u16)> {
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() == "\u{b7}")
+            .collect()
+    }
+
+    /// The wave must not land in the gaps BETWEEN WORDS of a release note.
+    ///
+    /// The first version of this test filled every cell with `x`, which
+    /// cannot exercise the defect it is named for: a per-cell blank check
+    /// passes trivially when there are no blanks. Real notes are words
+    /// separated by spaces, and those spaces are blank cells - so the field
+    /// speckled the text it was supposed to sit beside. The fixture is now
+    /// prose, and the rule is per ROW: nothing at or left of that row's
+    /// last painted cell.
+    #[test]
+    fn the_wave_never_lands_inside_a_line_of_text() {
+        let (w, h) = (76u16, 8u16);
+        let mut buf = blank(w, h);
+        let note = "fix: a release note with many spaces between its words";
+        buf.set_string(0, 2, note, Style::default());
+        buf.set_string(
+            0,
+            3,
+            "and a second line that also has spaces",
+            Style::default(),
+        );
+        paint_card_wave(&mut buf, area(w, h), |c| c);
+
+        for (row, text) in [(2u16, note), (3, "and a second line that also has spaces")] {
+            let end = text.chars().count() as u16;
+            for (x, y) in dots_at(&buf, w, h) {
+                assert!(
+                    y != row || x >= end,
+                    "a dot landed at column {x} of row {row}, inside {end}-cell text"
+                );
+            }
+            // And the text itself is byte-for-byte what was painted.
+            let painted: String = (0..end).map(|x| buf[(x, row)].symbol()).collect();
+            assert_eq!(painted, text, "row {row} was altered");
+        }
+    }
+
+    /// And it does paint, or the test above would pass against a function
+    /// that does nothing at all.
     #[test]
     fn the_wave_paints_into_the_blank_right_of_a_card() {
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 60,
-            height: 8,
-        };
-        let mut buf = blank(60, 8);
-        paint_card_wave(&mut buf, area, |c| c);
-        let dots = (0..8)
-            .flat_map(|y| (0..60).map(move |x| (x, y)))
-            .filter(|&(x, y)| buf[(x, y)].symbol() == "\u{b7}")
-            .count();
-        assert!(dots > 0, "the field is drawn on an empty card");
-        // And never into the left half, which the note text owns.
-        let left = (0..8)
-            .flat_map(|y| (0..30).map(move |x| (x, y)))
-            .filter(|&(x, y)| buf[(x, y)].symbol() == "\u{b7}")
-            .count();
-        assert_eq!(left, 0, "the text side stays clear");
+        let (w, h) = (76u16, 8u16);
+        let mut buf = blank(w, h);
+        paint_card_wave(&mut buf, area(w, h), |c| c);
+        let dots = dots_at(&buf, w, h);
+        assert!(!dots.is_empty(), "the field is drawn on an empty card");
+        let start = (w as f32 * WAVE_START) as u16;
+        assert!(
+            dots.iter().all(|&(x, _)| x >= start),
+            "nothing lands left of the fade point at column {start}"
+        );
+    }
+
+    /// Sparse, not a smear. Sampling every column put adjacent dots on the
+    /// same row often enough that the curves merged into solid dashes.
+    #[test]
+    fn the_field_is_sparse_enough_to_read_as_dots() {
+        let (w, h) = (76u16, 8u16);
+        let mut buf = blank(w, h);
+        paint_card_wave(&mut buf, area(w, h), |c| c);
+        for y in 0..h {
+            let mut run = 0u16;
+            for x in 0..w {
+                if buf[(x, y)].symbol() == "\u{b7}" {
+                    run += 1;
+                    assert!(
+                        run <= 1,
+                        "row {y} has a run of {run} dots, which reads as a dash"
+                    );
+                } else {
+                    run = 0;
+                }
+            }
+        }
     }
 
     /// A card too small to carry a field gets none rather than a stripe.
     #[test]
     fn a_narrow_card_gets_no_wave() {
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 20,
-            height: 8,
-        };
         let mut buf = blank(20, 8);
         let before = buf.clone();
-        paint_card_wave(&mut buf, area, |c| c);
+        paint_card_wave(&mut buf, area(20, 8), |c| c);
         assert_eq!(buf, before);
     }
 }
