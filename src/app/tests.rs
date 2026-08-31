@@ -1510,6 +1510,24 @@ fn app_with_open_file_and_editor_cell() -> (App, tempfile::TempDir, u16, u16) {
     (app, tmp, col, row)
 }
 
+/// The first grid cell of `pane` whose row text carries `needle`, searched
+/// row-major over the pane's own `last_area` (#397).
+///
+/// A test that prints something into a pane and then clicks it must not assume
+/// which row it landed on: the pane runs a REAL shell whose prompt races the
+/// feed, so the row is a property of machine load rather than of the test.
+/// Callers anchor on the exact text they printed, so unrelated output cannot
+/// satisfy the search.
+fn cell_carrying(pane: &crate::widgets::terminal::PtyTerminal, needle: &str) -> Option<(u16, u16)> {
+    let area = pane.last_area;
+    (area.y..area.y + area.height)
+        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
+        .find(|&(c, r)| {
+            pane.line_text_at(c, r)
+                .is_some_and(|(text, _)| text.contains(needle))
+        })
+}
+
 fn mouse(
     kind: crossterm::event::MouseEventKind,
     col: u16,
@@ -1759,7 +1777,10 @@ fn a_terminal_link_binding_is_not_refused_for_an_editor_side_reason() {
     // one it always runs, and the cell is then searched for rather than
     // assumed.
     app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
-    app.terminals[0].feed_bytes_for_test(b"\x1b]8;;mailto:t@example.com\x1b\\link\x1b]8;;\x1b\\");
+    // Trailing newline parks the cursor on the NEXT row: without it any late
+    // shell output writes onto the link's own row.
+    app.terminals[0]
+        .feed_bytes_for_test(b"\x1b]8;;mailto:t@example.com\x1b\\link\x1b]8;;\x1b\\\r\n");
     term.draw(|f| app.render(f)).unwrap();
     let area = app.terminals[0].last_area;
     let (col, row) = (area.y..area.y + area.height)
@@ -2442,8 +2463,23 @@ fn an_unmatched_modified_click_does_not_arm_the_tracker() {
         area.width > 4 && area.height > 2,
         "terminal must be laid out"
     );
-    let (col, row) = (area.x + 2, area.y + 1);
+    // A line of output IN FRONT of the token, so the ordering that used to
+    // break these tests is the one this test always runs (#397), and the cell
+    // is SEARCHED rather than assumed.
+    //
+    // Assuming it made this test conditionally vacuous, which is worse than
+    // plainly vacuous: measured both ways, with `ClickTracker::record`'s
+    // modifier guard deliberately broken, it FAILED with the token on the
+    // assumed row and PASSED with the token one row down. So it discriminated
+    // whenever it was checked by hand and went blind precisely under load,
+    // which is the only condition it exists to cover. The negative assertion
+    // at the end is satisfied by a click that lands on blank and selects
+    // nothing, whether or not the tracker armed.
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
     app.terminals[0].feed_bytes_for_test(b"hello_world_token some other text\r\n");
+    term.draw(|f| app.render(f)).unwrap();
+    let (col, row) = cell_carrying(&app.terminals[0], "hello_world_token")
+        .expect("the pane must show THIS test's token, or there is no word to mis-select");
 
     // Precondition: the CTRL click must match nothing, or it returns early
     // from the matched dispatch and never reaches the built-in.
@@ -2519,13 +2555,16 @@ fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal(
     // cell — so clicking an empty terminal makes this test pass vacuously
     // whether the tracker armed or not. Print text first, and assert it
     // arrived, so the click has a real word to wrongly select.
+    // A line of output IN FRONT of the token, so the ordering that used to
+    // break these tests is the one this test always runs (#397).
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
     app.terminals[0].feed_bytes_for_test(b"hello_world_token\r\n");
     term.draw(|f| app.render(f)).unwrap();
-    // `area.y` is the pane's BORDER row, not its first text row: `cell_at`
-    // hit-tests against `last_inner` and returns None outside it, so a click
-    // there resolves to no grid cell and selects nothing whatever the tracker
-    // holds. `+ 1` is what the working ctrl+double_click test above uses.
-    let (col, row) = (area.x + 2, area.y + 1);
+    // SEARCHED, not assumed. This test already carried a positive control, so
+    // a displaced token failed it outright rather than passing vacuously - the
+    // flaking half of the same defect its sibling had the vacuous half of.
+    let (col, row) = cell_carrying(&app.terminals[0], "hello_world_token")
+        .expect("the pane must show THIS test's token, or there is no word to mis-select");
     assert!(
         app.terminals[0]
             .visible_text()
@@ -2659,6 +2698,17 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     // Link in pane 0; pane 1 is ACTIVE. The two panes must differ, or the
     // bug is unreachable and this test proves nothing.
     app.terminals[0]
+        // A DECOY link on an earlier row. Under the `.is_some()` this branch
+        // replaced, the row-major search hits the decoy first and the click
+        // resolves the wrong link, so the exact-status assertion fails with
+        // `decoy@` in the message. That is the red state the tightening
+        // shipped without: nothing else in these panes emits OSC 8, so
+        // reverting it left the suite green.
+        //
+        // `mailto:` rather than `file://` deliberately: `file://` is
+        // intercepted by `editor_file_uri` and would exercise a different arm.
+        .feed_bytes_for_test(b"\x1b]8;;mailto:decoy@example.com\x1b\\decoy\x1b]8;;\x1b\\\r\n");
+    app.terminals[0]
         .feed_bytes_for_test(b"\x1b]8;;mailto:split@example.com\x1b\\split-link\x1b]8;;\x1b\\\r\n");
     app.active_terminal = 1;
     term.draw(|f| app.render(f)).unwrap();
@@ -2696,7 +2746,7 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     app.handle_mouse(ctrl);
 
     assert!(
-        app.status.contains("Refused to open non-web link"),
+        app.status == "Refused to open non-web link: mailto:split@example.com",
         "the prefix click must defer to the built-in, which opens the link in \
          the CLICKED pane. Reading the ACTIVE pane finds nothing there, \
          swallows the click, and the link never opens. status was {:?}",
@@ -2726,10 +2776,16 @@ fn a_prefix_click_defers_to_the_builtin_for_a_file_reference_too() {
         area.width > 12 && area.height > 2,
         "terminal must be laid out"
     );
+    // The same class as the OSC 8 tests, reached through `terminal_file_click`
+    // rather than `terminal_url_click`. The audit that found the others was
+    // scoped to "tests that feed an OSC 8 link", which excludes a bare file
+    // reference BY CONSTRUCTION - so the scope, not the code, is what hid it.
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
     app.terminals[0].feed_bytes_for_test(b"target_file.rs:1:1\r\n");
     term.draw(|f| app.render(f)).unwrap();
 
-    let (col, row) = (area.x + 2, area.y + 1);
+    let (col, row) = cell_carrying(&app.terminals[0], "target_file.rs:1:1")
+        .expect("the pane must carry THIS test's file reference");
     // Precondition: a file REFERENCE must be under the cursor, or the guard
     // declines for "nothing there" and the test says nothing about the file
     // half specifically.
@@ -2798,7 +2854,10 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     // that used to break this test, so the cell is searched for instead of
     // computed from the border row.
     app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
-    app.terminals[0].feed_bytes_for_test(b"\x1b]8;;mailto:x@example.com\x1b\\link\x1b]8;;\x1b\\");
+    // Trailing newline parks the cursor on the NEXT row: without it any late
+    // shell output writes onto the link's own row.
+    app.terminals[0]
+        .feed_bytes_for_test(b"\x1b]8;;mailto:x@example.com\x1b\\link\x1b]8;;\x1b\\\r\n");
     let (col, row) = (area.y..area.y + area.height)
         .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
         .find(|&(c, r)| {
@@ -2821,7 +2880,7 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     app.handle_mouse(ctrl);
 
     assert!(
-        app.status.contains("Refused to open non-web link"),
+        app.status == "Refused to open non-web link: mailto:x@example.com",
         "a double-click PREFIX over a mouse-tracking child must fall through to \
          the built-in: croft has no click-forwarding path, so swallowing it \
          hands the gesture to nobody -- the swallow branch \
