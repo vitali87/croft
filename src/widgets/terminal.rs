@@ -711,6 +711,15 @@ pub struct HintSpan {
 static NEXT_MARK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Take the next mark id.
+///
+/// `Relaxed` is sufficient and is not a shortcut. Uniqueness needs no
+/// ordering at all — `fetch_add` on a single atomic is totally ordered on
+/// itself, so no two callers can take the same value. And the id's
+/// PUBLICATION is ordered by something else entirely: it reaches a reader
+/// only inside a `StoredMark` behind the `marks` mutex, whose unlock/lock
+/// pair supplies the happens-before. There is no second variable whose
+/// visibility this atomic would have to fence, which is the only thing a
+/// stronger ordering would buy. Do not "upgrade" it to `SeqCst`.
 fn next_mark_id() -> u64 {
     NEXT_MARK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -725,12 +734,16 @@ struct StoredMark {
     /// Monotonic identity, assigned once when the mark is recorded and never
     /// renumbered (#440).
     ///
-    /// Positions are not identity here: `marks_snapshot` GCs marks past the
-    /// scrollback floor and the reader drops the oldest at `MARKS_MAX`, so
-    /// every index below an evicted mark shifts down. A caller holding
+    /// Positions are not identity here. Three paths remove marks —
+    /// `marks_snapshot` GCs those past the scrollback floor, the reader drops
+    /// the oldest at `MARKS_MAX`, and a destructive screen wipe clears the
+    /// list outright — and the first two shift every index below them down. A caller holding
     /// "index 3" is holding a slot, not a command, and after an eviction that
     /// slot silently names a different one. An id turns that into "command
     /// 41": if 41 is gone the caller learns it is gone instead of reading 42.
+    ///
+    /// The counter is never reset, including by the wipe, so an id is not
+    /// reused after a pane is cleared either.
     id: u64,
     kind: crate::shell_integration::OscEvent,
     line_rec: i32,
@@ -782,6 +795,23 @@ pub struct CommandDecoration {
     /// finished command has exactly one of — the prompt marks before it are
     /// optional in the pairing below, so keying on one of those would leave
     /// some decorations without an id.
+    ///
+    /// **Only the identity is stable; the presentation fields are not.** The
+    /// id, `exit` and the output span come from the `CommandStart`/`CommandEnd`
+    /// pair, so they hold for as long as the decoration exists at all. But
+    /// `line` and `input` come from the PROMPT marks, which sit on earlier
+    /// grid rows and so cross the scrollback floor FIRST: the GC in
+    /// `marks_snapshot` retains per mark, not per command, so a command can
+    /// outlive its own prompt. When that happens `line` falls back to
+    /// `output_start` and `input` becomes `None`, while the id keeps naming
+    /// the same command throughout.
+    ///
+    /// So a consumer keyed on the id gets a durable answer to "which
+    /// command", and a best-effort answer to "where on screen was it typed".
+    /// That is the right split for the callers there are — the gutter wants
+    /// a row and can use the fallback, and a re-run wants the text and must
+    /// handle its absence — but it is a real limit, not an oversight, and
+    /// worth knowing before keying anything else on the pair.
     pub id: u64,
     pub line: i32,
     pub exit: Option<i32>,
@@ -6217,7 +6247,6 @@ mod tests {
     /// numbering ids by position. The fixtures below care about pairing, not
     /// identity, so an id per row keeps them readable while still exercising
     /// the id path.
-    #[cfg(test)]
     fn views(
         marks: &[(
             crate::shell_integration::OscEvent,
@@ -7856,6 +7885,112 @@ mod tests {
         assert!(
             after.iter().all(|d| d.id != before[0].id),
             "an evicted command's id must never be reused by a survivor"
+        );
+    }
+
+    /// A command outlives its own prompt marks, and the id says so (#440).
+    ///
+    /// The GC retains per MARK, not per command, and the prompt marks sit on
+    /// earlier rows than the command's own — so the floor takes them first.
+    /// The interesting case is therefore not the clean boundary the test
+    /// above cuts, but this one: the same command, still identified, with its
+    /// presentation fields degraded. Pinning it here so the limit documented
+    /// on `CommandDecoration::id` cannot quietly stop being true.
+    #[test]
+    fn a_command_can_outlive_its_prompt_marks() {
+        use crate::shell_integration::OscEvent as E;
+        let marks = [
+            (E::PromptStart, -10, 0, None),
+            (E::PromptEnd, -10, 5, None),
+            (E::CommandStart, -9, 0, None),
+            (E::CommandEnd(Some(0)), -7, 0, None),
+        ];
+        let views = views(&marks);
+        let whole = pair_decorations(&views);
+        assert_eq!(whole.len(), 1, "staging: one finished command");
+
+        // The floor rises past the prompt row but not past the command's.
+        let survivors: Vec<MarkView> = views.iter().filter(|m| m.line >= -9).cloned().collect();
+        assert_eq!(survivors.len(), 2, "staging: only the prompt marks evict");
+        let after = pair_decorations(&survivors);
+        assert_eq!(after.len(), 1, "the command itself survives");
+
+        // Identity and the output span are untouched.
+        assert_eq!(after[0].id, whole[0].id, "the id names the same command");
+        assert_eq!(
+            (after[0].exit, after[0].output_start, after[0].output_end),
+            (whole[0].exit, whole[0].output_start, whole[0].output_end),
+            "the fields taken from CommandStart/CommandEnd do not drift"
+        );
+
+        // The presentation fields DO degrade, exactly as documented.
+        assert_eq!(
+            whole[0].input,
+            Some((-10, 5)),
+            "staging: the typed-text position existed before the eviction"
+        );
+        assert_eq!(
+            after[0].input, None,
+            "the typed-text position goes with the prompt mark"
+        );
+        assert_eq!(whole[0].line, -10, "staging: the row was the prompt's");
+        assert_eq!(
+            after[0].line, after[0].output_start,
+            "the row falls back to the command's own line"
+        );
+    }
+
+    /// Ids are unique across panes, and a wipe does not restart them (#440).
+    ///
+    /// The counter is process-wide precisely so an id means one thing
+    /// wherever it travels; a per-pane counter would hand two panes the same
+    /// id and a wipe would hand the same pane its old ids back. Both are the
+    /// kind of thing that looks fine until a consumer keys on the id, so both
+    /// are pinned rather than left to the comment.
+    #[test]
+    fn ids_are_unique_across_panes_and_survive_a_wipe() {
+        use crate::shell_integration::OscEvent;
+        let run = |t: &PtyTerminal| {
+            feed_pty(t, b"\r\n$ ");
+            t.push_mark_for_test(OscEvent::PromptStart, 0);
+            t.push_mark_for_test(OscEvent::PromptEnd, 2);
+            feed_pty(t, b"cmd\r\nout\r\n");
+            t.push_mark_for_test(OscEvent::CommandStart, 0);
+            t.push_mark_for_test(OscEvent::CommandEnd(Some(0)), 0);
+        };
+
+        let (_a, mut a) = quiet_pty();
+        let (_b, b) = quiet_pty();
+        run(&a);
+        run(&b);
+        run(&a);
+        let mut ids: Vec<u64> = a
+            .command_decorations()
+            .iter()
+            .chain(b.command_decorations().iter())
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(ids.len(), 3, "staging: three commands across two panes");
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "ids must not collide between panes");
+
+        // A wipe clears the pane's marks; the counter is not reset, so the
+        // next command must not be handed an id the wipe just freed.
+        let highest = *ids.last().unwrap();
+        a.clear_screen_and_scrollback();
+        assert!(
+            a.command_decorations().is_empty(),
+            "staging: the wipe must actually clear the marks"
+        );
+        run(&a);
+        let after = a.command_decorations();
+        assert_eq!(after.len(), 1, "staging: one command since the wipe");
+        assert!(
+            after[0].id > highest,
+            "an id must not be reused after a wipe: {} came after {highest}",
+            after[0].id
         );
     }
 
