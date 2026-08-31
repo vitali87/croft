@@ -237,6 +237,22 @@ impl AgentLedger {
         rows
     }
 
+    /// Every unreviewed file across every lane, deduplicated.
+    ///
+    /// One set rather than per-agent lists, because the consumer is the
+    /// Explorer's dot (#345) and a file two agents both wrote is one file
+    /// with one row. [`Self::unreviewed_files`] counts the same thing; this
+    /// hands back the paths so a caller can test membership per row, which
+    /// is what the Explorer's decoration needs.
+    pub fn unreviewed_paths(&self) -> std::collections::HashSet<PathBuf> {
+        self.lanes
+            .values()
+            .flat_map(|lane| lane.values())
+            .filter(|f| f.unreviewed())
+            .map(|f| f.path.clone())
+            .collect()
+    }
+
     /// Every agent that has a lane, in name order.
     pub fn agents(&self) -> Vec<&str> {
         self.lanes.keys().map(String::as_str).collect()
@@ -372,14 +388,15 @@ impl AgentLedger {
     /// Distinct FILES awaiting review across every lane. A shared row is one
     /// file to open, not two: a count that drops by two when the user
     /// reviews one file is telling them something untrue.
+    ///
+    /// Derived from [`Self::unreviewed_paths`] rather than counted
+    /// separately, so it cannot disagree with the set the Explorer draws.
+    /// It allocates that set to do it, which is why the status chip counts
+    /// the Explorer's own cached copy instead of calling this on every
+    /// frame — this is for callers that have no cache to hand.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn unreviewed_files(&self) -> usize {
-        self.lanes
-            .values()
-            .flat_map(|lane| lane.values())
-            .filter(|f| f.unreviewed())
-            .map(|f| &f.path)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
+        self.unreviewed_paths().len()
     }
 }
 
