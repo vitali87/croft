@@ -68,6 +68,7 @@ mod shell_integration;
 mod snippets;
 mod sqlite_view;
 mod svg;
+mod symbol_range;
 mod tasks;
 mod terminal_session;
 mod termux;
