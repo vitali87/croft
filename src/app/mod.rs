@@ -924,8 +924,22 @@ struct PendingCapture {
     doc: Option<PathBuf>,
     block_line: usize,
     /// Ids at or below this belong to commands that finished BEFORE the
-    /// block was typed. `None` when the pane had finished nothing yet, in
-    /// which case any first command is this block's.
+    /// block was typed.
+    ///
+    /// `None` is a sentinel, not a special case: ids start at 1, so `None`
+    /// and `Some(0)` select identically and a fresh pane needs no separate
+    /// handling.
+    ///
+    /// THE RESIDUAL IS IN THE SELECTION, NOT HERE. Settling takes the
+    /// EARLIEST qualifying id, which is this block's command only if
+    /// nothing else finished in the gap between arming and the keystrokes
+    /// reaching the shell. A command completing in that gap is taken
+    /// instead, on a pane with a full history exactly as on a fresh one -
+    /// `after` does not enter into it. The window is much smaller than the
+    /// eviction one it replaced, since a foreign command must now COMPLETE
+    /// in the gap rather than merely exist, and the outcome self-corrects
+    /// on the next run. Closing it properly means arming after the
+    /// keystrokes are known to have landed, which is a different change.
     after: Option<u64>,
     started: std::time::Instant,
     timeout: Option<std::time::Duration>,
@@ -26953,6 +26967,13 @@ impl App {
             // an evicted command is simply absent rather than silently
             // replaced by its neighbour, which is what the old positional
             // index could not distinguish.
+            // The EARLIEST command to finish after the block was typed.
+            // Earliest rather than latest because a block that finishes
+            // while a later one is still running must not be described by
+            // the later one - but see `PendingCapture::after`: earliest is
+            // also what makes a foreign command completing in the
+            // arm-to-keystroke gap win, which is this rule's residual and
+            // not `after`'s.
             let mine = decorations
                 .iter()
                 .filter(|d| c.after.is_none_or(|a| d.id > a))
