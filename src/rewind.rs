@@ -207,11 +207,19 @@ impl RewindBuffer {
     fn drop_orphan_keyframes(&mut self) {
         let Some(oldest_seq) = self.frames.front().map(|f| f.seq) else {
             // No frames at all. This is NOT the orphan case: a keyframe
-            // taken before any output — or after every frame has aged out —
-            // is a valid start point for everything that arrives next, and
-            // clearing here would drop the screen a fresh pane replays from.
-            // Only the newest is worth keeping; the older ones describe
-            // screens no surviving frame can reach.
+            // taken before any output has arrived is a valid start point for
+            // everything that arrives next, and clearing here would drop the
+            // screen a fresh pane replays from. Only the newest is worth
+            // keeping; the older ones describe screens no surviving frame
+            // can reach.
+            //
+            // Note this arm is NOT reached by frames "ageing out": eviction
+            // is byte-capped, not age-based, and stops as soon as the budget
+            // is met, while a pushed write is truncated to at most the
+            // capacity — so at any nonzero capacity the just-pushed frame
+            // always survives and a buffer that has held frames never
+            // returns to empty. The reachable states are: before the first
+            // output, and a zero capacity.
             while self.keyframes.len() > 1 {
                 self.keyframes.pop_front();
             }
@@ -395,6 +403,28 @@ mod tests {
         assert_eq!(kf.map(|k| k.at_ms), Some(20));
         let data: Vec<&[u8]> = frames.iter().map(|f| f.data.as_slice()).collect();
         assert_eq!(data, vec![b"two".as_slice()]);
+
+        // The boundary itself: "at or before" must include AT. A search using
+        // `<` rather than `<=` survives every other test in this module — it
+        // falls back to None and replays from a blank screen, reaching the
+        // right result by a slower path — so only an equality case catches it.
+        let (kf_eq, frames_eq) = b.replay_from(20);
+        assert_eq!(
+            kf_eq.map(|k| k.at_ms),
+            Some(20),
+            "a keyframe exactly AT the target must be selected, not skipped"
+        );
+        // No frames come back: the range is [start, at_ms] = [20, 20], and
+        // "two" landed at 30. The KEYFRAME selection is what this case pins;
+        // asserting the frames too would only restate the range filter, which
+        // `replay_from(35)` above already covers. (I first asserted ["two"]
+        // here by copying that case without re-deriving it for a different
+        // target -- the empty result is correct.)
+        let data_eq: Vec<&[u8]> = frames_eq.iter().map(|f| f.data.as_slice()).collect();
+        assert!(
+            data_eq.is_empty(),
+            "the replay range is [20, 20]; \"two\" at 30 is outside it: {data_eq:?}"
+        );
     }
 
     /// A frame in the same millisecond as the keyframe is replayed, not skipped.
@@ -647,14 +677,19 @@ mod tests {
     /// With NO surviving frames, keyframes still collapse to the newest.
     ///
     /// `drop_orphan_keyframes` has two arms, and the sibling test above only
-    /// covers the frames-present one. This is the `else` arm: when every
-    /// frame has aged out, the collapse loop there is the ONLY thing bounding
-    /// the keyframe deque, and deleting it leaves the whole rewind suite
-    /// green while keyframes grow without limit — each holding a full screen.
+    /// covers the frames-present one. This is the `else` arm, reached when no
+    /// frame survives: the collapse loop there is the ONLY thing bounding the
+    /// keyframe deque, and deleting it leaves the whole rewind suite green
+    /// while keyframes grow without limit — each holding a full screen.
     ///
-    /// Reachable in production, not just at capacity 0: any pane whose frames
-    /// have all aged out sits in this arm, which the module's own docs call
-    /// "after every frame has aged out".
+    /// Covered at BOTH reachable states, because capacity 0 alone would be a
+    /// degenerate configuration rather than the production path: a keyframe
+    /// taken before any output has arrived reaches this arm at an ordinary
+    /// 1 MB capacity. Frames "ageing out" does NOT reach it — eviction is
+    /// byte-capped rather than age-based and always leaves the just-pushed
+    /// frame, so a buffer that has held frames never returns to empty. (An
+    /// earlier version of this comment claimed otherwise; the claim was the
+    /// justification for the test not being degenerate, so it mattered.)
     #[test]
     fn keyframes_collapse_to_the_newest_when_no_frames_survive() {
         // Capacity 0: nothing is ever retained as a frame, so every call
@@ -684,6 +719,24 @@ mod tests {
             kf.map(|k| k.screen.clone()),
             Some(vec![String::from("k4")]),
             "the RETAINED keyframe must be the newest one"
+        );
+
+        // The PRODUCTION route, at an ordinary capacity: keyframes taken
+        // before any output arrives. Same arm, nothing degenerate about it.
+        let mut b = RewindBuffer::new(1 << 20);
+        for i in 0..5u64 {
+            b.push_keyframe(i, vec![format!("pre{i}")]);
+        }
+        assert!(
+            b.is_empty(),
+            "no output has arrived, so there are no frames"
+        );
+        assert_eq!(b.keyframe_count(), 1, "keyframes must collapse here too");
+        let (kf2, _) = b.replay_from(u64::MAX);
+        assert_eq!(
+            kf2.map(|k| k.screen.clone()),
+            Some(vec![String::from("pre4")]),
+            "the newest pre-output keyframe must be the one retained"
         );
     }
 
@@ -733,5 +786,13 @@ mod tests {
             }
         }
         assert_eq!(asked, 0, "2 KB of output must not trigger a keyframe");
+
+        // The boundary is `>=`, so a write landing EXACTLY on the interval
+        // asks. Mutating it to `>` survives every other test here.
+        let mut b2 = RewindBuffer::new(1 << 20);
+        assert!(
+            b2.push(1, &vec![b'x'; KEYFRAME_INTERVAL_BYTES]),
+            "a write landing exactly on the interval must ask for a keyframe"
+        );
     }
 }
