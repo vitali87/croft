@@ -62,6 +62,142 @@ struct HostBlock {
     user: Option<String>,
 }
 
+/// Programs whose command line this understands.
+///
+/// **`ssh` only, and that is a correctness limit rather than an oversight.**
+/// `mosh` and `et` reach a box the same way and were in this list, but they
+/// take LONG options and `ssh` does not — and the parse below is built on
+/// ssh's single-letter grammar. `mosh --port 60000 box` yields `60000`,
+/// because `strip_prefix('-')` leaves `-port`, the scan finds `p` mid-word,
+/// and the attached-value branch consumes nothing. That is a wrong host, not
+/// a refusal, and a wrong host here re-roots the workspace onto the wrong
+/// machine. Parsing them properly needs a per-program table of which long
+/// options take a separate word; until that exists, refusing is the only
+/// honest answer.
+///
+/// `sshfs` is absent for a different reason: it mounts a filesystem rather
+/// than giving you a shell, so re-rooting onto it answers a different
+/// question. `ssh-agent` and `ssh-keygen` share a prefix with `ssh` and
+/// nothing else, which is why the match is on the whole name.
+const SSH_PROGRAMS: [&str; 1] = ["ssh"];
+
+/// `ssh` flags that take a SEPARATE argument, per ssh(1).
+///
+/// This list is what makes the parse work: without it, `ssh -p 2222 box`
+/// yields `2222` as the destination, because `2222` is the first word that
+/// does not begin with `-`. The boolean flags need no listing — anything
+/// starting with `-` that is not here is simply skipped, so a SHORT flag
+/// added to ssh in future degrades to "skipped" rather than to a wrong host.
+/// That guarantee does NOT extend to long options — `--port` scans as `-port`
+/// and finds `p` mid-word — which is why [`SSH_PROGRAMS`] admits only `ssh`,
+/// the one program in this family that has none.
+const SSH_FLAGS_WITH_ARG: [char; 22] = [
+    'B', 'b', 'c', 'D', 'E', 'e', 'F', 'I', 'i', 'J', 'L', 'l', 'm', 'O', 'o', 'P', 'p', 'Q', 'R',
+    'S', 'W', 'w',
+];
+
+/// The destination an `ssh`-family command line names, or `None` when the
+/// line is not one of those programs or names no host yet (#364).
+///
+/// `cmd` is the process's argv. The rule is ssh's own: skip flags, skip the
+/// argument of any flag that takes one, and the first remaining word is the
+/// destination — everything after it is the remote command.
+///
+/// Deliberately pure and argv-shaped rather than reading `/proc`: the whole
+/// difficulty is the flag grammar, and a function that takes argv can be
+/// swept against real invocations without a live process.
+pub fn ssh_destination(cmd: &[&str]) -> Option<String> {
+    // `rsplit` always yields at least one item, so there is no empty case.
+    let program = cmd.first()?.rsplit('/').next()?;
+    if !SSH_PROGRAMS.contains(&program) {
+        return None;
+    }
+    let takes_arg = |c: char| SSH_FLAGS_WITH_ARG.contains(&c);
+    let mut rest = cmd[1..].iter();
+    while let Some(word) = rest.next() {
+        // `--` ends option parsing: the next word is the destination even if
+        // it begins with a dash. Without this, a host named like a flag is
+        // skipped and the parse runs off the end.
+        if *word == "--" {
+            return rest
+                .next()
+                .and_then(|w| (!w.is_empty()).then(|| (*w).to_string()));
+        }
+        let Some(flags) = word.strip_prefix('-') else {
+            // The first non-flag word is the destination. An empty string is
+            // not a host, and neither is a bare `-`.
+            return (!word.is_empty()).then(|| (*word).to_string());
+        };
+        if flags.is_empty() {
+            continue;
+        }
+        // Bundled booleans (`-4qt`) take nothing. A flag that takes an
+        // argument consumes the REST OF THIS WORD if there is any (`-p2222`),
+        // and otherwise the next word.
+        for (i, c) in flags.char_indices() {
+            if takes_arg(c) {
+                if i + c.len_utf8() == flags.len() {
+                    rest.next();
+                }
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// The configured host an ssh destination names, if croft knows one (#364).
+///
+/// Matches on the alias or the `HostName`, either of which people type, and
+/// ignores any `user@` prefix — the user is how you log in, not which machine
+/// it is, and offering a different workspace per login name would split one
+/// box into several.
+///
+/// `None` for a host with no `~/.ssh/config` entry. That is a real limit and
+/// the right one for now: the offer exists to hand the destination to the
+/// remote-connect flow, which is keyed on a config entry, so offering for an
+/// unknown host would promise something the next step cannot deliver.
+pub fn resolve_offer_host<'a>(dest: &str, targets: &'a [RemoteTarget]) -> Option<&'a RemoteTarget> {
+    let host = dest.rsplit('@').next().unwrap_or(dest).trim();
+    if host.is_empty() {
+        return None;
+    }
+    // Alias first, across ALL entries, before falling back to HostName.
+    // A single `find` testing both would let an earlier entry's HostName beat
+    // a later entry's own alias: with `Host jump / HostName db-1` above
+    // `Host db-1`, typing `ssh db-1` resolved to `jump` — an offer to re-root
+    // onto a different machine than the one named.
+    targets
+        .iter()
+        .find(|t| t.alias.eq_ignore_ascii_case(host))
+        .or_else(|| {
+            targets.iter().find(|t| {
+                t.host_name
+                    .as_deref()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(host))
+            })
+        })
+}
+
+/// The offer's answer, or the reason there is none (#364).
+///
+/// Split from the app handler so all four outcomes are assertable without a
+/// live pane: the handler samples argv and renders this, and nothing else
+/// decides what the user is told.
+pub fn ssh_reroot_decision<'a>(
+    argv: &[&str],
+    targets: &'a [RemoteTarget],
+) -> Result<&'a RemoteTarget, String> {
+    match ssh_destination(argv) {
+        Some(dest) => resolve_offer_host(&dest, targets).ok_or_else(|| {
+            // An ssh session to a box with no config entry: name it, since
+            // that is the actionable half of the answer.
+            format!("{dest} is not in your ~/.ssh/config, so croft cannot open a workspace on it")
+        }),
+        None => Err(String::from("This pane is not an SSH session")),
+    }
+}
+
 pub fn discover_ssh_targets() -> Vec<RemoteTarget> {
     ssh_config_paths()
         .into_iter()
@@ -2808,6 +2944,208 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// The destination an ssh command line names, from the shapes people
+    /// actually type (#364).
+    ///
+    /// Everything here is a real invocation rather than a synthetic one,
+    /// because the whole difficulty is that `ssh` takes flags with separate
+    /// arguments — `-p 2222`, `-i key`, `-o Opt=v` — and a parser that does
+    /// not know which flags consume the next word will take `2222` as the
+    /// host.
+    #[test]
+    fn an_ssh_command_line_yields_its_destination() {
+        let d = |cmd: &[&str]| ssh_destination(cmd);
+        assert_eq!(d(&["ssh", "box"]).as_deref(), Some("box"));
+        assert_eq!(d(&["ssh", "user@box"]).as_deref(), Some("user@box"));
+        // A flag that takes a separate argument must not donate it.
+        assert_eq!(d(&["ssh", "-p", "2222", "box"]).as_deref(), Some("box"));
+        assert_eq!(
+            d(&["ssh", "-i", "~/.ssh/id", "box"]).as_deref(),
+            Some("box")
+        );
+        assert_eq!(
+            d(&["ssh", "-o", "StrictHostKeyChecking=no", "box"]).as_deref(),
+            Some("box")
+        );
+        // Bundled boolean flags take no argument.
+        assert_eq!(d(&["ssh", "-4qt", "box"]).as_deref(), Some("box"));
+        // An attached value (`-p2222`) consumes nothing further.
+        assert_eq!(d(&["ssh", "-p2222", "box"]).as_deref(), Some("box"));
+        // Every arg-taking flag in ssh(1)'s synopsis, each given a value that
+        // would be taken as the host if the flag were missing from the list.
+        // `-P` was missing on the first pass, which is exactly this bug.
+        for f in [
+            "B", "b", "c", "D", "E", "e", "F", "I", "i", "J", "L", "l", "m", "O", "o", "P", "p",
+            "Q", "R", "S", "W", "w",
+        ] {
+            let flag = format!("-{f}");
+            assert_eq!(
+                d(&["ssh", &flag, "decoy", "box"]).as_deref(),
+                Some("box"),
+                "-{f} swallowed its argument's place"
+            );
+        }
+        // The FIRST non-flag word is the destination; anything after it is
+        // the remote command, not another host.
+        assert_eq!(
+            d(&["ssh", "box", "tail", "-f", "log"]).as_deref(),
+            Some("box")
+        );
+        // `--` ends option parsing.
+        assert_eq!(d(&["ssh", "--", "box"]).as_deref(), Some("box"));
+        assert_eq!(d(&["ssh", "-4", "--", "box"]).as_deref(), Some("box"));
+        // An absolute path invocation is still ssh.
+        assert_eq!(d(&["/usr/bin/ssh", "box"]).as_deref(), Some("box"));
+        // `--` ends option parsing, so even a host spelled like a flag is
+        // taken verbatim — which is what real ssh does.
+        assert_eq!(d(&["ssh", "--", "-4"]).as_deref(), Some("-4"));
+    }
+
+    /// The offer's whole decision, as one pure function (#364).
+    ///
+    /// Kept pure so the interesting cases can be swept without a live ssh
+    /// session: what the user sees is decided here, and the app layer only
+    /// samples argv and renders the result.
+    #[test]
+    fn the_offer_appears_only_for_a_known_host_in_an_ssh_pane() {
+        let targets = parse_ssh_config("Host db-1\n  HostName 10.0.0.4\n");
+        let o = |cmd: &[&str]| {
+            ssh_reroot_decision(cmd, &targets)
+                .ok()
+                .map(|h| h.alias.clone())
+        };
+
+        assert_eq!(o(&["ssh", "db-1"]).as_deref(), Some("db-1"));
+        assert_eq!(
+            o(&["ssh", "-p", "2222", "deploy@10.0.0.4"]).as_deref(),
+            Some("db-1")
+        );
+
+        // A shell is not an ssh session.
+        assert_eq!(o(&["zsh"]), None);
+        // An ssh session to a box croft has no config entry for: no offer,
+        // because the remote flow it would hand off to is keyed on one.
+        assert_eq!(o(&["ssh", "unknown-box"]), None);
+        // ssh with no destination yet — the user is still typing.
+        assert_eq!(o(&["ssh"]), None);
+        // sshfs is a mount, not a session; offering to re-root onto it would
+        // answer a question the user did not ask.
+        assert_eq!(o(&["sshfs", "db-1:/srv", "/mnt"]), None);
+    }
+
+    /// A destination is matched to a configured host, and the user part is
+    /// not part of the identity (#364).
+    #[test]
+    fn a_destination_resolves_against_the_configured_hosts() {
+        let targets = parse_ssh_config(
+            "Host db-1\n  HostName 10.0.0.4\n  User deploy\n\nHost web\n  HostName web.example\n",
+        );
+        let m = |dest: &str| resolve_offer_host(dest, &targets).map(|t| t.alias.clone());
+
+        assert_eq!(m("db-1").as_deref(), Some("db-1"));
+        // `user@alias` names the same box: the user is how you log in, not
+        // which machine it is.
+        assert_eq!(m("deploy@db-1").as_deref(), Some("db-1"));
+        assert_eq!(m("root@db-1").as_deref(), Some("db-1"));
+        // The HostName resolves too — people type either.
+        assert_eq!(m("10.0.0.4").as_deref(), Some("db-1"));
+        assert_eq!(m("web.example").as_deref(), Some("web"));
+        // Aliases are case-insensitive, as ssh treats them.
+        assert_eq!(m("DB-1").as_deref(), Some("db-1"));
+
+        // A host croft knows nothing about gets no offer: the prompt exists
+        // to reuse the remote machinery, which is keyed on a config entry.
+        assert_eq!(m("some-random-box"), None);
+        assert_eq!(m(""), None);
+        // A port suffix is not part of the host name.
+        assert_eq!(m("db-1:22"), None);
+
+        // An entry's own alias beats an EARLIER entry's HostName. Testing
+        // both in one pass let `jump` win here, so `ssh db-1` offered to
+        // re-root onto a different machine than the one named.
+        let shadowed =
+            parse_ssh_config("Host jump\n  HostName db-1\n\nHost db-1\n  HostName 10.0.0.4\n");
+        assert_eq!(
+            resolve_offer_host("db-1", &shadowed)
+                .map(|t| t.alias.clone())
+                .as_deref(),
+            Some("db-1"),
+            "an alias must beat another entry's HostName"
+        );
+        // The HostName fallback still works when no alias matches.
+        assert_eq!(
+            resolve_offer_host("10.0.0.4", &shadowed)
+                .map(|t| t.alias.clone())
+                .as_deref(),
+            Some("db-1")
+        );
+    }
+
+    /// Every outcome the user can be told, decided in one place.
+    #[test]
+    fn the_decision_names_the_host_or_says_why_not() {
+        let targets = parse_ssh_config("Host db-1\n  HostName 10.0.0.4\n");
+        let d = |argv: &[&str]| ssh_reroot_decision(argv, &targets).map(|t| t.alias.clone());
+        assert_eq!(d(&["ssh", "db-1"]), Ok(String::from("db-1")));
+
+        // A known shape of failure names the host, because that is the half
+        // the user can act on — add it to ~/.ssh/config and try again.
+        let err = d(&["ssh", "other-box"]).unwrap_err();
+        assert!(err.contains("other-box"), "unhelpful: {err}");
+        assert!(err.contains("ssh/config"), "unhelpful: {err}");
+
+        // Not an ssh session at all is a different message: there is no host
+        // to name, and saying one is missing would be misleading.
+        let err = d(&["zsh"]).unwrap_err();
+        assert_eq!(err, "This pane is not an SSH session");
+        assert!(!err.contains("ssh/config"));
+    }
+
+    /// mosh and et are refused rather than mis-parsed.
+    ///
+    /// They reach a box the same way and were once in `SSH_PROGRAMS`, but
+    /// they take LONG options and ssh's single-letter grammar mis-reads
+    /// those: `--port` scans as `-port`, finds `p` mid-word, consumes
+    /// nothing, and the VALUE becomes the host. A wrong host re-roots onto
+    /// the wrong machine, so refusing is the only honest answer until a
+    /// per-program table exists. Pinned here so re-adding them without that
+    /// table fails rather than silently regressing.
+    #[test]
+    fn a_long_option_program_is_refused_rather_than_misparsed() {
+        let d = |cmd: &[&str]| ssh_destination(cmd);
+        for cmd in [
+            vec!["mosh", "box"],
+            vec!["mosh", "--port", "60000", "box"],
+            vec!["mosh", "--ssh", "ssh -p 2222", "box"],
+            vec!["et", "box"],
+            vec!["et", "--port", "2022", "box"],
+        ] {
+            assert_eq!(
+                d(&cmd),
+                None,
+                "{cmd:?} must be refused while the grammar cannot parse it"
+            );
+        }
+    }
+
+    /// Things that look like an ssh session and are not one.
+    #[test]
+    fn a_non_ssh_command_line_yields_nothing() {
+        let d = |cmd: &[&str]| ssh_destination(cmd);
+        for cmd in [
+            vec!["zsh"],
+            vec!["ssh"],               // no destination yet
+            vec!["ssh", "-p", "2222"], // flag ate the last word
+            vec!["ssh-agent"],         // not ssh
+            vec!["ssh-keygen", "-t", "ed25519"],
+            vec!["sshfs", "box:/srv", "/mnt"], // a mount, not a session
+            vec!["git", "push", "ssh://box/repo"],
+            vec![],
+        ] {
+            assert_eq!(d(&cmd), None, "must not match: {cmd:?}");
+        }
+    }
 
     // The destination host must come BEFORE the script. ssh reads the first
     // non-flag argument as the destination, so a missing host does not fail
