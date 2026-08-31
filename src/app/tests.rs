@@ -37082,25 +37082,48 @@ fn a_task_pane_whose_shell_left_the_directory_is_not_reused() {
     );
 }
 
-/// #430: an UNREADABLE cwd must close the guard, not open it. `is_none_or`
-/// did the opposite in exactly the case the guard exists for — croft cannot
-/// tell where the shell is, so it reused the pane anyway.
+/// #430: "moved away" and "unknowable" are different, and only the first
+/// is a reason to refuse.
+///
+/// `kernel_shell_cwd` returns `None` for every pane on Android, for a
+/// remote pane's ssh process, and for a dead shell — not because the shell
+/// wandered off but because croft cannot ask. Refusing those would stack a
+/// new pane on EVERY task run for those users. The defect this fixes was
+/// never that `None` was tolerated; it was that `Some(subdirectory)` was.
 #[test]
-fn a_pane_with_no_readable_cwd_is_not_reused() {
+fn an_unknowable_cwd_still_allows_reuse_but_a_wrong_one_does_not() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let app = App::new(tmp.path().to_path_buf()).unwrap();
-    // A pane with no shell pid reports no cwd, which is what an android or
-    // remote pane looks like to `kernel_shell_cwd`.
     let t = &app.terminals[0];
-    if t.kernel_shell_cwd().is_none() {
-        assert!(
-            !pane_is_idle_at(t, t.label(), &root),
-            "an unreadable cwd closes the guard rather than opening it"
-        );
+    let label = t.label().to_string();
+
+    // Whatever this platform reports, the predicate must follow the rule:
+    // readable-and-equal reuses, readable-and-different refuses, and
+    // unreadable falls back to the pane's identity.
+    match t.kernel_shell_cwd() {
+        None => assert_eq!(
+            pane_is_idle_at(t, &label, &root),
+            t.foreground_is_shell(),
+            "an unreadable cwd falls back to the pane's identity rather \
+             than stacking a new pane on every run"
+        ),
+        Some(cwd) => {
+            assert_eq!(
+                pane_is_idle_at(t, &label, &cwd),
+                t.foreground_is_shell(),
+                "a shell standing exactly where the command will run is \
+                 that command's pane"
+            );
+            assert!(
+                !pane_is_idle_at(t, &label, &cwd.join("nowhere")),
+                "and a shell standing anywhere else is not"
+            );
+        }
     }
-    // A label mismatch is refused regardless of cwd, which is the other
-    // half of the predicate.
+
+    // A label mismatch is refused regardless of cwd, the other half of
+    // the predicate.
     assert!(!pane_is_idle_at(
         &app.terminals[0],
         "Task: nonexistent",

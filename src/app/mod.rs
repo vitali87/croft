@@ -41837,9 +41837,9 @@ fn relative_clipboard_text(path: &Path, root: &Path) -> String {
 /// fixed the runnable-fence copy the task copy kept both defects: a
 /// `starts_with` that accepted any DESCENDANT, so a shell that had `cd`'d
 /// into a subdirectory was reused and the command ran there; and an
-/// `is_none_or` that opened the guard when the cwd could not be read at
-/// all, which is the exact case the guard exists for. One predicate means
-/// a future correction cannot land on one caller and miss the other.
+/// `is_none_or` that opened the guard whenever the cwd could not be read.
+/// One predicate means a future correction cannot land on one caller and
+/// miss the other.
 ///
 /// The comparison is exact on purpose. Both sides are resolved paths — the
 /// kernel reports the shell's cwd fully resolved, and `canonicalize()`
@@ -41848,6 +41848,17 @@ fn relative_clipboard_text(path: &Path, root: &Path) -> String {
 /// `/tmp` -> `/private/tmp` symlink. When it does not hold, the caller
 /// opens a fresh pane at the right directory, so the worst case is a spare
 /// pane rather than a command run somewhere the user was not told about.
+///
+/// **"Moved away" and "unknowable" are different, and only the first is a
+/// reason to refuse.** `kernel_shell_cwd` returns `None` for every pane on
+/// Android, for a remote pane's ssh process, and for a dead shell — not
+/// because the shell wandered off, but because croft cannot ask. Refusing
+/// those would stack a new pane on EVERY task run for those users, which
+/// is why the original comment said an unknown cwd keeps today's reuse.
+/// The defect was never that `None` was tolerated; it was that `Some(sub)`
+/// was. So a readable cwd must match exactly, and an unreadable one falls
+/// back to the pane's identity — which is all croft had to go on before
+/// this guard existed at all.
 fn pane_is_idle_at(
     t: &crate::widgets::terminal::PtyTerminal,
     pane_name: &str,
@@ -41855,7 +41866,10 @@ fn pane_is_idle_at(
 ) -> bool {
     t.label() == pane_name
         && t.foreground_is_shell()
-        && t.kernel_shell_cwd().is_some_and(|cwd| cwd == root)
+        && match t.kernel_shell_cwd() {
+            Some(cwd) => cwd == root,
+            None => true,
+        }
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
