@@ -12873,7 +12873,14 @@ impl App {
         // next door, which is one column away.
         for (row, ch) in label
             .chars()
-            .filter(|c| unicode_width::UnicodeWidthChar::width(*c) == Some(1))
+            .filter_map(|c| match unicode_width::UnicodeWidthChar::width(c) {
+                Some(1) => Some(c),
+                // Wide: keep the position, lose the glyph.
+                Some(w) if w > 1 => Some(TERMINAL_STRIP_WIDE_STANDIN),
+                // Zero-width — a combining mark or a control character —
+                // has nothing to stand in for and no cell of its own.
+                _ => None,
+            })
             .take(area.height.saturating_sub(1) as usize)
             .enumerate()
         {
@@ -12967,21 +12974,23 @@ impl App {
         // silent-state-change this pair already refuses in the other
         // direction.
         if self.terminal_pane_maximized {
-            self.status = String::from("Restore is unavailable while a pane is maximized");
+            self.terminal_status(String::from(
+                "Restore is unavailable while a pane is maximized",
+            ));
             return;
         }
         let folded = self.terminals.iter().filter(|t| t.collapsed).count();
         if folded == 0 {
-            self.status = String::from("No collapsed terminal panes");
+            self.terminal_status(String::from("No collapsed terminal panes"));
             return;
         }
         for t in self.terminals.iter_mut() {
             t.collapsed = false;
         }
-        self.status = format!(
+        self.terminal_status(format!(
             "Restored {folded} terminal pane{}",
             if folded == 1 { "" } else { "s" }
-        );
+        ));
     }
 
     /// Keep at least one pane expanded after a pane leaves the row (#313).
@@ -35540,6 +35549,18 @@ impl App {
                 {
                     self.active_terminal = idx;
                     self.focus_pane(Pane::Terminal);
+                    // A folded pane cannot BE the active one: `focus_pane`
+                    // runs `sync_focus_flags`, whose invariant walks focus to
+                    // the nearest expanded neighbour rather than leave it on
+                    // a pane with nothing painted. Entries carrying `idx` are
+                    // unaffected, but the ones that read `active_terminal`
+                    // would act on that neighbour while this menu names THIS
+                    // pane - and the broadcast entry read its label from
+                    // `idx` while toggling the neighbour, so it could say
+                    // "Exclude from Broadcast" and include a different pane.
+                    // Each of them is also a gesture on a grid the user
+                    // cannot see while the pane is a strip.
+                    let folded = self.terminals.get(idx).is_some_and(|t| t.collapsed);
                     let mut items = vec![
                         MenuEntry::Item {
                             label: String::from("Rename Terminal"),
@@ -35549,23 +35570,27 @@ impl App {
                             label: String::from("Clear"),
                             action: MenuAction::ClearTerminal(idx),
                         },
-                        MenuEntry::Item {
-                            label: String::from("Quick Select"),
-                            action: MenuAction::TerminalQuickSelect,
-                        },
-                        MenuEntry::Item {
-                            label: String::from("Copy Mode"),
-                            action: MenuAction::TerminalCopyMode,
-                        },
-                        MenuEntry::Item {
-                            label: String::from("Command History"),
-                            action: MenuAction::TerminalCommandHistory,
-                        },
-                        MenuEntry::Item {
-                            label: String::from("Open Scrollback in Editor"),
-                            action: MenuAction::OpenScrollbackInEditor,
-                        },
                     ];
+                    if !folded {
+                        items.extend([
+                            MenuEntry::Item {
+                                label: String::from("Quick Select"),
+                                action: MenuAction::TerminalQuickSelect,
+                            },
+                            MenuEntry::Item {
+                                label: String::from("Copy Mode"),
+                                action: MenuAction::TerminalCopyMode,
+                            },
+                            MenuEntry::Item {
+                                label: String::from("Command History"),
+                                action: MenuAction::TerminalCommandHistory,
+                            },
+                            MenuEntry::Item {
+                                label: String::from("Open Scrollback in Editor"),
+                                action: MenuAction::OpenScrollbackInEditor,
+                            },
+                        ]);
+                    }
                     // Undo close only appears while a parked pane is alive
                     // to restore (the grace window).
                     if !self.closed_terminals.is_empty() {
@@ -35606,7 +35631,7 @@ impl App {
                             }),
                             action: MenuAction::ToggleBroadcastInput,
                         });
-                        if self.broadcast_input {
+                        if self.broadcast_input && !folded {
                             items.push(MenuEntry::Item {
                                 label: String::from(if self.terminals[idx].broadcast_excluded {
                                     "Include in Broadcast"
@@ -44649,6 +44674,11 @@ const TERMINAL_COLLAPSE_LABEL: &str = " \u{eab5} ";
 /// strip: the way back out. It points the opposite way to the button that put
 /// the pane there, which is the whole of the affordance in one column.
 const TERMINAL_EXPAND_GLYPH: char = '\u{eab6}';
+/// Stands in for a character too wide for the one column a strip owns. A
+/// CJK glyph or an emoji is two cells and would paint over the pane next
+/// door; dropping it outright left a pane named entirely in them with a
+/// blank strip, which is the one thing the strip exists to prevent.
+const TERMINAL_STRIP_WIDE_STANDIN: char = '\u{b7}';
 /// A collapsed pane's entire width: one column, carrying the expand chevron
 /// and the pane's name set vertically.
 const TERMINAL_STRIP_W: u16 = 1;

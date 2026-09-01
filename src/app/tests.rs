@@ -38827,3 +38827,123 @@ fn the_expand_entry_advertises_no_chord_it_cannot_perform() {
          the hint lookup being broken"
     );
 }
+
+#[test]
+fn a_folded_strips_menu_offers_nothing_that_acts_on_the_active_pane() {
+    // A strip right-click sets `active_terminal = idx` and focuses the pane,
+    // and `sync_focus_flags` then walks focus straight off a folded pane to
+    // its nearest expanded neighbour. Every menu entry that carries no index
+    // acts on `active_terminal`, so the menu named one pane and acted on
+    // another: "Open Scrollback in Editor" opened the NEIGHBOUR's scrollback
+    // under the neighbour's label. The broadcast entry was worse — it read
+    // its label from `terminals[idx]` and toggled `active_terminal`, so it
+    // could say "Exclude from Broadcast" and include a different pane.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.broadcast_input = true;
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    assert_ne!(
+        app.active_terminal, 1,
+        "precondition: focus cannot rest on a folded pane, which is what \
+         makes an index-free entry act on the wrong one"
+    );
+    let labels = |app: &App| -> Vec<String> {
+        app.context_menu
+            .as_ref()
+            .expect("a right-click opens the pane menu")
+            .items
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Item { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let folded = labels(&app);
+    for entry in [
+        "Quick Select",
+        "Copy Mode",
+        "Command History",
+        "Open Scrollback in Editor",
+        "Exclude from Broadcast",
+        "Include in Broadcast",
+    ] {
+        assert!(
+            !folded.iter().any(|l| l == entry),
+            "{entry:?} acts on the active pane, which is not this one: {folded:?}"
+        );
+    }
+    assert!(
+        folded.iter().any(|l| l == "Rename Terminal")
+            && folded.iter().any(|l| l == "Expand Terminal"),
+        "the entries that carry their own index stay: {folded:?}"
+    );
+
+    // The control, in the same run: an EXPANDED pane still offers all of
+    // them, so this is a rule about folded panes and not a menu that lost
+    // half its entries.
+    app.context_menu = None;
+    let area = app.terminals[0].last_area;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        area.x + 1,
+        area.y + 1,
+    ));
+    let expanded = labels(&app);
+    for entry in [
+        "Quick Select",
+        "Copy Mode",
+        "Command History",
+        "Open Scrollback in Editor",
+    ] {
+        assert!(
+            expanded.iter().any(|l| l == entry),
+            "{entry:?} belongs on an expanded pane's menu: {expanded:?}"
+        );
+    }
+}
+
+#[test]
+fn a_pane_named_in_wide_characters_still_marks_its_strip() {
+    // Only single-width characters are painted, because a CJK glyph or an
+    // emoji is two cells wide and the pane next door is one column away. But
+    // FILTERING them out left a pane named entirely in them with a blank
+    // strip: a folded pane that is not identifiable is the one thing the
+    // strip exists to prevent.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.terminals[1].set_manual_name(Some(String::from("\u{9805}\u{76ee}")));
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+    assert!(strip.height > 2, "precondition: room below the chevron");
+
+    let buf = term.backend().buffer();
+    let at = |x: u16, y: u16| {
+        buf.cell(ratatui::layout::Position::new(x, y))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default()
+    };
+    let marked = (strip.y + 1..strip.y + strip.height)
+        .filter(|&y| !at(strip.x, y).trim().is_empty())
+        .count();
+    assert!(
+        marked > 0,
+        "the strip must carry something under the chevron for a wide-character name"
+    );
+    // And the containment property the filter was there for: the stand-in is
+    // one cell, so the pane one column away is untouched.
+    assert_eq!(
+        unicode_width::UnicodeWidthChar::width(TERMINAL_STRIP_WIDE_STANDIN),
+        Some(1),
+        "the stand-in has to fit the one column the strip owns"
+    );
+}
