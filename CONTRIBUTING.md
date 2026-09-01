@@ -266,10 +266,15 @@ doc-removal: src/path/to/file.rs::SomeType::method_name
 The key after the path is the one the gate's own error names: a bare name
 for a free item, or the enclosing `impl` header for a method (`Foo::new`,
 `Display for Foo::fmt`), so a declared removal of one `new` cannot excuse
-another. It covers all three passes. For a victim the gate does not model as
-an item, an enum variant being the common case, the key is the leading name on
-the line itself (`E::A` is declared as `a.rs::A`), and the error prints the
-exact declaration to write.
+another. It covers the two passes that name an item: the merge-base loss check
+and the doc-changed-owner check. For a victim the gate does not model as an
+item, an enum variant being the common case, the key is the leading name on the
+line itself (`E::A` is declared as `a.rs::A`), and the error prints the exact
+declaration to write.
+
+The head-only pass has no declaration, because what it reports is prose with
+nothing under it and there is no item to name. Give the block an item, or move
+the inserted one above it.
 
 The file qualifier matters: an exemption keyed on the bare name would excuse
 every function of that name in every changed file, so a deliberate removal of

@@ -606,7 +606,10 @@ def reassigned_docs(before, after):
     return sorted(per_subject.values())
 
 
-SUBJECT_KEY = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:#\[[^\]]*\]\s*)*([A-Za-z_]\w*)")
+# The leading name on a subject line. `r#` is part of the name, not a
+# prefix to skip: `r#type` and `r#match` are different items, and
+# capturing `r` for both would let one declared removal excuse the other.
+SUBJECT_KEY = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:#\[[^\]]*\]\s*)*((?:r#)?[A-Za-z_]\w*)")
 
 
 def subject_key(line):
@@ -642,7 +645,11 @@ def main():
     exempt = {
         (path, name)
         for path, name in re.findall(
-            r"doc-removal:\s*([\w./-]+\.rs)::((?:(?:trait )?[A-Za-z_][\w:]*(?: for [A-Za-z_][\w:]*)?::)?[A-Za-z_]\w*)",
+            # `r#` belongs to the name it prefixes: `r#type` and `r#match` are
+            # different items, and a pattern stopping at `r` would read both
+            # declarations as the same one.
+            r"doc-removal:\s*([\w./-]+\.rs)::"
+            r"((?:(?:trait )?[A-Za-z_][\w:]*(?: for [A-Za-z_][\w:]*)?::)?(?:r#)?[A-Za-z_]\w*)",
             declared,
         )
     }
@@ -715,13 +722,24 @@ def main():
         touched = git(
             "log", f"{base}..{head}", "--format=%H", "--reverse", "--", f
         ).split()
-        texts = [git("show", f"{rev}:{f}", allow_missing_path=True) for rev in [base] + touched]
-        # The last commit that touched the file usually IS the head, so the
-        # pair loop below skips the duplicate rather than re-reading it.
-        texts.append(head_text)
+        # Each commit against its OWN first parent, not against the previous
+        # entry in the log. Path limiting simplifies history before `--reverse`
+        # orders it, so two adjacent entries need not be parent and child, and
+        # comparing them reads a doc as having moved between states that were
+        # never one edit apart. The base-to-head pair is kept as well: it is
+        # what sees a capture whose commits are all outside this file's own
+        # history, and it is the pair the real #454 instance was caught by.
+        pairs = [(git("show", f"{base}:{f}", allow_missing_path=True), head_text)]
+        for rev in touched:
+            pairs.append(
+                (
+                    git("show", f"{rev}^:{f}", allow_missing_path=True),
+                    git("show", f"{rev}:{f}", allow_missing_path=True),
+                )
+            )
         candidates = {}
-        for older, newer in zip(texts, texts[1:]):
-            if not older or older == newer:
+        for older, newer in pairs:
+            if not older or not newer or older == newer:
                 continue
             for _line, doc, old, new in reassigned_docs(older, newer):
                 # FIRST owner wins. A doc captured twice on one branch
@@ -732,7 +750,7 @@ def main():
                 candidates.setdefault(doc, (old, new))
         if not candidates:
             continue
-        losses_keys = [(l[0], l[1]) for l in losses]
+        losses_keys = [(loss[0], loss[1]) for loss in losses]
         at_head = doc_subjects(head_text)
         counts = line_counts(head_text)
         has_doc = documented_subjects(head_text)

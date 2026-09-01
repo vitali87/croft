@@ -933,6 +933,41 @@ class ReassignedDocTests(unittest.TestCase):
                 f"the head-only pass alone: {out.getvalue()}",
             )
 
+    def test_a_raw_identifier_is_one_name(self):
+        """`r#type` and `r#match` are different items. A key that stopped at
+        `r` would make one declared removal excuse the other, which is the
+        error the file qualifier exists to prevent one level up."""
+        self.assertEqual(gate.subject_key("    r#type,"), "r#type")
+        self.assertEqual(gate.subject_key("    r#match,"), "r#match")
+        self.assertEqual(gate.subject_key("    pub r#fn: u8,"), "r#fn")
+
+    def test_a_declared_removal_of_a_raw_identifier_is_exempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "enum E {\n    /// Doc for the type arm.\n    r#type,\n}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "enum E {\n    /// Doc for the type arm.\n    /// Doc for the match arm.\n"
+                "    r#match,\n    r#type,\n}\n",
+                message="feat: match\n\ndoc-removal: a.rs::r#type",
+            )
+            self.assertEqual(repo.exit_code(), 0)
+
+    def test_a_declaration_naming_a_different_raw_identifier_does_not_excuse_it(self):
+        """The control for the one above: `r#match` is not `r#type`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "enum E {\n    /// Doc for the type arm.\n    r#type,\n}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "enum E {\n    /// Doc for the type arm.\n    /// Doc for the match arm.\n"
+                "    r#match,\n    r#type,\n}\n",
+                message="feat: match\n\ndoc-removal: a.rs::r#match",
+            )
+            self.assertEqual(repo.exit_code(), 1)
+
     def test_a_block_doc_closer_is_not_prose(self):
         """`*/` closes a `/** */` block and says nothing about any item, but
         it matches the continuation-line shape, so it read as a doc line with
