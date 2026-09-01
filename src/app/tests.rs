@@ -38947,3 +38947,57 @@ fn a_pane_named_in_wide_characters_still_marks_its_strip() {
         "the stand-in has to fit the one column the strip owns"
     );
 }
+
+#[test]
+fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
+    // `ToggleMaximizeTerminal` carries its index and assigns `active_terminal`
+    // directly rather than through `focus_pane`, which makes it the one path
+    // that deliberately puts focus ON a folded pane. That is correct here:
+    // maximize ignores the collapse flags by design and paints the active
+    // pane across the panel, so the pane the menu names is the pane that
+    // appears. The strip's right-click made this reachable, and nothing
+    // pinned it.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    let folded_width = app.terminals[1].last_area.width;
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    let action = app
+        .context_menu
+        .as_ref()
+        .expect("a strip right-click opens the pane menu")
+        .items
+        .iter()
+        .find_map(|e| match e {
+            MenuEntry::Item { label, action } if label == "Maximize Terminal" => {
+                Some(action.clone())
+            }
+            _ => None,
+        })
+        .expect("a folded pane still offers maximize: the entry carries its own index");
+    app.context_menu = None;
+    let root = app.workspace_root().to_path_buf();
+    app.dispatch_menu_action(action, root);
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert_eq!(
+        app.active_terminal, 1,
+        "the maximized pane is the one the menu named"
+    );
+    assert!(
+        app.terminals[1].last_area.width > folded_width,
+        "the folded pane is painted across the panel, not left as a strip: \
+         {folded_width} then {}",
+        app.terminals[1].last_area.width
+    );
+    assert!(
+        app.terminal_strip_rects.iter().all(|r| r.width == 0),
+        "no strip survives maximize, or a click could land on a pane that is not painted"
+    );
+}
