@@ -629,7 +629,8 @@ ITEM_KEYWORDS = frozenset(
         "const",
         "static",
         "fn",
-        "macro_rules!",
+        # Without the bang: `SUBJECT_KEY` captures `\w*`, which stops before it.
+        "macro_rules",
         "pub",
         "unsafe",
         "async",
@@ -648,18 +649,38 @@ def subject_key(line):
     have a merge-blocking check and no way to declare a removal against it,
     which is the one thing that turns a gate into an obstacle.
     """
-    m = SUBJECT_KEY.match(line)
-    if not m:
-        return None
-    name = m.group(1)
-    if name in ITEM_KEYWORDS:
-        # A keyword-led line: the NAME is the word after it. `mod theme;` is
-        # exactly the unmodelled-item case this fallback exists for, and
-        # keying it as `mod` made one `doc-removal: f.rs::mod` excuse every
-        # captured `mod` in that file.
-        rest = SUBJECT_KEY.match(line[m.end():].lstrip())
-        return rest.group(1) if rest else None
-    return name
+    # An impl or trait header keys the way the loss pass already keys its
+    # methods, so one declaration cannot cover two impls of one type: `impl
+    # fmt::Display for Foo {` is `Display for Foo`, not `fmt`. Taking the
+    # first word gave `fmt` to both a Display and a Debug impl, and one
+    # `doc-removal: a.rs::fmt` excused either.
+    header = BLOCK_HEADER.match(line)
+    if header:
+        kind = "trait" if "trait" in header.group(0)[: header.start("rest")] else "impl"
+        return block_key(kind, header.group("rest")) or None
+
+    # EVERY leading keyword, not one. `pub async unsafe extern "C" fn bar(`
+    # walks four before the name, and stopping after the first keyed it as
+    # `unsafe`. The bound is a guard against a pathological line rather than
+    # a real limit: Rust has no item with eight qualifiers.
+    rest = line
+    for _ in range(8):
+        m = SUBJECT_KEY.match(rest)
+        if not m:
+            return None
+        name = m.group(1)
+        if name not in ITEM_KEYWORDS:
+            return name
+        rest = rest[m.end():]
+        if name == "extern":
+            # `extern "C" fn bar(`: the ABI is a string literal, which the
+            # name pattern cannot step over.
+            rest = re.sub(r'^\s*"[^"]*"', "", rest)
+        elif name == "macro_rules":
+            # The bang belongs to the keyword, and `\w` stops before it.
+            rest = rest.lstrip().removeprefix("!")
+        rest = rest.lstrip()
+    return None
 
 
 def git_ok(*args):
@@ -695,8 +716,14 @@ def main():
             # `r#` belongs to the name it prefixes: `r#type` and `r#match` are
             # different items, and a pattern stopping at `r` would read both
             # declarations as the same one.
+            # Three shapes, because the gate prints three. A bare name
+            # (`bar`); a method under its block (`Foo::new`, `Display for
+            # Foo::fmt`); and, since the diff pass may report an impl HEADER
+            # as the victim, that header on its own (`fmt::Display for Foo`).
+            # A declaration the error tells you to write has to parse back.
             r"doc-removal:\s*([\w./-]+\.rs)::"
-            r"((?:(?:trait )?[A-Za-z_][\w:]*(?: for [A-Za-z_][\w:]*)?::)?(?:r#)?[A-Za-z_]\w*)",
+            r"((?:trait )?(?:r#)?[A-Za-z_][\w:]*(?: for (?:r#)?[A-Za-z_][\w:]*)?"
+            r"(?:::(?:r#)?[A-Za-z_]\w*)?)",
             declared,
         )
     }
@@ -773,8 +800,16 @@ def main():
         # needs it, so that is the common shape rather than an exotic one. The
         # declaration that excused such a change on main is invisible here
         # too, because the commit-message scan starts above the merge base, so
-        # the report would name an escape hatch the reader cannot use. What a
-        # merge itself resolves is covered by the base-to-head pair below.
+        # the report would name an escape hatch the reader cannot use.
+        #
+        # What it COSTS, stated rather than waved at: a capture made by the
+        # resolution itself, when the thief is a line the other side already
+        # had. The base-to-head pair does not cover that one, because "the
+        # line the prose landed on is new" is false for a line main brought
+        # in. A resolution that invents a new thief line IS still caught.
+        # `test_a_capture_inside_a_merge_resolution_is_a_known_gap` pins that
+        # boundary, and an earlier version of this comment claimed the pair
+        # covered it, which was wrong.
         touched = git(
             "log", f"{base}..{head}", "--no-merges", "--format=%H", "--reverse", "--", f
         ).split()
@@ -832,10 +867,6 @@ def main():
             # defect, one annotation: the loss message is the older and more
             # precise of the two, so it keeps the report. The declared-removal
             # exemption travels with it for the same reason.
-            # The same capture, when its victim is an item `ITEM` models and
-            # was documented at the base, is already reported as a loss. One
-            # defect, one annotation: the loss message is the older and more
-            # precise of the two, so it keeps the report.
             modelled = item_name(old)
             if modelled and any(
                 path == f and (name == modelled or name.endswith(f"::{modelled}"))

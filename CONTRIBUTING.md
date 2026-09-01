@@ -247,9 +247,13 @@ Two further passes cover captures that fingerprint does not leave. One reads
 your head on its own and reports a `///` block with nothing under it that a
 doc can attach to, which is what an insertion strands when the newcomer has no
 doc of its own. The other compares what each doc line sat above earlier with
-what it sits above now, at the merge base and at every commit on your branch
-that touched the file, so a capture made and left in place mid-branch is seen
-even though the merge base predates both items. An item inserted directly
+what it sits above now, at the merge base and at every non-merge commit on
+your branch that touched the file, so a capture made and left in place
+mid-branch is seen even though the merge base predates both items. Merges are
+skipped because a merge's first parent is your branch tip, so comparing across
+one replays whatever you merged IN as your own work; the cost is that a
+capture made by a merge resolution, where the thief is a line the other side
+already had, is not reported. An item inserted directly
 above a documented enum variant takes its prose while stranding nothing at
 all, and that shape shipped once with the gate green. It reports only when the
 old item is still there and now has no documentation, and when the line the

@@ -23,9 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import check_doc_ownership as gate  # noqa: E402
 
 
-def run(cwd, *args):
+def run(cwd, *args, check=True):
     subprocess.run(
-        args, cwd=cwd, check=True, capture_output=True, text=True
+        args, cwd=cwd, check=check, capture_output=True, text=True
     )
 
 
@@ -1044,11 +1044,31 @@ class ReassignedDocTests(unittest.TestCase):
     def test_a_keyword_led_subject_keys_on_the_name(self):
         """`mod theme;` is the unmodelled-item case the fallback exists for.
         Keying it as `mod` made one declaration excuse every captured `mod`
-        in the file."""
-        self.assertEqual(gate.subject_key("mod theme;"), "theme")
-        self.assertEqual(gate.subject_key("pub mod pane;"), "pane")
-        self.assertEqual(gate.subject_key("impl Foo {"), "Foo")
-        self.assertEqual(gate.subject_key("    A,"), "A")
+        in the file, and one leading keyword is not enough: an item can carry
+        four before its name, and an impl header names a type rather than the
+        first path segment of a trait."""
+        for line, key in [
+            ("mod theme;", "theme"),
+            ("pub mod pane;", "pane"),
+            ("impl Foo {", "Foo"),
+            ("    A,", "A"),
+            ("    r#type,", "r#type"),
+            ("pub(crate) fn foo(", "foo"),
+            # Four qualifiers, and an ABI string the name pattern cannot step
+            # over on its own.
+            ('pub async unsafe extern "C" fn bar(', "bar"),
+            # The bang belongs to the keyword.
+            ("macro_rules! m {", "m"),
+            # Impl headers key like the loss pass keys their methods, so one
+            # declaration cannot cover two impls of the same type: taking the
+            # first word gave `fmt` to both of these.
+            ("impl fmt::Display for Foo {", "fmt::Display for Foo"),
+            ("impl fmt::Debug for Foo {", "fmt::Debug for Foo"),
+            ("unsafe impl Send for X {}", "Send for X"),
+            # Generics are stripped, so a reformat does not move the key.
+            ("impl<T> Foo<T> {", "Foo"),
+        ]:
+            self.assertEqual(gate.subject_key(line), key, line)
 
     def test_two_raw_methods_in_one_impl_are_two_keys(self):
         """`ITEM` stopping at `r` collapsed them, and the "any documented"
@@ -1060,6 +1080,114 @@ class ReassignedDocTests(unittest.TestCase):
         keys = gate.documented(text)
         self.assertIn("Foo::r#type", keys)
         self.assertIn("Foo::r#match", keys)
+
+    def test_two_impls_of_one_type_are_two_declarations(self):
+        """The collision the impl key exists to prevent, end to end: with both
+        headers keyed on `fmt`, one `doc-removal: a.rs::fmt` silenced both."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            before = (
+                "struct Foo;\n\n/// Doc for the Display impl.\n"
+                "impl fmt::Display for Foo {}\n\n/// Doc for the Debug impl.\n"
+                "impl fmt::Debug for Foo {}\n"
+            )
+            repo.commit("a.rs", before)
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "struct Foo;\n\n/// Doc for the Display impl.\n"
+                "/// Doc for the inserted impl.\n"
+                "impl fmt::LowerHex for Foo {}\n"
+                "impl fmt::Display for Foo {}\n\n/// Doc for the Debug impl.\n"
+                "impl fmt::Debug for Foo {}\n",
+                message="feat: hex\n\ndoc-removal: a.rs::fmt::Debug for Foo",
+            )
+            self.assertEqual(
+                repo.exit_code(),
+                1,
+                "a declaration naming the DEBUG impl must not excuse the Display one",
+            )
+
+    def test_a_declaration_naming_the_captured_impl_does_excuse_it(self):
+        """The other half, and the one that makes the pair discriminate: with
+        both headers keyed on `fmt`, the wrong declaration would work, so a
+        test that only checks the refusal passes either way."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit(
+                "a.rs",
+                "struct Foo;\n\n/// Doc for the Display impl.\n"
+                "impl fmt::Display for Foo {}\n\n/// Doc for the Debug impl.\n"
+                "impl fmt::Debug for Foo {}\n",
+            )
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "struct Foo;\n\n/// Doc for the Display impl.\n"
+                "/// Doc for the inserted impl.\n"
+                "impl fmt::LowerHex for Foo {}\n"
+                "impl fmt::Display for Foo {}\n\n/// Doc for the Debug impl.\n"
+                "impl fmt::Debug for Foo {}\n",
+                message="feat: hex\n\ndoc-removal: a.rs::fmt::Display for Foo",
+            )
+            self.assertEqual(repo.exit_code(), 0)
+
+    def test_a_capture_inside_a_merge_resolution_is_a_known_gap(self):
+        """Pinned as scope rather than left to be discovered.
+
+        The walk skips merges, because a merge's first parent is the branch
+        tip and `(M^, M)` otherwise replays the other side's work as this
+        branch's. What that costs is a capture the RESOLUTION itself makes,
+        when the thief is a line that already existed on the side being
+        merged: the base-to-head pair cannot see it either, since "the line
+        the prose landed on is new" is false for a line main already had.
+
+        A resolution that invents a NEW thief line is still caught, so the
+        gap is exactly this shape. If it is ever closed, this test inverts.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "enum E {\n    /// Doc for A.\n    A,\n    Z,\n}\n")
+            repo.branch("feat")
+            repo.commit("a.rs", "enum E {\n    /// Doc for A.\n    A,\n    Zed,\n}\n")
+            repo.checkout("main")
+            repo.commit("a.rs", "enum E {\n    /// Doc for A.\n    A,\n    Z,\n    B,\n}\n")
+            repo.checkout("feat")
+            run(repo.path, "git", "merge", "--no-commit", "main", check=False)
+            # The resolution puts a line main already had under the doc block.
+            (repo.path / "a.rs").write_text(
+                "enum E {\n    /// Doc for A.\n    B,\n    A,\n    Zed,\n}\n"
+            )
+            run(repo.path, "git", "add", "-A")
+            run(repo.path, "git", "commit", "-q", "--no-edit")
+            self.assertEqual(
+                repo.exit_code(base="main"),
+                0,
+                "known gap: a resolution that moves an existing line under a doc block",
+            )
+
+    def test_a_commit_with_no_parent_does_not_abort_the_gate(self):
+        """The `rev^` probe, which nothing pinned.
+
+        A commit in `base..head` can have no parent - an orphan branch is the
+        reachable case, a shallow boundary the other - and `git show
+        <root>^:<file>` fails as a BAD REVISION rather than as a missing path,
+        which `git()` deliberately does not tolerate. Without the probe the
+        gate raises `SystemExit` and reports nothing at all: not a pass, not a
+        failure, just an abort with a git error in the log.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("seed.rs", "fn seed() {}\n")
+            # An orphan branch: its first commit has no parent at all.
+            run(repo.path, "git", "checkout", "-q", "--orphan", "detached")
+            run(repo.path, "git", "rm", "-rq", "--cached", ".")
+            repo.commit("a.rs", "/// Doc for a.\nfn a() {}\n")
+            self.assertEqual(
+                repo.exit_code(base="main"),
+                0,
+                "a parentless commit is skipped, not fatal",
+            )
 
     def test_a_block_doc_closer_is_not_prose(self):
         """`*/` closes a `/** */` block and says nothing about any item, but
