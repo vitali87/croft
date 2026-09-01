@@ -780,3 +780,155 @@ class ReassignedDocTests(unittest.TestCase):
             "    /// Doc A, still here.\n    A,\n    /// Doc B.\n    B,\n}\n"
         )
         self.assertEqual(gate.reassigned_docs(before, after), [])
+
+    def test_a_doc_line_that_repeats_in_the_file_is_not_a_capture(self):
+        """Uniqueness is what keeps a coincidence from reading as a move. The
+        same `/// The width, in cells.` above three fields has no single owner
+        to have changed, so a rename in one struct plus a deletion in another
+        must not add up to a capture."""
+        before = (
+            "struct A {\n    /// The width, in cells.\n    w: u16,\n}\n"
+            "struct B {\n    /// The width, in cells.\n    x: u16,\n}\n"
+        )
+        after = (
+            "struct A {\n    /// The width, in cells.\n    width: u16,\n}\n"
+            "struct B {\n    x: u16,\n}\n"
+        )
+        self.assertEqual(gate.reassigned_docs(before, after), [])
+
+    def test_a_bare_separator_line_is_not_a_doc_that_moved(self):
+        """A `///` with no prose says nothing about which item it describes,
+        and a long block is full of them. Reporting one names a line the
+        reader cannot act on."""
+        before = "/// Alpha.\n///\nfn a() {}\n"
+        after = "/// Alpha.\n///\nfn zz() {}\n\nfn a() {}\n"
+        moved = [f for f in gate.reassigned_docs(before, after) if f[1] == "///"]
+        self.assertEqual(moved, [], "a separator is not evidence of anything")
+
+    def test_a_two_hop_capture_names_the_item_that_lost_its_doc(self):
+        """The message is the product here. When a doc is captured twice on
+        one branch, the victim is the item it described BEFORE the branch, not
+        the intermediate thief - repairing the one the gate names would leave
+        the real victim bare."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "enum E {\n    /// Doc for A.\n    A,\n}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "enum E {\n    /// Doc for A.\n    /// Doc for B.\n    B,\n    A,\n}\n",
+            )
+            repo.commit(
+                "a.rs",
+                "enum E {\n    /// Doc for A.\n    /// Doc for B.\n"
+                "    /// Doc for C.\n    C,\n    B,\n    A,\n}\n",
+            )
+            out = io.StringIO()
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            self.assertIn(
+                "described 'A,'",
+                out.getvalue(),
+                f"the victim is the item that had the doc at the base: {out.getvalue()}",
+            )
+
+    def test_a_capture_made_between_two_branch_commits_is_caught(self):
+        """Both items are absent at the merge base, so only the walk over the
+        branch's own commits can see this one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "fn existing() {}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "fn existing() {}\n\nenum E {\n    /// Doc for A.\n    A,\n}\n",
+            )
+            repo.commit(
+                "a.rs",
+                "fn existing() {}\n\nenum E {\n    /// Doc for A.\n"
+                "    /// Doc for B.\n    B,\n    A,\n}\n",
+            )
+            self.assertEqual(repo.exit_code(), 1)
+
+    def test_a_capture_a_later_commit_repaired_passes(self):
+        """What matters is the state at HEAD. Reporting every state a branch
+        passed through blocks a PR whose head is correct, which is the false
+        accusation that stops a gate being read."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "enum E {\n    /// Doc for A.\n    A,\n}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "enum E {\n    /// Doc for A.\n    /// Doc for B.\n    B,\n    A,\n}\n",
+            )
+            repo.commit(
+                "a.rs",
+                "enum E {\n    /// Doc for B.\n    B,\n    /// Doc for A.\n    A,\n}\n",
+            )
+            self.assertEqual(repo.exit_code(), 0)
+
+    def test_a_declared_removal_exempts_a_variant_too(self):
+        """The declaration is keyed on the name the gate's own error prints.
+        For a victim `ITEM` does not model - an enum variant is the kind #455
+        was filed for - that key comes from the subject line, and without it
+        the branch has a merge-blocking check and no way to declare."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "enum E {\n    /// Doc for A.\n    A,\n}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "enum E {\n    /// Doc for A.\n    /// Doc for B.\n    B,\n    A,\n}\n",
+                message="feat: b\n\ndoc-removal: a.rs::A",
+            )
+            self.assertEqual(repo.exit_code(), 0)
+
+    def test_the_diff_pass_stays_out_of_a_capture_the_others_report(self):
+        """A doc block separated from the newcomer's by a blank line is
+        stranded, and both older passes see it: the loss pass names the item
+        that lost its prose, the head-only pass names the stranded block. The
+        diff pass must not add a THIRD annotation, and in particular must not
+        report that the prose now describes another `///` line, which is not
+        an item and not something a reader can act on.
+
+        The victim is an enum variant, which `ITEM` does not model, so the
+        loss pass cannot fire here: what keeps the diff pass quiet has to be
+        the diff pass itself rather than the dedupe against a loss."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "enum E {\n    /// Doc for A.\n    A,\n}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "enum E {\n    /// Doc for A.\n\n    /// Doc for B.\n    B,\n    A,\n}\n",
+            )
+            out = io.StringIO()
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            self.assertNotIn(
+                "#455",
+                out.getvalue(),
+                f"the diff pass has nothing to say about a stranded block: {out.getvalue()}",
+            )
+            self.assertEqual(
+                out.getvalue().count("::error"),
+                1,
+                f"the head-only pass alone: {out.getvalue()}",
+            )

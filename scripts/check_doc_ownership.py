@@ -488,13 +488,21 @@ def _doc_blocks(lines, kinds):
         j = i
         while j < len(lines) and kinds[j] in (ATTR, SKIP):
             j += 1
-        yield start, i, (lines[j].strip() if j < len(lines) else None)
+        # A block followed by ANOTHER doc block documents nothing, and the
+        # head-only pass above reports exactly that. Handing the second
+        # block's text back as a "subject" made one defect print two
+        # annotations, the second of them saying the prose now describes a
+        # `///` line, which is not an item and not something a reader can act
+        # on. The two passes cannot now report the same block: this one needs
+        # a real subject, and the other one fires only when there is none.
+        subject = lines[j].strip() if j < len(lines) and kinds[j] == CODE else None
+        yield start, i, subject
 
 
 # A doc line carrying no prose of its own: the `///` separators a long block
 # is full of. They repeat, they move whenever anything near them moves, and
 # they say nothing about which item they describe.
-DOC_PROSE = re.compile(r"^\s*(?:///+|//!|/\*\*+|\*)\s*(\S.*)$")
+DOC_PROSE = re.compile(r"^\s*(?:///|/\*\*+|\*)\s*(\S.*)$")
 
 
 def doc_subjects(text):
@@ -589,6 +597,22 @@ def reassigned_docs(before, after):
     return sorted(found)
 
 
+SUBJECT_KEY = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:#\[[^\]]*\]\s*)*([A-Za-z_]\w*)")
+
+
+def subject_key(line):
+    """The name to declare a deliberate removal against, for a subject line
+    `ITEM` does not model.
+
+    #455 was filed for an enum variant, and a variant is not an item this
+    file parses. Without a key derived from the line itself, the branch would
+    have a merge-blocking check and no way to declare a removal against it,
+    which is the one thing that turns a gate into an obstacle.
+    """
+    m = SUBJECT_KEY.match(line)
+    return m.group(1) if m else None
+
+
 def item_name(line):
     """The bare item name a subject line declares, or None.
 
@@ -665,37 +689,41 @@ def main():
     # its victim is new on the branch, or because the capturing item is of a
     # kind `ITEM` does not model. Runs on the same changed files, needs no
     # base, and reports separately so the two failure shapes stay legible.
-    orphans = []
-    for f in changed:
-        text = git("show", f"{head}:{f}", allow_missing_path=True)
-        if not text:
-            continue
-        for line_no, first, follower in orphaned_docs(text):
-            orphans.append((f, line_no, first, follower))
     # The diff pass (#455): a doc line that changed the item it sits above.
     # Runs per file over the revisions that actually touched it - the merge
     # base, then each commit on the branch - so a capture made in one commit
     # of a branch is seen even though the merge base predates both items.
     # Every candidate is then re-tested against HEAD, because a capture that
     # a later commit repaired is not a defect in the branch being merged.
+    orphans = []
     reassigned = []
     for f in changed:
         head_text = git("show", f"{head}:{f}", allow_missing_path=True)
         if not head_text:
             continue
+        for line_no, first, follower in orphaned_docs(head_text):
+            orphans.append((f, line_no, first, follower))
         touched = git(
             "log", f"{base}..{head}", "--format=%H", "--reverse", "--", f
         ).split()
         texts = [git("show", f"{rev}:{f}", allow_missing_path=True) for rev in [base] + touched]
+        # The last commit that touched the file usually IS the head, so the
+        # pair loop below skips the duplicate rather than re-reading it.
         texts.append(head_text)
         candidates = {}
         for older, newer in zip(texts, texts[1:]):
             if not older or older == newer:
                 continue
             for _line, doc, old, new in reassigned_docs(older, newer):
-                candidates[doc] = (old, new)
+                # FIRST owner wins. A doc captured twice on one branch
+                # (A -> B -> C) would otherwise be reported as having left B,
+                # which is the thief from the first move; the item that
+                # actually lost its documentation is A, and a reader who
+                # repairs the item the message names leaves A bare.
+                candidates.setdefault(doc, (old, new))
         if not candidates:
             continue
+        losses_keys = [(l[0], l[1]) for l in losses]
         at_head = doc_subjects(head_text)
         counts = line_counts(head_text)
         has_doc = documented_subjects(head_text)
@@ -710,13 +738,27 @@ def main():
             # defect, one annotation: the loss message is the older and more
             # precise of the two, so it keeps the report. The declared-removal
             # exemption travels with it for the same reason.
-            victim = item_name(old)
-            if victim and any(
-                path == f and (name == victim or name.endswith(f"::{victim}"))
-                for path, name in [(l[0], l[1]) for l in losses] + sorted(exempt)
+            # The same capture, when its victim is an item `ITEM` models and
+            # was documented at the base, is already reported as a loss. One
+            # defect, one annotation: the loss message is the older and more
+            # precise of the two, so it keeps the report.
+            modelled = item_name(old)
+            if modelled and any(
+                path == f and (name == modelled or name.endswith(f"::{modelled}"))
+                for path, name in losses_keys
             ):
                 continue
-            reassigned.append((f, here[1], doc, old, here[0]))
+            # The declared-removal hatch reaches this pass too. Keyed on the
+            # modelled name where there is one, and otherwise on the leading
+            # name of the subject line - an enum variant has no other key, and
+            # a variant is what #455 was filed for.
+            key = modelled or subject_key(old)
+            if key and any(
+                path == f and (name == key or name.endswith(f"::{key}"))
+                for path, name in exempt
+            ):
+                continue
+            reassigned.append((f, here[1], doc, old, here[0], key))
 
     for f, name, at in losses:
         print(
@@ -734,7 +776,12 @@ def main():
             "check nor rustc reports it. Move the inserted item above the block, "
             f"or give the block an item. First line: {first!r}"
         )
-    for f, line_no, doc, old, new in reassigned:
+    for f, line_no, doc, old, new, key in reassigned:
+        declare = (
+            f" Or declare the removal with `doc-removal: {f}::{key}` in a commit message."
+            if key
+            else ""
+        )
         print(
             f"::error file={f},line={line_no}::this doc comment described {old!r} "
             f"before this branch and describes {new!r} now, leaving {old!r} with no "
@@ -742,6 +789,7 @@ def main():
             "one takes its prose: nothing is stranded, so the head-only pass cannot see "
             "it, and the rendered docs are confidently wrong rather than absent. Move "
             f"the new item above the doc block, or give it a doc of its own. Line: {doc!r}"
+            f"{declare}"
         )
     if losses or orphans or reassigned:
         if losses:
