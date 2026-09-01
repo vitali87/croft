@@ -1785,9 +1785,22 @@ mod tests {
         let doc = "~~~sh\necho hi\n~~~\n\nprose after\n";
         let out = replace_output_fence(doc, 0, "FIRSTRUN\n").expect("`~~~` opens a fence too");
         assert!(out.contains(OUTPUT_MARKER), "{out}");
+        // Pin the delimiter EXACTLY. This was
+        // `contains("~~~text") || contains("~~~~text")`, whose second arm is a
+        // substring case of its first — `"~~~text"` occurs inside `"~~~~text"`,
+        // so arm 1 is true whenever arm 2 is and the OR could only widen
+        // acceptance. It passed for a four-tilde fence, which is the
+        // wrong-delimiter case the message claims to reject (verified: both a
+        // three- and a four-tilde output satisfied the old form). The emitted
+        // fence is the block's own opener plus `text`, one determinate value,
+        // so an exact line match is available and an OR was never needed.
         assert!(
-            out.contains("~~~text") || out.contains("~~~~text"),
-            "the output fence uses the block's own delimiter: {out}"
+            out.lines().any(|l| l == "~~~text"),
+            "the output fence uses the block's own delimiter, exactly `~~~text`: {out}"
+        );
+        assert!(
+            !out.lines().any(|l| l == "~~~~text"),
+            "a four-tilde fence is the wrong delimiter for a `~~~` block: {out}"
         );
         assert!(out.contains("FIRSTRUN"), "{out}");
         assert!(out.contains("prose after"), "{out}");
