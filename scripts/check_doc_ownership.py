@@ -44,16 +44,20 @@ ITEM = re.compile(
     # merely undocumented. The `const A: u8` declaration is a branch below,
     # reached when this optional one is not taken.
     r"(?:default\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
+    # `r#` belongs to the name it prefixes. Without it here, `r#type` and
+    # `r#match` in one impl both key as `r`, and the "any documented" reading
+    # then hides a capture on either behind the other's surviving prose -
+    # the #405 collision the impl qualifier exists to prevent, one level down.
     r"(?:extern\s+\"[^\"]*\"\s+)?(?:"
-    r"fn\s+([A-Za-z_]\w*)"
-    r"|const\s+([A-Za-z_]\w*)\s*:"
-    r"|static\s+(?:mut\s+)?([A-Za-z_]\w*)\s*:"
-    r"|struct\s+([A-Za-z_]\w*)"
-    r"|enum\s+([A-Za-z_]\w*)"
-    r"|union\s+([A-Za-z_]\w*)"
-    r"|trait\s+([A-Za-z_]\w*)"
-    r"|type\s+([A-Za-z_]\w*)"
-    r"|macro_rules!\s+([A-Za-z_]\w*)"
+    r"fn\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|const\s+((?:r#)?[A-Za-z_]\w*)\s*:"
+    r"|static\s+(?:mut\s+)?((?:r#)?[A-Za-z_]\w*)\s*:"
+    r"|struct\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|enum\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|union\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|trait\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|type\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|macro_rules!\s+((?:r#)?[A-Za-z_]\w*)"
     r")"
 )
 
@@ -466,6 +470,240 @@ def orphaned_docs(text):
     return orphans
 
 
+def _doc_blocks(lines, kinds):
+    """Every `///` block in the file, with the line it documents.
+
+    Yields `(start, end, subject)`: the block spans `lines[start:end]`, and
+    `subject` is the first line under it that a doc can attach to - blank
+    lines, ordinary comments and attributes sit legally in between - or None
+    when the block reaches the end of the file. The subject is the line's own
+    text rather than a parsed item, because the captures that get through the
+    other two passes are on kinds `ITEM` deliberately does not model: an enum
+    variant is what #455 was filed for.
+    """
+    i = 0
+    while i < len(lines):
+        if kinds[i] != DOC:
+            i += 1
+            continue
+        start = i
+        while i < len(lines) and kinds[i] == DOC:
+            i += 1
+        j = i
+        while j < len(lines) and kinds[j] in (ATTR, SKIP):
+            j += 1
+        # A block followed by ANOTHER doc block documents nothing, and the
+        # head-only pass above reports exactly that. Handing the second
+        # block's text back as a "subject" made one defect print two
+        # annotations, the second of them saying the prose now describes a
+        # `///` line, which is not an item and not something a reader can act
+        # on. The two passes cannot now report the same block: this one needs
+        # a real subject, and the other one fires only when there is none.
+        subject = lines[j].strip() if j < len(lines) and kinds[j] == CODE else None
+        yield start, i, subject
+
+
+# A doc line carrying no prose of its own: the `///` separators a long block
+# is full of, and the `*/` that closes a `/** */` one. They repeat, they move
+# whenever anything near them moves, and they say nothing about which item
+# they describe. The lookahead is what keeps `*/` out: the continuation-line
+# branch matches its `*`, leaving `/` to read as prose.
+DOC_PROSE = re.compile(r"^\s*(?:///|/\*\*+|\*)\s*(?!\*?/\s*$)(\S.*)$")
+
+
+def doc_subjects(text):
+    """Doc lines that occur exactly once in `text`, and what each sits above.
+
+    Uniqueness is the whole guard against reading a coincidence as a move: a
+    `/// The width, in cells.` that appears above three different fields has
+    no single owner to have changed, so it is dropped rather than guessed at.
+    """
+    lines = text.splitlines()
+    kinds = classify(lines)
+    subjects = {}
+    seen = {}
+    for start, end, subject in _doc_blocks(lines, kinds):
+        for k in range(start, end):
+            doc = lines[k].strip()
+            seen[doc] = seen.get(doc, 0) + 1
+            subjects[doc] = (subject, k + 1)
+    return {
+        doc: where
+        for doc, where in subjects.items()
+        if seen[doc] == 1 and DOC_PROSE.match(doc)
+    }
+
+
+def documented_subjects(text):
+    """Every line that some doc block reaches, unique or not."""
+    lines = text.splitlines()
+    return {
+        subject
+        for _start, _end, subject in _doc_blocks(lines, classify(lines))
+        if subject
+    }
+
+
+def line_counts(text):
+    """How often each stripped line occurs, for the "still there, and only
+    once" test the report depends on."""
+    counts = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        counts[stripped] = counts.get(stripped, 0) + 1
+    return counts
+
+
+def reassigned_docs(before, after):
+    """Doc lines that changed the item they sit above, leaving it bare (#455).
+
+    The two passes above see a capture only through prose that is STRANDED -
+    a doc block with nothing a doc can attach to under it. A newcomer that
+    brings its own doc strands nothing: rustfmt leaves the stolen line and
+    the thief's own contiguous, they read as one ordinary two-line block, and
+    at HEAD the file is indistinguishable from one where somebody wrote a
+    two-line doc. That is why #455 could not be closed in the snapshot; the
+    signal only exists in the diff, where the same line used to sit above a
+    different item.
+
+    Three conditions have to hold together, and each one is a false-accusation
+    class removed rather than a nicety:
+
+    * the doc line is unchanged and unique on both sides, so there is exactly
+      one thing it can be talking about;
+    * its old subject is still in the file, exactly once, and now has no doc
+      block of its own - prose that merely moved between two documented items
+      cost nobody their documentation;
+    * the line it landed on is NEW. Moving a doc DOWN onto an item that was
+      already there is how a capture gets repaired, and a gate that fails the
+      fix as well as the bug is one people route around.
+
+    Returns `(line at head, the doc line, the old subject, the new one)`.
+    """
+    before_map = doc_subjects(before)
+    after_map = doc_subjects(after)
+    if not before_map or not after_map:
+        return []
+    before_lines = line_counts(before)
+    after_lines = line_counts(after)
+    documented = documented_subjects(after)
+    found = []
+    for doc, (old, _at) in before_map.items():
+        moved = after_map.get(doc)
+        if not old or not moved:
+            continue
+        new, line_no = moved
+        if not new or new == old:
+            continue
+        if after_lines.get(old, 0) != 1 or old in documented:
+            continue
+        if before_lines.get(new, 0):
+            continue
+        found.append((line_no, doc, old, new))
+    # One insertion is one defect. Every line of a block sits above the same
+    # item, so a three-line doc reported per line names the same victim and
+    # the same thief three times; the block's FIRST line is the one a reader
+    # recognises, and it is the lowest line number.
+    per_subject = {}
+    for line_no, doc, old, new in sorted(found):
+        per_subject.setdefault(old, (line_no, doc, old, new))
+    return sorted(per_subject.values())
+
+
+# The leading name on a subject line. `r#` is part of the name, not a
+# prefix to skip: `r#type` and `r#match` are different items, and
+# capturing `r` for both would let one declared removal excuse the other.
+SUBJECT_KEY = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:#\[[^\]]*\]\s*)*((?:r#)?[A-Za-z_]\w*)")
+
+
+# Words that lead an item rather than name one.
+ITEM_KEYWORDS = frozenset(
+    {
+        "mod",
+        "impl",
+        "trait",
+        "enum",
+        "struct",
+        "union",
+        "type",
+        "const",
+        "static",
+        "fn",
+        # Without the bang: `SUBJECT_KEY` captures `\w*`, which stops before it.
+        "macro_rules",
+        "pub",
+        "unsafe",
+        "async",
+        "default",
+        "extern",
+    }
+)
+
+
+def subject_key(line):
+    """The name to declare a deliberate removal against, for a subject line
+    `ITEM` does not model.
+
+    #455 was filed for an enum variant, and a variant is not an item this
+    file parses. Without a key derived from the line itself, the branch would
+    have a merge-blocking check and no way to declare a removal against it,
+    which is the one thing that turns a gate into an obstacle.
+    """
+    # An impl or trait header keys the way the loss pass already keys its
+    # methods, so one declaration cannot cover two impls of one type: `impl
+    # fmt::Display for Foo {` is `Display for Foo`, not `fmt`. Taking the
+    # first word gave `fmt` to both a Display and a Debug impl, and one
+    # `doc-removal: a.rs::fmt` excused either.
+    header = BLOCK_HEADER.match(line)
+    if header:
+        kind = "trait" if "trait" in header.group(0)[: header.start("rest")] else "impl"
+        return block_key(kind, header.group("rest")) or None
+
+    # EVERY leading keyword, not one. `pub async unsafe extern "C" fn bar(`
+    # walks four before the name, and stopping after the first keyed it as
+    # `unsafe`. The bound is a guard against a pathological line rather than
+    # a real limit: Rust has no item with eight qualifiers.
+    rest = line
+    for _ in range(8):
+        m = SUBJECT_KEY.match(rest)
+        if not m:
+            return None
+        name = m.group(1)
+        if name not in ITEM_KEYWORDS:
+            return name
+        rest = rest[m.end():]
+        if name == "extern":
+            # `extern "C" fn bar(`: the ABI is a string literal, which the
+            # name pattern cannot step over.
+            rest = re.sub(r'^\s*"[^"]*"', "", rest)
+        elif name == "macro_rules":
+            # The bang belongs to the keyword, and `\w` stops before it.
+            rest = rest.lstrip().removeprefix("!")
+        rest = rest.lstrip()
+    return None
+
+
+def git_ok(*args):
+    """Whether a git command succeeds, for a question rather than an answer."""
+    return (
+        subprocess.run(
+            ("git",) + args, capture_output=True, text=True, check=False
+        ).returncode
+        == 0
+    )
+
+
+def item_name(line):
+    """The bare item name a subject line declares, or None.
+
+    Only used to tell the two passes apart: when the diff pass and the loss
+    pass have found the same capture, the loss pass owns the report, and one
+    defect must not print two annotations.
+    """
+    m = ITEM.match(line)
+    return next((g for g in m.groups() if g), None) if m else None
+
+
 def main():
     base, head = sys.argv[1], sys.argv[2]
     declared = git("log", f"{base}..{head}", "--format=%B")
@@ -475,7 +713,17 @@ def main():
     exempt = {
         (path, name)
         for path, name in re.findall(
-            r"doc-removal:\s*([\w./-]+\.rs)::((?:(?:trait )?[A-Za-z_][\w:]*(?: for [A-Za-z_][\w:]*)?::)?[A-Za-z_]\w*)",
+            # `r#` belongs to the name it prefixes: `r#type` and `r#match` are
+            # different items, and a pattern stopping at `r` would read both
+            # declarations as the same one.
+            # Three shapes, because the gate prints three. A bare name
+            # (`bar`); a method under its block (`Foo::new`, `Display for
+            # Foo::fmt`); and, since the diff pass may report an impl HEADER
+            # as the victim, that header on its own (`fmt::Display for Foo`).
+            # A declaration the error tells you to write has to parse back.
+            r"doc-removal:\s*([\w./-]+\.rs)::"
+            r"((?:trait )?(?:r#)?[A-Za-z_][\w:]*(?: for (?:r#)?[A-Za-z_][\w:]*)?"
+            r"(?:::(?:r#)?[A-Za-z_]\w*)?)",
             declared,
         )
     }
@@ -509,7 +757,7 @@ def main():
                         and not after[name]
                         and (f, name) not in exempt
                         and not head_state[f].get(name, False)
-                        and not any(l[0] == f and l[1] == name for l in losses)
+                        and not any(loss[0] == f and loss[1] == name for loss in losses)
                     ):
                         # Name the commit the doc was last seen at. Saying
                         # "at {base}" would be wrong for a file the branch
@@ -531,13 +779,112 @@ def main():
     # its victim is new on the branch, or because the capturing item is of a
     # kind `ITEM` does not model. Runs on the same changed files, needs no
     # base, and reports separately so the two failure shapes stay legible.
+    # The diff pass (#455): a doc line that changed the item it sits above.
+    # Runs per file over the revisions that actually touched it - the merge
+    # base, then each commit on the branch - so a capture made in one commit
+    # of a branch is seen even though the merge base predates both items.
+    # Every candidate is then re-tested against HEAD, because a capture that
+    # a later commit repaired is not a defect in the branch being merged.
     orphans = []
+    reassigned = []
     for f in changed:
-        text = git("show", f"{head}:{f}", allow_missing_path=True)
-        if not text:
+        head_text = git("show", f"{head}:{f}", allow_missing_path=True)
+        if not head_text:
             continue
-        for line_no, first, follower in orphaned_docs(text):
+        for line_no, first, follower in orphaned_docs(head_text):
             orphans.append((f, line_no, first, follower))
+        # `--no-merges`, and the omission is not a shortcut. A merge's first
+        # parent is the branch tip, so the pair `(M^, M)` is everything the
+        # OTHER side brought in, replayed as though this branch had written
+        # it - and this repo's convention is to merge main into a branch that
+        # needs it, so that is the common shape rather than an exotic one. The
+        # declaration that excused such a change on main is invisible here
+        # too, because the commit-message scan starts above the merge base, so
+        # the report would name an escape hatch the reader cannot use.
+        #
+        # What it COSTS, stated rather than waved at: a capture made by the
+        # resolution itself, when the thief is a line the other side already
+        # had. The base-to-head pair does not cover that one, because "the
+        # line the prose landed on is new" is false for a line main brought
+        # in. A resolution that invents a new thief line IS still caught.
+        # `test_a_capture_inside_a_merge_resolution_is_a_known_gap` pins that
+        # boundary, and an earlier version of this comment claimed the pair
+        # covered it, which was wrong.
+        touched = git(
+            "log", f"{base}..{head}", "--no-merges", "--format=%H", "--reverse", "--", f
+        ).split()
+        # Each commit against its OWN first parent, not against the previous
+        # entry in the log. Path limiting simplifies history before `--reverse`
+        # orders it, so two adjacent entries need not be parent and child, and
+        # comparing them reads a doc as having moved between states that were
+        # never one edit apart.
+        #
+        # The base-to-head pair is kept as well, and it is not redundant: the
+        # per-commit walk asks whether the line the prose landed on is new IN
+        # THAT PAIR, so a capture split across two commits - the thief added
+        # above the block in one, moved under it in the next - is invisible to
+        # every pair but this one. It is also the pair that caught the real
+        # #454 instance.
+        pairs = [(git("show", f"{base}:{f}", allow_missing_path=True), head_text)]
+        for rev in touched:
+            # A root commit has no `rev^`, which is a git failure rather than
+            # a missing path, so it would abort instead of being skipped.
+            # Unreachable under CI's full-depth checkout, reachable in a
+            # shallow clone running the documented local invocation.
+            if not git_ok("rev-parse", "--verify", f"{rev}^"):
+                continue
+            pairs.append(
+                (
+                    git("show", f"{rev}^:{f}", allow_missing_path=True),
+                    git("show", f"{rev}:{f}", allow_missing_path=True),
+                )
+            )
+        candidates = {}
+        for older, newer in pairs:
+            if not older or not newer or older == newer:
+                continue
+            for _line, doc, old, new in reassigned_docs(older, newer):
+                # FIRST owner wins. A doc captured twice on one branch
+                # (A -> B -> C) would otherwise be reported as having left B,
+                # which is the thief from the first move; the item that
+                # actually lost its documentation is A, and a reader who
+                # repairs the item the message names leaves A bare.
+                candidates.setdefault(doc, (old, new))
+        if not candidates:
+            continue
+        losses_keys = [(loss[0], loss[1]) for loss in losses]
+        at_head = doc_subjects(head_text)
+        counts = line_counts(head_text)
+        has_doc = documented_subjects(head_text)
+        for doc, (old, new) in candidates.items():
+            here = at_head.get(doc)
+            if not here or not here[0] or here[0] == old:
+                continue
+            if counts.get(old, 0) != 1 or old in has_doc:
+                continue
+            # The same capture, when its victim is an item `ITEM` models and
+            # was documented at the base, is already reported as a loss. One
+            # defect, one annotation: the loss message is the older and more
+            # precise of the two, so it keeps the report. The declared-removal
+            # exemption travels with it for the same reason.
+            modelled = item_name(old)
+            if modelled and any(
+                path == f and (name == modelled or name.endswith(f"::{modelled}"))
+                for path, name in losses_keys
+            ):
+                continue
+            # The declared-removal hatch reaches this pass too. Keyed on the
+            # modelled name where there is one, and otherwise on the leading
+            # name of the subject line - an enum variant has no other key, and
+            # a variant is what #455 was filed for.
+            key = modelled or subject_key(old)
+            if key and any(
+                path == f and (name == key or name.endswith(f"::{key}"))
+                for path, name in exempt
+            ):
+                continue
+            reassigned.append((f, here[1], doc, old, here[0], key))
+
     for f, name, at in losses:
         print(
             f"::error file={f}::`{name}` had a doc comment at {at[:12]} and has none now. "
@@ -554,11 +901,28 @@ def main():
             "check nor rustc reports it. Move the inserted item above the block, "
             f"or give the block an item. First line: {first!r}"
         )
-    if losses or orphans:
+    for f, line_no, doc, old, new, key in reassigned:
+        declare = (
+            f" Or declare the removal with `doc-removal: {f}::{key}` in a commit message."
+            if key
+            else ""
+        )
+        print(
+            f"::error file={f},line={line_no}::this doc comment described {old!r} "
+            f"before this branch and describes {new!r} now, leaving {old!r} with no "
+            "documentation at all (#455). An item inserted directly above a documented "
+            "one takes its prose: nothing is stranded, so the head-only pass cannot see "
+            "it, and the rendered docs are confidently wrong rather than absent. Move "
+            f"the new item above the doc block, or give it a doc of its own. Line: {doc!r}"
+            f"{declare}"
+        )
+    if losses or orphans or reassigned:
         if losses:
             print(f"\n{len(losses)} item(s) lost documentation.", file=sys.stderr)
         if orphans:
             print(f"{len(orphans)} doc block(s) document nothing.", file=sys.stderr)
+        if reassigned:
+            print(f"{len(reassigned)} doc comment(s) changed owner.", file=sys.stderr)
         return 1
     print(
         f"No documentation lost or stranded across {len(changed)} changed Rust file(s)."
