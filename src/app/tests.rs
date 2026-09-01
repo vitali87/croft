@@ -24460,11 +24460,12 @@ fn undo_close_restores_a_closed_terminal_pane_with_its_process_alive() {
     assert_eq!(app.terminals[1].label(), "keepme");
     assert_eq!(app.active_terminal, 1, "the restored pane takes focus");
     app.terminals[1].write_input(b"back\n");
-    // The same operation and the same old constant as the restore wait in the
-    // next test: a shell echoing one line, waited on under whatever load the
-    // suite is running.
+    // The same operation and the same old constant as the wait in
+    // `terminal_session_restores_pane_layout_names_and_focus_across_restarts`:
+    // a shell echoing one line, waited on under whatever load the suite is
+    // running. Same 2s base, so the same 8s floor.
     crate::test_budget::await_spawned(
-        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(2),
         "the reopened pane's shell to answer",
         || {
             app.terminals[1]
@@ -24795,15 +24796,15 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
     // rather than of this test, and `test_budget` is where that reasoning
     // already lives (#307/#422).
     //
-    // The base is what the operation costs on a QUIET machine, which for a
-    // shell echoing one line is about a second. `await_spawned` multiplies it
-    // by `BASE_CALIBRATION * load_scale`, which that module's own test pins at
-    // 4 on a quiet machine and 8 at the cap, so 1s here is 4s quiet and 8s
-    // loaded: the 8000ms this replaces, kept as the CEILING rather than as the
-    // floor. An earlier version of this comment said the base was the old
-    // constant divided by the calibration, which is neither of those numbers.
+    // `await_spawned` multiplies the base by `BASE_CALIBRATION * load_scale`,
+    // which that module's own test pins at 4 at MIN_SCALE and 8 at the cap.
+    // A 2s base is therefore 8s at the floor and 16s at the cap: the 8000ms
+    // this replaces is what the wait KEEPS on a quiet machine, and load buys
+    // more on top. The floor is the point - `MIN_SCALE`'s own doc says it may
+    // never shrink below the budgets these tests already had, since every one
+    // of them was observed failing at 1x.
     crate::test_budget::await_spawned(
-        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(2),
         "the restored pane's shell to answer",
         || {
             app2.terminals[1]
@@ -30338,6 +30339,52 @@ fn shift_end_reaches_an_alt_screen_program() {
     );
 }
 
+#[test]
+fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
+    // The deterministic half of #397's quick-select entry. Its sibling below
+    // was measured at 3 failures in 20 runs under load, because a REAL
+    // shell's prompt wraps to several rows and the pane had one row of slack;
+    // a rate is the best evidence a race allows, and it is not a test.
+    //
+    // This one feeds the prompt itself, so the geometry is the whole claim
+    // and the machine has no say. Four rows of it, then the same park,
+    // stream and assert. On the unmaximized pane, which is five rows here,
+    // this fails on every machine on every run.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    app.toggle_terminal_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+    let inner = app.terminals[0].last_inner;
+    let h = inner.height as usize;
+
+    app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
+    app.terminals[0].feed_bytes_for_test(b"\r\nhttp://drift.io");
+    app.open_terminal_quick_select();
+    // The prompt arrives AFTER the URL is on screen, which is the race: one
+    // that lands before the flood is scrolled away by it and costs nothing.
+    // Four rows of it, the shape a hostname-and-path prompt takes when it
+    // wraps at this width, and then the stream that scrolls the URL.
+    app.terminals[0]
+        .feed_bytes_for_test(format!("\r\n{}", "p".repeat(inner.width as usize * 4)).as_bytes());
+    app.terminals[0].feed_bytes_for_test(b"\r\nx1\r\nx2\r\nx3");
+    term.draw(|f| app.render(f)).unwrap();
+
+    let buf = term.backend().buffer().clone();
+    let joined: String = (inner.y..inner.y + inner.height)
+        .flat_map(|y| {
+            (inner.x..inner.x + inner.width)
+                .map(move |x| (x, y))
+                .map(|(x, y)| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+        })
+        .collect();
+    assert!(
+        joined.contains("ttp://drift.io"),
+        "a four-row prompt must not cost the URL its place on screen: {joined:?}"
+    );
+}
+
 /// Quick-select labels ride the scroll clock like every other overlay:
 /// output streaming under an open label set used to leave the gold labels
 /// at fixed viewport rows while their matches scrolled away, so the user
@@ -30369,7 +30416,7 @@ fn quick_select_labels_follow_content_that_streams_below_them() {
     // supports: if a future panel change shrank the pane back toward five
     // rows, the test would quietly return to flaking instead of failing.
     assert!(
-        h >= 12,
+        h >= 16,
         "the maximized panel must leave slack for the shell's wrapped prompt; got {h} rows"
     );
     app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
@@ -30381,9 +30428,15 @@ fn quick_select_labels_follow_content_that_streams_below_them() {
     // this chunk (its row is above) or after it (it appends to the right).
     app.terminals[0].feed_bytes_for_test(b"\r\nhttp://drift.io");
     app.open_terminal_quick_select();
+    // The URL by name, not `is_some()`. Quick select stages every match on
+    // screen and the live shell's prompt path is one, so `is_some()` cannot
+    // tell "the URL is hinted" from "only the prompt is", and maximizing the
+    // pane put more prompt text on screen rather than less.
     assert!(
-        app.terminal_quick_select.is_some(),
-        "staging: at least the URL is hinted"
+        app.terminal_quick_select
+            .as_ref()
+            .is_some_and(|s| s.hints.iter().any(|h| h.text.contains("drift.io"))),
+        "staging: the URL is hinted"
     );
     app.terminals[0].feed_bytes_for_test(b"\r\nx1\r\nx2\r\nx3");
     term.draw(|f| app.render(f)).unwrap();
