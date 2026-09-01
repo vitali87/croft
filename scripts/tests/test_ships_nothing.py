@@ -266,6 +266,90 @@ class Verdicts(unittest.TestCase):
             repo.commit("a.rs", SHIPPED.replace("width(4), 2", "width(6), 3"))
             self.assertFalse(repo.verdict(path="does_not_exist.rs"))
 
+    def test_a_blank_line_inside_a_string_literal_ships(self):
+        """A blank line is only whitespace when it is CODE. Inside a raw
+        string it is content: croft's model prompt and its tree-sitter
+        queries are multi-line literals, and a blank line added or removed
+        there changes what the binary does. There are 42 such lines in `src/`
+        today, so this is not hypothetical."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            before = 'pub const P: &str = r#"\ncroft\n\nv1\n"#;\n'
+            after = 'pub const P: &str = r#"\ncroft\nv1\n"#;\n'
+            repo.commit("a.rs", before)
+            run(repo.path, "git", "checkout", "-q", "-b", "work")
+            repo.commit("a.rs", after)
+            self.assertFalse(repo.verdict(), "a blank line left a string literal")
+
+    def test_a_blank_line_added_to_a_string_literal_ships(self):
+        """The other direction, and the one that pins the removed-side half
+        of the blank filter: with only the added-side half tested, deleting
+        the removed-side line leaves the suite green."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            before = 'pub const P: &str = r#"\ncroft\nv1\n"#;\n'
+            after = 'pub const P: &str = r#"\ncroft\n\nv1\n"#;\n'
+            repo.commit("a.rs", before)
+            run(repo.path, "git", "checkout", "-q", "-b", "work")
+            repo.commit("a.rs", after)
+            self.assertFalse(repo.verdict(), "a blank line joined a string literal")
+
+    def test_a_whole_test_module_in_its_real_shape_ships_nothing(self):
+        """Every one of the 159 `#[cfg(test)]` modules in `src/` has a blank
+        line in it. Stripping blank lines from the touched set before asking
+        whether the whole span moved made the exemption's main case
+        unreachable for every module shaped like the ones already here."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "pub fn f() -> u8 {\n    1\n}\n")
+            run(repo.path, "git", "checkout", "-q", "-b", "work")
+            repo.commit(
+                "a.rs",
+                "pub fn f() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n"
+                "    use super::*;\n\n    #[test]\n    fn t() {\n"
+                "        assert_eq!(f(), 1);\n    }\n}\n",
+            )
+            self.assertTrue(repo.verdict(), "the module arrived in one piece")
+
+    def test_deleting_a_whole_test_module_in_its_real_shape_ships_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            whole = (
+                "pub fn f() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n"
+                "    use super::*;\n\n    #[test]\n    fn t() {\n"
+                "        assert_eq!(f(), 1);\n    }\n}\n"
+            )
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", whole)
+            run(repo.path, "git", "checkout", "-q", "-b", "work")
+            repo.commit("a.rs", "pub fn f() -> u8 {\n    1\n}\n")
+            self.assertTrue(repo.verdict(), "and the module leaving in one piece")
+
+    def test_a_diff_git_reports_as_binary_ships(self):
+        """`git diff -U0` on a file git calls binary prints no `@@` header at
+        all, so an inferred "nothing changed" is wrong in the waiving
+        direction."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            (Path(tmp) / "a.rs").write_bytes(b"pub fn f() -> u8 {\n    1\n}\n\x00\n")
+            run(repo.path, "git", "add", "-A")
+            run(repo.path, "git", "commit", "-q", "-m", "c")
+            run(repo.path, "git", "checkout", "-q", "-b", "work")
+            (Path(tmp) / "a.rs").write_bytes(b"pub fn f() -> u8 {\n    9\n}\n\x00\n")
+            run(repo.path, "git", "add", "-A")
+            run(repo.path, "git", "commit", "-q", "-m", "c2")
+            self.assertFalse(repo.verdict())
+
+    def test_a_mid_line_block_comment_yields_no_ranges(self):
+        """The brace tracker strips strings and `//`, not `/* */`, so a brace
+        inside a block comment is counted as structure and the span can
+        swallow shipped code below it. No range at all is the safe answer."""
+        text = (
+            "#[cfg(test)]\nmod tests {\n    fn t() {\n        let _x = 0; /* { */\n"
+            "    }\n}\n\npub fn g() -> u8 {\n    let _ = 0; /* } */\n    1\n}\n"
+        )
+        self.assertEqual(filt.cfg_test_ranges(text), [])
+
     def test_the_cli_reports_the_verdict_as_its_exit_status(self):
         """The gate is shell, so the answer has to arrive as a status."""
         with tempfile.TemporaryDirectory() as tmp:

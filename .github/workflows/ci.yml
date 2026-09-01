@@ -70,10 +70,15 @@ jobs:
           # holding `[`, `*` or `?` would reach the filter as a pathspec git
           # cannot resolve, and a path holding a space would arrive as two.
           kept="$(mktemp)"
+          trap 'rm -f "$kept"' EXIT
           while IFS= read -r f; do
             [ -n "$f" ] || continue
             if python3 scripts/ships_nothing.py "$base" HEAD "$f"; then
-              echo "$f: change confined to #[cfg(test)]; ships nothing."
+              # The status says "ships nothing"; it does not say why, and the
+              # script has more than one way to reach it. Claiming the reason
+              # here asserted "confined to #[cfg(test)]" about files that had
+              # no test module at all.
+              echo "$f: ships nothing."
             else
               printf '%s\n' "$f" >> "$kept"
             fi
@@ -84,7 +89,7 @@ jobs:
             exit 0
           fi
           echo "Shipped files changed:"
-          printf '  %s\n' $shipped
+          printf '  %s\n' "$shipped"
           ver() { git show "$1:Cargo.toml" | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -n1; }
           old="$(ver "$base")"
           new="$(ver HEAD)"

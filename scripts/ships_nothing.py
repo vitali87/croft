@@ -66,6 +66,34 @@ def git(*args, cwd=None, allow_missing_path=False):
     return done.stdout
 
 
+# A `/*` that opens mid-line. `BlockTracker` strips strings, chars and `//`
+# but not block comments, so a brace inside one is counted as structure and a
+# span can swallow the shipped code below it. Rare enough (no instance in
+# `src/` today) that refusing to answer is better than parsing it.
+MID_LINE_BLOCK_COMMENT = re.compile(r"\S.*/\*")
+
+
+def literal_lines(text):
+    """Line numbers (1-indexed) that sit INSIDE a multi-line string literal.
+
+    A blank line is only whitespace when it is code. Inside a raw string it is
+    content: croft's model prompt and its tree-sitter queries are multi-line
+    literals, and adding or removing a blank line there changes what the
+    binary does. `BlockTracker` already tracks the open-literal state for its
+    brace counting, so this reads it rather than re-deriving it.
+    """
+    lines = text.splitlines()
+    kinds = classify(lines)
+    tracker = BlockTracker()
+    inside = set()
+    for i, line in enumerate(lines):
+        if tracker.open_string is not None:
+            inside.add(i + 1)
+        if kinds[i] == CODE:
+            tracker.feed(line)
+    return inside
+
+
 def cfg_test_ranges(text):
     """Line spans (1-indexed, inclusive) of every `#[cfg(test)]` module.
 
@@ -77,6 +105,8 @@ def cfg_test_ranges(text):
     """
     lines = text.splitlines()
     kinds = classify(lines)
+    if any(kinds[i] == CODE and MID_LINE_BLOCK_COMMENT.search(l) for i, l in enumerate(lines)):
+        return []
     tracker = BlockTracker()
     ranges = []
     attr_at = None
@@ -112,7 +142,13 @@ def cfg_test_ranges(text):
 
 
 def changed_lines(base, head, path, cwd=None):
-    """(lines removed from base, lines added at head), 1-indexed."""
+    """(lines removed from base, lines added at head, the raw diff), 1-indexed.
+
+    The diff text comes back because "no hunk headers" has two causes: the
+    file did not change, and git did not describe the change. `git diff -U0`
+    on a file git treats as binary prints `Binary files ... differ` and no
+    `@@` line at all, and inferring "unchanged" from that waives a bump.
+    """
     diff = git("diff", "--no-renames", "-U0", base, head, "--", path, cwd=cwd)
     removed, added = [], []
     for line in diff.splitlines():
@@ -127,7 +163,7 @@ def changed_lines(base, head, path, cwd=None):
         )
         removed.extend(range(base_start, base_start + base_len))
         added.extend(range(head_start, head_start + head_len))
-    return removed, added
+    return removed, added, diff
 
 
 def inside(line_no, ranges):
@@ -145,7 +181,11 @@ def ships_nothing(base, head, path, cwd=None):
         return False
     base_text = git("show", f"{base}:{path}", cwd=cwd, allow_missing_path=True)
     head_text = git("show", f"{head}:{path}", cwd=cwd, allow_missing_path=True)
-    removed, added = changed_lines(base, head, path, cwd=cwd)
+    removed, added, diff = changed_lines(base, head, path, cwd=cwd)
+    if not removed and not added and diff.strip():
+        # git described a change it did not give hunk headers for - a file it
+        # treats as binary. Nothing here can read that, so it ships.
+        return False
     if not removed and not added:
         # An empty diff means "nothing changed" for a path that exists at both
         # ends, and "git could not resolve that pathspec" otherwise. Only the
@@ -157,14 +197,20 @@ def ships_nothing(base, head, path, cwd=None):
     base_lines = base_text.splitlines()
     head_lines = head_text.splitlines()
 
-    def blank(lines, n):
-        """A line that carries no code cannot change the binary, whichever
-        side of the diff it is on. Adding or removing the blank line above a
-        new test module is the common case."""
-        return 1 <= n <= len(lines) and not lines[n - 1].strip()
+    base_literals = literal_lines(base_text)
+    head_literals = literal_lines(head_text)
 
-    removed = [n for n in removed if not blank(base_lines, n)]
-    added = [n for n in added if not blank(head_lines, n)]
+    def blank(lines, n, literals):
+        """A line that carries no CODE cannot change the binary, whichever
+        side of the diff it is on: adding or removing the blank line above a
+        new test module is the common case. Inside a string literal it is not
+        whitespace at all but content, and croft has 42 such lines in `src/`
+        - the model's system prompt and the tree-sitter queries - where a
+        blank line changes what the binary does."""
+        return 1 <= n <= len(lines) and not lines[n - 1].strip() and n not in literals
+
+    removed = [n for n in removed if not blank(base_lines, n, base_literals)]
+    added = [n for n in added if not blank(head_lines, n, head_literals)]
     if not all(inside(n, base_ranges) for n in removed):
         return False
     if not all(inside(n, head_ranges) for n in added):
@@ -176,16 +222,25 @@ def ships_nothing(base, head, path, cwd=None):
     # puts a test module in. A touched attribute is therefore only test-only
     # when its WHOLE module moved with it, which is what a test module added
     # or deleted in one piece looks like.
-    return _whole_span_moved(base_ranges, removed) and _whole_span_moved(
-        head_ranges, added
+    return _whole_span_moved(base_ranges, removed, base_lines) and _whole_span_moved(
+        head_ranges, added, head_lines
     )
 
 
-def _whole_span_moved(ranges, touched):
-    """True unless a span's attribute line was touched without the rest."""
+def _whole_span_moved(ranges, touched, lines):
+    """True unless a span's attribute line was touched without the rest.
+
+    Blank lines inside the span are not required to have moved: they were
+    already dropped from `touched` above, and every one of the 159
+    `#[cfg(test)]` modules in `src/` contains at least one, so demanding them
+    made a whole module added or deleted in one piece - the case this
+    exemption exists for - unreachable for any module shaped like the ones
+    already here.
+    """
     marked = set(touched)
     return all(
-        not (start in marked) or all(n in marked for n in range(start, end + 1))
+        start not in marked
+        or all(n in marked for n in range(start, end + 1) if lines[n - 1].strip())
         for start, end in ranges
     )
 
