@@ -241,8 +241,19 @@ job): an item that had a doc comment at the merge base and has none at your
 head is the fingerprint this insertion leaves. It covers `fn`, `const`,
 `static`, `struct`, `enum`, `union`, `trait`, `type` and `macro_rules!`, and
 for a file your branch ADDS it compares your commits pairwise, since a file
-with no base version has no merge-base history to lose documentation against. If a removal is deliberate, say
-so in a commit message on the branch:
+with no base version has no merge-base history to lose documentation against.
+
+Two further passes cover captures that fingerprint does not leave. One reads
+your head on its own and reports a `///` block with nothing under it that a
+doc can attach to, which is what an insertion strands when the newcomer has no
+doc of its own. The other compares what each doc line sat above at the merge
+base with what it sits above now: an item inserted directly above a documented
+enum variant takes its prose while stranding nothing at all, and that shape
+shipped once with the gate green. It reports only when the old item is still
+there and now has no documentation, and when the line the prose landed on is
+new, so moving a doc back onto its rightful item stays green.
+
+If a removal is deliberate, say so in a commit message on the branch:
 
 ```text
 doc-removal: src/path/to/file.rs::some_function_name
