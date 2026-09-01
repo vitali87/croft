@@ -60,6 +60,8 @@ mod release_notes;
 mod remote;
 mod remote_bulk;
 mod remote_connect;
+mod review_threads;
+mod rewind;
 mod scrubber;
 mod session;
 mod session_host;
