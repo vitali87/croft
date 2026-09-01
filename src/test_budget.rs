@@ -328,22 +328,6 @@ mod tests {
     /// to be told their change broke something, which is the cost
     /// `MAX_SCALE` exists to bound.
     #[test]
-    /// A conversion must not be a cut. #397 replaced two `waited < 8000`
-    /// loops with `await_spawned`, and the base that does that honestly is
-    /// the one whose FLOOR is the constant it replaced: `MIN_SCALE`'s own
-    /// doc says a budget may never shrink below what these tests already
-    /// had, since every one of them was observed failing at 1x. A 1s base
-    /// would have given them 4s on a quiet machine, which is half.
-    #[test]
-    fn a_converted_wait_keeps_the_budget_it_replaced() {
-        let floor = Duration::from_secs(2) * BASE_CALIBRATION * MIN_SCALE;
-        assert!(
-            floor >= Duration::from_millis(8000),
-            "a 2s base must reproduce the 8000ms it replaced at the floor, got {floor:?}"
-        );
-    }
-
-    #[test]
     fn the_worst_case_stretch_is_unchanged() {
         assert_eq!(
             BASE_CALIBRATION * MAX_SCALE,
@@ -362,6 +346,21 @@ mod tests {
         assert!(
             spawn_budget(base) <= base * 8,
             "no budget may exceed the 8x ceiling, however it is composed"
+        );
+    }
+
+    /// A conversion must not be a cut. #397 replaced two `waited < 8000`
+    /// loops with `await_spawned`, and the base that does that honestly is
+    /// the one whose FLOOR is the constant it replaced: `MIN_SCALE`'s own
+    /// doc says a budget may never shrink below what these tests already
+    /// had, since every one of them was observed failing at 1x. A 1s base
+    /// would have given them 4s on a quiet machine, which is half.
+    #[test]
+    fn a_converted_wait_keeps_the_budget_it_replaced() {
+        let floor = Duration::from_secs(2) * BASE_CALIBRATION * MIN_SCALE;
+        assert!(
+            floor >= Duration::from_millis(8000),
+            "a 2s base must reproduce the 8000ms it replaced at the floor, got {floor:?}"
         );
     }
 
