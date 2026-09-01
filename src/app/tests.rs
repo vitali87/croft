@@ -16637,32 +16637,56 @@ fn assert_pane_pill_clears_its_buttons(name: &str) {
             .to_string()
     };
     let mut checked = 0;
-    for (i, btn) in app.terminal_max_buttons.iter().enumerate() {
-        if btn.width == 0 {
+    // Every button in the strip, not only `⛶`. Since #313 the leftmost is the
+    // `‹` collapse button, and checking the old leftmost alone would leave the
+    // new one free to be overpainted - the same bug this test exists for,
+    // three columns over.
+    let families: [(&str, &Vec<Rect>, char); 2] = [
+        ("collapse", &app.terminal_collapse_buttons, '\u{eab5}'),
+        ("maximize", &app.terminal_max_buttons, '\u{eb4c}'),
+    ];
+    for (i, pill) in app.terminal_label_rects.iter().enumerate() {
+        let painted: Vec<(&str, Rect, char)> = families
+            .iter()
+            .filter(|(_, rects, _)| rects[i].width > 0)
+            .map(|(f, rects, want)| (*f, rects[i], *want))
+            .collect();
+        if painted.is_empty() {
             continue;
         }
-        // The pill must actually be painted and long enough to reach the
-        // button, or a narrower layout would pass this while the bug stands.
-        let pill = app.terminal_label_rects[i];
+        // The pill has to run right up to the button strip, or a layout that
+        // simply left it short would pass this while the bug stands. Measured
+        // against the LEFTMOST button: the pill is clipped at the strip's
+        // edge, so asking it to also reach the rightmost would be asking it to
+        // be in two places at once.
+        //
+        // One cell of slack, and only one: a two-cell grapheme that would
+        // straddle the clip boundary is dropped whole rather than half-painted,
+        // so a `項` name legitimately stops one column short where a `§` name
+        // lands exactly on it. Two cells of slack would start admitting pills
+        // that were never long enough to threaten the buttons at all.
+        let leftmost = painted.iter().map(|(_, r, _)| r.x).min().unwrap();
         assert!(
-            pill.width > 0 && pill.x + pill.width >= btn.x,
-            "pane {i}'s pill must reach the button for this to prove anything, \
-             pill={pill:?} button={btn:?}"
+            pill.width > 0 && pill.x + pill.width + 1 >= leftmost,
+            "pane {i}'s pill must reach the button strip for this to prove \
+             anything, pill={pill:?} strip starts at {leftmost}"
         );
-        let painted: String = (btn.x..btn.x + btn.width).map(|x| cell(x, btn.y)).collect();
-        assert!(
-            !painted.contains(glyph),
-            "pane {i}'s {glyph:?} label painted over its maximize button: {painted:?}"
-        );
-        assert!(
-            painted.contains('\u{eb4c}'),
-            "pane {i}'s maximize glyph must survive a {glyph:?} label, got {painted:?}"
-        );
-        checked += 1;
+        for (family, btn, want) in painted {
+            let cells: String = (btn.x..btn.x + btn.width).map(|x| cell(x, btn.y)).collect();
+            assert!(
+                !cells.contains(glyph),
+                "pane {i}'s {glyph:?} label painted over its {family} button: {cells:?}"
+            );
+            assert!(
+                cells.contains(want),
+                "pane {i}'s {family} glyph must survive a {glyph:?} label, got {cells:?}"
+            );
+            checked += 1;
+        }
     }
     assert!(
-        checked >= 2,
-        "this layout must paint maximize buttons to test"
+        checked >= 4,
+        "this layout must paint both button families to test"
     );
 }
 
@@ -38126,6 +38150,856 @@ fn an_unknowable_cwd_still_allows_reuse_but_a_wrong_one_does_not() {
         "Task: nonexistent",
         &real_root
     ));
+}
+
+// ---------------------------------------------------------------------------
+// #313: collapsing terminal panes.
+// ---------------------------------------------------------------------------
+
+/// Split to `n` panes and render once at a size wide enough for every pane to
+/// carry its full header strip.
+fn app_with_terminal_panes(
+    n: usize,
+) -> (
+    tempfile::TempDir,
+    App,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for _ in 1..n {
+        app.split_terminal().unwrap();
+    }
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    (tmp, app, term)
+}
+
+#[test]
+fn collapsed_panes_keep_one_column_and_the_rest_divide_what_is_left() {
+    // The apportioning is the whole of the layout risk, so it is measured
+    // against real solved widths rather than eyeballed off a constraint list.
+    let solve = |flags: &[bool], width: u16| -> Vec<u16> {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(terminal_pane_constraints(flags))
+            .split(Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 10,
+            })
+            .iter()
+            .map(|r| r.width)
+            .collect()
+    };
+
+    // Nothing collapsed: the even split croft had before the feature existed.
+    assert_eq!(solve(&[false; 4], 100), vec![25, 25, 25, 25]);
+
+    // Two collapsed: one column each, and the two still open divide the 98
+    // that leaves. This is the assertion `Ratio(1, k)` fails - it would ask
+    // for 50 columns apiece out of the FULL 100 while the strips also want
+    // theirs, and the solver settles the overflow by shaving the panes.
+    let widths = solve(&[false, true, true, false], 100);
+    assert_eq!(
+        widths,
+        vec![49, 1, 1, 49],
+        "collapsed panes cost one column"
+    );
+    assert_eq!(widths.iter().sum::<u16>(), 100, "the row is fully spent");
+
+    // The gain is the point: 25 columns each becomes 49.
+    assert!(
+        widths[0] > solve(&[false; 4], 100)[0],
+        "collapsing must actually hand width to the panes still open"
+    );
+}
+
+#[test]
+fn the_minus_button_still_closes_and_the_chevron_collapses() {
+    // The ruling on #313: `-` keeps meaning close, and collapse is its own
+    // button. These are one test because the whole risk is the two being
+    // confused - a build where `-` folded instead of closing would pass any
+    // test that only exercised one of them.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+
+    let fold = app.terminal_collapse_buttons[1];
+    assert!(fold.width > 0, "the collapse button must be painted");
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        fold.x + 1,
+        fold.y,
+    ));
+    assert_eq!(app.terminals.len(), 3, "collapsing must never close a pane");
+    assert!(app.terminals[1].collapsed, "the clicked pane folded");
+
+    let close = app.terminal_close_buttons[0];
+    assert!(close.width > 0, "the close button must be painted");
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        close.x + 1,
+        close.y,
+    ));
+    assert_eq!(
+        app.terminals.len(),
+        2,
+        "`-` still closes the pane - it was NOT repurposed to collapse"
+    );
+}
+
+#[test]
+fn clicking_a_collapsed_strip_gives_the_pane_its_width_back() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    term.draw(|f| app.render(f)).unwrap();
+
+    let strip = app.terminal_strip_rects[2];
+    assert_eq!(strip.width, 1, "a collapsed pane is one column wide");
+    assert!(strip.height > 1, "the strip runs the height of the panel");
+    // Anywhere down the strip, not only the chevron: one column is a small
+    // enough target without also demanding the right row.
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        strip.x,
+        strip.y + strip.height / 2,
+    ));
+    assert!(!app.terminals[2].collapsed, "the strip is the way back out");
+}
+
+#[test]
+fn a_collapsed_pane_is_never_reflowed_into_its_strip() {
+    // `resize` clamps to two columns, so rendering a collapsed pane would not
+    // crash - it would quietly rewrap the running shell to a two-column grid
+    // and destroy everything on its screen. Skipping the render is what keeps
+    // the pane's geometry, and this is the assertion that says so.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    let before = app.terminals[1].grid_cols();
+    assert!(
+        before > 2,
+        "the pane must start at a real width to prove this"
+    );
+
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        app.terminals[1].grid_cols(),
+        before,
+        "a collapsed pane's shell keeps the geometry it had"
+    );
+    assert_eq!(
+        app.terminals[1].last_area,
+        Rect::default(),
+        "and its grid hit rect is cleared, so a strip click cannot land in it"
+    );
+}
+
+#[test]
+fn the_last_expanded_pane_refuses_to_collapse() {
+    let (_tmp, mut app, _term) = app_with_terminal_panes(2);
+    app.toggle_terminal_collapse(0);
+    assert!(app.terminals[0].collapsed);
+
+    app.toggle_terminal_collapse(1);
+    assert!(
+        !app.terminals[1].collapsed,
+        "folding every pane away would leave a row of strips with nothing in it"
+    );
+    assert!(
+        app.status.contains("last expanded"),
+        "and it says so rather than swallowing the click: {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn closing_the_only_expanded_pane_never_leaves_a_row_of_strips() {
+    // The refusal above guards one route into an all-collapsed row; closing
+    // is the other, and it arrives from the opposite direction.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(2);
+    app.toggle_terminal_collapse(0);
+    assert!(app.close_terminal_at(1), "close the pane that was expanded");
+    assert_eq!(app.terminals.len(), 1);
+    assert!(
+        !app.terminals[0].collapsed,
+        "the survivor must be given its width back"
+    );
+}
+
+#[test]
+fn reopening_a_closed_pane_brings_it_back_expanded() {
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    assert!(app.close_terminal_at(2));
+    app.undo_close_terminal();
+    // The count first. Without it a reopen that did nothing at all leaves two
+    // uncollapsed panes and satisfies the flag check while proving the pane
+    // never came back: the predicate is fine, the set it ranges over is wrong.
+    assert_eq!(app.terminals.len(), 3, "the pane must actually be back");
+    assert!(
+        !app.terminals.iter().any(|t| t.collapsed),
+        "a reopen that put a strip on screen would read as having failed"
+    );
+}
+
+#[test]
+fn cmd_k_brackets_fold_the_active_pane_and_restore_every_folded_one() {
+    let (_tmp, mut app, _term) = app_with_terminal_panes(4);
+    app.active_terminal = 3;
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('['), KeyModifiers::NONE)));
+    app.active_terminal = 2;
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('['), KeyModifiers::NONE)));
+    assert_eq!(
+        app.terminals.iter().filter(|t| t.collapsed).count(),
+        2,
+        "each Cmd+K [ folds the pane that is active"
+    );
+
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char(']'), KeyModifiers::NONE)));
+    assert!(
+        !app.terminals.iter().any(|t| t.collapsed),
+        "Cmd+K ] is the issue's one gesture back to equal-sized panes"
+    );
+    assert!(app.status.contains("Restored 2"), "{:?}", app.status);
+}
+
+#[test]
+fn cmd_k_e_still_reveals_in_the_explorer() {
+    // The design proposal had picked Cmd+K E for restore-all. It is croft's
+    // reveal-in-Explorer, and an `e` arm added below the existing one would
+    // never have been reached - a chord that silently does nothing. This
+    // pins the collision so the mistake cannot be made a second time.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(2);
+    app.toggle_terminal_collapse(1);
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('e'), KeyModifiers::NONE)));
+    // BOTH halves, in this test. "Did not collapse" alone passes against a
+    // build where `e` reaches nothing at all, while the test's NAME goes on
+    // claiming it revealed. With no file open the reveal arm says so, and
+    // that is the presence half over the same state.
+    assert_eq!(
+        app.status, "Reveal in Explorer View: no active file",
+        "Cmd+K E must still reach reveal-in-Explorer"
+    );
+    assert!(
+        app.terminals[1].collapsed,
+        "and must not have been quietly taken over by collapse"
+    );
+}
+
+#[test]
+fn folding_the_focused_pane_moves_focus_somewhere_visible() {
+    // A one-column strip shows no cursor, so keystrokes would land where the
+    // user cannot see them arrive.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.active_terminal = 1;
+    app.toggle_terminal_collapse(1);
+    assert!(app.terminals[1].collapsed);
+    // The SPECIFIC pane, not merely "not the folded one": naming it is what
+    // tells a deliberate hand-off from focus landing somewhere by accident.
+    // Pane 1's neighbours are equidistant, so this pins the left tie-break.
+    assert_eq!(app.active_terminal, 0, "ties go to the pane on the left");
+    assert!(
+        !app.terminals[app.active_terminal].collapsed,
+        "and that pane is actually on screen"
+    );
+}
+
+#[test]
+fn folding_a_pane_hands_focus_to_its_neighbour_not_to_the_front_of_the_row() {
+    // The case above cannot tell "nearest" from "first": pane 1 of three is
+    // one step from both its neighbours, so the two rules agree there. Four
+    // panes with the LAST one folded separates them - nearest says 2, first
+    // says 0 - which is the whole of the difference between handing focus to
+    // a neighbour and throwing the user back across the panel.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(4);
+    app.active_terminal = 3;
+    app.toggle_terminal_collapse(3);
+    assert!(app.terminals[3].collapsed);
+    assert_eq!(
+        app.active_terminal, 2,
+        "focus goes to the neighbour, not to the first expanded pane"
+    );
+}
+
+#[test]
+fn maximize_ignores_the_collapse_flags_and_gives_them_back_on_exit() {
+    // The two gestures are orthogonal: entering maximize does not clear the
+    // flags, and leaving it restores whatever folding was in force.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    app.active_terminal = 0;
+    app.toggle_terminal_pane_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.terminals[2].collapsed,
+        "maximize must not silently clear the folding"
+    );
+    assert_eq!(
+        app.terminal_strip_rects
+            .iter()
+            .filter(|r| r.width > 0)
+            .count(),
+        0,
+        "but no strip is painted while maximize owns the panel"
+    );
+
+    app.toggle_terminal_pane_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        app.terminal_strip_rects[2].width, 1,
+        "leaving maximize brings the strip back"
+    );
+}
+
+#[test]
+fn a_collapsed_strip_carries_the_pane_name_down_its_column() {
+    // The strip is what makes the gesture obviously reversible, so it has to
+    // be identifiable: the chevron out, then the name.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.terminals[1].set_manual_name(Some(String::from("build")));
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+
+    let strip = app.terminal_strip_rects[1];
+    let column: String = (strip.y..strip.y + strip.height)
+        .map(|y| {
+            term.backend()
+                .buffer()
+                .cell(ratatui::layout::Position::new(strip.x, y))
+                .unwrap()
+                .symbol()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        column.starts_with('\u{eab6}'),
+        "the expand chevron heads the strip: {column:?}"
+    );
+    assert!(
+        column.contains("build"),
+        "the pane's name runs down the strip: {column:?}"
+    );
+}
+
+#[test]
+fn a_long_pane_name_never_paints_past_the_end_of_its_strip() {
+    // A PROPERTY, not a case: this never states which row the name should end
+    // on, only that nothing lands outside the strip. A case written to a
+    // boundary already reasoned through would confirm the painting code's
+    // arithmetic rather than probe it, since the same reasoning produced both.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let height = app.terminal_strip_rects[1].height;
+    assert!(
+        height > 2,
+        "the strip must be tall enough for a name to overrun"
+    );
+
+    // Omega is one cell wide and appears nowhere else in the chrome, so any
+    // sighting of it outside the strip is the name having escaped.
+    const MARK: &str = "\u{3a9}";
+    for len in 1..=(height as usize + 2) {
+        app.terminals[1].set_manual_name(Some(MARK.repeat(len)));
+        term.draw(|f| app.render(f)).unwrap();
+        let strip = app.terminal_strip_rects[1];
+        assert_eq!(strip.width, 1, "still one column at name length {len}");
+        // Containment, counted over the WHOLE screen rather than probed at
+        // the row below the strip: that probe reads `None` whenever the panel
+        // reaches the last screen row, and an assertion the buffer's edge can
+        // satisfy is not an assertion. Comparing totals cannot go vacuous, and
+        // it states no arithmetic about which row is last.
+        let buf = term.backend().buffer();
+        let mark_at = |x: u16, y: u16| {
+            buf.cell(ratatui::layout::Position::new(x, y))
+                .is_some_and(|c| c.symbol() == MARK)
+        };
+        let area = buf.area();
+        let on_screen = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| mark_at(x, y))
+            .count();
+        let in_strip = (strip.y..strip.y + strip.height)
+            .filter(|&y| mark_at(strip.x, y))
+            .count();
+        assert!(
+            in_strip > 0,
+            "the name must actually be painted at length {len}, or nothing is being tested"
+        );
+        assert_eq!(
+            on_screen, in_strip,
+            "a {len}-character name painted outside its own strip"
+        );
+    }
+}
+
+// --- #313 fallback-review findings: red-first ------------------------------
+
+#[test]
+fn cycling_terminals_never_lands_on_a_collapsed_pane() {
+    // Cmd+] / Cmd+[ walk `active_terminal` by raw modular arithmetic, which
+    // predates the collapse flag. `toggle_terminal_collapse` documents the
+    // invariant "focus must not sit on a pane the user cannot see" and
+    // defends it on its own path only; cycling is the other way in.
+    //
+    // The FIXTURE has to be able to tell the two apart: four panes with index
+    // 1 folded, cycling from 0. Broken lands on 1 (folded, no cursor painted);
+    // correct skips to 2. A three-pane fixture would not discriminate.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(4);
+    app.toggle_terminal_collapse(1);
+    app.active_terminal = 0;
+    app.cycle_terminal();
+    assert_eq!(
+        app.active_terminal, 2,
+        "forward cycling steps over the strip"
+    );
+    assert!(!app.terminals[app.active_terminal].collapsed);
+
+    app.cycle_terminal_back();
+    assert_eq!(app.active_terminal, 0, "and so does backward cycling");
+    assert!(!app.terminals[app.active_terminal].collapsed);
+
+    // Presence half: with nothing folded the cycle still moves one slot, so
+    // this cannot pass by the cycle being broken outright.
+    app.restore_all_terminal_panes();
+    app.active_terminal = 0;
+    app.cycle_terminal();
+    assert_eq!(app.active_terminal, 1, "an unfolded row still steps by one");
+}
+
+#[test]
+fn collapse_is_inert_while_a_pane_is_maximized() {
+    // The `‹` button is not painted while maximized and the menu entry is
+    // suppressed, but the chord and the palette command called through
+    // unconditionally. `toggle_terminal_collapse` reassigns `active_terminal`,
+    // and the maximize branch hands the panel to whatever that is - so the
+    // pane being watched was silently swapped for a neighbour.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.active_terminal = 1;
+    app.toggle_terminal_pane_maximize();
+    assert!(app.terminal_pane_maximized, "precondition");
+
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('['), KeyModifiers::NONE)));
+    assert_eq!(
+        app.active_terminal, 1,
+        "the maximized pane must not be swapped out from under the user"
+    );
+    assert!(
+        !app.terminals.iter().any(|t| t.collapsed),
+        "and nothing folds while maximize owns the panel"
+    );
+}
+
+#[test]
+fn right_clicking_a_collapsed_strip_offers_to_expand_it() {
+    // `terminal_at_pos` hit-tests `last_area`, which a collapsed pane clears,
+    // so the right-click never resolved to a folded pane: the menu's
+    // "Expand Terminal" branch was unreachable while KEYBINDINGS.md advertised
+    // it, and a strip had exactly one gesture.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("a strip right-click opens the pane menu");
+    let labels: Vec<String> = menu
+        .items
+        .iter()
+        .filter_map(|e| match e {
+            MenuEntry::Item { label, .. } => Some(label.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "Expand Terminal"),
+        "the folded pane offers the way back out: {labels:?}"
+    );
+}
+
+#[test]
+fn a_reorder_never_hands_a_collapsed_pane_a_live_hit_rect() {
+    // `move_terminal` re-seats `last_area` in SLOT order, because the rect is a
+    // slot's geometry living on the terminal object. Before collapse existed
+    // every visible slot had a real rect, so that was self-consistent. Now a
+    // folded pane dragged into an expanded slot inherits a full-size rect it is
+    // not painted in, and clicks over it resolve to a pane that is not there.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+
+    app.move_terminal(0, 2);
+    let folded = app
+        .terminals
+        .iter()
+        .position(|t| t.collapsed)
+        .expect("the folded pane survived the reorder");
+    assert_eq!(
+        app.terminals[folded].last_area,
+        Rect::default(),
+        "a folded pane must not inherit an expanded slot's hit rect"
+    );
+    // Presence half: the panes that ARE painted keep real rects, so this
+    // cannot pass by the re-seat having been removed altogether.
+    assert!(
+        app.terminals
+            .iter()
+            .filter(|t| !t.collapsed)
+            .any(|t| t.last_area.width > 0),
+        "expanded panes still carry their slot geometry"
+    );
+}
+
+#[test]
+fn closing_the_pane_beside_a_folded_one_never_leaves_focus_on_it() {
+    // Round 1 fixed ONE route onto a folded pane (cycling) at the call site
+    // rather than at `sync_focus_flags`, which documents itself as the single
+    // place every gesture moving `active_terminal` funnels through.
+    //
+    // Here: fold the ACTIVE pane 1, which hands focus left to 0, then close 0.
+    // `close_terminal_at` leaves `active_terminal` at 0, which is now the
+    // folded pane. `ensure_a_terminal_pane_is_expanded` does not catch it - it
+    // enforces "SOME pane is expanded", not "the ACTIVE pane is".
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.active_terminal = 1;
+    app.toggle_terminal_collapse(1);
+    assert_eq!(app.active_terminal, 0, "precondition: focus went left");
+    assert!(app.close_terminal_at(0), "close the pane holding focus");
+    assert!(
+        !app.terminals[app.active_terminal].collapsed,
+        "closing a neighbour must not leave focus on a strip"
+    );
+}
+
+#[test]
+fn dismissing_a_strips_menu_never_leaves_focus_on_the_strip() {
+    // This route was OPENED by round 1's own fix: making a strip
+    // right-clickable also made it focusable, because the same line that
+    // resolves the pane also focuses it. A folded pane paints no cursor and no
+    // focus border, so the user then types into a pane they cannot see.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    assert!(
+        app.context_menu.is_some(),
+        "precondition: the strip right-click opened the pane menu"
+    );
+    // Dismiss through the PRODUCTION path. Assigning `context_menu = None`
+    // under a comment saying "the user presses Esc" made this test assert
+    // focus after the RIGHT-CLICK, not after dismissal: the right-click branch
+    // calls `focus_pane`, which runs the invariant, so the assertion below was
+    // already satisfied before the line pretending to dismiss anything ran. It
+    // passed, and it could not have failed for the reason it is named for.
+    app.handle_menu_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(
+        app.context_menu.is_none(),
+        "Esc must actually close the menu, or the dismissal path is not what \
+         this test exercised"
+    );
+    assert!(
+        !app.terminals[app.active_terminal].collapsed,
+        "dismissing a strip's menu must not leave focus on the strip"
+    );
+}
+
+#[test]
+fn leaving_maximize_never_lands_focus_on_a_folded_pane() {
+    // The rail lists every pane, folded ones included, and a rail click sets
+    // `active_terminal` with no collapse check. While maximized that is
+    // harmless - the flags are ignored and the pane is painted full width -
+    // but leaving maximize drops focus onto a one-column strip.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    app.active_terminal = 0;
+    app.toggle_terminal_pane_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Hand the maximized pane to the folded terminal the way the rail does.
+    app.active_terminal = 2;
+    app.toggle_terminal_pane_maximize();
+    assert!(
+        !app.terminal_pane_maximized,
+        "precondition: back to the split"
+    );
+    assert!(
+        !app.terminals[app.active_terminal].collapsed,
+        "leaving maximize must not leave focus on a strip"
+    );
+}
+
+#[test]
+fn restore_all_is_inert_while_a_pane_is_maximized() {
+    // The mirror of `collapse_is_inert_while_a_pane_is_maximized`. Collapse
+    // got the maximize guard in round 1 and restore did not, so Cmd+K ]
+    // cleared every flag and announced it, for a change invisible until the
+    // user left maximize - the same silent-state-change shape, reversed.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    app.active_terminal = 0;
+    app.toggle_terminal_pane_maximize();
+    assert!(app.terminal_pane_maximized, "precondition");
+
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char(']'), KeyModifiers::NONE)));
+    assert!(
+        app.terminals[2].collapsed,
+        "restore must not silently clear folding the user cannot see"
+    );
+}
+
+#[test]
+fn jumping_to_a_captured_line_reveals_the_folded_pane_that_holds_it() {
+    // Round 2 moved the "focus never rests on a folded pane" invariant into
+    // `sync_focus_flags`. That closed three routes and broke a fourth class:
+    // callers which deliberately TARGET a pane by index and then focus it.
+    // `sync_focus_flags` sees the target folded and walks focus away, so the
+    // caller's chosen pane is silently swapped for a neighbour - here the
+    // capture is applied to a pane the user cannot see while focus lands
+    // somewhere unrelated. `run_project_task` and `run_block_in_pane` have the
+    // same shape and write a COMMAND into the invisible pane.
+    //
+    // The invariant is right; what was missing is that reaching for a pane by
+    // index is a request to SEE it, which is the rationale `undo_close_terminal`
+    // already applies when it force-expands a reopened pane.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    let pid = app.terminals[1]
+        .shell_pid()
+        .expect("a real shell to key on");
+    app.terminals[1].feed_bytes_for_test(b"a captured line worth jumping to\r\n");
+    app.toggle_terminal_collapse(1);
+    assert!(
+        app.terminals[1].collapsed,
+        "precondition: the target is folded"
+    );
+    assert_ne!(app.active_terminal, 1, "precondition: focus left it");
+
+    app.captures.push(crate::widgets::captures::CapturedLine {
+        pane: String::from("build"),
+        shell_pid: Some(pid),
+        message: String::from("captured"),
+        line: String::from("a captured line worth jumping to"),
+    });
+    app.captures_open_selected();
+
+    assert_eq!(
+        app.active_terminal, 1,
+        "the jump must land on the pane that HOLDS the captured line"
+    );
+    assert!(
+        !app.terminals[1].collapsed,
+        "and that pane must be visible: applying a selection to a folded pane \
+         shows the user nothing"
+    );
+}
+
+#[test]
+fn the_expand_entry_advertises_no_chord_it_cannot_perform() {
+    // `Cmd+K [` acts on `active_terminal`, which the focus invariant keeps off
+    // folded panes, so the chord can only ever COLLAPSE. The menu label
+    // alternates, so a folded pane's menu read `Expand Terminal   ⌘K [` -
+    // advertising a shortcut that does the opposite of the label beside it.
+    // Contrast `ToggleMaximizeTerminal`, which carries `⌘K M` honestly because
+    // that chord genuinely toggles both ways.
+    assert_eq!(
+        shortcut_for(&MenuAction::ToggleCollapseTerminal(0)),
+        None,
+        "a one-way chord must not be advertised beside a two-way label"
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::ToggleMaximizeTerminal(0)),
+        Some("⌘K M"),
+        "and the genuinely two-way sibling keeps its hint, so this is not just \
+         the hint lookup being broken"
+    );
+}
+
+#[test]
+fn a_folded_strips_menu_offers_nothing_that_acts_on_the_active_pane() {
+    // A strip right-click sets `active_terminal = idx` and focuses the pane,
+    // and `sync_focus_flags` then walks focus straight off a folded pane to
+    // its nearest expanded neighbour. Every menu entry that carries no index
+    // acts on `active_terminal`, so the menu named one pane and acted on
+    // another: "Open Scrollback in Editor" opened the NEIGHBOUR's scrollback
+    // under the neighbour's label. The broadcast entry was worse — it read
+    // its label from `terminals[idx]` and toggled `active_terminal`, so it
+    // could say "Exclude from Broadcast" and include a different pane.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.broadcast_input = true;
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    assert_ne!(
+        app.active_terminal, 1,
+        "precondition: focus cannot rest on a folded pane, which is what \
+         makes an index-free entry act on the wrong one"
+    );
+    let labels = |app: &App| -> Vec<String> {
+        app.context_menu
+            .as_ref()
+            .expect("a right-click opens the pane menu")
+            .items
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Item { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let folded = labels(&app);
+    for entry in [
+        "Quick Select",
+        "Copy Mode",
+        "Command History",
+        "Open Scrollback in Editor",
+        "Exclude from Broadcast",
+        "Include in Broadcast",
+    ] {
+        assert!(
+            !folded.iter().any(|l| l == entry),
+            "{entry:?} acts on the active pane, which is not this one: {folded:?}"
+        );
+    }
+    assert!(
+        folded.iter().any(|l| l == "Rename Terminal")
+            && folded.iter().any(|l| l == "Expand Terminal"),
+        "the entries that carry their own index stay: {folded:?}"
+    );
+
+    // The control, in the same run: an EXPANDED pane still offers all of
+    // them, so this is a rule about folded panes and not a menu that lost
+    // half its entries.
+    app.context_menu = None;
+    let area = app.terminals[0].last_area;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        area.x + 1,
+        area.y + 1,
+    ));
+    let expanded = labels(&app);
+    for entry in [
+        "Quick Select",
+        "Copy Mode",
+        "Command History",
+        "Open Scrollback in Editor",
+    ] {
+        assert!(
+            expanded.iter().any(|l| l == entry),
+            "{entry:?} belongs on an expanded pane's menu: {expanded:?}"
+        );
+    }
+}
+
+#[test]
+fn a_pane_named_in_wide_characters_still_marks_its_strip() {
+    // Only single-width characters are painted, because a CJK glyph or an
+    // emoji is two cells wide and the pane next door is one column away. But
+    // FILTERING them out left a pane named entirely in them with a blank
+    // strip: a folded pane that is not identifiable is the one thing the
+    // strip exists to prevent.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.terminals[1].set_manual_name(Some(String::from("\u{9805}\u{76ee}")));
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+    assert!(strip.height > 2, "precondition: room below the chevron");
+
+    let buf = term.backend().buffer();
+    let at = |x: u16, y: u16| {
+        buf.cell(ratatui::layout::Position::new(x, y))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default()
+    };
+    let marked = (strip.y + 1..strip.y + strip.height)
+        .filter(|&y| !at(strip.x, y).trim().is_empty())
+        .count();
+    assert!(
+        marked > 0,
+        "the strip must carry something under the chevron for a wide-character name"
+    );
+    // And the containment property the filter was there for: the stand-in is
+    // one cell, so the pane one column away is untouched.
+    assert_eq!(
+        unicode_width::UnicodeWidthChar::width(TERMINAL_STRIP_WIDE_STANDIN),
+        Some(1),
+        "the stand-in has to fit the one column the strip owns"
+    );
+}
+
+#[test]
+fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
+    // `ToggleMaximizeTerminal` carries its index and assigns `active_terminal`
+    // directly rather than through `focus_pane`, which makes it the one path
+    // that deliberately puts focus ON a folded pane. That is correct here:
+    // maximize ignores the collapse flags by design and paints the active
+    // pane across the panel, so the pane the menu names is the pane that
+    // appears. The strip's right-click made this reachable, and nothing
+    // pinned it.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    let folded_width = app.terminals[1].last_area.width;
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    let action = app
+        .context_menu
+        .as_ref()
+        .expect("a strip right-click opens the pane menu")
+        .items
+        .iter()
+        .find_map(|e| match e {
+            MenuEntry::Item { label, action } if label == "Maximize Terminal" => {
+                Some(action.clone())
+            }
+            _ => None,
+        })
+        .expect("a folded pane still offers maximize: the entry carries its own index");
+    app.context_menu = None;
+    let root = app.workspace_root().to_path_buf();
+    app.dispatch_menu_action(action, root);
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert_eq!(
+        app.active_terminal, 1,
+        "the maximized pane is the one the menu named"
+    );
+    assert!(
+        app.terminals[1].last_area.width > folded_width,
+        "the folded pane is painted across the panel, not left as a strip: \
+         {folded_width} then {}",
+        app.terminals[1].last_area.width
+    );
+    assert!(
+        app.terminal_strip_rects.iter().all(|r| r.width == 0),
+        "no strip survives maximize, or a click could land on a pane that is not painted"
+    );
 }
 
 /// Stand up a `croft view` listener on `app` without touching process env.
