@@ -1514,8 +1514,8 @@ fn app_with_open_file_and_editor_cell() -> (App, tempfile::TempDir, u16, u16) {
 ///
 /// ONE walk. The column derivation in it was wrong once, and a second copy is
 /// a second place to fix it. `hyperlink_at_screen` and `line_text_at` both
-/// hit-test this rect and answer `None` outside it, so nothing yielded here is
-/// a cell a click could not reach.
+/// hit-test `last_inner`, which this rect contains, and answer `None` outside
+/// it, so nothing yielded here is a cell a click could not reach.
 fn cells_of(pane: &crate::widgets::terminal::PtyTerminal) -> impl Iterator<Item = (u16, u16)> {
     let area = pane.last_area;
     (area.y..area.y + area.height)
@@ -2496,14 +2496,21 @@ fn an_unmatched_modified_click_does_not_arm_the_tracker() {
     // which is the only condition it exists to cover. The negative assertion
     // at the end is satisfied by a click that lands on blank and selects
     // nothing, whether or not the tracker armed.
-    // ONE call, not two. `feed_bytes_for_test` holds the term mutex for a
-    // single `advance`, and the PTY reader locks the same mutex per chunk, so
-    // a reader blocked on the first call takes the lock at the handoff -
-    // exactly BETWEEN the two feeds - and the prompt prefixes the payload row,
-    // which is the state the decoy exists to prevent. Concatenated, the pair
-    // is atomic against the reader.
-    app.terminals[0]
-        .feed_bytes_for_test(b"a prompt got here first\r\nhello_world_token some other text\r\n");
+    // One call rather than two, which is fewer moving parts and nothing more:
+    // `cell_carrying` searches every cell of every row, so a prompt landing
+    // between two feeds and prefixing the payload row is tolerated either way.
+    // Three sibling tests still feed their decoy and payload separately.
+    //
+    // The payload row OPENS with a shell-shaped prefix on purpose. It is what
+    // gives the span predicate a red state: under a row-level `contains` the
+    // search resolves the `b` of `bash-5.2$`, `select_word_at` takes the word
+    // there instead of the token, and the positive control below fails by
+    // name. Every other fixture in this file prints its needle at column 0,
+    // where a row test and a span test pick the same cell and the refinement
+    // cannot go red.
+    app.terminals[0].feed_bytes_for_test(
+        b"a prompt got here first\r\nbash-5.2$ hello_world_token some other text\r\n",
+    );
     term.draw(|f| app.render(f)).unwrap();
     let (col, row) = cell_carrying(&app.terminals[0], "hello_world_token")
         .expect("the pane must show THIS test's token, or there is no word to mis-select");
@@ -2619,23 +2626,13 @@ fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal(
         "the terminal must actually show the token, or there is no word for a \
          wrongly-armed tracker to select and this test cannot fail"
     );
-    // The click must land on a real grid cell holding the token. Without this
-    // the test passes vacuously off-grid — which it did, three times.
-    let (text, idx) = app.terminals[0]
-        .line_text_at(col, row)
-        .expect("the click must resolve to a terminal grid cell, not the border");
-    // `idx < text.len()` was a tautology - `idx` is a char index into a row
-    // that by then certainly contains the token - so this asserted the row and
-    // called it the cell. The span is the claim a click makes.
-    let start = text
-        .find("hello_world_token")
-        .map(|b| text[..b].chars().count())
-        .expect("the row must carry the token");
-    assert!(
-        (start..start + "hello_world_token".chars().count()).contains(&idx),
-        "the click must land ON the token, not merely on its row: \
-         got {text:?} at char {idx}, token at {start}"
-    );
+    // No re-derivation of `cell_carrying`'s own predicate here. It ran that
+    // exact span test on this pane and this cell to produce `(col, row)`, so
+    // repeating it can only fail if the live shell scrolled the grid between
+    // the search and the re-read - a different fault from the one such an
+    // assertion would name. The span property is pinned by the fixture: the
+    // payload row opens with a prompt, so a row-level predicate resolves the
+    // wrong cell and the positive control below fails by name.
 
     let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
     ctrl.modifiers = KeyModifiers::CONTROL;
@@ -36746,19 +36743,24 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
         x: 1,
         y: 1,
         width: 40,
-        height: 6,
+        height: 24,
     };
     // `resize`, not a `CSI 8 ; rows ; cols t` feed: the emulator leaves that
     // sequence unhandled, so the grid kept the 80x24 it was spawned with while
     // `last_inner` said 40x6, and the recorded frame carried 24 rows under a
-    // resize event announcing 6. Every assertion below still passed, because
-    // they read the same `grid_lines` the recorder does: a fixture can be
-    // wrong about itself while everything asserted on it holds.
-    // `resize` writes through to the pty master, so the live shell in this
-    // pane takes a SIGWINCH that the escape-sequence feed never sent it. The
-    // slack absorbs what it prints: the flood ends on a newline, so
-    // `line-199` sits five rows above the bottom of a six-row screen.
-    app.terminals[0].resize(40, 6);
+    // header announcing 6. Every assertion below still passed, because they
+    // read the same `grid_lines` the recorder does: a fixture can be wrong
+    // about itself while everything asserted on it holds.
+    //
+    // 24 rows rather than the 6 the rect used to claim, and the height is the
+    // point rather than a detail. `resize` writes through to the pty master,
+    // so this pane's live shell takes a SIGWINCH the old feed never sent, and
+    // then prints. On a 6-row grid `line-199` lands one row above the bottom,
+    // so five rows of shell output evict it and the test starts failing under
+    // exactly the load #397 is about. At 24 it has the slack the unhandled
+    // escape sequence used to give it by accident, while 200 lines still
+    // overflow the screen many times over, which is what this test is about.
+    app.terminals[0].resize(40, 24);
 
     // Far more output than the screen holds, so most of it is scrollback.
     let mut flood = String::new();
