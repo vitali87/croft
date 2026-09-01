@@ -1510,6 +1510,18 @@ fn app_with_open_file_and_editor_cell() -> (App, tempfile::TempDir, u16, u16) {
     (app, tmp, col, row)
 }
 
+/// Every cell of `pane`'s own `last_area`, row-major.
+///
+/// ONE walk. The column derivation in it was wrong once, and a second copy is
+/// a second place to fix it. `hyperlink_at_screen` and `line_text_at` both
+/// hit-test this rect and answer `None` outside it, so nothing yielded here is
+/// a cell a click could not reach.
+fn cells_of(pane: &crate::widgets::terminal::PtyTerminal) -> impl Iterator<Item = (u16, u16)> {
+    let area = pane.last_area;
+    (area.y..area.y + area.height)
+        .flat_map(move |r| (area.x..area.x + area.width).map(move |c| (c, r)))
+}
+
 /// The first grid cell of `pane` that falls INSIDE an occurrence of `needle`,
 /// searched row-major over the pane's own `last_area` (#397).
 ///
@@ -1518,41 +1530,35 @@ fn app_with_open_file_and_editor_cell() -> (App, tempfile::TempDir, u16, u16) {
 /// feed, so the row is a property of machine load rather than of the test.
 /// Callers anchor on the exact text they printed, so unrelated output cannot
 /// satisfy the search.
+fn cell_carrying(pane: &crate::widgets::terminal::PtyTerminal, needle: &str) -> Option<(u16, u16)> {
+    cells_of(pane).find(|&(c, r)| {
+        // The cell must be ON the needle, not merely on a ROW containing
+        // it. `line_text_at` hands back the whole row plus the char index
+        // under the cell, and every column maps to an index (blanks
+        // included), so a `text.contains` test succeeds at the row's FIRST
+        // inner column whatever the needle's position. These fixtures print
+        // at column 0, which hid it; a row like `bash-5.2$ some_token`
+        // would have matched and clicked the `b`.
+        //
+        // A click lands on a cell, not a row, so the span is the claim.
+        pane.line_text_at(c, r).is_some_and(|(text, idx)| {
+            text.find(needle).is_some_and(|byte_start| {
+                let start = text[..byte_start].chars().count();
+                (start..start + needle.chars().count()).contains(&idx)
+            })
+        })
+    })
+}
+
 /// The first grid cell of `pane` carrying an OSC 8 link to exactly `uri`,
 /// searched row-major over the pane's own `last_area` (#397).
 ///
 /// The URI is the anchor rather than "any link", so a decoy printed beside the
-/// payload cannot satisfy the search. Same walk as [`cell_carrying`] and
-/// deliberately beside it: the column derivation in this walk was wrong once,
-/// and two copies is two places to fix.
+/// payload cannot satisfy the search. Below [`cell_carrying`] rather than
+/// above it: inserting an item over a `///` block hands that block to the
+/// newcomer, which is what happened here once already.
 fn cell_with_link(pane: &crate::widgets::terminal::PtyTerminal, uri: &str) -> Option<(u16, u16)> {
-    let area = pane.last_area;
-    (area.y..area.y + area.height)
-        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
-        .find(|&(c, r)| pane.hyperlink_at_screen(c, r).as_deref() == Some(uri))
-}
-
-fn cell_carrying(pane: &crate::widgets::terminal::PtyTerminal, needle: &str) -> Option<(u16, u16)> {
-    let area = pane.last_area;
-    (area.y..area.y + area.height)
-        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
-        .find(|&(c, r)| {
-            // The cell must be ON the needle, not merely on a ROW containing
-            // it. `line_text_at` hands back the whole row plus the char index
-            // under the cell, and every column maps to an index (blanks
-            // included), so a `text.contains` test succeeds at the row's FIRST
-            // inner column whatever the needle's position. These fixtures print
-            // at column 0, which hid it; a row like `bash-5.2$ some_token`
-            // would have matched and clicked the `b`.
-            //
-            // A click lands on a cell, not a row, so the span is the claim.
-            pane.line_text_at(c, r).is_some_and(|(text, idx)| {
-                text.find(needle).is_some_and(|byte_start| {
-                    let start = text[..byte_start].chars().count();
-                    (start..start + needle.chars().count()).contains(&idx)
-                })
-            })
-        })
+    cells_of(pane).find(|&(c, r)| pane.hyperlink_at_screen(c, r).as_deref() == Some(uri))
 }
 
 fn mouse(
@@ -2770,12 +2776,12 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     // `area.y + 1` made the test a race against shell startup rather than a
     // check of the swallow guard it is named for.
     //
-    // Searching trades a false negative for a weaker claim, which is the
-    // right trade HERE and not everywhere: this assertion only proves the
-    // built-in has something to act on, and the click coordinates are
-    // computed separately below. If it ever grows into a position-sensitive
-    // check, the search has to narrow with it - "the link is somewhere in
-    // the pane" would then pass for a row no click could reach.
+    // The search IS the click coordinate here, not a separate check ahead of
+    // one, and it is anchored on this test's own URI rather than on "a link":
+    // the decoy above is what makes that distinction fail loudly. Every cell
+    // `cells_of` yields is inside `last_area`, which `hyperlink_at_screen`
+    // hit-tests, so a cell found is a cell a click reaches - the claim is not
+    // weakened by not naming the row.
     let (col, row) = cell_with_link(&app.terminals[0], "mailto:split@example.com")
         .expect("pane 0 must carry the link somewhere, or the built-in has nothing to act on");
     assert_eq!(
@@ -36748,6 +36754,10 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
     // resize event announcing 6. Every assertion below still passed, because
     // they read the same `grid_lines` the recorder does: a fixture can be
     // wrong about itself while everything asserted on it holds.
+    // `resize` writes through to the pty master, so the live shell in this
+    // pane takes a SIGWINCH that the escape-sequence feed never sent it. The
+    // slack absorbs what it prints: the flood ends on a newline, so
+    // `line-199` sits five rows above the bottom of a six-row screen.
     app.terminals[0].resize(40, 6);
 
     // Far more output than the screen holds, so most of it is scrollback.
