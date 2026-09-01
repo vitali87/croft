@@ -65,15 +65,20 @@ jobs:
           # unsure about counts as shipped: waiving a bump that was needed
           # puts two binaries on one version, which is what this job exists
           # to prevent.
-          kept=""
-          for f in $shipped; do
+          # Read the list a line at a time rather than word-splitting it: an
+          # unquoted `for f in $shipped` also expands globs, so a path
+          # holding `[`, `*` or `?` would reach the filter as a pathspec git
+          # cannot resolve, and a path holding a space would arrive as two.
+          kept="$(mktemp)"
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
             if python3 scripts/ships_nothing.py "$base" HEAD "$f"; then
               echo "$f: change confined to #[cfg(test)]; ships nothing."
             else
-              kept="$kept $f"
+              printf '%s\n' "$f" >> "$kept"
             fi
-          done
-          shipped="$(printf '%s\n' $kept)"
+          done <<< "$shipped"
+          shipped="$(cat "$kept")"
           if [ -z "$shipped" ]; then
             echo "No shipped files changed; no release required."
             exit 0

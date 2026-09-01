@@ -27,7 +27,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_doc_ownership import ATTR, CODE, MISSING_PATH, SKIP, BlockTracker, classify  # noqa: E402
+from check_doc_ownership import (  # noqa: E402
+    ATTR,
+    CODE,
+    DOC,
+    MISSING_PATH,
+    SKIP,
+    BlockTracker,
+    classify,
+)
 
 # The attribute on its own line, which is what rustfmt produces and what every
 # test module in this repo has. `#[cfg(test)] mod tests {` on one line is legal
@@ -40,13 +48,19 @@ MOD = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_]\w*")
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
-def git(*args, cwd=None):
-    """Run git, tolerating only "that path is not in that revision"."""
+def git(*args, cwd=None, allow_missing_path=False):
+    """Run git, tolerating "that path is not in that revision" only where the
+    caller says a missing path is a legitimate answer.
+
+    Opt-in for the same reason `check_doc_ownership.git` is: tolerating it
+    everywhere lets an invalid revision or a malformed object read as empty
+    content, and empty content is the WAIVING answer here.
+    """
     done = subprocess.run(
         ("git",) + args, cwd=cwd, capture_output=True, text=True
     )
     if done.returncode != 0:
-        if MISSING_PATH.search(done.stderr):
+        if allow_missing_path and MISSING_PATH.search(done.stderr):
             return ""
         raise SystemExit(f"git {' '.join(args)} failed: {done.stderr.strip()}")
     return done.stdout
@@ -82,9 +96,12 @@ def cfg_test_ranges(text):
             continue
         if attr_at is None:
             continue
-        if kinds[i] in (SKIP, ATTR):
-            # Blank lines, comments and further attributes sit legally
-            # between `#[cfg(test)]` and the module it applies to.
+        if kinds[i] in (SKIP, ATTR, DOC):
+            # Blank lines, comments, doc comments and further attributes all
+            # sit legally between `#[cfg(test)]` and the module it applies
+            # to. `classify` labels `///` DOC rather than SKIP, and a
+            # documented test module is an ordinary shape: missing it loses
+            # the exemption silently rather than waiving wrongly.
             continue
         if MOD.match(line) and tracker.depth > depth_before:
             open_at = (attr_at, depth_before)
@@ -126,13 +143,50 @@ def ships_nothing(base, head, path, cwd=None):
     """
     if not path.endswith(".rs"):
         return False
+    base_text = git("show", f"{base}:{path}", cwd=cwd, allow_missing_path=True)
+    head_text = git("show", f"{head}:{path}", cwd=cwd, allow_missing_path=True)
     removed, added = changed_lines(base, head, path, cwd=cwd)
     if not removed and not added:
-        return True
-    base_ranges = cfg_test_ranges(git("show", f"{base}:{path}", cwd=cwd))
-    head_ranges = cfg_test_ranges(git("show", f"{head}:{path}", cwd=cwd))
-    return all(inside(n, base_ranges) for n in removed) and all(
-        inside(n, head_ranges) for n in added
+        # An empty diff means "nothing changed" for a path that exists at both
+        # ends, and "git could not resolve that pathspec" otherwise. Only the
+        # first is a reason to waive a bump, and the second is reachable: a
+        # path that matches nothing makes `git diff` exit 0 with no output.
+        return bool(base_text) and bool(head_text)
+    base_ranges = cfg_test_ranges(base_text)
+    head_ranges = cfg_test_ranges(head_text)
+    base_lines = base_text.splitlines()
+    head_lines = head_text.splitlines()
+
+    def blank(lines, n):
+        """A line that carries no code cannot change the binary, whichever
+        side of the diff it is on. Adding or removing the blank line above a
+        new test module is the common case."""
+        return 1 <= n <= len(lines) and not lines[n - 1].strip()
+
+    removed = [n for n in removed if not blank(base_lines, n)]
+    added = [n for n in added if not blank(head_lines, n)]
+    if not all(inside(n, base_ranges) for n in removed):
+        return False
+    if not all(inside(n, head_ranges) for n in added):
+        return False
+    # The `#[cfg(test)]` line is what DECIDES whether the module compiles, and
+    # it sits inside the span it opens, so a diff that only adds or removes it
+    # falls inside the span and would be waived. Both directions change the
+    # binary: adding the attribute takes a shipping module out, removing it
+    # puts a test module in. A touched attribute is therefore only test-only
+    # when its WHOLE module moved with it, which is what a test module added
+    # or deleted in one piece looks like.
+    return _whole_span_moved(base_ranges, removed) and _whole_span_moved(
+        head_ranges, added
+    )
+
+
+def _whole_span_moved(ranges, touched):
+    """True unless a span's attribute line was touched without the rest."""
+    marked = set(touched)
+    return all(
+        not (start in marked) or all(n in marked for n in range(start, end + 1))
+        for start, end in ranges
     )
 
 

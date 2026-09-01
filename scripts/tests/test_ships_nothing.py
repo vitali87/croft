@@ -193,6 +193,79 @@ class Verdicts(unittest.TestCase):
             )
             self.assertTrue(repo.verdict(path="c.rs"))
 
+    def test_adding_the_cfg_test_attribute_to_a_shipped_module_ships(self):
+        """The line that decides what compiles. Adding `#[cfg(test)]` above a
+        module that ships today REMOVES it from the binary, and the diff is a
+        single added line which falls inside the span the attribute opens - so
+        a span that swallows its own attribute waives the one change the job
+        exists to catch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            shipped = "pub fn f() -> u8 {\n    1\n}\n\nmod helpers {\n    pub fn g() -> u8 {\n        2\n    }\n}\n"
+            repo.commit("a.rs", shipped)
+            run(repo.path, "git", "checkout", "-q", "-b", "work")
+            repo.commit("a.rs", shipped.replace("\nmod helpers {", "\n#[cfg(test)]\nmod helpers {"))
+            self.assertFalse(repo.verdict())
+
+    def test_removing_the_cfg_test_attribute_ships(self):
+        """The same line, the other way: the module and everything in it
+        ENTERS the binary."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            gated = "pub fn f() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod helpers {\n    pub fn g() -> u8 {\n        2\n    }\n}\n"
+            repo.commit("a.rs", gated)
+            run(repo.path, "git", "checkout", "-q", "-b", "work")
+            repo.commit("a.rs", gated.replace("#[cfg(test)]\n", ""))
+            self.assertFalse(repo.verdict())
+
+    def test_a_whole_test_module_added_at_once_still_ships_nothing(self):
+        """The control for the two above, and the PR's main use case: when
+        the WHOLE module arrives in one diff, every line of the span is new
+        and nothing leaves or enters the binary."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "pub fn f() -> u8 {\n    1\n}\n")
+            run(repo.path, "git", "checkout", "-q", "-b", "work")
+            repo.commit(
+                "a.rs",
+                "pub fn f() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n"
+                "    #[test]\n    fn t() {\n        assert_eq!(super::f(), 1);\n    }\n}\n",
+            )
+            self.assertTrue(repo.verdict())
+
+    def test_a_module_left_open_at_end_of_file_is_not_a_range(self):
+        """A truncated file or a miscount. Treating the rest of the file as
+        test code would exempt everything below the attribute."""
+        text = "fn f() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n"
+        self.assertEqual(filt.cfg_test_ranges(text), [])
+
+    def test_a_module_declaration_without_a_body_is_not_a_range(self):
+        """`mod tests;` puts the body in another file and opens no braces, so
+        the span would run to the end of THIS file and cover shipped code."""
+        text = "#[cfg(test)]\nmod tests;\npub fn shipped() -> u8 {\n    1\n}\n"
+        self.assertEqual(filt.cfg_test_ranges(text), [])
+
+    def test_a_doc_comment_between_the_attribute_and_its_module_is_read(self):
+        """`classify` labels `///` as DOC, not SKIP, and a documented test
+        module is an ordinary shape. Missing it loses the exemption rather
+        than waiving wrongly, but it loses it silently."""
+        text = (
+            "fn f() {}\n#[cfg(test)]\n/// Unit tests for the parser.\n"
+            "mod tests {\n    #[test]\n    fn t() {}\n}\n"
+        )
+        self.assertEqual(filt.cfg_test_ranges(text), [(2, 7)])
+
+    def test_a_path_the_pathspec_cannot_resolve_ships(self):
+        """An empty diff means "nothing changed" for a path that exists at
+        both ends, and "I could not read that" otherwise. Only the first is a
+        reason to waive a bump."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", SHIPPED)
+            run(repo.path, "git", "checkout", "-q", "-b", "work")
+            repo.commit("a.rs", SHIPPED.replace("width(4), 2", "width(6), 3"))
+            self.assertFalse(repo.verdict(path="does_not_exist.rs"))
+
     def test_the_cli_reports_the_verdict_as_its_exit_status(self):
         """The gate is shell, so the answer has to arrive as a status."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,6 +281,17 @@ class Verdicts(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(done.returncode, 0, done.stderr)
+            # And the direction that matters, in the same test: a CLI that
+            # always exits 0 waives every bump, and the assertion above alone
+            # cannot tell that apart from a working filter.
+            repo.commit("a.rs", SHIPPED.replace("cols / 2", "cols / 3"))
+            ships = subprocess.run(
+                [sys.executable, script, "main", "HEAD", "a.rs"],
+                cwd=repo.path,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(ships.returncode, 1, ships.stderr)
 
 
 if __name__ == "__main__":
