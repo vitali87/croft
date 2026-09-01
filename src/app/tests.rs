@@ -24460,17 +24460,20 @@ fn undo_close_restores_a_closed_terminal_pane_with_its_process_alive() {
     assert_eq!(app.terminals[1].label(), "keepme");
     assert_eq!(app.active_terminal, 1, "the restored pane takes focus");
     app.terminals[1].write_input(b"back\n");
-    let mut waited = 0u32;
-    while !app.terminals[1]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.contains("revived-back"))
-    {
-        assert!(waited < 8000, "restored pane's shell no longer answers");
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        waited += 40;
-    }
+    // The same operation and the same old constant as the restore wait in the
+    // next test: a shell echoing one line, waited on under whatever load the
+    // suite is running.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the reopened pane's shell to answer",
+        || {
+            app.terminals[1]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("revived-back"))
+        },
+    );
 
     // Past the grace window the parked pane is dropped for real: the tick
     // reaps it and undo has nothing left to restore.
@@ -24790,11 +24793,17 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
     // Load-scaled, not a fixed 8000ms: what blows a wait on a spawned shell
     // is contention, which is a property of what else the suite is doing
     // rather than of this test, and `test_budget` is where that reasoning
-    // already lives (#307/#422). The old constant is this call's `base`
-    // divided by the calibration, so a quiet machine waits what it waited
-    // before and a loaded one waits longer instead of failing (#397).
+    // already lives (#307/#422).
+    //
+    // The base is what the operation costs on a QUIET machine, which for a
+    // shell echoing one line is about a second. `await_spawned` multiplies it
+    // by `BASE_CALIBRATION * load_scale`, which that module's own test pins at
+    // 4 on a quiet machine and 8 at the cap, so 1s here is 4s quiet and 8s
+    // loaded: the 8000ms this replaces, kept as the CEILING rather than as the
+    // floor. An earlier version of this comment said the base was the old
+    // constant divided by the calibration, which is neither of those numbers.
     crate::test_budget::await_spawned(
-        std::time::Duration::from_secs(4),
+        std::time::Duration::from_secs(1),
         "the restored pane's shell to answer",
         || {
             app2.terminals[1]
@@ -30340,17 +30349,29 @@ fn quick_select_labels_follow_content_that_streams_below_them() {
     app.focus_pane(Pane::Terminal);
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut term = ratatui::Terminal::new(backend).unwrap();
-    // The panel over the editor, so the pane has ROWS. Unmaximized it is five
-    // rows tall here, and this test parks its URL four rows from the bottom:
-    // one row of slack against a prompt that is written by a real shell and
-    // wraps to three or four rows on a machine with a long hostname and path.
-    // That is the whole of this test's entry in #397 - measured at 3 failures
-    // in 20 runs under load, and the URL scrolling off the top is what the
-    // failure prints. Maximizing leaves sixteen rows of slack instead of one.
+    // The panel over the editor, so the pane has ROWS. Unmaximized it is a
+    // few rows tall here, and this test parks its URL four rows from the
+    // bottom: almost no slack against a prompt that a real shell writes and
+    // that wraps to several rows on a machine with a long hostname and path.
+    // That is this test's entry in #397, measured at 3 failures in 20 runs
+    // under load, with the URL scrolling off the top in the failure. The
+    // measured numbers are in the PR; the literals are not repeated here,
+    // since they are one configuration's and the code derives its own below.
+    //
+    // The maximize also resizes the PTY, so the pane's shell takes a SIGWINCH
+    // and may repaint its prompt. That lands before the newline flood parks
+    // the cursor, and the slack this exists to create absorbs a late one.
     app.toggle_terminal_maximize();
     term.draw(|f| app.render(f)).unwrap();
     // Park the cursor at the pane bottom so every further row SCROLLS.
     let h = app.terminals[0].last_inner.height as usize;
+    // The precondition this fix IS, checked in the same run as the claim it
+    // supports: if a future panel change shrank the pane back toward five
+    // rows, the test would quietly return to flaking instead of failing.
+    assert!(
+        h >= 12,
+        "the maximized panel must leave slack for the shell's wrapped prompt; got {h} rows"
+    );
     app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
     // One atomic feed, opening with its own newline: the live child
     // shell's prompt can flush between feed calls under suite load (#62),
@@ -30360,7 +30381,10 @@ fn quick_select_labels_follow_content_that_streams_below_them() {
     // this chunk (its row is above) or after it (it appends to the right).
     app.terminals[0].feed_bytes_for_test(b"\r\nhttp://drift.io");
     app.open_terminal_quick_select();
-    assert!(app.terminal_quick_select.is_some(), "staging: one hint");
+    assert!(
+        app.terminal_quick_select.is_some(),
+        "staging: at least the URL is hinted"
+    );
     app.terminals[0].feed_bytes_for_test(b"\r\nx1\r\nx2\r\nx3");
     term.draw(|f| app.render(f)).unwrap();
     let buf = term.backend().buffer().clone();
