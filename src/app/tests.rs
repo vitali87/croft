@@ -1510,14 +1510,28 @@ fn app_with_open_file_and_editor_cell() -> (App, tempfile::TempDir, u16, u16) {
     (app, tmp, col, row)
 }
 
-/// The first grid cell of `pane` whose row text carries `needle`, searched
-/// row-major over the pane's own `last_area` (#397).
+/// The first grid cell of `pane` that falls INSIDE an occurrence of `needle`,
+/// searched row-major over the pane's own `last_area` (#397).
 ///
 /// A test that prints something into a pane and then clicks it must not assume
 /// which row it landed on: the pane runs a REAL shell whose prompt races the
 /// feed, so the row is a property of machine load rather than of the test.
 /// Callers anchor on the exact text they printed, so unrelated output cannot
 /// satisfy the search.
+/// The first grid cell of `pane` carrying an OSC 8 link to exactly `uri`,
+/// searched row-major over the pane's own `last_area` (#397).
+///
+/// The URI is the anchor rather than "any link", so a decoy printed beside the
+/// payload cannot satisfy the search. Same walk as [`cell_carrying`] and
+/// deliberately beside it: the column derivation in this walk was wrong once,
+/// and two copies is two places to fix.
+fn cell_with_link(pane: &crate::widgets::terminal::PtyTerminal, uri: &str) -> Option<(u16, u16)> {
+    let area = pane.last_area;
+    (area.y..area.y + area.height)
+        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
+        .find(|&(c, r)| pane.hyperlink_at_screen(c, r).as_deref() == Some(uri))
+}
+
 fn cell_carrying(pane: &crate::widgets::terminal::PtyTerminal, needle: &str) -> Option<(u16, u16)> {
     let area = pane.last_area;
     (area.y..area.y + area.height)
@@ -1795,16 +1809,10 @@ fn a_terminal_link_binding_is_not_refused_for_an_editor_side_reason() {
     app.terminals[0]
         .feed_bytes_for_test(b"\x1b]8;;mailto:t@example.com\x1b\\link\x1b]8;;\x1b\\\r\n");
     term.draw(|f| app.render(f)).unwrap();
-    let area = app.terminals[0].last_area;
-    let (col, row) = (area.y..area.y + area.height)
-        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
-        .find(|&(c, r)| {
-            app.terminals[0].hyperlink_at_screen(c, r).as_deref() == Some("mailto:t@example.com")
-        })
-        .expect(
-            "precondition: the click must land on the terminal link, or a refusal \
+    let (col, row) = cell_with_link(&app.terminals[0], "mailto:t@example.com").expect(
+        "precondition: the click must land on the terminal link, or a refusal \
              proves nothing about which branch refused it",
-        );
+    );
 
     app.focus_pane(Pane::Terminal);
     let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
@@ -2187,15 +2195,9 @@ fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one()
     // resolves against pane 0", and any cell carrying that link is a fair
     // place to click. The precondition survives, because a pane with no such
     // cell fails below rather than clicking somewhere arbitrary.
-    let area = app.terminals[0].last_area;
-    let (col, row) = (area.y..area.y + area.height)
-        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
-        .find(|&(c, r)| {
-            app.terminals[0].hyperlink_at_screen(c, r).as_deref() == Some("mailto:zero@example.com")
-        })
-        .expect(
-            "pane 0 must carry the OSC 8 link somewhere in its area, or a refusal proves nothing",
-        );
+    let (col, row) = cell_with_link(&app.terminals[0], "mailto:zero@example.com").expect(
+        "pane 0 must carry the OSC 8 link somewhere in its area, or a refusal proves nothing",
+    );
     let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
     ev.modifiers = KeyModifiers::CONTROL;
     app.handle_mouse(ev);
@@ -2774,13 +2776,7 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     // computed separately below. If it ever grows into a position-sensitive
     // check, the search has to narrow with it - "the link is somewhere in
     // the pane" would then pass for a row no click could reach.
-    let area = app.terminals[0].last_area;
-    let (col, row) = (area.y..area.y + area.height)
-        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
-        .find(|&(c, r)| {
-            app.terminals[0].hyperlink_at_screen(c, r).as_deref()
-                == Some("mailto:split@example.com")
-        })
+    let (col, row) = cell_with_link(&app.terminals[0], "mailto:split@example.com")
         .expect("pane 0 must carry the link somewhere, or the built-in has nothing to act on");
     assert_eq!(
         app.active_terminal, 1,
@@ -2902,22 +2898,19 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
     // Trailing newline parks the cursor on the NEXT row: without it any late
     // shell output writes onto the link's own row.
-    // A decoy link ahead of the real one, so the exact-status assertion below
-    // has a red state. Without it, reverting that assertion to `contains`
-    // leaves the suite green - the tightening was unpinned here even though
-    // its twin in this PR was pinned.
+    // A decoy link ahead of the real one, which gives the exact-URI SEARCH a
+    // red state: revert the predicate to `.is_some()` and the row-major scan
+    // stops on the decoy, so the status assertion rejects it by name. It does
+    // NOT pin the assertion's FORM - with the search intact, `contains`
+    // accepts the same correct answer, and an earlier version of this comment
+    // claimed otherwise.
     app.terminals[0].feed_bytes_for_test(
         b"\x1b]8;;mailto:decoy@example.com\x1b\\decoy\x1b]8;;\x1b\\\r\n\x1b]8;;mailto:x@example.com\x1b\\link\x1b]8;;\x1b\\\r\n",
     );
-    let (col, row) = (area.y..area.y + area.height)
-        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
-        .find(|&(c, r)| {
-            app.terminals[0].hyperlink_at_screen(c, r).as_deref() == Some("mailto:x@example.com")
-        })
-        .expect(
-            "the cell must carry THIS test's OSC 8 link, or the built-in has nothing \
+    let (col, row) = cell_with_link(&app.terminals[0], "mailto:x@example.com").expect(
+        "the cell must carry THIS test's OSC 8 link, or the built-in has nothing \
              to act on and this test cannot distinguish the two branches",
-        );
+    );
 
     app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
     assert!(
@@ -36749,7 +36742,13 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
         width: 40,
         height: 6,
     };
-    app.terminals[0].feed_bytes_for_test(b"\x1b[8;6;40t");
+    // `resize`, not a `CSI 8 ; rows ; cols t` feed: the emulator leaves that
+    // sequence unhandled, so the grid kept the 80x24 it was spawned with while
+    // `last_inner` said 40x6, and the recorded frame carried 24 rows under a
+    // resize event announcing 6. Every assertion below still passed, because
+    // they read the same `grid_lines` the recorder does: a fixture can be
+    // wrong about itself while everything asserted on it holds.
+    app.terminals[0].resize(40, 6);
 
     // Far more output than the screen holds, so most of it is scrollback.
     let mut flood = String::new();
@@ -36777,6 +36776,16 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
         .and_then(|ev| ev[2].as_str().map(String::from))
         .expect("an output event");
 
+    // The geometry a player is handed, taken from the FILE rather than from
+    // `grid_lines`. The recorder takes the header from the pane's rect and
+    // the frame body from the grid, and nothing tied the two together: a
+    // fixture whose rect and grid disagreed wrote a 24-row frame under a
+    // header announcing 6, and every assertion here still passed because they
+    // all read the grid. A player sizes its window from this header, so the
+    // frame that follows has to fit it.
+    let header: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("a header")).expect("the header is JSON");
+
     let rows = frame.split("\r\n").count();
     // The claim is the VISIBLE screen, so the bound is the screen's own
     // height, taken from the pane rather than guessed: `grid_lines` returns
@@ -36790,6 +36799,11 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
     assert_eq!(
         rows, visible,
         "the frame must be the {visible}-row screen, not {rows} rows of history"
+    );
+    assert_eq!(
+        (header["width"].as_u64(), header["height"].as_u64()),
+        (Some(40), Some(rows as u64)),
+        "the geometry a player reads must describe the frame that follows it"
     );
     // And a check that does not go through `grid_lines` at all, so a wrong
     // slice cannot agree with a wrong expectation: any frame wider than the
