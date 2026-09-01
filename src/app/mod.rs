@@ -28610,12 +28610,14 @@ impl App {
 
     /// Bind this croft's `croft view` socket and publish it to panes.
     ///
-    /// Keyed by pid so two crofts on one box never contend, and exported
-    /// through the process env so every pane spawned later inherits it
-    /// without each spawn site having to remember. Under `cfg(test)` the
-    /// bind is skipped: a test that stood up an App would otherwise leave a
-    /// live socket in the real cache dir and, worse, publish it into the env
-    /// of every OTHER test in the same process.
+    /// Keyed by pid so two crofts on one box never contend, and published
+    /// through [`crate::view_ipc::SOCK_PATH`], which `apply_pane_env` reads
+    /// at spawn time so no spawn site has to remember it. Not the process
+    /// env: `set_var` is unsound with threads running, and the body below
+    /// says so at length. Under `cfg(test)` the bind is skipped, since a test
+    /// that stood up an App would otherwise leave a live socket in the real
+    /// cache dir and set the one-shot global for every OTHER test in the same
+    /// process.
     fn bind_view_socket() -> Option<std::os::unix::net::UnixListener> {
         if cfg!(test) {
             return None;
@@ -44596,6 +44598,15 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
     sweep_staged_stdin(dir);
 }
 
+/// How long a staged stdin file outlives the pipe that wrote it (#362).
+///
+/// Generous, because the cost of keeping a file too long is disk and the cost
+/// of dropping one too early is a broken tab. It still bounds the pile: the
+/// module's own rationale names `vault read … | croft view -`, and without any
+/// sweep every such pipe left a permanent copy on disk the user was never told
+/// about.
+const STAGED_STDIN_RETENTION: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24);
+
 /// Drop staged stdin old enough that no running croft can be showing it (#362).
 ///
 /// Keyed on AGE, not on pid liveness, and the distinction is the whole of this
@@ -44607,13 +44618,8 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
 /// croft deleted it. That is not litter: `sqlite_view::table_page` re-opens the
 /// file by path on every page turn, so the tab breaks on the next page.
 ///
-/// The retention window is generous because the cost of keeping a file too
-/// long is disk and the cost of dropping one too early is a broken tab. It
-/// still bounds the pile: the module's own rationale names
-/// `vault read … | croft view -`, and without any sweep every such pipe left a
-/// permanent copy on disk the user was never told about.
-const STAGED_STDIN_RETENTION: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24);
-
+/// Runs at launch, from `sweep_dead_view_sockets`, so a file staged inside a
+/// long-lived session survives until the next croft starts.
 fn sweep_staged_stdin(dir: &Path) {
     let staged = dir.join("view-stdin");
     let Ok(entries) = std::fs::read_dir(&staged) else {

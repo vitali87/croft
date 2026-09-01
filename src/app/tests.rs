@@ -38457,12 +38457,19 @@ fn a_non_blocking_accepted_stream_is_still_answered() {
     // the flag it had just set. Deleting the production call left it green on
     // every platform, and its own comment claimed the opposite.
     //
-    // This one hands `answer_view_client` a deliberately NON-blocking stream -
-    // the state macOS actually produces, since BSD inherits the listener's
-    // flags across `accept` while Linux does not - and asserts the REPLY. If
-    // production stops clearing the flag, every read returns EAGAIN and the
-    // reply becomes `Err("unreadable request: Resource temporarily
-    // unavailable")`, which fails here on Linux too.
+    // The version after that could not fail either, for a NEW reason, and the
+    // fix that broke it was in the same round: `read_line_by_deadline` now
+    // swallows `WouldBlock`/`TimedOut` and loops, precisely so a per-recv
+    // errno cannot end a read early. A non-blocking stream therefore busy
+    // spins until the bytes arrive and the reply is `Ok` either way, so
+    // asserting the reply says nothing about the flag. Measured: with
+    // `set_nonblocking(false)` deleted from production, that version passed.
+    //
+    // The flag itself is the claim, so the flag is what this asserts. The
+    // probe is a DUP rather than a second connection: a dup shares the open
+    // file description, so it reads back the same `O_NONBLOCK` the server
+    // cleared on the original. The reply assertion stays alongside it, since
+    // a cleared flag on an unanswered request would not be a pass either.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let sock = seat_view_listener(&mut app, tmp.path());
@@ -38498,16 +38505,31 @@ fn a_non_blocking_accepted_stream_is_still_answered() {
     let (stream, _) = listener.accept().expect("a client is waiting");
     // The state macOS hands production, forced here so Linux exercises it too.
     stream.set_nonblocking(true).unwrap();
+    let probe = stream.try_clone().expect("a dup of the accepted stream");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     let (reply, opened) = app.answer_view_client(stream, deadline);
     let _ = client.join();
 
+    let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&probe), libc::F_GETFL) };
+    assert!(
+        flags >= 0,
+        "F_GETFL on the dup failed: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(
+        flags & libc::O_NONBLOCK,
+        0,
+        "production must clear O_NONBLOCK on an accepted stream: macOS inherits \
+         the listener's flags across accept, and a non-blocking read there \
+         returns before the client has written"
+    );
+
     assert_eq!(
         reply,
         crate::view_ipc::ViewReply::Ok,
-        "a non-blocking accepted stream must still be read: production has to \
-         clear the flag, and this is the reply that says whether it did"
+        "and the request is still answered: a cleared flag with no reply \
+         behind it would not be a pass"
     );
     assert!(opened, "and the file must actually have been opened");
 }
@@ -38536,6 +38558,39 @@ fn the_sweep_spares_staged_stdin_a_croft_may_still_be_showing() {
     );
 }
 
+#[test]
+fn the_staging_sweep_leaves_a_file_it_did_not_stage() {
+    // The name filter, which had no negative case: the socket sweep has one
+    // and this did not. A user who drops a note in the staging directory, or
+    // any other program that writes there, must not have it deleted on a
+    // guess just for being old.
+    let tmp = tempfile::tempdir().unwrap();
+    let staged = tmp.path().join("view-stdin");
+    std::fs::create_dir_all(&staged).unwrap();
+    let stranger = staged.join("notes.txt");
+    std::fs::write(&stranger, b"not croft's").unwrap();
+    let ours = staged.join("stdin-999999-0.txt");
+    std::fs::write(&ours, b"croft's").unwrap();
+
+    // Both older than the window, so age cannot be what separates them.
+    let old = std::time::SystemTime::now() - (STAGED_STDIN_RETENTION * 2);
+    for p in [&stranger, &ours] {
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+
+    crate::app::sweep_staged_stdin(tmp.path());
+
+    assert!(
+        stranger.exists(),
+        "a file croft did not stage is not croft's to delete"
+    );
+    assert!(
+        !ours.exists(),
+        "and the control: a staged file that old goes"
+    );
+}
 #[test]
 fn the_sweep_removes_staged_stdin_old_enough_that_nothing_can_be_showing_it() {
     // The other half. Age is the honest key here: the pid in the name belongs

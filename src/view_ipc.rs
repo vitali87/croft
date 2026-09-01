@@ -196,7 +196,10 @@ pub fn read_line_by_deadline(
                     // the limit was accepted and deserialised: the bound held
                     // for an unterminated flood and not for a terminated one,
                     // which is the case an actual client sends.
-                    if pos as u64 > MAX_REQUEST_BYTES {
+                    // `>=`, not `>`: `pos` is an INDEX and the accumulate
+                    // branch below tests a LENGTH, so the two were a byte apart
+                    // on the same cap.
+                    if pos as u64 >= MAX_REQUEST_BYTES {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "request exceeded the maximum length",
@@ -672,6 +675,29 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"first");
         assert_eq!(std::fs::read(&b).unwrap(), b"second");
+    }
+
+    #[test]
+    fn a_staged_name_already_on_disk_is_stepped_past_not_overwritten() {
+        // The collision arm, which the counter test above cannot reach: it
+        // walks the per-process counter, and this is the OTHER way a name
+        // repeats - a recycled pid meeting a file an earlier croft left. The
+        // file it meets is somebody else's data, so stepping past is the
+        // whole point: `create_new` is what stops the write from landing on
+        // it, and the retry is what stops the command failing forever.
+        let tmp = tempfile::tempdir().unwrap();
+        let stem = format!("stdin-{}-0.txt", std::process::id());
+        let taken = tmp.path().join(&stem);
+        std::fs::write(&taken, b"an older croft's bytes").unwrap();
+
+        let path = stage_stdin(tmp.path(), b"mine", Some("txt")).unwrap();
+        assert_ne!(path, taken, "the name on disk must not be reused");
+        assert_eq!(
+            std::fs::read(&taken).unwrap(),
+            b"an older croft's bytes",
+            "and the file that held it must be untouched"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"mine");
     }
 
     #[test]
