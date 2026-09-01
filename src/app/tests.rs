@@ -39147,20 +39147,34 @@ fn the_socket_sweep_removes_a_dead_crofts_file_and_spares_a_live_one() {
         child.wait().unwrap();
         pid
     };
-    let mine = std::process::id();
+    // A live pid that is NOT this process. Naming the live socket for
+    // `process::id()` made this half unfalsifiable: production reads
+    // `pid != me && kill(pid, 0) != 0`, so for our own pid the first term
+    // decides it and the liveness probe never runs. Measured - replacing the
+    // whole condition with `pid != me` left all three assertions passing,
+    // while production would then unlink the socket of every OTHER running
+    // croft, which is the outcome the comment above calls worse than litter.
+    let mut peer = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let live = peer.id();
     let dead_sock = tmp.path().join(format!("view-{dead}.sock"));
-    let live_sock = tmp.path().join(format!("view-{mine}.sock"));
+    let live_sock = tmp.path().join(format!("view-{live}.sock"));
     let stranger = tmp.path().join("not-a-view-socket");
     for p in [&dead_sock, &live_sock, &stranger] {
         std::fs::write(p, b"").unwrap();
     }
 
     crate::app::sweep_dead_view_sockets(tmp.path());
+    let live_survived = live_sock.exists();
+    let _ = peer.kill();
+    let _ = peer.wait();
 
     assert!(!dead_sock.exists(), "a dead croft's socket must be cleared");
     assert!(
-        live_sock.exists(),
-        "this process is alive, so its socket must survive the sweep"
+        live_survived,
+        "another croft is alive, so its socket must survive the sweep"
     );
     assert!(
         stranger.exists(),

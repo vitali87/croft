@@ -28990,7 +28990,14 @@ impl App {
         }
         let dir = croft_cache_dir();
         std::fs::create_dir_all(&dir).ok()?;
+        // ABSOLUTE, always. `croft_cache_dir` falls back to `.` when `HOME`
+        // is unset, and the client resolves what it is handed against the
+        // PANE's cwd - so a relative socket path published here reports "the
+        // croft that opened this pane is gone" from any pane that has `cd`'d,
+        // while the croft is running. The module's own invariant is that the
+        // server only ever sees absolute paths; this is where that starts.
         let path = crate::view_ipc::socket_path(&dir, std::process::id());
+        let path = std::path::absolute(&path).unwrap_or(path);
         sweep_dead_view_sockets(&dir);
         let listener = prepare_view_listener(&path).ok()?;
         // Published through a `OnceLock` read at SPAWN time rather than
@@ -45061,11 +45068,7 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(pid) = name
-            .strip_prefix("view-")
-            .and_then(|r| r.strip_suffix(".sock"))
-            .and_then(|p| p.parse::<u32>().ok())
-        else {
+        let Some(pid) = crate::view_ipc::pid_of_socket(name) else {
             continue;
         };
         // Signal 0 checks existence and permission without delivering

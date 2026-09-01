@@ -85,7 +85,48 @@ impl ViewRequest {
 /// first. The name is kept short because an `AF_UNIX` path is capped near
 /// 104 bytes on macOS and the cache dir already eats most of that.
 pub fn socket_path(cache_dir: &Path, pid: u32) -> PathBuf {
-    cache_dir.join(format!("view-{pid}.sock"))
+    socket_path_with(cache_dir, pid, &nonce())
+}
+
+/// A short random tail, so a recycled pid cannot aim a stale
+/// `CROFT_VIEW_SOCK` at a DIFFERENT croft.
+///
+/// The pid alone made the name predictable in the wrong way. A process that
+/// outlives the croft that spawned it - a `nohup`, a `setsid`, a disowned
+/// job - keeps the variable, and once that pid is recycled by another croft
+/// the client connects successfully and the file opens in a window the user
+/// was not looking at. A refusal is recoverable and says what happened; the
+/// wrong window is silent.
+///
+/// The pid stays FIRST so the sweep can still read it, and six hex
+/// characters cost little against the 104-byte `AF_UNIX` path budget.
+fn nonce() -> String {
+    // No rand dependency for six characters: the address of a heap
+    // allocation and the clock are both unpredictable enough for a name
+    // whose only job is to differ from a previous boot's.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let here = Box::into_raw(Box::new(0u8));
+    let mixed = now ^ (here as u64);
+    // SAFETY: the pointer came from `Box::into_raw` one line above and has
+    // not been used since.
+    drop(unsafe { Box::from_raw(here) });
+    format!("{:06x}", mixed & 0xff_ffff)
+}
+
+pub fn socket_path_with(cache_dir: &Path, pid: u32, nonce: &str) -> PathBuf {
+    cache_dir.join(format!("view-{pid}-{nonce}.sock"))
+}
+
+/// The pid a socket file name was made for, or None if the name is not one
+/// croft wrote. Both spellings are read: a socket left by a croft from
+/// before the nonce existed is still that croft's to spare or to clear.
+pub fn pid_of_socket(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("view-")?.strip_suffix(".sock")?;
+    let head = rest.split_once('-').map_or(rest, |(pid, _)| pid);
+    head.parse::<u32>().ok()
 }
 
 /// Resolve the user's argument against the client's cwd.
@@ -407,7 +448,12 @@ pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> anyhow
         {
             Ok(mut f) => {
                 std::io::Write::write_all(&mut f, bytes)?;
-                return Ok(path);
+                // Absolute for the same reason the socket path is: `-` is the
+                // one branch that never calls `resolve`, so a relative name
+                // here reaches the server, which resolves it against CROFT's
+                // cwd rather than the client's and opens a different file or
+                // none. `croft_cache_dir` is relative whenever `HOME` is.
+                return Ok(std::path::absolute(&path).unwrap_or(path));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 64 => {
                 attempt += 1;
@@ -551,9 +597,19 @@ mod tests {
 
     #[test]
     fn the_socket_is_keyed_by_pid_so_two_crofts_do_not_contend() {
+        // The name is `view-<pid>-<nonce>.sock` now, so this pins the two
+        // properties rather than the spelling: different crofts never share a
+        // path, and the pid stays readable, which is what the sweep needs to
+        // tell a dead croft's socket from a live one's.
         let dir = Path::new("/c");
         assert_ne!(socket_path(dir, 10), socket_path(dir, 11));
-        assert_eq!(socket_path(dir, 10), PathBuf::from("/c/view-10.sock"));
+        let ten = socket_path(dir, 10);
+        let name = ten.file_name().unwrap().to_str().unwrap();
+        assert_eq!(pid_of_socket(name), Some(10));
+        assert!(
+            ten.starts_with("/c"),
+            "and it stays in the cache dir: {ten:?}"
+        );
     }
 
     #[test]
@@ -675,6 +731,38 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"first");
         assert_eq!(std::fs::read(&b).unwrap(), b"second");
+    }
+
+    #[test]
+    fn a_socket_name_carries_the_pid_first_and_a_tail_that_differs() {
+        // The pid stays readable by the sweep, and the tail is what stops a
+        // recycled pid from aiming a stale `CROFT_VIEW_SOCK` at a different
+        // croft: two sockets for the SAME pid must not be the same file.
+        let dir = PathBuf::from("/tmp/croft-test");
+        let a = socket_path(&dir, 4242);
+        let b = socket_path(&dir, 4242);
+        let name_a = a.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            pid_of_socket(name_a),
+            Some(4242),
+            "the sweep must read the pid"
+        );
+        assert_ne!(a, b, "two binds by one pid must not collide on one name");
+        assert!(
+            name_a.len() < 104,
+            "the whole name has to fit an AF_UNIX path with room for the dir"
+        );
+    }
+
+    #[test]
+    fn a_socket_name_from_before_the_nonce_is_still_read() {
+        // A croft that started before this change owns `view-<pid>.sock`, and
+        // the sweep must still spare or clear it by pid rather than skip it
+        // as unrecognised and leave it forever.
+        assert_eq!(pid_of_socket("view-77.sock"), Some(77));
+        assert_eq!(pid_of_socket("view-77-a1b2c3.sock"), Some(77));
+        assert_eq!(pid_of_socket("not-a-view-socket"), None);
+        assert_eq!(pid_of_socket("view-notapid.sock"), None);
     }
 
     #[test]
