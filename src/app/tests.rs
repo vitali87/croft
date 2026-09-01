@@ -24787,17 +24787,23 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
     );
     // The restored pane runs a live shell.
     app2.terminals[1].write_input(b"s=ali; echo ${s}ve-42\n");
-    let mut waited = 0u32;
-    while !app2.terminals[1]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.contains("alive-42"))
-    {
-        assert!(waited < 8000, "restored pane's shell is not alive");
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        waited += 60;
-    }
+    // Load-scaled, not a fixed 8000ms: what blows a wait on a spawned shell
+    // is contention, which is a property of what else the suite is doing
+    // rather than of this test, and `test_budget` is where that reasoning
+    // already lives (#307/#422). The old constant is this call's `base`
+    // divided by the calibration, so a quiet machine waits what it waited
+    // before and a loaded one waits longer instead of failing (#397).
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(4),
+        "the restored pane's shell to answer",
+        || {
+            app2.terminals[1]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("alive-42"))
+        },
+    );
 
     // Closing back down to one default pane prunes the record, so a plain
     // single-shell workspace never grows the file.
@@ -30334,6 +30340,14 @@ fn quick_select_labels_follow_content_that_streams_below_them() {
     app.focus_pane(Pane::Terminal);
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut term = ratatui::Terminal::new(backend).unwrap();
+    // The panel over the editor, so the pane has ROWS. Unmaximized it is five
+    // rows tall here, and this test parks its URL four rows from the bottom:
+    // one row of slack against a prompt that is written by a real shell and
+    // wraps to three or four rows on a machine with a long hostname and path.
+    // That is the whole of this test's entry in #397 - measured at 3 failures
+    // in 20 runs under load, and the URL scrolling off the top is what the
+    // failure prints. Maximizing leaves sixteen rows of slack instead of one.
+    app.toggle_terminal_maximize();
     term.draw(|f| app.render(f)).unwrap();
     // Park the cursor at the pane bottom so every further row SCROLLS.
     let h = app.terminals[0].last_inner.height as usize;
