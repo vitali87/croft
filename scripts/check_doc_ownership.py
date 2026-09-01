@@ -44,16 +44,20 @@ ITEM = re.compile(
     # merely undocumented. The `const A: u8` declaration is a branch below,
     # reached when this optional one is not taken.
     r"(?:default\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
+    # `r#` belongs to the name it prefixes. Without it here, `r#type` and
+    # `r#match` in one impl both key as `r`, and the "any documented" reading
+    # then hides a capture on either behind the other's surviving prose -
+    # the #405 collision the impl qualifier exists to prevent, one level down.
     r"(?:extern\s+\"[^\"]*\"\s+)?(?:"
-    r"fn\s+([A-Za-z_]\w*)"
-    r"|const\s+([A-Za-z_]\w*)\s*:"
-    r"|static\s+(?:mut\s+)?([A-Za-z_]\w*)\s*:"
-    r"|struct\s+([A-Za-z_]\w*)"
-    r"|enum\s+([A-Za-z_]\w*)"
-    r"|union\s+([A-Za-z_]\w*)"
-    r"|trait\s+([A-Za-z_]\w*)"
-    r"|type\s+([A-Za-z_]\w*)"
-    r"|macro_rules!\s+([A-Za-z_]\w*)"
+    r"fn\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|const\s+((?:r#)?[A-Za-z_]\w*)\s*:"
+    r"|static\s+(?:mut\s+)?((?:r#)?[A-Za-z_]\w*)\s*:"
+    r"|struct\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|enum\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|union\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|trait\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|type\s+((?:r#)?[A-Za-z_]\w*)"
+    r"|macro_rules!\s+((?:r#)?[A-Za-z_]\w*)"
     r")"
 )
 
@@ -612,6 +616,29 @@ def reassigned_docs(before, after):
 SUBJECT_KEY = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:#\[[^\]]*\]\s*)*((?:r#)?[A-Za-z_]\w*)")
 
 
+# Words that lead an item rather than name one.
+ITEM_KEYWORDS = frozenset(
+    {
+        "mod",
+        "impl",
+        "trait",
+        "enum",
+        "struct",
+        "union",
+        "type",
+        "const",
+        "static",
+        "fn",
+        "macro_rules!",
+        "pub",
+        "unsafe",
+        "async",
+        "default",
+        "extern",
+    }
+)
+
+
 def subject_key(line):
     """The name to declare a deliberate removal against, for a subject line
     `ITEM` does not model.
@@ -622,7 +649,27 @@ def subject_key(line):
     which is the one thing that turns a gate into an obstacle.
     """
     m = SUBJECT_KEY.match(line)
-    return m.group(1) if m else None
+    if not m:
+        return None
+    name = m.group(1)
+    if name in ITEM_KEYWORDS:
+        # A keyword-led line: the NAME is the word after it. `mod theme;` is
+        # exactly the unmodelled-item case this fallback exists for, and
+        # keying it as `mod` made one `doc-removal: f.rs::mod` excuse every
+        # captured `mod` in that file.
+        rest = SUBJECT_KEY.match(line[m.end():].lstrip())
+        return rest.group(1) if rest else None
+    return name
+
+
+def git_ok(*args):
+    """Whether a git command succeeds, for a question rather than an answer."""
+    return (
+        subprocess.run(
+            ("git",) + args, capture_output=True, text=True, check=False
+        ).returncode
+        == 0
+    )
 
 
 def item_name(line):
@@ -683,7 +730,7 @@ def main():
                         and not after[name]
                         and (f, name) not in exempt
                         and not head_state[f].get(name, False)
-                        and not any(l[0] == f and l[1] == name for l in losses)
+                        and not any(loss[0] == f and loss[1] == name for loss in losses)
                     ):
                         # Name the commit the doc was last seen at. Saying
                         # "at {base}" would be wrong for a file the branch
@@ -719,18 +766,38 @@ def main():
             continue
         for line_no, first, follower in orphaned_docs(head_text):
             orphans.append((f, line_no, first, follower))
+        # `--no-merges`, and the omission is not a shortcut. A merge's first
+        # parent is the branch tip, so the pair `(M^, M)` is everything the
+        # OTHER side brought in, replayed as though this branch had written
+        # it - and this repo's convention is to merge main into a branch that
+        # needs it, so that is the common shape rather than an exotic one. The
+        # declaration that excused such a change on main is invisible here
+        # too, because the commit-message scan starts above the merge base, so
+        # the report would name an escape hatch the reader cannot use. What a
+        # merge itself resolves is covered by the base-to-head pair below.
         touched = git(
-            "log", f"{base}..{head}", "--format=%H", "--reverse", "--", f
+            "log", f"{base}..{head}", "--no-merges", "--format=%H", "--reverse", "--", f
         ).split()
         # Each commit against its OWN first parent, not against the previous
         # entry in the log. Path limiting simplifies history before `--reverse`
         # orders it, so two adjacent entries need not be parent and child, and
         # comparing them reads a doc as having moved between states that were
-        # never one edit apart. The base-to-head pair is kept as well: it is
-        # what sees a capture whose commits are all outside this file's own
-        # history, and it is the pair the real #454 instance was caught by.
+        # never one edit apart.
+        #
+        # The base-to-head pair is kept as well, and it is not redundant: the
+        # per-commit walk asks whether the line the prose landed on is new IN
+        # THAT PAIR, so a capture split across two commits - the thief added
+        # above the block in one, moved under it in the next - is invisible to
+        # every pair but this one. It is also the pair that caught the real
+        # #454 instance.
         pairs = [(git("show", f"{base}:{f}", allow_missing_path=True), head_text)]
         for rev in touched:
+            # A root commit has no `rev^`, which is a git failure rather than
+            # a missing path, so it would abort instead of being skipped.
+            # Unreachable under CI's full-depth checkout, reachable in a
+            # shallow clone running the documented local invocation.
+            if not git_ok("rev-parse", "--verify", f"{rev}^"):
+                continue
             pairs.append(
                 (
                     git("show", f"{rev}^:{f}", allow_missing_path=True),

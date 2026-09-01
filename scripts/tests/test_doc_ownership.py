@@ -46,6 +46,14 @@ class Repo:
     def branch(self, name: str):
         run(self.path, "git", "checkout", "-q", "-b", name)
 
+    def checkout(self, name: str):
+        run(self.path, "git", "checkout", "-q", name)
+
+    def merge(self, name: str):
+        """Merge `name` into the current branch, as this repo's convention
+        says to do when a branch needs main."""
+        run(self.path, "git", "merge", "-q", "--no-edit", name)
+
     def exit_code(self, base="main", head="HEAD"):
         """The gate's exit status: 1 when it found a capture, 0 when clean."""
         import os
@@ -967,6 +975,91 @@ class ReassignedDocTests(unittest.TestCase):
                 message="feat: match\n\ndoc-removal: a.rs::r#match",
             )
             self.assertEqual(repo.exit_code(), 1)
+
+    def test_merging_main_does_not_report_what_main_did(self):
+        """A merge's first parent is the branch tip, so the pair `(M^, M)` is
+        everything the OTHER side brought in. Replaying that as the branch's
+        own work reports a capture main already declared - and the
+        declaration is invisible here, since the commit-message scan starts
+        above the merge base, so the message names a hatch the reader cannot
+        use. This repo merges main into a branch that needs it, so the shape
+        is the convention rather than an exotic case."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "enum E {\n    /// Doc for Toggle.\n    Toggle,\n}\n")
+            repo.branch("feat")
+            # The branch touches the same file, far from the doc block.
+            repo.commit(
+                "a.rs",
+                "enum E {\n    /// Doc for Toggle.\n    Toggle,\n}\n\npub fn helper() {}\n",
+            )
+            repo.checkout("main")
+            repo.commit(
+                "a.rs",
+                "enum E {\n    /// Doc for Toggle.\n    /// Doc for Load.\n"
+                "    Load,\n    Toggle,\n}\n",
+                message="feat: load\n\ndoc-removal: a.rs::Toggle",
+            )
+            repo.checkout("feat")
+            repo.merge("main")
+            self.assertEqual(
+                repo.exit_code(base="main"),
+                0,
+                "main's own change, declared on main, is not this branch's capture",
+            )
+
+    def test_a_capture_after_a_merge_is_still_caught(self):
+        """The control for the one above: skipping merges must not skip the
+        branch's own commits that follow one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "enum E {\n    /// Doc for A.\n    A,\n}\n")
+            repo.branch("feat")
+            repo.commit("b.rs", "fn b() {}\n")
+            repo.checkout("main")
+            repo.commit("c.rs", "fn c() {}\n")
+            repo.checkout("feat")
+            repo.merge("main")
+            repo.commit(
+                "a.rs",
+                "enum E {\n    /// Doc for A.\n    /// Doc for B.\n    B,\n    A,\n}\n",
+            )
+            self.assertEqual(repo.exit_code(base="main"), 1)
+
+    def test_a_capture_split_across_two_commits_is_caught(self):
+        """What the base-to-head pair is FOR, and what nothing pinned. Each
+        per-commit pair asks whether the line the prose landed on is new IN
+        THAT PAIR, so a thief added above the block in one commit and moved
+        under it in the next is invisible to every pair but this one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "enum E {\n    /// Doc for A.\n    A,\n}\n")
+            repo.branch("feat")
+            # B arrives ABOVE the block: no capture yet.
+            repo.commit("a.rs", "enum E {\n    B,\n    /// Doc for A.\n    A,\n}\n")
+            # and then moves UNDER it, which is the capture.
+            repo.commit("a.rs", "enum E {\n    /// Doc for A.\n    B,\n    A,\n}\n")
+            self.assertEqual(repo.exit_code(), 1)
+
+    def test_a_keyword_led_subject_keys_on_the_name(self):
+        """`mod theme;` is the unmodelled-item case the fallback exists for.
+        Keying it as `mod` made one declaration excuse every captured `mod`
+        in the file."""
+        self.assertEqual(gate.subject_key("mod theme;"), "theme")
+        self.assertEqual(gate.subject_key("pub mod pane;"), "pane")
+        self.assertEqual(gate.subject_key("impl Foo {"), "Foo")
+        self.assertEqual(gate.subject_key("    A,"), "A")
+
+    def test_two_raw_methods_in_one_impl_are_two_keys(self):
+        """`ITEM` stopping at `r` collapsed them, and the "any documented"
+        reading then hid a capture on either behind the other's prose."""
+        text = (
+            "impl Foo {\n    /// Doc for type.\n    pub fn r#type(&self) {}\n\n"
+            "    /// Doc for match.\n    pub fn r#match(&self) {}\n}\n"
+        )
+        keys = gate.documented(text)
+        self.assertIn("Foo::r#type", keys)
+        self.assertIn("Foo::r#match", keys)
 
     def test_a_block_doc_closer_is_not_prose(self):
         """`*/` closes a `/** */` block and says nothing about any item, but
