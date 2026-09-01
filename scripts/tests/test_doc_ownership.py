@@ -932,3 +932,27 @@ class ReassignedDocTests(unittest.TestCase):
                 1,
                 f"the head-only pass alone: {out.getvalue()}",
             )
+
+    def test_a_block_doc_closer_is_not_prose(self):
+        """`*/` closes a `/** */` block and says nothing about any item, but
+        it matches the continuation-line shape, so it read as a doc line with
+        the prose `/`. Reported, it names a line the reader cannot act on."""
+        before = "/**\n */\nfn a() {}\n"
+        after = "/**\n */\nfn zz() {}\n\nfn a() {}\n"
+        self.assertEqual(
+            gate.reassigned_docs(before, after),
+            [],
+            "the delimiter is not the documentation",
+        )
+
+    def test_a_captured_block_doc_is_reported_once(self):
+        """One insertion is one defect. Keying the report on each doc LINE
+        turned a three-line block into three annotations that name the same
+        item, the same thief and the same file."""
+        before = "/** Doc for A.\n * More.\n */\nfn a() {}\n"
+        after = "/** Doc for A.\n * More.\n */\nfn zz() {}\n\nfn a() {}\n"
+        found = gate.reassigned_docs(before, after)
+        self.assertEqual(
+            len(found), 1, f"one block above one item is one report: {found}"
+        )
+        self.assertEqual(found[0][1], "/** Doc for A.", "and it names the block's first line")

@@ -500,9 +500,11 @@ def _doc_blocks(lines, kinds):
 
 
 # A doc line carrying no prose of its own: the `///` separators a long block
-# is full of. They repeat, they move whenever anything near them moves, and
-# they say nothing about which item they describe.
-DOC_PROSE = re.compile(r"^\s*(?:///|/\*\*+|\*)\s*(\S.*)$")
+# is full of, and the `*/` that closes a `/** */` one. They repeat, they move
+# whenever anything near them moves, and they say nothing about which item
+# they describe. The lookahead is what keeps `*/` out: the continuation-line
+# branch matches its `*`, leaving `/` to read as prose.
+DOC_PROSE = re.compile(r"^\s*(?:///|/\*\*+|\*)\s*(?!\*?/\s*$)(\S.*)$")
 
 
 def doc_subjects(text):
@@ -594,7 +596,14 @@ def reassigned_docs(before, after):
         if before_lines.get(new, 0):
             continue
         found.append((line_no, doc, old, new))
-    return sorted(found)
+    # One insertion is one defect. Every line of a block sits above the same
+    # item, so a three-line doc reported per line names the same victim and
+    # the same thief three times; the block's FIRST line is the one a reader
+    # recognises, and it is the lowest line number.
+    per_subject = {}
+    for line_no, doc, old, new in sorted(found):
+        per_subject.setdefault(old, (line_no, doc, old, new))
+    return sorted(per_subject.values())
 
 
 SUBJECT_KEY = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:#\[[^\]]*\]\s*)*([A-Za-z_]\w*)")
