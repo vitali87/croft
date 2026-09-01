@@ -2561,10 +2561,15 @@ fn an_unmatched_modified_click_does_not_arm_the_tracker() {
     // single-cell selection and wipe it, which is what the first draft of this
     // control did and why it failed.
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
-    assert!(
-        app.terminal()
-            .selection_text()
-            .contains("hello_world_token"),
+    // The WORD, exactly. `select_word_at` brackets the alphanumeric run
+    // around the pivot and `selection_text` extracts that span, so a correct
+    // select yields the token and nothing else; `contains` would also accept
+    // a selection wider than the word, which is the shape a scroll-clock
+    // rebase can produce. This PR tightened two status assertions for the
+    // same reason, so its own new control should not be looser.
+    assert_eq!(
+        app.terminal().selection_text(),
+        "hello_world_token",
         "a PLAIN click pairing with the plain click above must select the \
          word: the tracker arms on plain clicks and refuses only modified \
          ones, and without this the negative above proves nothing"
@@ -2630,9 +2635,14 @@ fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal(
     // exact span test on this pane and this cell to produce `(col, row)`, so
     // repeating it can only fail if the live shell scrolled the grid between
     // the search and the re-read - a different fault from the one such an
-    // assertion would name. The span property is pinned by the fixture: the
-    // payload row opens with a prompt, so a row-level predicate resolves the
-    // wrong cell and the positive control below fails by name.
+    // assertion would name.
+    //
+    // The span property is not pinned HERE. This test's payload prints at
+    // column 0, where a row predicate and a span predicate select the same
+    // cell, and both assertions below are negatives. Its red state lives in
+    // `an_unmatched_modified_click_does_not_arm_the_tracker`, whose payload
+    // row opens with a shell prefix and whose positive control fails by name
+    // under a row predicate.
 
     let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
     ctrl.modifiers = KeyModifiers::CONTROL;
@@ -36743,7 +36753,7 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
         x: 1,
         y: 1,
         width: 40,
-        height: 24,
+        height: 12,
     };
     // `resize`, not a `CSI 8 ; rows ; cols t` feed: the emulator leaves that
     // sequence unhandled, so the grid kept the 80x24 it was spawned with while
@@ -36752,15 +36762,16 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
     // read the same `grid_lines` the recorder does: a fixture can be wrong
     // about itself while everything asserted on it holds.
     //
-    // 24 rows rather than the 6 the rect used to claim, and the height is the
-    // point rather than a detail. `resize` writes through to the pty master,
-    // so this pane's live shell takes a SIGWINCH the old feed never sent, and
-    // then prints. On a 6-row grid `line-199` lands one row above the bottom,
-    // so five rows of shell output evict it and the test starts failing under
-    // exactly the load #397 is about. At 24 it has the slack the unhandled
-    // escape sequence used to give it by accident, while 200 lines still
-    // overflow the screen many times over, which is what this test is about.
-    app.terminals[0].resize(40, 24);
+    // 12 rows, and the number is chosen against two failures rather than one.
+    // At 6 the slack is gone: `resize` writes through to the pty master, so
+    // this pane's live shell takes a SIGWINCH the old feed never sent and
+    // then prints, and `line-199` sits one row above the bottom, where five
+    // rows of output evict it. At 24 the slack is back but the header
+    // assertion below cannot fail, because 24 is the height the pane is
+    // SPAWNED at: restore the old unhandled escape sequence and every
+    // assertion here still passes. 12 is neither, so the fixture keeps
+    // eleven rows of tolerance AND the control that proves it is honest.
+    app.terminals[0].resize(40, 12);
 
     // Far more output than the screen holds, so most of it is scrollback.
     let mut flood = String::new();
