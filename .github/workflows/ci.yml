@@ -37,11 +37,24 @@ jobs:
     name: version bump + release notes
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # This job now runs a SCRIPT from the submitted branch, which the inline
+    # shell above it never did, so it takes the same posture the doc-ownership
+    # job below documents: only what it needs to read the diff, and no
+    # checkout token left in the local git config for that script to reach.
+    #
+    # Pinning the script to the base revision instead would buy nothing on
+    # this trigger: `pull_request` runs the workflow file from the merge of
+    # the branch, so a PR that wanted to neuter the gate would edit the job
+    # rather than the helper it calls. What is worth removing is the
+    # CREDENTIAL, not the ability to run branch code.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           # Full history so the merge-base with the PR base resolves.
           fetch-depth: 0
+          persist-credentials: false
       - name: Shipped changes must bump the version and replace the notes
         run: |
           set -euo pipefail
