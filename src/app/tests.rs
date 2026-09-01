@@ -36778,9 +36778,26 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
         .expect("an output event");
 
     let rows = frame.split("\r\n").count();
+    // The claim is the VISIBLE screen, so the bound is the screen's own
+    // height, taken from the pane rather than guessed: `grid_lines` returns
+    // the scrollback first, and the visible rows are what remains after its
+    // negative `top`. The bound of 64 this replaces admitted the regression
+    // it existed to reject - a recorder that wrote the last 64 rows carries
+    // 40 rows of history AND `line-199`, so every assertion here passed on
+    // it (verified by making `record_active_screen` do exactly that).
+    let (all, top) = app.terminals[0].grid_lines();
+    let visible = all.len() - (-top).max(0) as usize;
+    assert_eq!(
+        rows, visible,
+        "the frame must be the {visible}-row screen, not {rows} rows of history"
+    );
+    // And a check that does not go through `grid_lines` at all, so a wrong
+    // slice cannot agree with a wrong expectation: any frame wider than the
+    // screen reaches back into the flood, and `line-100` is far outside a
+    // screen-sized window at the recent end of 200 lines.
     assert!(
-        rows <= 64,
-        "the frame carries {rows} rows — that is scrollback, not a screen"
+        !frame.contains("line-100"),
+        "the frame reaches back into scrollback: {frame:?}"
     );
     // And it is the RECENT end of the output, not the oldest.
     // `line-199` alone. The `|| contains("line-19")` this replaces was both
