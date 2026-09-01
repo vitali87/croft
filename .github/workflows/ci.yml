@@ -32,15 +32,29 @@ jobs:
     # describes THIS version instead of silently carrying the previous
     # release's story. One file per version (#399) so two open PRs describing
     # different changes never collide on the same file.
-    # Docs / CI / test-only changes ship nothing and are exempt.
+    # Docs / CI / test-only changes ship nothing and are exempt, including a
+    # diff confined to a `#[cfg(test)]` module inside a shipped file (#461).
     name: version bump + release notes
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # This job now runs a SCRIPT from the submitted branch, which the inline
+    # shell above it never did, so it takes the same posture the doc-ownership
+    # job below documents: only what it needs to read the diff, and no
+    # checkout token left in the local git config for that script to reach.
+    #
+    # Pinning the script to the base revision instead would buy nothing on
+    # this trigger: `pull_request` runs the workflow file from the merge of
+    # the branch, so a PR that wanted to neuter the gate would edit the job
+    # rather than the helper it calls. What is worth removing is the
+    # CREDENTIAL, not the ability to run branch code.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           # Full history so the merge-base with the PR base resolves.
           fetch-depth: 0
+          persist-credentials: false
       - name: Shipped changes must bump the version and replace the notes
         run: |
           set -euo pipefail
@@ -56,12 +70,39 @@ jobs:
           shipped="$(printf '%s\n' "$changed" \
             | grep -E '^(src/|assets/|build\.rs$|Cargo\.toml$|Cargo\.lock$)' \
             | grep -vE '^(src/app/tests\.rs|tests/)' || true)"
+          # A `.rs` file whose diff touches nothing outside a
+          # `#[cfg(test)] mod tests` produces a byte-identical binary, and
+          # croft keeps most unit tests beside the code they cover, so that
+          # is the ordinary shape of a test-only fix here (#461). The path
+          # list above only reaches whole test FILES. Anything the parse is
+          # unsure about counts as shipped: waiving a bump that was needed
+          # puts two binaries on one version, which is what this job exists
+          # to prevent.
+          # Read the list a line at a time rather than word-splitting it: an
+          # unquoted `for f in $shipped` also expands globs, so a path
+          # holding `[`, `*` or `?` would reach the filter as a pathspec git
+          # cannot resolve, and a path holding a space would arrive as two.
+          kept="$(mktemp)"
+          trap 'rm -f "$kept"' EXIT
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if python3 scripts/ships_nothing.py "$base" HEAD "$f"; then
+              # The status says "ships nothing"; it does not say why, and the
+              # script has more than one way to reach it. Claiming the reason
+              # here asserted "confined to #[cfg(test)]" about files that had
+              # no test module at all.
+              echo "$f: ships nothing."
+            else
+              printf '%s\n' "$f" >> "$kept"
+            fi
+          done <<< "$shipped"
+          shipped="$(cat "$kept")"
           if [ -z "$shipped" ]; then
             echo "No shipped files changed; no release required."
             exit 0
           fi
           echo "Shipped files changed:"
-          printf '  %s\n' $shipped
+          printf '  %s\n' "$shipped"
           ver() { git show "$1:Cargo.toml" | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -n1; }
           old="$(ver "$base")"
           new="$(ver HEAD)"

@@ -217,7 +217,12 @@ current version's file may change in a PR: an older one describes a release
 that has already shipped.
 
 CI enforces all of it (the `version bump + release notes` job). Docs, CI, and
-test-only PRs (`src/app/tests.rs`, `tests/`) are exempt.
+test-only PRs are exempt: `src/app/tests.rs` and `tests/` by path, and a `.rs`
+file whose diff touches nothing outside a `#[cfg(test)]` module, since most of
+croft's unit tests sit beside the code they cover and a change confined to them
+produces a byte-identical binary. Anything that filter is unsure about counts
+as shipped, so an unexpected bump request is the failure it prefers over a
+waived one.
 
 ## Insert new items AFTER a complete item, never above a doc block
 

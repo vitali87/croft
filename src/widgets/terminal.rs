@@ -523,6 +523,21 @@ pub struct PtyTerminal {
     /// mirrored keystrokes (it still gets its own input when focused).
     /// Toggled per pane with Cmd+K Shift+I; session-scoped.
     pub broadcast_excluded: bool,
+    /// Collapsed to a one-column strip (#313): the pane keeps running and
+    /// keeps its place in the row, but yields its width to the panes still
+    /// expanded.
+    ///
+    /// A flag on the PANE rather than a set of indices held by the app.
+    /// Indices shift when a pane is closed or reordered, so a stored one
+    /// comes to name a different terminal than it was set against - the
+    /// same class of bug as #440, where a positional index named the wrong
+    /// command after an eviction. A flag that travels with the pane cannot
+    /// be pointed at the wrong one.
+    ///
+    /// Session-scoped, and deliberately not written to the terminal session
+    /// store: collapse says "I am not looking at this right now", which is
+    /// not a fact worth restoring a workspace into.
+    pub collapsed: bool,
     /// When focused, draw the orange→green gradient border (Black theme)
     /// instead of the solid blue one. Set by the app's focus/theme sync.
     pub focus_gradient: bool,
@@ -2097,6 +2112,7 @@ impl PtyTerminal {
             size_shared,
             focused: false,
             broadcast_excluded: false,
+            collapsed: false,
             focus_gradient: false,
             theme: crate::theme::Theme::default(),
             last_area: Rect::default(),
@@ -3612,6 +3628,19 @@ impl PtyTerminal {
         self.images.lock().unwrap().clear();
         self.marks.lock().unwrap().clear();
         self.pty_dirty.store(true, Ordering::Release);
+    }
+
+    /// The PTY grid's current column count.
+    ///
+    /// Test-only, and the point of it is #313: a collapsed pane must not be
+    /// reflowed into its one-column strip. `resize` clamps to two columns, so
+    /// a collapsed pane that got rendered would not crash - it would quietly
+    /// rewrap the running shell to a two-column grid and lose everything on
+    /// its screen. Reading the real grid width is what tells that apart from
+    /// a pane that was simply left alone.
+    #[cfg(test)]
+    pub fn grid_cols(&self) -> u16 {
+        self.cols
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
