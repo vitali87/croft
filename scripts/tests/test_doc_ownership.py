@@ -648,13 +648,13 @@ class HeadOnlyOrphanTests(unittest.TestCase):
             repo.commit("a.rs", "fn existing() {}\n\n/// Documents nothing at all.\n")
             self.assertEqual(repo.exit_code(), 1)
 
-    def test_a_capture_by_a_documented_newcomer_is_a_known_miss(self):
-        """The residue #427 keeps. When the inserted item carries its OWN
-        doc, nothing is stranded — the original prose has silently moved and
-        both items look documented — so this pass cannot see it. Pinned as a
-        deliberate limitation rather than left for someone to discover: if a
-        future change makes this exit 1, that is an improvement and this test
-        should be inverted, not deleted."""
+    def test_a_capture_by_a_documented_newcomer_is_caught(self):
+        """Was the residue #427 kept, and is now caught by the diff pass
+        (#455). When the inserted item carries its OWN doc nothing is
+        stranded, so the head-only pass still cannot see it; what gives it
+        away is that `/// Documents alpha.` sat above `fn alpha()` earlier on
+        the branch and sits above a newly inserted item now, leaving `alpha`
+        bare. Inverted rather than deleted, as the earlier version asked."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Repo(Path(tmp))
             repo.commit("a.rs", "fn existing() {}\n")
@@ -666,7 +666,7 @@ class HeadOnlyOrphanTests(unittest.TestCase):
                 "/// ...but now sits above the newcomer.\n"
                 "struct Inserted;\n\nfn alpha() {}\n",
             )
-            self.assertEqual(repo.exit_code(), 0)
+            self.assertEqual(repo.exit_code(), 1)
 
     def test_a_documented_re_export_is_not_reported(self):
         """`pub use` CAN legitimately carry a doc — rustdoc renders it — so
@@ -698,3 +698,85 @@ class HeadOnlyOrphanTests(unittest.TestCase):
             repo.commit("b.rs", "fn b() {}\n\nfn c() {}\n")
             self.assertEqual(repo.exit_code(), 0)
 
+
+
+class ReassignedDocTests(unittest.TestCase):
+    """The third pass (#455): a doc line that changed the item it sits above.
+
+    The head-only pass sees a capture only through the prose it STRANDS, and
+    a capture whose newcomer brings its own doc strands nothing: rustfmt
+    leaves the two `///` lines contiguous, they read as one ordinary block,
+    and the item below them is the thief. What separates that from a genuine
+    two-line doc block is not in the snapshot at all - it is in the diff,
+    where the same line used to sit above a different item.
+    """
+
+    def test_a_contiguous_capture_of_a_variants_doc_is_caught(self):
+        """#455, reduced from the instance that shipped in #454: the victim
+        is an enum variant, which `ITEM` does not model, and the stolen doc
+        is contiguous with the thief's, which the head-only pass reads as
+        one block. Both existing passes are blind to it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit(
+                "a.rs",
+                "enum E {\n"
+                "    /// Doc for A, an existing item.\n"
+                "    A,\n"
+                "}\n",
+            )
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "enum E {\n"
+                "    /// Doc for A, an existing item.\n"
+                "    /// Doc for B, inserted above it.\n"
+                "    B,\n"
+                "    A,\n"
+                "}\n",
+            )
+            self.assertEqual(repo.exit_code(), 1)
+
+    def test_the_error_names_the_line_and_both_items(self):
+        """A gate that says only "something moved" sends the reader hunting.
+        The message has to carry the prose, what it used to describe, and
+        what it describes now."""
+        before = "enum E {\n    /// Doc for A.\n    A,\n}\n"
+        after = "enum E {\n    /// Doc for A.\n    /// Doc for B.\n    B,\n    A,\n}\n"
+        found = gate.reassigned_docs(before, after)
+        self.assertEqual(len(found), 1, found)
+        _line, doc, old, new = found[0]
+        self.assertEqual(doc, "/// Doc for A.")
+        self.assertEqual(old, "A,")
+        self.assertEqual(new, "B,")
+
+    def test_moving_a_doc_back_onto_its_own_item_is_not_a_capture(self):
+        """The corrective PR. Repairing a misattribution moves the prose the
+        other way, and the item it lands on is one that already existed -
+        which is exactly what an INSERTED thief is not."""
+        before = "enum E {\n    /// Doc for A.\n    B,\n    A,\n}\n"
+        after = "enum E {\n    B,\n    /// Doc for A.\n    A,\n}\n"
+        self.assertEqual(gate.reassigned_docs(before, after), [])
+
+    def test_reordering_documented_items_is_not_a_capture(self):
+        """Each doc travels with its own item, so no line changes owner."""
+        before = "enum E {\n    /// Doc A.\n    A,\n    /// Doc B.\n    B,\n}\n"
+        after = "enum E {\n    /// Doc B.\n    B,\n    /// Doc A.\n    A,\n}\n"
+        self.assertEqual(gate.reassigned_docs(before, after), [])
+
+    def test_a_renamed_item_is_not_a_capture(self):
+        """The old subject line is gone at head, so nothing was stranded."""
+        before = "/// Doc for alpha.\nfn alpha() {}\n"
+        after = "/// Doc for alpha.\nfn renamed() {}\n"
+        self.assertEqual(gate.reassigned_docs(before, after), [])
+
+    def test_a_victim_that_keeps_a_doc_of_its_own_is_not_reported(self):
+        """The swap that fixes a capture leaves both items documented. Only
+        prose that leaves an item BARE is a loss worth failing a PR over."""
+        # `Inserted` is new, and A keeps a doc line, so nothing is bare.
+        before = "enum E {\n    /// Doc A.\n    A,\n    /// Doc B.\n    B,\n}\n"
+        after = (
+            "enum E {\n    /// Doc A.\n    Inserted,\n"
+            "    /// Doc A, still here.\n    A,\n    /// Doc B.\n    B,\n}\n"
+        )
+        self.assertEqual(gate.reassigned_docs(before, after), [])
