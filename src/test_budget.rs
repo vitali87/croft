@@ -56,6 +56,22 @@ const MIN_SCALE: u32 = 2;
 /// to know about.
 const BASE_CALIBRATION: u32 = 2;
 
+/// The base the two restored-shell waits use (#397).
+///
+/// Shared rather than retyped at each call site, because the test that pins
+/// it has to be about THEM: an assertion over a literal written beside it
+/// stays green when a call site changes, which is the regression it exists
+/// to catch.
+///
+/// 2s because `await_spawned` multiplies by `BASE_CALIBRATION * load_scale`,
+/// which is 4 at the floor: these two replaced a fixed 8000ms, and this
+/// keeps that as what they still get on a quiet machine. Deliberately NOT a
+/// repo-wide rule - `a_terminal_link_binding_is_not_refused_for_an_editor_side_reason`
+/// converts an 8s constant with a 1s base, and reconciling the two is a
+/// question about that test's operation rather than about these.
+#[cfg(test)]
+pub(crate) const RESTORED_SHELL_BASE: Duration = Duration::from_secs(2);
+
 /// One-minute load average, where the platform reports one.
 fn load_average() -> Option<f64> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -349,18 +365,21 @@ mod tests {
         );
     }
 
-    /// A conversion must not be a cut. #397 replaced two `waited < 8000`
-    /// loops with `await_spawned`, and the base that does that honestly is
-    /// the one whose FLOOR is the constant it replaced: `MIN_SCALE`'s own
-    /// doc says a budget may never shrink below what these tests already
-    /// had, since every one of them was observed failing at 1x. A 1s base
-    /// would have given them 4s on a quiet machine, which is half.
+    /// The two restored-shell waits keep the 8000ms they replaced.
+    ///
+    /// Written against `RESTORED_SHELL_BASE`, which those call sites use, so
+    /// lowering the base fails HERE. The first version asserted over a
+    /// literal `Duration::from_secs(2)` retyped beside it, which left both
+    /// call sites free to change underneath it, and reduced to
+    /// `BASE_CALIBRATION * MIN_SCALE >= 4` - already asserted, more
+    /// strongly, by `the_worst_case_stretch_is_unchanged` above.
     #[test]
     fn a_converted_wait_keeps_the_budget_it_replaced() {
-        let floor = Duration::from_secs(2) * BASE_CALIBRATION * MIN_SCALE;
+        let floor = RESTORED_SHELL_BASE * BASE_CALIBRATION * MIN_SCALE;
         assert!(
             floor >= Duration::from_millis(8000),
-            "a 2s base must reproduce the 8000ms it replaced at the floor, got {floor:?}"
+            "the restored-shell base must reproduce the 8000ms it replaced at \
+             the floor, got {floor:?}"
         );
     }
 

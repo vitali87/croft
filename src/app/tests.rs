@@ -24465,7 +24465,7 @@ fn undo_close_restores_a_closed_terminal_pane_with_its_process_alive() {
     // a shell echoing one line, waited on under whatever load the suite is
     // running. Same 2s base, so the same 8s floor.
     crate::test_budget::await_spawned(
-        std::time::Duration::from_secs(2),
+        crate::test_budget::RESTORED_SHELL_BASE,
         "the reopened pane's shell to answer",
         || {
             app.terminals[1]
@@ -24804,7 +24804,7 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
     // never shrink below the budgets these tests already had, since every one
     // of them was observed failing at 1x.
     crate::test_budget::await_spawned(
-        std::time::Duration::from_secs(2),
+        crate::test_budget::RESTORED_SHELL_BASE,
         "the restored pane's shell to answer",
         || {
             app2.terminals[1]
@@ -30358,6 +30358,14 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
     term.draw(|f| app.render(f)).unwrap();
     let inner = app.terminals[0].last_inner;
     let h = inner.height as usize;
+    // The same tripwire the sibling carries. This fixture's own band is
+    // wider - it needs eight rows, not sixteen - but a panel that shrank
+    // below the sibling's threshold should fail in both, not silently pass
+    // here while failing there.
+    assert!(
+        h >= 16,
+        "the maximized panel must leave slack for the wrapped prompt; got {h} rows"
+    );
 
     app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
     app.terminals[0].feed_bytes_for_test(b"\r\nhttp://drift.io");
@@ -30379,9 +30387,13 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
                 .map(|(x, y)| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
         })
         .collect();
+    // The label clause is what makes `open_terminal_quick_select` above
+    // load-bearing: without it the bare URL satisfies this assertion just as
+    // well as a labelled one, and deleting the call left the test green.
     assert!(
-        joined.contains("ttp://drift.io"),
-        "a four-row prompt must not cost the URL its place on screen: {joined:?}"
+        joined.contains("ttp://drift.io") && !joined.contains("http://drift.io"),
+        "a four-row prompt must not cost the URL its place on screen, and a \
+         label must still cover its first cell: {joined:?}"
     );
 }
 
