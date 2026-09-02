@@ -45063,13 +45063,6 @@ struct HttpRunOutcome {
 /// would be asserting against its own setup: production could drop the call
 /// and the "the drain does not block" test would still pass, which is a
 /// check that cannot fail.
-/// Why the `croft view` socket could not be bound, if it could not.
-///
-/// A `static` because `bind_view_socket` runs before an `App` exists to hold
-/// it: `App::new` reads it once, right after the call, and puts it on the
-/// status line.
-static VIEW_BIND_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
 fn prepare_view_listener(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
     let listener = crate::session::bind_socket_0600(path)?;
     // Polled from the frame loop, so a blocking accept would stall every
@@ -45077,6 +45070,13 @@ fn prepare_view_listener(path: &Path) -> std::io::Result<std::os::unix::net::Uni
     listener.set_nonblocking(true)?;
     Ok(listener)
 }
+
+/// Why the `croft view` socket could not be bound, if it could not.
+///
+/// A `static` because `bind_view_socket` runs before an `App` exists to hold
+/// it: `App::new` reads it once, right after the call, and puts it on the
+/// status line.
+static VIEW_BIND_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Remove `view-<pid>-<nonce>.sock` files whose croft is gone (#362).
 ///
