@@ -257,6 +257,28 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false, hide = true)]
         repl: bool,
     },
+    /// Open a file in the croft that hosts this pane (#362).
+    ///
+    /// `imgcat` works over SSH because escape sequences travel through the
+    /// terminal, but croft's richer previews (paged PDFs, spreadsheets,
+    /// SQLite) are editor tabs, so a shell prompt had no way to ask for
+    /// one. This is that ask: the path is resolved against the shell's own
+    /// cwd and handed to the running croft, which opens it exactly as an
+    /// Explorer click would.
+    View {
+        /// File to open, or `-` to read the content from stdin.
+        ///
+        /// `OsString`, not `String`: a filename is bytes on Unix, and the
+        /// wire format goes to some trouble to carry those bytes intact.
+        /// Taking the argument as a `String` would have thrown them away at
+        /// the entry point, one call before the encoding that preserves them.
+        path: std::ffi::OsString,
+        /// Extension to stage piped bytes under, for content that has no
+        /// magic bytes to sniff (`--as csv`, `--as json`). Ignored unless
+        /// the path is `-`.
+        #[arg(long = "as")]
+        as_ext: Option<String>,
+    },
     /// One-time setup for the cross-compile fast path used by `croft <host>`:
     /// installs cargo-zigbuild and adds the two rustup targets croft ships
     /// binaries for (x86_64 / aarch64 musl). After this finishes, the
@@ -446,6 +468,21 @@ impl Cli {
                 }
                 crate::collab::ensure_relay(&socket)?;
                 crate::collab_agent::run(&socket, name.unwrap_or_else(|| "claude".into()))
+            }
+            Some(CliCommand::View { path, as_ext }) => {
+                // Printed and exited here rather than returned: an `Err` out
+                // of `run` reaches anyhow's `Debug`, which appends a full
+                // Rust backtrace whenever RUST_BACKTRACE is set, and it is
+                // set in this repo's CI, where the one-line-of-stderr test
+                // measured 42. Someone running `croft view` at a prompt
+                // should get a sentence about their file, not croft's stack.
+                if let Err(e) =
+                    crate::view_ipc::run(&path, as_ext.as_deref(), &crate::app::croft_cache_dir())
+                {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                Ok(())
             }
             Some(CliCommand::Pair {
                 workspace,
