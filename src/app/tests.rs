@@ -39009,6 +39009,16 @@ fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
 /// other test running in the same process. This binds the same way and
 /// publishes nothing, so the server half is exercised and the neighbours are
 /// left alone.
+fn seat_view_listener(app: &mut App, dir: &std::path::Path) -> std::path::PathBuf {
+    let sock = dir.join("view-test.sock");
+    // Deliberately the production helper: seating a hand-built listener here
+    // would let `prepare_view_listener` lose its non-blocking mode without a
+    // single test noticing.
+    let listener = crate::app::prepare_view_listener(&sock).unwrap();
+    app.view_listener = Some(listener);
+    sock
+}
+
 /// Accept one client from a NON-blocking listener, waiting for it (#362).
 ///
 /// `prepare_view_listener` makes the listener non-blocking on purpose, so a
@@ -39033,16 +39043,6 @@ fn accept_when_ready(
             Err(e) => panic!("accept failed: {e}"),
         }
     }
-}
-
-fn seat_view_listener(app: &mut App, dir: &std::path::Path) -> std::path::PathBuf {
-    let sock = dir.join("view-test.sock");
-    // Deliberately the production helper: seating a hand-built listener here
-    // would let `prepare_view_listener` lose its non-blocking mode without a
-    // single test noticing.
-    let listener = crate::app::prepare_view_listener(&sock).unwrap();
-    app.view_listener = Some(listener);
-    sock
 }
 
 /// Send one request from a client thread and hand back its reply.
