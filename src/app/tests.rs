@@ -2624,13 +2624,6 @@ fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal(
     // flaking half of the same defect its sibling had the vacuous half of.
     let (col, row) = cell_carrying(&app.terminals[0], "hello_world_token")
         .expect("the pane must show THIS test's token, or there is no word to mis-select");
-    assert!(
-        app.terminals[0]
-            .visible_text()
-            .contains("hello_world_token"),
-        "the terminal must actually show the token, or there is no word for a \
-         wrongly-armed tracker to select and this test cannot fail"
-    );
     // No re-derivation of `cell_carrying`'s own predicate here. It ran that
     // exact span test on this pane and this cell to produce `(col, row)`, so
     // repeating it can only fail if the live shell scrolled the grid between
@@ -36753,7 +36746,7 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
         x: 1,
         y: 1,
         width: 40,
-        height: 12,
+        height: 20,
     };
     // `resize`, not a `CSI 8 ; rows ; cols t` feed: the emulator leaves that
     // sequence unhandled, so the grid kept the 80x24 it was spawned with while
@@ -36762,16 +36755,30 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
     // read the same `grid_lines` the recorder does: a fixture can be wrong
     // about itself while everything asserted on it holds.
     //
-    // 12 rows, and the number is chosen against two failures rather than one.
-    // At 6 the slack is gone: `resize` writes through to the pty master, so
-    // this pane's live shell takes a SIGWINCH the old feed never sent and
-    // then prints, and `line-199` sits one row above the bottom, where five
-    // rows of output evict it. At 24 the slack is back but the header
-    // assertion below cannot fail, because 24 is the height the pane is
-    // SPAWNED at: restore the old unhandled escape sequence and every
-    // assertion here still passes. 12 is neither, so the fixture keeps
-    // eleven rows of tolerance AND the control that proves it is honest.
-    app.terminals[0].resize(40, 12);
+    // 20 rows, and the number answers two failures at once rather than
+    // trading one for the other.
+    //
+    // `line-199` sits one row above the bottom at EVERY height, because the
+    // flood ends on a newline. What the height sets is the eviction budget:
+    // how many rows the pane's live shell may print before the frame is
+    // recorded. `resize` writes through to the pty master, so that shell
+    // takes a SIGWINCH the old escape-sequence feed never sent, and it is a
+    // login shell running the developer's own rc - a wrapped prompt and a
+    // banner are ordinary. At 6 the budget was five rows, which is inside
+    // that range; at 12 it was eleven, which is nearer than it needs to be.
+    //
+    // The other constraint is only that the height DIFFER from the 24 a pane
+    // is spawned at, or the header assertion below cannot fail: restore the
+    // unhandled escape sequence at 24 and every assertion here passes. 20
+    // satisfies both - 19 rows of budget, and the control still fires.
+    //
+    // A third way the height matters, worth writing down because it is not
+    // obvious: the scrollback guard rejects a last-N-rows recorder by
+    // arithmetic on this number, not structurally. At `resize(40, 64)` a
+    // recorder writing the last 64 rows would satisfy every assertion here,
+    // because 64 would then BE the screen. The row-order assertion below is
+    // the one check that does not depend on the height.
+    app.terminals[0].resize(40, 20);
 
     // Far more output than the screen holds, so most of it is scrollback.
     let mut flood = String::new();
@@ -36835,6 +36842,14 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
     assert!(
         !frame.contains("line-100"),
         "the frame reaches back into scrollback: {frame:?}"
+    );
+    // Order and adjacency, in one literal that does not go through
+    // `grid_lines`. Everything above constrains the frame's ENDS and its row
+    // count, so a recorder that emitted the visible rows reversed, or
+    // shuffled, satisfies all of it.
+    assert!(
+        frame.contains("line-198\r\nline-199"),
+        "the frame must carry the screen's rows in order: {frame:?}"
     );
     // And it is the RECENT end of the output, not the oldest.
     // `line-199` alone. The `|| contains("line-19")` this replaces was both
