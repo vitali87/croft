@@ -126,7 +126,12 @@ pub fn socket_path_with(cache_dir: &Path, pid: u32, nonce: &str) -> PathBuf {
 pub fn pid_of_socket(name: &str) -> Option<u32> {
     let rest = name.strip_prefix("view-")?.strip_suffix(".sock")?;
     let head = rest.split_once('-').map_or(rest, |(pid, _)| pid);
-    head.parse::<u32>().ok()
+    let pid = head.parse::<u32>().ok()?;
+    // A number that cannot be a pid is not one. The sweep casts this to
+    // `pid_t`, where 0 means the caller's process group and 4294967295 means
+    // -1, "every process we may signal": both answer "alive" to signal 0, so
+    // such a file would be spared forever instead of swept.
+    (pid > 0 && pid <= i32::MAX as u32).then_some(pid)
 }
 
 /// Resolve the user's argument against the client's cwd.
@@ -305,7 +310,7 @@ pub fn write_reply(
 
 /// Map sniffed content to the extension the editor's routing keys on.
 ///
-/// The editor picks a viewer by EXTENSION (`crate::sheet::is_sheet`,
+/// The editor picks a viewer by EXTENSION (`crate::sheet::extension_is_sheet`,
 /// `Editor::open`'s arms), so staging stdin under a bare name would land
 /// every piped byte in the text fallback however recognisable it was. This
 /// hands the staged file a name the existing routing already understands,
@@ -410,29 +415,48 @@ pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> anyhow
     // would leave it world-readable in a predictable path under the cache
     // dir. Possession of the account is already the trust boundary for
     // every other croft socket and staging path, and this joins them.
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     let dir = cache_dir.join("view-stdin");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&dir)?;
+    // `DirBuilder`'s mode applies only when it CREATES, so a staging
+    // directory left by an older croft (or by anything else) keeps whatever
+    // mode it had. The contents are 0600 either way, so what a loose mode
+    // leaks is the names, and `vault read … | croft view -` puts a
+    // recognisable name in there.
+    let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let stem = format!("stdin-{}-{n}", std::process::id());
     let name = match stdin_extension(bytes, hint)? {
         Some(ext) => format!("{stem}.{ext}"),
         None => stem,
     };
-    // `create_new` rather than `write`, so this never truncates a file it did
-    // not make. But the name carries THIS process's pid and a per-process
-    // counter that restarts at 0, and nothing used to remove the staging
-    // directory - so once a croft drew a recycled pid it collided with a
-    // months-old file and `croft view -` failed with "File exists" forever.
-    // The collision is with the dead, not with a live competitor, so the right
-    // answer is to step past it rather than to refuse.
+    stage_at(&dir, &name, bytes)
+}
+
+/// Write `bytes` to `dir/name`, stepping past a name already taken.
+///
+/// Split out so the collision can be CONSTRUCTED in a test rather than
+/// predicted: `stage_stdin`'s name carries a process-wide counter that every
+/// other test in the binary bumps, so a fixture that guesses the next name
+/// tests nothing. Two earlier attempts at that fixture were vacuous - one
+/// guessed the counter, the next wrote its decoy a directory above the one
+/// this writes to.
+///
+/// `create_new` rather than `write`, so this never truncates a file it did
+/// not make. The name carries this process's pid and a counter that restarts
+/// at 0, and the staging directory outlives the process, so once a croft drew
+/// a recycled pid it met a months-old file and `croft view -` failed with
+/// "File exists" forever. The collision is with the dead rather than with a
+/// live competitor, so the answer is to step past it, not to refuse.
+pub(crate) fn stage_at(dir: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let mut attempt = 0;
     loop {
         let suffixed = if attempt == 0 {
-            name.clone()
+            name.to_string()
         } else {
             match name.rsplit_once('.') {
                 Some((stem, ext)) => format!("{stem}-{attempt}.{ext}"),
@@ -767,33 +791,30 @@ mod tests {
 
     #[test]
     fn a_staged_name_already_on_disk_is_stepped_past_not_overwritten() {
-        // The collision arm, which the counter test above cannot reach: it
-        // walks the per-process counter, and this is the OTHER way a name
-        // repeats - a recycled pid meeting a file an earlier croft left. The
-        // file it meets is somebody else's data, so stepping past is the
-        // whole point: `create_new` is what stops the write from landing on
-        // it, and the retry is what stops the command failing forever.
-        // The occupied name is DERIVED, not assumed. `SEQ` is a process-wide
-        // counter and other tests in this binary bump it, so hardcoding `-0`
-        // made the fixture depend on test order: once the counter had moved,
-        // the name under test was free and the retry arm was never reached.
-        // One staging call reveals the current value; the next name is the
-        // one to occupy.
+        // CONSTRUCTED, not predicted. Two earlier versions of this test were
+        // vacuous: the first guessed `SEQ`'s next value, which every other
+        // test in this binary bumps, and the second wrote its decoy one
+        // directory ABOVE the `view-stdin` subdirectory `stage_stdin` writes
+        // to, so the name under test was free either way and the retry arm
+        // was never reached. Going through `stage_at` removes the guess: the
+        // collision is a file this test put exactly where the next write
+        // will land.
+        //
+        // The file it meets is somebody else's data - a croft that drew this
+        // pid months ago - so stepping past is the whole point. `create_new`
+        // is what stops the write landing on it, and the retry is what stops
+        // the command failing forever.
         let tmp = tempfile::tempdir().unwrap();
-        let first = stage_stdin(tmp.path(), b"probe", Some("txt")).unwrap();
-        let n: u64 = first
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.rsplit_once('-'))
-            .and_then(|(_, n)| n.parse().ok())
-            .expect("the staged name ends in its counter");
-        let taken = tmp
-            .path()
-            .join(format!("stdin-{}-{}.txt", std::process::id(), n + 1));
+        let taken = tmp.path().join("x.txt");
         std::fs::write(&taken, b"an older croft's bytes").unwrap();
 
-        let path = stage_stdin(tmp.path(), b"mine", Some("txt")).unwrap();
-        assert_ne!(path, taken, "the name on disk must not be reused");
+        let path = stage_at(tmp.path(), "x.txt", b"mine").unwrap();
+
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "x-1.txt",
+            "the taken name must be stepped past, not reused: {path:?}"
+        );
         assert_eq!(
             std::fs::read(&taken).unwrap(),
             b"an older croft's bytes",

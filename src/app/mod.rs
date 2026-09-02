@@ -4202,6 +4202,7 @@ impl App {
         // `view_ipc::SOCK_PATH` at spawn time, so this ordering is what
         // decides whether the startup pane can use `croft view` at all (#362).
         let view_listener = Self::bind_view_socket();
+        let view_bind_error = VIEW_BIND_ERROR.lock().unwrap().take();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
         // Background git worker: every `git status` / `git status
@@ -4367,7 +4368,13 @@ impl App {
             sidebar_dwell: SidebarDwell::default(),
             pre_zen: None,
             layout_icon_areas: LayoutIconAreas::default(),
-            status: String::from("Ready"),
+            status: match &view_bind_error {
+                // The one startup failure that would otherwise be invisible
+                // until a user ran `croft view` and got told to do what they
+                // were doing.
+                Some(e) => format!("croft view is unavailable: {e}"),
+                None => String::from("Ready"),
+            },
             persistence_warning: remote_persistence_status(
                 is_remote_session(),
                 std::env::var_os("CROFT_SESSION_PERSISTENT").is_some(),
@@ -28999,7 +29006,26 @@ impl App {
         let path = crate::view_ipc::socket_path(&dir, std::process::id());
         let path = std::path::absolute(&path).unwrap_or(path);
         sweep_dead_view_sockets(&dir);
-        let listener = prepare_view_listener(&path).ok()?;
+        // A bind failure is reported, not swallowed. The reachable causes are
+        // real - `AddrInUse` from the liveness check, a full or read-only
+        // `$HOME`, or the 104-byte `AF_UNIX` path budget with a long home
+        // directory on macOS - and the client's message for an unset socket
+        // tells the user to run from a pane inside croft, which is exactly
+        // what they were doing. Saying so once at startup is the difference
+        // between a feature that is off and a feature that lies about why.
+        let listener = prepare_view_listener(&path)
+            .map_err(|e| {
+                // Latched rather than dropped. The reachable causes are real -
+                // `AddrInUse` from the liveness check, a full or read-only
+                // `$HOME`, the 104-byte `AF_UNIX` path budget with a long home
+                // on macOS - and the client's message for an unset socket
+                // tells the user to run from a pane inside croft, which is
+                // what they were already doing. `App::new` puts this on the
+                // status line, so a feature that is off says why once instead
+                // of misdirecting every time it is used.
+                *VIEW_BIND_ERROR.lock().unwrap() = Some(format!("{e}"));
+            })
+            .ok()?;
         // Published through a `OnceLock` read at SPAWN time rather than
         // `std::env::set_var` (#362). Two things were wrong with the env:
         //
@@ -45037,6 +45063,13 @@ struct HttpRunOutcome {
 /// would be asserting against its own setup: production could drop the call
 /// and the "the drain does not block" test would still pass, which is a
 /// check that cannot fail.
+/// Why the `croft view` socket could not be bound, if it could not.
+///
+/// A `static` because `bind_view_socket` runs before an `App` exists to hold
+/// it: `App::new` reads it once, right after the call, and puts it on the
+/// status line.
+static VIEW_BIND_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 fn prepare_view_listener(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
     let listener = crate::session::bind_socket_0600(path)?;
     // Polled from the frame loop, so a blocking accept would stall every
@@ -45045,7 +45078,7 @@ fn prepare_view_listener(path: &Path) -> std::io::Result<std::os::unix::net::Uni
     Ok(listener)
 }
 
-/// Remove `view-<pid>.sock` files whose croft is gone (#362).
+/// Remove `view-<pid>-<nonce>.sock` files whose croft is gone (#362).
 ///
 /// A Unix socket is not auto-unlinked, so every croft that dies leaves its
 /// file behind. An `impl Drop` would clean up the tidy exits and none of the
