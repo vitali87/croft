@@ -56,22 +56,6 @@ const MIN_SCALE: u32 = 2;
 /// to know about.
 const BASE_CALIBRATION: u32 = 2;
 
-/// The base the two restored-shell waits use (#397).
-///
-/// Shared rather than retyped at each call site, because the test that pins
-/// it has to be about THEM: an assertion over a literal written beside it
-/// stays green when a call site changes, which is the regression it exists
-/// to catch.
-///
-/// 2s because `await_spawned` multiplies by `BASE_CALIBRATION * load_scale`,
-/// which is 4 at the floor: these two replaced a fixed 8000ms, and this
-/// keeps that as what they still get on a quiet machine. Deliberately NOT a
-/// repo-wide rule - `a_terminal_link_binding_is_not_refused_for_an_editor_side_reason`
-/// converts an 8s constant with a 1s base, and reconciling the two is a
-/// question about that test's operation rather than about these.
-#[cfg(test)]
-pub(crate) const RESTORED_SHELL_BASE: Duration = Duration::from_secs(2);
-
 /// One-minute load average, where the platform reports one.
 fn load_average() -> Option<f64> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -252,8 +236,29 @@ pub fn await_spawned(base: Duration, what: &str, mut ready: impl FnMut() -> bool
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// The base the two restored-shell waits use (#397).
+    ///
+    /// Shared rather than retyped at each call site, because the test that
+    /// pins it has to be about THEM: an assertion over a literal written
+    /// beside it stays green when a call site changes, which is the
+    /// regression it exists to catch.
+    ///
+    /// 2s because `await_spawned` multiplies by
+    /// `BASE_CALIBRATION * load_scale`, which is 4 at the floor: these two
+    /// replaced a fixed 8000ms, and this keeps that as what they still get
+    /// on a quiet machine. Deliberately NOT a repo-wide rule -
+    /// `a_terminal_link_binding_is_not_refused_for_an_editor_side_reason`
+    /// converts an 8s constant with a 1s base, and reconciling the two is a
+    /// question about that test's operation rather than about these.
+    ///
+    /// Inside this module rather than beside it, because the release gate
+    /// waives a `#[cfg(test)] mod` and nothing else: a `#[cfg(test)]` on a
+    /// free item reads as shipped, which is the conservative direction that
+    /// filter deliberately takes.
+    pub(crate) const RESTORED_SHELL_BASE: Duration = Duration::from_secs(2);
 
     // The floor matters more than it looks: every budget this replaces was
     // observed failing at 1x, so a quiet machine must still get more room

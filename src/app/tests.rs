@@ -24465,7 +24465,7 @@ fn undo_close_restores_a_closed_terminal_pane_with_its_process_alive() {
     // a shell echoing one line, waited on under whatever load the suite is
     // running. Same 2s base, so the same 8s floor.
     crate::test_budget::await_spawned(
-        crate::test_budget::RESTORED_SHELL_BASE,
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
         "the reopened pane's shell to answer",
         || {
             app.terminals[1]
@@ -24804,7 +24804,7 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
     // never shrink below the budgets these tests already had, since every one
     // of them was observed failing at 1x.
     crate::test_budget::await_spawned(
-        crate::test_budget::RESTORED_SHELL_BASE,
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
         "the restored pane's shell to answer",
         || {
             app2.terminals[1]
