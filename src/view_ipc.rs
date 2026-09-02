@@ -773,9 +773,23 @@ mod tests {
         // file it meets is somebody else's data, so stepping past is the
         // whole point: `create_new` is what stops the write from landing on
         // it, and the retry is what stops the command failing forever.
+        // The occupied name is DERIVED, not assumed. `SEQ` is a process-wide
+        // counter and other tests in this binary bump it, so hardcoding `-0`
+        // made the fixture depend on test order: once the counter had moved,
+        // the name under test was free and the retry arm was never reached.
+        // One staging call reveals the current value; the next name is the
+        // one to occupy.
         let tmp = tempfile::tempdir().unwrap();
-        let stem = format!("stdin-{}-0.txt", std::process::id());
-        let taken = tmp.path().join(&stem);
+        let first = stage_stdin(tmp.path(), b"probe", Some("txt")).unwrap();
+        let n: u64 = first
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.rsplit_once('-'))
+            .and_then(|(_, n)| n.parse().ok())
+            .expect("the staged name ends in its counter");
+        let taken = tmp
+            .path()
+            .join(format!("stdin-{}-{}.txt", std::process::id(), n + 1));
         std::fs::write(&taken, b"an older croft's bytes").unwrap();
 
         let path = stage_stdin(tmp.path(), b"mine", Some("txt")).unwrap();

@@ -39009,6 +39009,32 @@ fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
 /// other test running in the same process. This binds the same way and
 /// publishes nothing, so the server half is exercised and the neighbours are
 /// left alone.
+/// Accept one client from a NON-blocking listener, waiting for it (#362).
+///
+/// `prepare_view_listener` makes the listener non-blocking on purpose, so a
+/// single `accept()` after a fixed sleep asserts that the client thread was
+/// scheduled inside that window - a property of machine load rather than of
+/// the code under test. When it loses, the panic names the client rather than
+/// the deadline, the blocking flag or the length cap the test is about.
+fn accept_when_ready(
+    listener: &std::os::unix::net::UnixListener,
+) -> std::os::unix::net::UnixStream {
+    let started = std::time::Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(5),
+                    "no client connected in five seconds"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    }
+}
+
 fn seat_view_listener(app: &mut App, dir: &std::path::Path) -> std::path::PathBuf {
     let sock = dir.join("view-test.sock");
     // Deliberately the production helper: seating a hand-built listener here
@@ -39318,7 +39344,7 @@ fn a_client_that_never_sends_a_newline_is_refused_by_the_deadline() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let listener = app.view_listener.as_ref().unwrap();
-    let (stream, _) = listener.accept().expect("the dribbler is waiting");
+    let stream = accept_when_ready(listener);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
     let (reply, opened) = app.answer_view_client(stream, deadline);
     let _ = dribbler.join();
@@ -39390,7 +39416,7 @@ fn a_non_blocking_accepted_stream_is_still_answered() {
     std::thread::sleep(std::time::Duration::from_millis(30));
 
     let listener = app.view_listener.as_ref().unwrap();
-    let (stream, _) = listener.accept().expect("a client is waiting");
+    let stream = accept_when_ready(listener);
     // The state macOS hands production, forced here so Linux exercises it too.
     stream.set_nonblocking(true).unwrap();
     let probe = stream.try_clone().expect("a dup of the accepted stream");
@@ -39641,7 +39667,7 @@ fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let listener = app.view_listener.as_ref().unwrap();
-    let (stream, _) = listener.accept().expect("the flooder is waiting");
+    let stream = accept_when_ready(listener);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     let (reply, opened) = app.answer_view_client(stream, deadline);
     let _ = flood.join();

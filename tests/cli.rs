@@ -297,9 +297,14 @@ fn view_sends_the_resolved_path_to_the_socket_and_exits_zero() {
         .split(',')
         .map(|n| n.trim().parse::<u8>().expect("the wire is a byte array"))
         .collect();
+    // Canonicalised on both sides: macOS hands a process a cwd under
+    // `/private/var` for a `/var` tempdir, so the client resolves against a
+    // path that is the same directory by a different name and a raw compare
+    // fails there while passing on Linux.
+    let received = std::path::PathBuf::from(String::from_utf8(bytes).unwrap());
     assert_eq!(
-        std::path::PathBuf::from(String::from_utf8(bytes).unwrap()),
-        target,
+        received.canonicalize().unwrap_or(received),
+        target.canonicalize().unwrap_or(target.clone()),
         "the server must receive the path resolved against the client's cwd"
     );
 }
@@ -330,7 +335,11 @@ fn view_refuses_a_missing_file_without_bothering_the_socket() {
 /// survives. That is only true if the CLI takes the argument as an
 /// `OsString`: a `String` parameter throws the bytes away one call before
 /// the encoding that preserves them, which is where this started.
-#[cfg(unix)]
+///
+/// Not on macOS: APFS rejects a filename that is not valid UTF-8, so the
+/// fixture cannot be created there and the test would fail for a reason
+/// that has nothing to do with the wire.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn view_transmits_a_non_utf8_filename_byte_for_byte() {
     use std::ffi::OsStr;
