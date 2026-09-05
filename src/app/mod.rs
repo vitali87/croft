@@ -2153,6 +2153,17 @@ pub enum BranchPurpose {
     Rebase,
 }
 
+/// A left press forwarded to a mouse-tracking child (#474): which pane got
+/// it, the host cell it landed on, and whether the drag since has become
+/// croft's own text selection (a child that asked only for clicks cannot use
+/// a drag, so croft keeps it). See `App::terminal_pointer_forwarded`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForwardedPointer {
+    pane: usize,
+    press: (u16, u16),
+    selecting: bool,
+}
+
 /// State for edge auto-scroll during a terminal drag-selection. `dir` is
 /// -1 (pointer above the top edge, scroll into history) or +1 (below the
 /// bottom edge, scroll toward live); `col` is the last drag column so the
@@ -2863,6 +2874,17 @@ pub struct App {
     /// or its maximize-rail row). The reorder is live: crossing another pane
     /// or rail row moves the terminal there immediately, and this follows it.
     terminal_drag_from: Option<usize>,
+    /// A left press that was FORWARDED to a pane because its child tracks
+    /// the mouse (#474), live until the release. The release goes to the
+    /// same pane, clamped to its grid if the pointer left it. What the drag
+    /// in between does depends on what the child asked for: motion reports
+    /// under 1002/1003, croft's own text selection anchored at the press
+    /// cell under click-only 1000 (Claude Code's mode), since a child that
+    /// never asked for motion cannot use the drag and the user still needs
+    /// to copy text out of it. The pane is held by index, like
+    /// `terminal_drag_from`; one closed mid-press is bounds-checked rather
+    /// than chased.
+    terminal_pointer_forwarded: Option<ForwardedPointer>,
     /// True while one terminal pane fills the panel's width and the others
     /// are listed in the right-side rail (the per-pane `⛶` button / Cmd+K M).
     /// Distinct from `terminal_maximized`, which grows the panel vertically
@@ -4448,6 +4470,7 @@ impl App {
             terminal_rail_revealed: None,
             terminal_label_rects: Vec::new(),
             terminal_drag_from: None,
+            terminal_pointer_forwarded: None,
             terminal_pane_maximized: false,
             bottom_panel_tab: BottomPanelTab::Terminal,
             problems: crate::widgets::problems::ProblemsPanel::new(),
@@ -35136,17 +35159,20 @@ impl App {
         // one the user had aimed at the TUI in the terminal. Same predicate as
         // the dispatch below, indexed by the pane that was CLICKED.
         let child_owns_pointer = bound_mouse.is_some_and(|(ctx, gesture, _)| {
-            // ONLY THE WHEEL. A tracking child can only "own" a gesture croft
-            // actually forwards, and croft forwards exactly one kind:
-            // `report_mouse` has three production call sites and all three
-            // construct WheelUp/WheelDown. No path constructs
-            // MouseButtonKind::Left/Middle/Right outside `encode_mouse_report`'s
-            // own tests, so declining a bound CLICK hands it to nobody -- and
-            // the built-in Down(Left) arm then runs anyway, since unlike
-            // click-to-move-cursor it never consults `mouse_reporting()`.
+            // Only the gestures croft actually FORWARDS: a tracking child can
+            // own nothing else. That is the wheel (both wheel arms below) and
+            // the LEFT button -- press in the Down(Left) arm, motion in Drag,
+            // release in Up -- since #474, when clicking a TUI's own controls
+            // (Claude Code's diff-panel ×) started working. `Click` and
+            // `DoubleClick` are both Down(Left), so both are the child's.
+            // Middle and right clicks are still croft's (paste, the context
+            // menu), so a binding on them fires over a tracking child too.
             matches!(
                 gesture.kind,
-                crate::keymap::GestureKind::WheelUp | crate::keymap::GestureKind::WheelDown
+                crate::keymap::GestureKind::WheelUp
+                    | crate::keymap::GestureKind::WheelDown
+                    | crate::keymap::GestureKind::Click
+                    | crate::keymap::GestureKind::DoubleClick
             ) && matches!(ctx, crate::keymap::MouseContext::Terminal)
                 && terminal_hit.is_some_and(|idx| {
                     // Tracking is not enough: `terminal_at_pos` hit-tests
@@ -35200,12 +35226,16 @@ impl App {
         // that state anyway: swallowing would cost the built-in and buy
         // nothing. Omitting it here disabled the built-in Ctrl+click over
         // every full-screen TUI for anyone who bound only `ctrl+double_click`.
-        // `child_owns_pointer` used to carry this branch's deferral too, but it
-        // is wheel-only now (croft forwards no clicks), so it is always false
-        // here and cannot decide anything. The question the swallow actually
-        // needs answered is narrower: would declining this click COST the user
-        // a built-in that was going to act? For Ctrl/Cmd the built-in opens a
-        // URL or a file reference, so defer when either is under the cursor.
+        // Over a tracking child the click is forwarded to it (#474), so
+        // `child_owns_pointer` is true for a left click there and the swallow
+        // steps aside: the recording above already declined, the bound double
+        // is unreachable, and swallowing would only cost the child its press.
+        // Where the child does not own it, the question is narrower: would
+        // declining this click COST the user a built-in that was going to act?
+        // For Ctrl/Cmd the built-in opens a URL or a file reference, so defer
+        // when either is under the cursor -- that link-open runs BEFORE the
+        // forward in the Down(Left) arm, so it applies over a tracking child
+        // as well.
         let builtin_would_act = matches!(bound_mouse, Some((ctx, _, _)) if
             matches!(ctx, crate::keymap::MouseContext::Terminal))
             && (m.modifiers.contains(KeyModifiers::CONTROL)
@@ -35215,6 +35245,7 @@ impl App {
         if let Some((ctx, gesture, None)) = bound_mouse
             && !gesture.mods.is_empty()
             && !builtin_would_act
+            && !child_owns_pointer
             && self.keymap.is_double_click_prefix(gesture, ctx)
         {
             // Focus still moves, as a click in a pane always does — otherwise
@@ -37096,6 +37127,42 @@ impl App {
                     {
                         return;
                     }
+                    // A child tracking the mouse (Claude Code's diff panel,
+                    // htop, lazygit, vim with `mouse=a`) gets the click
+                    // itself (#474): an SGR/X10 press now, motion under
+                    // 1002/1003 as the drag goes, and the release on
+                    // mouse-up, all aimed at THIS pane via
+                    // `terminal_pointer_forwarded`. Shift is the bypass,
+                    // the same one the wheel has: croft's own selection when
+                    // held. `report_mouse` is the whole gate -- it declines
+                    // when the child is not tracking or the cell is on the
+                    // border, and either way the click falls through to the
+                    // selection below. The Cmd/Ctrl link-open above still
+                    // wins, as in VS Code and iTerm2: the modifier is
+                    // croft's, and Cmd has no mouse-report encoding anyway.
+                    // A stale croft highlight goes, as it does for a plain
+                    // click anywhere else -- the user is aiming at the TUI,
+                    // not at the text under it -- and the double-click
+                    // tracker is not armed: the pair, if any, is the child's.
+                    if !m.modifiers.contains(KeyModifiers::SHIFT)
+                        && self.terminal_mut().report_mouse(
+                            MouseButtonKind::Left,
+                            MouseAction::Press,
+                            m.column,
+                            m.row,
+                            mouse_mods(&m),
+                        )
+                    {
+                        self.terminal_mut().clear_selection();
+                        self.editor.clear_selection();
+                        self.terminal_pointer_forwarded = Some(ForwardedPointer {
+                            pane: idx,
+                            press: (m.column, m.row),
+                            selecting: false,
+                        });
+                        self.terminal_click.clear();
+                        return;
+                    }
                     // Shift+click extends the existing selection to the
                     // clicked cell (VS Code / iTerm2) instead of starting a
                     // fresh one.
@@ -37227,6 +37294,39 @@ impl App {
                 // the one tracker not on this list behaved differently from
                 // every other one for no reason a user could discover.
                 self.modified_click.clear_if_moved(m.column, m.row);
+                // A drag after a press that went to a mouse-tracking child
+                // (#474) belongs to whoever can use it. A child that asked
+                // for motion (1002/1003) gets it, at the pane that got the
+                // press, clamped to that pane's grid so a pointer that
+                // wanders out reports the edge cell instead of vanishing. A
+                // child that asked only for clicks (1000: Claude Code) has
+                // no use for a drag, so the drag is croft's text selection,
+                // anchored at the PRESS cell on its first motion so nothing
+                // is lost by the press having been forwarded, then extended
+                // by the drag-selection path below like any other drag. The
+                // child still gets the release either way.
+                if let Some(fp) = self.terminal_pointer_forwarded
+                    && fp.pane < self.terminals.len()
+                {
+                    if self.terminals[fp.pane].mouse_motion_reporting() {
+                        let (col, row) = self.terminals[fp.pane].clamp_to_grid(m.column, m.row);
+                        self.terminals[fp.pane].report_mouse(
+                            MouseButtonKind::Left,
+                            MouseAction::Motion,
+                            col,
+                            row,
+                            mouse_mods(&m),
+                        );
+                        return;
+                    }
+                    if !fp.selecting {
+                        self.terminals[fp.pane].start_selection_at(fp.press.0, fp.press.1);
+                        self.terminal_pointer_forwarded = Some(ForwardedPointer {
+                            selecting: true,
+                            ..fp
+                        });
+                    }
+                }
                 // Terminal drag-selection is handled before the per-pane
                 // branches so it keeps extending even when the pointer
                 // leaves the pane: dragging past the bottom edge is how the
@@ -37325,6 +37425,36 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // The release of a press that was forwarded to a tracking
+                // child goes to the same pane (#474), clamped to its grid
+                // like the drag. `report_mouse` may decline if the child
+                // dropped tracking mid-press, which is the child's own
+                // choice; there is nothing croft should do with the release
+                // instead. The pane index is checked against the current
+                // list in case the pane closed under the held button. A
+                // gesture that stayed the child's (a click, or a drag it
+                // asked for) ends here: no copy-on-select, no click-to-move,
+                // no annotation or secret popup. One the Drag arm turned
+                // into croft's selection falls through to the ordinary
+                // mouse-up below, so the selection is finalised and
+                // copy-on-select fires as for any other drag.
+                if let Some(fp) = self.terminal_pointer_forwarded.take() {
+                    if fp.pane < self.terminals.len() {
+                        let (col, row) = self.terminals[fp.pane].clamp_to_grid(m.column, m.row);
+                        self.terminals[fp.pane].report_mouse(
+                            MouseButtonKind::Left,
+                            MouseAction::Release,
+                            col,
+                            row,
+                            mouse_mods(&m),
+                        );
+                    }
+                    if !fp.selecting {
+                        self.terminal_select_autoscroll = None;
+                        self.terminal_drag_from = None;
+                        return;
+                    }
+                }
                 // Releasing the button ends any terminal edge auto-scroll
                 // and finalizes a drag-selection (the alt-screen content
                 // anchor is captured at release).
@@ -44573,8 +44703,8 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 }
 
 /// Fold a mouse event's Shift/Alt/Ctrl state into the form `report_mouse`
-/// wants, so a forwarded wheel event carries the same modifiers the child
-/// would have seen natively.
+/// wants, so a forwarded wheel notch or left-button event carries the same
+/// modifiers the child would have seen natively.
 fn mouse_mods(m: &MouseEvent) -> MouseMods {
     MouseMods {
         shift: m.modifiers.contains(KeyModifiers::SHIFT),

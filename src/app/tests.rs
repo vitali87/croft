@@ -2162,14 +2162,11 @@ fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one()
 
 #[test]
 fn a_mouse_tracking_child_keeps_the_pointer_from_a_bound_wheel() {
-    // A tracking child owns the gestures croft actually FORWARDS, and croft
-    // forwards exactly one kind: `report_mouse`'s three production call sites
-    // all construct WheelUp/WheelDown. So the wheel is the case where "the
-    // child asked for it" is true, and a bound wheel must decline for the
-    // child. Clicks are covered by
-    // `a_bound_click_still_fires_over_a_mouse_tracking_child`, which asserts
-    // the opposite for the opposite reason: there is no click-forwarding path,
-    // so declining a click hands it to nobody.
+    // A tracking child owns the gestures croft actually FORWARDS: the wheel
+    // (both wheel arms) and, since #474, the left button. So a bound wheel
+    // must decline for the child. The left click is covered by
+    // `a_bound_click_defers_to_a_mouse_tracking_child`, which asserts the
+    // same rule for the same reason.
     //
     // SHIFT is the documented override.
     use crossterm::event::MouseEventKind;
@@ -2551,20 +2548,14 @@ fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal(
 }
 
 #[test]
-fn a_bound_click_still_fires_over_a_mouse_tracking_child() {
-    // `child_owns_pointer` suppressed bound CLICKS on the stated ground that a
-    // tracking child owns the pointer. For the WHEEL that is exact -- the
-    // wheel arms genuinely call `report_mouse`. For clicks it is false:
-    // `report_mouse`'s three production call sites all construct
-    // WheelUp/WheelDown, and `MouseButtonKind::Left` is never constructed
-    // outside `encode_mouse_report`'s own tests. There is no click-forwarding
-    // path, so suppressing the binding hands the gesture to nobody -- and the
-    // built-in `Down(Left)` arm does not defer either (it runs
-    // `start_selection_at` and Ctrl+click URL-open with no `mouse_reporting`
-    // check, unlike click-to-move-cursor, which does gate on it).
-    //
-    // So the binding must fire. The observable is the bound command's own
-    // effect, not a status string the built-in could also produce.
+fn a_bound_click_defers_to_a_mouse_tracking_child() {
+    // `child_owns_pointer` covers a bound CLICK the same way it covers the
+    // wheel, because since #474 the left button is a gesture croft actually
+    // forwards: the Down(Left) arm sends the press to a tracking child. So a
+    // `ctrl+click` binding must decline over a tracking child -- the child
+    // asked for the pointer -- and the press must reach it with the Ctrl bit
+    // set, exactly as it would under a bare terminal emulator. SHIFT remains
+    // the bypass (`holding_shift_takes_the_pointer_back_from_a_tracking_child`).
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -2582,31 +2573,36 @@ fn a_bound_click_still_fires_over_a_mouse_tracking_child() {
     );
     let (col, row) = (area.x + 2, area.y + 1);
 
-    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
     assert!(
         app.terminals[0].mouse_reporting(),
         "the child must be tracking, or this test says nothing about the guard"
     );
-    assert!(
-        app.terminals[0].cell_at(col, row).is_some(),
-        "the click must land on a real grid cell, or the guard declines for the \
-         border reason instead of the tracking one and the test is vacuous"
-    );
+    let Some((lr, lc)) = app.terminals[0].cell_at(col, row) else {
+        panic!(
+            "the click must land on a real grid cell, or the guard declines for the \
+             border reason instead of the tracking one and the test is vacuous"
+        );
+    };
 
     let before = app.editor.wrap_enabled();
     let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
     ctrl.modifiers = KeyModifiers::CONTROL;
     app.handle_mouse(ctrl);
 
-    assert_ne!(
+    assert_eq!(
         app.editor.wrap_enabled(),
         before,
-        "a bound ctrl+click over a tracking child must RUN: croft has no \
-         click-forwarding path, so declining it gives the gesture to nobody \
-         while the built-in fires anyway"
+        "a bound ctrl+click over a tracking child must NOT run: the child asked \
+         for the pointer and croft forwards the press to it"
+    );
+    let expected = format!("\x1b[<16;{};{}M", lc + 1, lr + 1);
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        expected,
+        "the press reaches the child as an SGR report carrying the Ctrl bit"
     );
 }
-
 #[test]
 fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     // `terminal_would_open_something_at` decides whether swallowing a
@@ -2796,9 +2792,8 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     assert!(
         app.status.contains("Refused to open non-web link"),
         "a double-click PREFIX over a mouse-tracking child must fall through to \
-         the built-in: croft has no click-forwarding path, so swallowing it \
-         hands the gesture to nobody -- the swallow branch \
-         is missing the `child_owns_pointer` guard its sibling applies. \
+         the built-in: the Cmd/Ctrl link-open runs BEFORE the press is \
+         forwarded, so swallowing the click would cost the user the link. \
          Expected the refusal from the built-in link handler, got {:?}",
         app.status
     );
@@ -26461,8 +26456,12 @@ fn alt_screen_upward_drag_through_the_real_mouse_pipeline_selects_upward() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
 
-    // Few enough rows that nothing scrolls in the pane's alt grid.
-    let mut screen = String::from("\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[H\x1b[2J");
+    // Few enough rows that nothing scrolls in the pane's alt grid. The
+    // modes are Claude Code's own pair: click-only 1000 with SGR 1006. Since
+    // #474 the press is forwarded to such a child, but a drag is croft's
+    // selection because the child never asked for motion -- under 1002 this
+    // same plain drag would be the app's and Shift would be needed.
+    let mut screen = String::from("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[H\x1b[2J");
     for i in 0..6 {
         screen.push_str(&format!("transcript line number {i:02}\r\n"));
     }
@@ -39103,4 +39102,312 @@ fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
         app.terminal_strip_rects.iter().all(|r| r.width == 0),
         "no strip survives maximize, or a click could land on a pane that is not painted"
     );
+}
+
+/// #474: a rendered app whose only pane is tracking the mouse with SGR
+/// reports, exactly the pair Claude Code sends (`?1000h` + `?1006h`), plus
+/// a cell inside the grid and that cell's local coordinates.
+fn tracking_terminal_app(modes: &[u8]) -> (App, tempfile::TempDir, u16, u16, u16, u16) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].feed_bytes_for_test(modes);
+    let inner = app.terminals[0].last_inner;
+    assert!(
+        inner.width > 6 && inner.height > 3,
+        "terminal grid must be laid out, got {inner:?}"
+    );
+    let (col, row) = (inner.x + 3, inner.y + 2);
+    let (lr, lc) = app.terminals[0]
+        .cell_at(col, row)
+        .expect("the test cell lies inside the grid");
+    (app, tmp, col, row, lc, lr)
+}
+
+#[test]
+fn a_click_over_a_mouse_tracking_child_is_forwarded_as_press_and_release() {
+    // Claude Code's diff panel closes from a click on its ×; htop, lazygit
+    // and vim's `mouse=a` route clicks the same way. All of them see the
+    // click only if croft sends the press AND the release: a TUI that got a
+    // press with no release believes the button is still down. Before #474
+    // neither was sent -- the click became a one-cell croft selection.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, lc, lr) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    assert!(app.terminals[0].mouse_reporting());
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!("\x1b[<0;{};{}M", lc + 1, lr + 1),
+        "the press is an SGR button-0 report at the 1-based grid cell"
+    );
+    assert!(
+        app.terminals[0].selection().is_none(),
+        "a forwarded press plants no croft selection: the child owns the click"
+    );
+    assert!(
+        app.terminal_pointer_forwarded
+            .is_some_and(|f| f.pane == 0 && f.press == (col, row) && !f.selecting),
+        "the pane and cell that got the press are remembered for the release"
+    );
+
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!("\x1b[<0;{c};{r}M\x1b[<0;{c};{r}m", c = lc + 1, r = lr + 1),
+        "the release follows as the lower-case SGR terminator"
+    );
+    assert!(
+        app.terminal_pointer_forwarded.is_none(),
+        "the release ends the forwarded gesture"
+    );
+    assert!(
+        app.terminals[0].selection().is_none(),
+        "nor does the release leave a highlight behind"
+    );
+}
+
+#[test]
+fn a_click_over_a_child_that_is_not_tracking_stays_a_croft_selection() {
+    // The forward is gated on the child having asked (`report_mouse` declines
+    // without a tracking mode), so a shell prompt or a plain pager keeps
+    // croft's click-to-select and nothing reaches the child's stdin.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, _, _) = tracking_terminal_app(b"");
+    assert!(!app.terminals[0].mouse_reporting());
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.terminals[0].written_bytes_for_test().is_empty(),
+        "no report is written to a child that never asked for the mouse"
+    );
+    assert!(
+        app.terminals[0].selection().is_some(),
+        "the click anchors croft's own selection as before"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn shift_click_over_a_tracking_child_keeps_the_click_for_croft() {
+    // Shift is the bypass for the whole forwarded family, the same one the
+    // wheel has and the one xterm, iTerm2 and VS Code use: with it held the
+    // click anchors croft's selection so text can still be copied out of a
+    // full-screen app that otherwise owns the pointer.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, _, _) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+
+    let mut shift = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    shift.modifiers = KeyModifiers::SHIFT;
+    app.handle_mouse(shift);
+    assert!(
+        app.terminals[0].written_bytes_for_test().is_empty(),
+        "Shift+click is croft's: nothing is reported to the child"
+    );
+    assert!(
+        app.terminals[0].selection().is_some(),
+        "Shift+click anchors croft's own selection over a tracking child"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_click_on_the_pane_border_is_not_forwarded_to_a_tracking_child() {
+    // `terminal_at_pos` hit-tests the pane INCLUDING its border, while a
+    // report needs a grid cell. A border click over a tracking child must
+    // fall through to croft (where it is inert) rather than be reported at a
+    // cell the child does not have.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, _, _, _) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    let border_row = app.terminals[0].last_area.y;
+    assert!(
+        app.terminals[0].cell_at(col, border_row).is_none(),
+        "the top border is not a grid cell"
+    );
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        col,
+        border_row,
+    ));
+    assert!(
+        app.terminals[0].written_bytes_for_test().is_empty(),
+        "no report for a cell outside the child's grid"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_forwarded_drag_reports_motion_only_when_the_child_asked_for_it() {
+    // DECSET 1000 is click-only: the child wants presses and releases and
+    // nothing in between. 1002 adds button-held motion. The Drag arm hands
+    // the event to `report_mouse`, whose motion guard already encodes that
+    // distinction, so the same drag is silent under 1000 and a `+32` report
+    // under 1002 -- and croft's own drag-selection never starts either way.
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let (mut app, _tmp, col, row, lc, lr) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        col + 2,
+        row + 1,
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!("\x1b[<0;{};{}M", lc + 1, lr + 1),
+        "under 1000 the drag adds nothing after the press: the child asked for clicks"
+    );
+    // A click-only child cannot use the drag, so croft keeps it: the
+    // selection is anchored at the PRESS cell, not where the first motion
+    // event happened to land, and extends to the pointer.
+    let sel = app.terminals[0]
+        .selection()
+        .expect("under 1000 the drag is croft's text selection");
+    let (sr, sc, er, ec) = sel.normalised();
+    assert_eq!(
+        (sr, sc, er, ec),
+        (lr as i32, lc, lr as i32 + 1, lc + 2),
+        "the selection runs from the press cell to the drag cell"
+    );
+    assert!(
+        app.terminal_pointer_forwarded.is_some_and(|f| f.selecting),
+        "the gesture is still open and marked as croft's selection"
+    );
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        col + 2,
+        row + 1,
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!(
+            "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+            lc + 1,
+            lr + 1,
+            lc + 3,
+            lr + 2
+        ),
+        "the child that got the press still gets the release"
+    );
+    assert!(
+        app.terminals[0].selection().is_some_and(|s| s.has_area()),
+        "and croft's selection survives the release for copying"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+
+    let (mut app, _tmp, col, row, lc, lr) = tracking_terminal_app(b"\x1b[?1002h\x1b[?1006h");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        col + 2,
+        row + 1,
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!(
+            "\x1b[<0;{};{}M\x1b[<32;{};{}M",
+            lc + 1,
+            lr + 1,
+            lc + 3,
+            lr + 2
+        ),
+        "under 1002 the drag is a button-0 motion report at the new cell"
+    );
+    assert!(app.terminals[0].selection().is_none());
+}
+
+#[test]
+fn a_forwarded_release_outside_the_pane_is_clamped_to_its_grid() {
+    // A press the child got must be followed by a release the child gets,
+    // even when the pointer has wandered off the pane by then; otherwise the
+    // child keeps a button held that the user let go. xterm reports such a
+    // release at the nearest cell, and so does croft: the coordinates are
+    // clamped to the pane's grid rather than the report being dropped.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, lc, lr) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    let inner = app.terminals[0].last_inner;
+    assert!(
+        app.terminals[0].cell_at(0, 0).is_none(),
+        "(0,0) must be outside the pane, or nothing is clamped"
+    );
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 0));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!("\x1b[<0;{};{}M\x1b[<0;1;1m", lc + 1, lr + 1),
+        "the release lands on the grid's top-left cell, the nearest to (0,0)"
+    );
+    assert_eq!(
+        app.terminals[0].clamp_to_grid(u16::MAX, u16::MAX),
+        (inner.x + inner.width - 1, inner.y + inner.height - 1),
+        "the far corner clamps to the last cell, never one past it"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_forwarded_release_over_a_sibling_pane_goes_to_the_pane_that_got_the_press() {
+    // The point of remembering the pane in `terminal_pointer_forwarded`
+    // rather than re-hit-testing at release: a drag that ends over the
+    // NEIGHBOUR pane still owes its release to the child that got the press,
+    // at that child's nearest edge cell. Re-resolving by pointer would hand
+    // the release to a pane that never saw a press (or drop it, if that pane
+    // is not tracking) and leave the first child with a held button.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.terminals.len(), 2, "two panes are visible");
+    // Only pane 0 tracks the mouse; pane 1 is a plain shell.
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
+    assert!(app.terminals[0].mouse_reporting());
+    assert!(!app.terminals[1].mouse_reporting());
+
+    let inner0 = app.terminals[0].last_inner;
+    let inner1 = app.terminals[1].last_inner;
+    assert!(
+        inner0.width > 4 && inner0.height > 3 && inner1.width > 4 && inner1.height > 3,
+        "both panes need a real grid: {inner0:?} {inner1:?}"
+    );
+    let (col, row) = (inner0.x + 2, inner0.y + 1);
+    let (lr, lc) = app.terminals[0].cell_at(col, row).unwrap();
+    // A cell well inside pane 1, on the same row.
+    let (far_col, far_row) = (inner1.x + 2, row);
+    assert!(
+        app.terminals[1].cell_at(far_col, far_row).is_some()
+            && app.terminals[0].cell_at(far_col, far_row).is_none(),
+        "the release cell must belong to pane 1 only"
+    );
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        far_col,
+        far_row,
+    ));
+
+    let (clamped_col, clamped_row) = app.terminals[0].clamp_to_grid(far_col, far_row);
+    let (er, ec) = app.terminals[0].cell_at(clamped_col, clamped_row).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!(
+            "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+            lc + 1,
+            lr + 1,
+            ec + 1,
+            er + 1
+        ),
+        "pane 0 gets the press and the release, the latter at its nearest edge cell"
+    );
+    assert!(
+        app.terminals[1].written_bytes_for_test().is_empty(),
+        "pane 1 never saw a press, so it gets no release either"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
 }
