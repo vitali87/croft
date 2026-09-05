@@ -617,6 +617,75 @@ class HeadOnlyOrphanTests(unittest.TestCase):
             )
             self.assertEqual(repo.exit_code(), 1)
 
+    def test_a_capture_both_older_passes_see_is_reported_once(self):
+        """#463: when the victim is an item `ITEM` models and was documented
+        at the base, the loss pass names it AND the head-only pass names the
+        block it left stranded. Both are true and both point at one
+        insertion; a reader counting annotations counts two defects. The
+        loss message is the older and more precise of the two, so it keeps
+        the report and the stranded-block one stands down."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "/// Documents beta.\nfn beta() {}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "/// Documents beta.\n\n/// Documents gamma.\nfn gamma() {}\n\nfn beta() {}\n",
+            )
+            out = io.StringIO()
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            self.assertIn(
+                "`beta` had a doc comment",
+                out.getvalue(),
+                f"the loss pass keeps the report: {out.getvalue()}",
+            )
+            self.assertEqual(
+                out.getvalue().count("::error"),
+                1,
+                f"one insertion, one annotation: {out.getvalue()}",
+            )
+
+    def test_a_stranded_block_unrelated_to_a_loss_is_still_reported(self):
+        """The stand-down is keyed on the BLOCK, not on the file: a loss in a
+        file must not silence every stranded block in it. Here the branch
+        makes the #463 capture and, elsewhere in the same file, strands a
+        block that never documented the lost item. That one is a second
+        defect and keeps its annotation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "/// Documents beta.\nfn beta() {}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "/// Documents beta.\n\n/// Documents gamma.\nfn gamma() {}\n\nfn beta() {}\n"
+                "\n/// Lonely.\n\n/// Documents delta.\nfn delta() {}\n",
+            )
+            out = io.StringIO()
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            text = out.getvalue()
+            self.assertIn("`beta` had a doc comment", text)
+            self.assertIn("'/// Lonely.'", text, f"the unrelated block is still stranded: {text}")
+            self.assertNotIn("'/// Documents beta.'", text, f"the block the loss explains stands down: {text}")
+            self.assertEqual(text.count("::error"), 2, f"two defects, two annotations: {text}")
+
     def test_ordinary_docs_are_not_reported(self):
         """The control. A gate that cries wolf stops being read, so the
         shapes a real file is full of must stay silent: attributes and
