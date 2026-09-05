@@ -3029,6 +3029,13 @@ impl PtyTerminal {
         p.advance(&mut *term, bytes);
     }
 
+    /// Test-only: the pane's grid lock, for tests that must observe what
+    /// `resize` does WHILE the grid is held (#473).
+    #[cfg(test)]
+    pub fn grid_lock_for_test(&self) -> Arc<FairMutex<Term<VoidListener>>> {
+        self.term.clone()
+    }
+
     /// Test-only: run one reader-thread timestamp pass over the current
     /// grid, exactly as a real chunk arrival would.
     #[cfg(test)]
@@ -3655,15 +3662,28 @@ impl PtyTerminal {
         self.cols = cols;
         self.rows = rows;
         *self.size_shared.lock().unwrap() = (cols, rows);
+        // Grid first, pty second, under one hold of the grid lock (#473).
+        // The pty ioctl delivers SIGWINCH, and a full-screen child answers
+        // it with a complete repaint sized to the NEW dimensions. If that
+        // repaint reaches the reader before the grid has been resized, it
+        // is parsed into the old grid: rows land on the wrong lines, wide
+        // lines wrap, and once the grid does grow those cells sit where a
+        // diff-based renderer (Claude Code, and anything else that only
+        // redraws what it believes changed) considers them already blank.
+        // Nothing ever repaints them, and the stale text stays on screen.
+        // Resizing the grid while holding the lock across the ioctl means
+        // every byte the child emits in reply meets a grid of the right
+        // size.
+        let mut term = self.term.lock();
+        let size = TermSize::new(cols as usize, rows as usize);
+        term.resize(size);
         let _ = self.master.resize(PtySize {
             cols,
             rows,
             pixel_width: 0,
             pixel_height: 0,
         });
-        let mut term = self.term.lock();
-        let size = TermSize::new(cols as usize, rows as usize);
-        term.resize(size);
+        drop(term);
         self.pty_dirty.store(true, Ordering::Release);
     }
 }
@@ -5792,6 +5812,69 @@ mod tests {
             term.peek_pending_bytes() > 0,
             "direct-spawned /bin/echo must produce output without any write_input"
         );
+    }
+
+    /// #473: the grid must take the new size BEFORE the child hears about it.
+    ///
+    /// `resize` used to send the pty ioctl (which delivers SIGWINCH) first
+    /// and resize alacritty's grid second. A program that repaints on
+    /// WINCH - Claude Code does, with a full frame laid out for the new
+    /// size - can have that frame parsed into the OLD grid whenever the
+    /// render thread loses the CPU between the two steps. A frame laid out
+    /// for one size and parsed into another leaves rows of stale text the
+    /// program believes it erased: its renderer diffs against its own model
+    /// and never repaints what it thinks is already blank. Replaying a
+    /// recorded Claude Code session with the two steps swapped reproduces
+    /// the residue; the correct order replays clean.
+    ///
+    /// The order is observed, not timed: the child records its size the
+    /// moment WINCH arrives, and the test holds the grid lock across the
+    /// whole `resize`. If the ioctl goes out before the grid is resized,
+    /// the child reports the new size WHILE the lock is held, which the
+    /// correct order makes impossible however long the wait.
+    #[test]
+    fn the_grid_takes_the_new_size_before_the_child_hears_the_winch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("winch-size");
+        let script = format!(
+            "trap 'stty size > {out}' WINCH; echo trap-armed; while :; do sleep 0.05; done",
+            out = out.display()
+        );
+        let mut pane =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script], tmp.path()).unwrap();
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the child shell to arm its WINCH trap",
+            || pane.visible_text().contains("trap-armed"),
+        );
+        let grid = pane.grid_lock_for_test();
+        let held = grid.lock();
+        // A budget, not a race: the wrong order sends the ioctl before it
+        // ever asks for the lock, so the child's report lands within
+        // milliseconds; the right order cannot produce one while the lock
+        // is held, so waiting longer only makes a true failure slower.
+        let window = crate::test_budget::spawn_budget(std::time::Duration::from_millis(150));
+        std::thread::scope(|s| {
+            s.spawn(|| pane.resize(30, 10));
+            std::thread::sleep(window);
+            let reported = std::fs::read_to_string(&out).ok();
+            // Released BEFORE asserting, or a failure deadlocks the scope
+            // on a resize that is still waiting for the grid.
+            drop(held);
+            assert!(
+                reported.is_none(),
+                "the child saw the new size ({:?}) while the grid lock was still held: \
+                 the pty was resized before the grid",
+                reported.map(|s| s.trim().to_string())
+            );
+        });
+        // Positive control: the trap works and the resize went through.
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the child to report the new size once the grid lock was released",
+            || std::fs::read_to_string(&out).is_ok_and(|s| s.trim() == "10 30"),
+        );
+        assert_eq!(pane.grid_cols(), 30, "the grid took the new column count");
     }
 
     #[test]
