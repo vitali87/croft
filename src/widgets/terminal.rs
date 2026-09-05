@@ -5836,12 +5836,23 @@ mod tests {
     fn the_grid_takes_the_new_size_before_the_child_hears_the_winch() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("winch-size");
-        let script = format!(
-            "trap 'stty size > {out}' WINCH; echo trap-armed; while :; do sleep 0.05; done",
-            out = out.display()
-        );
-        let mut pane =
-            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script], tmp.path()).unwrap();
+        // The path travels as `$1` rather than being spliced into the
+        // script: a temp dir with a space, a `;` or a quote in it would break
+        // an interpolated redirection, while "$1" is expanded by the shell
+        // itself when WINCH fires.
+        let script =
+            "trap 'stty size > \"$1\"' WINCH; echo trap-armed; while :; do sleep 0.05; done";
+        let mut pane = PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                String::from(script),
+                String::from("sh"),
+                out.display().to_string(),
+            ],
+            tmp.path(),
+        )
+        .unwrap();
         crate::test_budget::await_spawned(
             std::time::Duration::from_millis(500),
             "the child shell to arm its WINCH trap",
@@ -5874,7 +5885,14 @@ mod tests {
             "the child to report the new size once the grid lock was released",
             || std::fs::read_to_string(&out).is_ok_and(|s| s.trim() == "10 30"),
         );
-        assert_eq!(pane.grid_cols(), 30, "the grid took the new column count");
+        // The parser grid itself, not the cached `cols` field: `resize`
+        // writes that field before it touches the grid, so it reads 30 even
+        // when the grid was never resized.
+        assert_eq!(
+            grid.lock().columns(),
+            30,
+            "the grid took the new column count"
+        );
     }
 
     #[test]
