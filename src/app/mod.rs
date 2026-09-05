@@ -2157,9 +2157,15 @@ pub enum BranchPurpose {
 /// it, the host cell it landed on, and whether the drag since has become
 /// croft's own text selection (a child that asked only for clicks cannot use
 /// a drag, so croft keeps it). See `App::terminal_pointer_forwarded`.
+///
+/// The pane is held by its stable `uid`, NOT its index in `App::terminals`:
+/// a pane closed while the button is held (the close chord, the header
+/// button) shifts every later pane one slot left, and an index would then
+/// deliver the release to the neighbour while the child that got the press
+/// keeps a button it thinks is still down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ForwardedPointer {
-    pane: usize,
+    pane: u64,
     press: (u16, u16),
     selecting: bool,
 }
@@ -2881,9 +2887,12 @@ pub struct App {
     /// under 1002/1003, croft's own text selection anchored at the press
     /// cell under click-only 1000 (Claude Code's mode), since a child that
     /// never asked for motion cannot use the drag and the user still needs
-    /// to copy text out of it. The pane is held by index, like
-    /// `terminal_drag_from`; one closed mid-press is bounds-checked rather
-    /// than chased.
+    /// to copy text out of it. The pane is named by `uid`, so a pane closed
+    /// or reordered mid-press is found again (or found gone) rather than
+    /// confused with whichever pane now holds its old index. Every later
+    /// event of the gesture -- motion, selection extension, release,
+    /// copy-on-select -- is aimed at THAT pane, never at the active one:
+    /// the keyboard can move the active pane while the button is held.
     terminal_pointer_forwarded: Option<ForwardedPointer>,
     /// True while one terminal pane fills the panel's width and the others
     /// are listed in the right-side rail (the per-pane `⛶` button / Cmd+K M).
@@ -13362,6 +13371,14 @@ impl App {
 
     /// The clipboard's view of terminal text: rules marked `copy: masked`
     /// keep their mask, everything else copies as typed (#360).
+    /// The current index of the pane a forwarded left press went to (#474),
+    /// or `None` once that pane has been closed. Looked up by uid on every
+    /// event of the gesture because a close or reorder while the button is
+    /// held renumbers the vector under a stored index.
+    fn forwarded_pane_index(&self, fp: ForwardedPointer) -> Option<usize> {
+        self.terminals.iter().position(|t| t.uid() == fp.pane)
+    }
+
     fn terminal_text_for_copy(&self, text: String) -> String {
         crate::triggers::mask_text(&text, &self.triggers, true)
     }
@@ -37156,7 +37173,7 @@ impl App {
                         self.terminal_mut().clear_selection();
                         self.editor.clear_selection();
                         self.terminal_pointer_forwarded = Some(ForwardedPointer {
-                            pane: idx,
+                            pane: self.terminals[idx].uid(),
                             press: (m.column, m.row),
                             selecting: false,
                         });
@@ -37303,14 +37320,24 @@ impl App {
                 // no use for a drag, so the drag is croft's text selection,
                 // anchored at the PRESS cell on its first motion so nothing
                 // is lost by the press having been forwarded, then extended
-                // by the drag-selection path below like any other drag. The
-                // child still gets the release either way.
-                if let Some(fp) = self.terminal_pointer_forwarded
-                    && fp.pane < self.terminals.len()
-                {
-                    if self.terminals[fp.pane].mouse_motion_reporting() {
-                        let (col, row) = self.terminals[fp.pane].clamp_to_grid(m.column, m.row);
-                        self.terminals[fp.pane].report_mouse(
+                // here -- on the ORIGIN pane, found by uid, not through
+                // `terminal_mut()`: Cmd+] can move the active pane while the
+                // button is held, and the generic drag path below would then
+                // extend the wrong pane's selection and leave this one at its
+                // one-cell anchor. Edge auto-scroll is armed only while the
+                // origin is still the active pane, because the tick that
+                // services it scrolls the active one. The child still gets
+                // the release either way. A gesture whose pane is gone ends
+                // here with nothing to deliver.
+                if let Some(fp) = self.terminal_pointer_forwarded {
+                    let Some(idx) = self.forwarded_pane_index(fp) else {
+                        self.terminal_pointer_forwarded = None;
+                        self.terminal_select_autoscroll = None;
+                        return;
+                    };
+                    if self.terminals[idx].mouse_motion_reporting() {
+                        let (col, row) = self.terminals[idx].clamp_to_grid(m.column, m.row);
+                        self.terminals[idx].report_mouse(
                             MouseButtonKind::Left,
                             MouseAction::Motion,
                             col,
@@ -37320,12 +37347,20 @@ impl App {
                         return;
                     }
                     if !fp.selecting {
-                        self.terminals[fp.pane].start_selection_at(fp.press.0, fp.press.1);
+                        self.terminals[idx].start_selection_at(fp.press.0, fp.press.1);
                         self.terminal_pointer_forwarded = Some(ForwardedPointer {
                             selecting: true,
                             ..fp
                         });
                     }
+                    let dir = self.terminals[idx].drag_select_to(m.column, m.row);
+                    self.terminal_select_autoscroll = (dir != 0 && idx == self.active_terminal)
+                        .then_some(TerminalSelectAutoScroll {
+                            dir,
+                            col: m.column,
+                            last: std::time::Instant::now(),
+                        });
+                    return;
                 }
                 // Terminal drag-selection is handled before the per-pane
                 // branches so it keeps extending even when the pointer
@@ -37430,30 +37465,43 @@ impl App {
                 // like the drag. `report_mouse` may decline if the child
                 // dropped tracking mid-press, which is the child's own
                 // choice; there is nothing croft should do with the release
-                // instead. The pane index is checked against the current
-                // list in case the pane closed under the held button. A
-                // gesture that stayed the child's (a click, or a drag it
-                // asked for) ends here: no copy-on-select, no click-to-move,
-                // no annotation or secret popup. One the Drag arm turned
-                // into croft's selection falls through to the ordinary
-                // mouse-up below, so the selection is finalised and
-                // copy-on-select fires as for any other drag.
+                // instead. The pane is found by uid, so one closed under
+                // the held button is simply gone rather than mistaken for
+                // its neighbour. The whole gesture ends here, aimed at the
+                // ORIGIN pane and never the active one: a click, or a drag
+                // the child asked for, gets no copy-on-select, click-to-move,
+                // annotation or secret popup; a drag the Drag arm turned into
+                // croft's selection is finalised on that pane (`end_drag`,
+                // then copy-on-select), the same tail the ordinary mouse-up
+                // below runs for the active pane.
                 if let Some(fp) = self.terminal_pointer_forwarded.take() {
-                    if fp.pane < self.terminals.len() {
-                        let (col, row) = self.terminals[fp.pane].clamp_to_grid(m.column, m.row);
-                        self.terminals[fp.pane].report_mouse(
+                    if let Some(idx) = self.forwarded_pane_index(fp) {
+                        let (col, row) = self.terminals[idx].clamp_to_grid(m.column, m.row);
+                        self.terminals[idx].report_mouse(
                             MouseButtonKind::Left,
                             MouseAction::Release,
                             col,
                             row,
                             mouse_mods(&m),
                         );
+                        if fp.selecting {
+                            self.terminals[idx].end_drag();
+                            if self.copy_on_select
+                                && self.terminals[idx]
+                                    .selection()
+                                    .is_some_and(|s| s.has_area())
+                            {
+                                let text = self
+                                    .terminal_text_for_copy(self.terminals[idx].selection_text());
+                                if !text.is_empty() {
+                                    copy_to_clipboard(&text);
+                                }
+                            }
+                        }
                     }
-                    if !fp.selecting {
-                        self.terminal_select_autoscroll = None;
-                        self.terminal_drag_from = None;
-                        return;
-                    }
+                    self.terminal_select_autoscroll = None;
+                    self.terminal_drag_from = None;
+                    return;
                 }
                 // Releasing the button ends any terminal edge auto-scroll
                 // and finalizes a drag-selection (the alt-screen content

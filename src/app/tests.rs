@@ -39147,10 +39147,11 @@ fn a_click_over_a_mouse_tracking_child_is_forwarded_as_press_and_release() {
         app.terminals[0].selection().is_none(),
         "a forwarded press plants no croft selection: the child owns the click"
     );
+    let uid = app.terminals[0].uid();
     assert!(
         app.terminal_pointer_forwarded
-            .is_some_and(|f| f.pane == 0 && f.press == (col, row) && !f.selecting),
-        "the pane and cell that got the press are remembered for the release"
+            .is_some_and(|f| f.pane == uid && f.press == (col, row) && !f.selecting),
+        "the pane (by uid) and cell that got the press are remembered for the release"
     );
 
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
@@ -39408,6 +39409,130 @@ fn a_forwarded_release_over_a_sibling_pane_goes_to_the_pane_that_got_the_press()
     assert!(
         app.terminals[1].written_bytes_for_test().is_empty(),
         "pane 1 never saw a press, so it gets no release either"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_forwarded_release_finds_its_pane_after_an_earlier_pane_closes() {
+    // `ForwardedPointer` names the pane by uid, not by index. Close the pane
+    // BEFORE the pressed one while the button is held: the pressed pane
+    // slides from index 1 to index 0, and the release must still reach it.
+    // An index would have delivered the release to whatever now sits at
+    // the old slot (nothing, here) and left the pressed child holding a
+    // button.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.terminals.len(), 2);
+    app.terminals[1].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
+    let pressed_uid = app.terminals[1].uid();
+    let inner = app.terminals[1].last_inner;
+    let (col, row) = (inner.x + 2, inner.y + 1);
+    let (lr, lc) = app.terminals[1].cell_at(col, row).unwrap();
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.terminal_pointer_forwarded
+            .is_some_and(|f| f.pane == pressed_uid)
+    );
+
+    assert!(app.close_terminal_at(0), "the EARLIER pane closes");
+    assert_eq!(app.terminals.len(), 1);
+    assert_eq!(
+        app.terminals[0].uid(),
+        pressed_uid,
+        "the pressed pane now sits at index 0"
+    );
+    // The pane was re-laid out by the close; release wherever the pointer
+    // is, the report is clamped to the pane's current grid.
+    term.draw(|f| app.render(f)).unwrap();
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+
+    let written = String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).into_owned();
+    assert!(
+        written.starts_with(&format!("\x1b[<0;{};{}M", lc + 1, lr + 1)),
+        "the press went to the pane before the close: {written:?}"
+    );
+    assert!(
+        written.ends_with('m') && written.matches("\x1b[<0;").count() == 2,
+        "the release still reaches the same pane after it moved to index 0: {written:?}"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_click_only_drag_keeps_extending_the_origin_pane_after_the_active_pane_moves() {
+    // Under click-only 1000 the drag is croft's selection on the pane that
+    // got the press. `Cmd+]` (cycle_terminal) can move the ACTIVE pane while
+    // the button is held; the drag must keep extending the origin's
+    // selection, not the new active pane's, and the release must finalise
+    // it there. Routing through `terminal_mut()` would have left the origin
+    // at its one-cell anchor and started nothing on the other pane either.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
+    let inner = app.terminals[0].last_inner;
+    assert!(
+        inner.width > 6 && inner.height > 3,
+        "pane 0 needs a grid: {inner:?}"
+    );
+    let (col, row) = (inner.x + 2, inner.y + 1);
+    let (lr, lc) = app.terminals[0].cell_at(col, row).unwrap();
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert_eq!(
+        app.active_terminal, 0,
+        "the press activates the pressed pane"
+    );
+    // The keyboard moves the active pane mid-gesture.
+    app.cycle_terminal();
+    assert_eq!(app.active_terminal, 1, "Cmd+] moved the active pane");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        col + 3,
+        row + 1,
+    ));
+    let sel = app.terminals[0]
+        .selection()
+        .expect("the origin pane carries the drag-selection");
+    let (sr, sc, er, ec) = sel.normalised();
+    assert_eq!(
+        (sr, sc, er, ec),
+        (lr as i32, lc, lr as i32 + 1, lc + 3),
+        "the origin's selection runs from the press cell to the drag cell"
+    );
+    assert!(
+        app.terminals[1].selection().is_none(),
+        "the pane that merely became active gets no selection"
+    );
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        col + 3,
+        row + 1,
+    ));
+    assert!(
+        app.terminals[0].selection().is_some_and(|s| s.has_area()),
+        "the release finalises the origin's selection"
+    );
+    assert!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).ends_with('m'),
+        "and the origin child gets the release"
+    );
+    assert!(
+        app.terminals[1].written_bytes_for_test().is_empty(),
+        "the active pane's child sees nothing"
     );
     assert!(app.terminal_pointer_forwarded.is_none());
 }
