@@ -217,7 +217,12 @@ current version's file may change in a PR: an older one describes a release
 that has already shipped.
 
 CI enforces all of it (the `version bump + release notes` job). Docs, CI, and
-test-only PRs (`src/app/tests.rs`, `tests/`) are exempt.
+test-only PRs are exempt: `src/app/tests.rs` and `tests/` by path, and a `.rs`
+file whose diff touches nothing outside a `#[cfg(test)]` module, since most of
+croft's unit tests sit beside the code they cover and a change confined to them
+produces a byte-identical binary. Anything that filter is unsure about counts
+as shipped, so an unexpected bump request is the failure it prefers over a
+waived one.
 
 ## Insert new items AFTER a complete item, never above a doc block
 
@@ -241,8 +246,26 @@ job): an item that had a doc comment at the merge base and has none at your
 head is the fingerprint this insertion leaves. It covers `fn`, `const`,
 `static`, `struct`, `enum`, `union`, `trait`, `type` and `macro_rules!`, and
 for a file your branch ADDS it compares your commits pairwise, since a file
-with no base version has no merge-base history to lose documentation against. If a removal is deliberate, say
-so in a commit message on the branch:
+with no base version has no merge-base history to lose documentation against.
+
+Two further passes cover captures that fingerprint does not leave. One reads
+your head on its own and reports a `///` block with nothing under it that a
+doc can attach to, which is what an insertion strands when the newcomer has no
+doc of its own. The other compares what each doc line sat above earlier with
+what it sits above now, at the merge base and at every non-merge commit on
+your branch that touched the file, so a capture made and left in place
+mid-branch is seen even though the merge base predates both items. Merges are
+skipped because a merge's first parent is your branch tip, so comparing across
+one replays whatever you merged IN as your own work; the cost is that a
+capture made by a merge resolution, where the thief is a line the other side
+already had, is not reported. An item inserted directly
+above a documented enum variant takes its prose while stranding nothing at
+all, and that shape shipped once with the gate green. It reports only when the
+old item is still there and now has no documentation, and when the line the
+prose landed on is new, so moving a doc back onto its rightful item stays
+green.
+
+If a removal is deliberate, say so in a commit message on the branch:
 
 ```text
 doc-removal: src/path/to/file.rs::some_function_name
@@ -252,7 +275,15 @@ doc-removal: src/path/to/file.rs::SomeType::method_name
 The key after the path is the one the gate's own error names: a bare name
 for a free item, or the enclosing `impl` header for a method (`Foo::new`,
 `Display for Foo::fmt`), so a declared removal of one `new` cannot excuse
-another.
+another. It covers the two passes that name an item: the merge-base loss check
+and the doc-changed-owner check. For a victim the gate does not model as an
+item, an enum variant being the common case, the key is the leading name on the
+line itself (`E::A` is declared as `a.rs::A`), and the error prints the exact
+declaration to write.
+
+The head-only pass has no declaration, because what it reports is prose with
+nothing under it and there is no item to name. Give the block an item, or move
+the inserted one above it.
 
 The file qualifier matters: an exemption keyed on the bare name would excuse
 every function of that name in every changed file, so a deliberate removal of
