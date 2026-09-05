@@ -5,10 +5,11 @@
 //!
 //! This widget is deliberately pure: it owns the query text, the result
 //! list, and the selection, but never spawns zoxide itself. The app
-//! layer runs `crate::zoxide::query` and feeds results in via
-//! `set_results`, which keeps every behaviour here unit-testable without
-//! a zoxide binary and concentrates the one subprocess call off the
-//! render path.
+//! layer captures the frecency snapshot once at open (`all_dirs`, one
+//! `crate::zoxide::query`), filters it in-process on every keystroke, and
+//! feeds results in via `set_results`, which keeps every behaviour here
+//! unit-testable without a zoxide binary and keeps typing free of
+//! subprocess spawns.
 
 use ratatui::{
     buffer::Buffer,
@@ -33,9 +34,10 @@ pub struct ZoxideJump {
     /// not be found on this host; drives the "unavailable" message.
     pub available: bool,
     /// The full frecency-ranked database, captured once when the popup
-    /// opens (`zoxide query -l`). The app layer reads this to run the
-    /// typo-tolerant fuzzy fallback without re-spawning zoxide on every
-    /// keystroke that misses.
+    /// opens (`zoxide query -l`). Every keystroke filters this in-process:
+    /// the strict keyword filter first, then the typo-tolerant fuzzy
+    /// fallback when nothing matches, so zoxide is never re-spawned while
+    /// typing.
     pub all_dirs: Vec<PathBuf>,
     /// True when `results` came from the fuzzy fallback rather than a
     /// strict zoxide match; drives the "no exact match" hint so an

@@ -1,9 +1,13 @@
 //! zoxide integration for the Explorer "jump" popup (Cmd+Z).
 //!
-//! croft delegates all directory ranking to the `zoxide` binary rather
-//! than parsing its database: `zoxide query -l <tokens>` returns the
-//! frecency-ranked matches, exactly the algorithm the user already gets
-//! from `j <tokens>` in the shell (their init is `zoxide init zsh --cmd j`).
+//! croft delegates directory ranking to the `zoxide` binary rather than
+//! parsing its database: `zoxide query -l` (no keywords) is captured once
+//! when the popup opens, and every keystroke then filters that snapshot
+//! in-process with `strict_filter`, a replica of zoxide's own keyword
+//! rule, so typing never spawns a process. The result is what
+//! `zoxide query -l <tokens>` prints: the frecency-ranked matches, exactly
+//! the algorithm the user already gets from `j <tokens>` in the shell
+//! (their init is `zoxide init zsh --cmd j`).
 //!
 //! GOLDEN RULE — identical local/remote: croft runs *on* the host (the
 //! user's Mac locally, a Linux box under the remote-launch flow), so we
@@ -133,6 +137,21 @@ fn probe(candidate: &PathBuf) -> bool {
 /// wins), then the absolute fallbacks. `None` means zoxide is not
 /// installed on this host.
 pub fn binary() -> Option<PathBuf> {
+    // Resolving costs a `zoxide --version` spawn (6-10 ms idle), so a hit
+    // is remembered for the process lifetime. A miss is NOT cached: the
+    // background installer may drop the binary in later, and the next call
+    // must be able to find it.
+    static RESOLVED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(found) = RESOLVED.get() {
+        return Some(found.clone());
+    }
+    let found = resolve_binary()?;
+    let _ = RESOLVED.set(found.clone());
+    Some(found)
+}
+
+/// The uncached probe behind [`binary`].
+fn resolve_binary() -> Option<PathBuf> {
     let on_path = PathBuf::from("zoxide");
     if probe(&on_path) {
         return Some(on_path);
@@ -173,6 +192,46 @@ pub fn query(needle: &str) -> Option<Vec<PathBuf>> {
     let bin = binary()?;
     let output = Command::new(bin).args(query_args(needle)).output().ok()?;
     Some(parse_query_output(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// In-process replica of `zoxide query`'s keyword filter, run over the
+/// frecency snapshot the popup captured at open (`query -l` with no
+/// keywords). zoxide's rule (`Database::filter_by_keywords`): keywords are
+/// matched case-insensitively as substrings, right to left, each one
+/// strictly before the previous match; the LAST keyword must land in the
+/// path's final component (nothing after its match may contain a
+/// separator). Filtering a frecency-ordered list in order keeps zoxide's
+/// ranking, so the result is byte-for-byte what `zoxide query -l <needle>`
+/// prints for the same database -- without a subprocess per keystroke.
+/// A blank needle keeps every entry, like `zoxide query -l`.
+pub fn strict_filter(needle: &str, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let keywords: Vec<String> = needle.split_whitespace().map(str::to_lowercase).collect();
+    dirs.iter()
+        .filter(|p| matches_keywords(&keywords, &p.to_string_lossy().to_lowercase()))
+        .cloned()
+        .collect()
+}
+
+/// The per-path half of [`strict_filter`]; `path` and `keywords` are
+/// already lowercased.
+fn matches_keywords(keywords: &[String], path: &str) -> bool {
+    let Some((last, rest)) = keywords.split_last() else {
+        return true;
+    };
+    let Some(idx) = path.rfind(last.as_str()) else {
+        return false;
+    };
+    if path[idx + last.len()..].contains(std::path::MAIN_SEPARATOR) {
+        return false;
+    }
+    let mut path = &path[..idx];
+    for keyword in rest.iter().rev() {
+        let Some(idx) = path.rfind(keyword.as_str()) else {
+            return false;
+        };
+        path = &path[..idx];
+    }
+    true
 }
 
 /// Optimal-string-alignment (restricted Damerau-Levenshtein) distance of
@@ -473,6 +532,82 @@ mod tests {
         // Exact substring is free.
         let exact: Vec<char> = "split".chars().collect();
         assert_eq!(osa_substring_distance(&exact, &t), 0);
+    }
+
+    #[test]
+    fn strict_filter_requires_the_last_keyword_in_the_final_component() {
+        // Mirrors `zoxide query`: the last keyword must land in the path's
+        // final component, so a directory whose ancestor matches is out.
+        let dirs = vec![
+            PathBuf::from("/home/u/Documents/croft"),
+            PathBuf::from("/home/u/Documents/croft/src"),
+            PathBuf::from("/home/u/croft-2/docs"),
+            PathBuf::from("/home/u/Documents"),
+        ];
+        assert_eq!(
+            strict_filter("croft", &dirs),
+            vec![PathBuf::from("/home/u/Documents/croft")],
+            "only the dir whose basename holds `croft` may match"
+        );
+        // Paired control: the same corpus does match on its final component.
+        assert_eq!(
+            strict_filter("docs", &dirs),
+            vec![PathBuf::from("/home/u/croft-2/docs")]
+        );
+    }
+
+    #[test]
+    fn strict_filter_matches_earlier_keywords_in_order_before_the_last() {
+        let dirs = vec![
+            PathBuf::from("/home/u/Documents/croft"),
+            PathBuf::from("/home/u/croft/Documents"),
+            PathBuf::from("/home/u/croft-docs/croft"),
+        ];
+        assert_eq!(
+            strict_filter("doc cro", &dirs),
+            vec![
+                PathBuf::from("/home/u/Documents/croft"),
+                PathBuf::from("/home/u/croft-docs/croft"),
+            ],
+            "`doc` must precede the final-component `cro`; `/croft/Documents` ends in Documents, not cro"
+        );
+        // Earlier keywords must match strictly BEFORE the last keyword's
+        // match, not merely somewhere in the path: `oft` only occurs inside
+        // the very `croft` that `cro` consumed.
+        let one = vec![PathBuf::from("/home/u/Documents/croft")];
+        assert!(
+            strict_filter("oft cro", &one).is_empty(),
+            "a keyword that only occurs inside the last match must not count"
+        );
+        assert_eq!(
+            strict_filter("u cro", &one),
+            one,
+            "paired control: the same dir matches when the earlier keyword precedes the last"
+        );
+    }
+
+    #[test]
+    fn strict_filter_is_case_insensitive_and_keeps_frecency_order() {
+        let dirs = vec![
+            PathBuf::from("/home/u/Documents"),
+            PathBuf::from("/home/u/DOCUMENTS-old"),
+            PathBuf::from("/home/u/Desktop"),
+            PathBuf::from("/home/u/other/documents"),
+        ];
+        assert_eq!(
+            strict_filter("DoCu", &dirs),
+            vec![
+                PathBuf::from("/home/u/Documents"),
+                PathBuf::from("/home/u/DOCUMENTS-old"),
+                PathBuf::from("/home/u/other/documents"),
+            ],
+            "matches keep the snapshot's (frecency) order"
+        );
+        assert_eq!(
+            strict_filter("  ", &dirs),
+            dirs,
+            "a blank needle lists everything, like `zoxide query -l`"
+        );
     }
 
     #[test]

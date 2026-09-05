@@ -32775,17 +32775,23 @@ impl App {
         }
     }
 
-    /// Re-run `zoxide query` for the popup's current text and feed the
-    /// ranked matches back to the widget. The one subprocess per keystroke
-    /// is cheap (zoxide reads a small frecency DB; single-digit ms) and
-    /// fires only on input, never on the render hot path.
+    /// Filter the popup's frecency snapshot for its current text and feed
+    /// the ranked matches back to the widget. No subprocess runs here:
+    /// `strict_filter` replicates `zoxide query`'s keyword rule over the
+    /// `all_dirs` list captured at open, so a keystroke costs microseconds.
+    /// It used to spawn `zoxide --version` plus `zoxide query` per key,
+    /// 10-37 ms each on an idle Mac and far more under load, which is what
+    /// made typing into the jump popup feel sluggish.
     ///
-    /// Two layers: the strict `zoxide query` is authoritative and handles
-    /// the common case. Only when it returns zero matches for a non-empty
+    /// Two layers: the strict keyword filter is authoritative and handles
+    /// the common case. Only when it yields zero matches for a non-empty
     /// needle does the typo-tolerant `fuzzy_rank` fallback run, ranking the
-    /// cached frecency DB by edit distance so a transposition like `spilt`
+    /// same snapshot by edit distance so a transposition like `spilt`
     /// still finds `pr-split` (zoxide's own subsequence matcher cannot).
-    /// The fallback is purely in-memory, so it never spawns zoxide twice.
+    ///
+    /// The one remaining spawn is the unavailable path: zoxide was missing
+    /// when the popup opened, so the background install may have finished
+    /// since and the snapshot has to be fetched before it can be filtered.
     fn refresh_zoxide_results(&mut self) {
         let Some(jump) = self.zoxide_jump.as_mut() else {
             return;
@@ -32794,16 +32800,25 @@ impl App {
         // The background install may have advanced (Running -> Done/Failed)
         // since the popup opened; keep the unavailable message current.
         jump.install_state = crate::zoxide::install_state();
-        match crate::zoxide::query(&needle) {
-            Some(paths) if paths.is_empty() && !needle.trim().is_empty() => {
-                let ranked = crate::zoxide::fuzzy_rank(&needle, &jump.all_dirs);
-                if ranked.is_empty() {
-                    jump.set_results(Some(Vec::new()));
-                } else {
-                    jump.set_approximate_results(ranked);
+        if !jump.available {
+            match crate::zoxide::query("") {
+                Some(all) => jump.set_all_dirs(all),
+                None => {
+                    jump.set_results(None);
+                    return;
                 }
             }
-            other => jump.set_results(other),
+        }
+        let strict = crate::zoxide::strict_filter(&needle, &jump.all_dirs);
+        if strict.is_empty() && !needle.trim().is_empty() {
+            let ranked = crate::zoxide::fuzzy_rank(&needle, &jump.all_dirs);
+            if ranked.is_empty() {
+                jump.set_results(Some(Vec::new()));
+            } else {
+                jump.set_approximate_results(ranked);
+            }
+        } else {
+            jump.set_results(Some(strict));
         }
     }
 
@@ -38884,11 +38899,19 @@ impl App {
         // into a child repo left rust-analyzer running `cargo metadata` against
         // the parent, which has no Cargo.toml, so every opened .rs came back as
         // an `unlinked-file` with no hover / completion / semantic tokens.
-        // Spawn a fresh manager rooted at new_root; assigning over the Option
-        // drops the old manager, whose Drop shuts its servers down. Clearing
-        // lsp_last_seen makes the next sync_lsp() re-open every live editor tab
-        // against the new servers; the stale diagnostics / progress from the
-        // old root are dropped with it.
+        // Spawn a fresh manager rooted at new_root. Clearing lsp_last_seen
+        // makes the next sync_lsp() re-open every live editor tab against the
+        // new servers; the stale diagnostics / progress from the old root are
+        // dropped with it.
+        //
+        // The old manager is retired OFF the UI thread. Its Drop blocks on a
+        // graceful shutdown of every server, capped at 3 s, and rust-analyzer
+        // routinely uses 2.5 s of that: measured inline, every Cmd+Z jump out
+        // of a Rust workspace froze the whole app for that long before the
+        // tree even moved. The shutdown still happens, just on a thread the
+        // event loop never waits for (the same treatment the FSEvents watcher
+        // gets in `rebind`).
+        fs_watch::offload_drop(self.lsp.take());
         self.lsp = match crate::lsp::LspManager::new(new_root.clone()) {
             Ok(m) => Some(m),
             Err(e) => {

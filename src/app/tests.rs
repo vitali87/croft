@@ -18153,6 +18153,53 @@ fn cmd_z_in_explorer_opens_the_zoxide_jump_popup() {
     assert!(app.zoxide_jump.is_none(), "Esc must close the jump popup");
 }
 
+#[test]
+fn zoxide_jump_keystrokes_filter_the_open_time_snapshot_in_process() {
+    // Every keystroke used to spawn `zoxide --version` and `zoxide query`
+    // (10-37 ms each on an idle Mac, far worse under load). The popup now
+    // filters the frecency snapshot captured at open. The proof: these
+    // paths do not exist on disk, so the zoxide binary could never have
+    // returned them -- only in-process filtering can.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut jump = crate::widgets::zoxide_jump::ZoxideJump::new();
+    jump.set_all_dirs(vec![
+        PathBuf::from("/nonexistent/zj/Documents/croft"),
+        PathBuf::from("/nonexistent/zj/Documents"),
+        PathBuf::from("/nonexistent/zj/croft/src"),
+    ]);
+    jump.set_results(Some(jump.all_dirs.clone()));
+    app.zoxide_jump = Some(jump);
+    for c in "cro".chars() {
+        app.handle_zoxide_jump_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    let jump = app.zoxide_jump.as_ref().unwrap();
+    assert_eq!(
+        jump.results,
+        vec![PathBuf::from("/nonexistent/zj/Documents/croft")],
+        "typing filters the snapshot with zoxide's keyword rule"
+    );
+    assert!(!jump.approximate, "a strict hit is not flagged approximate");
+    // Backspace re-widens from the same snapshot.
+    app.handle_zoxide_jump_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+    app.handle_zoxide_jump_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+    app.handle_zoxide_jump_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+    assert_eq!(app.zoxide_jump.as_ref().unwrap().results.len(), 3);
+    // A typo still falls through to the typo-tolerant ranking, flagged.
+    for c in "corft".chars() {
+        app.handle_zoxide_jump_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    let jump = app.zoxide_jump.as_ref().unwrap();
+    assert_eq!(
+        jump.results,
+        vec![PathBuf::from("/nonexistent/zj/Documents/croft")]
+    );
+    assert!(
+        jump.approximate,
+        "a fuzzy-only hit must be flagged approximate"
+    );
+}
+
 // --- Native modal (vim) editing -------------------------------------------
 
 fn vim_app(content: &str) -> (App, tempfile::TempDir) {
