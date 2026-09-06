@@ -627,7 +627,7 @@ fn digest_verdict(sha256: &[(&str, &str)], key: &str, bytes: &[u8]) -> Result<()
     // would otherwise pair a digest with bytes it was never the digest of.
     // Such a manifest is a mistake and is refused, as a partial map is.
     match sha256.iter().find(|(k, _)| *k == key) {
-        None => Err("no pinned digest under the platform's target key"),
+        None => Err("the manifest's digest list does not cover this platform's download"),
         Some((_, expected)) if sha256_matches(bytes, expected) => Ok(()),
         Some(_) => Err("checksum mismatch"),
     }
@@ -1638,8 +1638,6 @@ mod tests {
         );
     }
 
-    /// A manifest that pins digests for some platforms but not this one
-    /// refuses to install here rather than silently skipping the gate; no
     /// A background install that ends without producing the binary releases
     /// the one-shot gate (#485 review): the next request is a real retry,
     /// not a "still installing" that never lands. The download here fails
@@ -1686,8 +1684,38 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        // The attempt created its install dir under the real servers dir
+        // before the download; leave nothing behind on the host.
+        if let Some(dir) = servers_dir() {
+            let _ = std::fs::remove_dir_all(dir.join("gate-test-viewer"));
+        }
     }
 
+    /// One unreadable directory is skipped, not the whole walk: the binary
+    /// in a sibling still on the stack is found.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_does_not_end_the_binary_walk() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sealed = tmp.path().join("aaa-sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let open = tmp.path().join("zzz-open");
+        std::fs::create_dir(&open).unwrap();
+        let bin = open.join("csvlens");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let found = find_file_named(tmp.path(), std::ffi::OsStr::new("csvlens"));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            found,
+            Some(bin),
+            "the sibling's binary is found past the sealed dir"
+        );
+    }
+
+    /// A manifest that pins digests for some platforms but not this one
+    /// refuses to install here rather than silently skipping the gate; no
     /// pins at all stays unverified, as every older binary provision is.
     #[test]
     fn a_partial_digest_map_refuses_an_unlisted_platform() {
@@ -1735,7 +1763,7 @@ mod tests {
         );
         assert_eq!(
             digest_verdict(&[("macos-aarch64", digest.as_str())], key, universal),
-            Err("no pinned digest under the platform's target key"),
+            Err("the manifest's digest list does not cover this platform's download"),
             "per-arch digests beside a universal asset are a manifest mistake"
         );
         let per_arch = [("macos-aarch64", "https://example.invalid/arm.tar.xz")];
@@ -1743,7 +1771,7 @@ mod tests {
         assert_eq!(key, "macos-aarch64");
         assert_eq!(
             digest_verdict(&[("macos", digest.as_str())], key, universal),
-            Err("no pinned digest under the platform's target key"),
+            Err("the manifest's digest list does not cover this platform's download"),
             "a universal digest beside per-arch assets is refused, not checked against the wrong bytes"
         );
     }

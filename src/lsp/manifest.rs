@@ -458,18 +458,52 @@ pub fn parse(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
             )));
         }
     }
-    // The consent prompt shows a viewer's `command`; when the viewer is
-    // provisioned, what runs is the provision's `bin`. A manifest in which
-    // the two name different programs would have the user allow one and
-    // croft run another, so it is refused here rather than at spawn time.
-    for v in &m.viewers {
-        if let Some(p) = &v.provision
-            && command_file_name(&v.command) != p.bin
-        {
+    // A provisioned path is joined under the managed store and then run:
+    // `Path::join` with an absolute argument drops the store prefix, and a
+    // parent reference walks out of it, so either would let a manifest run
+    // (and write) outside the store. Refused for every provision.
+    let provisions = m
+        .viewers
+        .iter()
+        .filter_map(|v| v.provision.as_ref().map(|p| ("viewer", v.id.as_str(), p)))
+        .chain(
+            m.mcp_servers
+                .iter()
+                .filter_map(|s| s.provision.as_ref().map(|p| ("server", s.id.as_str(), p))),
+        )
+        .chain(
+            m.language_servers
+                .iter()
+                .filter_map(|s| s.provision.as_ref().map(|p| ("server", s.name.as_str(), p))),
+        );
+    for (what, id, p) in provisions {
+        let runs = p.bin_path.as_deref().unwrap_or(&p.bin);
+        if !provisioned_path_stays_in_store(runs) {
             return Err(serde::de::Error::custom(format!(
-                "viewer {:?} runs {:?} but provisions {:?}: the command and the provisioned binary must name one program",
-                v.id, v.command, p.bin
+                "{what} {id:?} provisions {runs:?}: a provisioned path must stay inside the managed store"
             )));
+        }
+    }
+    // The consent prompt shows a viewer's `command`; when the viewer is
+    // provisioned, what runs is the provision's `bin_path` when set, else
+    // its `bin`. A manifest in which the two name different programs would
+    // have the user allow one and croft run another, so it is refused here
+    // rather than at spawn time.
+    for v in &m.viewers {
+        if v.command.trim().is_empty() {
+            return Err(serde::de::Error::custom(format!(
+                "viewer {:?} has an empty command",
+                v.id
+            )));
+        }
+        if let Some(p) = &v.provision {
+            let runs = p.bin_path.as_deref().unwrap_or(&p.bin);
+            if command_file_name(&v.command) != command_file_name(runs) {
+                return Err(serde::de::Error::custom(format!(
+                    "viewer {:?} runs {:?} but provisions {runs:?}: the command and the provisioned binary must name one program",
+                    v.id, v.command
+                )));
+            }
         }
     }
     Ok(m)
@@ -479,6 +513,21 @@ pub fn parse(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
 /// and `csvlens` are the same program for the purpose of the consent check.
 fn command_file_name(command: &str) -> &str {
     command.rsplit(['/', '\\']).next().unwrap_or(command)
+}
+
+/// Whether a provisioned `bin`/`bin_path` stays under the managed store once
+/// joined there: relative, and never through a parent reference.
+fn provisioned_path_stays_in_store(runs: &str) -> bool {
+    let path = std::path::Path::new(runs);
+    !runs.is_empty()
+        && !path.is_absolute()
+        && !runs.starts_with('\\')
+        && !path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
 }
 
 /// Whether an id can safely name a directory and a key segment.
@@ -793,6 +842,66 @@ provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { 
             parse(AGREES).is_ok(),
             "a path whose file name is the bin agrees"
         );
+    }
+
+    /// The program that runs is `bin_path` when the manifest sets one, not
+    /// `bin`: the consent check follows the path that is spawned, and a
+    /// provisioned path that leaves the managed store (absolute, or through
+    /// a parent reference) is refused for every provision, not only a
+    /// viewer's, since `Path::join` with an absolute argument drops the
+    /// store prefix entirely.
+    #[test]
+    fn a_provisioned_bin_path_must_name_the_command_and_stay_in_the_store() {
+        const OTHER_PROGRAM: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "csvlens"
+provision = { kind = "binary", bin = "csvlens", bin_path = "payload/other-program", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        let err = parse(OTHER_PROGRAM).expect_err("a bin_path naming another program is refused");
+        assert!(err.to_string().contains("other-program"), "{err}");
+        const NESTED_SAME: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "csvlens"
+provision = { kind = "binary", bin = "csvlens", bin_path = "csvlens-1.0/bin/csvlens", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        assert!(
+            parse(NESTED_SAME).is_ok(),
+            "a nested path to the same program agrees"
+        );
+        for (what, bin_path) in [
+            ("absolute", "/tmp/evil"),
+            ("parent", "../../../../tmp/evil"),
+        ] {
+            let src = format!(
+                r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[mcp_servers]]
+id = "srv"
+command = "evil"
+provision = {{ kind = "binary", bin = "evil", bin_path = "{bin_path}", archive = "gz", targets = {{ "linux-x86_64" = "https://example.invalid/z.gz" }} }}
+"#
+            );
+            let err = parse(&src).expect_err("a provisioned path that leaves the store is refused");
+            assert!(
+                err.to_string().contains("managed store"),
+                "the {what} path is refused for leaving the store: {err}"
+            );
+        }
     }
 
     /// #465: a catalog entry that opens a file kind in an external TUI.
