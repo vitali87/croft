@@ -314,6 +314,9 @@ fn render_log(
             if span.style.underline {
                 style = style.add_modifier(Modifier::UNDERLINED);
             }
+            if span.style.strikeout {
+                style = style.add_modifier(Modifier::CROSSED_OUT);
+            }
             let room = right.saturating_sub(x) as usize;
             buf.set_stringn(x, y, text, room, style);
         }
@@ -15158,6 +15161,42 @@ mod tests {
             buf[(x + 1, y)].style().fg,
             Some(Color::Rgb(r, g, b)),
             "SGR 31 resolves through the theme's ANSI slot 1 across the span"
+        );
+    }
+
+    /// SGR 9 reaches the painter as CROSSED_OUT, so a pane's struck-through
+    /// cells stay struck through in a rendered log.
+    #[test]
+    fn rendered_log_paints_strikeout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("s.log");
+        std::fs::write(&p, "\u{1b}[9mSTRUCK\u{1b}[0m plain\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        assert!(e.log.is_some(), "the fixture opens rendered");
+        let area = Rect::new(0, 0, 40, 4);
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+        let mut struck = None;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if buf[(x, y)].symbol() == "S"
+                    && buf[(x, y)]
+                        .style()
+                        .add_modifier
+                        .contains(Modifier::CROSSED_OUT)
+                {
+                    struck = Some((x, y));
+                }
+            }
+        }
+        let (x, y) = struck.expect("the struck S paints somewhere in the body");
+        assert!(
+            !buf[(x + 7, y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT),
+            "the reset ends the run before `plain`"
         );
     }
 
