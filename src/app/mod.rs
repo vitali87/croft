@@ -27312,11 +27312,13 @@ impl App {
     /// `grid_lines` the find bar searches; the blank live-screen tail is
     /// trimmed so the buffer ends at the last real row.
     fn open_scrollback_in_editor(&mut self) {
-        let (lines, _) = self.terminal().grid_lines();
-        let coloured = self.terminal().grid_lines_ansi();
-        let last = lines
+        // Plain and coloured rows come from ONE grid read, so a redact rule
+        // is applied to the row it matches and never to a neighbour that
+        // shifted in while a second read was taken.
+        let rows_both = self.terminal().grid_lines_ansi();
+        let last = rows_both
             .iter()
-            .rposition(|l| !l.trim().is_empty())
+            .rposition(|(plain, _)| !plain.trim().is_empty())
             .map_or(0, |i| i + 1);
         let pane = self.terminal().label();
         let pane = if pane.is_empty() { "terminal" } else { pane };
@@ -27325,20 +27327,24 @@ impl App {
         // leaves the pane as bytes (#360). Masking works on the plain text;
         // a row the rules touch keeps its masked plain form and gives up its
         // colour, since a mask spliced between escapes could break them.
+        let mut plain_rows: Vec<String> = Vec::with_capacity(last);
         let mut rows: Vec<String> = Vec::with_capacity(last);
-        for (plain, ansi) in lines[..last].iter().zip(coloured.iter()) {
+        for (plain, ansi) in &rows_both[..last] {
             let masked = crate::triggers::mask_text(plain, &self.triggers, false);
             rows.push(if masked == *plain {
                 ansi.clone()
             } else {
-                masked
+                masked.clone()
             });
+            plain_rows.push(masked);
         }
         // A pane that showed colour lands in the rendered log view (#257),
         // which indexes from disk, so the rows go to a real file under the
-        // scrollback dir, one per pane, overwritten on each dump. A pane
-        // with no colour keeps the scratch buffer it always had.
-        if rows.iter().any(|r| r.contains('\x1b')) {
+        // scrollback dir, one per pane, overwritten on each dump. The gate
+        // uses the open path's own sniff, so the file can never open as an
+        // editable buffer of raw escapes. A pane with no colour keeps the
+        // scratch buffer it always had.
+        if scrollback_opens_as_log(&rows) {
             let file = self.scrollback_dir.join(format!(
                 "{}-scrollback.log",
                 pane.chars()
@@ -27349,17 +27355,33 @@ impl App {
                     })
                     .collect::<String>()
             ));
+            // A tab from an earlier dump holds a byte index over the OLD
+            // file; it is closed so the open below rebuilds the view over the
+            // new bytes rather than reading them through the stale index.
+            if let Some(idx) = self.editor.find_tab_with_path(&file) {
+                self.editor.close_tab(idx);
+            }
             let written = std::fs::create_dir_all(&self.scrollback_dir)
                 .and_then(|()| std::fs::write(&file, rows.join("\n") + "\n"));
-            match written
+            // Pinned, as the scratch buffer was: a later file peek must not
+            // replace the dump, and two panes' dumps must not share a slot.
+            let opened = written
                 .map_err(anyhow::Error::from)
-                .and_then(|()| self.editor.open_preview(&file))
-            {
-                Ok(()) => {
+                .and_then(|()| self.editor.open_pinned(&file));
+            match opened {
+                Ok(()) if self.editor.log.is_some() => {
                     self.focus_pane(Pane::Editor);
                     self.sync_open_file_poll_mtime();
                     self.status = format!("Opened {last} scrollback lines as a rendered log");
                     return;
+                }
+                Ok(()) => {
+                    // The open path decided this was not a log after all:
+                    // never leave the user an editable file of raw escapes.
+                    if let Some(idx) = self.editor.find_tab_with_path(&file) {
+                        self.editor.close_tab(idx);
+                    }
+                    self.status = String::from("Rendered scrollback unavailable; opened as text");
                 }
                 Err(e) => {
                     // Fall through to the plain scratch buffer rather than
@@ -27368,7 +27390,7 @@ impl App {
                 }
             }
         }
-        let text = crate::triggers::mask_text(&lines[..last].join("\n"), &self.triggers, false);
+        let text = plain_rows.join("\n");
         match self.editor.open_text_buffer(Path::new(&label), &text) {
             Ok(()) => {
                 self.focus_pane(Pane::Editor);
@@ -44633,6 +44655,24 @@ fn log_cell_at(
         .map(|t| crate::cell_map::CellMap::new(t).char_at_cell(cell))
         .unwrap_or(cell as usize);
     (line, column)
+}
+
+/// Whether a scrollback dump goes to the rendered log view or to the plain
+/// scratch buffer (#257). Must agree with the open path's own sniff, which
+/// reads only the first 8 KiB of the file: a dump this says is a log but the
+/// sniff says is text would open as an editable file full of raw escapes.
+fn scrollback_opens_as_log(rows: &[String]) -> bool {
+    // The same 8 KiB the file sniff reads, over the same bytes it will read.
+    let mut prefix = String::new();
+    for row in rows {
+        if prefix.len() >= 8192 {
+            break;
+        }
+        prefix.push_str(row);
+        prefix.push('\n');
+    }
+    let cut = prefix.floor_char_boundary(prefix.len().min(8192));
+    crate::ansi_text::looks_like_ansi(&prefix[..cut])
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {

@@ -1389,13 +1389,17 @@ impl PtyTerminal {
         (lines, top)
     }
 
-    /// [`Self::grid_lines`] with each row's colours and attributes written
-    /// back as SGR sequences, so the text can be re-rendered elsewhere with
-    /// the colours the pane showed (#257: "open scrollback in an editor tab"
-    /// through the rendered log view). Wide-char spacers are skipped as in
-    /// `grid_lines`; trailing default-styled blanks are trimmed; every row
-    /// that set a style ends with a reset.
-    pub fn grid_lines_ansi(&self) -> Vec<String> {
+    /// Every readable grid row as `(plain, coloured)`: the plain text
+    /// exactly as [`Self::grid_lines`] gives it, and the same row with the
+    /// cells' colours and attributes written back as SGR, so the text can be
+    /// re-rendered elsewhere with the colours the pane showed (#257: "open
+    /// scrollback in an editor tab" through the rendered log view). Both
+    /// forms come from ONE pass under ONE term lock, so a caller that masks
+    /// the plain row and writes the coloured one can never pair a row with
+    /// its neighbour after output landed between two reads. Wide-char
+    /// spacers are skipped as in `grid_lines`; trailing default-styled
+    /// blanks are trimmed; every row that set a style ends with a reset.
+    pub fn grid_lines_ansi(&self) -> Vec<(String, String)> {
         let term = self.term.lock();
         if term.columns() == 0 {
             return Vec::new();
@@ -1420,6 +1424,12 @@ impl PtyTerminal {
                 let ch = if cell.c == '\0' { ' ' } else { cell.c };
                 cells.push((ch, cell_sgr(cell.fg, cell.bg, cell.flags)));
             }
+            let plain: String = cells
+                .iter()
+                .map(|(ch, _)| *ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string();
             while cells
                 .last()
                 .is_some_and(|(ch, sgr)| *ch == ' ' && sgr.is_empty())
@@ -1443,7 +1453,7 @@ impl PtyTerminal {
             if !current.is_empty() {
                 out.push_str("\x1b[0m");
             }
-            lines.push(out);
+            lines.push((plain, out));
             l += 1;
         }
         lines
@@ -7364,12 +7374,17 @@ mod tests {
         .unwrap();
         wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains("QQRED plain")));
         let exported = term.grid_lines_ansi();
-        let raw = exported
+        let (plain, raw) = exported
             .iter()
-            .find(|l| l.contains("QQRED"))
+            .find(|(p, _)| p.contains("QQRED"))
             .expect("the coloured row is exported");
         let mut style = crate::ansi_text::AnsiStyle::default();
         let parsed = crate::ansi_text::parse_line(raw, &mut style);
+        assert_eq!(
+            parsed.text.trim_end(),
+            plain.trim_end(),
+            "the plain twin is the coloured row with its escapes stripped"
+        );
         assert!(
             parsed.text.starts_with("QQRED plain"),
             "escapes never reach the text: {:?}",

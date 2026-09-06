@@ -25773,6 +25773,7 @@ fn cmd_k_d_dumps_the_pane_scrollback_into_a_rendered_log_tab() {
     )
     .unwrap();
     app.terminals[0].set_manual_name(Some(String::from("bldlog")));
+    app.scrollback_dir = tmp.path().join("dumps");
     app.focus_pane(Pane::Terminal);
     let mut waited = 0u32;
     while !app.terminals[0]
@@ -25901,6 +25902,141 @@ fn cmd_k_d_opens_the_scrollback_as_a_rendered_log_with_its_colours() {
     assert!(
         path.is_file(),
         "the dump exists on disk for the view to index"
+    );
+}
+
+/// The dump file is one per pane and overwritten on each Cmd+K D, so the
+/// second dump must show the pane's NEW output, not the first dump's rows
+/// through a stale index, and must not claim a fresh open it did not make.
+#[test]
+fn a_second_dump_of_the_same_pane_shows_its_new_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from(
+                "s=QQ; printf \"\\033[32m${s}ONE\\033[0m\\n\"; read line; \
+                 printf \"\\033[32m${s}TWO\\033[0m\\n\"; sleep 30",
+            ),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the first coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQONE"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    assert!(app.editor.log.is_some(), "the first dump is a rendered log");
+
+    app.terminals[0].write_input(b"\n");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the second coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQTWO"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let text: Vec<String> = {
+        let log = app
+            .editor
+            .log
+            .as_mut()
+            .expect("the second dump is a rendered log too");
+        log.finish_index();
+        let n = log.len();
+        log.ensure(0, n).unwrap();
+        (0..n)
+            .map(|i| log.visible_text(i).unwrap_or("").to_string())
+            .collect()
+    };
+    assert!(
+        text.iter().any(|l| l.contains("QQTWO")),
+        "the second dump shows the new row, not the stale first dump: {text:?}"
+    );
+}
+
+/// The route gate and the open path's sniff must agree: the sniff reads only
+/// the first 8 KiB, so colour that first appears beyond it must route to the
+/// plain buffer, or the user gets an editable file full of raw escapes.
+#[test]
+fn colour_beyond_the_sniff_prefix_keeps_the_dump_plain() {
+    let plain: Vec<String> = (0..400)
+        .map(|i| format!("plain row {i:04} with padding text"))
+        .collect();
+    let mut late = plain.clone();
+    late.push(String::from("\x1b[32mlate colour\x1b[0m"));
+    assert!(
+        late.iter().map(|r| r.len() + 1).take(400).sum::<usize>() > 8192,
+        "fixture: the colour sits past the 8 KiB sniff prefix"
+    );
+    assert!(
+        !scrollback_opens_as_log(&late),
+        "colour past the prefix is not a log to the sniff"
+    );
+    let mut early = vec![String::from("\x1b[32mearly colour\x1b[0m")];
+    early.extend(plain.iter().cloned());
+    assert!(
+        scrollback_opens_as_log(&early),
+        "colour inside the prefix is"
+    );
+    assert!(!scrollback_opens_as_log(&plain), "no colour at all is not");
+}
+
+/// A dump is a pinned tab of its own, as the scratch buffer was: a later
+/// single-click file peek must not replace it, and two panes' dumps must
+/// not share one preview slot.
+#[test]
+fn a_scrollback_dump_is_a_pinned_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}PIN\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQPIN"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the dump tab has a path");
+    let idx = app
+        .editor
+        .find_tab_with_path(&path)
+        .expect("the dump tab is findable by its path");
+    assert!(
+        !app.editor.is_preview(idx),
+        "the dump is pinned, not a replaceable preview"
     );
 }
 
