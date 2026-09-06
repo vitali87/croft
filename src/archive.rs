@@ -17,17 +17,28 @@ pub const MEMBER_CAP: u64 = 100 * 1024 * 1024;
 /// zip's central directory. Larger files fall to the hex viewer.
 pub const TAR_LIST_CAP: u64 = 100 * 1024 * 1024;
 
-/// The most entries a zip listing will build (#493). A zip's entry COUNT
-/// is not bounded by its file size: the central directory costs about 88
-/// bytes per member, so a file well under [`crate::widgets::editor`]'s
-/// 50 MB cap can still declare hundreds of thousands of members, and
-/// `list` builds an owned `String` per member on the frame loop. Measured
-/// at 1.8s for 400k entries, which is a frozen editor, and `croft view`
-/// (#362) puts that behind any process in any pane rather than behind a
-/// deliberate click. The tar branch has bounded itself by decoded size
-/// since #198; this is the same guard for the branch that needed a
-/// different measure.
-pub const ZIP_ENTRY_CAP: usize = 50_000;
+/// The largest zip this will LIST, bounded by file size because that is
+/// the only measure available before the cost is paid (#493).
+///
+/// A zip's entry count is not bounded above by its file size, so the
+/// editor's 50 MB cap does not bound the listing work: measured at 87
+/// bytes per member, a 33 MB file declares 400k members and takes 1.65s
+/// to list, which is a frozen editor on the frame loop.
+///
+/// It is bounded BELOW by file size, though, and that is what makes this
+/// gate work. `ZipArchive::new` parses the whole central directory before
+/// returning — allocating a name, extra field, comment and entry record
+/// per member — so `len()` only exists once the expensive work is done.
+/// Measured, that constructor is ~71% of the total (1.17s of the 1.65s at
+/// 400k), so a guard on `len()` would arrive too late to prevent most of
+/// what it is for. Gating the file size is the only bound that precedes
+/// the parse, which is also what the tar branch does (#198).
+///
+/// 8 MB admits ~97k members, ~400ms worst case. For scale, a large
+/// library jar measured here holds 38k members in 3.2 MB, so ordinary
+/// archives pass with room; a zipped monorepo `node_modules` may not, and
+/// is expected to fall through to the hex viewer with the reason shown.
+pub const ZIP_LIST_CAP: u64 = 8 * 1024 * 1024;
 
 /// A reader that fails once more than `remaining` bytes have been
 /// pulled through it (#198 review): the compressed size of a tar.gz
@@ -113,16 +124,16 @@ pub fn list(path: &Path, kind: ArchiveKind) -> std::io::Result<ArchiveView> {
     let mut entries: Vec<ArchiveEntry> = Vec::new();
     match kind {
         ArchiveKind::Zip => {
-            let f = std::fs::File::open(path)?;
-            let mut z = zip::ZipArchive::new(f).map_err(std::io::Error::other)?;
-            // The count comes from the central directory, so this refuses
-            // BEFORE building a single entry rather than partway through.
-            if z.len() > ZIP_ENTRY_CAP {
+            // Before the open, not after: the constructor below is where
+            // the per-member cost is paid.
+            if meta.len() > ZIP_LIST_CAP {
                 return Err(std::io::Error::other(format!(
-                    "zip has too many entries to list ({} > {ZIP_ENTRY_CAP})",
-                    z.len()
+                    "zip too large to list ({} bytes)",
+                    meta.len()
                 )));
             }
+            let f = std::fs::File::open(path)?;
+            let mut z = zip::ZipArchive::new(f).map_err(std::io::Error::other)?;
             for i in 0..z.len() {
                 let e = z.by_index_raw(i).map_err(std::io::Error::other)?;
                 entries.push(ArchiveEntry {
@@ -323,35 +334,39 @@ pub fn contained_join(dir: &Path, member: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// A zip whose entry COUNT is large lists nothing rather than parking
-    /// the frame loop (#493): entry count is not bounded by file size, so
-    /// the general size cap does not reach this, and `croft view` makes it
-    /// reachable by any process in any pane.
+    /// A zip large enough to cost real time lists nothing rather than
+    /// parking the frame loop (#493). The gate is on the file, before the
+    /// parse: `ZipArchive::new` builds a record per member, so a bound read
+    /// off the parsed archive would arrive after most of the cost.
     #[test]
-    fn a_zip_with_too_many_entries_refuses_to_list() {
+    fn a_zip_over_the_list_cap_refuses_to_list() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("many.zip");
-        write_zip_with_entries(&p, ZIP_ENTRY_CAP + 1);
+        // ~87 bytes a member, so this clears the cap without writing a
+        // pointlessly enormous fixture.
+        write_zip_with_entries(&p, (ZIP_LIST_CAP / 80) as usize);
+        let size = std::fs::metadata(&p).unwrap().len();
+        assert!(size > ZIP_LIST_CAP, "fixture: {size} bytes clears the cap");
+        assert!(
+            size < 50 * 1024 * 1024,
+            "and stays under the editor's general size cap, so only this \
+             guard could have caught it"
+        );
         let err = list(&p, ArchiveKind::Zip).unwrap_err();
         assert!(
-            err.to_string().contains("too many entries"),
+            err.to_string().contains("too large to list"),
             "says why: {err}"
-        );
-        assert!(
-            std::fs::metadata(&p).unwrap().len() < 50 * 1024 * 1024,
-            "and the file is under the general size cap, so only this guard \
-             could have caught it"
         );
     }
 
-    /// A refused listing still opens, as hex (#493): the entry cap bounds
-    /// the WORK, and must not cost the user their look at the file. Same
-    /// fall-through a corrupt archive already takes.
+    /// A refused listing still opens, as hex, AND says why (#493): the cap
+    /// bounds the work, not the user's look at the file, and a browser
+    /// silently replaced by a hex dump reads as a bug rather than a policy.
     #[test]
-    fn a_zip_over_the_entry_cap_still_opens_as_hex() {
+    fn a_zip_over_the_list_cap_opens_as_hex_and_says_why() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("many.zip");
-        write_zip_with_entries(&p, ZIP_ENTRY_CAP + 1);
+        write_zip_with_entries(&p, (ZIP_LIST_CAP / 80) as usize);
         let mut e = crate::widgets::editor::Editor::new();
         e.open(&p).unwrap();
         assert!(
@@ -359,17 +374,42 @@ mod tests {
             "the file is still viewable, just not as an archive"
         );
         assert!(e.archive.is_none(), "and not as the archive it refused");
+        assert!(
+            e.status.contains("too large to list"),
+            "and the status says why it is hex: {}",
+            e.status
+        );
     }
 
-    /// The bound is on the count, not the file: an archive at the limit
-    /// still lists, so the guard cannot be satisfied by refusing everything.
+    /// The same refusal on the magic-sniffed route (#493 review): an
+    /// extensionless zip reaches `open_archive` by a second path, which
+    /// must be bounded too.
     #[test]
-    fn a_zip_at_the_entry_cap_still_lists() {
+    fn an_extensionless_zip_over_the_list_cap_also_refuses() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("atcap.zip");
-        write_zip_with_entries(&p, ZIP_ENTRY_CAP);
+        let p = dir.path().join("noext");
+        write_zip_with_entries(&p, (ZIP_LIST_CAP / 80) as usize);
+        let mut e = crate::widgets::editor::Editor::new();
+        e.open(&p).unwrap();
+        assert!(e.hex.is_some(), "sniffed as a zip, refused, still viewable");
+        assert!(e.archive.is_none());
+    }
+
+    /// An ordinary archive still lists, so the guard cannot be satisfied
+    /// by refusing everything. Sized after a real library jar measured at
+    /// 38k members in 3.2 MB, the kind of file that must keep working.
+    #[test]
+    fn an_ordinary_zip_under_the_list_cap_still_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ordinary.zip");
+        write_zip_with_entries(&p, 38_000);
+        let size = std::fs::metadata(&p).unwrap().len();
+        assert!(
+            size < ZIP_LIST_CAP,
+            "fixture: {size} bytes is under the cap"
+        );
         let view = list(&p, ArchiveKind::Zip).unwrap();
-        assert_eq!(view.entries.len(), ZIP_ENTRY_CAP);
+        assert_eq!(view.entries.len(), 38_000);
     }
 
     /// Build a zip with `n` empty stored members, through the crate the

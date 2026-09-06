@@ -2335,6 +2335,11 @@ pub struct Editor {
     /// time gets read as fact and the line it gets wrong is the one someone
     /// is arguing about.
     pub provenance: crate::provenance::Provenance,
+    /// Why the viewer the file's kind called for was declined, when it was
+    /// declined by a deliberate cap rather than by failing to parse (#493).
+    /// Consumed by the fallback viewer's status line: a browser silently
+    /// replaced by a hex dump reads as a bug rather than as a policy.
+    route_note: Option<String>,
     /// The `edit_seq` at which `App::sync_provenance` last considered THIS
     /// buffer for a persisted map (#349), so the history read happens once
     /// per buffer generation rather than per tick. Per tab, because
@@ -2853,6 +2858,7 @@ impl Editor {
             path: None,
             lines: Vec::new(),
             provenance: crate::provenance::Provenance::new(),
+            route_note: None,
             provenance_synced_seq: None,
             breakpoints: std::collections::HashMap::new(),
             stop_line: None,
@@ -3907,10 +3913,18 @@ impl Editor {
             }
             // A corrupt archive falls through to content routing and,
             // ultimately, the hex fallback.
-            if let Some(kind) = crate::archive::kind_from_ext(path)
-                && self.open_archive(path, kind).is_ok()
-            {
-                return Ok(());
+            if let Some(kind) = crate::archive::kind_from_ext(path) {
+                match self.open_archive(path, kind) {
+                    Ok(()) => return Ok(()),
+                    // A SIZE refusal is a deliberate cap, not a parse
+                    // failure (#493): the file still opens as hex, but the
+                    // reason rides along so the viewer can say why the
+                    // browser it expected was declined.
+                    Err(e) if e.to_string().contains("too large to list") => {
+                        self.route_note = Some(e.to_string());
+                    }
+                    Err(_) => {}
+                }
             }
             if extension_is_image(ext) {
                 // A DECODE failure means the extension lied (#174): fall
@@ -4007,11 +4021,13 @@ impl Editor {
                     return Ok(());
                 }
                 // Not a workbook: browse it as the archive it is (#179).
-                if self
-                    .open_archive(path, crate::archive::ArchiveKind::Zip)
-                    .is_ok()
-                {
-                    return Ok(());
+                match self.open_archive(path, crate::archive::ArchiveKind::Zip) {
+                    Ok(()) => return Ok(()),
+                    // The same deliberate cap as the extension route (#493).
+                    Err(e) if e.to_string().contains("too large to list") => {
+                        self.route_note = Some(e.to_string());
+                    }
+                    Err(_) => {}
                 }
             }
             // The remaining container kinds browse too when they parse.
@@ -4827,7 +4843,10 @@ impl Editor {
         // keep painting after "Reopen as Hex" reported success.
         self.log = None;
         self.hex = Some(view);
-        self.status = format!("Opened {} in the hex viewer", path.display());
+        self.status = match self.route_note.take() {
+            Some(why) => format!("Opened {} in the hex viewer: {why}", path.display()),
+            None => format!("Opened {} in the hex viewer", path.display()),
+        };
         Ok(())
     }
 
